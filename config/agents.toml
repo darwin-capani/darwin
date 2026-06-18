@@ -1,0 +1,440 @@
+# JARVIS agent constellation — the company of 27 agents.
+#
+# Each agent is a PROFILE on the one local engine (one 4B LLM + Kokoro TTS),
+# NOT a separate model. What differs per agent is its persona prefix, its
+# Kokoro voice, the HUD core hue, its tool allowlist, and its memory
+# namespace. Jarvis-Prime hears every request and delegates to the right
+# agent (daemon/src/router.rs); the selected agent runs the EXISTING
+# converse/cloud pipeline with its own persona, voice, namespace, and
+# allowlist.
+#
+# Parsed into AgentRegistry (daemon/src/agents.rs, serde + deny_unknown_fields).
+# Field contract per [[agent]] entry:
+#   name         lowercase id; also the memory-namespace suffix and the
+#                persona filename stem (inference/personas/<name>.txt).
+#   role         one-line role description (shown in the HUD roster panel).
+#   voice        Kokoro voice id — VERIFIED to load from
+#                mlx-community/Kokoro-82M-bf16/voices/<voice>.safetensors.
+#   hue          HUD core hue, integer degrees 0-360, on the cyan-navy FUI
+#                palette. Red (0/360 +-) is RESERVED for alerts; ultron uses
+#                deep-orange 15 for identity, never a literal alert red.
+#   persona_file persona prompt + INTRO line (read by the daemon, passed to
+#                the converse op as the per-agent persona; owned by part B).
+#   tools        action/intent allowlist this agent may invoke. jarvis = all
+#                (the orchestrator). An agent attempting a tool outside its
+#                list is refused and the request is routed to the owning
+#                agent — isolation is enforced in router.rs and tested.
+#   namespace    "agent.<name>"; facts/exchanges this agent records are
+#                tagged with it, and recall feeds the active agent its own
+#                namespace plus shared (non-namespaced) facts.
+
+[[agent]]
+name = "jarvis"
+role = "Prime Orchestrator: hears every request, delegates to the right agent, keeps you updated, ensures nothing falls through"
+voice = "bm_george"
+hue = 190
+persona_file = "inference/personas/jarvis.txt"
+# The orchestrator alone may invoke any tool/intent in the system.
+tools = ["*"]
+namespace = "agent.jarvis"
+
+[[agent]]
+name = "friday"
+role = "Daily Intel: morning briefs, news, schedule, what-changed-overnight"
+voice = "bf_emma"
+hue = 35
+persona_file = "inference/personas/friday.txt"
+tools = ["conversation", "system.query", "memory.recall", "system_status", "recall_facts", "gcal_list_events", "gmail_list_recent", "gmail_read_message", "gdrive_list_files", "gdrive_search", "world_query", "world_update", "skill_list", "skill_invoke"]
+namespace = "agent.friday"
+
+[[agent]]
+name = "veronica"
+role = "Content + Comms: drafts content and messages"
+voice = "af_bella"
+hue = 320
+persona_file = "inference/personas/veronica.txt"
+tools = ["conversation", "memory.store", "memory.recall", "remember_fact", "recall_facts", "slack_list_channels", "slack_read_channel", "slack_post_message", "gdrive_upload_text", "connect_x", "connect_linkedin", "x_recent_tweets", "x_mentions", "x_post", "linkedin_me", "linkedin_post", "world_query"]
+namespace = "agent.veronica"
+
+[[agent]]
+name = "vision"
+role = "Research + OSINT: competitors, trends, ads, deep research on authorized targets"
+voice = "bf_isabella"
+hue = 265
+persona_file = "inference/personas/vision.txt"
+tools = ["conversation", "web.open", "web.search", "file.op", "memory.recall", "web_search", "open_url", "search_files", "recall_facts", "world_query"]
+namespace = "agent.vision"
+
+[[agent]]
+name = "ultron"
+role = "Security + Automation: defensive monitoring of your Mac and LAN; automation, no offensive tooling"
+voice = "am_onyx"
+hue = 15
+persona_file = "inference/personas/ultron.txt"
+tools = ["conversation", "system.query", "memory.recall", "system_status", "recall_facts", "world_query"]
+namespace = "agent.ultron"
+
+[[agent]]
+name = "athena"
+role = "Greek-Life Strategy: chapter, rush, and social strategy advisor"
+voice = "af_nova"
+hue = 50
+persona_file = "inference/personas/athena.txt"
+tools = ["conversation", "memory.store", "memory.recall", "remember_fact", "recall_facts", "world_query"]
+namespace = "agent.athena"
+
+[[agent]]
+name = "stark"
+role = "Business Intel: metrics, competitors, business decisions"
+voice = "am_adam"
+hue = 205
+persona_file = "inference/personas/stark.txt"
+# stark and gecko are the two ads agents (both manage capital), so BOTH hold the
+# ads read tools and BOTH hold the consequential spend tools (pause/enable/resume/
+# budget). Those consequential tools still route through the foundation gate, so
+# they preview unless [integrations].allow_consequential is on AND confirm=true.
+tools = ["conversation", "web.search", "memory.recall", "web_search", "recall_facts", "connect_linkedin", "linkedin_me", "linkedin_post", "connect_google_ads", "connect_meta_ads", "gads_report", "gads_pause_campaign", "gads_enable_campaign", "gads_set_budget", "meta_report", "meta_pause_campaign", "meta_resume_campaign", "meta_set_budget", "world_query"]
+namespace = "agent.stark"
+
+[[agent]]
+name = "steve"
+role = "CTO + Builds: investigates bugs, makes code changes, opens GitHub PRs (future)"
+voice = "am_michael"
+hue = 150
+persona_file = "inference/personas/steve.txt"
+tools = ["conversation", "file.op", "system.query", "memory.recall", "search_files", "open_path", "system_status", "recall_facts", "github_list_prs", "github_get_pr", "github_list_issues", "github_comment_issue", "github_open_pr", "forge_app", "code_explain", "code_propose_diff", "shell_run", "ui_actuate", "world_query"]
+namespace = "agent.steve"
+
+[[agent]]
+name = "oracle"
+role = "Workflows: chains actions into repeatable workflows"
+voice = "bm_lewis"
+hue = 280
+persona_file = "inference/personas/oracle.txt"
+tools = ["conversation", "app.launch", "app.control", "system.query", "memory.recall", "open_app", "quit_app", "system_status", "recall_facts", "forge_app", "standing_create", "standing_list", "standing_cancel", "world_query"]
+namespace = "agent.oracle"
+
+[[agent]]
+name = "gecko"
+role = "Markets + Capital: market watch, trading research (future Algo-Core)"
+voice = "bm_daniel"
+hue = 120
+persona_file = "inference/personas/gecko.txt"
+# gecko, the other ads agent (Markets + Capital), holds the same ads read +
+# consequential spend tools as stark — both manage capital. The consequential
+# tools still route through the foundation gate (preview unless allow_consequential
+# is on AND confirm=true).
+tools = ["conversation", "web.search", "memory.recall", "web_search", "recall_facts", "connect_google_ads", "connect_meta_ads", "gads_report", "gads_pause_campaign", "gads_enable_campaign", "gads_set_budget", "meta_report", "meta_pause_campaign", "meta_resume_campaign", "meta_set_budget", "world_query"]
+namespace = "agent.gecko"
+
+[[agent]]
+name = "hercules"
+role = "Fitness + Nutrition: training and nutrition coaching"
+voice = "am_fenrir"
+hue = 90
+persona_file = "inference/personas/hercules.txt"
+tools = ["conversation", "memory.store", "memory.recall", "remember_fact", "recall_facts", "world_query"]
+namespace = "agent.hercules"
+
+[[agent]]
+name = "pepper"
+role = "Personal EA + Reflection: scheduling, reminders, reflective consolidation"
+voice = "bf_alice"
+hue = 300
+persona_file = "inference/personas/pepper.txt"
+tools = ["conversation", "memory.store", "memory.recall", "remember_fact", "recall_facts", "gcal_list_events", "gcal_create_event", "gmail_list_recent", "gmail_read_message", "gmail_send", "gdrive_list_files", "gdrive_search", "gdrive_upload_text", "world_query", "world_update"]
+namespace = "agent.pepper"
+
+[[agent]]
+name = "hulk"
+role = "Offline Survival: the all-local mode when the cloud is unreachable"
+voice = "am_echo"
+hue = 110
+persona_file = "inference/personas/hulk.txt"
+tools = ["conversation", "system.query", "app.launch", "app.control", "file.op", "memory.store", "memory.recall", "world_query"]
+namespace = "agent.hulk"
+
+[[agent]]
+name = "herald"
+role = "Meetings: capture, notes, scheduling"
+voice = "bm_fable"
+hue = 220
+persona_file = "inference/personas/herald.txt"
+tools = ["conversation", "memory.store", "memory.recall", "remember_fact", "recall_facts", "gcal_list_events", "gcal_create_event", "world_query"]
+namespace = "agent.herald"
+
+[[agent]]
+name = "jerome"
+role = "Leisure + DJ: music and entertainment control"
+voice = "af_river"
+hue = 340
+persona_file = "inference/personas/jerome.txt"
+tools = ["conversation", "app.launch", "app.control", "memory.recall", "open_app", "quit_app", "recall_facts", "world_query"]
+namespace = "agent.jerome"
+
+[[agent]]
+name = "edith"
+role = "Proactive Sentinel: watches your signals and surfaces what matters before you ask"
+# af_sky: a real American-English female Kokoro voice (one of the original
+# Kokoro-82M set), distinct from every other roster voice.
+voice = "af_sky"
+# Teal 170: distinct, calm, on the cyan-navy FUI palette; never the reserved
+# alert red. Sits between gecko (120) and jarvis (190).
+hue = 170
+persona_file = "inference/personas/edith.txt"
+# Read-only / no-consequential surface. EDITH READS the signals it watches
+# (calendar, mail metadata, system health, stored facts) and composes its own
+# brief on demand; it never ACTS. The two edith_* tools are read-only. A
+# consequential follow-up the user approves routes through the foundation gate
+# at the owning agent, not here.
+tools = ["conversation", "system.query", "memory.recall", "system_status", "recall_facts", "gcal_list_events", "gmail_list_recent", "edith_brief", "edith_watch", "world_query"]
+namespace = "agent.edith"
+
+[[agent]]
+name = "fury"
+role = "Mission Orchestrator: decomposes a goal, dispatches the right agents, drives it to done"
+# am_eric: a real American-English male Kokoro voice (one of the original
+# Kokoro-82M set), deep and authoritative, distinct from every other roster
+# voice — fitting the one who assembles the team.
+voice = "am_eric"
+# Deep navy-blue 235: distinct, commanding, on the cyan-navy FUI palette; never
+# the reserved alert red. Sits between stark (205) and vision (265).
+hue = 235
+persona_file = "inference/personas/fury.txt"
+# FURY is NOT an orchestrator-wildcard like jarvis. It holds an EXPLICIT mission
+# tool (fury_mission) plus the read tools it needs to plan and ground a mission —
+# the actual ACTING happens inside each sub-task as the OWNING specialist, under
+# that specialist's own allowlist (the mission engine re-runs the cloud tool loop
+# per sub-task). FURY itself never holds another agent's consequential tools.
+tools = ["conversation", "system.query", "memory.recall", "system_status", "recall_facts", "fury_mission", "standing_create", "standing_list", "standing_cancel", "mission_save", "mission_list", "mission_resume", "mission_cancel", "world_query"]
+namespace = "agent.fury"
+
+[[agent]]
+name = "cassandra"
+role = "Forecast & Simulation: runs the numbers, models scenarios, reports the odds"
+# af_aoede: a real American-English female Kokoro voice from the Kokoro-82M set,
+# distinct from every other roster voice — fitting the probabilistic oracle
+# archetype (a muse). The archetype is a NAME, not a claim of foresight:
+# Cassandra models what could happen, she does not prophesy.
+voice = "af_aoede"
+# Steel-blue 250: distinct, cool and analytical, on the cyan-navy FUI palette;
+# never the reserved alert red. Sits between fury (235) and vision (265).
+hue = 250
+persona_file = "inference/personas/cassandra.txt"
+# READ-ONLY surface. Both cassandra_* tools are PURE simulations over the user's
+# (or default) assumptions — no side effects, nothing sent or changed, so neither
+# touches the foundation gate. Cassandra models what COULD happen under the
+# inputs; she never acts and never promises an outcome will occur.
+tools = ["conversation", "memory.recall", "recall_facts", "cassandra_forecast", "cassandra_simulate", "world_query"]
+namespace = "agent.cassandra"
+
+[[agent]]
+name = "mnemosyne"
+role = "Semantic Memory: recalls what you've told JARVIS and surfaces the relevant past"
+# af_kore: a real American-English female Kokoro voice from the Kokoro-82M set
+# (Kore, the maiden — like Mnemosyne, a Greek-myth figure used only as a NAME,
+# not a claim), distinct from every other roster voice — fitting the precise,
+# recollective archetype.
+voice = "af_kore"
+# Teal-cyan 130: distinct, calm and recollective, on the cyan-navy FUI palette;
+# never the reserved alert red. Sits between gecko (120) and steve (150).
+hue = 130
+persona_file = "inference/personas/mnemosyne.txt"
+# READ-ONLY surface. mnemosyne_recall RANKS the EXISTING stored memories and
+# returns the relevant ones; it stores nothing, sends nothing, and changes
+# nothing, so it never touches the foundation gate. The STORE half is pepper's;
+# Mnemosyne is retrieval only. She also holds the generic recall_facts read tool.
+# The ranking is lexical-semantic (BM25), NOT neural embeddings — the persona and
+# tool copy say so; recall is keyword-semantic, not vector-semantic.
+tools = ["conversation", "memory.recall", "recall_facts", "mnemosyne_recall", "episodic_recall", "world_query", "world_update", "user_model_query", "user_model_correct", "user_model_forget", "skill_list", "skill_invoke", "doc_search", "unified_search", "docsearch.index", "docsearch.forget", "docsearch.build_graph", "knowledge.build"]
+namespace = "agent.mnemosyne"
+
+[[agent]]
+name = "sage"
+role = "Deep Research: multi-source investigation with cited synthesis"
+# am_puck: a real American-English male Kokoro voice from the Kokoro-82M set, a
+# measured, scholarly reader — fitting the one who "reads widely and shows its
+# sources." Distinct from every other roster voice.
+voice = "am_puck"
+# Indigo 245: distinct, deep and studious, on the cyan-navy FUI palette; never
+# the reserved alert red. Sits between fury (235) and cassandra (250), 10 degrees
+# off each.
+hue = 245
+persona_file = "inference/personas/sage.txt"
+# SAGE's surface: the deep-research tool (sage_research — the bounded plan ->
+# search -> fetch -> cited-synthesize core in daemon/src/research.rs) plus the
+# web read tools it leans on to ground an investigation (web.search/web_search to
+# find sources, web.open/open_url to surface one). All READ surface: a real run
+# needs the web + the cloud and spends tokens, but it fetches and CITES — it
+# never acts, and a citation always maps to a source it actually fetched (never
+# an invented URL). recall_facts lets it ground a question against what the user
+# already told JARVIS.
+tools = ["conversation", "web.search", "web.open", "memory.recall", "web_search", "open_url", "recall_facts", "sage_research", "world_query", "skill_list", "skill_invoke"]
+namespace = "agent.sage"
+
+[[agent]]
+name = "vitalis"
+role = "Health & Biometrics: tracks recovery, strain, and sleep, and tells you what your body is saying"
+# af_heart: a real American-English female Kokoro voice — the flagship voice of
+# the Kokoro-82M set — warm and steady, distinct from every other roster voice;
+# fitting a calm performance physiologist who reads the signals and says it
+# straight.
+voice = "af_heart"
+# Teal 160: distinct, calm and clinical, on the cyan-navy FUI palette; never the
+# reserved alert red. Sits between mnemosyne (130) and edith (170).
+hue = 160
+persona_file = "inference/personas/vitalis.txt"
+# WHOOP-based biometrics. The three vitalis_* tools are READ-ONLY (recovery,
+# sleep, strain) over the WHOOP API on the generic oauth2 provider — they fetch
+# and report, they never act, so none touches the foundation gate. connect_whoop
+# runs the one-time browser OAuth consent (it stores the refresh token the daemon
+# writes; it posts nothing and changes no WHOOP data). HONESTY: there is NO Apple
+# Health / HealthKit here — that data is iOS/watchOS only and is not reachable
+# from the Mac; Vitalis reads WHOOP, and only once the user connects it.
+tools = ["conversation", "memory.recall", "recall_facts", "connect_whoop", "vitalis_recovery", "vitalis_sleep", "vitalis_strain", "world_query"]
+namespace = "agent.vitalis"
+
+[[agent]]
+name = "karen"
+role = "Comms Autopilot: triages your inbox and channels, drafts replies, sends only on your say-so"
+# af_sarah: a real American-English female Kokoro voice from the original
+# Kokoro-82M set — steady and professional, distinct from every other roster
+# voice; fitting a sharp, unflappable chief-of-staff.
+voice = "af_sarah"
+# Cyan 200: distinct, calm and businesslike, on the cyan-navy FUI palette; never
+# the reserved alert red. Sits between jarvis (190) and stark (205).
+hue = 200
+persona_file = "inference/personas/karen.txt"
+# Comms autopilot over the EXISTING Gmail/Slack/X tools — no new integration of her
+# own. The two karen_* tools are READ-ONLY: karen_triage aggregates the recent
+# unread/mentions across the CONNECTED comms surfaces (it calls the existing read
+# clients; an unconnected surface is skipped honestly) into one prioritized
+# summary, and karen_draft composes a reply DRAFT and returns it as a PREVIEW —
+# neither sends, so neither touches the foundation gate. She ALSO holds the existing
+# read tools she triages over plus the existing consequential SEND tools
+# (gmail_send, slack_post_message, x_post), which stay behind the foundation gate
+# exactly as today: Karen drafts and triages freely, but a send needs the gate ON
+# and confirm=true.
+tools = ["conversation", "memory.recall", "recall_facts", "karen_triage", "karen_draft", "draft_compose", "draft_list", "draft_forget", "gmail_list_recent", "gmail_read_message", "gmail_send", "slack_list_channels", "slack_read_channel", "slack_post_message", "x_mentions", "x_recent_tweets", "x_post", "world_query"]
+namespace = "agent.karen"
+
+[[agent]]
+name = "dume"
+role = "Home & Environment: reads and controls your smart-home devices through your hub"
+# am_liam: a real American-English male Kokoro voice from the original Kokoro-82M
+# set, distinct from every other roster voice — an eager, ready-to-help register
+# that fits a competent lab-bot ("Point me at the lights, sir").
+voice = "am_liam"
+# Spring-teal 140: distinct, fresh and utilitarian, on the cyan-navy FUI palette;
+# never the reserved alert red. Sits between mnemosyne (130) and steve (150), 10
+# degrees off each.
+hue = 140
+persona_file = "inference/personas/dume.txt"
+# Home Assistant bridge. dume_devices is READ-ONLY (it lists the hub's entities +
+# states over the local REST API) and never touches the foundation gate.
+# dume_control is CONSEQUENTIAL: it routes through the foundation gate, so it
+# previews the exact service call unless allow_consequential is ON and
+# confirm=true — no device moves otherwise. HONESTY: control goes through the
+# user's OWN Home Assistant hub; JARVIS does not talk HomeKit directly (raw
+# HomeKit is not cleanly reachable from a macOS daemon).
+tools = ["conversation", "memory.recall", "recall_facts", "dume_devices", "dume_control", "world_query"]
+namespace = "agent.dume"
+
+[[agent]]
+name = "midas"
+role = "Personal Treasury: reads your balances and spending and tells you where the money goes — never moves it"
+# am_santa: a real American-English male Kokoro voice from the original Kokoro-82M
+# set, distinct from every other roster voice — a calm, measured register fitting a
+# discreet private banker who watches the books.
+voice = "am_santa"
+# Amber-gold 100: distinct, a treasury/gold note on the cyan-navy FUI palette;
+# never the reserved alert red. Sits between hercules (90) and hulk (110), 10
+# degrees off each.
+hue = 100
+persona_file = "inference/personas/midas.txt"
+# Plaid READ client. The three midas_* tools are READ-ONLY (balances, transactions,
+# by-category spending) over the Plaid API and NONE touches the foundation gate.
+# HARD RULE: MIDAS NEVER MOVES MONEY — there is no transfer/payment/trade tool,
+# not even a gated one, because no money action exists to gate. HONESTY: Plaid needs
+# the user's own app (client id + secret) AND a linked-institution access token from
+# Plaid Link (a frontend step JARVIS does not perform); until configured Midas says
+# "no linked accounts — connect via Plaid in Settings". Midas watches the books;
+# it never touches the money.
+tools = ["conversation", "memory.recall", "recall_facts", "midas_balances", "midas_transactions", "midas_spending", "world_query"]
+namespace = "agent.midas"
+
+[[agent]]
+name = "voyager"
+role = "Travel & Logistics: routes, places, and travel times — gets you there"
+# bf_lily: a real British-English female voice from the original Kokoro-82M set,
+# distinct from every other roster voice — a calm, well-travelled register that fits
+# a seasoned navigator/concierge ("Tell me where; I'll find the way").
+voice = "bf_lily"
+# Cyan 180: distinct, calm and wayfinding, on the cyan-navy FUI palette; never the
+# reserved alert red. Sits between edith (170) and jarvis (190), 10 degrees off each.
+hue = 180
+persona_file = "inference/personas/voyager.txt"
+# Maps READ client. The three voyager_* tools are READ-ONLY over a maps provider
+# (Google Maps Platform: Directions, Places, Distance Matrix): a route, a places
+# search, and a travel time. NONE touches the foundation gate. HARD SCOPE: VOYAGER
+# NEVER BOOKS OR PAYS — there is no reservation/payment tool, not even a gated one,
+# because booking would need many provider APIs plus payment, which is out of scope.
+# HONESTY: needs the user's own Maps Platform API key (maps_api_key), pasted in
+# Settings; until then Voyager says "maps isn't configured — add your Maps Platform
+# API key in Settings". The key rides only the request HEADER at call time (never
+# the URL) and is never logged. Voyager finds the way; it never books the trip.
+tools = ["conversation", "memory.recall", "recall_facts", "voyager_directions", "voyager_places", "voyager_eta", "world_query"]
+namespace = "agent.voyager"
+
+[[agent]]
+name = "aegis"
+role = "Defense & Privacy: checks your exposure and the machine's security posture"
+# af_nicole: a real American-English female voice from the original Kokoro-82M set,
+# distinct from every other roster voice — a calm, measured register that fits a
+# security chief who reports the walls plainly ("I watch the walls; I tell you where
+# you're exposed").
+voice = "af_nicole"
+# Steel-blue 210: distinct, calm and watchful, on the cyan-navy FUI palette; never
+# the reserved alert red (red stays for alerts; ultron's identity hue is deep-orange
+# 15). Sits between stark (205) and herald (220).
+hue = 210
+persona_file = "inference/personas/aegis.txt"
+# DEFENSIVE-ONLY, READ-ONLY surface. Two reads, both safe — NEITHER touches the
+# foundation gate because neither changes anything. aegis_breach_check reads the Have
+# I Been Pwned catalog for the USER'S OWN email (defaulting to the user's stored
+# address): it reports exposure, it cracks nothing and scans no other host; it needs
+# the user's own HIBP API key (hibp_api_key) in Settings, and says so when missing.
+# aegis_posture reads the LOCAL machine's security posture (FileVault, firewall, SIP,
+# pending updates) with the same read-only system-command pattern the daemon already
+# uses — it REPORTS; turning a protection on is the user's own action in System
+# Settings. NO offensive capability: the user's own email + own machine only. Aegis
+# holds NO consequential/remediation tool, not even a gated one.
+tools = ["conversation", "memory.recall", "recall_facts", "aegis_breach_check", "aegis_posture", "world_query"]
+namespace = "agent.aegis"
+
+[[agent]]
+name = "babel"
+role = "Translation & Interpretation: renders text between languages and interprets speech turn-by-turn (transcribe -> translate -> speak); continuous real-time live-mic interpretation is device-gated"
+# af_jessica: a real American-English female voice from the original Kokoro-82M set,
+# distinct from every other roster voice — a clear, even-handed register that fits a
+# faithful interpreter who renders meaning straight ("Any tongue, rendered true").
+voice = "af_jessica"
+# Cyan-teal 155: distinct, calm and lucid, on the cyan-navy FUI palette; never the
+# reserved alert red. Sits between steve (150) and vitalis (160), 5 degrees off each.
+hue = 155
+persona_file = "inference/personas/babel.txt"
+# READ-ONLY surface. babel_translate renders `text` from one language to another by
+# calling the ON-DEVICE LLM (the existing generate/brain path) with a faithful-
+# translation prompt — it transforms text and reports the result; it stores nothing,
+# sends nothing, and changes nothing, so it never touches the foundation gate.
+# babel_interpret chains that SAME on-device translate with the daemon's echo-safe
+# speech path: it renders one already-transcribed utterance into the target language
+# and speaks the bare translation aloud (TURN-BASED interpretation).
+# HONESTY: text/turn translation quality is bounded by the local ~4B model — competent,
+# not a dedicated machine-translation system and not a professional translator — and
+# CONTINUOUS, always-listening, real-time live-mic interpretation (two-way, hands-free)
+# is DEVICE/AUDIO-gated and not wired here. Babel ships the text core + the turn-based
+# interpreter and documents the continuous live-mic mode as the device-gated next step.
+# Babel renders; it never composes original content (that is Veronica) and never sends.
+tools = ["conversation", "memory.recall", "recall_facts", "babel_translate", "babel_interpret", "world_query"]
+namespace = "agent.babel"

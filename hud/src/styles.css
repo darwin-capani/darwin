@@ -1,0 +1,6474 @@
+/* JARVIS HUD — classic sci-fi FUI restyle (build directive #4).
+ *
+ * Language: near-black navy void, dotted grid + concentric watermark +
+ * scanlines backdrop; angular cut-corner frames with corner brackets and
+ * 1-2px glowing cyan strokes; beveled trapezoid title bars with a leading
+ * light-streak; mono UPPERCASE micro-labels with tick decorations; dashed
+ * sub-blocks; triangular warning icons; segmented block gauges; a circular
+ * reticle dial top-left. RED (--alert-red) is reserved EXCLUSIVELY for
+ * alerts/errors.
+ *
+ * Anti-flash rule: every color/opacity/transform that can change at runtime
+ * carries a CSS transition; overlays fade via class toggles on permanently
+ * mounted nodes (never conditional mount/unmount of animated elements).
+ */
+:root {
+  --bg-void: #04080f;
+  --panel-bg: rgba(5, 11, 19, 0.84);
+  --cyan: #1ad6ff;
+  --cyan-bright: #7df3ff;
+  --cyan-dim: rgba(26, 214, 255, 0.55);
+  --stroke: rgba(26, 214, 255, 0.42);
+  --ice: #eaf8ff;
+  --ice-dim: #8fb4c4;
+  --cloud-violet: #9d7dff;
+  --warn-amber: #ffb454;
+  --alert-red: #ff3b4e;
+  --learn-green: #5ce0a8;
+  --cut: 14px;
+
+  --mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
+  --sans: "SF Pro Display", -apple-system, system-ui, sans-serif;
+  --text: "SF Pro Text", -apple-system, system-ui, sans-serif;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--bg-void);
+  color: var(--ice);
+  font-family: var(--text);
+  user-select: none;
+  cursor: default;
+}
+
+/* ------------------------------------------------------------- layout */
+
+.hud {
+  position: relative;
+  width: 100vw;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.hud::after {
+  /* fine scanline texture over everything */
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(125, 243, 255, 0.012) 0px,
+    rgba(125, 243, 255, 0.012) 1px,
+    transparent 1px,
+    transparent 3px
+  );
+  z-index: 50;
+}
+
+/* dotted grid + huge concentric-circle watermark. Sits ABOVE the (opaque)
+   WebGL canvas — etched-on-glass — because a transparent canvas under a
+   postprocessing composer flickers in WKWebView. */
+.hud-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  background-image: radial-gradient(rgba(26, 214, 255, 0.075) 1px, transparent 1.4px);
+  background-size: 26px 26px;
+}
+
+.watermark {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 170vmin;
+  height: 170vmin;
+  transform: translate(-50%, -50%);
+  background: repeating-radial-gradient(
+    circle at center,
+    rgba(26, 214, 255, 0.05) 0px,
+    rgba(26, 214, 255, 0.05) 1.5px,
+    transparent 1.5px,
+    transparent 88px
+  );
+  -webkit-mask-image: radial-gradient(circle at center, black 28%, transparent 72%);
+  mask-image: radial-gradient(circle at center, black 28%, transparent 72%);
+}
+
+.hud-vignette {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: radial-gradient(ellipse at center, transparent 35%, rgba(2, 4, 7, 0.8) 100%);
+  z-index: 2;
+}
+
+.core-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 0; /* opaque canvas paints the navy void; backdrop etches above */
+}
+
+.panel-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 3;
+  display: grid;
+  grid-template-rows: auto auto 1fr auto;
+  grid-template-columns: minmax(260px, 24vw) 1fr minmax(260px, 24vw);
+  grid-template-areas:
+    "status status status"
+    "latency latency latency"
+    "left center right"
+    "wave wave wave";
+  gap: 12px;
+  padding: 14px 18px 12px;
+  pointer-events: none;
+}
+
+.panel-layer > * {
+  pointer-events: auto;
+}
+
+.left-col {
+  grid-area: left;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+/* Center column holds the R3F core (painted by .core-layer beneath) plus the
+   intel-feed panel anchored to the LOWER half — flex pushes the panel to the
+   bottom and a max-height keeps the core sphere above it fully visible. The
+   empty flex spacer is pointer-events:none so the core stays interactive. */
+.center-col {
+  grid-area: center;
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-end;
+  min-height: 0;
+  pointer-events: none;
+}
+
+.center-col > .global-scan {
+  pointer-events: auto;
+  max-height: 56%;
+}
+
+/* ------------------------------------------------- angular frame chrome */
+
+.frame {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  filter: drop-shadow(0 0 7px rgba(26, 214, 255, 0.14));
+}
+
+/* 1px cyan stroke that follows the cut corners: gradient layer clipped to
+   the octagon, panel surface clipped to the same shape 1px inside. */
+.frame-clip {
+  flex: 1;
+  display: flex;
+  min-height: 0;
+  padding: 1px;
+  background: linear-gradient(
+    165deg,
+    rgba(26, 214, 255, 0.85),
+    rgba(26, 214, 255, 0.3) 30%,
+    rgba(26, 214, 255, 0.22) 70%,
+    rgba(26, 214, 255, 0.6)
+  );
+  clip-path: polygon(
+    var(--cut) 0,
+    100% 0,
+    100% calc(100% - var(--cut)),
+    calc(100% - var(--cut)) 100%,
+    0 100%,
+    0 var(--cut)
+  );
+}
+
+.frame-inner {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel-bg);
+  clip-path: polygon(
+    var(--cut) 0,
+    100% 0,
+    100% calc(100% - var(--cut)),
+    calc(100% - var(--cut)) 100%,
+    0 100%,
+    0 var(--cut)
+  );
+}
+
+.frame-inner::after {
+  /* per-panel scanlines */
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(125, 243, 255, 0.02) 0px,
+    rgba(125, 243, 255, 0.02) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+}
+
+/* corner brackets */
+.frame .bk {
+  position: absolute;
+  width: 11px;
+  height: 11px;
+  border: 0 solid var(--cyan-bright);
+  opacity: 0.85;
+  pointer-events: none;
+}
+.frame .bk.tl { left: -2px; top: -2px; border-left-width: 2px; border-top-width: 2px; }
+.frame .bk.tr { right: -2px; top: -2px; border-right-width: 2px; border-top-width: 2px; }
+.frame .bk.bl { left: -2px; bottom: -2px; border-left-width: 2px; border-bottom-width: 2px; }
+.frame .bk.br { right: -2px; bottom: -2px; border-right-width: 2px; border-bottom-width: 2px; }
+
+/* beveled trapezoid title bar with leading light-streak */
+.frame-title {
+  position: relative;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 14px 5px 16px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: #cff3ff;
+  background: linear-gradient(
+    90deg,
+    rgba(26, 214, 255, 0.3),
+    rgba(26, 214, 255, 0.12) 45%,
+    rgba(26, 214, 255, 0.03) 85%
+  );
+  clip-path: polygon(0 0, 100% 0, calc(100% - 16px) 100%, 0 100%);
+}
+
+.frame-title::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 3px;
+  background: linear-gradient(180deg, #effeff, var(--cyan));
+  box-shadow: 0 0 12px var(--cyan), 0 0 4px var(--cyan-bright);
+}
+
+.frame-title .t {
+  white-space: nowrap;
+}
+
+.frame-title .tag {
+  font-weight: 400;
+  font-size: 9.5px;
+  color: var(--cyan-dim);
+  letter-spacing: 0.08em;
+  text-transform: none;
+}
+
+.frame-title .ticks {
+  margin-left: auto;
+  display: flex;
+  gap: 3px;
+  align-items: flex-end;
+  padding-right: 16px;
+}
+.frame-title .ticks i { width: 3px; height: 9px; background: var(--cyan-dim); }
+.frame-title .ticks i:nth-child(2) { height: 6px; opacity: 0.7; }
+.frame-title .ticks i:nth-child(3) { height: 4px; opacity: 0.45; }
+
+/* dashed sub-blocks */
+.sub {
+  border: 1px dashed rgba(26, 214, 255, 0.28);
+  margin: 8px 10px;
+  padding: 8px 10px;
+}
+
+.sub-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--ice-dim);
+  padding: 2px 12px 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.sub-title .tag {
+  font-size: 9.5px;
+  color: var(--cyan-dim);
+}
+
+/* triangular warning icon (StatusBar + AlertPanel) */
+svg.tri {
+  width: 20px;
+  height: 18px;
+  flex: none;
+}
+svg.tri.sm {
+  width: 14px;
+  height: 12px;
+  vertical-align: -2px;
+  margin-right: 5px;
+}
+svg.tri path,
+svg.tri line {
+  stroke: currentColor;
+}
+svg.tri circle {
+  fill: currentColor;
+}
+
+/* ------------------------------------------------------------- status bar */
+
+.statusbar {
+  grid-area: status;
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 7px 16px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.1em;
+  color: var(--ice-dim);
+  background: linear-gradient(180deg, rgba(8, 16, 26, 0.85), rgba(6, 12, 20, 0.62));
+  border: 1px solid var(--stroke);
+  border-left: 3px solid var(--cyan);
+  box-shadow: 0 0 18px rgba(26, 214, 255, 0.07);
+}
+
+.status-ident {
+  color: var(--cyan-bright);
+  font-weight: 700;
+  letter-spacing: 0.24em;
+  text-shadow: 0 0 10px rgba(26, 214, 255, 0.5);
+  white-space: nowrap;
+}
+
+.ident-sub {
+  color: var(--ice-dim);
+  margin-left: 10px;
+  font-weight: 400;
+  letter-spacing: 0.18em;
+  text-shadow: none;
+}
+
+.statusbar .grow {
+  flex: 1;
+}
+
+.dot {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  margin-right: 6px;
+  vertical-align: 1px;
+  background: var(--ice-dim);
+  box-shadow: 0 0 6px currentColor;
+  transition: background 0.4s ease, color 0.4s ease, box-shadow 0.4s ease;
+}
+
+.dot.ok { background: var(--cyan-bright); color: var(--cyan-bright); }
+.dot.good { background: var(--learn-green); color: var(--learn-green); }
+.dot.warn { background: var(--warn-amber); color: var(--warn-amber); }
+.dot.bad { background: var(--alert-red); color: var(--alert-red); }
+.dot.off { background: #3a4a55; color: #3a4a55; box-shadow: none; }
+
+.status-item {
+  white-space: nowrap;
+  transition: color 0.4s ease;
+}
+
+.status-item.warned {
+  color: var(--warn-amber);
+  display: inline-flex;
+  align-items: center;
+}
+
+.status-item.cloud-chip {
+  color: var(--cloud-violet);
+}
+
+/* Active-agent chip — colored by the agent's identity hue (set inline via
+   --agent-hue). Transition keeps the color change a fade as the active agent
+   cycles during a roll call. */
+.status-item.agent-chip {
+  --agent-hue: 190;
+  color: hsl(var(--agent-hue) 95% 72%);
+  text-shadow: 0 0 8px hsl(var(--agent-hue) 95% 60% / 0.5);
+  letter-spacing: 0.12em;
+  transition: color 0.4s ease, text-shadow 0.4s ease;
+}
+
+.status-item.state-word {
+  color: var(--ice);
+  letter-spacing: 0.22em;
+}
+
+/* Voice-id chip — on-device speaker-match verdict. Tone follows the same
+   vocabulary as the credential pills (good=verified, bad=unrecognized,
+   warn=enrolling, idle=off/not-enrolled/resting). HONEST: it is a similarity
+   indicator, never a security badge. */
+.status-item.voiceid-chip {
+  display: inline-flex;
+  align-items: center;
+  letter-spacing: 0.06em;
+}
+.status-item.voiceid-chip.good { color: var(--learn-green); }
+.status-item.voiceid-chip.bad { color: var(--alert-red); }
+.status-item.voiceid-chip.warn { color: var(--warn-amber); }
+.status-item.voiceid-chip.idle { color: var(--ice-dim); }
+/* Idle dot for the resting/off voice-id state — same muted slate as .dot.off. */
+.dot.idle { background: #3a4a55; color: #3a4a55; box-shadow: none; }
+
+/* The AT-REST ENCRYPTION chip — ENCRYPTED AT REST (the key actually resolved) in
+   the affirmative green, NOT ENCRYPTED in the muted idle tone (the honest
+   shipped-OFF default, deliberately not an alarm colour). Mirrors voiceid-chip. */
+.status-item.encryption-chip {
+  display: inline-flex;
+  align-items: center;
+  letter-spacing: 0.06em;
+}
+.status-item.encryption-chip.on { color: var(--learn-green); }
+.status-item.encryption-chip.idle { color: var(--ice-dim); }
+/* The "on" dot reuses the affirmative green defined by .dot.good above. */
+.dot.on { background: var(--learn-green); color: var(--learn-green); }
+
+/* Model-tier chip — which model answers (LOCAL/FAST/HEAVY) + MANUAL/AUTO mode.
+   Tone follows the credential/voice-id vocabulary: good=HEAVY (most capable cloud),
+   warn=FAST/AWAITING, ok=cyan (FAST alt), bad=FALLBACK (a cloud degrade worth
+   noticing), idle=LOCAL/awaiting (on-device/dim — NOT a quality verdict, just a
+   muted on-device look). HONEST: it reflects which model answers, never a safety
+   badge — LOCAL is private but capability-limited, not Opus-grade. */
+.status-item.modeltier-chip {
+  display: inline-flex;
+  align-items: center;
+  letter-spacing: 0.06em;
+}
+.status-item.modeltier-chip.good { color: var(--learn-green); }
+.status-item.modeltier-chip.bad { color: var(--alert-red); }
+.status-item.modeltier-chip.warn { color: var(--warn-amber); }
+.status-item.modeltier-chip.ok { color: var(--cyan-bright); }
+.status-item.modeltier-chip.idle { color: var(--ice-dim); }
+/* The "ok" tone reuses the existing cyan .dot.ok defined above. */
+
+/* Resident-models chip (task #17, item 3) — the Local tier's resident-models PLAN:
+   good=SINGLE (one local model kept warm: the safe single-resident low-RAM
+   default), warn=MULTI (>1 local model kept warm for an INSTANT swap WHEN RAM
+   allows — an extra capability that costs ~2x RAM, worth noticing), idle=awaiting.
+   HONEST: it reports the PLANNED warm-set, NOT a measured speed benefit (the swap
+   benefit is device/RAM-dependent); it changes no safety gate and no tier choice.
+   Mirrors the modeltier-chip. */
+.status-item.residentmodels-chip {
+  display: inline-flex;
+  align-items: center;
+  letter-spacing: 0.06em;
+}
+.status-item.residentmodels-chip.good { color: var(--learn-green); }
+.status-item.residentmodels-chip.warn { color: var(--warn-amber); }
+.status-item.residentmodels-chip.idle { color: var(--ice-dim); }
+
+/* Offline-agency chip (task #3) — ACTING OFFLINE (the on-device path is using SAFE
+   LOCAL tools while offline): cyan "ok" tone when running clean, amber "warn" when
+   a safety gate fired or the 4B reached outside the safe subset (a GATED/REFUSED
+   flag worth noticing — the proof the gates apply offline). Renders only while
+   engaged; the resting "chatting" state adds no chip. Mirrors the modeltier-chip. */
+.status-item.localtools-chip {
+  display: inline-flex;
+  align-items: center;
+  letter-spacing: 0.06em;
+}
+.status-item.localtools-chip.ok { color: var(--cyan-bright); }
+.status-item.localtools-chip.warn { color: var(--warn-amber); }
+.status-item.localtools-chip.idle { color: var(--ice-dim); }
+
+/* Voice (TTS) tier chip — CLOUD VOICE (amber accent: text leaves the device) vs
+   ON-DEVICE (calm green default) vs AWAITING (dim). Mirrors the modeltier-chip. */
+.status-item.voicetier-chip {
+  display: inline-flex;
+  align-items: center;
+  letter-spacing: 0.06em;
+}
+.status-item.voicetier-chip.good { color: var(--learn-green); }
+.status-item.voicetier-chip.warn { color: var(--warn-amber); }
+.status-item.voicetier-chip.idle { color: var(--ice-dim); }
+
+/* STT tier chip — CLOUD STT (amber accent: the user's VOICE AUDIO leaves the
+   device, more sensitive than TTS text) vs ON-DEVICE STT (calm green whisper
+   default + fallback) vs AWAITING (dim). Mirrors the voicetier-chip. */
+.status-item.stttier-chip {
+  display: inline-flex;
+  align-items: center;
+  letter-spacing: 0.06em;
+}
+.status-item.stttier-chip.good { color: var(--learn-green); }
+.status-item.stttier-chip.warn { color: var(--warn-amber); }
+.status-item.stttier-chip.idle { color: var(--ice-dim); }
+/* Settings model-tier control buttons row. */
+.modeltier-controls {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.cred-pill.ok { color: var(--cyan-bright); }
+
+.icon-btn {
+  background: transparent;
+  border: 1px solid var(--stroke);
+  color: var(--ice-dim);
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 4px 10px;
+  cursor: pointer;
+  clip-path: polygon(5px 0, 100% 0, 100% calc(100% - 5px), calc(100% - 5px) 100%, 0 100%, 0 5px);
+  transition: all 160ms cubic-bezier(0.33, 1, 0.68, 1);
+}
+
+.icon-btn:hover {
+  color: var(--cyan-bright);
+  border-color: var(--cyan-bright);
+  background: rgba(26, 214, 255, 0.08);
+}
+
+.icon-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* ------------------------------------------------------------- overlays */
+
+/* Always mounted; class-toggled fade. The show transition is DELAYED so a
+   sub-500ms reconnect flap never flashes the overlay at all. */
+.link-offline {
+  position: absolute;
+  top: 46%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 6;
+  text-align: center;
+  font-family: var(--mono);
+  letter-spacing: 0.35em;
+  color: var(--ice-dim);
+  opacity: 0;
+  transition: opacity 0.6s ease;
+  pointer-events: none;
+}
+
+.link-offline.visible {
+  opacity: 0.9;
+  transition-delay: 0.5s;
+}
+
+.link-offline .pulse {
+  animation: offlinePulse 2.4s ease-in-out infinite;
+}
+
+.link-offline .big {
+  font-size: 20px;
+  margin-bottom: 6px;
+}
+
+.link-offline .small {
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: #51707f;
+}
+
+@keyframes offlinePulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+.banner {
+  position: absolute;
+  top: 88px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 7;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.22em;
+  color: var(--alert-red);
+  border: 1px solid rgba(255, 59, 78, 0.55);
+  background: rgba(24, 5, 9, 0.78);
+  padding: 6px 14px;
+  opacity: 0;
+  transition: opacity 0.45s ease;
+  pointer-events: none;
+}
+
+.banner.visible {
+  opacity: 1;
+  transition-delay: 0.25s;
+}
+
+.banner .pulse {
+  display: inline-block;
+  animation: offlinePulse 2s ease-in-out infinite;
+}
+
+/* ------------------------------------------------------------- alert panel */
+
+.alert-panel {
+  position: absolute;
+  top: 132px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 8;
+  display: flex;
+  gap: 12px;
+  align-items: flex-start;
+  max-width: 580px;
+  padding: 11px 14px;
+  font-family: var(--mono);
+  color: var(--cyan-bright);
+  background: rgba(6, 12, 20, 0.92);
+  border: 1px solid var(--stroke);
+  border-left: 3px solid var(--alert-red);
+  box-shadow: 0 0 18px rgba(26, 214, 255, 0.1);
+  animation: alertIn 240ms cubic-bezier(0.33, 1, 0.68, 1);
+}
+
+.alert-panel .tri {
+  color: var(--alert-red);
+  margin-top: 2px;
+}
+
+.alert-panel.red {
+  color: var(--alert-red);
+  border-color: rgba(255, 59, 78, 0.6);
+  box-shadow: 0 0 18px rgba(255, 59, 78, 0.16);
+}
+
+@keyframes alertIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -8px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+
+.alert-body {
+  min-width: 0;
+}
+
+.alert-title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.18em;
+}
+
+.alert-detail {
+  font-size: 10.5px;
+  color: var(--ice-dim);
+  margin-top: 3px;
+  line-height: 1.5;
+  word-break: break-word;
+}
+
+.alert-ack {
+  background: transparent;
+  border: 1px solid currentColor;
+  color: inherit;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 4px 9px;
+  cursor: pointer;
+  flex: none;
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+  transition: background 160ms ease;
+}
+
+.alert-ack:hover {
+  background: rgba(26, 214, 255, 0.12);
+}
+
+.alert-panel.red .alert-ack:hover {
+  background: rgba(255, 59, 78, 0.14);
+}
+
+/* ------------------------------------------------ self-heal proposal panel */
+/* SELF-REPAIR // PROPOSALS. A pending/validated proposal (and the in-flight
+ * diagnosis) is an ATTENTION state, not an error: it leans on --warn-amber.
+ * --alert-red is NOT used anywhere in this panel — that colour is reserved
+ * for the rejected/blocked banner (.alert-panel.red). Display-and-guide only:
+ * the apply command is surfaced as read-only text, never a one-click action. */
+
+/* Centered modal (was docked top-right, where it collided with the
+ * constellation roster + diagnostics, then center, where it hit Global-Scan —
+ * the layout is too dense for an inline card). A pending self-repair proposal
+ * is a gated decision that warrants focus, so it presents as a modal over a
+ * light scrim: no panel collision, clearly an attention layer, dismissible.
+ * Self-heal ships OFF by default, so this surface is rare. */
+/* SELF-FORGE // PROPOSALS shares the exact same review-modal posture: a
+ * validated, sandboxed micro-app proposed for HUMAN REVIEW is an attention
+ * state (warn-amber), display-and-guide ONLY — the apply command is read-only
+ * text, never a one-click action. Forge ships OFF by default, so this surface
+ * is rare. Both panels reuse the .sh-* card internals + .frame.self-heal.attn
+ * chrome below; only the wrapper selector differs. */
+.self-heal-panel,
+.forge-panel {
+  position: fixed;
+  inset: 0;
+  z-index: 16;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none; /* only the scrim + card are interactive */
+}
+
+/* Light scrim: dims the HUD so the card reads as "on top" without fully
+ * hiding the rest. */
+.self-heal-panel::before,
+.forge-panel::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(ellipse at center, rgba(2, 5, 10, 0.42), rgba(2, 5, 10, 0.7));
+  pointer-events: auto;
+}
+
+/* The card itself (Frame renders .frame.self-heal.attn). */
+.self-heal-panel > .frame,
+.forge-panel > .frame {
+  position: relative;
+  width: 460px;
+  max-width: calc(100vw - 44px);
+  max-height: calc(100vh - 120px);
+  overflow: auto;
+  pointer-events: auto;
+  font-family: var(--mono);
+  animation: alertIn 240ms cubic-bezier(0.33, 1, 0.68, 1);
+  filter: drop-shadow(0 14px 54px rgba(0, 0, 0, 0.7));
+}
+
+/* Opaque surface so nothing bleeds through the card. */
+.self-heal-panel .frame-inner,
+.forge-panel .frame-inner {
+  background: #060d16;
+}
+
+/* Amber-tinted variant of the shared Frame chrome (the attention state). */
+.frame.self-heal.attn .frame-clip {
+  background: linear-gradient(180deg, rgba(255, 180, 84, 0.05), rgba(6, 12, 20, 0));
+}
+.frame.self-heal.attn .frame-title {
+  color: var(--warn-amber);
+}
+
+.sh-body {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  padding: 4px 2px 2px;
+}
+
+.sh-state-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.sh-state-label {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--warn-amber);
+}
+
+/* CSS-only spinner for the DIAGNOSING state — a single bounded rotation, not a
+ * React-driven loop, so it costs nothing on the render path. */
+.sh-spinner {
+  width: 11px;
+  height: 11px;
+  flex: none;
+  border: 1.5px solid rgba(255, 180, 84, 0.28);
+  border-top-color: var(--warn-amber);
+  border-radius: 50%;
+  animation: shSpin 900ms linear infinite;
+}
+
+@keyframes shSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.sh-row {
+  display: flex;
+  gap: 9px;
+  align-items: baseline;
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.sh-k {
+  flex: none;
+  width: 78px;
+  color: var(--cyan-dim);
+  letter-spacing: 0.12em;
+}
+
+.sh-v {
+  min-width: 0;
+  color: var(--ice);
+  word-break: break-word;
+}
+
+.sh-sig {
+  color: var(--cyan-bright);
+}
+
+.sh-pass {
+  color: var(--learn-green);
+  letter-spacing: 0.04em;
+}
+
+.sh-note {
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+
+.dim-note {
+  color: var(--ice-dim);
+}
+
+/* segmented confidence gauge */
+.sh-conf {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  margin-top: 2px;
+}
+
+.sh-conf-label {
+  flex: none;
+  width: 78px;
+  font-size: 10.5px;
+  color: var(--cyan-dim);
+  letter-spacing: 0.12em;
+}
+
+.sh-conf-gauge {
+  display: flex;
+  gap: 2px;
+  flex: 1;
+}
+
+.sh-conf-gauge i {
+  flex: 1;
+  height: 9px;
+  background: rgba(26, 214, 255, 0.1);
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  clip-path: polygon(2px 0, 100% 0, 100% calc(100% - 2px), calc(100% - 2px) 100%, 0 100%, 0 2px);
+}
+
+.sh-conf-gauge i.on {
+  background: var(--warn-amber);
+  border-color: var(--warn-amber);
+  box-shadow: 0 0 6px rgba(255, 180, 84, 0.4);
+}
+
+.sh-conf-pct {
+  flex: none;
+  font-size: 10.5px;
+  color: var(--warn-amber);
+  min-width: 30px;
+  text-align: right;
+}
+
+.sh-conf-na {
+  font-size: 10px;
+}
+
+/* gated review block */
+.sh-review {
+  margin-top: 4px;
+  padding: 8px 9px;
+  background: rgba(255, 180, 84, 0.06);
+  border: 1px solid rgba(255, 180, 84, 0.28);
+  border-left: 3px solid var(--warn-amber);
+}
+
+.sh-review-label {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--warn-amber);
+}
+
+.sh-review-text {
+  font-size: 9.5px;
+  line-height: 1.55;
+  color: var(--ice-dim);
+  margin-top: 4px;
+}
+
+.sh-cmd {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 7px;
+  padding: 5px 8px;
+  background: rgba(6, 12, 20, 0.7);
+  border: 1px dashed rgba(255, 180, 84, 0.4);
+  font-size: 11px;
+  user-select: text; /* the one selectable element — the human copies it */
+}
+
+.sh-cmd-prompt {
+  color: var(--warn-amber);
+  font-weight: 700;
+}
+
+.sh-cmd code {
+  font-family: var(--mono);
+  color: var(--cyan-bright);
+  word-break: break-all;
+}
+
+.sh-foot {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 7px;
+}
+
+.sh-foot-hint {
+  font-size: 9px;
+  line-height: 1.45;
+}
+
+.sh-ack {
+  flex: none;
+  background: transparent;
+  border: 1px solid var(--warn-amber);
+  color: var(--warn-amber);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.14em;
+  padding: 4px 9px;
+  cursor: pointer;
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+  transition: background 160ms ease;
+}
+
+.sh-ack:hover:not(:disabled) {
+  background: rgba(255, 180, 84, 0.14);
+}
+
+.sh-ack:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Scrollable diff for human review — the actual staged code change. Monospace,
+ * capped height so the modal never grows past the viewport (the card already
+ * scrolls, but a tall diff should scroll WITHIN its own pane). */
+.sh-diff {
+  margin: 7px 0 0;
+  max-height: 230px;
+  overflow: auto;
+  padding: 7px 8px;
+  background: rgba(2, 6, 12, 0.72);
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.5;
+  color: var(--ice);
+  white-space: pre;
+  user-select: text;
+  tab-size: 4;
+}
+
+.sh-diff:focus-visible {
+  outline: 1px solid var(--cyan-bright);
+  outline-offset: -1px;
+}
+
+.sh-report-head {
+  font-size: 9.5px;
+  line-height: 1.5;
+  margin-top: 5px;
+}
+
+/* Mandatory safety copy beneath the command line. */
+.sh-safety {
+  font-size: 9.5px;
+  line-height: 1.55;
+  margin-top: 6px;
+  padding-left: 8px;
+  border-left: 2px solid rgba(255, 180, 84, 0.4);
+}
+
+/* Apply lifecycle status — spinner+stage while applying; learn-green on
+ * success; alert-red on failure (the one red affordance on this surface, for
+ * a real failure of a live-mutation attempt). */
+.sh-apply-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 7px;
+  padding: 6px 9px;
+  font-size: 10px;
+  line-height: 1.45;
+  font-family: var(--mono);
+  letter-spacing: 0.04em;
+}
+
+.sh-apply-status.applying {
+  color: var(--warn-amber);
+  background: rgba(255, 180, 84, 0.07);
+  border: 1px solid rgba(255, 180, 84, 0.24);
+}
+
+.sh-apply-status.applied {
+  color: var(--learn-green);
+  background: rgba(92, 224, 168, 0.08);
+  border: 1px solid rgba(92, 224, 168, 0.32);
+}
+
+.sh-apply-status.failed {
+  color: var(--alert-red);
+  background: rgba(255, 59, 78, 0.08);
+  border: 1px solid rgba(255, 59, 78, 0.34);
+}
+
+.sh-actions {
+  display: flex;
+  gap: 8px;
+  flex: none;
+  align-items: center;
+}
+
+/* The Accept / Confirm button. Amber by default; the CONFIRM step is a visually
+ * stronger (filled) amber so the two-step gate is unmistakable. */
+.sh-apply {
+  background: rgba(255, 180, 84, 0.12);
+  border: 1px solid var(--warn-amber);
+  color: var(--warn-amber);
+  font-family: var(--mono);
+  font-size: 9.5px;
+  font-weight: 700;
+  letter-spacing: 0.14em;
+  padding: 4px 11px;
+  cursor: pointer;
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+  transition: background 160ms ease, box-shadow 160ms ease;
+}
+
+.sh-apply:hover:not(:disabled) {
+  background: rgba(255, 180, 84, 0.22);
+}
+
+/* Armed confirm state: filled amber, glowing — clearly a different, stronger
+ * affordance than the first click. */
+.sh-apply.confirm {
+  background: var(--warn-amber);
+  color: #1a0f00;
+  border-color: var(--warn-amber);
+  box-shadow: 0 0 12px rgba(255, 180, 84, 0.55);
+  animation: shConfirmPulse 1100ms ease-in-out infinite;
+}
+
+.sh-apply.confirm:hover:not(:disabled) {
+  background: #ffc878;
+}
+
+@keyframes shConfirmPulse {
+  0%,
+  100% {
+    box-shadow: 0 0 10px rgba(255, 180, 84, 0.4);
+  }
+  50% {
+    box-shadow: 0 0 16px rgba(255, 180, 84, 0.7);
+  }
+}
+
+.sh-apply:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+  animation: none;
+  box-shadow: none;
+}
+
+/* ------------------------------------------------------------- reticle dial */
+
+.reticle {
+  position: relative;
+  width: 172px;
+  flex: none;
+  align-self: flex-start;
+  font-family: var(--mono);
+  filter: drop-shadow(0 0 8px rgba(26, 214, 255, 0.12));
+}
+
+.reticle-svg {
+  width: 172px;
+  height: 172px;
+  display: block;
+}
+
+.rt-ring { fill: none; stroke: var(--stroke); stroke-width: 1; }
+.rt-ring.faint { stroke: rgba(26, 214, 255, 0.16); }
+.rt-ring.dashed { stroke: rgba(26, 214, 255, 0.34); stroke-dasharray: 3 5; }
+
+.rt-tick { stroke: rgba(26, 214, 255, 0.32); stroke-width: 1; }
+.rt-tick.major { stroke: rgba(26, 214, 255, 0.68); stroke-width: 1.5; }
+
+.rt-cross { stroke: rgba(125, 243, 255, 0.55); stroke-width: 1; }
+
+.rt-sweep {
+  transform-origin: 80px 80px;
+  animation: dialSpin 9s linear infinite;
+}
+.rt-sweep line,
+.rt-sweep path {
+  stroke: rgba(26, 214, 255, 0.3);
+  stroke-width: 1.4;
+}
+
+@keyframes dialSpin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.rt-needle {
+  transform-origin: 80px 80px;
+  transition: transform 0.7s cubic-bezier(0.33, 1, 0.68, 1);
+}
+.rt-needle line {
+  stroke: var(--cyan-bright);
+  stroke-width: 2;
+  transition: stroke 0.4s ease;
+}
+.rt-needle circle {
+  fill: var(--cyan-bright);
+  transition: fill 0.4s ease;
+}
+.rt-needle.hot line { stroke: var(--warn-amber); }
+.rt-needle.hot circle { fill: var(--warn-amber); }
+
+.reticle-readout {
+  position: absolute;
+  top: 86px;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  text-align: center;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.reticle-readout .pct {
+  font-size: 16px;
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+}
+
+.reticle-readout .lbl {
+  font-size: 8px;
+  letter-spacing: 0.3em;
+  color: var(--ice-dim);
+}
+
+.reticle-readout .state {
+  font-size: 8px;
+  letter-spacing: 0.2em;
+  color: var(--cyan-bright);
+  margin-top: 2px;
+  transition: color 0.4s ease;
+}
+
+.reticle.offline .reticle-readout .state {
+  color: var(--ice-dim);
+}
+
+/* ------------------------------------------------------------- transcript */
+
+.transcript {
+  flex: 1;
+  min-height: 0;
+}
+
+.transcript-scroll {
+  flex: 1;
+  overflow-y: auto;
+  padding: 8px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(26, 214, 255, 0.35) transparent;
+}
+
+.line {
+  font-size: 13px;
+  line-height: 1.45;
+  animation: lineIn 200ms cubic-bezier(0.33, 1, 0.68, 1);
+}
+
+@keyframes lineIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.line .who {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  display: block;
+  margin-bottom: 2px;
+}
+
+.line.user .who { color: var(--ice-dim); }
+.line.jarvis .who { color: var(--cyan); }
+.line.jarvis.cloud .who { color: var(--cloud-violet); }
+
+.line .text {
+  color: var(--ice);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.line.user .text {
+  color: var(--ice-dim);
+}
+
+.dim-note {
+  color: #51707f;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.intent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 2px 12px 10px;
+  padding: 3px 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--ice-dim);
+  border: 1px dashed rgba(26, 214, 255, 0.3);
+  width: fit-content;
+}
+
+.intent-chip .conf {
+  width: 48px;
+  height: 3px;
+  background: rgba(143, 180, 196, 0.25);
+  overflow: hidden;
+}
+
+.intent-chip .conf > i {
+  display: block;
+  height: 100%;
+  background: var(--cyan);
+  transition: width 400ms ease, background 400ms ease;
+}
+
+.intent-chip.low .conf > i {
+  background: var(--warn-amber);
+}
+
+/* ------------------------------------------------------------- global-scan */
+
+.global-scan {
+  min-height: 0;
+}
+
+/* Offline placeholder: dimmed, never red (red is alerts-only). */
+.global-scan.offline {
+  opacity: 0.62;
+  filter: drop-shadow(0 0 7px rgba(26, 214, 255, 0.08));
+  transition: opacity 0.5s ease;
+}
+
+.gs-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 18px 12px 22px;
+  font-family: var(--mono);
+  text-align: center;
+}
+
+.gs-ph-big {
+  font-size: 12px;
+  letter-spacing: 0.26em;
+  color: var(--ice-dim);
+}
+
+.gs-ph-small {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: #51707f;
+}
+
+.gs-brief {
+  margin: 8px 10px 4px;
+  padding: 7px 9px;
+  border: 1px dashed rgba(26, 214, 255, 0.28);
+  font-size: 11px;
+  line-height: 1.5;
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+
+.gs-brief-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.2em;
+  color: var(--cyan-dim);
+  flex: none;
+}
+
+.gs-brief-text {
+  color: var(--ice);
+  word-break: break-word;
+}
+
+.gs-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(26, 214, 255, 0.35) transparent;
+}
+
+.gs-empty {
+  padding: 6px 2px;
+}
+
+.gs-item {
+  padding-left: 8px;
+  border-left: 2px solid rgba(26, 214, 255, 0.32);
+  animation: lineIn 200ms cubic-bezier(0.33, 1, 0.68, 1);
+  transition: border-color 0.4s ease;
+}
+
+/* Breaking/alert items: the ONLY place this panel uses --alert-red. */
+.gs-item.alert {
+  border-left-color: var(--alert-red);
+}
+
+.gs-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 3px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: var(--ice-dim);
+}
+
+.gs-chip {
+  padding: 1px 6px;
+  border: 1px solid rgba(26, 214, 255, 0.4);
+  color: var(--cyan-bright);
+  letter-spacing: 0.14em;
+  clip-path: polygon(3px 0, 100% 0, 100% calc(100% - 3px), calc(100% - 3px) 100%, 0 100%, 0 3px);
+}
+
+.gs-chip.alert {
+  color: var(--alert-red);
+  border-color: rgba(255, 59, 78, 0.6);
+}
+
+.gs-source {
+  color: var(--cyan-dim);
+  text-transform: uppercase;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.gs-time {
+  margin-left: auto;
+  flex: none;
+  color: #51707f;
+  font-variant-numeric: tabular-nums;
+}
+
+.gs-headline {
+  font-size: 12.5px;
+  line-height: 1.4;
+  color: var(--ice);
+  word-break: break-word;
+}
+
+.gs-item.alert .gs-headline {
+  color: #ffd7dc;
+}
+
+.gs-summary {
+  margin-top: 2px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--ice-dim);
+  word-break: break-word;
+}
+
+/* --------------------------------------------------------- silicon-canvas
+ * GPU schematic renderer telemetry. The board itself composites on-device as
+ * a fullscreen Metal IOSurface (SPEC §UI); this panel is the HUD-side readout
+ * of canvas.render_ms / canvas.viewport / canvas.selection. RED (--alert-red)
+ * appears ONLY on ERC error findings — every other accent is cyan/amber.
+ */
+.silicon-canvas {
+  min-height: 0;
+}
+
+.silicon-canvas.offline {
+  opacity: 0.62;
+  filter: drop-shadow(0 0 7px rgba(26, 214, 255, 0.08));
+  transition: opacity 0.5s ease;
+}
+
+.sc-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 18px 12px 22px;
+  font-family: var(--mono);
+  text-align: center;
+}
+
+.sc-ph-big {
+  font-size: 12px;
+  letter-spacing: 0.26em;
+  color: var(--ice-dim);
+}
+
+.sc-ph-small {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: #51707f;
+}
+
+.sc-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px 12px;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(26, 214, 255, 0.35) transparent;
+}
+
+/* On-device composite affordance: an honest "render is live on the GPU"
+   marker — NOT a faked board. */
+.sc-surface {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 1px dashed rgba(26, 214, 255, 0.28);
+  font-family: var(--mono);
+}
+
+.sc-surface-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: var(--cyan);
+  box-shadow: 0 0 6px var(--cyan);
+  animation: scPulse 2.2s ease-in-out infinite;
+}
+
+@keyframes scPulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.sc-surface-text {
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  color: var(--cyan-bright);
+}
+
+.sc-surface-sub {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: #51707f;
+  white-space: nowrap;
+}
+
+/* canvas.render_ms — segmented stats strip. */
+.sc-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 5px;
+}
+
+.sc-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 5px 2px;
+  border: 1px solid var(--stroke);
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+}
+
+.sc-stat-label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.16em;
+  color: var(--cyan-dim);
+}
+
+.sc-stat-val {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+}
+
+/* canvas.viewport — minimap affordance + camera readout. */
+.sc-viewport {
+  display: flex;
+  gap: 9px;
+  align-items: stretch;
+}
+
+.sc-mini {
+  position: relative;
+  flex: none;
+  width: 56px;
+  height: 42px;
+  border: 1px solid var(--stroke);
+  background:
+    repeating-linear-gradient(0deg, transparent 0 7px, rgba(26, 214, 255, 0.08) 7px 8px),
+    repeating-linear-gradient(90deg, transparent 0 7px, rgba(26, 214, 255, 0.08) 7px 8px);
+}
+
+.sc-mini-frame {
+  position: absolute;
+  left: 30%;
+  top: 28%;
+  width: 38%;
+  height: 40%;
+  border: 1px solid var(--cyan-bright);
+  box-shadow: 0 0 5px rgba(125, 243, 255, 0.4);
+}
+
+.sc-vp-readout {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.sc-vp-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.sc-vp-label {
+  font-size: 8px;
+  letter-spacing: 0.16em;
+  color: var(--cyan-dim);
+  flex: none;
+  width: 34px;
+}
+
+.sc-vp-val {
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sc-layers {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px;
+  margin-top: 2px;
+}
+
+.sc-layer {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  padding: 1px 4px;
+  border: 1px solid rgba(26, 214, 255, 0.32);
+  color: var(--cyan-dim);
+}
+
+.sc-layer.off {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+
+/* canvas.selection — selected net / component summary. */
+.sc-net {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  border-left: 2px solid var(--cyan);
+  font-family: var(--mono);
+}
+
+.sc-net-label {
+  font-size: 8px;
+  letter-spacing: 0.16em;
+  color: var(--cyan-dim);
+  flex: none;
+}
+
+.sc-net-name {
+  font-size: 12px;
+  color: var(--cyan-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sc-net-counts {
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--ice-dim);
+  flex: none;
+  font-variant-numeric: tabular-nums;
+}
+
+/* canvas.selection.trace — net-walk progress affordance (SPEC §4). The board's
+   via-flash is on-device; this is the telemetry readout of the trace front. */
+.sc-trace {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 5px 8px;
+  border-left: 2px solid var(--cyan-bright);
+  font-family: var(--mono);
+}
+
+.sc-trace.cross-layer {
+  border-left-color: var(--warn-amber);
+  animation: scTraceFlash 1.1s ease-in-out infinite;
+}
+
+@keyframes scTraceFlash {
+  0%, 100% { box-shadow: inset 2px 0 0 -1px rgba(255, 180, 84, 0); }
+  50% { box-shadow: inset 3px 0 8px -2px rgba(255, 180, 84, 0.55); }
+}
+
+.sc-trace-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.sc-trace-label {
+  font-size: 8px;
+  letter-spacing: 0.18em;
+  color: var(--cyan-dim);
+  flex: none;
+}
+
+.sc-trace-step {
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--cyan-bright);
+  font-variant-numeric: tabular-nums;
+}
+
+.sc-trace-xlayer {
+  margin-left: auto;
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  padding: 1px 4px;
+  color: #1a120a;
+  background: var(--warn-amber);
+}
+
+.sc-trace-end {
+  margin-left: auto;
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  color: var(--ice-dim);
+}
+
+.sc-trace.cross-layer .sc-trace-end {
+  margin-left: 6px;
+}
+
+.sc-trace-front {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.sc-trace-at {
+  font-size: 11px;
+  color: var(--ice);
+}
+
+.sc-trace-dist {
+  margin-left: auto;
+  font-size: 9px;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ERC findings — amber warning / red error badges (SPEC §5). */
+.sc-erc {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  border: 1px solid var(--stroke);
+  padding: 6px 8px;
+}
+
+.sc-erc-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+}
+
+.sc-erc-title {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: var(--cyan-dim);
+}
+
+.sc-erc-clean {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: var(--learn-green);
+}
+
+.sc-erc-count {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: var(--ice-dim);
+}
+
+.sc-erc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sc-erc-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  padding-left: 6px;
+  border-left: 2px solid var(--warn-amber);
+}
+
+.sc-erc-row.error {
+  border-left-color: var(--alert-red);
+}
+
+.sc-erc-badge {
+  flex: none;
+  font-size: 8px;
+  letter-spacing: 0.1em;
+  padding: 1px 4px;
+  border: 1px solid var(--warn-amber);
+  color: var(--warn-amber);
+}
+
+.sc-erc-badge.error {
+  border-color: rgba(255, 59, 78, 0.65);
+  color: var(--alert-red);
+}
+
+.sc-erc-code {
+  flex: none;
+  color: var(--ice);
+}
+
+.sc-erc-msg {
+  color: var(--ice-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ----------------------------------------------------------------- vision
+ * On-device computer-vision telemetry (apps/vision). The camera/screen capture
+ * + Apple Vision/Core ML INFERENCE run ON-DEVICE behind a macOS TCC consent
+ * gate (NOT grantable by SBPL); this panel is the HUD-side readout of
+ * vision.detections / vision.status / vision.motion / vision.perf /
+ * vision.error. It shows COUNTS / boxes / labels / timing — never pixels,
+ * never identity. The accent is the Vision agent's violet hue (--vision-hue,
+ * 265); RED (--alert-red) appears ONLY on the vision.error row.
+ */
+.vision {
+  min-height: 0;
+}
+
+.vision.offline {
+  opacity: 0.62;
+  filter: drop-shadow(0 0 7px hsl(var(--vision-hue, 265) 90% 60% / 0.08));
+  transition: opacity 0.5s ease;
+}
+
+.vi-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 18px 12px 22px;
+  font-family: var(--mono);
+  text-align: center;
+}
+
+.vi-ph-big {
+  font-size: 12px;
+  letter-spacing: 0.26em;
+  color: hsl(var(--vision-hue, 265) 70% 78%);
+}
+
+.vi-ph-small {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: #51707f;
+}
+
+.vi-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px 12px;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--vision-hue, 265) 80% 60% / 0.35) transparent;
+}
+
+/* On-device honesty banner — capture + inference are live on the device behind
+   the TCC gate. NOT a video preview; nothing leaves the device. */
+.vi-surface {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 1px dashed hsl(var(--vision-hue, 265) 80% 65% / 0.32);
+  font-family: var(--mono);
+}
+
+.vi-surface-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: hsl(var(--vision-hue, 265) 90% 68%);
+  box-shadow: 0 0 6px hsl(var(--vision-hue, 265) 90% 60%);
+  animation: viPulse 2.2s ease-in-out infinite;
+}
+
+@keyframes viPulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.vi-surface-text {
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  color: hsl(var(--vision-hue, 265) 90% 80%);
+}
+
+.vi-surface-sub {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: #51707f;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------------------ *
+ * IMAGE // ON-DEVICE DIFFUSION panel (task #18). The HUD-side readout of the   *
+ * image.generated event (channel "local"). Mirrors the vision .vi-* layout:    *
+ * a honesty banner + a generated-image card. HONEST: generation is 100%        *
+ * on-device (MLX diffusion); the prompt + image stay on the machine, nothing   *
+ * goes to the cloud; device-gated on a multi-GB model + RAM; OFF/opt-in. The    *
+ * pixels never ride this readout — only WHERE the file landed + metadata. The   *
+ * fallback state reads dim, never red (an unavailable/OFF model is the honest,  *
+ * expected ships-OFF state, NOT an error). Accent hue = the routed agent's.    *
+ * ------------------------------------------------------------------------ */
+.image {
+  min-height: 0;
+}
+
+.image.idle {
+  opacity: 0.62;
+  filter: drop-shadow(0 0 7px hsl(var(--image-hue, 320) 90% 60% / 0.08));
+  transition: opacity 0.5s ease;
+}
+
+.img-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 18px 12px 22px;
+  font-family: var(--mono);
+  text-align: center;
+}
+
+.img-ph-big {
+  font-size: 12px;
+  letter-spacing: 0.26em;
+  color: hsl(var(--image-hue, 320) 70% 78%);
+}
+
+.img-ph-small {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: #51707f;
+}
+
+.img-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px 12px;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--image-hue, 320) 80% 60% / 0.35) transparent;
+}
+
+/* On-device honesty banner — generation runs on the device; nothing leaves it. */
+.img-surface {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 1px dashed hsl(var(--image-hue, 320) 80% 65% / 0.32);
+  font-family: var(--mono);
+}
+
+.img-surface-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: hsl(var(--image-hue, 320) 90% 68%);
+  box-shadow: 0 0 6px hsl(var(--image-hue, 320) 90% 60%);
+  animation: viPulse 2.2s ease-in-out infinite;
+}
+
+.img-surface-text {
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  color: hsl(var(--image-hue, 320) 90% 80%);
+}
+
+.img-surface-sub {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: #51707f;
+  white-space: nowrap;
+}
+
+/* image.generated — the generated-image card. A faint magenta card when an
+   image was saved; the fallback state reads dim, never red. */
+.img-gen {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 8px;
+  border: 1px solid hsl(var(--image-hue, 320) 80% 65% / 0.3);
+  background: hsl(var(--image-hue, 320) 80% 55% / 0.05);
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+}
+
+.img-gen.fallback {
+  border-color: var(--stroke);
+  background: transparent;
+}
+
+.img-gen-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+}
+
+.img-gen-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: hsl(var(--image-hue, 320) 70% 72%);
+}
+
+.img-gen-tag {
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  color: var(--ice-dim);
+  opacity: 0.85;
+}
+
+.img-gen-state {
+  margin-left: auto;
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  padding: 1px 6px;
+  border: 1px solid var(--stroke);
+  color: var(--ice-dim);
+  clip-path: polygon(3px 0, 100% 0, 100% calc(100% - 3px), calc(100% - 3px) 100%, 0 100%, 0 3px);
+}
+
+.img-gen-state.on {
+  color: var(--learn-green);
+  border-color: hsl(var(--learn-green-hue, 145) 70% 50% / 0.5);
+}
+
+.img-gen-saved {
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--ice);
+}
+
+.img-gen-path-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.img-gen-path-label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  color: hsl(var(--image-hue, 320) 70% 72%);
+}
+
+.img-gen-path {
+  font-family: var(--mono);
+  font-size: 9.5px;
+  line-height: 1.4;
+  color: var(--ice);
+  word-break: break-all;
+  padding: 3px 5px;
+  border: 1px solid hsl(var(--image-hue, 320) 80% 65% / 0.22);
+  background: hsl(var(--image-hue, 320) 80% 55% / 0.06);
+}
+
+.img-gen-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.img-gen-chip {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.1em;
+  padding: 1px 6px;
+  border: 1px solid hsl(var(--image-hue, 320) 80% 65% / 0.28);
+  color: hsl(var(--image-hue, 320) 70% 78%);
+  clip-path: polygon(3px 0, 100% 0, 100% calc(100% - 3px), calc(100% - 3px) 100%, 0 100%, 0 3px);
+}
+
+.img-gen-fallback {
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--ice-dim);
+}
+
+.img-gen-note {
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+  opacity: 0.8;
+}
+
+/* vision.error — recoverable error. The ONLY place this panel uses alert-red.
+   tcc_denied is the honest, expected state until consent is granted on-device. */
+.vi-error {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  border-left: 2px solid var(--alert-red);
+  font-family: var(--mono);
+}
+
+.vi-error-badge {
+  flex: none;
+  width: 0;
+  height: 0;
+  align-self: center;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-bottom: 9px solid var(--alert-red);
+}
+
+.vi-error-code {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--alert-red);
+}
+
+.vi-error-msg {
+  font-size: 10px;
+  color: var(--ice-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vi-error-src {
+  margin-left: auto;
+  flex: none;
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  color: var(--ice-dim);
+  text-transform: uppercase;
+}
+
+/* vision.status — watch lifecycle + TCC capability snapshot. */
+.vi-status {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 8px;
+  border: 1px solid var(--stroke);
+  font-family: var(--mono);
+}
+
+.vi-status-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.vi-state {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  padding: 1px 6px;
+  border: 1px solid hsl(var(--vision-hue, 265) 80% 65% / 0.5);
+  color: hsl(var(--vision-hue, 265) 90% 80%);
+  clip-path: polygon(3px 0, 100% 0, 100% calc(100% - 3px), calc(100% - 3px) 100%, 0 100%, 0 3px);
+}
+
+/* Watching pulses; idle/stopped sit dim. */
+.vi-state.watching,
+.vi-state.analyzing {
+  animation: viPulse 2s ease-in-out infinite;
+}
+
+.vi-state.stopped,
+.vi-state.idle {
+  opacity: 0.7;
+}
+
+.vi-status-src {
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--cyan-dim);
+}
+
+.vi-status-sens {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* TCC chips read HONESTLY: a not-granted / unknown chip is dim, never faked. */
+.vi-tcc {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+
+.vi-tcc-chip {
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  padding: 1px 5px;
+  border: 1px solid var(--stroke);
+  color: var(--ice-dim);
+  opacity: 0.7;
+}
+
+.vi-tcc-chip.on {
+  color: var(--learn-green);
+  border-color: rgba(92, 224, 168, 0.5);
+  opacity: 1;
+}
+
+.vi-status-msg {
+  font-size: 10px;
+  color: var(--ice-dim);
+  line-height: 1.4;
+}
+
+/* vision.detections — by-kind count chips + per-box list. */
+.vi-detect {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.vi-detect-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+}
+
+.vi-detect-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: hsl(var(--vision-hue, 265) 70% 72%);
+}
+
+.vi-detect-frame {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+}
+
+.vi-detect-count {
+  margin-left: auto;
+  font-size: 13px;
+  color: hsl(var(--vision-hue, 265) 90% 82%);
+  font-variant-numeric: tabular-nums;
+}
+
+.vi-kinds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+
+.vi-kind {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  padding: 1px 5px;
+  border: 1px solid hsl(var(--vision-hue, 265) 80% 65% / 0.4);
+  color: hsl(var(--vision-hue, 265) 90% 80%);
+}
+
+.vi-kind-empty {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  color: var(--ice-dim);
+  opacity: 0.75;
+}
+
+.vi-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.vi-row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  padding-left: 6px;
+  border-left: 2px solid hsl(var(--vision-hue, 265) 80% 65% / 0.45);
+}
+
+.vi-row-kind {
+  flex: none;
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  color: hsl(var(--vision-hue, 265) 80% 78%);
+  width: 58px;
+}
+
+.vi-row-label {
+  color: var(--ice);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vi-row-conf {
+  margin-left: auto;
+  flex: none;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* vision.screen — OCR screen-read readout (READ ON REQUEST). The recognized
+ * text is SENSITIVE + TRANSIENT (kept off lifelong memory / optimizer traces by
+ * the daemon); this surfaces it live only, never persisted. READ-ONLY: a
+ * where-is result LOCATES a control (box/center), it never clicks. */
+/* vision.describe — the ON-DEVICE VLM readout. DISTINCT from .vi-screen (OCR):
+   this surfaces the VLM scene-description POSTURE only (the description text + the
+   pixels never ride telemetry). A faint violet card; the fallback state reads dim,
+   never red (an unavailable/off VLM is the honest, expected ships-OFF state). */
+.vi-vlm {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 8px;
+  border: 1px solid hsl(var(--vision-hue, 265) 80% 65% / 0.3);
+  background: hsl(var(--vision-hue, 265) 80% 55% / 0.05);
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+}
+
+.vi-vlm.fallback {
+  border-color: var(--stroke);
+  background: transparent;
+}
+
+.vi-vlm-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+}
+
+.vi-vlm-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: hsl(var(--vision-hue, 265) 70% 72%);
+}
+
+.vi-vlm-tag {
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  color: var(--ice-dim);
+  opacity: 0.85;
+}
+
+.vi-vlm-state {
+  margin-left: auto;
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  padding: 1px 6px;
+  border: 1px solid var(--stroke);
+  color: var(--ice-dim);
+  clip-path: polygon(3px 0, 100% 0, 100% calc(100% - 3px), calc(100% - 3px) 100%, 0 100%, 0 3px);
+}
+
+.vi-vlm-state.on {
+  color: var(--learn-green);
+  border-color: hsl(var(--learn-green-hue, 145) 70% 50% / 0.5);
+}
+
+.vi-vlm-spoken {
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--ice);
+}
+
+.vi-vlm-fallback {
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--ice-dim);
+}
+
+.vi-vlm-note {
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+  opacity: 0.8;
+}
+
+.vi-screen {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.vi-screen-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+}
+
+.vi-screen-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: hsl(var(--vision-hue, 265) 70% 72%);
+}
+
+.vi-screen-tag {
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  color: var(--ice-dim);
+  opacity: 0.85;
+}
+
+.vi-screen-count {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* NON-RAW-TEXT signal row: the read length + (for #29) the honest document-
+   detected state. Glyph-free — it summarizes presence/length without exposing the
+   sensitive recognized text. */
+.vi-screen-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+}
+
+.vi-screen-doc.found {
+  color: var(--learn-green);
+}
+
+.vi-screen-doc.none {
+  color: var(--ice-dim);
+}
+
+.vi-screen-len {
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.vi-screen-locate {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.vi-screen-q {
+  letter-spacing: 0.08em;
+  color: hsl(var(--vision-hue, 265) 80% 78%);
+}
+
+.vi-screen-hit {
+  color: var(--learn-green);
+  font-variant-numeric: tabular-nums;
+}
+
+.vi-screen-miss {
+  color: var(--ice-dim);
+  letter-spacing: 0.08em;
+}
+
+.vi-screen-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.vi-screen-ctl {
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border: 1px solid hsl(var(--vision-hue, 265) 80% 65% / 0.45);
+  color: hsl(var(--vision-hue, 265) 90% 82%);
+  clip-path: polygon(3px 0, 100% 0, 100% calc(100% - 3px), calc(100% - 3px) 100%, 0 100%, 0 3px);
+}
+
+.vi-screen-text {
+  margin: 0;
+  max-height: 132px;
+  overflow: auto;
+  padding: 5px 7px;
+  border: 1px solid var(--stroke);
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--ice);
+  white-space: pre-wrap;
+  word-break: break-word;
+  scrollbar-width: thin;
+}
+
+.vi-screen-empty {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+}
+
+/* audio.sound_monitor — the OPT-IN ambient sound-monitor STATE indicator. SHIPS
+   OFF: the OFF state reads dim (the honest, expected default — never red); the
+   MONITORING state takes a faint violet card + a green state pill. Honest copy
+   only: opt-in + mic/TCC gated, labels only, audio never leaves the device. */
+.vi-monitor {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 8px;
+  border: 1px solid var(--stroke);
+  background: transparent;
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+}
+
+.vi-monitor.on {
+  border-color: hsl(var(--vision-hue, 265) 80% 65% / 0.4);
+  background: hsl(var(--vision-hue, 265) 80% 55% / 0.05);
+}
+
+.vi-monitor-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+}
+
+.vi-monitor-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: hsl(var(--vision-hue, 265) 70% 72%);
+}
+
+.vi-monitor-state {
+  margin-left: auto;
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  padding: 1px 6px;
+  border: 1px solid var(--stroke);
+  color: var(--ice-dim);
+  clip-path: polygon(3px 0, 100% 0, 100% calc(100% - 3px), calc(100% - 3px) 100%, 0 100%, 0 3px);
+}
+
+.vi-monitor-state.on {
+  color: var(--learn-green);
+  border-color: hsl(var(--learn-green-hue, 145) 70% 50% / 0.5);
+}
+
+.vi-monitor-copy {
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--ice-dim);
+}
+
+.vi-monitor-note {
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+  opacity: 0.8;
+}
+
+/* screen_context.* — CONTINUOUS SCREEN CONTEXT (#42). The MOST privacy-sensitive
+   read feature, so the WATCHING state is deliberately PROMINENT — amber/alert
+   styling + a pulsing dot — so the user can never miss that the screen is being
+   read. The OFF (not watching) state is dim/inert. SECRET-FREE: only the
+   loop-active bit + the bounded ring counts render here, never the glyphs. */
+.vi-sctx {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 6px 8px;
+  border: 1px solid var(--stroke);
+  background: transparent;
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+}
+
+/* The WATCHING state is alert-grade: amber border + wash, so it reads as a clear
+   "the screen is being read RIGHT NOW" banner regardless of where the eye lands. */
+.vi-sctx.watching {
+  border-color: var(--warn-amber);
+  background: hsl(36 100% 60% / 0.08);
+  box-shadow: inset 0 0 0 1px hsl(36 100% 60% / 0.25);
+}
+
+.vi-sctx-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+}
+
+.vi-sctx-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: hsl(var(--vision-hue, 265) 70% 72%);
+}
+
+.vi-sctx-state {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  padding: 1px 6px;
+  border: 1px solid var(--stroke);
+  color: var(--ice-dim);
+  clip-path: polygon(3px 0, 100% 0, 100% calc(100% - 3px), calc(100% - 3px) 100%, 0 100%, 0 3px);
+}
+
+/* The active WATCHING badge — amber, bold, with a pulsing dot. */
+.vi-sctx-state.watching {
+  color: var(--warn-amber);
+  border-color: var(--warn-amber);
+  background: hsl(36 100% 60% / 0.12);
+  font-weight: 600;
+}
+
+.vi-sctx-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warn-amber);
+  box-shadow: 0 0 6px var(--warn-amber);
+  animation: vi-sctx-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes vi-sctx-pulse {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.35;
+    transform: scale(0.7);
+  }
+}
+
+.vi-sctx-ring {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 9px;
+}
+
+.vi-sctx-held {
+  color: var(--ice);
+}
+
+.vi-sctx-empty {
+  color: var(--ice-dim);
+  font-style: italic;
+}
+
+.vi-sctx-verb {
+  margin-left: auto;
+  font-size: 8px;
+  letter-spacing: 0.1em;
+  padding: 1px 5px;
+  border: 1px solid var(--stroke);
+  color: var(--ice-dim);
+  clip-path: polygon(3px 0, 100% 0, 100% calc(100% - 3px), calc(100% - 3px) 100%, 0 100%, 0 3px);
+}
+
+.vi-sctx-verb.forget {
+  color: var(--learn-green);
+  border-color: hsl(var(--learn-green-hue, 145) 70% 50% / 0.5);
+}
+
+.vi-sctx-copy {
+  font-size: 10px;
+  line-height: 1.45;
+  color: var(--ice-dim);
+}
+
+.vi-sctx-note {
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+  opacity: 0.8;
+}
+
+/* vision.sound — the Apple SOUND ANALYSIS class readout (the audio analog of
+   vision.detections). The top sound classes + a confidence bar each. LABELS
+   ONLY — no audio rides this; a fixed ~300-class classifier (not arbitrary
+   sounds); DISTINCT from speech/STT. */
+.vi-sound {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.vi-sound-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+}
+
+.vi-sound-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: hsl(var(--vision-hue, 265) 70% 72%);
+}
+
+.vi-sound-tag {
+  font-size: 8px;
+  letter-spacing: 0.12em;
+  color: var(--ice-dim);
+  opacity: 0.85;
+}
+
+.vi-sound-count {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.vi-sound-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.vi-sound-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.vi-sound-name {
+  flex: none;
+  min-width: 84px;
+  letter-spacing: 0.04em;
+  color: hsl(var(--vision-hue, 265) 90% 82%);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.vi-sound-bar {
+  flex: 1;
+  height: 6px;
+  min-width: 0;
+  border: 1px solid var(--stroke);
+  overflow: hidden;
+}
+
+.vi-sound-fill {
+  display: block;
+  height: 100%;
+  background: hsl(var(--vision-hue, 265) 90% 65%);
+  box-shadow: 0 0 6px hsl(var(--vision-hue, 265) 90% 60% / 0.6);
+  transition: width 0.4s ease;
+}
+
+.vi-sound-conf {
+  flex: none;
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+}
+
+.vi-sound-empty {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+}
+
+.vi-sound-note {
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+  opacity: 0.8;
+}
+
+/* vision.motion — generic magnitude bar + region/frame (never what moved). */
+.vi-motion {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+}
+
+.vi-motion-label {
+  flex: none;
+  letter-spacing: 0.16em;
+  color: var(--cyan-dim);
+}
+
+.vi-motion-bar {
+  flex: 1;
+  height: 6px;
+  min-width: 0;
+  border: 1px solid var(--stroke);
+  overflow: hidden;
+}
+
+.vi-motion-fill {
+  display: block;
+  height: 100%;
+  background: hsl(var(--vision-hue, 265) 90% 65%);
+  box-shadow: 0 0 6px hsl(var(--vision-hue, 265) 90% 60% / 0.6);
+  transition: width 0.4s ease;
+}
+
+.vi-motion-mag {
+  flex: none;
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+}
+
+.vi-motion-frame {
+  flex: none;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* vision.perf — inference timing strip (where the request ran: ane/gpu/all). */
+.vi-perf {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 5px;
+}
+
+.vi-perf-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 5px 2px;
+  border: 1px solid var(--stroke);
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+}
+
+.vi-perf-label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.16em;
+  color: var(--cyan-dim);
+}
+
+.vi-perf-val {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ----------------------------------------------------------------- nexus
+ * Low-latency audio routing matrix + studio control (apps/nexus). A Python
+ * control plane hosts a Rust cdylib realtime/DSP core via ctypes; audio=true,
+ * net_hosts=[] offline. The CoreAudio IOProc, aggregate device, the sub-10ms
+ * monitor RTT and AUv3 hosting run ON-DEVICE against real audio hardware and
+ * CANNOT run headlessly — so every LIVE number (meters, LUFS, spectrum,
+ * measured_rtt_ms, clip events) appears ONLY when the on-device core runs. This
+ * panel is the HUD-side readout of audio.levels / audio.routes / audio.gain /
+ * audio.clipping / audio.spectrum. The accent is the MUSIC/AUDIO agent's hue
+ * (--nexus-hue, jerome = 340); RED (--alert-red) appears ONLY on the clip flash.
+ */
+.nexus {
+  --nx-rowhdr: 20px;
+  min-height: 0;
+}
+
+.nexus.offline {
+  opacity: 0.62;
+  filter: drop-shadow(0 0 7px hsl(var(--nexus-hue, 340) 90% 60% / 0.08));
+  transition: opacity 0.5s ease;
+}
+
+/* Clip flash — a recent audio.clipping event pulses the whole frame's edge.
+   The ONLY place this panel reaches for alert-red. */
+.nexus.clip .frame-clip {
+  animation: nxClipFlash 0.5s ease-out;
+}
+
+@keyframes nxClipFlash {
+  0% { box-shadow: inset 0 0 0 1px var(--alert-red), 0 0 18px var(--alert-red); }
+  100% { box-shadow: inset 0 0 0 1px transparent, 0 0 0 transparent; }
+}
+
+.nx-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 18px 12px 22px;
+  font-family: var(--mono);
+  text-align: center;
+}
+
+.nx-ph-big {
+  font-size: 12px;
+  letter-spacing: 0.26em;
+  color: hsl(var(--nexus-hue, 340) 70% 78%);
+}
+
+.nx-ph-small {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: #51707f;
+}
+
+.nx-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px 12px;
+  min-height: 0;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--nexus-hue, 340) 80% 60% / 0.35) transparent;
+}
+
+/* On-device honesty banner — the realtime core + RTT measurement are live on
+   the device; this panel is the telemetry readout, never a synthesizer. */
+.nx-surface {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 9px;
+  border: 1px dashed hsl(var(--nexus-hue, 340) 80% 65% / 0.32);
+  font-family: var(--mono);
+}
+
+.nx-surface-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: hsl(var(--nexus-hue, 340) 90% 68%);
+  box-shadow: 0 0 6px hsl(var(--nexus-hue, 340) 90% 60%);
+  animation: nxPulse 2.2s ease-in-out infinite;
+}
+
+@keyframes nxPulse {
+  0%, 100% { opacity: 0.4; }
+  50% { opacity: 1; }
+}
+
+.nx-surface-text {
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  color: hsl(var(--nexus-hue, 340) 90% 80%);
+}
+
+.nx-surface-sub {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: #51707f;
+  white-space: nowrap;
+}
+
+/* audio.clipping — true-peak clip event. The ONLY alert-red row in the panel. */
+.nx-clip {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 5px 8px;
+  border-left: 2px solid var(--alert-red);
+  font-family: var(--mono);
+}
+
+.nx-clip-badge {
+  flex: none;
+  width: 0;
+  height: 0;
+  align-self: center;
+  border-left: 5px solid transparent;
+  border-right: 5px solid transparent;
+  border-bottom: 9px solid var(--alert-red);
+}
+
+.nx-clip-text {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  color: var(--alert-red);
+}
+
+.nx-clip-ch {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+}
+
+.nx-clip-tp {
+  margin-left: auto;
+  flex: none;
+  font-size: 10px;
+  color: var(--alert-red);
+  font-variant-numeric: tabular-nums;
+}
+
+/* audio.routes — the crosspoint routing grid. */
+.nx-routes {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+
+.nx-routes-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+}
+
+.nx-routes-label {
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  color: hsl(var(--nexus-hue, 340) 70% 72%);
+}
+
+.nx-routes-dim {
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.nx-routes-rtt {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.nx-grid {
+  display: grid;
+  gap: 2px;
+  align-items: stretch;
+}
+
+.nx-grid-corner {
+  width: var(--nx-rowhdr);
+}
+
+.nx-grid-colhdr,
+.nx-grid-rowhdr {
+  font-family: var(--mono);
+  font-size: 7.5px;
+  letter-spacing: 0.04em;
+  color: var(--cyan-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.nx-grid-rowhdr {
+  width: var(--nx-rowhdr);
+}
+
+/* A crosspoint cell: dim by default, lit when the route is above -inf. */
+.nx-cell {
+  aspect-ratio: 1 / 1;
+  min-width: 0;
+  border: 1px solid hsl(var(--nexus-hue, 340) 40% 50% / 0.22);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: hsl(var(--nexus-hue, 340) 50% 30% / 0.06);
+}
+
+.nx-cell.on {
+  border-color: hsl(var(--nexus-hue, 340) 85% 65% / 0.7);
+  background: hsl(var(--nexus-hue, 340) 80% 55% / 0.18);
+}
+
+.nx-cell-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: hsl(var(--nexus-hue, 340) 90% 68%);
+  box-shadow: 0 0 5px hsl(var(--nexus-hue, 340) 90% 60%);
+}
+
+.nx-grid-empty {
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+/* audio.levels — vertical meter pair + LUFS readout. */
+.nx-levels {
+  display: flex;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.nx-meters {
+  display: flex;
+  gap: 6px;
+  height: 70px;
+  flex: none;
+}
+
+.nx-meters-empty {
+  font-family: var(--mono);
+  font-size: 10px;
+  align-self: center;
+}
+
+.nx-meter {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+
+.nx-meter-track {
+  position: relative;
+  width: 12px;
+  flex: 1;
+  border: 1px solid var(--stroke);
+  background: rgba(5, 11, 19, 0.6);
+  overflow: hidden;
+}
+
+.nx-meter-rms {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(
+    to top,
+    hsl(var(--nexus-hue, 340) 85% 55%),
+    hsl(var(--nexus-hue, 340) 90% 70%)
+  );
+  box-shadow: 0 0 6px hsl(var(--nexus-hue, 340) 90% 60% / 0.5);
+  transition: height 0.12s ease;
+}
+
+/* Peak cap — a thin line riding above the rms body; turns red over the ceiling. */
+.nx-meter-peak {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 2px;
+  background: hsl(var(--nexus-hue, 340) 95% 82%);
+  transition: bottom 0.12s ease;
+}
+
+.nx-meter-peak.hot {
+  background: var(--alert-red);
+  box-shadow: 0 0 5px var(--alert-red);
+}
+
+.nx-meter-val {
+  font-family: var(--mono);
+  font-size: 7.5px;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.nx-meter-label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+}
+
+.nx-lufs {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 0;
+}
+
+.nx-lufs-stat {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 2px 6px;
+  border: 1px solid var(--stroke);
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+}
+
+.nx-lufs-label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  color: var(--cyan-dim);
+}
+
+.nx-lufs-val {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: hsl(var(--nexus-hue, 340) 90% 82%);
+  font-variant-numeric: tabular-nums;
+}
+
+/* audio.spectrum — 96-band log spectrum strip. */
+.nx-spectrum {
+  display: flex;
+  align-items: flex-end;
+  gap: 1px;
+  height: 48px;
+  padding: 3px 4px;
+  border: 1px solid var(--stroke);
+  background: rgba(5, 11, 19, 0.5);
+}
+
+.nx-band {
+  flex: 1;
+  min-width: 0;
+  min-height: 1px;
+  background: linear-gradient(
+    to top,
+    hsl(var(--nexus-hue, 340) 80% 45%),
+    hsl(var(--nexus-hue, 340) 90% 72%)
+  );
+  transition: height 0.08s linear;
+}
+
+.nx-spectrum-label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  color: var(--cyan-dim);
+  text-align: right;
+}
+
+/* audio.gain — last trim change. */
+.nx-gain {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  padding-top: 2px;
+}
+
+.nx-gain-label {
+  letter-spacing: 0.16em;
+  color: hsl(var(--nexus-hue, 340) 70% 72%);
+}
+
+.nx-gain-ch {
+  color: var(--ice-dim);
+}
+
+.nx-gain-stage {
+  color: var(--cyan-dim);
+  letter-spacing: 0.1em;
+}
+
+.nx-gain-db {
+  margin-left: auto;
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+}
+
+/* --------------------------------------------------------- mark-forge
+ * Deterministic rigid-body physics sandbox telemetry. The ENGINE is CPU/f64
+ * and verified headlessly (cargo test); the live 60fps R3F render is
+ * DEVICE-GATED (the headless preview suspends the loop) — this panel renders
+ * TELEMETRY-DRIVEN body transforms (pos + orientation per frame), NOT a
+ * claimed-measured framerate. Cyan family throughout; RED stays reserved.
+ */
+.mark-forge {
+  min-height: 0;
+}
+
+.mark-forge.offline {
+  opacity: 0.62;
+  filter: drop-shadow(0 0 7px rgba(26, 214, 255, 0.08));
+  transition: opacity 0.5s ease;
+}
+
+.mf-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 18px 12px 22px;
+  font-family: var(--mono);
+  text-align: center;
+}
+
+.mf-ph-big {
+  font-size: 12px;
+  letter-spacing: 0.26em;
+  color: var(--ice-dim);
+}
+
+.mf-ph-small {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  color: #51707f;
+}
+
+.mf-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px 10px 12px;
+  min-height: 0;
+}
+
+/* The R3F sandbox surface. A fixed-aspect well the Canvas absolutely fills; the
+   "device-gated" tag is an honest marker that the on-screen motion / framerate
+   is verified on the device, not headlessly. */
+.mf-scene {
+  position: relative;
+  width: 100%;
+  height: 168px;
+  border: 1px solid var(--stroke);
+  overflow: hidden;
+  clip-path: polygon(6px 0, 100% 0, 100% calc(100% - 6px), calc(100% - 6px) 100%, 0 100%, 0 6px);
+}
+
+.mf-scene-tag {
+  position: absolute;
+  left: 7px;
+  bottom: 5px;
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.14em;
+  color: var(--cyan-dim);
+  background: rgba(5, 8, 12, 0.6);
+  padding: 1px 4px;
+  pointer-events: none;
+}
+
+/* physics.step — segmented stats strip (mirrors .sc-stats). */
+.mf-stats {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 5px;
+}
+
+.mf-stat {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 5px 2px;
+  border: 1px solid var(--stroke);
+  clip-path: polygon(4px 0, 100% 0, 100% calc(100% - 4px), calc(100% - 4px) 100%, 0 100%, 0 4px);
+}
+
+.mf-stat-label {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.16em;
+  color: var(--cyan-dim);
+}
+
+.mf-stat-val {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+}
+
+/* physics.step bounded-work signal — engine-reported per-substep cap hit
+   (pairs_cap_hit / contact_cap_hit on StepReport). A RECEIVED telemetry flag, not
+   a HUD-measured value; amber = attention (the scene was deterministically bounded
+   + signalled), not an error. The whole row is absent on normal scenes. */
+.mf-cap-hit {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 5px;
+}
+
+.mf-cap-pill {
+  font-family: var(--mono);
+  font-size: 8px;
+  letter-spacing: 0.16em;
+  color: #ffb454;
+  padding: 2px 6px;
+  border: 1px solid rgba(255, 180, 84, 0.5);
+  border-radius: 2px;
+  background: rgba(255, 180, 84, 0.08);
+}
+
+/* physics.scene — sim-params readout (gravity / dt / sim-time). */
+.mf-params {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.mf-param {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-family: var(--mono);
+  font-size: 10px;
+}
+
+.mf-param-label {
+  font-size: 8px;
+  letter-spacing: 0.16em;
+  color: var(--cyan-dim);
+  flex: none;
+  width: 56px;
+}
+
+.mf-param-val {
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ----------------------------------------------------- right column stack */
+
+/* The right column stacks the agent constellation above system diagnostics.
+   Mirrors .left-col: a flex column that owns the grid cell so both panels
+   share the right rail without breaking the three-column layout. */
+.right-col {
+  grid-area: right;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-height: 0;
+}
+
+/* ------------------------------------------------------------- diagnostics */
+
+.diagnostics {
+  /* No longer owns the grid cell (now nested in .right-col); it takes the
+     lower share of the rail and scrolls its tickers internally. */
+  flex: 1;
+  min-height: 0;
+}
+
+.gauges {
+  display: grid;
+  gap: 12px;
+}
+
+.gauge {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ice-dim);
+}
+
+.gauge .row {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 4px;
+}
+
+.gauge .val {
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+}
+
+/* segmented block gauge — discrete equalizer cells */
+.seg-bar {
+  display: flex;
+  gap: 2px;
+  height: 8px;
+}
+
+.seg-bar i {
+  flex: 1;
+  background: rgba(26, 214, 255, 0.1);
+  transition: background 0.45s ease, box-shadow 0.45s ease;
+}
+
+.seg-bar i.on {
+  background: linear-gradient(180deg, #9af0ff, var(--cyan));
+  box-shadow: 0 0 6px rgba(26, 214, 255, 0.5);
+}
+
+.gauge.hot .seg-bar i.on {
+  background: linear-gradient(180deg, #ffd9a1, var(--warn-amber));
+  box-shadow: 0 0 6px rgba(255, 180, 84, 0.5);
+}
+
+.tickers {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  scrollbar-width: thin;
+}
+
+.tick-entry {
+  line-height: 1.4;
+  word-break: break-word;
+}
+
+.tick-entry .k { color: var(--learn-green); }
+.tick-entry .a { color: var(--cyan); }
+.tick-entry .v { color: var(--ice-dim); }
+
+/* ------------------------------------------- constellation / agents panel */
+
+/* The team layer (CONTRACT part C.2). Each row carries a --agent-hue custom
+   property (an integer 0..360 set inline from the roster / the live event);
+   colors derive from it via hsl(). The active row lights in its hue, the rest
+   stay dimmed. Every per-row color/opacity change carries a transition so an
+   agent lighting up or dimming is a fade, never a single-frame cut. The panel
+   is sized so the full 27-agent roster fits the right rail; it scrolls only as
+   a safety valve at very short heights. NOTE: --agent-hue can be ultron's
+   deep-orange 15 — that is an identity color, NOT the reserved --alert-red. */
+.constellation {
+  flex: 0 0 auto;
+  max-height: 52%;
+}
+
+.agent-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 2px 2px 4px;
+  scrollbar-width: thin;
+}
+
+.agent-row {
+  --agent-hue: 190;
+  display: grid;
+  grid-template-columns: 12px minmax(58px, auto) 1fr;
+  align-items: baseline;
+  gap: 8px;
+  padding: 3px 6px;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+  border-left: 2px solid transparent;
+  /* anti-flicker: fade highlight in/out, never hard-cut */
+  transition: background 0.45s ease, border-color 0.45s ease, opacity 0.45s ease;
+}
+
+.agent-glyph {
+  width: 8px;
+  height: 8px;
+  align-self: center;
+  border-radius: 50%;
+  background: hsl(var(--agent-hue) 85% 62%);
+  opacity: 0.4;
+  transition: opacity 0.45s ease, box-shadow 0.45s ease, background 0.45s ease;
+}
+
+.agent-name {
+  color: var(--ice-dim);
+  font-weight: 600;
+  transition: color 0.45s ease, text-shadow 0.45s ease;
+}
+
+.agent-role {
+  color: var(--ice-dim);
+  opacity: 0.65;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transition: color 0.45s ease, opacity 0.45s ease;
+}
+
+.agent-row.dim {
+  opacity: 0.62;
+}
+
+.agent-row.active {
+  opacity: 1;
+  background: hsl(var(--agent-hue) 90% 55% / 0.12);
+  border-left-color: hsl(var(--agent-hue) 90% 60%);
+}
+
+.agent-row.active .agent-glyph {
+  opacity: 1;
+  box-shadow: 0 0 8px hsl(var(--agent-hue) 95% 62% / 0.85);
+}
+
+.agent-row.active .agent-name {
+  color: hsl(var(--agent-hue) 95% 78%);
+  text-shadow: 0 0 8px hsl(var(--agent-hue) 95% 60% / 0.6);
+}
+
+.agent-row.active .agent-role {
+  color: var(--ice);
+  opacity: 0.92;
+}
+
+/* "currently handling" footer — dashed sub-block, mirrors the diagnostics
+   sub-title language. Fades between STANDBY and an active agent. */
+.agent-handling {
+  flex: 0 0 auto;
+  margin-top: 4px;
+  padding: 5px 8px;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  border-top: 1px dashed rgba(26, 214, 255, 0.28);
+  transition: border-color 0.45s ease;
+}
+
+.agent-handling .ah-label {
+  color: var(--cyan-dim);
+}
+
+.agent-handling .ah-name {
+  --agent-hue: 190;
+  color: hsl(var(--agent-hue) 95% 78%);
+  font-weight: 700;
+  text-shadow: 0 0 8px hsl(var(--agent-hue) 95% 60% / 0.6);
+  transition: color 0.45s ease, text-shadow 0.45s ease;
+}
+
+.agent-handling .ah-role {
+  color: var(--ice-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-handling .ah-idle {
+  color: var(--ice-dim);
+  opacity: 0.7;
+}
+
+/* ------------------------------------------------------------- latency strip */
+
+.latency {
+  grid-area: latency;
+  padding: 8px 14px 10px;
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.06em;
+  color: var(--ice-dim);
+  background: rgba(5, 11, 19, 0.55);
+  border: 1px dashed rgba(26, 214, 255, 0.28);
+}
+
+.latency .num {
+  color: var(--ice);
+  font-weight: 500;
+}
+
+.latency .track {
+  position: relative;
+  height: 14px;
+  margin-top: 6px;
+  border: 1px solid var(--stroke);
+  overflow: hidden;
+  display: flex;
+  background: rgba(8, 14, 20, 0.6);
+}
+
+.latency .seg {
+  height: 100%;
+  position: relative;
+  transition: width 500ms cubic-bezier(0.33, 1, 0.68, 1);
+  min-width: 0;
+}
+
+.seg.stt { background: rgba(26, 214, 255, 0.5); }
+.seg.classify { background: rgba(125, 243, 255, 0.38); }
+.seg.route { background: rgba(157, 125, 255, 0.45); }
+.seg.speak { background: rgba(92, 224, 168, 0.4); }
+
+.latency .first-audio {
+  position: absolute;
+  top: -3px;
+  bottom: -3px;
+  width: 2px;
+  background: var(--ice);
+  box-shadow: 0 0 8px var(--cyan-bright);
+  transition: left 500ms cubic-bezier(0.33, 1, 0.68, 1);
+}
+
+.latency .legend {
+  display: flex;
+  gap: 16px;
+  margin-top: 5px;
+  flex-wrap: wrap;
+}
+
+.latency .legend b {
+  color: var(--ice);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.latency .idle-note {
+  color: #51707f;
+  letter-spacing: 0.15em;
+}
+
+/* ------------------------------------------------------------- waveform */
+
+.waveform {
+  grid-area: wave;
+  height: 118px;
+}
+
+.waveform canvas {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  display: block;
+}
+
+/* ------------------------------------------------------------- toasts */
+
+.toasts {
+  position: absolute;
+  right: 24px;
+  bottom: 142px;
+  z-index: 9;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  align-items: flex-end;
+  pointer-events: none;
+}
+
+.toast {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 8px 12px;
+  background: var(--panel-bg);
+  border: 1px solid;
+  max-width: 420px;
+  clip-path: polygon(8px 0, 100% 0, 100% calc(100% - 8px), calc(100% - 8px) 100%, 0 100%, 0 8px);
+  animation: toastIn 200ms cubic-bezier(0.33, 1, 0.68, 1);
+  transition: opacity 220ms ease, transform 220ms ease;
+}
+
+/* reducer marks exiting TOAST_EXIT_MS before removal — fade/slide out */
+.toast.exiting {
+  opacity: 0;
+  transform: translateX(14px);
+}
+
+@keyframes toastIn {
+  from {
+    opacity: 0;
+    transform: translateX(16px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.toast.learned {
+  color: var(--learn-green);
+  border-color: rgba(92, 224, 168, 0.5);
+}
+
+.toast.action {
+  color: var(--cyan-bright);
+  border-color: rgba(26, 214, 255, 0.5);
+}
+
+.toast.memory {
+  color: var(--ice-dim);
+  border-color: rgba(143, 180, 196, 0.4);
+}
+
+.toast.info {
+  color: var(--cyan-bright);
+  border-color: rgba(26, 214, 255, 0.6);
+  box-shadow: 0 0 14px rgba(26, 214, 255, 0.16);
+}
+
+/* ------------------------------------------------------------- settings */
+
+.modal-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 20;
+  background: rgba(2, 4, 7, 0.72);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.modal {
+  width: 500px;
+  max-width: 92vw;
+}
+
+.modal .body {
+  padding: 10px 14px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  font-size: 12.5px;
+  color: var(--ice-dim);
+}
+
+.field-row {
+  display: flex;
+  gap: 8px;
+}
+
+.field-row input {
+  flex: 1;
+  background: rgba(8, 14, 20, 0.8);
+  border: 1px solid var(--stroke);
+  color: var(--ice);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 7px 10px;
+  outline: none;
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+
+.field-row input:focus {
+  border-color: var(--cyan-bright);
+  box-shadow: 0 0 10px rgba(26, 214, 255, 0.2);
+}
+
+.kv-note {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: #51707f;
+  line-height: 1.5;
+}
+
+/* The [voice_id] key reference inside the voice-id settings note — a compact
+   bulleted list of the exact lockstep jarvis.toml keys. */
+.kv-note ul.voiceid-keys {
+  margin: 4px 0 6px;
+  padding-left: 16px;
+  list-style: square;
+}
+.kv-note ul.voiceid-keys li {
+  margin: 2px 0;
+}
+
+.key-status {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.key-status.on { color: var(--learn-green); }
+.key-status.off { color: var(--ice-dim); }
+
+.test-result {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+.test-result.valid { color: var(--learn-green); }
+.test-result.unauthorized { color: var(--alert-red); }
+.test-result.network { color: var(--warn-amber); }
+
+/* ---------------------------------------------------- credentials registry */
+
+.cred-section-title {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.28em;
+  color: var(--cyan-dim);
+  padding-bottom: 2px;
+  border-bottom: 1px solid var(--stroke);
+  margin-top: 4px;
+}
+
+.cred-row {
+  display: grid;
+  grid-template-columns: 130px 1fr auto;
+  grid-template-areas:
+    "label input remove"
+    "hint  hint  hint"
+    "pill  pill  pill";
+  align-items: center;
+  gap: 6px 8px;
+}
+
+.cred-label {
+  grid-area: label;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  color: var(--ice);
+}
+
+.cred-input {
+  grid-area: input;
+  background: rgba(8, 14, 20, 0.8);
+  border: 1px solid var(--stroke);
+  color: var(--ice);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 6px 9px;
+  outline: none;
+  transition: border-color 200ms ease, box-shadow 200ms ease;
+}
+
+.cred-input:focus {
+  border-color: var(--cyan-bright);
+  box-shadow: 0 0 10px rgba(26, 214, 255, 0.2);
+}
+
+.cred-remove {
+  grid-area: remove;
+  font-size: 11px;
+  padding: 4px 8px;
+}
+
+.cred-hint {
+  grid-area: hint;
+  font-family: var(--mono);
+  font-size: 10px;
+  line-height: 1.3;
+  color: var(--ice-dim);
+}
+
+.cred-pill {
+  grid-area: pill;
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.12em;
+}
+
+.cred-pill.good { color: var(--learn-green); }
+.cred-pill.bad { color: var(--alert-red); }
+.cred-pill.warn { color: var(--warn-amber); }
+.cred-pill.idle { color: var(--ice-dim); }
+/* "on" = an active/engaged subsystem (e.g. ENCRYPTED AT REST, LOCAL · BOUNDED) —
+   the affirmative green, mirroring .good. NOT ENCRYPTED uses the muted .idle tone
+   on purpose: it is the honest shipped-OFF default, not an alarm. */
+.cred-pill.on { color: var(--learn-green); }
+
+/* ------------------------------------------------------------ command deck */
+/* The interactive holotable command surface — a toggleable overlay, additive
+   to the telemetry HUD (the orb + panels are untouched when it is closed). */
+.command-deck {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(2, 6, 12, 0.62);
+  backdrop-filter: blur(3px);
+}
+.cmd-deck-frame {
+  width: min(880px, 92vw);
+  max-height: 88vh;
+}
+.cmd-deck-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-height: 82vh;
+  overflow: hidden;
+}
+.cmd-deck-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+.cmd-deck-sub {
+  flex: 1;
+  font: 11px/1.4 var(--text);
+  color: var(--cyan-dim);
+}
+.cmd-deck-close {
+  background: transparent;
+  border: 1px solid var(--stroke);
+  color: var(--cyan-bright);
+  width: 26px;
+  height: 26px;
+  cursor: pointer;
+}
+.cmd-deck-close:hover { border-color: var(--cyan-bright); }
+
+/* Pending-actions tray — warn-amber attention chrome. */
+.cmd-tray {
+  border: 1px solid var(--warn-amber);
+  background: rgba(255, 180, 84, 0.06);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.cmd-tray-label {
+  font: 700 10px/1 var(--mono);
+  letter-spacing: 0.12em;
+  color: var(--warn-amber);
+}
+.cmd-tray-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid rgba(255, 180, 84, 0.22);
+  padding-top: 8px;
+}
+.cmd-tray-info { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.cmd-tray-tool { font: 700 12px/1.2 var(--mono); color: var(--ice); }
+.cmd-tray-agent { font: 10px/1 var(--mono); color: var(--cyan-dim); }
+.cmd-tray-preview { font: 11px/1.4 var(--text); color: var(--ice-dim); }
+.cmd-tray-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.cmd-forge-cmd {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  margin-top: 4px;
+  padding: 4px 8px;
+  background: rgba(0, 0, 0, 0.4);
+  border-left: 2px solid var(--warn-amber);
+}
+.cmd-forge-prompt { color: var(--warn-amber); font: 12px/1 var(--mono); }
+.cmd-forge-cmd code { font: 12px/1.3 var(--mono); color: var(--ice); }
+
+/* Deck conversation log. */
+.cmd-log {
+  flex: 1;
+  min-height: 120px;
+  overflow-y: auto;
+  border: 1px solid var(--stroke);
+  background: rgba(0, 0, 0, 0.28);
+  padding: 8px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cmd-log-empty { font: 11px/1.4 var(--text); }
+.cmd-log-row { font: 12px/1.4 var(--text); display: flex; gap: 8px; }
+.cmd-log-agent {
+  font: 700 10px/1.4 var(--mono);
+  color: var(--cyan-dim);
+  flex-shrink: 0;
+  text-transform: uppercase;
+}
+.cmd-log-text { color: var(--ice); }
+.cmd-log-row.command .cmd-log-text { color: var(--cyan-bright); }
+.cmd-log-row.error .cmd-log-text { color: var(--alert-red); }
+.cmd-log-row.system .cmd-log-text { color: var(--ice-dim); font-style: italic; }
+
+/* Input row + launchers. */
+.cmd-input-row { display: flex; gap: 6px; }
+.cmd-agent-select,
+.cmd-text {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--stroke);
+  color: var(--ice);
+  font: 12px/1 var(--text);
+  padding: 7px 8px;
+}
+.cmd-agent-select { max-width: 220px; }
+.cmd-text { flex: 1; }
+.cmd-text:focus,
+.cmd-agent-select:focus { outline: none; border-color: var(--cyan-bright); }
+.cmd-launchers { display: flex; gap: 6px; align-items: center; }
+.cmd-busy { font: 11px/1 var(--mono); }
+
+.cmd-btn {
+  background: rgba(26, 214, 255, 0.08);
+  border: 1px solid var(--stroke);
+  color: var(--cyan-bright);
+  font: 700 11px/1 var(--mono);
+  letter-spacing: 0.08em;
+  padding: 7px 12px;
+  cursor: pointer;
+}
+.cmd-btn:hover:not(:disabled) { border-color: var(--cyan-bright); background: rgba(26, 214, 255, 0.16); }
+.cmd-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.cmd-approve { color: var(--learn-green); border-color: rgba(92, 224, 168, 0.5); }
+.cmd-deny,
+.cmd-dismiss { color: var(--warn-amber); border-color: rgba(255, 180, 84, 0.5); }
+
+/* Interactive constellation — the addressable agent deck. */
+.cmd-constellation { display: flex; flex-direction: column; gap: 6px; }
+.cmd-const-label { font: 700 10px/1 var(--mono); letter-spacing: 0.12em; color: var(--cyan-dim); }
+.cmd-const-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+  gap: 5px;
+  max-height: 150px;
+  overflow-y: auto;
+}
+.cmd-agent-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: rgba(0, 0, 0, 0.32);
+  border: 1px solid var(--stroke);
+  color: var(--ice-dim);
+  font: 11px/1 var(--mono);
+  padding: 6px 8px;
+  cursor: pointer;
+  text-align: left;
+}
+.cmd-agent-chip:hover { border-color: var(--cyan-bright); color: var(--ice); }
+.cmd-agent-chip.selected {
+  border-color: hsl(var(--agent-hue, 190) 90% 62%);
+  color: hsl(var(--agent-hue, 190) 90% 78%);
+  background: hsl(var(--agent-hue, 190) 90% 50% / 0.14);
+}
+.cmd-chip-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: hsl(var(--agent-hue, 190) 90% 60%);
+  box-shadow: 0 0 6px hsl(var(--agent-hue, 190) 90% 60%);
+}
+.cmd-chip-name { text-transform: uppercase; letter-spacing: 0.04em; }
+
+/* ---------------------------------------------------------------- MCP panel */
+/* The external-tool review surface. REVIEW-ONLY + secret-free — see McpPanel. */
+.mcp-body { display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.mcp-off { padding: 4px 2px; line-height: 1.4; }
+.mcp-foot { margin-top: 4px; line-height: 1.35; }
+.mcp-server {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 6px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.mcp-server-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mcp-server-name {
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--cyan-bright);
+}
+.mcp-server-transport {
+  font-size: 0.72em;
+  letter-spacing: 0.06em;
+  color: var(--cyan-dim);
+}
+.mcp-pill {
+  font-size: 0.68em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.mcp-pill.ok { color: var(--learn-green); }
+.mcp-pill.off { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
+.mcp-pill.token { color: var(--warn-amber); }
+.mcp-tools { display: flex; flex-wrap: wrap; gap: 5px; }
+.mcp-tool {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.74em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid rgba(26, 214, 255, 0.25);
+}
+.mcp-tool .mcp-tool-class {
+  font-style: normal;
+  font-size: 0.78em;
+  letter-spacing: 0.05em;
+  opacity: 0.75;
+}
+/* A consequential (gated) MCP tool is badged amber so it reads distinctly from a
+   read-only one — it parks for a spoken confirmation before it can act. RED stays
+   reserved for alerts, so the gated badge uses amber, not red. */
+.mcp-tool.conseq { border-color: rgba(255, 180, 84, 0.55); color: var(--warn-amber); }
+.mcp-tool.ro { color: var(--cyan); }
+.mcp-agents { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.mcp-agents-label {
+  font-size: 0.68em;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+}
+.mcp-agent {
+  font-size: 0.72em;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: rgba(26, 214, 255, 0.08);
+}
+.mcp-empty { font-size: 0.74em; }
+
+/* ------------------------------------------------- EXTENSIBILITY // WEBHOOKS + PLUGINS */
+/* The read-only review surface for the two opt-in extension points (#35 webhook
+   triggers, #36 plugin SDK). Mirrors the MCP panel's review-only language: a
+   loopback inbound surface + sandboxed capability modules, secret-free. */
+.ext-body { display: flex; flex-direction: column; gap: 12px; padding: 4px 2px; }
+.ext-section { display: flex; flex-direction: column; gap: 6px; }
+.ext-section-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ext-section-title {
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  color: var(--cyan-bright);
+}
+.ext-pill {
+  font-size: 0.68em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.ext-pill.ok { color: var(--learn-green); }
+.ext-pill.off { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
+.ext-pill.count { color: var(--cyan); }
+.ext-pill.sandboxed { color: var(--learn-green); }
+/* A rejected handshake reads amber (a problem to notice), not red (alerts only). */
+.ext-pill.reject { color: var(--warn-amber); border-color: rgba(255, 180, 84, 0.55); }
+.ext-rows { display: flex; flex-direction: column; gap: 3px; }
+.ext-row { display: flex; align-items: center; gap: 8px; }
+.ext-row-label {
+  font-size: 0.68em;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+  min-width: 110px;
+}
+.ext-row-value { display: inline-flex; align-items: center; gap: 6px; }
+.ext-intent { font-size: 0.82em; color: var(--cyan-bright); }
+.ext-outcome {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+  opacity: 0.85;
+}
+.ext-outcome.routed { color: var(--cyan); }
+/* A parked (consequential) webhook is the safety highlight — it did NOT auto-run. */
+.ext-outcome.parked { color: var(--warn-amber); }
+.ext-outcome.unauthorized,
+.ext-outcome.unmapped,
+.ext-outcome.bad_request { color: var(--fg-dim, rgba(255, 255, 255, 0.45)); }
+.ext-plugins { display: flex; flex-direction: column; gap: 5px; }
+.ext-plugin {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 5px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.ext-plugin-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ext-plugin-name {
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--cyan-bright);
+}
+.ext-plugin-detail { font-size: 0.72em; line-height: 1.35; }
+.ext-note { line-height: 1.35; }
+.ext-empty { font-size: 0.74em; line-height: 1.4; padding: 2px 0; }
+
+/* ------------------------------------------------- SUGGESTIONS // PROACTIVE INTEL */
+/* The propose-only feed for habit-automation offers (#13) + predictive
+   suggestions (#14). Tone: cyan default; the cards lean on --cyan-dim chrome
+   (an OFFER, not an alert). Accept is the affirmative cyan verb; Dismiss is a
+   neutral ghost verb. Honest copy carries the never-auto-act + still-gated
+   posture. No --alert-red here — a suggestion is never an alert. */
+.sg-body { display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.sg-foot { margin-top: 4px; line-height: 1.35; }
+
+.sg-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 9px;
+  border: 1px solid var(--stroke);
+  border-left: 3px solid var(--cyan-dim);
+  background: rgba(26, 214, 255, 0.05);
+  border-radius: 3px;
+}
+.sg-card.predictive { border-left-color: rgba(157, 125, 255, 0.55); }
+
+.sg-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.sg-kind {
+  font-family: var(--mono);
+  font-size: 0.66em;
+  letter-spacing: 0.08em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+  color: var(--cyan);
+}
+.sg-kind.predictive { color: var(--cloud-violet); }
+.sg-agent { font-family: var(--mono); font-size: 0.72em; color: var(--ice-dim); }
+.sg-noact {
+  margin-left: auto;
+  font-family: var(--mono);
+  font-size: 0.62em;
+  letter-spacing: 0.06em;
+  color: var(--ice-dim);
+  opacity: 0.85;
+}
+
+.sg-text { font-size: 0.9em; line-height: 1.35; color: var(--ice); }
+.sg-evidence { font-size: 0.72em; }
+
+.sg-proposal {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 5px 7px;
+  border: 1px dashed var(--cyan-dim);
+  border-radius: 3px;
+  background: rgba(26, 214, 255, 0.04);
+}
+.sg-proposal-label {
+  font-family: var(--mono);
+  font-size: 0.62em;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+}
+.sg-row { display: flex; gap: 8px; font-size: 0.78em; }
+.sg-k { flex: 0 0 64px; color: var(--ice-dim); font-family: var(--mono); font-size: 0.92em; }
+.sg-v { color: var(--ice); }
+.sg-gate { font-size: 0.7em; line-height: 1.35; margin-top: 2px; }
+
+.sg-actions { display: flex; gap: 8px; margin-top: 2px; }
+.sg-accept,
+.sg-dismiss {
+  font-family: var(--mono);
+  font-size: 0.72em;
+  letter-spacing: 0.06em;
+  padding: 3px 12px;
+  border-radius: 3px;
+  cursor: pointer;
+  background: transparent;
+}
+.sg-accept {
+  color: var(--cyan-bright);
+  border: 1px solid var(--cyan);
+}
+.sg-accept:hover { background: rgba(26, 214, 255, 0.14); }
+.sg-dismiss {
+  color: var(--ice-dim);
+  border: 1px solid var(--stroke);
+}
+.sg-dismiss:hover { color: var(--ice); background: rgba(26, 214, 255, 0.06); }
+
+/* ------------------------------------------------- AUDIT // CONSEQUENTIAL GATE */
+/* The read-only accountability surface for the consequential gate. Tone code:
+   GREEN (learn-green) = chain verified / executed / confirmed (a real good
+   state, not an alert); AMBER (warn-amber) = ASK / parked (the default gated
+   path) AND the ALWAYS loosening (a deliberate, master-gated state); RED
+   (alert-red) is used ONLY for NEVER/blocked/denied and the genuine
+   CHAIN-TAMPER verdict — those ARE the alert conditions this panel exists to
+   surface, so red is appropriate (a tamper or a hard block is exactly an
+   alert), consistent with the global red-for-alerts rule. */
+.audit-body { display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.audit-off { padding: 4px 2px; line-height: 1.4; }
+.audit-foot { margin-top: 4px; line-height: 1.35; }
+.audit-truncated,
+.audit-more { line-height: 1.35; }
+
+.audit-chain {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 5px 8px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+}
+.audit-chain.ok { color: var(--learn-green); }
+.audit-chain.broken { color: var(--alert-red); }
+.audit-chain.awaiting { color: var(--ice-dim); }
+.audit-chain-led {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 6px currentColor;
+}
+.audit-chain-label { font-weight: 600; letter-spacing: 0.06em; font-size: 0.8em; }
+.audit-chain-detail { font-size: 0.74em; }
+
+.audit-timeline { display: flex; flex-direction: column; gap: 4px; }
+.audit-empty { padding: 4px 2px; line-height: 1.4; }
+.audit-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 0.74em;
+  padding: 3px 6px;
+  border: 1px solid rgba(26, 214, 255, 0.14);
+  border-radius: 3px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.audit-row.live { border-color: rgba(255, 180, 84, 0.3); }
+.audit-live-tag {
+  font-size: 0.86em;
+  letter-spacing: 0.08em;
+  color: var(--warn-amber);
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.audit-seq { color: var(--cyan-dim); font-variant-numeric: tabular-nums; }
+.audit-agent { color: var(--ice-dim); }
+.audit-tool { color: var(--cyan-bright); font-weight: 600; }
+.audit-target { color: var(--cyan); opacity: 0.85; }
+.audit-via { font-size: 0.92em; }
+.audit-ts { margin-left: auto; font-variant-numeric: tabular-nums; }
+
+/* Decision + outcome pills share a tone vocabulary. */
+.audit-decision,
+.audit-outcome {
+  font-size: 0.86em;
+  letter-spacing: 0.05em;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.audit-decision.always,
+.audit-outcome.always { color: var(--warn-amber); }
+.audit-decision.never,
+.audit-outcome.never { color: var(--alert-red); }
+.audit-decision.ask,
+.audit-outcome.ask { color: var(--cyan); }
+.audit-outcome.ok { color: var(--learn-green); }
+.audit-outcome.neutral { color: var(--ice-dim); }
+
+/* ------------------------------ ACTION panel (#25 drafts / #26 missions /
+   #27 macros). Read-only + secret-free; three stacked sections sharing one
+   tone vocabulary (cyan = neutral, amber = attention/paused, green = ok/
+   active, ice = inert/cancelled). No send/run/replay control lives here. */
+.act-body { display: flex; flex-direction: column; gap: 10px; }
+.act-section { display: flex; flex-direction: column; gap: 5px; }
+.act-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  border-bottom: 1px solid rgba(26, 214, 255, 0.14);
+  padding-bottom: 3px;
+}
+.act-section-title {
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  font-size: 0.78em;
+  color: var(--cyan-bright);
+}
+.act-count {
+  font-size: 0.74em;
+  font-variant-numeric: tabular-nums;
+  color: var(--cyan-dim);
+  border: 1px solid rgba(26, 214, 255, 0.24);
+  border-radius: 3px;
+  padding: 0 5px;
+}
+.act-list { display: flex; flex-direction: column; gap: 4px; }
+.act-row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 0.74em;
+  padding: 4px 6px;
+  border: 1px solid rgba(26, 214, 255, 0.14);
+  border-radius: 3px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.act-row-head {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+}
+.act-kind {
+  font-size: 0.92em;
+  letter-spacing: 0.05em;
+  color: var(--cyan);
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  padding: 0 4px;
+}
+.act-subject,
+.act-mission-goal,
+.act-macro-name { color: var(--cyan-bright); font-weight: 600; }
+.act-mission-id { margin-left: auto; font-variant-numeric: tabular-nums; }
+.act-macro-steps { font-variant-numeric: tabular-nums; }
+.act-preview,
+.act-macro-step,
+.act-progress-text { font-size: 0.92em; line-height: 1.4; }
+
+/* Status pills share the tone vocabulary. The draft pill is pinned DRAFT
+   (never sent); mission/macro phases map onto amber/green/ice. */
+.act-status {
+  font-size: 0.82em;
+  letter-spacing: 0.05em;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.act-status.draft { color: var(--cyan); }
+.act-status.active,
+.act-status.done,
+.act-status.running { color: var(--learn-green); }
+.act-status.paused,
+.act-status.idle { color: var(--warn-amber); }
+.act-status.cancelled { color: var(--ice-dim); }
+
+.act-progress { display: flex; align-items: center; gap: 7px; }
+.act-progress-bar {
+  flex: 1;
+  height: 5px;
+  border-radius: 3px;
+  background: rgba(26, 214, 255, 0.12);
+  overflow: hidden;
+}
+.act-progress-bar i {
+  display: block;
+  height: 100%;
+  background: var(--learn-green);
+  box-shadow: 0 0 5px var(--learn-green);
+}
+.act-progress-text { margin-left: auto; }
+.act-note { font-size: 0.72em; line-height: 1.4; padding: 1px 2px; }
+
+/* --------------------------------------------- CONSEQUENTIAL POLICY editor */
+/* In the Settings modal. The per-action ALWAYS/NEVER/ASK editor. Same tone
+   vocabulary as the audit panel: amber = ALWAYS (a deliberate, master-gated
+   loosening) + ASK-default, red = NEVER (hard block). User-set only. */
+.policy-rules { display: flex; flex-direction: column; gap: 4px; margin: 2px 0 6px; }
+.policy-rule-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 0.82em;
+  padding: 3px 6px;
+  border: 1px solid rgba(26, 214, 255, 0.14);
+  border-radius: 3px;
+}
+.policy-decision {
+  font-size: 0.86em;
+  letter-spacing: 0.05em;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.policy-decision.always { color: var(--warn-amber); }
+.policy-decision.never { color: var(--alert-red); }
+.policy-decision.ask { color: var(--cyan); }
+.policy-tool { color: var(--cyan-bright); font-weight: 600; }
+.policy-scope-bit { color: var(--ice-dim); font-size: 0.92em; }
+.policy-controls { flex-wrap: wrap; }
+.policy-controls .policy-always { color: var(--warn-amber); }
+.policy-controls .policy-never { color: var(--alert-red); }
+.policy-controls .policy-ask { color: var(--cyan); }
+
+/* ----------------------------------------------------- PANIC / LOCKDOWN (#12) */
+/* The status-bar LOCKDOWN indicator chip + the prominent PANIC button, and the
+   Settings PANIC / UNLOCK controls. LOCKED DOWN is a genuine ALARM state (red),
+   NORMAL is calm (ok green); the PANIC button is always alarm-red so it reads as
+   the emergency stop, and reads ENGAGED + inert once locked. */
+.status-item.lockdown-chip { display: inline-flex; align-items: center; }
+.status-item.lockdown-chip.bad {
+  color: var(--alert-red);
+  font-weight: 700;
+  letter-spacing: 0.1em;
+}
+.status-item.lockdown-chip.ok { color: var(--ice-dim); }
+
+.panic-btn {
+  margin: 0 0.4rem;
+  padding: 0.18rem 0.6rem;
+  border: 1px solid var(--alert-red);
+  border-radius: 4px;
+  background: rgba(40, 6, 6, 0.65);
+  color: var(--alert-red);
+  font: inherit;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.2s ease, color 0.2s ease, box-shadow 0.2s ease;
+}
+.panic-btn:hover:not(:disabled) {
+  background: var(--alert-red);
+  color: #150202;
+  box-shadow: 0 0 10px var(--alert-red);
+}
+.panic-btn.engaged,
+.panic-btn:disabled {
+  opacity: 0.7;
+  cursor: default;
+  box-shadow: none;
+}
+
+.panic-controls { flex-wrap: wrap; gap: 0.4rem; }
+.panic-controls .panic-engage {
+  color: var(--alert-red);
+  border-color: var(--alert-red);
+  font-weight: 700;
+}
+.panic-controls .panic-unlock { color: var(--cyan); }
+.panic-controls .panic-unlock.armed {
+  color: var(--warn-amber);
+  border-color: var(--warn-amber);
+  font-weight: 700;
+}
+
+/* --------------------------------------------------------- FILE SEARCH panel */
+/* FILE SEARCH // ON-DEVICE — the read-only on-device file-RAG surface. PRIVATE +
+   REVIEW-ONLY: counts + cited results only, no action button (indexing/searching/
+   forgetting are spoken). Green = fully-neural index/result; amber = BM25
+   fallback (a real, honest degraded state, not an alert) — RED stays for alerts. */
+.docsearch-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.docsearch-index,
+.docsearch-results { display: flex; flex-direction: column; gap: 6px; }
+.docsearch-index-head,
+.docsearch-results-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.docsearch-index-title,
+.docsearch-results-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.docsearch-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.docsearch-pill.neural { color: var(--learn-green); }
+.docsearch-pill.bm25 { color: var(--warn-amber); }
+.docsearch-pill.off { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
+.docsearch-counts { display: flex; gap: 14px; flex-wrap: wrap; }
+.docsearch-count { display: flex; flex-direction: column; gap: 1px; }
+.docsearch-count-val {
+  font-size: 1.05em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+  font-variant-numeric: tabular-nums;
+}
+.docsearch-count-total { font-size: 0.7em; font-weight: 400; color: var(--cyan-dim); }
+.docsearch-count-label {
+  font-size: 0.62em;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+}
+.docsearch-note { line-height: 1.35; }
+.docsearch-empty { padding: 2px 0; line-height: 1.4; }
+.docsearch-query { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.docsearch-query-label {
+  font-size: 0.62em;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+}
+.docsearch-query-text { font-size: 0.82em; color: var(--cyan-bright); }
+.docsearch-hits { display: flex; flex-direction: column; gap: 6px; }
+.docsearch-hit {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.docsearch-hit-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.docsearch-hit-path {
+  font-size: 0.76em;
+  font-weight: 600;
+  color: var(--cyan);
+  word-break: break-all;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.docsearch-hit-offset {
+  font-size: 0.66em;
+  color: var(--cyan-dim);
+  font-variant-numeric: tabular-nums;
+}
+.docsearch-hit-score {
+  font-size: 0.7em;
+  color: var(--learn-green);
+  font-variant-numeric: tabular-nums;
+}
+.docsearch-hit-snippet {
+  font-size: 0.78em;
+  line-height: 1.4;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.docsearch-foot { margin-top: 2px; line-height: 1.35; }
+/* The live index-status line inside the SETTINGS file-search section. */
+.kv-status { margin-top: 6px; line-height: 1.4; color: var(--cyan-dim); }
+.kv-status b { color: var(--cyan-bright); }
+
+/* ------------------------------------------------------- CODE INTEL panel */
+/* CODE INTEL // ON-DEVICE — grounded + cited code explanations (real file +
+   offset + snippet, like docsearch) and PROPOSE-ONLY diffs shown READ-ONLY with
+   the EXACT MANUAL apply command (amber dashed command box, like the forge/heal
+   review panels — NO one-click apply). Cyan = cited/neutral; green = neural;
+   amber = the BM25 fallback, the propose-only diff, and the manual command;
+   amber stays for honest non-error notes too (RED is reserved for alerts). */
+.codeintel-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.codeintel-explain,
+.codeintel-proposal,
+.codeintel-note { display: flex; flex-direction: column; gap: 6px; }
+.codeintel-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.codeintel-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.codeintel-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.codeintel-pill.neural { color: var(--learn-green); }
+.codeintel-pill.bm25 { color: var(--warn-amber); }
+.codeintel-pill.propose { color: var(--warn-amber); }
+.codeintel-pill.note { color: var(--warn-amber); }
+.codeintel-q { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.codeintel-q-label {
+  font-size: 0.62em;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+  font-weight: 600;
+}
+.codeintel-q-text { font-size: 0.82em; color: var(--cyan-bright); }
+.codeintel-grounded { line-height: 1.35; }
+.codeintel-empty { padding: 2px 0; line-height: 1.4; }
+.codeintel-hits { display: flex; flex-direction: column; gap: 6px; }
+.codeintel-hit {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.codeintel-hit-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.codeintel-hit-path {
+  font-size: 0.76em;
+  font-weight: 600;
+  color: var(--cyan);
+  word-break: break-all;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.codeintel-hit-offset {
+  font-size: 0.66em;
+  color: var(--cyan-dim);
+  font-variant-numeric: tabular-nums;
+}
+.codeintel-hit-snippet {
+  margin: 0;
+  font-family: var(--mono);
+  font-size: 0.74em;
+  line-height: 1.45;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow: auto;
+  user-select: text;
+  tab-size: 4;
+}
+/* The PROPOSE-ONLY review block: meta + the EXACT MANUAL apply command (amber
+   dashed box, mirroring the forge/heal review command line). NO apply button. */
+.codeintel-prop-meta { line-height: 1.4; }
+.codeintel-review { display: flex; flex-direction: column; gap: 4px; }
+.codeintel-review-label {
+  font-size: 0.64em;
+  letter-spacing: 0.12em;
+  font-weight: 700;
+  color: var(--warn-amber);
+}
+.codeintel-cmd {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  background: rgba(6, 12, 20, 0.7);
+  border: 1px dashed rgba(255, 180, 84, 0.4);
+  font-size: 0.8em;
+  user-select: text; /* the one selectable element — the human copies it */
+}
+.codeintel-cmd-prompt { color: var(--warn-amber); font-weight: 700; }
+.codeintel-cmd code {
+  font-family: var(--mono);
+  color: var(--cyan-bright);
+  word-break: break-all;
+}
+.codeintel-safety { line-height: 1.4; }
+.codeintel-note-body { line-height: 1.4; }
+.codeintel-note-reason { color: var(--warn-amber); }
+.codeintel-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ------------------------------------------------------- SHELL panel (#43) */
+/* SHELL // SANDBOXED — the read-only surface for the HIGHEST-RISK feature
+   (arbitrary code execution). It mirrors the confirm-park + code-apply postures:
+   a consequential action shown READ-ONLY with NO control that runs anything. The
+   command parks for the user's SPOKEN confirm and never auto-runs. Cyan =
+   neutral/command; amber = the honest review-only attention states (OFF, parked,
+   denied, executing — NOT alerts); green = a clean run (exit 0); --alert-red is
+   used ONLY for the genuinely-bad run signals (nonzero exit, timed out). The
+   panel deliberately has NO button/link — the daemon never puts a command's
+   output on the wire, so NONE is ever rendered. */
+.shell-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.shell-outcome { display: flex; flex-direction: column; gap: 6px; }
+.shell-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.shell-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.shell-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+/* Honest review-only attention (OFF / parked / denied / executing / blocked) is
+   AMBER — red is reserved for the genuinely-bad run signals only. */
+.shell-pill.off { color: var(--warn-amber); }
+.shell-pill.note { color: var(--warn-amber); }
+.shell-pill.denied { color: var(--warn-amber); }
+.shell-pill.parked { color: var(--warn-amber); }
+.shell-pill.executing { color: var(--cyan-bright); }
+.shell-pill.armed { color: var(--cyan); }
+.shell-pill.ran { color: var(--learn-green); }
+/* The exact command — shown as TEXT, never a runnable control (no button/link). */
+.shell-cmd {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  background: rgba(6, 12, 20, 0.7);
+  border: 1px dashed rgba(255, 180, 84, 0.4);
+  font-size: 0.8em;
+  user-select: text;
+}
+.shell-cmd-prompt { color: var(--warn-amber); font-weight: 700; }
+.shell-cmd code {
+  font-family: var(--mono);
+  color: var(--cyan-bright);
+  word-break: break-all;
+}
+.shell-empty { padding: 2px 0; line-height: 1.4; }
+.shell-detail { line-height: 1.4; }
+.shell-reason { color: var(--warn-amber); }
+.shell-facts { display: inline-flex; gap: 8px; flex-wrap: wrap; margin-left: 4px; }
+.shell-exit {
+  font-size: 0.92em;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+.shell-exit.ok { color: var(--learn-green); }
+.shell-exit.nonzero { color: var(--alert-red); }
+.shell-flag {
+  font-size: 0.92em;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  color: var(--alert-red);
+}
+.shell-foot { margin-top: 2px; line-height: 1.35; }
+
+/* --------------------------------------------------- UI AUTOMATION (#44) panel */
+/* UI AUTOMATION // GATED — the read-only surface for the SINGLE MOST DANGEROUS
+   feature: physically actuating the UI (a single CGEvent click / type / key). It
+   mirrors the SHELL panel posture exactly: a consequential action shown READ-ONLY
+   with NO control that actuates anything. Every action PARKS for the user's
+   SPOKEN confirm PER ACTION (one confirm = one actuation), never batched, never
+   autonomous. Cyan = neutral; amber = the honest review-only attention states
+   (OFF, parked, refused — NOT alerts); cyan-bright = actuating; green = a faithful
+   actuated result. The panel deliberately has NO button/link, and NEVER renders a
+   coordinate, typed text, or a fabricated actuation result — only the action
+   class + a faithful target description. */
+.actuate-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.actuate-outcome { display: flex; flex-direction: column; gap: 6px; }
+.actuate-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.actuate-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.actuate-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+/* Honest review-only attention (OFF / parked / refused / device-gated) is AMBER —
+   actuating is cyan-bright, a faithful actuated result is green. No red chrome:
+   nothing here is an alert. */
+.actuate-pill.off { color: var(--warn-amber); }
+.actuate-pill.denied { color: var(--warn-amber); }
+.actuate-pill.parked { color: var(--warn-amber); }
+.actuate-pill.executing { color: var(--cyan-bright); }
+.actuate-pill.armed { color: var(--cyan); }
+.actuate-pill.ran { color: var(--learn-green); }
+/* The proposed PER-ACTION plan — the action CLASS + a faithful target, shown as
+   TEXT, never a runnable control and never a coordinate/typed-text. */
+.actuate-plan {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 8px;
+  background: rgba(6, 12, 20, 0.7);
+  border: 1px dashed rgba(255, 180, 84, 0.4);
+  font-size: 0.8em;
+  user-select: text;
+}
+.actuate-kind {
+  color: var(--warn-amber);
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  font-size: 0.92em;
+}
+.actuate-target {
+  font-family: var(--mono);
+  color: var(--cyan-bright);
+  word-break: break-word;
+}
+.actuate-empty { padding: 2px 0; line-height: 1.4; }
+.actuate-detail { line-height: 1.4; }
+.actuate-reason { color: var(--warn-amber); }
+.actuate-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ----------------------------------------------------- UNIFIED SEARCH panel */
+/* UNIFIED SEARCH // EVERYTHING — one query fanned out across every available
+   source, grouped BY SOURCE with real citations + an honest coverage line
+   (searched vs skipped-with-reason). PRIVATE + REVIEW-ONLY: cited results only,
+   no action button (searching is spoken). On-device sources are badged GREEN
+   (content never leaves the device); cloud sources CYAN (searched only when
+   connected); a skipped source is shown AMBER (a real, honest skip, not an alert
+   — RED stays reserved for alerts). */
+.unified-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.unified-query { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.unified-query-label {
+  font-size: 0.62em;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+}
+.unified-query-text { font-size: 0.82em; color: var(--cyan-bright); }
+
+/* Coverage line: searched vs skipped, never conflated. */
+.unified-coverage { display: flex; flex-direction: column; gap: 5px; }
+.unified-coverage-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.unified-coverage-label {
+  font-size: 0.62em;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+  flex: 0 0 auto;
+}
+.unified-coverage-none { font-size: 0.74em; color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
+.unified-coverage-chips { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* A searched-source pill, badged by privacy posture. */
+.unified-src {
+  font-size: 0.66em;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.unified-src.on-device { color: var(--learn-green); }
+.unified-src.cloud { color: var(--cyan); }
+
+/* A skipped source + its honest reason — amber (degraded/honest, not an alert). */
+.unified-skip {
+  font-size: 0.7em;
+  color: var(--warn-amber);
+}
+.unified-skip-reason { color: var(--warn-amber); opacity: 0.75; }
+
+/* Results grouped by source, in the daemon's deterministic ranked order. */
+.unified-groups { display: flex; flex-direction: column; gap: 10px; }
+.unified-group { display: flex; flex-direction: column; gap: 6px; }
+.unified-group-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.unified-group-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.unified-group-count {
+  font-size: 0.66em;
+  color: var(--cyan-dim);
+  font-variant-numeric: tabular-nums;
+}
+.unified-hits { display: flex; flex-direction: column; gap: 6px; }
+.unified-hit {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.unified-hit-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.unified-hit-cite {
+  font-size: 0.76em;
+  font-weight: 600;
+  color: var(--cyan);
+  word-break: break-all;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.unified-hit-ts {
+  font-size: 0.66em;
+  color: var(--cyan-dim);
+  font-variant-numeric: tabular-nums;
+}
+.unified-hit-score {
+  font-size: 0.7em;
+  color: var(--learn-green);
+  font-variant-numeric: tabular-nums;
+}
+.unified-hit-title { font-size: 0.78em; font-weight: 600; color: var(--cyan-bright); }
+.unified-hit-snippet {
+  font-size: 0.78em;
+  line-height: 1.4;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.unified-empty { padding: 2px 0; line-height: 1.4; }
+.unified-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ------------------------------------------------- ANSWER PROVENANCE panel */
+/* ANSWER // PROVENANCE — the last answer's HONEST provenance: the REAL
+   tool-result SOURCES that informed it (a real tool name + locator + bounded
+   snippet), the honest "from my own knowledge" label when no retrieval ran, and
+   the model's self-reported CONFIDENCE (grounded/inferred/uncertain). HONEST +
+   REVIEW-ONLY: real sources only (never fabricated), no action button. Confidence
+   is the model's OWN self-report, not a measured score. Ships OFF — the panel
+   renders nothing until [answers].cite / [answers].confidence is enabled.
+   Green = grounded/cited; cyan = inferred; amber = uncertain / from-my-knowledge
+   (real, honest states, not alerts — RED stays reserved for alerts). */
+.answer-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.answer-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.answer-pill.conf-grounded { color: var(--learn-green); }
+.answer-pill.conf-inferred { color: var(--cyan); }
+.answer-pill.conf-uncertain { color: var(--warn-amber); }
+.answer-pill.cited { color: var(--learn-green); }
+.answer-pill.own-knowledge { color: var(--warn-amber); }
+
+/* Confidence row: the model's self-report (level chip + one-line reason). */
+.answer-confidence { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.answer-confidence-head {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.answer-confidence-reason {
+  font-size: 0.78em;
+  line-height: 1.4;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  flex: 1 1 100%;
+}
+
+/* Sources section: the real cited tool-result sources, or the honest
+   from-my-knowledge label. */
+.answer-sources { display: flex; flex-direction: column; gap: 6px; }
+.answer-sources-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.answer-sources-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.answer-empty { padding: 2px 0; line-height: 1.4; }
+.answer-source-list { display: flex; flex-direction: column; gap: 6px; }
+.answer-source {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.answer-source-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.answer-source-tool {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  color: var(--cyan-dim);
+  text-transform: uppercase;
+}
+.answer-source-cite {
+  font-size: 0.78em;
+  font-weight: 600;
+  color: var(--cyan);
+  word-break: break-all;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.answer-source-snippet {
+  font-size: 0.78em;
+  line-height: 1.4;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.answer-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ----------------------------------------------------------- REPORT panel #40 */
+/* REPORT // GENERATED — the read-only readout for a report the daemon assembled
+   from already-cited notebook/research sources (report.built). The title +
+   section/citation counts + a bounded preview of the REAL citations. Every
+   citation is a real source ref an input claim carried — never fabricated; an
+   empty report says "no sources to report on" plainly. REVIEW-ONLY (no button);
+   ships OFF behind [report].enabled. Green = cited/built; amber = honest-empty
+   (an honest state, not an alert — RED stays reserved for alerts). */
+.report-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.report-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.report-title {
+  font-size: 0.92em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+.report-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.report-pill.built { color: var(--learn-green); }
+.report-pill.cited { color: var(--learn-green); }
+.report-pill.empty { color: var(--warn-amber); }
+.report-empty { padding: 2px 0; line-height: 1.4; }
+.report-sections,
+.report-citations { display: flex; flex-direction: column; gap: 6px; }
+.report-sections-title,
+.report-citations-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.report-citations-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.report-section-list {
+  margin: 0;
+  padding-left: 1.2em;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.report-section-item { font-size: 0.82em; line-height: 1.35; color: var(--text); }
+.report-citation-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.report-citation {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.report-citation-id {
+  font-size: 0.7em;
+  font-weight: 600;
+  color: var(--cyan-dim);
+  flex: 0 0 auto;
+}
+.report-citation-text { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.report-citation-title { font-size: 0.82em; font-weight: 600; color: var(--cyan); word-break: break-word; }
+.report-citation-url {
+  font-size: 0.74em;
+  color: var(--cyan-dim);
+  word-break: break-all;
+}
+.report-more { font-size: 0.74em; padding-top: 2px; }
+.report-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ------------------------------------------------------------- CHART panel #41 */
+/* CHART // <title> — the EXACT renderer for a daemon ChartSpec (chart.data). It
+   plots the series the daemon emitted, by kind (bar/line/sparkline): every
+   emitted point, line segments only between the given points, NO interpolation /
+   invented / extrapolated point; axis ranges derived from the data; an
+   honest-empty spec shows "no data". NEUTRAL presentation (no button, no action);
+   ships OFF behind [chart].enabled. */
+.chart-body { display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.chart-empty { padding: 8px 0; line-height: 1.4; }
+.chart-svg { width: 100%; height: auto; display: block; }
+.chart-plot-rect {
+  fill: rgba(26, 214, 255, 0.02);
+  stroke: rgba(26, 214, 255, 0.12);
+  stroke-width: 0.6;
+}
+.chart-axis-line { stroke: rgba(26, 214, 255, 0.35); stroke-width: 0.8; }
+.chart-tick-label {
+  fill: var(--cyan-dim);
+  font-size: 7px;
+  font-family: var(--mono, monospace);
+}
+.chart-tick-label.y { text-anchor: end; }
+.chart-tick-label.x.start { text-anchor: start; }
+.chart-tick-label.x.end { text-anchor: end; }
+.chart-line { stroke: currentColor; stroke-width: 1.4; }
+.chart-line.sparkline { stroke-width: 1.1; }
+.chart-dot { fill: currentColor; }
+.chart-bar { fill: currentColor; opacity: 0.7; }
+.chart-axes { display: flex; gap: 12px; flex-wrap: wrap; }
+.chart-axis { font-size: 0.72em; color: var(--cyan-dim); letter-spacing: 0.04em; }
+.chart-legend { display: flex; gap: 10px; flex-wrap: wrap; }
+.chart-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 0.72em;
+  color: var(--text);
+}
+.chart-legend-swatch { width: 8px; height: 8px; border-radius: 2px; display: inline-block; }
+.chart-legend-count { font-size: 0.9em; color: var(--cyan-dim); }
+.chart-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ------------------------------------------------------- BRIEF // FOCUS panel */
+/* BRIEF // FOCUS — the attention surface for #23 (the smarter brief,
+   proactive.digest) + #24 (focus profiles, focus.active). HONEST + READ-ONLY.
+   BRIEF: the prioritized items, each cited to its REAL source (calendar event id
+   / message id / news source), or the honest-empty "nothing to brief" state —
+   never a padded/fabricated item. FOCUS: the active profile + what it is quieting;
+   the default profile is the identity (today's behavior). A focus profile only
+   QUIETS what surfaces — it never loosens a gate or enables an action (stated on
+   the wire + in the copy). Green = urgent/cited; cyan = important/surfacing; amber
+   = routine / empty / quieted (real, honest states, not alerts — RED stays for
+   alerts). No button — review only. */
+.brief-body { display: flex; flex-direction: column; gap: 12px; padding: 4px 2px; }
+.brief-section { display: flex; flex-direction: column; gap: 6px; }
+.brief-section-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.brief-section-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.brief-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.brief-pill.cited { color: var(--learn-green); }
+.brief-pill.empty { color: var(--warn-amber); }
+.brief-pill.prio-urgent { color: var(--learn-green); }
+.brief-pill.prio-important { color: var(--cyan); }
+.brief-pill.prio-routine { color: var(--warn-amber); }
+.brief-pill.profile-default { color: var(--cyan-dim); }
+.brief-pill.profile-work { color: var(--cyan); }
+.brief-pill.profile-sleep { color: var(--warn-amber); }
+.brief-pill.profile-deep_focus { color: var(--warn-amber); }
+.brief-pill.profile-custom { color: var(--cyan); }
+
+.brief-empty { padding: 2px 0; line-height: 1.4; }
+.brief-item-list { display: flex; flex-direction: column; gap: 6px; }
+.brief-item {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 6px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.brief-item-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.brief-item-text {
+  font-size: 0.82em;
+  line-height: 1.4;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+.brief-item-source {
+  font-size: 0.7em;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  color: var(--cyan-dim);
+  word-break: break-all;
+}
+
+/* Focus posture: the active profile's quieting knobs + the honest contract note. */
+.focus-default { padding: 2px 0; line-height: 1.4; }
+.focus-body { display: flex; flex-direction: column; gap: 6px; }
+.focus-quieting { display: flex; flex-direction: column; gap: 4px; }
+.focus-knob { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.focus-knob-label {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  color: var(--cyan-dim);
+  text-transform: uppercase;
+  flex: 0 0 auto;
+  min-width: 72px;
+}
+.focus-knob-value {
+  font-size: 0.8em;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.focus-knob-value.muted { color: var(--warn-amber); }
+.focus-knob-value.verb-full { color: var(--learn-green); }
+.focus-knob-value.verb-brief { color: var(--cyan); }
+.focus-knob-value.verb-silent { color: var(--warn-amber); }
+.focus-cat {
+  font-size: 0.92em;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid rgba(26, 214, 255, 0.22);
+  color: var(--cyan);
+}
+.focus-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ------------------------------------------------- RESEARCH NOTEBOOKS panel */
+/* RESEARCH // NOTEBOOKS — the user's saved research (daemon/src/notebook.rs,
+   emitted as `notebook.card`). HONEST + READ-ONLY: it surfaces a notebook voice
+   command's verb, the topic + saved-run count, a bounded already-redacted snippet
+   of the surfaced run, and the run's REAL fetched-source citations (title + URL).
+   Cites real fetched sources only (never fabricated); no live fetch and no action
+   button happen here. Green = saved/cited; cyan = revisited/shelf; amber =
+   forgotten / no-sources / honest-empty (real states, not alerts — RED stays for
+   alerts). */
+.notebook-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.notebook-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.notebook-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.notebook-pill.verb-saved { color: var(--learn-green); }
+.notebook-pill.verb-revisit { color: var(--cyan); }
+.notebook-pill.verb-list { color: var(--cyan); }
+.notebook-pill.verb-forget { color: var(--warn-amber); }
+.notebook-pill.verb-save_none,
+.notebook-pill.verb-forget_none,
+.notebook-pill.verb-error { color: var(--warn-amber); }
+.notebook-pill.cited { color: var(--learn-green); }
+.notebook-pill.no-sources { color: var(--warn-amber); }
+.notebook-topic {
+  font-size: 0.82em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+.notebook-count {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  color: var(--cyan-dim);
+  font-variant-numeric: tabular-nums;
+}
+.notebook-snippet {
+  font-size: 0.78em;
+  line-height: 1.45;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.notebook-empty { padding: 2px 0; line-height: 1.4; }
+.notebook-cites { display: flex; flex-direction: column; gap: 6px; }
+.notebook-cites-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.notebook-cites-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.notebook-cite-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding-left: 1.4em;
+}
+.notebook-cite {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.notebook-cite-title { font-size: 0.78em; font-weight: 600; color: var(--cyan); word-break: break-word; }
+.notebook-cite-url {
+  font-size: 0.7em;
+  color: var(--cyan-dim);
+  word-break: break-all;
+}
+.notebook-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ------------------------------------------------- INFERENCE PERF panel */
+/* INFERENCE // PERF — the read-only surface for speculative decoding (#37),
+   battery/thermal throttle (#38), and selectable quantization (#39). HONEST +
+   READ-ONLY: it reports the path that ACTUALLY ran this turn (whether speculative
+   decoding ran, the quant that loaded, the active throttle plan or none), sourced
+   from the daemon's per-turn `model.tier` payload. The real speedup / RAM-quality
+   tradeoff / thermal-battery effect are device/model-gated and never measured
+   here. Green = speculative actually ran; cyan = the loaded quant; amber = an
+   active throttle (a real state worth noticing, not an alert); dim = OFF/neutral
+   (no throttle, normal generation — today's runtime). No action button. */
+.infperf-body { display: flex; flex-direction: column; gap: 12px; padding: 4px 2px; }
+.infperf-row { display: flex; flex-direction: column; gap: 4px; }
+.infperf-row-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.infperf-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.infperf-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+  font-variant-numeric: tabular-nums;
+}
+.infperf-pill.spec-on { color: var(--learn-green); }
+.infperf-pill.spec-off { color: var(--cyan-dim); }
+.infperf-pill.throttle-none { color: var(--cyan-dim); }
+.infperf-pill.throttle-on { color: var(--warn-amber); }
+.infperf-pill.quant-known { color: var(--cyan); }
+.infperf-pill.quant-unknown { color: var(--warn-amber); }
+.infperf-sub {
+  font-size: 0.64em;
+  letter-spacing: 0.06em;
+  color: var(--cyan-dim);
+}
+.infperf-sub.defer { color: var(--warn-amber); }
+.infperf-note { line-height: 1.4; }
+.infperf-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ------------------------------------------------------------ LIFE-LOG panel */
+/* LIFE-LOG // DIGEST — the user's own activity digest (daemon/src/lifelog.rs,
+   emitted as `lifelog.digest`). HONEST + READ-ONLY: it summarizes the user's REAL
+   recorded (already-redacted) episodes — the period, the real episode count, the
+   rendered digest line, and the bounded themes / topics / recent summaries. Never
+   invents an event; an empty window shows the honest "nothing logged" state. No
+   action button. Cyan = the period/digest; amber = the honest-empty state. */
+.lifelog-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.lifelog-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.lifelog-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.lifelog-pill.period { color: var(--cyan); }
+.lifelog-count {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  color: var(--cyan-dim);
+  font-variant-numeric: tabular-nums;
+}
+.lifelog-digest-text {
+  font-size: 0.82em;
+  line-height: 1.45;
+  color: var(--fg, rgba(255, 255, 255, 0.9));
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.lifelog-empty { padding: 2px 0; line-height: 1.4; color: var(--warn-amber); }
+.lifelog-tags { display: flex; flex-direction: column; gap: 4px; }
+.lifelog-tags-head {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.lifelog-tag-row { display: flex; flex-wrap: wrap; gap: 6px; }
+.lifelog-tag {
+  font-size: 0.7em;
+  padding: 1px 7px;
+  border-radius: 10px;
+  border: 1px solid rgba(26, 214, 255, 0.25);
+  background: rgba(26, 214, 255, 0.05);
+  color: var(--cyan);
+}
+.lifelog-summaries { display: flex; flex-direction: column; gap: 4px; }
+.lifelog-summaries-head {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.lifelog-summary-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+  padding-left: 1.2em;
+}
+.lifelog-summary {
+  font-size: 0.78em;
+  line-height: 1.4;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  word-break: break-word;
+}
+.lifelog-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ----------------------------------------------- ANSWER SELF-CHECK panel */
+/* ANSWER // SELF-CHECK — the last answer's OPTIONAL second self-verification
+   outcome (daemon/src/anthropic.rs `verify` module, emitted as `answer.verified`
+   from main.rs run_pipeline). HONEST + REVIEW-ONLY: the model re-reads its own
+   draft against the real sources it used; the badge is the outcome, never a
+   verdict that the answer is correct. Ships OFF — the panel renders nothing until
+   [answers].verify is enabled AND the turn is gated in.
+   Green = verified-clean (the self-check found nothing to flag — NOT a correctness
+   guarantee); cyan = revised (the self-check corrected it — a real, honest state);
+   amber = flagged (an unresolved caveat the answer carries — a real bound, not an
+   alert; RED stays reserved for alerts). */
+.verify-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.verify-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.verify-head {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.verify-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.verify-pill.verify-verified-clean { color: var(--learn-green); }
+.verify-pill.verify-revised { color: var(--cyan); }
+.verify-pill.verify-flagged { color: var(--warn-amber); }
+.verify-meaning {
+  font-size: 0.78em;
+  line-height: 1.4;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  flex: 1 1 100%;
+}
+.verify-foot { margin-top: 2px; line-height: 1.35; }
+
+/* ------------------------------------------------------- AUDIO // I/O panel */
+/* AUDIO // I/O — the read-only #30 live interpretation / #31 multi-speaker
+   diarization / #32 custom wake-word indicator. Reuses the verify-* row/body
+   layout; the pill tones map onto the same FUI palette as the dot tones (green =
+   calm/honest default, amber = an accent worth noticing — live interpret active
+   or a confirmed multi-speaker diarization, dim = an idle/not-seen resting state).
+   HONEST + READ-ONLY: device-gated live loops, ElevenLabs-Scribe-only diarization,
+   never a fabricated speaker/translation/wake trigger. Ships OFF/neutral. */
+.audioio-panel .verify-pill { display: inline-flex; align-items: center; gap: 5px; }
+.verify-pill.audioio-good { color: var(--learn-green); }
+.verify-pill.audioio-warn { color: var(--warn-amber); }
+.verify-pill.audioio-idle { color: var(--fg-dim, rgba(255, 255, 255, 0.5)); }
+.audioio-sub {
+  margin: -4px 0 0 0;
+  padding-left: 2px;
+  font-size: 0.74em;
+  line-height: 1.35;
+  flex: 1 1 100%;
+}
+
+/* ---------------------------------------------- ANSWER CROSS-CHECK panel */
+/* ANSWER // CROSS-CHECK — the last answer's two OPTIONAL answer-quality passes,
+   siblings of SELF-CHECK: #21 tool-result plausibility cross-check (emitted as
+   `answer.cross_checked`) and #22 multi-model debate (emitted as `answer.debated`),
+   both from daemon/src/anthropic.rs via main.rs run_pipeline. HONEST + REVIEW-ONLY:
+   the cross-check only DOWNGRADES + FLAGS (never removes a confirmation gate, never
+   proves correctness); debate SURFACES disagreement (never a fabricated consensus)
+   and falls back to one model when the second is unavailable. Both ship OFF — each
+   row renders nothing until its gate is enabled AND the turn is gated in; with both
+   off the panel renders nothing.
+   #21: green = CHECKED (nothing tripped — NOT a correctness guarantee); amber =
+   UNVERIFIED (a check tripped, confidence downgraded — a real bound, not an alert).
+   #22: green = CORROBORATED (both models agreed); amber = DISPUTED (models disagree,
+   BOTH surfaced — a real divergence, not an alert); cyan = ONE-MODEL (second model
+   unavailable, an honest fallback). RED stays reserved for alerts. */
+.crosscheck-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.crosscheck-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.crosscheck-head {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.crosscheck-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.crosscheck-pill.crosscheck-plausible { color: var(--learn-green); }
+.crosscheck-pill.crosscheck-flagged { color: var(--warn-amber); }
+.crosscheck-pill.debate-agree { color: var(--learn-green); }
+.crosscheck-pill.debate-disagree { color: var(--warn-amber); }
+.crosscheck-pill.debate-fallback { color: var(--cyan); }
+.crosscheck-meaning {
+  font-size: 0.78em;
+  line-height: 1.4;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  flex: 1 1 100%;
+}
+.crosscheck-foot { margin-top: 2px; line-height: 1.35; }
+.crosscheck-foot p { margin: 0 0 6px; }
+.crosscheck-foot p:last-child { margin-bottom: 0; }
+
+/* --------------------------------------------------- KNOWLEDGE GRAPH panel */
+/* KNOWLEDGE GRAPH // FROM YOUR DOCUMENTS — entities EXTRACTED from the user's own
+   indexed documents (a conservative on-device heuristic), grouped BY TYPE with
+   each node's source PROVENANCE citation + the relationships as from→to edges.
+   PRIVATE + REVIEW-ONLY: extracted/cited nodes only, no action button (building is
+   spoken). Cyan is the neutral data accent; amber marks the honest at-cap skip
+   count (a real bound, not an alert — RED stays reserved for alerts). */
+.kg-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+
+/* Build stats: chunks scanned / entities / relationships / skipped-at-cap. */
+.kg-stats { display: flex; flex-direction: column; gap: 6px; }
+.kg-stats-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.kg-stats-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.kg-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.kg-pill.method { color: var(--cyan); }
+.kg-stats-counts { display: flex; gap: 14px; flex-wrap: wrap; }
+.kg-count { display: flex; flex-direction: column; gap: 1px; }
+.kg-count-val {
+  font-size: 1.05em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+  font-variant-numeric: tabular-nums;
+}
+.kg-count.warn .kg-count-val { color: var(--warn-amber); }
+.kg-count-label {
+  font-size: 0.62em;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+}
+.kg-count.warn .kg-count-label { color: var(--warn-amber); opacity: 0.8; }
+.kg-note { line-height: 1.35; }
+.kg-empty { padding: 2px 0; line-height: 1.4; }
+
+/* Entities grouped by type (Project/Person/Deadline/Task/Topic/Thread). */
+.kg-groups { display: flex; flex-direction: column; gap: 10px; }
+.kg-group { display: flex; flex-direction: column; gap: 6px; }
+.kg-group-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.kg-group-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.kg-group-count {
+  font-size: 0.66em;
+  color: var(--cyan-dim);
+  font-variant-numeric: tabular-nums;
+}
+.kg-entities { display: flex; flex-direction: column; gap: 4px; }
+.kg-entity {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.kg-entity-name {
+  font-size: 0.8em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+  flex: 0 1 auto;
+  min-width: 0;
+}
+.kg-entity-source {
+  font-size: 0.66em;
+  color: var(--cyan-dim);
+  word-break: break-all;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.kg-entity-source.none,
+.kg-rel-source.none { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); font-style: italic; }
+
+/* Relationships as from → to edges, each with its grounding source. */
+.kg-rels { display: flex; flex-direction: column; gap: 6px; }
+.kg-rels-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.kg-rels-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.kg-rels-count {
+  font-size: 0.66em;
+  color: var(--cyan-dim);
+  font-variant-numeric: tabular-nums;
+}
+.kg-rels-list { display: flex; flex-direction: column; gap: 4px; }
+.kg-rel {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.18);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.kg-rel-edge { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.kg-rel-from,
+.kg-rel-to { font-size: 0.78em; font-weight: 600; color: var(--cyan-bright); word-break: break-all; }
+.kg-rel-relation {
+  font-size: 0.68em;
+  letter-spacing: 0.04em;
+  color: var(--cyan);
+  padding: 0 5px;
+  border-radius: 3px;
+  background: rgba(26, 214, 255, 0.08);
+}
+.kg-rel-arrow { font-size: 0.78em; color: var(--cyan-dim); }
+.kg-rel-source {
+  font-size: 0.64em;
+  color: var(--cyan-dim);
+  word-break: break-all;
+  font-variant-numeric: tabular-nums;
+}
+.kg-foot { margin-top: 2px; line-height: 1.35; }
+
+/* --------------------------------------------------------------- EVAL panel */
+/* EVAL // OPTIMIZER — the MEASURED scorecard + propose-only optimizer status.
+   MEASURED + REVIEW-ONLY: every number is a real measurement (or an honest
+   "awaiting turns" placeholder); the optimizer is OFF by default and never
+   auto-tunes. Amber is reserved for the pending-proposal attention state and the
+   estimate label; RED stays reserved for alerts (none here). */
+.eval-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
+.eval-section { display: flex; flex-direction: column; gap: 5px; }
+.eval-section-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.eval-section-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.eval-runtime-pill {
+  font-size: 0.62em;
+  letter-spacing: 0.07em;
+  padding: 1px 5px;
+  border-radius: 3px;
+  border: 1px solid var(--cyan-dim);
+  color: var(--cyan-dim);
+}
+.eval-metrics {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 6px 12px;
+}
+.eval-stat { display: flex; flex-direction: column; gap: 1px; min-width: 56px; }
+.eval-stat-label {
+  font-size: 0.6em;
+  letter-spacing: 0.06em;
+  color: var(--cyan-dim);
+}
+.eval-stat-value {
+  font-family: var(--mono);
+  font-size: 0.86em;
+  color: var(--ice);
+  font-variant-numeric: tabular-nums;
+}
+.eval-stat.prominent .eval-stat-value { font-size: 1.04em; color: var(--cyan-bright); }
+.eval-stat-awaiting {
+  font-size: 0.66em;
+  letter-spacing: 0.05em;
+  color: var(--ice-dim);
+}
+.eval-stat-sub { font-size: 0.58em; color: var(--ice-dim); }
+.eval-n {
+  align-self: flex-end;
+  font-family: var(--mono);
+  font-size: 0.62em;
+  color: var(--ice-dim);
+}
+.eval-estimate-note { align-self: flex-end; font-size: 0.62em; }
+.eval-awaiting { padding: 3px 2px; line-height: 1.4; font-size: 0.72em; }
+
+.eval-optimizer { padding-top: 4px; border-top: 1px dashed rgba(26, 214, 255, 0.18); }
+.eval-opt-pill {
+  font-size: 0.64em;
+  letter-spacing: 0.07em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.eval-opt-pill.off { color: var(--ice-dim); }
+.eval-opt-pill.on { color: var(--learn-green); }
+.eval-opt-posture {
+  font-size: 0.6em;
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+}
+.eval-opt-note { line-height: 1.4; font-size: 0.72em; }
+
+/* The pending optimizer proposal — an ATTENTION (review) state, NOT an error,
+   so it leans on amber. There is deliberately NO apply button; the panel shows
+   the MANUAL command only. */
+.eval-proposal {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 7px 9px;
+  border: 1px solid rgba(255, 180, 84, 0.45);
+  border-radius: 4px;
+  background: rgba(255, 180, 84, 0.05);
+}
+.eval-proposal-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.eval-proposal-tag {
+  font-size: 0.62em;
+  letter-spacing: 0.08em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid var(--warn-amber);
+  color: var(--warn-amber);
+}
+.eval-proposal-improve {
+  font-family: var(--mono);
+  font-size: 0.84em;
+  color: var(--learn-green);
+  font-variant-numeric: tabular-nums;
+}
+.eval-proposal-changes { font-size: 0.66em; color: var(--ice-dim); }
+.eval-proposal-detail { font-size: 0.66em; font-family: var(--mono); }
+.eval-proposal-apply { display: flex; flex-direction: column; gap: 2px; }
+.eval-proposal-apply-label {
+  font-size: 0.58em;
+  letter-spacing: 0.08em;
+  color: var(--warn-amber);
+}
+.eval-proposal-cmd {
+  font-family: var(--mono);
+  font-size: 0.72em;
+  color: var(--ice);
+  background: rgba(0, 0, 0, 0.35);
+  padding: 3px 6px;
+  border-radius: 3px;
+  word-break: break-all;
+  user-select: text;
+}
+.eval-proposal-note { line-height: 1.35; font-size: 0.66em; }
+.eval-foot { margin-top: 2px; line-height: 1.35; font-size: 0.7em; }
+
+/* SKILLS // MARKETPLACE — review-only catalog browser. Mirrors the MCP panel's
+   visual language (cyan surface, amber for a gated entry; RED stays reserved for
+   alerts). All interactivity here is local view state (search + category filter)
+   — there is no action that invokes a skill or changes a setting. */
+.skills-body { display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.skills-off { padding: 4px 2px; line-height: 1.4; }
+.skills-foot { margin-top: 4px; line-height: 1.35; }
+.skills-head { display: flex; align-items: center; gap: 8px; }
+.skills-count {
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--cyan-bright);
+}
+.skills-pill {
+  font-size: 0.68em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.skills-pill.ok { color: var(--learn-green); }
+.skills-pill.off { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
+/* A gated (consequential) skill is badged amber so it reads distinctly from a
+   pure read-only one — it parks for a spoken confirmation before it can act. */
+.skills-pill.conseq { color: var(--warn-amber); }
+/* A source-gated skill needs a data source until one is configured. */
+.skills-pill.gated { color: var(--cyan-dim); }
+.skills-cats { display: flex; flex-wrap: wrap; gap: 5px; }
+.skills-cat {
+  font: inherit;
+  font-size: 0.74em;
+  letter-spacing: 0.03em;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid rgba(26, 214, 255, 0.25);
+  background: transparent;
+  color: var(--cyan);
+  cursor: pointer;
+}
+.skills-cat:hover:not(:disabled) { border-color: rgba(26, 214, 255, 0.5); }
+.skills-cat.on {
+  border-color: var(--cyan-bright);
+  background: rgba(26, 214, 255, 0.1);
+  color: var(--cyan-bright);
+}
+.skills-cat:disabled { opacity: 0.4; cursor: default; }
+.skills-cat .skills-cat-n { font-style: normal; opacity: 0.7; font-size: 0.9em; }
+.skills-search { display: flex; align-items: center; gap: 8px; }
+.skills-search-in {
+  flex: 1;
+  font: inherit;
+  font-size: 0.78em;
+  padding: 3px 8px;
+  border-radius: 3px;
+  border: 1px solid rgba(26, 214, 255, 0.25);
+  background: rgba(26, 214, 255, 0.03);
+  color: var(--fg, #cfeffe);
+}
+.skills-search-in::placeholder { color: var(--cyan-dim); opacity: 0.7; }
+.skills-search-in:focus { outline: none; border-color: var(--cyan-bright); }
+.skills-search-n { font-size: 0.72em; white-space: nowrap; }
+.skills-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 280px;
+  overflow-y: auto;
+}
+.skills-skill {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.16);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.skills-skill-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.skills-skill-name {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--cyan-bright);
+}
+.skills-skill-cat {
+  font-size: 0.68em;
+  letter-spacing: 0.06em;
+  color: var(--cyan-dim);
+  text-transform: uppercase;
+}
+.skills-skill-desc { font-size: 0.78em; line-height: 1.3; opacity: 0.85; }
+.skills-empty { font-size: 0.74em; padding: 4px 2px; }
+
+/* ---------------------------------------------------------------- TAKEOVER */
+/* The explicit ENTER trigger — small, idle, bottom-right of the windowed HUD.
+   Visible-but-unobtrusive; the ONLY way into takeover (never auto-entered). */
+.takeover-enter {
+  position: fixed;
+  right: 14px;
+  bottom: 12px;
+  z-index: 55;
+  padding: 6px 12px;
+  font: 600 11px/1 var(--text);
+  letter-spacing: 0.08em;
+  color: var(--cyan);
+  background: rgba(4, 10, 18, 0.7);
+  border: 1px solid var(--cyan-dim);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.takeover-enter:hover { background: rgba(8, 20, 34, 0.9); }
+
+/* The full-desktop takeover stage — covers everything, NO OS chrome inside. */
+.takeover-stage {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  background: radial-gradient(120% 120% at 50% 0%, rgba(6, 16, 28, 0.97), rgba(1, 4, 9, 0.99));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* The ALWAYS-PRESENT visible EXIT control — high contrast, top-right, above the
+   desktop so it can never be occluded. Rendered unconditionally by the stage. */
+.takeover-exit {
+  position: absolute;
+  top: 14px;
+  right: 16px;
+  z-index: 100;
+  padding: 8px 16px;
+  font: 700 12px/1 var(--text);
+  letter-spacing: 0.1em;
+  color: #ffd9d2;
+  background: rgba(40, 10, 8, 0.92);
+  border: 1px solid rgba(255, 120, 96, 0.85);
+  border-radius: 4px;
+  cursor: pointer;
+  box-shadow: 0 0 14px rgba(255, 96, 72, 0.35);
+}
+.takeover-exit:hover { background: rgba(64, 14, 10, 0.96); }
+.takeover-exit-hint {
+  position: absolute;
+  top: 44px;
+  right: 18px;
+  z-index: 100;
+  font: 10px/1 var(--text);
+  letter-spacing: 0.08em;
+  color: var(--cyan-dim);
+}
+
+.takeover-desktop {
+  flex: 1;
+  display: grid;
+  grid-template-columns: 1fr 1.3fr 1fr;
+  gap: 16px;
+  padding: 56px 18px 18px;
+  overflow: hidden;
+}
+.takeover-col {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+}
+.takeover-col-center { align-items: stretch; }
+/* The reused CommandDeck renders inline (not as a fixed overlay) inside the
+   takeover desktop's center column. */
+.takeover-col-center .command-deck {
+  position: static;
+  inset: auto;
+  background: none;
+  backdrop-filter: none;
+  display: block;
+}
+
+/* ------------------------------------------------------------------------ *
+ * MEMORY // EPISODIC TIMELINE + WHAT JARVIS KNOWS ABOUT YOU (components/      *
+ * MemoryPanel.tsx). The HUD-side surface for the episodic store (Core-A) +    *
+ * the user model (Core-B). TELEMETRY-FED + READ-MOSTLY: it shows ACTIVITY     *
+ * (counts, timestamps, agents, the eviction proof) — never the episode bodies *
+ * or the profile entries, which stay LOCAL in the daemon and are recalled by   *
+ * voice. Accent is Mnemosyne's hue (--memory-hue, ~280, indigo); RED          *
+ * (--alert-red) appears ONLY on the stale / NOT-KEPT affordances.             *
+ * ------------------------------------------------------------------------ */
+.memory {
+  min-height: 0;
+}
+
+.mem-body {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  padding: 8px 10px 12px;
+  min-height: 0;
+  max-height: 340px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--memory-hue, 280) 80% 60% / 0.35) transparent;
+}
+
+/* Honesty banner — the whole contract in one line (dashed, like vi-surface). */
+.mem-honesty {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  padding: 6px 9px;
+  border: 1px dashed hsl(var(--memory-hue, 280) 80% 65% / 0.32);
+  font-family: var(--mono);
+}
+
+.mem-honesty-dot {
+  width: 7px;
+  height: 7px;
+  flex: none;
+  border-radius: 50%;
+  background: hsl(var(--memory-hue, 280) 90% 70%);
+  box-shadow: 0 0 6px hsl(var(--memory-hue, 280) 90% 62%);
+  animation: viPulse 2.2s ease-in-out infinite;
+}
+
+.mem-honesty-text {
+  font-size: 9.5px;
+  letter-spacing: 0.16em;
+  color: hsl(var(--memory-hue, 280) 90% 82%);
+}
+
+.mem-honesty-sub {
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  color: #6b7d92;
+}
+
+/* A labeled section (timeline / user-model). */
+.mem-section {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.mem-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid hsl(var(--memory-hue, 280) 70% 60% / 0.18);
+  padding-bottom: 3px;
+}
+
+.mem-section-label {
+  font-family: var(--mono);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  color: hsl(var(--memory-hue, 280) 75% 80%);
+}
+
+.mem-section-note {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.08em;
+  color: #5f7184;
+}
+
+.mem-empty {
+  font-family: var(--mono);
+  font-size: 9px;
+  line-height: 1.5;
+  letter-spacing: 0.04em;
+  color: #6b7d92;
+  padding: 6px 4px;
+}
+
+/* EPISODIC TIMELINE — newest-first rows of episode-store outcomes. */
+.mem-timeline {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  max-height: 124px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: hsl(var(--memory-hue, 280) 80% 60% / 0.3) transparent;
+}
+
+.mem-ep {
+  display: grid;
+  grid-template-columns: auto auto 1fr auto;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 6px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  border-left: 2px solid hsl(var(--memory-hue, 280) 80% 65% / 0.45);
+  background: hsl(var(--memory-hue, 280) 60% 30% / 0.06);
+}
+
+/* A gated-out (not kept) turn reads as a muted, red-edged row — honest, not a
+   failure: it is a deliberately-skipped transient/unverified/abandoned turn. */
+.mem-ep.gated {
+  border-left-color: var(--alert-red);
+  opacity: 0.62;
+}
+
+.mem-ep-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: hsl(var(--memory-hue, 280) 90% 70%);
+}
+
+.mem-ep.gated .mem-ep-dot {
+  background: var(--alert-red);
+  box-shadow: none;
+}
+
+.mem-ep-time {
+  color: #8fb4c4;
+  letter-spacing: 0.04em;
+}
+
+.mem-ep-scope {
+  font-size: 8.5px;
+  letter-spacing: 0.1em;
+  color: hsl(var(--memory-hue, 280) 85% 80%);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mem-ep-state {
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+  color: hsl(var(--memory-hue, 280) 70% 76%);
+}
+
+.mem-ep.gated .mem-ep-state {
+  color: var(--alert-red);
+}
+
+.mem-timeline-foot,
+.mem-um-foot {
+  font-family: var(--text);
+  font-size: 9px;
+  line-height: 1.5;
+  color: #6b7d92;
+}
+
+.mem-timeline-foot b,
+.mem-um-foot b {
+  color: hsl(var(--memory-hue, 280) 75% 82%);
+  font-weight: 600;
+}
+
+/* WHAT JARVIS KNOWS ABOUT YOU — the user-model inspector. */
+.mem-um {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 6px 8px;
+  border: 1px solid hsl(var(--memory-hue, 280) 70% 60% / 0.22);
+}
+
+.mem-um-stat {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.mem-um-num {
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 600;
+  color: hsl(var(--memory-hue, 280) 90% 84%);
+}
+
+.mem-um-unit {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.12em;
+  color: #6b7d92;
+}
+
+.mem-um-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-left: auto;
+  text-align: right;
+}
+
+.mem-um-when {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  color: #5f7184;
+}
+
+.mem-um-stale {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  color: var(--alert-red);
+}
+
+/* FORGET control — two-step arm -> confirm (a stray click can't wipe). */
+.mem-forget {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-top: 2px;
+}
+
+.mem-forget-btn,
+.mem-forget-yes,
+.mem-forget-no {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  padding: 5px 9px;
+  background: transparent;
+  border: 1px solid hsl(var(--memory-hue, 280) 70% 62% / 0.45);
+  color: hsl(var(--memory-hue, 280) 80% 80%);
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.mem-forget-btn:hover:not(:disabled),
+.mem-forget-no:hover:not(:disabled) {
+  background: hsl(var(--memory-hue, 280) 60% 40% / 0.14);
+}
+
+.mem-forget-btn:disabled,
+.mem-forget-yes:disabled,
+.mem-forget-no:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.mem-forget-confirm {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.mem-forget-q {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  color: #c5d6e2;
+}
+
+/* The destructive confirm is the ONE place this panel borrows the alert colour
+   for an affirmative control — a clear, deliberate "this clears it" signal. */
+.mem-forget-yes {
+  border-color: var(--alert-red);
+  color: var(--alert-red);
+}
+
+.mem-forget-yes:hover:not(:disabled) {
+  background: rgba(255, 59, 78, 0.12);
+}
+
+.mem-forget-result {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  color: hsl(var(--memory-hue, 280) 70% 80%);
+}
+
+.mem-forget-note {
+  font-family: var(--text);
+  font-size: 8.5px;
+  line-height: 1.5;
+  color: #5f7184;
+}
+
+/* RETENTION — the bounded evict-oldest proof line. */
+.mem-retention {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding-top: 5px;
+  border-top: 1px solid hsl(var(--memory-hue, 280) 70% 60% / 0.18);
+}
+
+.mem-retention-label {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.18em;
+  color: hsl(var(--memory-hue, 280) 70% 74%);
+}
+
+.mem-retention-text {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.03em;
+  color: #6b7d92;
+}

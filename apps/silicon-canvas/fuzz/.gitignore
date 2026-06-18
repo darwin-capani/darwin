@@ -1,0 +1,5 @@
+# cargo-fuzz build + corpus artifacts (regenerated locally; never committed).
+target/
+corpus/
+artifacts/
+coverage/

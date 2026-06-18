@@ -1,0 +1,38 @@
+# Global-Scan feed registry: categories -> list of RSS/Atom feed URLs.
+#
+# Every URL here was verified to return a parseable feed over HTTPS (root
+# <rss>/<feed>, non-empty item/entry list) from OPEN, reputable, non-paywalled
+# sources. The hostname of every URL MUST also appear in manifest.toml's
+# [permissions].net_hosts — the seatbelt profile allows outbound only to those
+# hosts, so an unlisted host would simply fail to fetch.
+#
+# Keep this in lockstep with the manifest. main.py reads this file; if it is
+# missing it falls back to a small built-in default set (the same URLs).
+
+[world]
+feeds = [
+  "https://feeds.npr.org/1001/rss.xml",
+  "https://feeds.bbci.co.uk/news/world/rss.xml",
+]
+
+[tech]
+feeds = [
+  "https://feeds.arstechnica.com/arstechnica/index",
+  "https://hnrss.org/frontpage",
+  "https://www.theverge.com/rss/index.xml",
+]
+
+[science]
+feeds = [
+  "https://www.sciencedaily.com/rss/top/science.xml",
+  "https://www.nasa.gov/feed/",
+]
+
+[markets]
+feeds = [
+  "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
+  # MarketWatch top stories. The feeds.marketwatch.com vanity URL 301s to this
+  # Dow Jones content host; we point straight at the final URL so the host the
+  # app actually connects to (feeds.content.dowjones.io) is the one in net_hosts.
+  "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+]

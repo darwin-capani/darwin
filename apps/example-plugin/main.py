@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Example-Plugin — the #36 PLUGIN SDK reference handler.
+
+A minimal micro-app illustrating the capability-module contract. It runs under
+the daemon-generated default-deny seatbelt profile (docs/SANDBOX.md), connects
+to its own per-app JSONL socket, and includes its per-launch capability token on
+EVERY line — exactly like global-scan. It exposes the two READ-ONLY tools its
+manifest declares:
+
+  - example.read_status : reports a tiny status object (no side effect).
+  - example.summarize   : asks the daemon-mediated generate proxy for a neutral
+                          one-line summary (op=generate ONLY; the proxy structurally
+                          refuses any other op — see docs/SANDBOX.md finding #4).
+
+This handler is intentionally tiny: the SDK's value is the VALIDATED CONTRACT
+(daemon/src/plugin_sdk.rs) and the sandbox, not the handler. It has NO
+consequential surface — nothing it can do reaches the confirmation gate, by
+construction. The daemon never spawns it in tests; this file is the live runtime
+the seatbelt profile launches.
+"""
+import json
+import os
+import socket
+import sys
+
+TOKEN = os.environ.get("JARVIS_APP_TOKEN", "")
+SOCKET_PATH = os.environ.get("JARVIS_APP_SOCKET", "")
+
+
+def send(conn, obj):
+    """Send one JSONL line; every app->host line carries the capability token."""
+    obj["token"] = TOKEN
+    conn.sendall((json.dumps(obj) + "\n").encode("utf-8"))
+
+
+def handle(conn, msg):
+    """Dispatch one host->app op. Only the manifest-declared tools are handled."""
+    op = msg.get("type")
+    if op == "start":
+        send(conn, {"type": "status", "data": {"tool": "example.read_status", "ready": True}})
+    elif op == "refresh":
+        # example.read_status — a tiny, side-effect-free status object.
+        send(conn, {"type": "items", "data": {"status": "ok", "uptime_note": "example plugin alive"}})
+    elif op == "stop":
+        raise SystemExit(0)
+
+
+def main():
+    if not TOKEN or not SOCKET_PATH:
+        print("missing JARVIS_APP_TOKEN / JARVIS_APP_SOCKET; not launched by jarvisd", file=sys.stderr)
+        return 1
+    conn = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    conn.connect(SOCKET_PATH)
+    buf = b""
+    while True:
+        chunk = conn.recv(4096)
+        if not chunk:
+            break
+        buf += chunk
+        while b"\n" in buf:
+            line, buf = buf.split(b"\n", 1)
+            if not line.strip():
+                continue
+            try:
+                handle(conn, json.loads(line))
+            except SystemExit:
+                return 0
+            except Exception as e:  # noqa: BLE001 — a plugin never crashes the host
+                send(conn, {"type": "log", "data": {"line": f"handler error: {e}"}})
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

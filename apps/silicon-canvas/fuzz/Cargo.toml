@@ -1,0 +1,38 @@
+# cargo-fuzz target for Silicon Canvas's KiCad parser (SPEC §1/§7).
+#
+# This is a SEPARATE package (not a member of any workspace) that depends on the
+# `silicon-canvas` library by path. It builds ONLY under the nightly toolchain
+# with `libFuzzer` linked in, driven by `cargo +nightly fuzz run parse_document`.
+# It is intentionally NOT part of the normal `cargo build` / `cargo test` of the
+# parent crate, so a stable-only / GPU-less box never tries to compile libFuzzer.
+#
+# The parser's panic-freedom is ALSO covered by an in-tree, stable, deterministic
+# randomized test (see `sexpr::tests::fuzz_*` and `parser::tests::fuzz_*`), which
+# is what actually runs in CI here. This target is the deeper, coverage-guided
+# complement for a machine that has nightly + cargo-fuzz available.
+
+[package]
+name = "silicon-canvas-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.silicon-canvas]
+path = ".."
+
+# Keep this crate out of any future workspace auto-discovery: it must be built
+# on its own with nightly, never folded into the parent's stable build graph.
+[workspace]
+
+[[bin]]
+name = "parse_document"
+path = "fuzz_targets/parse_document.rs"
+test = false
+doc = false
+bench = false

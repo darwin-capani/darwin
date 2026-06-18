@@ -1,0 +1,38 @@
+# Global-Scan — intel feed aggregator (first micro-app on the substrate).
+# Schema: docs/SANDBOX.md. Aggregates & summarizes PUBLIC, non-paywalled RSS
+# feeds and renders them in the HUD; no prediction, no surveillance.
+#
+# net_hosts lists EXACTLY the feed hostnames apps/global-scan/feeds.toml polls
+# (every URL there was verified to return a parseable RSS/Atom feed). The
+# seatbelt profile jarvisd generates allows outbound network only to these
+# hosts; the daemon-mediated generate proxy socket is the app's one extra grant
+# (it never reaches the raw inference.sock — see docs/SANDBOX.md finding #4).
+
+[app]
+name        = "global-scan"
+version     = "0.1.0"
+description = "Intel feed aggregator: polls reputable public RSS/Atom feeds, dedupes and ranks the latest items, optionally adds a neutral local-LLM summary, and renders the result as a HUD panel."
+entry       = "apps/global-scan/main.py"
+runtime     = "python"
+
+[permissions]
+audio     = false
+gpu       = false
+# Exactly the feed hostnames in feeds.toml — keep the two lists in lockstep.
+net_hosts = [
+  "feeds.npr.org",          # NPR — world/national news
+  "feeds.bbci.co.uk",       # BBC — world news
+  "feeds.arstechnica.com",  # Ars Technica — technology
+  "hnrss.org",              # Hacker News front page — technology
+  "www.theverge.com",       # The Verge — technology
+  "www.sciencedaily.com",   # ScienceDaily — science
+  "www.nasa.gov",           # NASA — science
+  "feeds.a.dj.com",            # WSJ public markets headlines — markets
+  "feeds.content.dowjones.io", # MarketWatch top stories (post-redirect host) — markets
+]
+fs_read   = ["state/ipc/apps/generate.sock"] # op-restricted generate proxy (NOT raw inference.sock)
+fs_write  = ["state/apps/global-scan"]       # cache / scratch (its own app dir)
+
+[ui]
+surface          = "panel"
+telemetry_topics = ["feed"]

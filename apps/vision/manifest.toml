@@ -1,0 +1,61 @@
+# Vision — on-device computer-vision micro-app (mirrors silicon-canvas:
+# runtime = "binary", a prebuilt Swift binary in the app dir).
+# Schema: docs/SANDBOX.md / daemon/src/apps.rs::AppManifest.
+#
+# DEFENSIVE-ONLY, ON-DEVICE ONLY:
+#   - net_hosts = [] -> fully offline. Frames/detections/embeddings NEVER leave
+#     the device. No cloud, no upload, no network of any kind.
+#   - Built-in Apple Vision/Core ML requests only — NO external model download.
+#   - Detects generic presence/motion/objects/humans-as-rectangles, NOT "who".
+#     No facial recognition, no identity database, no person re-identification.
+#   - Authorized-only + the user's OWN devices (own camera, own screen, own
+#     video files). No covert capture.
+#
+# CAMERA + SCREEN are gated by macOS TCC, which requires runtime USER CONSENT
+# and is NOT grantable by an SBPL/seatbelt profile. This manifest only DECLARES
+# the need; the actual grant happens on-device at first use. See the
+# [permissions] note below for the proposed schema extension.
+
+[app]
+name        = "vision"
+version     = "0.1.0"
+description = "On-device computer-vision micro-app: detects generic presence, motion, humans-as-rectangles, animals, objects and salient regions from the user's OWN camera, screen, or video files using Apple's built-in Vision/Core ML requests (ANE/GPU). Fully offline, defensive-only — no identity recognition, no upload."
+entry       = "vision"        # prebuilt Swift binary in the app dir
+runtime     = "binary"
+
+[permissions]
+# audio = false: this app NEVER opens the microphone. The classify.sound op does
+# NOT capture audio — it classifies ONE audio CLIP the HOST already wrote to disk
+# (from the daemon's own captured buffer) with the built-in Sound Analysis
+# classifier, then discards it. Continuous live mic monitoring + TCC consent are
+# a SEPARATE, opt-in daemon concern; the Vision app stays mic-free.
+audio     = false                       # vision/sound-of-a-clip only — never the microphone
+gpu       = true                        # ANE / Core ML / GPU for built-in Vision requests
+net_hosts = []                          # fully offline — frames/detections NEVER leave the device
+fs_read   = [
+  "apps/vision/videos/input",           # user-provided video files for analyze.file
+]
+fs_write  = ["state/tmp/vision"]        # scratch: decoded-frame cache, run artifacts
+
+# --- PROPOSED schema extension (activated in Integrate) --------------------
+# The current daemon AppManifest uses serde(deny_unknown_fields), so the two
+# keys below are kept as comments until daemon/src/apps.rs adds them to
+# PermissionsSection. They DECLARE a TCC-gated capability the app needs; the
+# daemon should surface them in the launch UI / status, but they grant nothing
+# by themselves (TCC consent is the real gate and is requested on-device):
+#   camera = true   # AVFoundation capture from the user's OWN camera (TCC: Camera)
+#   screen = true   # ScreenCaptureKit capture of the user's OWN screen (TCC: Screen Recording)
+# Until then, AppEnv also reads JARVIS_VISION_CAMERA / JARVIS_VISION_SCREEN
+# from the launch env as an interim declaration channel (default: false).
+
+[ui]
+surface          = "panel"
+telemetry_topics = [
+  "vision.detections",   # per-frame detection summary (the main stream)
+  "vision.status",       # watch lifecycle: started/stopped, source, sensitivity, TCC state
+  "vision.motion",       # motion events (frame-to-frame change crossing threshold)
+  "vision.perf",         # inference timing: p50/p95 ms, fps, compute unit
+  "vision.error",        # recoverable errors (decode fail, TCC denied, bad op)
+  "vision.screen",       # OCR screen-read readout: recognized text blocks + control candidates (read-on-request)
+  "vision.sound",        # Sound Analysis class readout: top sound classes (LABELS only) over a supplied clip (audio never leaves)
+]

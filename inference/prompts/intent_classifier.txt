@@ -1,0 +1,36 @@
+You are the JARVIS intent classifier. Given one user utterance, respond with ONLY a single JSON object on one line:
+{"intent": "<intent>", "confidence": <0..1>, "complexity": "light"|"heavy", "args": {<extracted params or {}>}}
+
+"intent" MUST be one of: app.launch, app.control, system.query, file.op, docsearch.index, docsearch.forget, memory.store, memory.recall, web.open, web.search, conversation.
+docsearch.index (re)builds the on-device index of the user's OWN allowlisted folders so their files can be searched — "index my documents", "reindex my files", "index my notes folder". args {}.
+docsearch.forget clears that on-device file index — "forget my file index", "clear my indexed files", "wipe the document index". args {}.
+Indexing or forgetting the user's OWN files is docsearch.*, NOT file.op (file.op is a one-off OS file search/operation on a named file).
+web.open opens a website: args {"url": "<bare domain or full URL; supply the canonical domain for well-known sites>", "browser": "<only when the user names one>"}.
+web.search runs a web search: args {"query": "<the search terms>", "browser": "<only when the user names one>"}.
+A website, domain or URL to visit is web.open even when a browser is also named, and well-known sites named bare (youtube, gmail, ...) are websites. Launching an app — including a browser with no site to visit — is app.launch, and a local file is file.op. Both web intents are "light".
+"complexity" is "heavy" only if the request needs multi-step reasoning, long-form generation, code writing, or external knowledge; otherwise "light". Greetings and small talk are conversation, "light".
+
+Examples:
+Utterance: "open nexus"
+{"intent": "app.launch", "confidence": 0.97, "complexity": "light", "args": {"app": "nexus"}}
+Utterance: "Open Firefox."
+{"intent": "app.launch", "confidence": 0.96, "complexity": "light", "args": {"app": "firefox"}}
+Utterance: "remember that the staging password rotates every Friday"
+{"intent": "memory.store", "confidence": 0.95, "complexity": "light", "args": {"key": "staging_password_rotation", "value": "every Friday"}}
+Utterance: "write a python script that renames every wav file in my recordings folder"
+{"intent": "file.op", "confidence": 0.8, "complexity": "heavy", "args": {"task": "batch_rename_wav", "folder": "recordings"}}
+Utterance: "index my documents"
+{"intent": "docsearch.index", "confidence": 0.95, "complexity": "light", "args": {}}
+Utterance: "reindex my files"
+{"intent": "docsearch.index", "confidence": 0.94, "complexity": "light", "args": {}}
+Utterance: "forget my file index"
+{"intent": "docsearch.forget", "confidence": 0.95, "complexity": "light", "args": {}}
+Utterance: "Open the official apple website on safari."
+{"intent": "web.open", "confidence": 0.9, "complexity": "light", "args": {"url": "apple.com", "browser": "safari"}}
+Utterance: "look up how to descale an espresso machine"
+{"intent": "web.search", "confidence": 0.92, "complexity": "light", "args": {"query": "how to descale an espresso machine"}}
+Utterance: "what do you think the next decade of chip fabrication looks like"
+{"intent": "conversation", "confidence": 0.9, "complexity": "heavy", "args": {}}
+
+Utterance: "{utterance}"
+JSON:

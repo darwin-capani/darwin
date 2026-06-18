@@ -1,0 +1,198 @@
+<div align="center">
+
+# ⟁ Project JARVIS
+
+### An on-device-first autonomous AI desktop OS for Apple Silicon.
+
+**A local MLX brain with cloud fallback · a 27-agent constellation · a holographic HUD · a sandboxed micro-app runtime.**
+**Everything consequential ships OFF, behind a master switch, per-action confirm, on-device voice-id, and lockdown.**
+
+</div>
+
+---
+
+JARVIS turns an Apple Silicon Mac into a voice-driven, always-on AI environment that **owns the machine end to end** — yet never does anything consequential until you explicitly arm it. A Rust daemon (`jarvisd`) runs the always-on audio/intent loop; MLX serves local inference on the Apple GPU; the Anthropic API handles what the local models can't; and a fullscreen HUD (Tauri 2 + React-Three-Fiber) renders the machine's live state as a dark-glass, cyan-holographic heads-up display. macOS stays underneath as an invisible host kernel.
+
+It is built **honestly**: the headline features below are real and tested, the device-gated ones are labeled, and nothing here is a fabricated benchmark.
+
+---
+
+## Install in one command
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/darwin-capani/jarvis/main/install.sh | bash
+```
+
+The installer presents a **futuristic, full-screen progress UI** and does the "every bit" install per-user, with **no sudo**:
+
+- creates the install home at `~/Library/Application Support/JARVIS`,
+- provisions the Python 3.11 venv and installs `inference/requirements.txt`,
+- **builds every release artifact fresh** (`jarvisd` + the HUD + the Swift/Rust micro-apps — it never ships a prebuilt binary),
+- downloads the MLX LLM + Whisper STT weights into the per-machine HuggingFace cache,
+- initializes the SQLite memory store,
+- and (optionally) installs the two LaunchAgents so JARVIS comes up on login.
+
+Prefer to read before you run? Clone and use the local entrypoint — same steps, same UI:
+
+```sh
+git clone https://github.com/darwin-capani/jarvis.git
+cd jarvis
+./install.sh                # interactive install with the progress UI
+./install.sh --dry-run      # print every action, change nothing
+./install.sh --help         # all flags
+```
+
+**Requirements:** Apple Silicon Mac (M1 or later), macOS, Homebrew Python 3.11 (`/opt/homebrew/bin/python3.11` — MLX has no wheels for 3.14), a Rust toolchain (`rustup`), and Node 20+ for the HUD. The 4B default model wants **≥ 16 GB unified memory** (8 GB works but is tight). Cloud fallback and premium voice need an `ANTHROPIC_API_KEY` (and optionally an ElevenLabs key) — entered once in the HUD and stored in the macOS Keychain, never on disk.
+
+### Uninstall — one command, two confirmations
+
+```bash
+~/Library/Application\ Support/JARVIS/uninstall.sh
+```
+
+Completely removes JARVIS from the machine, behind a **two-step typed confirmation** — it asks *"Delete JARVIS completely? (yes/no)"*, and only if you answer `yes` does it ask *"Are you ABSOLUTELY sure? (yes/no)"*. Either `no` (or any unrecognized input) cancels and deletes nothing. It removes **only** JARVIS's own footprint — the install home, the two LaunchAgents, the JARVIS Keychain items (`com.jarvis.daemon` only), and the logs — each a specific, guarded path (never a broad `rm`). Run it with `--dry-run` first to see exactly what it would remove without touching anything.
+
+---
+
+## What it can do
+
+JARVIS **acts on the machine, not just talks about it.** The built-in actuator (`daemon/src/actions.rs`) is **benign-only by hard contract** — no shell passthrough, no deleting/moving/writing your files, no keystroke synthesis — and backs both the local intent router and the cloud tool loop, so any phrasing gets things done.
+
+| Capability | Phrasing | Notes |
+|---|---|---|
+| **Open / quit apps** | "open Safari", "quit Chrome" | fuzzy-matched across `/Applications` + `/System/Applications`; ambiguous names come back as a spoken list, never a wrong guess |
+| **Open websites & search** | "open the apple website", "search for mechanical keyboards" | only `http`/`https` ever reach `open`; `file:`/`javascript:`/`data:` are refused |
+| **Find files** | "find my budget spreadsheet" | Spotlight under your home folder, filenames then contents, newest first |
+| **Set volume / report status** | "volume to 40%", "system status" | live CPU/MEM/DISK/UPTIME from the telemetry cache |
+| **Remember & recall facts** | "my name is Dar", "what are my projects?" | durable facts in SQLite, folded into every later reply; corrections overwrite |
+| **Search your own docs, on-device** | "index my documents", "search my files for the lease clause" | **OFF by default**, allowlisted folders only, embeddings never leave the device; honest BM25 fallback that reports which method ran |
+
+Heavy or low-confidence requests route to the cloud and run the **same** actions through an Anthropic Messages-API tool loop (bounded: ≤ 3 model calls, 75 s), so *"could you possibly get that browser thing going"* works as well as *"open Safari."* Every executed action emits an `action.executed` telemetry event.
+
+### The 27-agent constellation
+
+A single local engine + per-agent profiles (not 27 separate models) gives JARVIS a routed "council" — the prime orchestrator (`jarvis`) hears every request and delegates to the right specialist: `friday` (daily intel), `vision` (research/OSINT), `ultron` (defensive security/automation), `steve` (CTO/builds), `gecko` (markets), `pepper` (personal EA/reflection), `hulk` (offline survival mode), and 20 more. Profiles live in `config/agents.toml`; isolation between them is the real security win, not the count.
+
+### The voice & persona
+
+JARVIS answers out loud in a neural voice — **Kokoro TTS on the Metal GPU via `mlx-audio`** — in the register of the Iron Man films' JARVIS: a composed British butler-AI that addresses you as "sir," with dry understatement, kept to a few sentences. The persona (`inference/prompts/persona.txt`) is the single source of truth; there are no canned replies — every response is phrased live by the LLM from real handler data. An **optional ElevenLabs cloud-voice tier** is an *added* premium layer that ships **DISABLED**; on-device Kokoro stays the private/offline default and the fallback on any cloud error.
+
+### The HUD
+
+`hud/` is the face of the machine — a fullscreen Tauri 2 + React-Three-Fiber app rendering the live telemetry feed: a glowing wireframe core that breathes when idle, pulses with your voice while listening, surges cyan for local thinking and violet for cloud; a transcript feed, system gauges, a 64-bar waveform equalizer, a pipeline-latency strip, and toasts for learned facts and executed actions. It's a pure client of `ws://127.0.0.1:7177` — it can crash and reconnect without ever touching the voice pipeline.
+
+---
+
+## Architecture at a glance
+
+```
+                            voice in ─┐
+                                      ▼
+  ┌───────────────────────────────────────────────────────────────┐
+  │  jarvisd  (Rust, LaunchAgent, always-on)                       │
+  │  audio capture → VAD → STT → intent router → actuator          │
+  │  telemetry server (ws://127.0.0.1:7177) · micro-app supervisor │
+  │  gates: master switch · confirm · voice-id · lockdown · policy │
+  └───────┬───────────────────────────────┬──────────────┬────────┘
+          │ Unix socket (IPC)             │ tool loop     │ telemetry
+          ▼                                ▼              ▼
+  ┌───────────────┐              ┌─────────────────┐  ┌──────────────┐
+  │ inference/    │              │  Anthropic API  │  │  hud/  (HUD) │
+  │ MLX server    │              │  (cloud fallbk) │  │  Tauri 2 +   │
+  │ STT·classify· │              └─────────────────┘  │  React-Three │
+  │ generate·TTS  │                                    │  -Fiber      │
+  │ (Apple GPU)   │              ┌─────────────────┐  └──────────────┘
+  └───────────────┘              │  apps/  (micro- │
+                                 │  app runtime,   │
+                                 │  sandboxed)     │
+                                 └─────────────────┘
+```
+
+| Component | Path | Language | Role |
+|---|---|---|---|
+| `jarvisd` | `daemon/` | Rust | Audio capture, VAD, routing, actuation, telemetry server, micro-app supervisor |
+| Inference server | `inference/` | Python 3.11 + MLX | STT, intent classification, local generation, fact extraction, TTS over a Unix socket |
+| HUD | `hud/` | Tauri 2 + React + TS + R3F | Fullscreen telemetry visualization + settings (API key → Keychain) |
+| Micro-apps | `apps/` | mixed (Rust, Swift) | Sandboxed apps per `docs/SANDBOX.md`; specs in `apps/<name>/SPEC.md` |
+| Config | `config/` | TOML | `jarvis.toml` (runtime) + `agents.toml` (constellation) |
+| Runtime state | `state/` | — | Sockets, logs, tmp, SQLite DBs. **Never committed.** |
+
+### Hardware reality (read before contributing)
+
+JARVIS was developed on an M4 Mac Mini, but the whole stack (arm64 + Metal/MLX + Core ML/ANE + macOS) is present on **every** Apple Silicon chip — local performance simply scales with the chip and unified memory.
+
+- **macOS is the host, not Linux.** MLX (the Apple-GPU Metal backend) and Core ML/ANE access exist **only** on macOS. Asahi Linux is a non-starter on M4-generation silicon, and even where Asahi boots, MLX/Core ML need macOS — so macOS is the host regardless of chip.
+- **MLX runs on the Apple GPU via Metal, not the Neural Engine.** LLM decode is memory-bandwidth-bound and the GPU sees full unified-memory bandwidth, so the model stays on the GPU. The ANE — reachable only through Core ML — is reserved for Phase-3 auxiliary models (wake-word, VAD, embeddings).
+- **"Zero latency" is marketing, not physics.** Honest targets on M4-class silicon (M1/M2/M3 proportionally slower): local intent classification < 300 ms, STT < 1 s/utterance, first token < 500 ms. These are design targets, not measured claims on your device.
+- **Kiosk takeover is Phase-2 BUILT but DEVICE-GATED.** The `enter_takeover`/`exit_takeover` wiring, state machine, exit-safety, and `TakeoverStage` layout are implemented and tested; the *actual* fullscreen render + Dock/menu-bar hide need a live Tauri app on a real display and were never observed headlessly. It ships OFF and is never auto-entered. See `docs/ROADMAP.md`.
+
+---
+
+## Safety model
+
+**Everything consequential is OFF by default, and arming it takes more than one switch.** Read-only lookups always work; anything that posts/sends/spends or controls the machine must clear every layer:
+
+1. **Master switch — OFF.** `[integrations].allow_consequential` ships `false`. Every consequential subsystem (self-heal, app forge, standing missions, MCP, trace optimizer, cloud voice/STT, doc search, screen capture, proactive speech) has its **own** independent OFF-default switch — none piggyback.
+2. **Per-action confirm.** Each consequential action parks behind a fresh, cross-turn spoken confirmation. No batching past the gate — a macro or standing mission re-runs every consequential step through the gate individually.
+3. **On-device voice-id (optional).** When enrolled + enabled, an unrecognized speaker can't trigger or confirm a consequential action. **Fail-closed**: an embed error is treated as unverified for the consequential path, never bricking ordinary replies. The profile is a local feature vector; no audio leaves the device.
+4. **Lockdown.** One command hard-disables the consequential surface regardless of the other switches.
+5. **Policy + allowlists.** A per-action policy plus per-feature allowlists bound what each path can touch (e.g. doc-search `roots` ships **empty** — never a whole-disk scan).
+6. **Benign-only actuator + sandboxed apps.** The core actuator can't shell out, delete files, or synthesize keystrokes; micro-apps run under a default-deny sandbox with minimal declared permissions.
+
+Secrets live in the macOS Keychain (resolved once at startup, never logged, never in a URL/argv/telemetry event). Where any learning corpus is stored — only when its own switch is on — content is PII-redacted with bounded retention. See [SECURITY.md](SECURITY.md).
+
+---
+
+## Layout
+
+Per-user install home — **no sudo, relocatable** (the daemon is `JARVIS_ROOT`-relative):
+
+```
+~/Library/Application Support/JARVIS/
+├── daemon/           # jarvisd (Rust) — built fresh at install
+├── inference/        # MLX inference server (Python 3.11)
+├── hud/              # fullscreen HUD (Tauri 2 + React + R3F)
+├── apps/             # sandboxed micro-apps
+├── boot/             # boot wrappers + LaunchAgent plist TEMPLATES (__JARVIS_ROOT__)
+├── scripts/          # install_boot.sh, init_memory.py, ane_probe.py, …
+├── config/           # jarvis.toml (runtime) + agents.toml (constellation)
+├── docs/             # ARCHITECTURE · ROADMAP · HUD · SANDBOX · …
+├── .venv/            # Python 3.11 environment (not committed)
+└── state/            # runtime only, NEVER committed:
+    ├── env.sh        #   secrets (chmod 600), sourced by boot wrappers
+    ├── ipc/          #   inference.sock, command.sock, command.token, apps/<name>.sock
+    ├── logs/  tmp/  images/  voice-samples/  openers/
+    ├── ane/          #   Core ML probe model cache (.mlpackage)
+    └── *.db          #   SQLite memory / audit / optimize stores
+```
+
+The git repo tracks **source only**. The entire `state/` tree, all secrets, every build artifact, model weight, `.venv`, log, `.wav`, SQLite DB, and rendered plist are `.gitignore`d — see [.gitignore](.gitignore). This repo is safe to push public.
+
+---
+
+## What needs you
+
+Some things only **you** can grant — a config flag cannot substitute:
+
+- **macOS consent (TCC).** The OS will prompt for **Microphone** (the always-on loop), and — only if you turn the relevant OFF-by-default features on — **Screen Recording**, **Accessibility/Automation**, and broader **Files & Folders** access. These are yours to approve or deny.
+- **API keys in Keychain.** Paste your `ANTHROPIC_API_KEY` (and optional `elevenlabs_api_key`) once in the HUD's Settings — masked, stored in the Keychain (service `com.jarvis.daemon`), never plaintext on disk. Restart JARVIS after changing a key.
+- **Auto-login (optional).** For true boot-to-JARVIS, enable "Automatically log in as" in System Settings → Users & Groups (requires FileVault off). The LaunchAgents do the rest.
+- **Arming consequential features.** Nothing side-effecting runs until you deliberately flip its switch *and* confirm each action.
+
+---
+
+## Further reading
+
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — component diagram, IPC contract, telemetry, learning loop, memory subsystem
+- [docs/OS_CAPABILITIES.md](docs/OS_CAPABILITIES.md) — the full capability surface
+- [docs/ROADMAP.md](docs/ROADMAP.md) — the phase plan
+- [docs/HUD.md](docs/HUD.md) · [hud/README.md](hud/README.md) — HUD spec and the shipped HUD
+- [docs/SANDBOX.md](docs/SANDBOX.md) · [docs/PLUGIN_SDK.md](docs/PLUGIN_SDK.md) — micro-app sandboxing + plugin SDK
+- [docs/BRINGUP.md](docs/BRINGUP.md) — manual dev bring-up (venv, models, release build, run)
+- [SECURITY.md](SECURITY.md) — security posture + private reporting · [LICENSE](LICENSE) — MIT
+
+<div align="center">
+
+*Built on-device. Off by default. Honest about its limits.*
+
+</div>

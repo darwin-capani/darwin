@@ -1,0 +1,23 @@
+# Silicon Canvas — GPU-accelerated schematic renderer.
+# Schema: docs/SANDBOX.md
+
+[app]
+name        = "silicon-canvas"
+version     = "0.1.0"
+description = "GPU-accelerated schematic renderer: loads symbol/footprint libraries and renders interactive schematics as a fullscreen HUD surface."
+entry       = "silicon-canvas"        # prebuilt Metal binary in the app dir
+runtime     = "binary"
+
+[permissions]
+audio     = false
+net_hosts = []                                    # fully offline
+fs_read   = [
+  "apps/silicon-canvas/libraries",                # symbol + footprint libraries
+  "apps/silicon-canvas/projects",                 # schematic project files
+]
+fs_write  = ["state/tmp/silicon-canvas"]          # render cache
+gpu       = true                                  # Metal access for rendering
+
+[ui]
+surface          = "fullscreen"
+telemetry_topics = ["canvas.render_ms", "canvas.viewport", "canvas.selection"]

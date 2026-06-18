@@ -1,0 +1,74 @@
+# Nexus Core — low-latency audio routing matrix + DSP/metering realtime core.
+#
+# A Rust library loaded by the Python control plane (apps/nexus/main.py) via
+# ctypes. The manifest declares runtime = "python", entry = "python3 main.py";
+# Python hosts this native core because the realtime IOProc path cannot be
+# Python (SPEC §2). This crate is STANDALONE — NOT part of the daemon workspace.
+#
+# crate-type:
+#   - "cdylib"  -> the .dylib Python loads via ctypes (the FFI surface in ffi.rs)
+#   - "rlib"    -> so `cargo test` can exercise the pure DSP/matrix/metering
+#                  functions directly as a Rust library (the headless math).
+#
+# DEPENDENCY POLICY (FROZEN): every dependency the whole app will ever need is
+# declared HERE so no downstream module agent edits this file. The CoreAudio
+# device stack is behind an OPTIONAL `coreaudio` feature so `cargo test` /
+# `cargo build` work WITHOUT a real audio device (this headless dev box), and
+# `cargo check --features coreaudio` compiles the device-gated IOProc/aggregate
+# code. The whole DSP/metering/matrix core builds and tests headlessly with
+# SYNTHESIZED in-memory buffers only — it NEVER opens a CoreAudio device.
+
+[package]
+name = "nexus_core"
+version = "0.1.0"
+edition = "2021"
+description = "Low-latency audio routing matrix + DSP/metering realtime core for the Nexus studio-control micro-app (loaded by the Python control plane via ctypes)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "nexus_core"
+# cdylib: the ctypes-loadable .dylib (the C-ABI FFI surface).
+# rlib:   lets `cargo test` link the crate as a normal Rust library so the pure
+#         DSP/matrix/metering functions are unit-testable headlessly.
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[dependencies]
+# --- core (always compiled; NO audio device, NO OS audio framework) --------
+# The realtime core is deliberately dependency-light: no allocator tricks, no
+# async, nothing that could pull a syscall onto the audio thread. The pure math
+# (mix, filters, FFT, LUFS, true-peak) is hand-written std-only so the audio
+# callback has zero hidden allocations/locks (SPEC §2). serde/toml are used by
+# the CONTROL-PLANE-adjacent preset (de)serialization helpers exposed to Python,
+# NEVER on the audio thread.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# --- CoreAudio device stack (optional; behind `coreaudio` feature) ---------
+# DEVICE-GATED, NEVER built or run on this headless box. These bind the real
+# AudioDeviceIOProc, aggregate-device create/destroy, and the HAL property
+# plumbing (SPEC §1/§2). `cargo check --features coreaudio` compiles the seam;
+# it is NEVER enabled by `cargo build`/`cargo test` here. The honest boundary:
+# this code is written CORRECT but is DEVICE-GATED and never claim-measured.
+coreaudio-sys = { version = "0.2", optional = true }
+
+[features]
+# Default OFF so the headless DSP/metering/matrix core builds and tests on a
+# device-less box with only synthesized buffers. Turn on with
+# `cargo check --features coreaudio` to compile the CoreAudio IOProc seam.
+default = []
+coreaudio = ["dep:coreaudio-sys"]
+
+[dev-dependencies]
+# (reserved for module-agent tests; kept minimal — std + the core deps above
+# cover the headless test surface: synthesized buffers + numeric assertions.)
+
+[profile.release]
+# The audio callback wants tight, vectorized, branch-light inner loops; the FFT
+# and oversampler want fast math with no surprise spills. Match silicon-canvas's
+# release discipline (opt-level 3, thin LTO, single codegen unit).
+opt-level = 3
+lto = "thin"
+codegen-units = 1

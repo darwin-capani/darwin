@@ -1,0 +1,41 @@
+[package]
+name = "jarvis-core"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "jarvisd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+cpal = "0.15"
+futures-util = "0.3"
+# Capability-token HMAC-SHA256 (RustCrypto): hmac + sha2 mint/verify the
+# per-app token, hex encodes it for the JSONL line and the launch env.
+hex = "0.4"
+hmac = "0.12"
+hound = "3.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+# 0.20 shares cpal 0.15 with the capture path (one CoreAudio backend, no
+# duplicate cpal in the tree); only the wav decoder (hound) is needed.
+rodio = { version = "0.20", default-features = false, features = ["wav"] }
+# SQLCipher (transparent, whole-file AES-256 page encryption via PRAGMA key) for
+# the at-rest encrypted-memory feature (#11). `bundled-sqlcipher` vendors a SQLite
+# amalgamation built WITH SQLCipher's crypto provider — the documented dep
+# exception for this feature (encryption needs a backend). It is a strict superset
+# of `bundled`: when [security].encrypt_memory is OFF the stores open WITHOUT a
+# PRAGMA key and behave byte-for-byte as a plain SQLite file (no behavior change).
+# `bundled-sqlcipher-vendored-openssl` so the crypto provider builds from a vendored
+# OpenSSL in this environment rather than needing a system OpenSSL.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sysinfo = "0.32"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.24"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

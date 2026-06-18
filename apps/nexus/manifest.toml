@@ -1,0 +1,20 @@
+# Project Nexus — low-latency audio routing matrix / studio control.
+# Schema: docs/SANDBOX.md
+
+[app]
+name        = "nexus"
+version     = "0.1.0"
+description = "Low-latency audio routing matrix and studio control surface for the Shure SM7dB chain: input gain, routes, monitor mixes, level metering."
+entry       = "python3 main.py"
+runtime     = "python"
+
+[permissions]
+audio     = true                      # needs the daemon's audio API for routing and metering
+net_hosts = []                        # fully offline
+fs_read   = ["apps/nexus/presets"]    # routing/mix presets
+fs_write  = ["state/tmp/nexus"]       # scratch (meter history, session state)
+gpu       = false
+
+[ui]
+surface          = "panel"
+telemetry_topics = ["audio.levels", "audio.routes", "audio.gain", "audio.clipping", "audio.spectrum"]

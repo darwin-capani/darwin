@@ -1,0 +1,231 @@
+# ============================================================================
+#  Project JARVIS — .gitignore
+#  This repo is intended to be PUBLIC. Nothing sensitive, secret, generated,
+#  or large may be tracked. When in doubt, exclude it.
+#  Source of truth that MUST be committed: config/*.toml, daemon/src,
+#  inference/*.py, hud/src, apps/*/{SPEC.md,manifest.toml,src}, scripts/*.sh,
+#  boot/* (templates), docs/*.md, README/LICENSE/SECURITY.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+#  Runtime state — sockets, logs, tmp, SQLite DBs, secrets, caches.
+#  The entire state/ tree is machine-local runtime and is NEVER committed.
+# ----------------------------------------------------------------------------
+state/
+# Belt-and-suspenders: even if state/ is ever un-ignored, these never ship.
+state/env.sh
+state/secrets
+state/secrets/
+state/secrets.*
+**/secrets/
+**/secrets.*
+
+# ----------------------------------------------------------------------------
+#  Secrets / credentials / tokens / keys — anywhere in the tree.
+# ----------------------------------------------------------------------------
+*.env
+.env
+.env.*
+env.sh
+*.secret
+*.secrets
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+*.token
+*token*
+id_rsa
+id_ecdsa
+id_ed25519
+*.crt              # local cert material; commit none
+# Common accidental key-bearing dumps. NB: `credentials.*` would otherwise match
+# SOURCE files named credentials.{rs,ts,test.ts} (the Keychain-account registry +
+# settings UI — no secrets in them), so those are explicitly re-included below.
+credentials
+credentials.*
+*.credentials
+!**/credentials.rs
+!**/credentials.ts
+!**/credentials.tsx
+!**/credentials.test.ts
+!**/credentials.test.tsx
+
+# ----------------------------------------------------------------------------
+#  Databases & write-ahead/shared-memory sidecars (SQLite memory/audit/optimize)
+# ----------------------------------------------------------------------------
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite-wal
+*.sqlite-shm
+
+# ----------------------------------------------------------------------------
+#  IPC — Unix domain sockets and their command tokens.
+# ----------------------------------------------------------------------------
+*.sock
+*.socket
+command.token
+
+# ----------------------------------------------------------------------------
+#  Editor / tooling config (e.g. Claude Code launch config) — not part of the OS.
+# ----------------------------------------------------------------------------
+.claude/
+
+# ----------------------------------------------------------------------------
+#  Logs.
+# ----------------------------------------------------------------------------
+*.log
+logs/
+**/logs/
+
+# ----------------------------------------------------------------------------
+#  Audio — TTS output, voice samples, openers, capture wavs. All generated.
+# ----------------------------------------------------------------------------
+*.wav
+*.aiff
+*.aif
+*.caf
+*.mp3
+*.flac
+
+# ----------------------------------------------------------------------------
+#  Models & ML caches — weights are downloaded per-machine by
+#  inference/deploy_models.py into the HuggingFace cache; never in the repo.
+#  Core ML probe artifacts (.mlpackage / .mlmodel / weight.bin) are generated.
+# ----------------------------------------------------------------------------
+models/
+**/models/
+*.mlpackage/
+**/*.mlpackage/
+*.mlmodel
+*.mlmodelc/
+*.mlmodelc
+*.gguf
+*.safetensors
+*.bin                # CoreML weight.bin + any downloaded weight blobs
+*.pt
+*.pth
+*.onnx
+*.npz
+.cache/
+**/.cache/
+huggingface/
+**/huggingface/
+hf_cache/
+
+# ----------------------------------------------------------------------------
+#  Rust — every crate's build output (daemon + all app crates + tauri backend).
+# ----------------------------------------------------------------------------
+target/
+**/target/
+# Cargo.lock IS committed for the binary crates (reproducible builds).
+# Convenience symlinks into target/release/ (e.g. ./mark-forge, ./silicon-canvas):
+# these point at build artifacts and would dangle on a fresh clone — the
+# installer builds the real binaries fresh, so the symlinks are never committed.
+/mark-forge
+/silicon-canvas
+apps/silicon-canvas/silicon-canvas
+
+# ----------------------------------------------------------------------------
+#  Swift — apps/vision (SwiftPM) build products.
+# ----------------------------------------------------------------------------
+.build/
+**/.build/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+DerivedData/
+**/DerivedData/
+*.dSYM/
+*.dSYM.zip
+
+# ----------------------------------------------------------------------------
+#  Node / HUD (Tauri 2 + React).
+# ----------------------------------------------------------------------------
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+hud/dist/
+hud/src-tauri/target/
+hud/src-tauri/gen/
+.vite/
+**/.vite/
+*.tsbuildinfo
+
+# ----------------------------------------------------------------------------
+#  Python.
+# ----------------------------------------------------------------------------
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.python-version
+
+# ----------------------------------------------------------------------------
+#  Rendered / installed LaunchAgent plists.
+#  The boot/*.plist files are __JARVIS_ROOT__ TEMPLATES and ARE committed.
+#  Anything rendered to an absolute path or staged for install is not.
+# ----------------------------------------------------------------------------
+*.rendered.plist
+*.installed.plist
+state/agents/*.plist
+LaunchAgents/
+
+# ----------------------------------------------------------------------------
+#  Self-heal / forge / optimize staging, proposals, rejects (all under state/,
+#  but listed explicitly in case they are relocated).
+# ----------------------------------------------------------------------------
+**/staging-*/
+**/proposals/
+**/rejected/
+**/quarantine/
+
+# ----------------------------------------------------------------------------
+#  Images / vision scratch (generated captures, sweep frames).
+# ----------------------------------------------------------------------------
+state/images/
+state/tmp/
+*.png.tmp
+
+# ----------------------------------------------------------------------------
+#  Build / dist outputs (bundled apps, archives).
+# ----------------------------------------------------------------------------
+build/
+out/
+*.app/               # bundled JARVIS.app etc. (built fresh by the installer)
+*.dmg
+*.pkg
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+
+# ----------------------------------------------------------------------------
+#  macOS / editors / misc cruft.
+# ----------------------------------------------------------------------------
+.DS_Store
+**/.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace

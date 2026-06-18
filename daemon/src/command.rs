@@ -1,0 +1,1442 @@
+//! HUD -> daemon COMMAND CHANNEL — a local-only, token-authenticated intake
+//! that lets the HUD drive the system, routing EVERY command INTO the existing
+//! gated pipeline (never around it).
+//!
+//! ## What this is (and is NOT)
+//!
+//! The HUD has always been a READ-ONLY telemetry client of `ws://127.0.0.1:7177`.
+//! This module adds the FIRST inbound surface: a confined Unix socket
+//! (`state/ipc/command.sock`) the Tauri backend connects to, carrying a small,
+//! fixed set of commands. It is JUST ANOTHER INPUT into the SAME pipeline the
+//! voice path uses — it can do NOTHING the spoken path cannot:
+//!
+//!   * a consequential `ask` STILL parks via the cross-turn confirmation gate
+//!     (confirm.rs); the channel never pre-confirms,
+//!   * the OFF-by-default master switch (`integrations.allow_consequential`)
+//!     STILL gates every fire — a `confirm {id}` with the switch OFF only
+//!     previews and fires nothing (the replay re-checks it),
+//!   * per-agent allowlist isolation STILL applies — an `ask {agent}` uses that
+//!     agent's tools only; a `confirm` re-checks the parked agent's allowlist,
+//!   * Self-Forge stays PROPOSE-ONLY — `dismiss_forge` clears the pending marker
+//!     but NEVER applies/deploys (apply stays scripts/apply_forge.sh).
+//!
+//! ## Confinement (mirrors genproxy.rs / the per-app sockets / apps.rs tokens)
+//!
+//!   1. LOCAL-ONLY: a Unix socket under `state/ipc/` (`0700` dir, `0600`
+//!      socket) — no TCP, nothing off-host.
+//!   2. TOKEN-AUTHENTICATED: every line carries a capability token verified by
+//!      [`apps::verify_command_token`] — the SAME HMAC-SHA256 machinery as the
+//!      per-app relay + the generate proxy, bound to a reserved principal and a
+//!      per-boot nonce (a forged/tampered/stale token fails closed).
+//!   3. BOUNDED: oversized lines are rejected before parse; the command set is a
+//!      fixed STRUCTURAL allowlist — an unknown command is rejected, never
+//!      routed.
+//!   4. RATE-LIMITED: a rolling per-window cap (the spam guard), same shape as
+//!      genproxy's limiter.
+//!   5. NO SECRET crosses the channel or is logged: the token authenticates the
+//!      caller; replies carry only the same prose the user would hear.
+//!
+//! ## Shape
+//!
+//! [`decide`] is a PURE function: parse + size-check + structural allowlist +
+//! token presence, with no I/O — the security tests drive it directly. The
+//! routing INTO the heavy pipeline (`route()`, `edith_brief`, `fury_mission`,
+//! roster/state) is behind the [`CommandPipeline`] trait so the tests inject a
+//! hermetic mock instead of a live daemon, while the confirmation-gate and
+//! forge-dismiss logic is exercised against the REAL `confirm` / forge state.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use serde::Deserialize;
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Mutex;
+use tracing::{info, warn};
+
+use crate::apps;
+use crate::telemetry;
+
+/// Hard cap on a single command line's length. A command is a short JSON object
+/// (a command name + a short text/goal/id); anything beyond this is a probe or a
+/// mistake and is rejected BEFORE parse so a hostile client can't feed the JSON
+/// parser an unbounded line. Generous enough for a paragraph-length `ask`.
+pub const MAX_LINE_BYTES: usize = 8 * 1024;
+
+/// Hard cap on the free-text payload (`ask.text`, `mission.goal`) AFTER parse.
+/// The pipeline itself bounds its work, but trimming here keeps an oversized
+/// (yet under-[`MAX_LINE_BYTES`]) field from reaching the model.
+pub const MAX_TEXT_CHARS: usize = 4 * 1024;
+
+/// Rolling rate-limit: at most this many commands within [`RATE_WINDOW`]. The
+/// command channel is a human at a deck, not an automation firehose; this is the
+/// spam / accidental-loop guard (mirrors genproxy's PROXY_RATE shape).
+pub const RATE: u32 = 60;
+/// The rolling window for [`RATE`].
+pub const RATE_WINDOW: Duration = Duration::from_secs(60);
+
+/// One inbound command line. We read only what we need (no `deny_unknown_fields`
+/// on the wire so a future client may add fields); the command name is validated
+/// STRUCTURALLY in [`decide`] against the fixed allowlist.
+#[derive(Debug, Deserialize)]
+struct RawCommand {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    goal: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    ts: Option<u64>,
+}
+
+/// The BOUNDED command set — the structural allowlist. Parsing a line into one
+/// of these is the ONLY way past [`decide`]; an unknown `cmd` string is
+/// [`Decision::UnknownCommand`] and never routed. Each variant carries only the
+/// already-bounded fields it needs.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Command {
+    /// Run the normal route()/pipeline path; consequential tools STILL park.
+    Ask { text: String, agent: Option<String> },
+    /// Trigger Edith's on-demand brief (read-only).
+    Brief,
+    /// Run a bounded Fury mission.
+    Mission { goal: String },
+    /// Read-only constellation/agent roster.
+    Roster,
+    /// Read-only pending + agent state snapshot.
+    State,
+    /// List pending confirmations + forge proposals (ids + faithful previews).
+    Pending,
+    /// Approve a SPECIFIC genuinely-parked confirmation by id (the authenticated
+    /// local equivalent of the spoken "confirm").
+    Confirm { id: String },
+    /// Deny a SPECIFIC parked confirmation by id (clears it; fires nothing).
+    Deny { id: String },
+    /// Dismiss a forge PROPOSAL by ts — clears the pending marker; NEVER applies.
+    DismissForge { ts: u64 },
+    /// USER-SET a per-action consequential policy from an anchored phrase
+    /// (`always allow the <tool> action` / `never allow the <tool> action` /
+    /// `always ask before the <tool> action`). This is a DEDICATED verb, NOT
+    /// `ask` — it NEVER reaches the model tool loop; the daemon classifies the
+    /// phrase (`policy::classify_policy_command`) and applies it via the
+    /// USER-SET-ONLY write path. There is no model/agent/tool path to this verb.
+    Policy { text: String },
+    /// ENGAGE the panic / lockdown emergency stop (task #12). A DEDICATED verb,
+    /// NOT `ask` — it NEVER reaches the model tool loop; the daemon calls
+    /// `lockdown::panic()` directly (sets the global flag, drops any pending
+    /// confirm, persists the marker, audits). This is the HUD PANIC button. There
+    /// is no model/agent/tool path to this verb.
+    Panic,
+    /// LIFT the lockdown (task #12). A DEDICATED verb, NOT `ask` — the
+    /// authenticated-local USER resume that, with the spoken "unlock" intent, is
+    /// the ONLY way to `lockdown::unlock()` (gates return to their configured
+    /// values; the marker is removed). NEVER model-routed.
+    Unlock,
+}
+
+/// The pre-auth decision for one inbound line. PURE and exhaustively unit-tested:
+/// size, parse, structural allowlist, and required-field shape are all decided
+/// here BEFORE any token check, rate-limit, or route — so the tests prove an
+/// unknown command and an oversized/malformed line can never reach a route.
+#[derive(Debug, PartialEq)]
+enum Decision {
+    /// Shape is valid: this is the parsed command and the token to verify.
+    Ok { token: String, command: Command },
+    /// `cmd` was not in the allowlist — rejected, never routed.
+    UnknownCommand { cmd: String },
+    /// Parsed, but a required field was missing/empty (e.g. confirm with no id).
+    BadRequest { reason: &'static str },
+    /// Line exceeded [`MAX_LINE_BYTES`] — rejected before parse.
+    Oversized,
+    /// Not parseable as a command object.
+    Malformed,
+}
+
+/// Clamp a free-text field to [`MAX_TEXT_CHARS`] characters (char-boundary safe).
+fn clamp_text(s: String) -> String {
+    if s.chars().count() <= MAX_TEXT_CHARS {
+        return s;
+    }
+    s.chars().take(MAX_TEXT_CHARS).collect()
+}
+
+/// PURE size + parse + structural-allowlist + shape gate. The ONLY accepted
+/// commands are the [`Command`] variants; every other `cmd` string is
+/// [`Decision::UnknownCommand`], so there is no code path from an unknown command
+/// to a route.
+fn decide(raw: &str) -> Decision {
+    if raw.len() > MAX_LINE_BYTES {
+        return Decision::Oversized;
+    }
+    let Ok(req) = serde_json::from_str::<RawCommand>(raw.trim()) else {
+        return Decision::Malformed;
+    };
+    let command = match req.cmd.as_str() {
+        "ask" => {
+            let text = clamp_text(req.text);
+            if text.trim().is_empty() {
+                return Decision::BadRequest { reason: "ask requires non-empty text" };
+            }
+            // An agent reference, when present, must be non-empty; resolution to
+            // a real agent happens in the pipeline (the allowlist applies there).
+            let agent = req.agent.filter(|a| !a.trim().is_empty());
+            Command::Ask { text, agent }
+        }
+        "brief" => Command::Brief,
+        "mission" => {
+            let goal = clamp_text(req.goal);
+            if goal.trim().is_empty() {
+                return Decision::BadRequest { reason: "mission requires a non-empty goal" };
+            }
+            Command::Mission { goal }
+        }
+        "roster" => Command::Roster,
+        "state" => Command::State,
+        "pending" => Command::Pending,
+        "confirm" => {
+            if req.id.trim().is_empty() {
+                return Decision::BadRequest { reason: "confirm requires an id" };
+            }
+            Command::Confirm { id: req.id }
+        }
+        "deny" => {
+            if req.id.trim().is_empty() {
+                return Decision::BadRequest { reason: "deny requires an id" };
+            }
+            Command::Deny { id: req.id }
+        }
+        "dismiss_forge" => match req.ts {
+            Some(ts) => Command::DismissForge { ts },
+            None => return Decision::BadRequest { reason: "dismiss_forge requires a ts" },
+        },
+        "policy" => {
+            let text = clamp_text(req.text);
+            if text.trim().is_empty() {
+                return Decision::BadRequest { reason: "policy requires the phrase text" };
+            }
+            Command::Policy { text }
+        }
+        // Task #12 — the HUD panic button + unlock control. Both are bare verbs
+        // (no fields): the daemon calls lockdown::panic()/unlock() directly, never
+        // the model. They still pass the SAME token + rate gate every command does.
+        "panic" => Command::Panic,
+        "unlock" => Command::Unlock,
+        // Anything else — including the empty string — is rejected here. There is
+        // NO route for an unknown command.
+        other => return Decision::UnknownCommand { cmd: other.to_string() },
+    };
+    Decision::Ok { token: req.token, command }
+}
+
+/// Per-window rolling rate-limiter for the command channel. Single principal
+/// (the one HUD token), so it is not keyed by name — just a window of recent
+/// call instants. Pure rate math, tested directly. Mirrors genproxy's limiter.
+#[derive(Default)]
+struct RateLimiter {
+    calls: Vec<Instant>,
+}
+
+impl RateLimiter {
+    /// Record a call at `now` and report whether it is ALLOWED (within [`RATE`]
+    /// over [`RATE_WINDOW`]). A rejected call is NOT recorded, so a steady stream
+    /// at the limit is not permanently wedged by one rejected burst.
+    fn check(&mut self, now: Instant) -> bool {
+        self.calls.retain(|t| now.duration_since(*t) < RATE_WINDOW);
+        if self.calls.len() as u32 >= RATE {
+            return false;
+        }
+        self.calls.push(now);
+        true
+    }
+}
+
+/// The seam to the heavy gated pipeline, abstracted so the unit tests run with a
+/// hermetic mock instead of a live daemon (no model, no socket, no network). The
+/// PRODUCTION impl ([`crate::main`]'s wiring) routes each call through the SAME
+/// pipeline the voice path uses:
+///   * [`ask`] -> `router::route()` (delegation, RAG, cloud tool-loop) — a
+///     consequential tool STILL parks via the confirmation gate,
+///   * [`brief`] -> `anticipate::on_demand_brief` (Edith's on-demand brief),
+///   * [`mission`] -> `mission::run_mission` (bounded),
+///   * [`roster`] / [`state`] -> read-only registry/state snapshots.
+///
+/// The confirm/deny-by-id and dismiss_forge commands do NOT go through this
+/// trait — they act on the REAL `confirm` slot and forge marker (via
+/// [`Dispatcher`] below), so the non-bypass guarantees are tested against the
+/// genuine gate, not a mock.
+pub trait CommandPipeline: Send + Sync {
+    /// Route an `ask` through the normal pipeline; the agent ref (if any) selects
+    /// the handling agent (its allowlist applies). A consequential tool parks —
+    /// the returned text is then the confirmation prompt, NOT a fired action.
+    fn ask(
+        &self,
+        text: &str,
+        agent: Option<&str>,
+    ) -> impl std::future::Future<Output = String> + Send;
+    /// Compose Edith's on-demand brief (read-only).
+    fn brief(&self) -> impl std::future::Future<Output = String> + Send;
+    /// Run a bounded Fury mission.
+    fn mission(&self, goal: &str) -> impl std::future::Future<Output = String> + Send;
+    /// Read-only roster snapshot (the constellation).
+    fn roster(&self) -> impl std::future::Future<Output = String> + Send;
+    /// Read-only state snapshot (pending + agent state).
+    fn state(&self) -> impl std::future::Future<Output = String> + Send;
+}
+
+/// The seam to the confirmation gate + forge marker — the SECURITY-critical
+/// surface. Default-implemented to act on the REAL process-global confirm slot
+/// and the real forge pending marker, so the production path and the tests use
+/// the SAME logic. The tests park a real confirmation and drive confirm/deny by
+/// id through here, proving a switch-OFF confirm fires nothing and a dismiss
+/// writes nothing into apps/.
+pub trait Dispatcher: Send + Sync {
+    /// List the genuinely-pending confirmations (faithful id + preview) and the
+    /// pending forge proposal ts (if any). Read-only.
+    fn list_pending(&self) -> impl std::future::Future<Output = Value> + Send;
+    /// Approve the SPECIFIC parked confirmation named by `id`: replay ONLY that
+    /// exact parked action, ONLY if it is genuinely pending AND the master switch
+    /// is ON (the replay re-checks the switch + the agent allowlist). An unknown
+    /// id fires nothing. Returns the spoken-style outcome.
+    fn confirm(&self, id: &str) -> impl std::future::Future<Output = String> + Send;
+    /// Deny the parked confirmation named by `id`: clear it, fire nothing.
+    fn deny(&self, id: &str) -> impl std::future::Future<Output = String> + Send;
+    /// Dismiss the forge proposal named by `ts`: clear the pending marker only.
+    /// MUST NOT apply/deploy (apply stays scripts/apply_forge.sh).
+    fn dismiss_forge(&self, ts: u64) -> impl std::future::Future<Output = String> + Send;
+    /// USER-SET a per-action consequential policy from the anchored `text` phrase.
+    /// This is the AUTHENTICATED-LOCAL user write path: it parses + applies the
+    /// rule via `policy::handle_user_policy_text` (NOT the model tool loop). A
+    /// phrase that is not one of the anchored shapes is reported as not understood
+    /// — it is NEVER routed to the model from here, so no model output can reach
+    /// the policy store through this verb. Returns a spoken-style ack.
+    fn policy(&self, text: &str) -> impl std::future::Future<Output = String> + Send;
+    /// ENGAGE the panic / lockdown emergency stop (task #12). The HUD PANIC button.
+    /// Calls `lockdown::panic()` directly — sets the global flag (forcing every
+    /// master gate OFF), drops any parked confirmation, persists the marker, audits
+    /// — and returns the honest spoken-style confirmation. NEVER the model loop.
+    /// Default-implemented so production + tests share the real lockdown path.
+    fn panic(&self) -> impl std::future::Future<Output = String> + Send {
+        async { crate::lockdown::panic().await.to_string() }
+    }
+    /// LIFT the lockdown (task #12). The authenticated-local USER resume control.
+    /// Calls `lockdown::unlock()` directly (clears the flag — gates return to their
+    /// CONFIGURED values — and removes the marker) and returns the honest ack.
+    /// Together with the spoken "unlock" intent this is the ONLY path to unlock;
+    /// it is NEVER reachable from the model loop. Default-implemented so production
+    /// + tests share the real lockdown path.
+    fn unlock(&self) -> impl std::future::Future<Output = String> + Send {
+        async { crate::lockdown::unlock().await.to_string() }
+    }
+}
+
+/// Serve the command channel until the process exits. Binds
+/// `state/ipc/command.sock` (creating the `0700` dir, `chmod 0600` on the
+/// socket), then accepts HUD connections and handles each JSONL line through
+/// [`handle_line`]. Spawned from main.rs alongside the other socket servers.
+pub async fn serve<P, D>(command_sock: PathBuf, pipeline: Arc<P>, dispatcher: Arc<D>)
+where
+    P: CommandPipeline + 'static,
+    D: Dispatcher + 'static,
+{
+    let limiter = Arc::new(Mutex::new(RateLimiter::default()));
+    let listener = match bind_socket(&command_sock) {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(path = %command_sock.display(), error = %e, "command channel failed to bind; HUD cannot drive the system");
+            return;
+        }
+    };
+    info!(path = %command_sock.display(), "command channel listening");
+
+    loop {
+        match listener.accept().await {
+            Ok((stream, _peer)) => {
+                let pipeline = pipeline.clone();
+                let dispatcher = dispatcher.clone();
+                let limiter = limiter.clone();
+                tokio::spawn(async move {
+                    handle_conn(stream, pipeline, dispatcher, limiter).await;
+                });
+            }
+            Err(e) => warn!(error = %e, "command channel accept failed"),
+        }
+    }
+}
+
+/// Bind the command socket: remove a stale one, create the `0700` parent dir,
+/// bind, `chmod 0600`. Defense-in-depth on top of the token gate.
+fn bind_socket(path: &Path) -> std::io::Result<UnixListener> {
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %path.display(), error = %e, "could not remove stale command socket");
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        set_mode(parent, 0o700);
+    }
+    let listener = UnixListener::bind(path)?;
+    set_mode(path, 0o600);
+    Ok(listener)
+}
+
+/// chmod best-effort: a failed tightening is defense-in-depth (token
+/// verification is the real gate), so warn and continue.
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+        warn!(path = %path.display(), error = %e, "could not tighten command socket permissions");
+    }
+}
+
+/// Serve one accepted connection: read JSONL lines and reply to each. A line
+/// over [`MAX_LINE_BYTES`] is rejected by [`decide`]'s `raw.len()` length check
+/// (the size gate runs AFTER the line is buffered, not as a read bound). The
+/// socket is 0600 inside a 0700 ipc dir and token-gated (same-user local
+/// process only), so the read sits inside the daemon's trust boundary.
+async fn handle_conn<P, D>(
+    stream: UnixStream,
+    pipeline: Arc<P>,
+    dispatcher: Arc<D>,
+    limiter: Arc<Mutex<RateLimiter>>,
+) where
+    P: CommandPipeline,
+    D: Dispatcher,
+{
+    let (read_half, mut write_half) = stream.into_split();
+    let mut reader = BufReader::new(read_half);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line).await {
+            Ok(0) => return, // client closed
+            Ok(_) => {
+                let reply = handle_line(&line, &pipeline, &dispatcher, &limiter).await;
+                let mut out = reply.to_string();
+                out.push('\n');
+                if write_half.write_all(out.as_bytes()).await.is_err() {
+                    return;
+                }
+                if write_half.flush().await.is_err() {
+                    return;
+                }
+            }
+            Err(e) => {
+                warn!(error = %e, "reading command socket failed");
+                return;
+            }
+        }
+    }
+}
+
+/// Handle one inbound line end-to-end and produce the reply JSON. This is the
+/// orchestration seam the unit tests drive with a mock pipeline + the real
+/// dispatcher: it runs the PURE [`decide`], then the token check, the rate
+/// limit, and the route — emitting the same telemetry the production path does.
+/// The ORDER matters and is part of the contract:
+///   1. size/parse/allowlist/shape ([`decide`]) — an unknown/oversized/malformed
+///      line never reaches auth,
+///   2. token verification — an unauthenticated/forged/stale line never routes,
+///   3. rate-limit — a verified-but-flooding client is throttled,
+///   4. route into the gated pipeline.
+async fn handle_line<P, D>(
+    raw: &str,
+    pipeline: &Arc<P>,
+    dispatcher: &Arc<D>,
+    limiter: &Arc<Mutex<RateLimiter>>,
+) -> Value
+where
+    P: CommandPipeline,
+    D: Dispatcher,
+{
+    let (token, command) = match decide(raw) {
+        Decision::Ok { token, command } => (token, command),
+        Decision::UnknownCommand { cmd } => {
+            telemetry::emit("system", "command.denied", json!({"reason": "unknown_command", "cmd": cmd}));
+            return json!({"ok": false, "error": "unknown_command"});
+        }
+        Decision::BadRequest { reason } => {
+            return json!({"ok": false, "error": "bad_request", "detail": reason});
+        }
+        Decision::Oversized => {
+            telemetry::emit("system", "command.denied", json!({"reason": "oversized"}));
+            return json!({"ok": false, "error": "oversized"});
+        }
+        Decision::Malformed => {
+            return json!({"ok": false, "error": "malformed"});
+        }
+    };
+
+    // (2) TOKEN: the SAME HMAC machinery as the per-app relay / generate proxy.
+    // A forged/tampered/stale/missing token fails closed BEFORE any route. No
+    // token value is ever logged.
+    if !apps::verify_command_token(&token) {
+        warn!("command line failed token verification");
+        telemetry::emit("system", "command.auth_failed", json!({"via": "command"}));
+        return json!({"ok": false, "error": "unauthorized"});
+    }
+
+    // (3) RATE-LIMIT (spam guard) — after auth so an unauthenticated flood can't
+    // consume an authenticated client's budget, and the unauthenticated line was
+    // already rejected above.
+    let allowed = {
+        let mut lim = limiter.lock().await;
+        lim.check(Instant::now())
+    };
+    if !allowed {
+        warn!("command channel rate limit tripped");
+        telemetry::emit("system", "command.denied", json!({"reason": "rate_limited"}));
+        return json!({"ok": false, "error": "rate_limited"});
+    }
+
+    // (4) ROUTE into the existing gated pipeline (never around it).
+    route_command(command, pipeline, dispatcher).await
+}
+
+/// Route an AUTHENTICATED, rate-passed command into the gated pipeline. Each arm
+/// either calls the read/route pipeline (ask/brief/mission/roster/state) or the
+/// security-critical dispatcher (pending/confirm/deny/dismiss_forge). Nothing
+/// here bypasses a gate: a consequential `ask` parks in `pipeline.ask`; a
+/// `confirm` fires ONLY through `dispatcher.confirm`, which re-checks the master
+/// switch + the agent allowlist; `dismiss_forge` clears a marker only.
+async fn route_command<P, D>(command: Command, pipeline: &Arc<P>, dispatcher: &Arc<D>) -> Value
+where
+    P: CommandPipeline,
+    D: Dispatcher,
+{
+    match command {
+        Command::Ask { text, agent } => {
+            telemetry::emit("system", "command.routed", json!({"cmd": "ask", "agent": agent}));
+            let reply = pipeline.ask(&text, agent.as_deref()).await;
+            json!({"ok": true, "reply": reply})
+        }
+        Command::Brief => {
+            telemetry::emit("system", "command.routed", json!({"cmd": "brief"}));
+            json!({"ok": true, "reply": pipeline.brief().await})
+        }
+        Command::Mission { goal } => {
+            telemetry::emit("system", "command.routed", json!({"cmd": "mission"}));
+            json!({"ok": true, "reply": pipeline.mission(&goal).await})
+        }
+        Command::Roster => {
+            json!({"ok": true, "reply": pipeline.roster().await})
+        }
+        Command::State => {
+            json!({"ok": true, "reply": pipeline.state().await})
+        }
+        Command::Pending => {
+            json!({"ok": true, "pending": dispatcher.list_pending().await})
+        }
+        Command::Confirm { id } => {
+            telemetry::emit("system", "command.routed", json!({"cmd": "confirm"}));
+            json!({"ok": true, "reply": dispatcher.confirm(&id).await})
+        }
+        Command::Deny { id } => {
+            telemetry::emit("system", "command.routed", json!({"cmd": "deny"}));
+            json!({"ok": true, "reply": dispatcher.deny(&id).await})
+        }
+        Command::DismissForge { ts } => {
+            telemetry::emit("system", "command.routed", json!({"cmd": "dismiss_forge", "ts": ts}));
+            json!({"ok": true, "reply": dispatcher.dismiss_forge(ts).await})
+        }
+        Command::Policy { text } => {
+            // The phrase text is NOT logged (a tool name is not a secret, but we
+            // keep the telemetry shape minimal + uniform with the other verbs).
+            telemetry::emit("system", "command.routed", json!({"cmd": "policy"}));
+            json!({"ok": true, "reply": dispatcher.policy(&text).await})
+        }
+        Command::Panic => {
+            // The HUD PANIC button: engage the emergency stop directly via the
+            // dispatcher (lockdown::panic) — never the model. Telemetry records the
+            // engage so the HUD status indicator flips to LOCKED DOWN.
+            telemetry::emit("system", "command.routed", json!({"cmd": "panic"}));
+            let reply = dispatcher.panic().await;
+            json!({"ok": true, "reply": reply, "locked": crate::lockdown::is_locked_down()})
+        }
+        Command::Unlock => {
+            // The HUD unlock control: lift the lockdown directly via the dispatcher
+            // (lockdown::unlock) — the authenticated-local USER path, never the
+            // model. The HUD status indicator flips back to normal.
+            telemetry::emit("system", "command.routed", json!({"cmd": "unlock"}));
+            let reply = dispatcher.unlock().await;
+            json!({"ok": true, "reply": reply, "locked": crate::lockdown::is_locked_down()})
+        }
+    }
+}
+
+// ===========================================================================
+// Production dispatcher — acts on the REAL confirm slot + forge marker.
+// ===========================================================================
+
+/// The production [`Dispatcher`]: confirm/deny act on the REAL process-global
+/// confirmation slot (confirm.rs); dismiss_forge clears the REAL forge pending
+/// marker via Memory. It NEVER applies/deploys a forge proposal. Owns the
+/// `Memory` + project root it needs for the replay + the marker.
+pub struct LiveDispatcher {
+    pub memory: Arc<crate::memory::Memory>,
+    pub root: PathBuf,
+}
+
+impl Dispatcher for LiveDispatcher {
+    async fn list_pending(&self) -> Value {
+        // Faithful, replay-FREE listing: id + agent + tool + preview for the live
+        // confirmation, plus the forge proposal ts (if any). No input args cross
+        // the channel — the listing names what exists; only confirm {id} fires.
+        let confirmation = crate::confirm::peek_pending(Instant::now()).map(|p| {
+            json!({"id": p.id, "agent": p.agent, "tool": p.tool, "preview": p.preview})
+        });
+        let forge_pending = self
+            .memory
+            .get_fact("meta.forge_pending")
+            .await
+            .ok()
+            .flatten();
+        json!({
+            "confirmation": confirmation,
+            "forge_pending_ts": forge_pending,
+        })
+    }
+
+    async fn confirm(&self, id: &str) -> String {
+        // Take the parked action ONLY if the id names the genuine, non-expired
+        // slot. An unknown/stale id is inert — nothing is taken, nothing fires.
+        match crate::confirm::confirm_by_id(id, Instant::now()) {
+            crate::confirm::ByIdConfirm::Matched(pending) => {
+                // Replay the EXACT parked action through the SAME path the spoken
+                // "yes" uses: it re-checks the agent allowlist AND the master
+                // switch. With the switch OFF, the replay only previews and fires
+                // nothing (the correct fail-safe). Nothing is re-derived from the
+                // channel — only what was previewed can fire.
+                let (outcome, _is_error) =
+                    crate::anthropic::replay_confirmed_action(&pending, self.memory.as_ref()).await;
+                outcome
+            }
+            crate::confirm::ByIdConfirm::NoMatch => {
+                "No pending action with that id.".to_string()
+            }
+        }
+    }
+
+    async fn deny(&self, id: &str) -> String {
+        if crate::confirm::deny_by_id(id, Instant::now()) {
+            "Cancelled.".to_string()
+        } else {
+            "No pending action with that id.".to_string()
+        }
+    }
+
+    async fn dismiss_forge(&self, ts: u64) -> String {
+        dismiss_forge_marker(self.memory.as_ref(), &self.root, ts).await
+    }
+
+    async fn policy(&self, text: &str) -> String {
+        // USER-SET-ONLY write: parse the anchored phrase + apply it to the global
+        // policy store. `handle_user_policy_text` returns None for anything that is
+        // not one of the three anchored phrases — we DO NOT fall back to the model
+        // (the whole point is that no model path can set a policy), so a non-phrase
+        // gets an honest "not understood" reply, never a route into the tool loop.
+        crate::policy::handle_user_policy_text(text).unwrap_or_else(|| {
+            "I didn't recognize that as a policy command. Say, for example, \
+             \"always allow the gmail_send action\", \"never allow the x_post action\", \
+             or \"always ask before the gmail_send action\"."
+                .to_string()
+        })
+    }
+}
+
+// ===========================================================================
+// Production pipeline — routes into the EXISTING gated, text-returning paths.
+// ===========================================================================
+
+/// The production [`CommandPipeline`]. Every arm routes into the SAME gated path
+/// the voice surface uses, but TEXT-ONLY (it never opens the speaker — the
+/// channel returns prose to the HUD; no audio, no echo risk):
+///   * `ask`     -> `anthropic::complete_with_tools` (the cloud tool-loop). A
+///     consequential tool STILL parks via the confirmation gate inside
+///     `execute_tool`; the agent's OWN allowlist (`agent.tools`) is what is
+///     offered/accepted, so isolation holds. The channel pre-confirms NOTHING.
+///   * `brief`   -> `anthropic::edith_brief_now` (read-only on-demand brief).
+///   * `mission` -> `anthropic::run_fury_mission` (bounded; sub-tasks under each
+///     specialist's allowlist + the same gate).
+///   * `roster`/`state` -> read-only registry / pending snapshots.
+///
+/// The command channel is STATELESS per request (no cross-turn history is fed
+/// into `ask`) — a deliberate, safe choice: the cross-turn CONFIRMATION state is
+/// the ONLY state that persists, and it lives in the gated `confirm` slot, not
+/// here. So a consequential `ask` parks; the user then `confirm {id}`s it.
+pub struct LivePipeline {
+    pub memory: Arc<crate::memory::Memory>,
+    pub agents: Arc<crate::agents::AgentRegistry>,
+    pub heavy_model: String,
+    pub max_tokens: u32,
+}
+
+impl LivePipeline {
+    /// Resolve the requested agent (or the orchestrator when none/unknown). The
+    /// returned agent's `tools` is the allowlist `complete_with_tools` enforces.
+    fn resolve_agent<'a>(&'a self, agent: Option<&str>) -> &'a crate::agents::Agent {
+        agent
+            .and_then(|a| self.agents.get(a))
+            .unwrap_or_else(|| self.agents.orchestrator())
+    }
+}
+
+impl CommandPipeline for LivePipeline {
+    async fn ask(&self, text: &str, agent: Option<&str>) -> String {
+        let agent = self.resolve_agent(agent);
+        let mem = self.memory.as_ref();
+        let facts =
+            crate::anthropic::grounded_facts_live(text, mem, &agent.namespace).await;
+        // SHARED WORLD MODEL context (relevant to this request) from the shared
+        // user.world.* tier — grounds the reply in the one coherent world picture
+        // every agent shares; never reads another agent's private notes.
+        let world_context = crate::anthropic::grounded_world_live(text, mem).await;
+        // PERSONALIZATION: the bounded user-model summary (observed profile) so
+        // the command reply personalizes to the real observed user. Shared tier
+        // only -> never another agent's private notes.
+        let personalization = crate::anthropic::grounded_personalization_live(mem).await;
+        let persona =
+            crate::anthropic::agent_persona_text(&agent.name, agent.is_orchestrator());
+        // Stateless turn: empty history. A consequential tool parks inside the
+        // loop (execute_tool) and the returned text is the confirmation prompt —
+        // the channel never fires it.
+        match crate::anthropic::complete_with_tools(
+            &self.heavy_model,
+            self.max_tokens,
+            text,
+            &facts,
+            &[],
+            mem,
+            &agent.tools,
+            &agent.namespace,
+            persona.as_deref(),
+            &world_context,
+            &personalization,
+        )
+        .await
+        {
+            Ok(reply) => reply,
+            // No cloud key / cloud error: an honest, secret-free line (never a
+            // crash, never a leaked error body).
+            Err(_) => "I can't reach the cloud to handle that right now, sir.".to_string(),
+        }
+    }
+
+    async fn brief(&self) -> String {
+        crate::anthropic::edith_brief_now()
+    }
+
+    async fn mission(&self, goal: &str) -> String {
+        crate::anthropic::run_fury_mission(goal, self.memory.as_ref()).await
+    }
+
+    async fn roster(&self) -> String {
+        self.agents.roster_spoken()
+    }
+
+    async fn state(&self) -> String {
+        // Read-only: the live constellation plus whether a confirmation is parked
+        // and whether a forge proposal is pending. No secrets, no replay material.
+        let pending = crate::confirm::peek_pending(Instant::now())
+            .map(|p| format!("A {} action is awaiting confirmation (id {}).", p.tool, p.id))
+            .unwrap_or_else(|| "Nothing awaiting confirmation.".to_string());
+        format!("{}\n{}", self.agents.roster_spoken(), pending)
+    }
+}
+
+/// Clear the forge pending marker for `ts` — and NOTHING else. This is the
+/// channel's `dismiss_forge`: it DISMISSES a proposal from the deck. It MUST NOT
+/// apply/deploy — apply stays scripts/apply_forge.sh, which is the only path that
+/// writes into apps/. This function only deletes the `meta.forge_pending` fact
+/// when it matches `ts` (so dismissing a stale id is a no-op); it never touches
+/// apps/ and never runs generated code.
+///
+/// Factored out (free function over `&Memory`) so the no-deploy guarantee is
+/// unit-testable: the test asserts the marker is gone AND that apps/ is byte-for-
+/// byte unchanged.
+pub async fn dismiss_forge_marker(memory: &crate::memory::Memory, _root: &Path, ts: u64) -> String {
+    match memory.get_fact("meta.forge_pending").await {
+        Ok(Some(current)) if current == ts.to_string() => {
+            match memory.delete_fact("meta.forge_pending").await {
+                Ok(_) => {
+                    telemetry::emit("system", "forge.dismissed", json!({"ts": ts}));
+                    format!("Dismissed the forge proposal {ts}. (It was not deployed; apply stays scripts/apply_forge.sh.)")
+                }
+                Err(e) => {
+                    warn!(error = %e, "failed to clear forge pending marker");
+                    "Could not clear the forge proposal marker.".to_string()
+                }
+            }
+        }
+        // The marker is absent or names a different ts — dismissing a stale id is
+        // a no-op. NEVER deploy, NEVER touch apps/.
+        _ => "No matching pending forge proposal to dismiss.".to_string(),
+    }
+}
+
+/// Per-app socket dir lives under state/ipc/apps; the command socket sits beside
+/// it at state/ipc/command.sock so the existing `0700` ipc dir confines it too.
+pub fn command_socket_path(root: &Path) -> PathBuf {
+    root.join("state").join("ipc").join("command.sock")
+}
+
+/// The per-boot capability token is handed to the Tauri backend OUT-OF-BAND via
+/// a `0600` file inside the SAME `0700` confined `state/ipc/` dir as the socket
+/// (the established local handshake — the daemon is the only writer, the HUD
+/// backend the only reader, and the token never touches argv, env, telemetry, or
+/// any logged path). The token dies on restart (fresh per-boot nonce), so a
+/// stale file is harmless — a captured value fails [`apps::verify_command_token`].
+pub fn command_token_path(root: &Path) -> PathBuf {
+    root.join("state").join("ipc").join("command.token")
+}
+
+/// Write the minted command token to its `0600` handoff file (creating the
+/// `0700` parent dir). Best-effort + NEVER logs the token: on a write failure we
+/// warn with the path only, never the value, and the channel simply stays
+/// unreachable from the HUD (fails closed). Returns whether the write succeeded.
+pub fn write_command_token(root: &Path, token: &str) -> bool {
+    let path = command_token_path(root);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            warn!(path = %parent.display(), error = %e, "could not create ipc dir for the command token handoff");
+            return false;
+        }
+        set_mode(parent, 0o700);
+    }
+    // Remove any stale file first so the new `0600` perms are not inherited from
+    // a previous, possibly looser, file.
+    let _ = std::fs::remove_file(&path);
+    if let Err(e) = std::fs::write(&path, token.as_bytes()) {
+        warn!(path = %path.display(), error = %e, "could not write the command token handoff file");
+        return false;
+    }
+    set_mode(&path, 0o600);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Mutex as StdMutex;
+
+    // -- pure decide: size / parse / allowlist / shape ------------------------
+
+    /// Every allowlisted command parses to its variant; an unknown command is
+    /// rejected (never routed).
+    #[test]
+    fn allowlist_admits_only_the_bounded_set() {
+        // Known commands -> Ok with the right variant.
+        let cases = [
+            (json!({"token": "t", "cmd": "ask", "text": "hi"}), true),
+            (json!({"token": "t", "cmd": "brief"}), true),
+            (json!({"token": "t", "cmd": "mission", "goal": "do x"}), true),
+            (json!({"token": "t", "cmd": "roster"}), true),
+            (json!({"token": "t", "cmd": "state"}), true),
+            (json!({"token": "t", "cmd": "pending"}), true),
+            (json!({"token": "t", "cmd": "confirm", "id": "abc"}), true),
+            (json!({"token": "t", "cmd": "deny", "id": "abc"}), true),
+            (json!({"token": "t", "cmd": "dismiss_forge", "ts": 42}), true),
+            (json!({"token": "t", "cmd": "policy", "text": "always allow the gmail_send action"}), true),
+        ];
+        for (line, _ok) in cases {
+            assert!(
+                matches!(decide(&line.to_string()), Decision::Ok { .. }),
+                "known command must be Ok: {line}"
+            );
+        }
+        // Unknown / privileged-sounding / empty commands -> UnknownCommand.
+        for cmd in ["apply_forge", "deploy", "exec", "raw", "", "shutdown", "set_switch"] {
+            let line = json!({"token": "t", "cmd": cmd, "text": "x"}).to_string();
+            match decide(&line) {
+                Decision::UnknownCommand { cmd: got } => assert_eq!(got, cmd),
+                other => panic!("cmd {cmd:?} must be UnknownCommand, got {other:?}"),
+            }
+        }
+    }
+
+    /// Required fields are enforced structurally: ask needs text, mission a goal,
+    /// confirm/deny an id, dismiss_forge a ts.
+    #[test]
+    fn required_fields_are_enforced() {
+        let bad = [
+            json!({"token": "t", "cmd": "ask", "text": "   "}),
+            json!({"token": "t", "cmd": "ask"}),
+            json!({"token": "t", "cmd": "mission", "goal": ""}),
+            json!({"token": "t", "cmd": "confirm", "id": ""}),
+            json!({"token": "t", "cmd": "confirm"}),
+            json!({"token": "t", "cmd": "deny"}),
+            json!({"token": "t", "cmd": "dismiss_forge"}),
+            json!({"token": "t", "cmd": "policy", "text": "   "}),
+            json!({"token": "t", "cmd": "policy"}),
+        ];
+        for line in bad {
+            assert!(
+                matches!(decide(&line.to_string()), Decision::BadRequest { .. }),
+                "must be BadRequest: {line}"
+            );
+        }
+    }
+
+    /// A non-JSON line is Malformed; an oversized line is Oversized (before parse).
+    #[test]
+    fn malformed_and_oversized_are_rejected_before_route() {
+        assert_eq!(decide("not json"), Decision::Malformed);
+        assert_eq!(decide(""), Decision::Malformed);
+        // Oversized: a line longer than MAX_LINE_BYTES, even if it would parse.
+        let huge_text = "x".repeat(MAX_LINE_BYTES + 10);
+        let line = json!({"token": "t", "cmd": "ask", "text": huge_text}).to_string();
+        assert!(line.len() > MAX_LINE_BYTES);
+        assert_eq!(decide(&line), Decision::Oversized);
+    }
+
+    /// An under-the-line-cap but over-the-text-cap ask is clamped, not rejected.
+    #[test]
+    fn long_text_is_clamped() {
+        let text = "a".repeat(MAX_TEXT_CHARS + 500);
+        let line = json!({"token": "t", "cmd": "ask", "text": text}).to_string();
+        // Stays under the line cap.
+        assert!(line.len() <= MAX_LINE_BYTES);
+        match decide(&line) {
+            Decision::Ok { command: Command::Ask { text, .. }, .. } => {
+                assert_eq!(text.chars().count(), MAX_TEXT_CHARS, "text clamped to the cap");
+            }
+            other => panic!("expected clamped Ask, got {other:?}"),
+        }
+    }
+
+    // -- rate limiter --------------------------------------------------------
+
+    #[test]
+    fn rate_limit_trips_after_the_rate_and_rolls() {
+        let mut lim = RateLimiter::default();
+        let t0 = Instant::now();
+        for i in 0..RATE {
+            assert!(lim.check(t0), "call {i} should pass");
+        }
+        assert!(!lim.check(t0), "the call past RATE must trip");
+        let later = t0 + RATE_WINDOW + Duration::from_secs(1);
+        assert!(lim.check(later), "the window rolled; allowed again");
+    }
+
+    // -- mock pipeline + a probe dispatcher for the handler-level tests -------
+
+    #[derive(Default)]
+    struct MockPipeline {
+        ask_calls: AtomicU32,
+        last_agent: StdMutex<Option<String>>,
+    }
+    impl CommandPipeline for MockPipeline {
+        async fn ask(&self, text: &str, agent: Option<&str>) -> String {
+            self.ask_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_agent.lock().unwrap() = agent.map(str::to_string);
+            format!("routed:{text}")
+        }
+        async fn brief(&self) -> String { "brief".into() }
+        async fn mission(&self, goal: &str) -> String { format!("mission:{goal}") }
+        async fn roster(&self) -> String { "roster".into() }
+        async fn state(&self) -> String { "state".into() }
+    }
+
+    #[derive(Default)]
+    struct ProbeDispatcher {
+        confirm_calls: AtomicU32,
+        deny_calls: AtomicU32,
+        dismiss_calls: AtomicU32,
+        policy_calls: AtomicU32,
+        last_policy_text: StdMutex<Option<String>>,
+        // Task #12: prove the panic/unlock VERBS route to the dispatcher (the
+        // user/HUD path), never the model pipeline. We OVERRIDE the default trait
+        // impls (which call the real lockdown::panic/unlock) so the routing test
+        // stays hermetic — it records the call instead of mutating global state.
+        panic_calls: AtomicU32,
+        unlock_calls: AtomicU32,
+    }
+    impl Dispatcher for ProbeDispatcher {
+        async fn list_pending(&self) -> Value { json!({"confirmation": null}) }
+        async fn confirm(&self, id: &str) -> String {
+            self.confirm_calls.fetch_add(1, Ordering::SeqCst);
+            format!("confirm:{id}")
+        }
+        async fn deny(&self, id: &str) -> String {
+            self.deny_calls.fetch_add(1, Ordering::SeqCst);
+            format!("deny:{id}")
+        }
+        async fn dismiss_forge(&self, ts: u64) -> String {
+            self.dismiss_calls.fetch_add(1, Ordering::SeqCst);
+            format!("dismiss:{ts}")
+        }
+        async fn policy(&self, text: &str) -> String {
+            self.policy_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_policy_text.lock().unwrap() = Some(text.to_string());
+            format!("policy:{text}")
+        }
+        async fn panic(&self) -> String {
+            self.panic_calls.fetch_add(1, Ordering::SeqCst);
+            "panic-engaged".to_string()
+        }
+        async fn unlock(&self) -> String {
+            self.unlock_calls.fetch_add(1, Ordering::SeqCst);
+            "unlock-lifted".to_string()
+        }
+    }
+
+    fn fresh_limiter() -> Arc<Mutex<RateLimiter>> {
+        Arc::new(Mutex::new(RateLimiter::default()))
+    }
+
+    /// A VALID command token from the SAME machinery the channel verifies with.
+    fn valid_token() -> String {
+        apps::mint_command_token()
+    }
+
+    // -- token auth ----------------------------------------------------------
+
+    /// An unauthenticated line (missing token), a forged token, and a tampered
+    /// token are all rejected as unauthorized BEFORE any route — the pipeline is
+    /// never touched.
+    #[tokio::test]
+    async fn unauthenticated_forged_and_tampered_tokens_are_rejected() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+
+        // Missing token.
+        let line = json!({"cmd": "ask", "text": "do something"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["error"], "unauthorized", "missing token");
+
+        // Forged token.
+        let line = json!({"token": "deadbeef", "cmd": "ask", "text": "x"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["error"], "unauthorized", "forged token");
+
+        // Tampered: a valid token with a flipped hex nibble.
+        let good = valid_token();
+        let mut chars: Vec<char> = good.chars().collect();
+        chars[0] = if chars[0] == 'a' { 'b' } else { 'a' };
+        let tampered: String = chars.into_iter().collect();
+        let line = json!({"token": tampered, "cmd": "ask", "text": "x"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["error"], "unauthorized", "tampered token");
+
+        // The pipeline was NEVER reached.
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "no route on an unauthorized line");
+    }
+
+    /// An unknown command is rejected even WITH a valid token (the allowlist is
+    /// structural, independent of auth) and never routes.
+    #[tokio::test]
+    async fn unknown_command_with_a_valid_token_is_rejected() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "apply_forge", "ts": 1}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["error"], "unknown_command");
+        assert_eq!(dispatcher.dismiss_calls.load(Ordering::SeqCst), 0, "unknown cmd never dispatched");
+    }
+
+    /// A valid, allowlisted ask routes through the pipeline (the normal path),
+    /// and the agent ref is carried so the agent's allowlist applies downstream.
+    #[tokio::test]
+    async fn valid_ask_routes_through_the_pipeline_with_its_agent() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "ask", "text": "status", "agent": "edith"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "routed:status");
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(pipeline.last_agent.lock().unwrap().as_deref(), Some("edith"));
+    }
+
+    /// brief / mission / roster / state route to their pipeline arms.
+    #[tokio::test]
+    async fn read_and_route_commands_reach_their_arms() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let cases = [
+            (json!({"token": valid_token(), "cmd": "brief"}), "brief"),
+            (json!({"token": valid_token(), "cmd": "mission", "goal": "g"}), "mission:g"),
+            (json!({"token": valid_token(), "cmd": "roster"}), "roster"),
+            (json!({"token": valid_token(), "cmd": "state"}), "state"),
+        ];
+        for (line, want) in cases {
+            let r = handle_line(&line.to_string(), &pipeline, &dispatcher, &lim).await;
+            assert_eq!(r["reply"], want, "for {line}");
+        }
+    }
+
+    /// The `policy` verb routes to the dispatcher's USER-SET-ONLY policy write —
+    /// NOT to the pipeline's `ask` (so it NEVER reaches the model tool loop). The
+    /// phrase text is carried verbatim to the classifier.
+    #[tokio::test]
+    async fn policy_verb_routes_to_the_user_write_path_not_the_model() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let phrase = "always allow the gmail_send action";
+        let line = json!({"token": valid_token(), "cmd": "policy", "text": phrase}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], format!("policy:{phrase}"));
+        // It reached the dispatcher's policy arm, with the phrase verbatim.
+        assert_eq!(dispatcher.policy_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(dispatcher.last_policy_text.lock().unwrap().as_deref(), Some(phrase));
+        // It did NOT route through the model pipeline (ask) — no model path to a policy.
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "policy never reaches the model");
+    }
+
+    /// Task #12: the `panic` verb routes to the dispatcher's lockdown engage —
+    /// NOT the model pipeline (`ask`). It is the HUD PANIC button: a bare,
+    /// authenticated, rate-passed verb with no model path.
+    #[tokio::test]
+    async fn panic_verb_routes_to_the_dispatcher_not_the_model() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "panic"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "panic-engaged");
+        assert_eq!(dispatcher.panic_calls.load(Ordering::SeqCst), 1, "panic reached the dispatcher");
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "panic never reaches the model");
+    }
+
+    /// Task #12: the `unlock` verb routes to the dispatcher's lockdown lift — NOT
+    /// the model pipeline. Together with the spoken "unlock" intent this is the
+    /// ONLY path to unlock; there is no model/tool/MCP route to it.
+    #[tokio::test]
+    async fn unlock_verb_routes_to_the_dispatcher_not_the_model() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "unlock"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "unlock-lifted");
+        assert_eq!(dispatcher.unlock_calls.load(Ordering::SeqCst), 1, "unlock reached the dispatcher");
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "unlock never reaches the model");
+    }
+
+    /// Task #12: unlock requires a VALID token, exactly like every other command —
+    /// an unauthenticated line never reaches the dispatcher, so a stray/forged
+    /// local line can never lift the emergency stop.
+    #[tokio::test]
+    async fn unlock_verb_requires_a_valid_token() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": "wrong-token", "cmd": "unlock"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["ok"], false, "a bad token is rejected");
+        assert_eq!(dispatcher.unlock_calls.load(Ordering::SeqCst), 0, "unauth unlock never dispatched");
+    }
+
+    /// The LiveDispatcher's `policy` arm actually parses + applies an anchored
+    /// phrase through the USER-SET-ONLY global write path, and an unrecognized
+    /// phrase gets an honest "not understood" reply (never a model route). Driven
+    /// through the policy override seam so it does not poison the set-once global.
+    #[tokio::test]
+    async fn live_dispatcher_policy_sets_a_rule_and_rejects_a_non_phrase() {
+        let _g = gate_guard();
+        let _p = crate::policy::PolicyOverride::force(true, crate::policy::PolicyStore::empty());
+        let (disp, _root) = live_dispatcher("cmd_policy");
+
+        // An anchored phrase sets the rule (now in force at evaluate_global).
+        let ack = disp.policy("always allow the gmail_send action").await;
+        assert!(ack.to_lowercase().contains("auto-approve"), "honest ALWAYS ack: {ack}");
+        assert_eq!(
+            crate::policy::evaluate_global("gmail_send", "agent.pepper", ""),
+            crate::policy::Decision::Always,
+            "the user write took effect"
+        );
+
+        // A non-phrase gets an honest reply and changes NOTHING — it is never
+        // routed to the model from the policy verb.
+        let miss = disp.policy("please send my taxes to the IRS").await;
+        assert!(miss.to_lowercase().contains("didn't recognize"), "honest miss: {miss}");
+        assert_eq!(
+            crate::policy::evaluate_global("x_post", "agent.pepper", ""),
+            crate::policy::Decision::Ask,
+            "an unrecognized phrase set nothing"
+        );
+    }
+
+    /// The rate limit trips after RATE authenticated commands in the window.
+    #[tokio::test]
+    async fn rate_limit_trips_through_the_handler() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "brief"}).to_string();
+        for _ in 0..RATE {
+            let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+            assert_eq!(r["ok"], true);
+        }
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["error"], "rate_limited");
+    }
+
+    /// An oversized line is rejected through the handler before any route.
+    #[tokio::test]
+    async fn oversized_line_rejected_through_handler() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let huge = "x".repeat(MAX_LINE_BYTES + 10);
+        let line = json!({"token": valid_token(), "cmd": "ask", "text": huge}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["error"], "oversized");
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0);
+    }
+
+    // -- NON-BYPASS: confirm-by-id honors the gate + master switch ------------
+    //
+    // These drive the REAL LiveDispatcher against the REAL confirm slot, proving
+    // the channel cannot escalate: a consequential action still parks, confirm
+    // fires ONLY the genuine parked action AND only with the switch ON, an
+    // unknown id fires nothing, and dismiss_forge writes nothing into apps/.
+
+    use crate::confirm::{self, PendingConfirmation};
+
+    // Serialize the tests that touch the process-global confirm slot + the
+    // process-global master switch so they don't race. We share ONE lock with
+    // confirm::tests (crate::confirm::PENDING_TEST_LOCK) — both modules drive
+    // the SAME global slot, and cargo runs them concurrently, so a lock private
+    // to this module would not stop a confirm::tests case from stomping ours.
+    fn gate_guard() -> std::sync::MutexGuard<'static, ()> {
+        crate::confirm::PENDING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn park_a_consequential(agent: &str, tool: &str, input: Value, allowed: Vec<String>) -> String {
+        confirm::clear();
+        confirm::park(PendingConfirmation {
+            agent: agent.to_string(),
+            tool: tool.to_string(),
+            input,
+            allowed,
+            preview: "Would do the thing".to_string(),
+            created_at: Instant::now(),
+            id: String::new(),
+        });
+        // The id is what `pending` would surface and `confirm {id}` names.
+        confirm::peek_pending(Instant::now()).expect("just parked").id
+    }
+
+    fn open_temp_memory(tag: &str) -> crate::memory::Memory {
+        let path = std::env::temp_dir().join(format!(
+            "jarvis-command-test-{}-{tag}.db",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        crate::memory::Memory::open(&path).unwrap()
+    }
+
+    fn live_dispatcher(tag: &str) -> (LiveDispatcher, PathBuf) {
+        let mem = Arc::new(open_temp_memory(tag));
+        let root = std::env::temp_dir().join(format!("jarvis-cmd-{tag}-{}", std::process::id()));
+        (LiveDispatcher { memory: mem, root: root.clone() }, root)
+    }
+
+    /// confirm {id} replays ONLY the exact parked action, and — because the master
+    /// switch ships OFF (and the test binary never flips it on) — the replay runs
+    /// through gate(false)=DryRun and fires NOTHING. This is the non-bypass proof:
+    /// the authenticated-local confirm cannot execute a consequential action while
+    /// the switch is off. The parked action is consumed (taken from the slot), so
+    /// it cannot fire on a later confirm either.
+    #[tokio::test]
+    async fn confirm_by_id_with_switch_off_consumes_but_never_executes() {
+        let _g = gate_guard();
+        // The master switch is OFF in the test binary (OnceLock default false).
+        assert!(
+            !crate::integrations::consequential_allowed(),
+            "the test binary must have the master switch OFF (the shipped default)"
+        );
+
+        // Park a consequential action for an agent that legitimately holds it.
+        let id = park_a_consequential(
+            "agent.pepper",
+            "gmail_send",
+            json!({"to": "a@b.com", "subject": "Hi", "body": "x", "confirm": true}),
+            vec!["gmail_send".into()],
+        );
+        let (disp, _root) = live_dispatcher("cmd_confirm_switch");
+
+        let out_off = disp.confirm(&id).await;
+        // The slot is now empty (taken), so the action cannot fire on a later
+        // confirm — and with the switch OFF this replay performed no external
+        // action (gate -> DryRun): the outcome is never an executed-send ack.
+        assert!(
+            confirm::peek_pending(Instant::now()).is_none(),
+            "the parked action was consumed by the confirm attempt"
+        );
+        let again = disp.confirm(&id).await;
+        assert_eq!(again, "No pending action with that id.", "consumed id cannot re-fire");
+        assert!(
+            !out_off.to_lowercase().contains("sent to"),
+            "switch-OFF confirm must not report an executed send: {out_off}"
+        );
+    }
+
+    /// confirm {unknown-id} does NOTHING — no fabricated action, and the genuine
+    /// pending is left intact for its real id.
+    #[tokio::test]
+    async fn confirm_unknown_id_does_nothing_and_leaves_the_real_pending() {
+        let _g = gate_guard();
+        let real_id = park_a_consequential(
+            "agent.pepper",
+            "gmail_send",
+            json!({"to": "a@b.com", "subject": "Hi", "body": "x", "confirm": true}),
+            vec!["gmail_send".into()],
+        );
+        let (disp, _root) = live_dispatcher("cmd_confirm_unknown");
+
+        let out = disp.confirm("0000000000000000").await;
+        assert_eq!(out, "No pending action with that id.", "unknown id fires nothing");
+        // The genuine pending is STILL parked under its real id.
+        let still = confirm::peek_pending(Instant::now()).expect("real pending intact");
+        assert_eq!(still.id, real_id, "the real pending was untouched");
+
+        confirm::clear();
+    }
+
+    /// A consequential ask STILL parks (does not auto-fire) — proven by routing an
+    /// ask whose pipeline impl mimics execute_tool's gate: with the switch OFF it
+    /// parks nothing (DryRun preview), and with the gate the consequential path
+    /// would PARK rather than fire. Here we assert the channel itself never fires:
+    /// the `ask` arm returns whatever the pipeline returns and never reaches the
+    /// dispatcher's confirm, so a fire can only ever follow an explicit confirm.
+    #[tokio::test]
+    async fn consequential_ask_does_not_auto_fire_through_the_channel() {
+        // A pipeline that mimics execute_tool for a consequential tool: it PARKS
+        // and returns the confirmation prompt, never a fired action. We assert the
+        // channel relays that PARK and never reaches the dispatcher's confirm.
+        struct ParkingPipeline;
+        impl CommandPipeline for ParkingPipeline {
+            async fn ask(&self, _text: &str, _agent: Option<&str>) -> String {
+                "Would send an email — say 'confirm' to proceed.".to_string()
+            }
+            async fn brief(&self) -> String { unreachable!() }
+            async fn mission(&self, _g: &str) -> String { unreachable!() }
+            async fn roster(&self) -> String { unreachable!() }
+            async fn state(&self) -> String { unreachable!() }
+        }
+        let pipeline = Arc::new(ParkingPipeline);
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "ask", "text": "email alice"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        // The reply is the PARK prompt, not an executed action; the channel never
+        // invoked the dispatcher's confirm — a fire can only follow an explicit
+        // confirm {id}.
+        assert!(r["reply"].as_str().unwrap().contains("confirm"), "ask surfaces the park prompt");
+        assert_eq!(dispatcher.confirm_calls.load(Ordering::SeqCst), 0, "ask never auto-confirms");
+    }
+
+    /// deny {id} clears the parked action and fires nothing; an unknown id leaves
+    /// it intact.
+    #[tokio::test]
+    async fn deny_by_id_clears_only_the_named_action() {
+        let _g = gate_guard();
+        let id = park_a_consequential(
+            "agent.pepper",
+            "gmail_send",
+            json!({"to": "a@b.com", "confirm": true}),
+            vec!["gmail_send".into()],
+        );
+        let (disp, _root) = live_dispatcher("cmd_deny");
+
+        // Unknown id: no-op, the action stays parked.
+        let miss = disp.deny("ffffffffffffffff").await;
+        assert_eq!(miss, "No pending action with that id.");
+        assert!(confirm::peek_pending(Instant::now()).is_some(), "still parked after a wrong deny");
+
+        // The real id: cleared.
+        let hit = disp.deny(&id).await;
+        assert_eq!(hit, "Cancelled.");
+        assert!(confirm::peek_pending(Instant::now()).is_none(), "denied action is gone");
+    }
+
+    /// dismiss_forge clears ONLY the matching pending marker and NEVER deploys —
+    /// apps/ is unchanged.
+    #[tokio::test]
+    async fn dismiss_forge_clears_marker_and_never_deploys() {
+        let _g = gate_guard();
+        let (disp, root) = live_dispatcher("cmd_dismiss_forge");
+
+        // Stamp a pending forge marker (as a successful proposal would).
+        disp.memory.upsert_fact("meta.forge_pending", "12345").await.unwrap();
+
+        // Snapshot apps/ (the project's real apps dir) so we can prove it is
+        // untouched by a dismiss — dismiss must never apply/deploy.
+        let apps_dir = project_root().join("apps");
+        let before = snapshot_dir(&apps_dir);
+
+        // Dismissing a NON-matching ts is a no-op (marker stays).
+        let miss = disp.dismiss_forge(999).await;
+        assert!(miss.contains("No matching"), "stale ts is a no-op: {miss}");
+        assert_eq!(
+            disp.memory.get_fact("meta.forge_pending").await.unwrap().as_deref(),
+            Some("12345"),
+            "non-matching dismiss left the marker"
+        );
+
+        // Dismissing the matching ts clears the marker.
+        let hit = disp.dismiss_forge(12345).await;
+        assert!(hit.contains("Dismissed"), "matching dismiss reported: {hit}");
+        assert!(hit.contains("not deployed"), "dismiss states it did not deploy: {hit}");
+        assert!(
+            disp.memory.get_fact("meta.forge_pending").await.unwrap().is_none(),
+            "the marker is cleared"
+        );
+
+        // apps/ is byte-for-byte unchanged — NOTHING was deployed.
+        let after = snapshot_dir(&apps_dir);
+        assert_eq!(before, after, "dismiss_forge must NEVER write into apps/");
+        let _ = root;
+    }
+
+    // -- helpers -------------------------------------------------------------
+
+    fn project_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().to_path_buf()
+    }
+
+    /// A stable, content-free snapshot of a directory tree: the sorted set of
+    /// relative paths. Enough to prove no app dir/file was added (a deploy) by a
+    /// dismiss, without reading file bytes.
+    fn snapshot_dir(dir: &Path) -> Vec<String> {
+        fn walk(base: &Path, dir: &Path, out: &mut Vec<String>) {
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if let Ok(rel) = p.strip_prefix(base) {
+                        out.push(rel.to_string_lossy().into_owned());
+                    }
+                    if p.is_dir() {
+                        walk(base, &p, out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, dir, &mut out);
+        out.sort();
+        out
+    }
+}

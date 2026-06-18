@@ -1,0 +1,51 @@
+# Mark-Forge — deterministic 3D rigid-body physics sandbox micro-app for JARVIS.
+#
+# Standalone binary crate (NOT part of the daemon workspace). The manifest
+# declares runtime = "binary", entry = "mark-forge"; jarvisd execs the prebuilt
+# binary directly under sandbox-exec (apps.rs Runtime::Binary), exactly like
+# silicon-canvas.
+#
+# DEPENDENCY POLICY (frozen): every dependency the whole app will ever need is
+# declared HERE so no downstream module agent edits this file. The physics
+# ENGINE is pure CPU/f64 with NO heavy deps — only serde/serde_json for the IPC
+# op + telemetry wire shapes and thiserror for the typed error. There is NO GPU
+# stack: the engine runs on the CPU and the HUD's R3F panel renders the bodies,
+# so the whole crate builds and tests headlessly on any box with `cargo build` +
+# `cargo test` (no Metal/GPU device, no feature flags needed).
+
+[package]
+name = "mark-forge"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic 3D rigid-body physics engine + sandbox micro-app: fixed-timestep impulse solver (CPU/f64) emitting body-transform telemetry for a HUD R3F panel."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "mark-forge"
+path = "src/main.rs"
+
+[lib]
+name = "mark_forge"
+path = "src/lib.rs"
+
+[dependencies]
+# IPC op + telemetry wire shapes (SPEC §7/§8). The engine math itself uses NO
+# external crate — Vec3/Quat/Mat3 and the integrator/solver are hand-rolled f64
+# so determinism is fully under our control (no third-party float paths).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Typed crate error (mirror of silicon-canvas error.rs discipline).
+thiserror = "1"
+
+[dev-dependencies]
+# (reserved for module-agent tests; the engine's golden-trace + property tests
+# need only std + the deps above.)
+
+[profile.release]
+# The integrator/broadphase/solver want tight, vectorized inner loops; keep the
+# release binary deterministic and fast. (No fast-math — determinism over speed:
+# we never enable flags that reorder/contract float ops.)
+opt-level = 3
+lto = "thin"
+codegen-units = 1

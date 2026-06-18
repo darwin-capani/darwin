@@ -1,0 +1,20 @@
+# Fab-Link — 3D-printing telemetry overlay (Moonraker / OctoPrint).
+# Schema: docs/SANDBOX.md. This is also the worked example in that document.
+
+[app]
+name        = "fab-link"
+version     = "0.1.0"
+description = "3D-printing telemetry overlay: polls Moonraker/OctoPrint and renders job progress, temperatures, and ETA in the HUD."
+entry       = "python3 main.py"
+runtime     = "python"
+
+[permissions]
+audio     = false
+net_hosts = ["voron.local", "octoprint.local"]   # printer endpoints only
+fs_read   = ["apps/fab-link/gcode-previews"]
+fs_write  = ["state/tmp/fab-link"]
+gpu       = false
+
+[ui]
+surface          = "overlay"
+telemetry_topics = ["fab.progress", "fab.temps", "fab.eta", "fab.alerts"]

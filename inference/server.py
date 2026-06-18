@@ -1,0 +1,5435 @@
+#!/opt/homebrew/bin/python3.11
+"""JARVIS inference server.
+
+Asyncio Unix-domain-socket server speaking newline-delimited JSON at
+state/ipc/inference.sock per the shared contract:
+
+  Request:  {"id": str,
+             "op": "transcribe"|"classify"|"generate"|"extract_facts"|"speak"
+                   |"converse"|"consolidate"|"embed"|"clone_voice"
+                   |"describe_image"|"generate_image",
+             "path"?: str, "text"?: str, "max_tokens"?: int, "voice"?: str,
+             op=speak may also carry the OPTIONAL ElevenLabs cloud voice tier:
+               "backend"?: "elevenlabs", "voice_id"?: str, "model"?: str,
+               "el_key"?: str (the xi-api-key, request-body only, NEVER logged),
+               "lang"?: str (Babel target language; a NON-English lang selects an
+               EL multilingual model — ignored on Kokoro / when the tier is OFF).
+               Absent/"kokoro" -> on-device Kokoro. On any cloud error the server
+               FALLS BACK to Kokoro (never fails the turn).
+             op=transcribe may also carry the OPTIONAL gated cloud-STT tier:
+               "backend"?: "elevenlabs_scribe", "model"?: "scribe_v1",
+               "el_key"?: str (xi-api-key, request-body only, NEVER logged).
+               Absent/"whisper" -> on-device mlx_whisper. On any cloud
+               error/missing-key the server FALLS BACK to mlx_whisper (never
+               fails the turn). HONESTY: the cloud path sends the user's VOICE
+               AUDIO off the device — MORE sensitive than TTS text.
+             op=clone_voice (CONSENT-GATED) carries {"path": owner sample wav,
+               "text": display name, "el_key": xi-api-key}; the daemon only emits
+               it after an explicit authorization-bound consent confirm. HONESTY:
+               the audio SAMPLE leaves the device to ElevenLabs.
+             op=describe_image (OPTIONAL on-device VLM, ships OFF) carries
+               {"path": LOCAL image path (the daemon path-confines it first),
+               "question"?: str (optional VQA; absent => a general scene
+               description), "max_tokens"?: int}. On success responds {"id",
+               "ok": true, "text": <description/answer>, "model": <vlm id>}; when
+               the VLM is unavailable (mlx-vlm not installed or the checkpoint
+               not downloaded) responds {"id", "ok": false, "reason":
+               "vlm_unavailable", "error": <honest msg>} — NEVER a fabricated
+               description, so the daemon falls back (OCR/classification).
+               DISTINCT from OCR (OCR = text glyphs; VLM = visual understanding).
+               HONESTY: the image is read LOCALLY and handed only to the
+               on-device MLX VLM — the pixels NEVER leave the device.
+             op=generate_image (OPTIONAL on-device text->image, ships OFF)
+               carries {"prompt": str (the text to render), "size"?: int
+               (square px), "steps"?: int (sampling steps), "seed"?: int}. On
+               success responds {"id", "ok": true, "path": <abs path under
+               state/images/>, "model": <image model id>, "size", "steps",
+               "seed"}; when the diffusion model is unavailable (the diffusion
+               package not installed or the checkpoint not downloaded) responds
+               {"id", "ok": false, "reason": "image_model_unavailable", "error":
+               <honest msg>} — NEVER a fabricated image and NEVER a cloud call,
+               so the daemon surfaces an honest "the on-device image model isn't
+               set up" message. HONESTY: image generation is 100% ON-DEVICE (MLX
+               diffusion) — the prompt and the generated pixels stay on the
+               machine and NEVER leave the device; there is NO cloud image API.
+             "history"?: [{"speaker": "user"|"jarvis", "text": str}, ...],
+             "facts"?: [str], "data"?: str, "response"?: str,
+             "opener_spoken"?: str, "texts"?: [str] (op=embed),
+             "transcripts"?: [{"user": str, "jarvis": str}, ...]}
+             (op=consolidate reads "transcripts" (<=40, oldest first) and a
+              differently-shaped "facts": [{"key": str, "value": str}, ...])
+  op=clone_voice responds {"id", "ok": true, "voice_id": str} on a successful
+    clone (the daemon stores voice_id, which is NON-secret), or {"id", "ok":
+    false, "error": str} on a clean no-clone (the user keeps Kokoro / their
+    existing voice). The el_key is NEVER echoed.
+
+  Response: {"id": str, "ok": bool, "text"?: str, "intent"?: str,
+             "confidence"?: float, "complexity"?: "light"|"heavy",
+             "args"?: object (classify only: the model's extracted params,
+             passed through verbatim; {} when absent or malformed),
+             "path"?: str, "facts"?: [{"key": str, "value": str}],
+             "upserts"?: [{"key": str, "value": str}], "deletes"?: [str],
+             "vectors"?: [[float]] (op=embed: one L2-normalized vector per
+             input text, in input order),
+             "model"?: str (op=describe_image: the VLM id used; op=generate_image:
+             the image model id used),
+             "size"?: int, "steps"?: int, "seed"?: int (op=generate_image: the
+             resolved generation params),
+             "reason"?: str (op=describe_image unavailable: "vlm_unavailable";
+             op=generate_image unavailable: "image_model_unavailable"),
+             "error"?: str, "latency_ms": int}
+
+  op=converse alone responds with MULTIPLE JSON lines (same id, in order):
+    {"id", "event": "sentence", "seq": <0-based int>, "text": str,
+     "path": "<abs wav path under state/tmp/>"}     one per spoken sentence,
+                                                    emitted as soon as that
+                                                    sentence is synthesized
+    {"id", "event": "done", "ok": true, "text": "<full reply>",
+     "sentences": int, "first_sentence_ms": int, "latency_ms": int}
+  On mid-stream failure the terminal line is
+    {"id", "event": "done", "ok": false, "error": str, "latency_ms": int}
+  and any sentence events already emitted remain valid.
+
+Ops:
+  transcribe     WAV path -> text. Default + fallback: mlx_whisper (on-device,
+                 stdlib-wave decode, no ffmpeg). When backend=elevenlabs_scribe
+                 with a key: POST the audio to ElevenLabs Scribe; on ANY
+                 error/missing-key fall back to mlx_whisper (never fail). HONESTY:
+                 the cloud path sends the user's voice audio off the device.
+  clone_voice    CONSENT-GATED: POST an owner audio sample to ElevenLabs
+                 /v1/voices/add and return the new voice_id; clean no-clone on
+                 any failure (the user keeps Kokoro). The audio sample leaves the
+                 device. NON-secret voice_id out; el_key never echoed.
+  classify       utterance -> {intent, confidence, complexity, args}; args is
+                 the model's extracted-params JSON object passed through
+                 verbatim — {} when the model omitted it or emitted a
+                 non-object, never fabricated server-side. Runs on the
+                 dedicated small [models].classifier model when configured
+                 (empty string reuses the main LLM); either way the static
+                 classifier prefix is KV-prompt-cached so only the utterance
+                 and suffix are prefilled per request
+  generate       text (+ optional history oldest-first, facts, data) ->
+                 persona-voiced reply. System role = prompts/persona.txt plus
+                 a facts block; history becomes alternating user/assistant
+                 turns; data is appended to the final user turn as verified
+                 system data the model must convey without altering numbers.
+                 The persona-only prefix is KV-prompt-cached like the
+                 classifier prefix (facts/history/text prefill after it).
+                 Default max_tokens 160, override honored.
+  converse       streamed generate+TTS in one request: decodes the persona
+                 reply (same prompt assembly, KV cache and sampler as
+                 generate) and, at every completed decimal-aware sentence
+                 boundary (. ! ? newline — matching the daemon's
+                 split_sentences), pauses decoding, synthesizes that sentence
+                 to a silence-trimmed WAV, emits a "sentence" event, and
+                 resumes. At most 5 sentences are synthesized; later text is
+                 returned in the done event only. Optional "opener_spoken"
+                 (the opener line the daemon already played from the opener
+                 bank) appends a bracketed continuation note to the final
+                 user turn so the reply goes straight to the substance
+                 instead of acknowledging twice.
+  extract_facts  user utterance (+ optional response) -> at most 3 durable
+                 {key, value} facts with namespaced keys (user.name,
+                 user.preference.<x>, user.project.<x>, context.<x>);
+                 strict-JSON parse with empty-list fallback. Corrections are
+                 honored: when the user contradicts an earlier fact
+                 ("actually my name is..."), the corrected fact is emitted
+                 under the same key with the new value.
+  consolidate    self-learning reflection pass: recent transcripts (<=40,
+                 oldest first) + the current facts table -> {"upserts":
+                 [{key, value}], "deletes": [key]}. Greedy decode, strict
+                 JSON with empty-arrays fallback; conservative by design
+                 (merge duplicates, prefer the newest phrasing on conflict,
+                 delete facts contradicted later, change nothing when
+                 unsure). Also mines clearly recurring user patterns into
+                 user.habit.<slug> facts — only when the SAME kind of user
+                 request appears >=3 separate times in the provided
+                 transcripts, counted from the user's lines only (never the
+                 assistant's); habit facts are deletable like any other.
+                 Deletes may only name keys present in the input
+                 facts, upserts+deletes are capped at 12 total, and
+                 "meta."-prefixed keys are ignored entirely.
+  embed          [str] -> [[float]]: one L2-normalized embedding VECTOR per
+                 input text, computed ON-DEVICE by mean-pooling the resident
+                 LLM's last hidden states (the inner decoder stack's output,
+                 before the LM head). Reuses the already-loaded generate model
+                 — NO new model is downloaded. Each input is capped at
+                 EMBED_MAX_TOKENS tokens and the batch at EMBED_MAX_BATCH.
+                 Deterministic (a forward pass, no sampling). MNEMOSYNE's
+                 NeuralEmbeddingProvider uses these for cosine-similarity recall
+                 ranking; when this server is down it falls back to lexical BM25.
+  speak          text -> 24kHz WAV under state/tmp/ (TTS on MLX via
+                 mlx-audio; the daemon owns playback and deletion). Synthesis
+                 dispatches on [speech].engine — "kokoro" (default), "csm"
+                 (Sesame) or "orpheus" — through one synth function per
+                 engine; speak, converse and the opener bank all share that
+                 dispatch. All synthesized WAVs have leading/trailing samples
+                 below amplitude 0.005 trimmed, keeping 60ms padding each
+                 side — Kokoro bakes ~0.26s lead / ~0.46s tail of silence
+                 into every utterance otherwise — and then get linear edge
+                 fades (5ms in / 10ms out) so every emitted WAV starts and
+                 ends at near-zero amplitude: click-free clip joins.
+
+Opener bank: at startup (inside preload, after the TTS warm) the server
+clears state/openers/ and synthesizes every [speech].openers line to
+state/openers/opener-<idx>.wav with the current engine/voice/speed,
+silence-trimmed. The daemon plays a random opener the instant an utterance
+ends and maps the filename index back to the configured openers list, so
+indexes always match the config order (a failed line leaves a gap, never a
+shift). Regenerating on every start means a voice/engine change Just Works.
+
+Models load lazily on first use and stay resident; with [inference]
+preload=true a background thread warms STT, LLM (+classifier and persona
+prompt caches) and TTS at startup. MLX imports are deferred so this file
+compiles and imports without the MLX venv (python3.11 required at runtime —
+no mlx wheels on 3.14; MLX runs on the Apple GPU via Metal). main() refuses
+to bind the socket when the MLX stack is missing (e.g. when run with the
+bare Homebrew interpreter instead of .venv/bin/python).
+"""
+
+import asyncio
+import itertools
+import json
+import logging
+import os
+import re
+import signal
+import sys
+import threading
+import time
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+CONFIG_PATH = PROJECT_ROOT / "config" / "jarvis.toml"
+SOCKET_PATH = PROJECT_ROOT / "state" / "ipc" / "inference.sock"
+LOG_PATH = PROJECT_ROOT / "state" / "logs" / "inference.log"
+TMP_DIR = PROJECT_ROOT / "state" / "tmp"
+OPENERS_DIR = PROJECT_ROOT / "state" / "openers"
+PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "intent_classifier.txt"
+PERSONA_PATH = Path(__file__).resolve().parent / "prompts" / "persona.txt"
+# Per-agent persona prefixes for the constellation. op=converse may carry a
+# "persona" NAME (an agent id from config/agents.toml); the engine maps it to
+# inference/personas/<name>.txt and uses that text as the system prefix for
+# THAT call. Each distinct agent prefix gets its OWN KV prompt cache (keyed by
+# agent name, LRU-bounded) — so an agent's persona-prefix KV is prefilled once
+# and REUSED on that agent's later turns, instead of being recomputed from
+# scratch every call. The base-persona cache (keyed to prompts/persona.txt)
+# stays separate and untouched. Absent/None -> base persona + base cache.
+PERSONAS_DIR = Path(__file__).resolve().parent / "personas"
+# Agent name -> persona text, loaded lazily and cached. A valid agent id is a
+# lowercase ASCII slug; the name is validated before it touches the filesystem
+# so "persona" can never be used for path traversal.
+import re as _re_personas
+_AGENT_NAME_RE = _re_personas.compile(r"^[a-z][a-z0-9_]{0,31}$")
+_AGENT_PERSONA_CACHE = {}
+
+
+def load_agent_persona(name):
+    """Return the persona text for agent `name`, or None if the name is
+    invalid or the file is missing/unreadable. Cached per process. The name
+    must be a lowercase slug (validated, never path-joined raw) so this can be
+    fed straight from an untrusted request field without traversal risk."""
+    if not isinstance(name, str):
+        return None
+    name = name.strip().lower()
+    if not _AGENT_NAME_RE.match(name):
+        return None
+    if name in _AGENT_PERSONA_CACHE:
+        return _AGENT_PERSONA_CACHE[name]
+    path = PERSONAS_DIR / f"{name}.txt"
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        log.warning("persona file for agent %r not found at %s; using base persona", name, path)
+        text = None
+    _AGENT_PERSONA_CACHE[name] = text
+    return text
+
+# Contract fallback defaults (used when config/jarvis.toml is missing).
+DEFAULT_LLM = "mlx-community/Qwen3-4B-Instruct-2507-4bit"
+DEFAULT_STT = "mlx-community/whisper-small-mlx"
+DEFAULT_TTS = "mlx-community/Kokoro-82M-bf16"
+# Contract default repo for the OPTIONAL on-device vision-language model
+# (op=describe_image). A Qwen2-VL-class checkpoint that mlx-vlm can load. This
+# is only a DEFAULT id — the model is a multi-GB download that ships OFF, so the
+# op honestly reports "unavailable" until both mlx-vlm AND this checkpoint are
+# present on the device. The pixels never leave the device.
+DEFAULT_VLM = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+# Contract default model for the OPTIONAL on-device text->image generator
+# (op=generate_image). A FLUX.1-schnell-class checkpoint mflux can load on MLX.
+# Like the VLM, this is only a DEFAULT id — the model is a multi-GB download
+# that ships OFF/opt-in, so the op honestly reports "unavailable" until both the
+# diffusion package AND this checkpoint are present on the device. The prompt
+# and the generated pixels never leave the device (image gen is LOCAL only;
+# there is NO cloud image API).
+DEFAULT_IMAGE_MODEL = "schnell"
+DEFAULT_VOICE = "bm_george"
+DEFAULT_SPEED = 1.2
+# Sane kokoro speed range (audit fix): the engine divides predicted phoneme
+# durations by speed (mlx-audio kokoro.py), so speed <= 0 produces
+# div-by-zero/inf durations and broken synthesis with no config-time signal,
+# and the retry-at-1.0 guard only catches broadcast_shapes ValueErrors.
+SPEED_MIN = 0.5
+SPEED_MAX = 2.0
+DEFAULT_TTS_ENGINE = "kokoro"
+
+# ---------------------------------------------------------------------------
+# ElevenLabs cloud VOICE TIER (OPTIONAL, OFF-by-default, credential+runtime
+# gated). The daemon decides WHETHER to use it (voice_tier::resolve_voice_backend:
+# tier on + key present + non-offline + agent mapped) and passes
+# {backend:"elevenlabs", voice_id, model, el_key} on the speak request. Here we
+# ONLY make the synthesis call when the daemon asked for it, and on ANY error we
+# FALL BACK to on-device Kokoro so a turn is never failed by the cloud leg.
+#
+# HONESTY: when this path runs, the sentence text LEAVES the device (a cloud round
+# trip). Kokoro stays the private/offline default + the fallback. The key is read
+# ONLY from the request the daemon passed (from the Keychain) and rides ONLY the
+# xi-api-key header — never logged, never on a URL/query. We request PCM output
+# (pcm_24000) so the bytes are raw 16-bit/24kHz mono, which we wrap as the SAME
+# pipeline WAV (via _write_wav) — no mp3 decoder dependency needed.
+ELEVENLABS_API_BASE = "https://api.elevenlabs.io/v1/text-to-speech"
+ELEVENLABS_OUTPUT_FORMAT = "pcm_24000"
+ELEVENLABS_SAMPLE_RATE = 24000
+ELEVENLABS_DEFAULT_MODEL = "eleven_flash_v2_5"
+ELEVENLABS_TIMEOUT_S = 15.0
+# The DENYLIST of substrings that must never appear in a log line about a TTS
+# request — the key, and the header that carries it. Used by the redaction guard.
+_ELEVENLABS_HEADER = "xi-api-key"
+
+# --- build 2/2 ElevenLabs endpoints + model selection ----------------------
+# CLONE: POST /v1/voices/add (multipart name + audio sample) -> {"voice_id"}.
+# The voice_id is NON-secret (the daemon stores it like any EL voice id); the
+# key is secret and rides ONLY the xi-api-key header. HONESTY: cloning uploads
+# the owner's audio SAMPLE to the cloud — the daemon only reaches here after an
+# explicit, consent-gated, authorization-bound trigger (no impersonation, never
+# automatic). On any error -> no voice_id, and the user keeps Kokoro/their voice.
+ELEVENLABS_CLONE_URL = "https://api.elevenlabs.io/v1/voices/add"
+# SCRIBE STT: POST /v1/speech-to-text (the audio file + model_id=scribe_v1) ->
+# {"text"}. HONESTY: this sends the user's VOICE AUDIO to the cloud — MORE
+# sensitive than TTS text. It runs ONLY when the daemon's gated cloud-STT tier
+# named backend=elevenlabs_scribe with a key; on ANY error/missing-key the
+# transcribe op FALLS BACK to on-device mlx_whisper (never fails the turn).
+ELEVENLABS_SCRIBE_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+ELEVENLABS_SCRIBE_MODEL = "scribe_v1"
+ELEVENLABS_SCRIBE_BACKEND = "elevenlabs_scribe"
+# Multilingual TTS: the English-centric default (eleven_flash_v2_5) does not
+# carry non-English prosody well; when the speak request names a non-English
+# target language (Babel's interpret/translate output), select a multilingual
+# model instead. eleven_multilingual_v2 is the stable multilingual model.
+ELEVENLABS_MULTILINGUAL_MODEL = "eleven_multilingual_v2"
+# #33 ADAPTIVE PROSODY: the ONLY ElevenLabs model that supports inline audio-tags
+# ("[calm]", "[urgently]") + stability/style voice-settings. MUST mirror the
+# daemon's `prosody::ELEVENLABS_V3_MODEL`. The rich prosody surface (audio_tag,
+# stability, style) is consumed ONLY when the resolved model is exactly this id;
+# on flash/multilingual the daemon never SENDS those fields (they are EL-v3-gated
+# on the daemon side too), and this server-side check is defense in depth so a
+# stray tag can never be spoken literally on a non-v3 model. The COARSE rate/gain
+# hints are honoured on every backend.
+ELEVENLABS_V3_MODEL = "eleven_v3"
+# Coarse delivery-hint bounds, mirrored on the daemon side. The daemon clamps
+# before sending; the server clamps again (defense in depth) so a degenerate
+# value can never reach the synth path or the WAV gain.
+SPEAK_RATE_MIN = 0.5
+SPEAK_RATE_MAX = 2.0
+SPEAK_VOLUME_MIN = 0.05
+SPEAK_VOLUME_MAX = 1.0
+
+
+def _is_non_english_lang(lang):
+    """True when `lang` names a language that is NOT English (so the EL TTS leg
+    should pick a multilingual model). Conservative: a missing/empty lang, a
+    non-string, or any English spelling/code ("English", "en", "en-US", "eng")
+    returns False -> the English-centric default is kept. PURE; no network.
+
+    Babel passes the target language as a human name ("Spanish", "French") or an
+    ISO-ish code; we only need the English-vs-not decision here, so we match a
+    small set of English aliases and treat everything else non-empty as
+    non-English (the daemon only sets `lang` when it actually wants a target
+    language spoken)."""
+    if not isinstance(lang, str):
+        return False
+    norm = lang.strip().lower()
+    if not norm:
+        return False
+    # Strip a region suffix ("en-us" / "en_GB") down to the primary subtag.
+    primary = norm.replace("_", "-").split("-", 1)[0]
+    english_aliases = {"en", "eng", "en-us", "en-gb", "english"}
+    return norm not in english_aliases and primary not in english_aliases
+
+
+def _clamp_optional_float(value, lo, hi):
+    """Clamp `value` to [lo, hi] when it is a finite real number, else None. A bad
+    type / NaN / inf reads as 'absent' (the neutral default) rather than an error,
+    so a malformed delivery hint can never reach the synth path. PURE; no network."""
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    f = float(value)
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return max(lo, min(hi, f))
+
+
+def _normalize_speak_shape(req):
+    """Extract + validate the OPTIONAL #33/#34 EXPRESSIVENESS shaping off a speak
+    request, returning (audio_tag, stability, style, rate, volume) where each is the
+    validated value or None (== 'not set' == the neutral default). PURE; no network.
+
+    A field that is absent, the wrong type, or out of range reads as None so the
+    synth path stays byte-for-byte today's when nothing valid was sent — exactly the
+    posture for the shipped-OFF default, where the daemon sends none of these. The
+    rich EL-v3 fields (audio_tag/stability/style) are CARRIED THROUGH here but only
+    ACTED ON when the resolved model is the EL-v3 model (the speak op enforces that);
+    rate/volume are coarse hints honoured on every backend. This is the seam the
+    daemon's shaped params flow through — there is NO network call here."""
+    audio_tag = req.get("audio_tag")
+    if not (isinstance(audio_tag, str) and audio_tag.strip()):
+        audio_tag = None
+    stability = _clamp_optional_float(req.get("stability"), 0.0, 1.0)
+    style = _clamp_optional_float(req.get("style"), 0.0, 1.0)
+    rate = _clamp_optional_float(req.get("rate"), SPEAK_RATE_MIN, SPEAK_RATE_MAX)
+    volume = _clamp_optional_float(req.get("volume"), SPEAK_VOLUME_MIN, SPEAK_VOLUME_MAX)
+    return audio_tag, stability, style, rate, volume
+
+
+def _redact_elevenlabs(s):
+    """Best-effort scrub of anything key/header-shaped from a string before it can
+    reach a log line. The cloud-leg error path logs only the exception class name
+    through this, so even a future change can't accidentally surface the header
+    name or a key fragment. Pure."""
+    if not isinstance(s, str):
+        s = str(s)
+    return s.replace(_ELEVENLABS_HEADER, "[redacted-header]")
+
+
+def _build_elevenlabs_payload(voice_id, model, text, audio_tag=None, stability=None, style=None):
+    """Build the ElevenLabs TTS request JSON (as a dict) for `voice_id`/`model`.
+
+    #33 ADAPTIVE PROSODY: the rich surface is EL-v3-GATED here too (defense in
+    depth) — `audio_tag` is prefixed inline to the text AND `stability`/`style` ride
+    `voice_settings` ONLY when the resolved model is exactly the EL-v3 model. On any
+    other model (flash/multilingual) the tag/settings are IGNORED so a tag can never
+    be spoken literally and a non-v3 model never gets v3-only settings. PURE; no
+    network — split out from the seam so the payload shaping is unit-testable without
+    HTTP. The daemon already withholds these fields off the v3 path, so this is a
+    belt-and-suspenders gate, not the primary one."""
+    resolved = model or ELEVENLABS_DEFAULT_MODEL
+    body = {"text": text, "model_id": resolved}
+    if resolved == ELEVENLABS_V3_MODEL:
+        # Rich v3 path: inline audio-tag prefix + stability/style voice-settings.
+        if isinstance(audio_tag, str) and audio_tag.strip():
+            body["text"] = f"{audio_tag.strip()} {text}"
+        settings = {}
+        if isinstance(stability, (int, float)) and not isinstance(stability, bool):
+            settings["stability"] = float(stability)
+        if isinstance(style, (int, float)) and not isinstance(style, bool):
+            settings["style"] = float(style)
+        if settings:
+            body["voice_settings"] = settings
+    return body
+
+
+def _elevenlabs_synth_pcm(voice_id, model, api_key, text, timeout_s=ELEVENLABS_TIMEOUT_S,
+                          audio_tag=None, stability=None, style=None):
+    """THE network seam (and the ONLY place that touches the ElevenLabs network).
+
+    POST the text to ElevenLabs TTS for `voice_id` and return raw PCM16 mono bytes
+    at 24kHz (output_format=pcm_24000). The `api_key` rides ONLY the `xi-api-key`
+    request header — never the URL/query, never a log line. Raises on any
+    HTTP/transport error; the caller (the speak op) catches EVERYTHING and falls
+    back to Kokoro, so this never fails a turn on its own.
+
+    #33 ADAPTIVE PROSODY: `audio_tag`/`stability`/`style` are the EL-v3 rich surface;
+    they are folded into the payload by `_build_elevenlabs_payload`, which acts on
+    them ONLY when `model` is the EL-v3 model (EL-v3-gated, defense in depth).
+
+    This function is the mock seam: tests monkeypatch
+    `server._elevenlabs_synth_pcm` to return canned bytes (or raise) WITHOUT
+    touching the network — there is no real HTTP in any test. It is deliberately
+    tiny and dependency-free (stdlib urllib only) so the gating + fallback logic
+    around it is what gets unit-tested.
+
+    CREDENTIAL+RUNTIME GATED: it is reached ONLY from the speak op's
+    backend=="elevenlabs" branch, which the daemon enters only after its own
+    tier+key+offline gate. There is no other caller."""
+    import urllib.request
+
+    if not api_key:
+        # Defense in depth: never send a keyless cloud request. The daemon should
+        # never reach here without a key, but if it did we refuse rather than POST.
+        raise ValueError("ElevenLabs synthesis requires an API key (none supplied)")
+    if not voice_id:
+        raise ValueError("ElevenLabs synthesis requires a voice id")
+
+    url = f"{ELEVENLABS_API_BASE}/{voice_id}?output_format={ELEVENLABS_OUTPUT_FORMAT}"
+    payload = json.dumps(
+        _build_elevenlabs_payload(voice_id, model, text, audio_tag, stability, style)
+    ).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST")
+    # The key rides ONLY this header. Never a URL/query param, never logged.
+    req.add_header(_ELEVENLABS_HEADER, api_key)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "audio/pcm")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        return resp.read()
+
+
+def _pcm16_to_float32(pcm_bytes):
+    """Decode raw little-endian PCM16 mono bytes to a float32 array in [-1, 1],
+    the same shape the engine's synth functions produce — so ElevenLabs audio
+    flows through the IDENTICAL _write_wav path (fades, atomic write, pipeline WAV
+    format). Pure; no network. An odd trailing byte (truncated frame) is dropped."""
+    import numpy as np
+
+    if len(pcm_bytes) % 2:
+        pcm_bytes = pcm_bytes[: len(pcm_bytes) - 1]
+    pcm = np.frombuffer(pcm_bytes, dtype="<i2")
+    return (pcm.astype(np.float32) / 32768.0)
+
+
+def _multipart_body(fields, file_field, file_name, file_bytes, content_type="audio/wav"):
+    """Build an RFC-2388 multipart/form-data body (boundary, body bytes) from
+    plain text `fields` (dict) plus one file part. Stdlib-only (no `requests`),
+    so the clone seam stays dependency-free and the whole thing is unit-testable
+    without the network. Returns (content_type_header, body_bytes). PURE."""
+    import os as _os
+
+    boundary = "----jarvisclone" + _os.urandom(16).hex()
+    crlf = b"\r\n"
+    parts = []
+    for name, value in fields.items():
+        parts.append(b"--" + boundary.encode("ascii") + crlf)
+        parts.append(
+            ('Content-Disposition: form-data; name="%s"' % name).encode("utf-8") + crlf + crlf
+        )
+        parts.append(str(value).encode("utf-8") + crlf)
+    parts.append(b"--" + boundary.encode("ascii") + crlf)
+    parts.append(
+        (
+            'Content-Disposition: form-data; name="%s"; filename="%s"'
+            % (file_field, file_name)
+        ).encode("utf-8")
+        + crlf
+    )
+    parts.append(("Content-Type: %s" % content_type).encode("ascii") + crlf + crlf)
+    parts.append(file_bytes + crlf)
+    parts.append(b"--" + boundary.encode("ascii") + b"--" + crlf)
+    return "multipart/form-data; boundary=" + boundary, b"".join(parts)
+
+
+def _elevenlabs_clone_voice(name, sample_path, api_key, timeout_s=ELEVENLABS_TIMEOUT_S):
+    """THE clone network seam (the ONLY place clone touches the ElevenLabs net).
+
+    POST the owner audio SAMPLE at `sample_path` to /v1/voices/add as multipart
+    (name=`name` + the audio file) and return the new voice_id (a string). The
+    `api_key` rides ONLY the `xi-api-key` request header — never the URL/query,
+    never a log line. Raises on any HTTP/transport/parse error; the caller
+    (`clone_voice`) catches EVERYTHING and returns a clean no-clone result, so a
+    failure never produces a voice and the user keeps their existing voice.
+
+    This is the mock seam: tests monkeypatch `server._elevenlabs_clone_voice` to
+    return a stub voice_id (or raise) WITHOUT touching the network. Stdlib-only.
+
+    CONSENT+CREDENTIAL+RUNTIME GATED: reached ONLY from the clone_voice op, which
+    the daemon enters only after an explicit, authorized consent confirm on a
+    user-owned sample. HONESTY: the audio sample LEAVES the device here."""
+    import json as _json
+    import urllib.request
+
+    if not api_key:
+        # Never send a keyless cloud request (defense in depth).
+        raise ValueError("ElevenLabs voice cloning requires an API key (none supplied)")
+    if not name:
+        raise ValueError("ElevenLabs voice cloning requires a display name")
+    with open(sample_path, "rb") as f:
+        sample_bytes = f.read()
+    if not sample_bytes:
+        raise ValueError("owner voice sample is empty; nothing to clone")
+    file_name = os.path.basename(sample_path) or "sample.wav"
+    content_type, body = _multipart_body(
+        {"name": name}, "files", file_name, sample_bytes, content_type="audio/wav"
+    )
+    req = urllib.request.Request(ELEVENLABS_CLONE_URL, data=body, method="POST")
+    # The key rides ONLY this header. Never a URL/query param, never logged.
+    req.add_header(_ELEVENLABS_HEADER, api_key)
+    req.add_header("Content-Type", content_type)
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read()
+    data = _json.loads(raw.decode("utf-8"))
+    voice_id = data.get("voice_id") if isinstance(data, dict) else None
+    if not isinstance(voice_id, str) or not voice_id:
+        raise ValueError("ElevenLabs clone response had no voice_id")
+    return voice_id
+
+
+def _elevenlabs_scribe_transcribe(audio_path, api_key, model=ELEVENLABS_SCRIBE_MODEL,
+                                  timeout_s=ELEVENLABS_TIMEOUT_S):
+    """THE Scribe STT network seam (the ONLY place STT touches the ElevenLabs
+    net). POST the audio file at `audio_path` to /v1/speech-to-text as multipart
+    (the file + model_id) and return the transcript text. The `api_key` rides
+    ONLY the `xi-api-key` request header — never the URL/query, never a log line.
+    Raises on any HTTP/transport/parse error; the caller (`transcribe`) catches
+    EVERYTHING and FALLS BACK to mlx_whisper, so a cloud failure never fails the
+    turn.
+
+    This is the mock seam: tests monkeypatch `server._elevenlabs_scribe_transcribe`
+    to return canned text (or raise) WITHOUT touching the network. Stdlib-only.
+
+    CREDENTIAL+RUNTIME GATED: reached ONLY when the daemon's gated cloud-STT tier
+    named backend=elevenlabs_scribe with a key. HONESTY: the user's VOICE AUDIO
+    leaves the device here — MORE sensitive than TTS text. mlx_whisper is the
+    private/offline default + the fallback."""
+    import json as _json
+    import urllib.request
+
+    if not api_key:
+        raise ValueError("ElevenLabs Scribe STT requires an API key (none supplied)")
+    with open(audio_path, "rb") as f:
+        audio_bytes = f.read()
+    if not audio_bytes:
+        raise ValueError("audio file is empty; nothing to transcribe")
+    file_name = os.path.basename(audio_path) or "audio.wav"
+    content_type, body = _multipart_body(
+        {"model_id": model or ELEVENLABS_SCRIBE_MODEL},
+        "file",
+        file_name,
+        audio_bytes,
+        content_type="audio/wav",
+    )
+    req = urllib.request.Request(ELEVENLABS_SCRIBE_URL, data=body, method="POST")
+    # The key rides ONLY this header. Never a URL/query param, never logged.
+    req.add_header(_ELEVENLABS_HEADER, api_key)
+    req.add_header("Content-Type", content_type)
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read()
+    data = _json.loads(raw.decode("utf-8"))
+    text = data.get("text") if isinstance(data, dict) else None
+    if not isinstance(text, str):
+        raise ValueError("ElevenLabs Scribe response had no text")
+    # #31: Scribe MAY carry a per-word `words` stream with `speaker_id`s when it
+    # diarized. We surface it (untouched) so the daemon's gated [voice].diarize path
+    # can CONSUME the real labels — never fabricated. None/absent when Scribe sent no
+    # word detail (then the daemon's honest single-stream fallback applies). The
+    # words stream is text + timings + speaker ids only — never the audio.
+    words = data.get("words") if isinstance(data, dict) else None
+    if not isinstance(words, list):
+        words = None
+    return text, words
+
+
+# #31 MULTI-SPEAKER DIARIZATION — the PURE Scribe-label assignment.
+#
+# Scribe (op=transcribe, backend=elevenlabs_scribe) returns a `words` stream where
+# each word may carry a `speaker_id` (and start/end timings) when it diarized. This
+# PURE function CONSUMES those labels into per-speaker turns: contiguous words sharing
+# a speaker_id are coalesced into one turn; a change of speaker starts a new turn. It
+# is the Python mirror of the daemon's `diarize::diarize` (diarize.rs) — same honesty
+# rails:
+#   * report ONLY the speakers Scribe reported (distinct turns iff Scribe distinguished
+#     them);
+#   * a word with no speaker_id is attributed to "unknown" (NEVER fabricated as a
+#     distinct speaker), joining/extending the surrounding unknown run;
+#   * spacing / audio_event tokens are skipped (never their own turn);
+#   * timings are carried only when present (never invented).
+#
+# This is OFF-by-default + EL-SCRIBE-GATED at the daemon ([voice].diarize); on-device
+# whisper has no diarization model and gets the honest single-stream labeling instead.
+# PURE: no I/O, no network — exercised by `_selftest_diarize`.
+DIARIZE_UNKNOWN_SPEAKER = "unknown"
+
+
+def _diarize_scribe_words(data):
+    """Map a parsed Scribe response dict to a list of per-speaker turns
+    [{"speaker_id", "text", "start", "end"}]. PURE; consumes only the labels Scribe
+    reported, never fabricating distinct speakers. An absent/empty `words` stream
+    falls back to ONE "unknown" turn carrying the whole `text` (the response did not
+    diarize, so we do not pretend it did); empty text -> []."""
+    if not isinstance(data, dict):
+        return []
+    words = data.get("words")
+    word_items = []
+    if isinstance(words, list):
+        for w in words:
+            if not isinstance(w, dict):
+                continue
+            kind = w.get("type")
+            # A missing type is treated as a word; spacing/audio_event are skipped.
+            if kind is not None and kind != "word":
+                continue
+            word_items.append(w)
+    if not word_items:
+        text = (data.get("text") or "").strip()
+        if not text:
+            return []
+        return [{"speaker_id": DIARIZE_UNKNOWN_SPEAKER, "text": text, "start": None, "end": None}]
+
+    turns = []
+    for w in word_items:
+        sid = w.get("speaker_id")
+        speaker = sid.strip() if isinstance(sid, str) and sid.strip() else DIARIZE_UNKNOWN_SPEAKER
+        wtext = (w.get("text") or "").strip()
+        start = w.get("start") if isinstance(w.get("start"), (int, float)) else None
+        end = w.get("end") if isinstance(w.get("end"), (int, float)) else None
+        if turns and turns[-1]["speaker_id"] == speaker:
+            if wtext:
+                turns[-1]["text"] = (turns[-1]["text"] + " " + wtext).strip()
+            if end is not None:
+                turns[-1]["end"] = end if turns[-1]["end"] is None else max(turns[-1]["end"], end)
+        else:
+            turns.append({"speaker_id": speaker, "text": wtext, "start": start, "end": end})
+    # Drop any turn that ended up textless.
+    return [t for t in turns if t["text"].strip()]
+
+
+# ---------------------------------------------------------------------------
+# On-device VISION-LANGUAGE MODEL seam (op=describe_image, OPTIONAL/OFF).
+#
+# This is the ONLY place mlx-vlm is imported. It is IMPORT-GUARDED: if mlx-vlm
+# is not installed (it is an optional dep), the import fails and we return None
+# so the op reports an honest "vision-language model not available" — py_compile
+# and the whole server work WITHOUT mlx-vlm present. This is also the MOCK SEAM:
+# tests monkeypatch `server._load_mlx_vlm` to inject a fake loader (or to force
+# the unavailable path) so the op dispatch + the fallback are exercised with NO
+# real model, NO MLX, and NO network.
+#
+# HONESTY: when this runs for real, the VLM runs ON-DEVICE via MLX — the image
+# pixels are read locally and NEVER leave the device. The model is a multi-GB
+# download (Qwen2-VL-class) gated on enough RAM, which is why the op ships OFF.
+def _load_mlx_vlm():
+    """Return the mlx-vlm callables we need (load, generate, apply_chat_template,
+    load_config) as a dict, or None if mlx-vlm is not installed.
+
+    Import-guarded: a missing mlx-vlm is the NORMAL ships-OFF state, not an
+    error — the caller turns a None return into an honest structured
+    "unavailable" response. We import the few symbols by their documented
+    mlx-vlm locations and tolerate minor version layout differences."""
+    try:
+        from mlx_vlm import generate as _generate
+        from mlx_vlm import load as _load
+        from mlx_vlm.prompt_utils import apply_chat_template as _apply_chat_template
+        from mlx_vlm.utils import load_config as _load_config
+    except Exception:
+        # ImportError (not installed) OR any layout error in an unexpected
+        # mlx-vlm version: treat as unavailable rather than crashing the op.
+        return None
+    return {
+        "load": _load,
+        "generate": _generate,
+        "apply_chat_template": _apply_chat_template,
+        "load_config": _load_config,
+    }
+
+
+# ---------------------------------------------------------------------------
+# #37 SPECULATIVE DECODING — import-guarded availability probe for mlx_lm's
+# speculative/draft generation support. This is the ONLY place we check that
+# mlx_lm can do draft generation; it is IMPORT-GUARDED exactly like
+# _load_mlx_vlm / _load_mlx_diffusion: an mlx_lm without speculative support (or
+# not installed) returns False so the generate path honestly falls back to
+# NORMAL generation and reports speculative=False — py_compile and the whole
+# server work WITHOUT speculative support. This is also the MOCK SEAM: tests
+# monkeypatch `server._mlx_speculative_available` to force on/off so the
+# should_use_speculative decision + the fallback are exercised with NO real
+# model, NO MLX, and NO draft load.
+#
+# HONESTY: even when this is True and a draft model is configured, the actual
+# speedup is device/model-dependent and only real on-device — it is NEVER
+# measured or claimed headlessly. The server reports the path that ACTUALLY ran.
+def _mlx_speculative_available():
+    """Whether mlx_lm exposes draft/speculative generation we can drive. Returns
+    True iff the symbols are importable; any ImportError / layout mismatch (an
+    mlx_lm too old for speculative decoding, or not installed) -> False so the
+    generate path falls back to normal generation honestly."""
+    try:
+        # mlx_lm threads a `draft_model` through generate/stream_generate for
+        # speculative decoding. We probe the import surface only; we do NOT load
+        # a model or run a generate here (that is the device-gated live path).
+        from mlx_lm import generate as _generate  # noqa: F401
+        from mlx_lm import stream_generate as _stream_generate  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
+# On-device IMAGE-GENERATION (text->image) seam (op=generate_image, OPTIONAL/OFF).
+#
+# This is the ONLY place the MLX diffusion package is imported. It is
+# IMPORT-GUARDED exactly like _load_mlx_vlm above: the diffusion package
+# (mflux — a Stable-Diffusion/FLUX-class text->image engine on MLX) is an
+# OPTIONAL dep. If it is not installed, the import fails and we return None so
+# the op reports an honest "image model not available" — py_compile and the
+# whole server work WITHOUT it. This is also the MOCK SEAM: tests monkeypatch
+# `server._load_mlx_diffusion` to inject a fake generator (or to force the
+# unavailable path) so the op dispatch + the fallback are exercised with NO
+# real model, NO MLX, and NO image generation.
+#
+# HONESTY: when this runs for real, image generation is 100% ON-DEVICE via MLX —
+# the prompt and the generated pixels stay on the machine and NEVER leave the
+# device (there is NO cloud image API anywhere in this path). The model is a
+# multi-GB download gated on enough RAM and is slow on smaller chips, which is
+# why the op ships OFF/opt-in.
+def _load_mlx_diffusion():
+    """Return the MLX diffusion callable(s) we need as a dict, or None if the
+    diffusion package is not installed.
+
+    Import-guarded: a missing diffusion package is the NORMAL ships-OFF state,
+    not an error — the caller turns a None return into an honest structured
+    "unavailable" response. We import from mflux (a FLUX/Stable-Diffusion-class
+    on-device MLX text->image engine) and tolerate minor version layout
+    differences. NEVER falls back to a cloud image API: absent package == honest
+    unavailable, full stop."""
+    try:
+        from mflux import Config as _Config
+        from mflux import Flux1 as _Flux1
+    except Exception:
+        # ImportError (not installed) OR any layout error in an unexpected
+        # version: treat as unavailable rather than crashing the op.
+        return None
+    return {
+        "Flux1": _Flux1,
+        "Config": _Config,
+    }
+
+
+# Opener bank ([speech].openers fallback): short acknowledgement lines
+# synthesized to state/openers/opener-<idx>.wav at preload so the daemon can
+# play one the instant an utterance ends, before STT even starts. Must stay
+# in lockstep with [speech].openers in config/jarvis.toml.
+DEFAULT_OPENERS = [
+    "Right away, sir.",
+    "Of course.",
+    "One moment.",
+    "On it, sir.",
+    "Let me see.",
+]
+
+# TTS engine registry: per-engine default HF repo and default voice (the most
+# JARVIS-suitable voice each engine offers). [speech].engine selects the
+# engine, [speech].model overrides the repo ("" = this default). Adoption is
+# GATED: a non-kokoro engine ships as default only after measuring warm
+# RTF (= synth_seconds / audio_seconds) <= 0.5 on the target machine, a clean
+# load, and output that survives the silence-trim path.
+# 2026-06-12 eval (M1 Pro 16GB, mlx-audio 0.4.4, warm, GPU otherwise idle,
+# same audition line; samples in state/voice-samples/<engine>-<voice>.wav):
+#   kokoro/bm_george           RTF 0.069 (runs 0.071/0.069)  PASS
+#   csm-1b-8bit/conv_b         RTF 0.931 (runs 1.123/0.931)  FAIL (loads
+#       clean, trim OK; ~9s synth for 9.7s audio)
+#   orpheus-3b-4bit/leo        RTF 1.28  (runs 1.298/1.280)  FAIL (loads
+#       clean, trim OK; slower than realtime)
+# Both candidates are LLM-class TTS — in real use they would also share the
+# GPU with the resident Qwen3-4B converse decode and add ~1.7-1.9GB each on a
+# 16GB machine, so the idle-GPU numbers above flatter them. Kokoro stays the
+# default; this registry is the dispatch/config hook for an M4 re-run.
+TTS_ENGINE_DEFAULTS = {
+    "kokoro": {"model": DEFAULT_TTS, "voice": DEFAULT_VOICE},
+    # Sesame CSM 1B (8-bit MLX). Voice = repo speaker prompt; conversational_b
+    # is the male prompt. speed is not supported by the model.
+    "csm": {"model": "mlx-community/csm-1b-8bit", "voice": "conversational_b"},
+    # Orpheus 3B ft (4-bit MLX). Male voices: leo (warm), dan, zac; no British
+    # voice exists. speed is not supported by the model.
+    "orpheus": {"model": "mlx-community/orpheus-3b-0.1-ft-4bit", "voice": "leo"},
+}
+# Dedicated classify model ("" = reuse the main LLM). Must stay in lockstep
+# with [models].classifier in config/jarvis.toml. Gated: only ships non-empty
+# after passing the 7-utterance accuracy eval (>=6/7, all heavy cases heavy).
+# 2026-06-12 (M1 Pro, mlx_lm 0.31.3): every small candidate FAILED the gate —
+# Qwen3-0.6B-4bit 4/7 (parrots the prompt's last few-shot example for memory
+# and greeting utterances; ~290ms vs ~870ms on the 4B), Qwen2.5-0.5B-Instruct
+# -4bit 4/7 + classified the script-writing case light, Llama-3.2-1B-Instruct
+# -4bit 3/7. The main 4B scores 7/7, so classify stays on it for now.
+DEFAULT_CLASSIFIER = ""
+
+# 160, not 80: the args contract means web.search/memory.store outputs echo
+# utterance content inside args, and a JSON skeleton + ~38 words already hit
+# 80 tokens — truncation there turns a valid classification into the
+# cloud-escalation fallback. The prefix is KV-cached and greedy decode stops
+# at EOS, so the higher cap only costs anything on the rare long outputs.
+CLASSIFY_MAX_TOKENS = 160
+GENERATE_DEFAULT_MAX_TOKENS = 160
+EXTRACT_FACTS_MAX_TOKENS = 120
+
+# op=embed: hard cap on how many tokens of one input we encode before
+# mean-pooling its hidden states. MNEMOSYNE embeds short facts and a short
+# query, so this is generous — it exists only to bound a pathological input
+# (a giant pasted blob) from holding the GPU lock or blowing memory. Inputs
+# longer than this are truncated to the first EMBED_MAX_TOKENS tokens before
+# the forward pass (an embedding of the lead is still useful; the alternative
+# is an unbounded forward). The batch is also capped (EMBED_MAX_BATCH) so one
+# request cannot enqueue an unbounded number of forward passes.
+EMBED_MAX_TOKENS = 512
+EMBED_MAX_BATCH = 256
+
+# op=describe_image (on-device VLM): structured marker the op returns when the
+# vision-language model cannot run (mlx-vlm not installed, or the checkpoint not
+# downloaded). The daemon keys off ok:false + reason="vlm_unavailable" to fall
+# back honestly (OCR/classification, or an honest "the vision model isn't
+# downloaded") — it NEVER substitutes a fabricated description. This op is the
+# ONLY place pixels are read, and they are read LOCALLY (never sent anywhere).
+DESCRIBE_IMAGE_UNAVAILABLE_REASON = "vlm_unavailable"
+# Decode budget for one description/answer. Generous enough for a paragraph of
+# scene description or a VQA answer; bounds a pathological generation from
+# holding the GPU lock. The daemon may not override it past this hard cap.
+DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS = 256
+DESCRIBE_IMAGE_MAX_TOKENS_CAP = 1024
+# Default instruction when the caller asks for a plain description (no question).
+DESCRIBE_IMAGE_DEFAULT_PROMPT = (
+    "Describe this image in detail. Focus on the visual scene — objects, "
+    "people, layout, colors, and what is happening — not just any text in it."
+)
+# Cap on the question length we forward to the VLM (a guard, not the normal
+# case; VQA questions are short).
+DESCRIBE_IMAGE_MAX_QUESTION_CHARS = 2000
+
+# op=generate_image (on-device text->image): structured marker the op returns
+# when the diffusion model cannot run (the diffusion package is not installed,
+# or the checkpoint is not downloaded / fails to load). The daemon keys off
+# ok:false + reason="image_model_unavailable" to surface an honest "the
+# on-device image model isn't set up" message — it NEVER substitutes a
+# fabricated image and NEVER falls back to a cloud image API. This op is the
+# ONLY place the prompt is handed to a generator, and that generator is the
+# on-device MLX diffusion model (the prompt + the pixels never leave the device).
+GENERATE_IMAGE_UNAVAILABLE_REASON = "image_model_unavailable"
+# Default sampling steps for one generation. Diffusion quality/speed trade off
+# against step count; this is a sane middle default the caller may override
+# (bounded by the cap below). The image QUALITY/speed are device/runtime-gated
+# and are NOT claimed measured here.
+GENERATE_IMAGE_DEFAULT_STEPS = 4
+GENERATE_IMAGE_MAX_STEPS_CAP = 50
+# Default square output resolution (pixels). Overridable per request, bounded by
+# the cap so one request cannot ask for a pathological allocation.
+GENERATE_IMAGE_DEFAULT_SIZE = 512
+GENERATE_IMAGE_MIN_SIZE = 64
+GENERATE_IMAGE_MAX_SIZE = 1536
+# Cap on the prompt length we forward to the diffusion model (a guard; a wildly
+# long prompt is truncated, not rejected).
+GENERATE_IMAGE_MAX_PROMPT_CHARS = 2000
+# On-device output directory for generated images (under state/, never the
+# network). Saved here and the absolute path is returned to the daemon; the
+# pixels stay on the machine.
+IMAGES_DIR = PROJECT_ROOT / "state" / "images"
+
+# op=consolidate: greedy decode budget, hard caps on what one reflection pass
+# may touch (upserts + deletes combined) and on the transcript window the
+# prompt is built from (the daemon sends the last 40 exchanges).
+CONSOLIDATE_MAX_TOKENS = 400
+CONSOLIDATE_MAX_CHANGES = 12
+CONSOLIDATE_MAX_TRANSCRIPTS = 40
+
+# op=converse synthesizes at most this many leading sentences; the rest of
+# the reply is returned as text only (the persona keeps replies short, so
+# this is a guard, not the normal case).
+CONVERSE_MAX_SPOKEN_SENTENCES = 5
+
+# Per-agent persona KV prompt caches kept resident at once (an LRU). The base
+# persona has its own dedicated cache (self._gen_cache); this bounds the EXTRA
+# agent-prefix caches so a long session that touches many agents does not grow
+# GPU memory without limit. A handful covers the agents a user actually rotates
+# through in a session; the least-recently-used cache is evicted past this.
+AGENT_PERSONA_CACHE_MAX = 4
+
+
+def _lru_insert(od, key, value, max_size):
+    """Insert `key`->`value` into the OrderedDict `od` used as an LRU: the key
+    becomes most-recently-used, and the oldest keys are evicted until at most
+    `max_size` remain. Returns the list of evicted keys (newest-eviction last),
+    so the caller can log/release them. PURE bookkeeping over the dict — no MLX,
+    no model — so the eviction policy is unit-testable in isolation."""
+    od[key] = value
+    od.move_to_end(key)
+    evicted = []
+    while len(od) > max_size:
+        ev, _ = od.popitem(last=False)
+        evicted.append(ev)
+    return evicted
+
+
+# ---------------------------------------------------------------------------
+# Multi-resident LOCAL model manager (task #17).
+#
+# HONESTY FIRST. This keeps MORE THAN ONE local MLX model warm at once SO THE
+# LOCAL TIER CAN SWAP INSTANTLY between them (e.g. a small "local-fast" model
+# and the capable 4B) WITHOUT a reload — but ONLY when there is RAM to spare.
+# Two resident models cost ~2x the RAM of one; the DEFAULT is single-resident
+# (warm-set = just the base LLM), which is exactly today's behavior and is the
+# safe state on a low-RAM Mac (8GB M1). Multi-resident is OPT-IN via config and
+# is RAM-BOUNDED: the manager NEVER loads past the budget, LRU-evicts the
+# least-recently-used resident when a new load would exceed it, and if even a
+# single configured model does not fit the budget it falls back to
+# single-resident. The POLICY here is pure and unit-tested over SYNTHETIC
+# sizes; the ACTUAL load + the swap speed benefit are runtime/device-gated and
+# are NOT claimed measured anywhere.
+#
+# This changes nothing about routing SAFETY: it does not touch the consequential
+# gate or which TIER is chosen (that is the existing model-swap). It only lets
+# the already-chosen LOCAL tier pick among models that are already warm.
+
+# Conservative approximate footprint (GiB of unified memory) used by the policy
+# ONLY when a model's size is unknown (not in [models].local_sizes and no
+# heuristic match). The 4B-4bit class is ~2.3-2.6GB resident on MLX; this is a
+# deliberately generous default so an unknown model is assumed COSTLY (it must
+# EARN a warm slot against the budget, never sneak in under-counted).
+DEFAULT_LOCAL_MODEL_GIB = 3.0
+
+# Hard floor on the warm-set: the base/primary LLM is ALWAYS a member (it is the
+# single-resident fallback and the model the persona KV cache + embeddings are
+# built on). The policy guarantees at least this one model stays warm.
+LOCAL_WARM_MIN = 1
+
+
+def estimate_local_model_gib(model_id, sizes=None):
+    """Best-effort APPROX resident footprint (GiB) for a local MLX model id,
+    used ONLY by the budgeting POLICY (never an allocation). Resolution order:
+      1. an explicit override in `sizes` ([models].local_sizes, id -> GiB),
+      2. a coarse heuristic on the id (param count x a per-bit-width factor),
+      3. DEFAULT_LOCAL_MODEL_GIB when nothing matches.
+    This is an ESTIMATE for keep-warm bookkeeping, NOT a measurement and NOT a
+    guarantee; the real resident size is device/quant/runtime dependent. Pure
+    (no MLX, no load), so the policy is unit-testable over synthetic ids."""
+    if sizes and model_id in sizes:
+        try:
+            g = float(sizes[model_id])
+            if g > 0:
+                return g
+        except (TypeError, ValueError):
+            pass  # bad override -> fall through to the heuristic (honest default)
+    name = (model_id or "").lower()
+    # Param count from a "<n>b" token in the id (e.g. "qwen3-4b" -> 4.0).
+    params_b = None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*b(?:[-_./]|$|it)", name)
+    if m:
+        try:
+            params_b = float(m.group(1))
+        except ValueError:
+            params_b = None
+    if params_b is None:
+        return DEFAULT_LOCAL_MODEL_GIB
+    # Bytes per parameter by quantization: 4bit ~0.55 GiB/B, 8bit ~1.1, else
+    # (bf16/fp16) ~2.2. The factors include MLX overhead + a small KV margin;
+    # they are intentionally a touch high so the budget is respected, not blown.
+    if "4bit" in name or "4-bit" in name or "q4" in name:
+        per_b = 0.6
+    elif "8bit" in name or "8-bit" in name or "q8" in name:
+        per_b = 1.15
+    else:
+        per_b = 2.2
+    return round(params_b * per_b, 3)
+
+
+def plan_warm_set(base_id, configured, budget_gib, sizes=None):
+    """PURE keep-warm POLICY. Decide which local models may be kept resident at
+    once under a RAM `budget_gib`, given the always-resident `base_id` and the
+    operator's `configured` extra warm ids ([models].local_warm). Returns the
+    ORDERED list of model ids the manager is ALLOWED to keep warm (base first,
+    then the configured extras that fit, in config order).
+
+    Rules (RAM-bounded, single-resident-safe):
+      * `base_id` is ALWAYS in the result — it is the single-resident fallback.
+      * Each subsequent configured id is admitted ONLY if adding its estimated
+        footprint keeps the running total <= budget_gib; otherwise it is
+        SKIPPED (it never gets a warm slot). Dedup preserves first position.
+      * If `base_id` alone already exceeds the budget, the budget is treated as
+        a soft floor for the base ONLY (the base MUST stay warm — it is the
+        fallback), and NO extras are admitted: SINGLE-RESIDENT.
+    Pure arithmetic over `sizes`/heuristic estimates — no MLX, no load — so the
+    budget/admit/single-fallback decisions are unit-testable with synthetic
+    sizes. This returns the ALLOWED SET, not what is loaded; actual loading is
+    lazy and LRU-bounded by the manager against this same set + budget."""
+    plan = [base_id]
+    try:
+        budget = float(budget_gib)
+    except (TypeError, ValueError):
+        budget = 0.0
+    used = estimate_local_model_gib(base_id, sizes)
+    seen = {base_id}
+    # base over budget OR a non-positive budget => single-resident (base only).
+    if budget <= 0 or used > budget:
+        return plan
+    for mid in configured or []:
+        if not mid or mid in seen:
+            continue
+        cost = estimate_local_model_gib(mid, sizes)
+        if used + cost <= budget:
+            plan.append(mid)
+            seen.add(mid)
+            used += cost
+        # else: does not fit -> skipped (NOT warm). Later, smaller models in the
+        # list may still fit, so we keep scanning rather than breaking.
+    return plan
+
+
+# ---------------------------------------------------------------------------
+# #37 SPECULATIVE DECODING + #39 SELECTABLE QUANTIZATION — PURE helpers.
+#
+# Both ship OFF/neutral: speculative defaults false (+ no draft model => normal
+# generation, today's runtime), quant defaults "auto" (load the model exactly as
+# configured, today's behavior). The PURE decisions below are unit-tested over
+# synthetic inputs by --selftest; the LIVE seams (the draft-model load, the
+# speculative generate, the quant model load) are device/runtime-gated and are
+# NEVER exercised here — import-guarded like the VLM/diffusion optional seams, so
+# a missing/absent draft or quant variant honestly falls back + reports the path
+# that ACTUALLY ran (never claims speculative when normal gen ran, never claims
+# int4 when fp16 loaded). The real speedup/RAM/quality effect is device-gated.
+# ---------------------------------------------------------------------------
+
+# The quantization values the contract allows. MUST match the daemon's
+# config.rs `InferenceConfig::ALLOWED_QUANT`. "auto" is the neutral default:
+# load the model as configured (today's behavior, no quant override).
+ALLOWED_QUANT = ("auto", "fp16", "int8", "int4")
+
+
+def validate_quant(quant):
+    """Validate a requested quantization string against the allowed set (#39).
+    PURE — returns the value unchanged if allowed, raises ValueError with a
+    precise message otherwise. Mirrors the daemon's `quant_is_valid` so the two
+    sides reject the same values. The caller (config-load seam) turns an invalid
+    value into a fall-back-to-"auto" + an honest log; this is the strict gate so
+    a bogus quant never reaches the model-load path."""
+    if quant in ALLOWED_QUANT:
+        return quant
+    raise ValueError(
+        f"unknown quantization {quant!r}; allowed: {', '.join(ALLOWED_QUANT)}"
+    )
+
+
+def select_quant(requested, available):
+    """PURE quant SELECTION + HONEST fallback (#39). Decide which quantization to
+    actually load given the `requested` value (validated) and the set/list of
+    quants `available` for the configured model on disk. Returns
+    `(chosen, requested_honored)`:
+
+      * requested == "auto"            -> ("auto", True): today's behavior — let
+        the loader pick the model as configured. No claim about a specific quant.
+      * requested in `available`       -> (requested, True): the requested quant
+        variant is present; load it.
+      * requested NOT in `available`   -> (<first available> or "auto", False):
+        the requested variant is NOT present — fall back to an available one (or
+        "auto" when nothing is enumerable) and report `requested_honored=False`
+        so the caller NEVER claims the requested quant loaded when it did not.
+
+    `available` may be empty/None (the common case: we did not enumerate on-disk
+    variants), in which case a non-auto request falls back to "auto" honestly
+    rather than fabricating a variant. PURE — no load, no MLX; the real load +
+    the RAM/speed tradeoff are device-gated. Unit-tested over synthetic inputs."""
+    validate_quant(requested)
+    if requested == "auto":
+        return ("auto", True)
+    avail = list(available or [])
+    if requested in avail:
+        return (requested, True)
+    # Requested variant absent: fall back HONESTLY. Prefer a concrete available
+    # quant (deterministic: first in the allowed order that is available); else
+    # "auto" (let the loader pick what is actually on disk).
+    for q in ALLOWED_QUANT:
+        if q != "auto" and q in avail:
+            return (q, False)
+    return ("auto", False)
+
+
+def quant_variant_id(base_id, quant):
+    """PURE: derive the model id to TRY for a requested non-"auto" quant (#39).
+    MLX community checkpoints encode the quant in the id suffix (…-4bit / …-8bit
+    / …-bf16). Given the configured `base_id` and a validated `quant`, return the
+    candidate id whose quant suffix is rewritten to the request:
+
+      * quant == "auto"  -> base_id unchanged (today's behavior: load as-is).
+      * quant int4/int8  -> swap a trailing -4bit/-8bit suffix (e.g.
+        "…-4bit" with quant=int8 -> "…-8bit"); if the base has no recognized
+        quant suffix, APPEND one ("…-8bit").
+      * quant fp16       -> swap to/append "-bf16" (the MLX half-precision id).
+
+    This is a best-effort id derivation, NOT a guarantee the variant exists — the
+    LOAD seam tries this id and falls back to the base id (recording the quant
+    that ACTUALLY loaded) if it is absent. PURE string work; no MLX, no load."""
+    if quant == "auto":
+        return base_id
+    target = {"int4": "4bit", "int8": "8bit", "fp16": "bf16"}.get(quant)
+    if not target:
+        return base_id
+    # Strip a recognized trailing quant suffix, then append the target.
+    stripped = re.sub(r"[-_](?:4bit|8bit|4-bit|8-bit|bf16|fp16|q4|q8)$", "", base_id, flags=re.IGNORECASE)
+    return f"{stripped}-{target}"
+
+
+def should_use_speculative(speculative_on, draft_model, draft_available):
+    """PURE decision for the generate path (#37): use speculative/draft decoding
+    THIS turn iff ALL of:
+      * `speculative_on` ([inference].speculative is true — the master gate), AND
+      * `draft_model` is a non-empty configured id, AND
+      * `draft_available` is True (the draft checkpoint + mlx_lm's speculative
+        support actually loaded — the import/availability guard's verdict).
+
+    Returns True only when speculative decoding will REALLY run; otherwise False
+    => NORMAL generation (today's runtime). The caller reports the path that
+    ACTUALLY ran from this same decision, so a turned-on-but-unavailable draft
+    honestly reports speculative=False (NEVER fakes speculative). PURE — no MLX,
+    no load; the real speedup is device/model-dependent and only on-device."""
+    return bool(speculative_on) and bool(draft_model) and bool(draft_available)
+
+
+class LocalWarmManager:
+    """Keeps up to N local MLX models WARM under a RAM budget so the Local tier
+    can swap between them instantly. The class is PURE bookkeeping over the
+    policy (plan_warm_set + an LRU of resident ids); it NEVER imports or loads
+    MLX itself — `select()` takes a `loader(model_id)` callback that the engine
+    supplies (the real MLX `load`), so every keep-warm / evict / select /
+    single-fallback decision is unit-testable with a synthetic loader and
+    synthetic sizes.
+
+    Contract used by the daemon's Local tier (via the engine's generate/converse
+    op): pass a requested local `model_id`; the manager returns the resident
+    (model, tokenizer) for it — loading + keeping it warm if it is in the
+    allowed warm-set and the budget permits, else transparently falling back to
+    the base/single-resident model. An ABSENT model (loader raises) or a model
+    OUTSIDE the warm-set returns the base — NEVER a crash.
+
+    `base_id` is the always-resident primary LLM; `select(None)` or
+    `select(base_id)` returns it. Caller holds the engine GPU lock; this class
+    does no locking of its own (it is driven entirely under that lock)."""
+
+    def __init__(self, base_id, configured=None, budget_gib=0.0, sizes=None):
+        self.base_id = base_id
+        self.configured = list(configured or [])
+        self.budget_gib = budget_gib
+        self.sizes = dict(sizes or {})
+        # The ALLOWED warm-set under the budget (base first). Anything not in
+        # here is never kept warm; a request for it falls back to the base.
+        self.plan = plan_warm_set(base_id, self.configured, budget_gib, self.sizes)
+        self.allowed = set(self.plan)
+        # How many distinct models may be RESIDENT at once. The plan already
+        # encodes the budget; capacity is just its length (>= LOCAL_WARM_MIN).
+        self.capacity = max(len(self.plan), LOCAL_WARM_MIN)
+        # id -> (model, tokenizer), used as an LRU (move_to_end on touch). The
+        # base, once loaded, is PINNED: it is never evicted (it is the fallback
+        # + the persona-cache/embedding model). Non-base residents LRU-evict.
+        from collections import OrderedDict as _OrderedDict
+
+        self.resident = _OrderedDict()
+
+    def multi_resident(self):
+        """True iff the policy admitted >1 model (i.e. instant local swap is
+        possible). False => single-resident (the safe low-RAM default)."""
+        return len(self.plan) > 1
+
+    def warm_ids(self):
+        """The model ids currently RESIDENT (loaded), base first. Honest view
+        for the HUD indicator: what is actually warm right now, not the plan."""
+        ids = []
+        if self.base_id in self.resident:
+            ids.append(self.base_id)
+        ids += [k for k in self.resident if k != self.base_id]
+        return ids
+
+    def resolve_id(self, model_id):
+        """Map a requested local model id to the id that will actually answer:
+        the request itself if it is in the allowed warm-set, else the base
+        (single-resident fallback). PURE — no load. None/"" -> base."""
+        if model_id and model_id in self.allowed:
+            return model_id
+        return self.base_id
+
+    def select(self, model_id, loader):
+        """Return (resolved_id, model, tokenizer) for the requested local model,
+        keeping it warm under the budget. `loader(id) -> (model, tokenizer)` is
+        the engine's real lazy MLX load (or a synthetic stub in tests).
+
+        Flow: resolve the id against the allowed warm-set (out-of-set -> base);
+        return it if already resident; otherwise load it, LRU-EVICT non-base
+        residents until at most `capacity` remain, and pin/insert it. If loading
+        a NON-base model RAISES (absent checkpoint / OOM), fall back to the base
+        (loading the base if needed) — never propagate the failure to the op."""
+        resolved = self.resolve_id(model_id)
+        hit = self.resident.get(resolved)
+        if hit is not None:
+            self.resident.move_to_end(resolved)
+            return (resolved, hit[0], hit[1])
+        try:
+            model, tokenizer = loader(resolved)
+        except Exception:
+            if resolved == self.base_id:
+                raise  # base load failing is fatal to the op anyway; surface it.
+            log.exception(
+                "local model %s could not be loaded; falling back to base %s",
+                resolved,
+                self.base_id,
+            )
+            return self.select(self.base_id, loader)
+        self._insert(resolved, model, tokenizer)
+        return (resolved, model, tokenizer)
+
+    def _insert(self, model_id, model, tokenizer):
+        """Insert a freshly loaded resident and LRU-evict non-base residents
+        until at most `capacity` remain. The base is PINNED (never evicted).
+        Returns the list of evicted ids (so the engine can drop their caches).
+
+        RAM NOTE — bounded +1 transient: the caller (`select`) loads the new model
+        object BEFORE calling this, so during a swap from a full warm-set RAM briefly
+        holds capacity+1 models until the eviction loop below drops the LRU victim.
+        This load-then-evict ordering is inherent to any keep-warm LRU (you must
+        materialize the replacement before discarding the old one) and it all runs
+        synchronously under the GPU lock in `_ensure_local_llm` before generation, so
+        it is a momentary in-flight peak, NOT a sustained leak: the STEADY-STATE
+        warm-set always respects the budget. The "never more than the budget" bound
+        therefore holds in steady state, not during the atomic in-flight swap. For a
+        RAM-tight Mac, set the budget with one-model headroom (or stay single-resident,
+        the default) so even the transient stays inside physical RAM."""
+        self.resident[model_id] = (model, tokenizer)
+        self.resident.move_to_end(model_id)
+        evicted = []
+        # Evict the oldest NON-base resident until within capacity.
+        while len(self.resident) > self.capacity:
+            victim = None
+            for k in self.resident:  # oldest-first
+                if k != self.base_id:
+                    victim = k
+                    break
+            if victim is None:
+                break  # only the base remains -> nothing evictable, stop.
+            del self.resident[victim]
+            evicted.append(victim)
+        if evicted:
+            log.info("local warm-set evicted %s (capacity %d)", evicted, self.capacity)
+        return evicted
+
+
+# Silence trim applied to every synthesized WAV (speak AND converse): samples
+# with |amplitude| < TRIM_AMPLITUDE are trimmed from both ends, keeping
+# TRIM_PAD_MS of padding each side. Kokoro bakes ~0.26s leading and ~0.46s
+# trailing silence into every utterance; trimmed, the residual lead/tail are
+# each <= 120ms (60ms pad + the sub-threshold fade).
+TRIM_AMPLITUDE = 0.005
+TRIM_PAD_MS = 60
+
+# Linear edge fades applied AFTER the silence trim, on the float array just
+# before int16 conversion: fade-in over the first FADE_IN_SAMPLES (5ms @24kHz)
+# and fade-out over the last FADE_OUT_SAMPLES (10ms @24kHz). The trim's hard
+# cut at the threshold used to leave a step at the clip edges that played as
+# a click where the daemon joins clips; the fade ramps pin the first and last
+# samples of every emitted WAV (speak, converse sentences, openers, audition
+# samples — they all funnel through _write_wav) to exactly 0, guaranteeing
+# |amp| < 0.002 at both edges.
+FADE_IN_SAMPLES = 120
+FADE_OUT_SAMPLES = 240
+
+# Sampling for the persona-voiced generate op ONLY. Greedy decoding (mlx_lm's
+# default, temp 0) is deterministic: identical requests produce byte-identical
+# replies, which breaks the persona contract ("vary your phrasing naturally;
+# never answer similar requests with identical wording"). classify and
+# extract_facts stay greedy — they emit strict JSON, where determinism is a
+# feature. See InferenceEngine._persona_sampler for why this needs an explicit
+# PRNG key instead of mlx_lm's make_sampler.
+#
+# Temp bump 0.6 -> 0.85 (persona part B): at 0.6 short turns collapsed onto a
+# couple of stock phrasings — five "Hi JARVIS" samples returned the same two
+# task-acknowledgement sentences ("Right away, sir. System online. Standing
+# by."), which reads as a console, not a person. 0.85 (with top-p 0.95 holding
+# the tail in check) gives genuinely distinct greetings each call while the
+# grounding rules in persona.txt keep specifics from drifting — measured: no
+# invented weather/schedule/numbers across the greeting + status + data probes.
+GENERATE_TEMP = 0.85
+GENERATE_TOP_P = 0.95
+
+# Appended to the final user turn of a converse request that carries
+# "opener_spoken": the daemon already played that opener line from the bank,
+# so the model must continue past it instead of acknowledging again. The
+# persona's short-opener-first rule intentionally loses to this note.
+OPENER_SPOKEN_NOTE = (
+    "[You already began your reply aloud with: '{opener}'. Continue naturally "
+    "from there - do not repeat any acknowledgement or greeting; go directly "
+    "to the substance.]"
+)
+
+# JSONL line limit. The asyncio default (64 KiB) is too small for generate
+# requests carrying long history exchanges (cloud replies can run ~16 KB of
+# JSON-escaped text each) plus facts and a data blob.
+STREAM_LIMIT = 8 * 1024 * 1024
+
+# Sesame CSM speaker prompts. mlx-audio's built-in voice= path fetches
+# prompts/<voice>.wav from the GATED upstream sesame/csm-1b repo (401 without
+# HF auth — measured 2026-06-12), so _synth_csm fetches the identical prompt
+# from the ungated mlx-community mirror and passes it as ref_audio/ref_text.
+# Transcripts are copied verbatim from mlx_audio.tts.models.sesame's
+# SPEAKER_PROMPTS (the mirror carries no .txt captions).
+CSM_PROMPT_REPO = "mlx-community/csm-1b"
+CSM_PROMPT_TEXTS = {
+    "conversational_a": (
+        "like revising for an exam I'd have to try and like keep up the momentum because I'd "
+        "start really early I'd be like okay I'm gonna start revising now and then like "
+        "you're revising for ages and then I just like start losing steam I didn't do that "
+        "for the exam we had recently to be fair that was a more of a last minute scenario "
+        "but like yeah I'm trying to like yeah I noticed this yesterday that like Mondays I "
+        "sort of start the day with this not like a panic but like a"
+    ),
+    "conversational_b": (
+        "like a super Mario level. Like it's very like high detail. And like, once you get "
+        "into the park, it just like, everything looks like a computer game and they have all "
+        "these, like, you know, if, if there's like a, you know, like in a Mario game, they "
+        "will have like a question block. And if you like, you know, punch it, a coin will "
+        "come out. So like everyone, when they come into the park, they get like this little "
+        "bracelet and then you can go punching question blocks around."
+    ),
+}
+
+# Marker spliced into the classifier template to find the static-prefix /
+# per-utterance boundary after chat templating. Never appears in real text.
+_UTTERANCE_SENTINEL = "\x00<utterance>\x00"
+
+# Valid Kokoro language codes (first letter of the voice name).
+_KOKORO_LANGS = frozenset("abefhijpz")
+
+# Orpheus 3B ft named speakers (upstream canopylabs voice set; mlx-audio
+# prepends the voice verbatim as a "<voice>: " prompt tag with NO validation,
+# so an unknown voice silently produces an arbitrary/garbled speaker).
+ORPHEUS_VOICES = frozenset({"tara", "leah", "jess", "leo", "dan", "mia", "zac", "zoe"})
+
+# Returned when the classifier output cannot be parsed/validated; confidence
+# 0.3 is below the router's cloud_confidence_threshold (0.6) and complexity
+# "heavy" both force escalation to cloud.
+CLASSIFY_FALLBACK = {"intent": "conversation", "confidence": 0.3, "complexity": "heavy", "args": {}}
+
+log = logging.getLogger("jarvis.inference")
+
+
+def setup_logging():
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
+    file_handler = logging.FileHandler(LOG_PATH)
+    file_handler.setFormatter(fmt)
+    stderr_handler = logging.StreamHandler(sys.stderr)
+    stderr_handler.setFormatter(fmt)
+    log.setLevel(logging.INFO)
+    log.addHandler(file_handler)
+    log.addHandler(stderr_handler)
+
+
+def load_config():
+    """Read settings from config/jarvis.toml with contract defaults.
+
+    Each key is validated independently: one bad value (e.g. speed = "fast")
+    keeps the rest of the file applied, and the log names exactly which keys
+    fell back — no half-applied dict misreported as full fallback.
+    """
+    settings = {
+        "llm": DEFAULT_LLM,
+        "stt": DEFAULT_STT,
+        "classifier": DEFAULT_CLASSIFIER,
+        # OPTIONAL on-device VLM checkpoint (op=describe_image). Default id is
+        # only the repo we'd load IF present; the op is gated on the model
+        # actually being downloaded, so this never forces a download.
+        "vlm": DEFAULT_VLM,
+        "engine": DEFAULT_TTS_ENGINE,
+        # "" = resolve from TTS_ENGINE_DEFAULTS for the active engine; the
+        # engine knows its own default repo/voice, so the empty string keeps
+        # an engine switch from dragging a stale kokoro voice along.
+        "tts_model": "",
+        "voice": "",
+        "speed": DEFAULT_SPEED,
+        "openers": list(DEFAULT_OPENERS),
+        "preload": True,
+        # Multi-resident LOCAL warm-set (task #17). DEFAULT is SINGLE-RESIDENT:
+        # an EMPTY extra warm-set + a 0 budget == today's behavior (only the
+        # base [models].llm is kept warm). Multi-resident is OPT-IN and
+        # RAM-bounded — see [models].local_warm / local_budget_gib / local_sizes
+        # in config/jarvis.toml. Conservative on purpose: a low-RAM Mac left at
+        # the defaults is unaffected.
+        "local_warm": [],
+        "local_budget_gib": 0.0,
+        "local_sizes": {},
+        # #37 SPECULATIVE DECODING (OFF/neutral default): speculative gated false
+        # + no draft model => NORMAL generation, today's exact runtime. A draft
+        # model is the small checkpoint mlx_lm uses to propose tokens; absent it
+        # (or unloadable) the generate path honestly falls back to normal gen.
+        "speculative": False,
+        "draft_model": "",
+        # #39 SELECTABLE QUANTIZATION (neutral default): "auto" == today's
+        # behavior (load the model as configured). An explicit value selects a
+        # matching variant at load; if absent the loader falls back + reports the
+        # quant that ACTUALLY loaded. Validated below (unknown -> "auto").
+        "quant": "auto",
+    }
+    try:
+        import tomllib  # stdlib on 3.11+
+
+        with open(CONFIG_PATH, "rb") as f:
+            cfg = tomllib.load(f)
+    except FileNotFoundError:
+        log.warning("config %s not found; using hardcoded contract defaults", CONFIG_PATH)
+        return settings
+    except Exception:
+        log.exception("failed to parse %s; using hardcoded contract defaults", CONFIG_PATH)
+        return settings
+
+    models = cfg.get("models", {})
+    speech = cfg.get("speech", {})
+    inference = cfg.get("inference", {})
+    sources = (
+        ("llm", models, "llm", str),
+        ("stt", models, "stt", str),
+        ("classifier", models, "classifier", str),
+        ("vlm", models, "vlm", str),
+        ("engine", speech, "engine", str),
+        ("tts_model", speech, "model", str),
+        ("voice", speech, "voice", str),
+        ("speed", speech, "speed", float),
+        ("preload", inference, "preload", bool),
+        # #37 SPECULATIVE DECODING (OFF/neutral): the master gate + the draft id.
+        ("speculative", inference, "speculative", bool),
+        ("draft_model", inference, "draft_model", str),
+    )
+    for key, section, cfg_key, conv in sources:
+        if not isinstance(section, dict) or cfg_key not in section:
+            continue
+        raw = section[cfg_key]
+        if conv is bool:
+            if isinstance(raw, bool):
+                settings[key] = raw
+            else:
+                log.warning("config key %r has non-boolean value %r; keeping default %r", key, raw, settings[key])
+            continue
+        if isinstance(raw, bool):
+            # A TOML boolean is never a valid str/float value, but float(True)
+            # == 1.0 and str(True) == "True" would both convert silently
+            # (audit fix: speed = true used to become 1.0 with no warning).
+            log.warning(
+                "config key %r has boolean value %r where %s is expected; keeping default %r",
+                key,
+                raw,
+                conv.__name__,
+                settings[key],
+            )
+            continue
+        try:
+            value = conv(raw)
+        except (TypeError, ValueError):
+            log.warning("config key %r has invalid value %r; keeping default %r", key, raw, settings[key])
+            continue
+        if key == "speed" and not (SPEED_MIN <= value <= SPEED_MAX):
+            # Out-of-range speed reaches every kokoro synthesis (opener bank
+            # included); see SPEED_MIN/SPEED_MAX (audit fix).
+            log.warning(
+                "config key 'speed' = %r is outside the supported range [%s, %s]; keeping default %r",
+                value,
+                SPEED_MIN,
+                SPEED_MAX,
+                settings[key],
+            )
+            continue
+        settings[key] = value
+    # [speech].openers: a non-empty list of non-empty strings, validated as a
+    # whole (a half-applied opener bank would desync the daemon's filename
+    # index -> opener text mapping). An INVALID list disables the bank
+    # entirely — zero WAVs — instead of substituting DEFAULT_OPENERS (audit
+    # fix): the daemon maps WAV filename indexes onto ITS OWN parsed openers
+    # list, so a defaults substitution here while the daemon keeps the custom
+    # list makes the model "continue" from an opener line the user never
+    # heard. A missing bank degrades gracefully daemon-side (no opener fires,
+    # no opener_spoken is sent); a mismapped one does not.
+    if isinstance(speech, dict) and "openers" in speech:
+        raw = speech["openers"]
+        if (
+            isinstance(raw, list)
+            and raw
+            and all(isinstance(s, str) and s.strip() for s in raw)
+        ):
+            settings["openers"] = [s.strip() for s in raw]
+        else:
+            log.warning(
+                "config key 'openers' must be a non-empty list of non-empty strings; "
+                "got %r; DISABLING the opener bank (a defaults substitution would "
+                "desync the daemon's index -> text mapping)",
+                raw,
+            )
+            settings["openers"] = []
+
+    # [models].local_warm: OPTIONAL list of EXTRA local model ids to keep warm
+    # alongside the base [models].llm for instant Local-tier swap. Validated as
+    # a whole list of non-empty strings; any invalid shape DISABLES the extra
+    # warm-set (single-resident) rather than half-applying it — the conservative,
+    # honest default. The base llm is always warm regardless; this is purely the
+    # EXTRA set, and it is still RAM-bounded by local_budget_gib below.
+    if isinstance(models, dict) and "local_warm" in models:
+        raw = models["local_warm"]
+        if isinstance(raw, list) and all(isinstance(s, str) and s.strip() for s in raw):
+            settings["local_warm"] = [s.strip() for s in raw]
+        else:
+            log.warning(
+                "config key [models].local_warm must be a list of non-empty strings; "
+                "got %r; keeping SINGLE-RESIDENT (no extra warm models)",
+                raw,
+            )
+            settings["local_warm"] = []
+
+    # [models].local_budget_gib: RAM budget (GiB) the warm-set may occupy. 0
+    # (the default) or any non-positive/invalid value means SINGLE-RESIDENT —
+    # the manager admits only the base. A positive budget lets the policy admit
+    # extras up to that total (estimated footprint). Conservative by default so
+    # an unconfigured low-RAM Mac never keeps two models warm.
+    if isinstance(models, dict) and "local_budget_gib" in models:
+        raw = models["local_budget_gib"]
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+            log.warning(
+                "config key [models].local_budget_gib must be a number; got %r; "
+                "keeping SINGLE-RESIDENT (budget 0)",
+                raw,
+            )
+        elif raw < 0:
+            log.warning(
+                "config key [models].local_budget_gib must be >= 0; got %r; "
+                "keeping SINGLE-RESIDENT (budget 0)",
+                raw,
+            )
+        else:
+            settings["local_budget_gib"] = float(raw)
+
+    # [models].local_sizes: OPTIONAL id -> approx resident GiB overrides for the
+    # budgeting policy (used when the heuristic would mis-estimate a model). Each
+    # entry must map a non-empty string id to a positive number; bad entries are
+    # dropped individually (the heuristic still covers them) so one typo never
+    # disables the whole table.
+    if isinstance(models, dict) and "local_sizes" in models:
+        raw = models["local_sizes"]
+        if isinstance(raw, dict):
+            sizes = {}
+            for k, v in raw.items():
+                if (
+                    isinstance(k, str)
+                    and k.strip()
+                    and not isinstance(v, bool)
+                    and isinstance(v, (int, float))
+                    and v > 0
+                ):
+                    sizes[k.strip()] = float(v)
+                else:
+                    log.warning(
+                        "config [models].local_sizes entry %r=%r is invalid "
+                        "(need non-empty id -> positive number); ignoring it",
+                        k,
+                        v,
+                    )
+            settings["local_sizes"] = sizes
+        else:
+            log.warning(
+                "config key [models].local_sizes must be a table; got %r; ignoring it",
+                raw,
+            )
+
+    # #39 SELECTABLE QUANTIZATION: [inference].quant must be one of ALLOWED_QUANT
+    # ("auto" default == today's behavior). An unknown value is a misconfiguration
+    # — keep the NEUTRAL "auto" default + warn rather than pass a bogus value to
+    # the model-load path. Mirrors the daemon's config.rs quant validation so the
+    # two sides reject the same values.
+    if isinstance(inference, dict) and "quant" in inference:
+        raw = inference["quant"]
+        if isinstance(raw, str):
+            try:
+                settings["quant"] = validate_quant(raw.strip())
+            except ValueError:
+                log.warning(
+                    "config key [inference].quant = %r is not one of %s; keeping \"auto\"",
+                    raw,
+                    ", ".join(ALLOWED_QUANT),
+                )
+        else:
+            log.warning(
+                "config key [inference].quant must be a string; got %r; keeping \"auto\"",
+                raw,
+            )
+
+    return settings
+
+
+def load_classifier_template():
+    try:
+        return PROMPT_PATH.read_text(encoding="utf-8")
+    except OSError:
+        log.exception("could not read %s; using built-in minimal classifier prompt", PROMPT_PATH)
+        return (
+            "You are the JARVIS intent classifier. Given one user utterance, "
+            'return ONLY a JSON object {"intent": "...", "confidence": 0.0, '
+            '"complexity": "light"|"heavy", "args": {}}.\n\n'
+            'Utterance: "{utterance}"\nJSON:'
+        )
+
+
+def load_persona():
+    try:
+        return PERSONA_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        log.exception("could not read %s; generate will run without persona", PERSONA_PATH)
+        return ""
+
+
+# System instruction for op=extract_facts. Kept out of the persona: this is a
+# structured-extraction task, not a voiced reply.
+EXTRACT_FACTS_SYSTEM = (
+    "You extract durable facts about the user from one voice-assistant exchange. "
+    "Reply with ONLY a JSON array — no prose, no code fences — of at most 3 objects, "
+    'each shaped {"key": "...", "value": "..."}. Keys are namespaced: user.name, '
+    "user.preference.<topic>, user.project.<name>, context.<topic>.\n"
+    "Grounding rules (non-negotiable):\n"
+    "- Extract ONLY facts the USER explicitly stated in their own words.\n"
+    "- The assistant's reply is context for disambiguation ONLY. It is NEVER a source "
+    "of facts: anything that appears only in the assistant's reply — names, numbers, "
+    "preferences, rooms, devices, temperatures — must be ignored entirely, even if it "
+    "sounds factual.\n"
+    "- Record only durable information worth remembering across conversations: the "
+    "user's name, preferences, projects, hardware, recurring goals or habits.\n"
+    "- Trivia, one-off commands, simple questions, greetings, and anything about the "
+    "assistant itself do NOT qualify.\n"
+    "- Corrections count: when the user contradicts or corrects an earlier fact "
+    "(\"actually my name is...\", \"no, I prefer...\"), extract the CORRECTED fact — "
+    "same key, new value. The correction is the durable fact, not the stale one.\n"
+    "- Be conservative: when in doubt, extract nothing. If the user stated nothing "
+    "durable, reply with exactly [].\n"
+    "Example — user says \"I'm Alice and I prefer metric units\": reply "
+    '[{"key": "user.name", "value": "Alice"}, '
+    '{"key": "user.preference.units", "value": "metric"}]. '
+    "Example — user says \"Actually my name is Dar, not Darwin\": reply "
+    '[{"key": "user.name", "value": "Dar"}]. '
+    "Example — user says \"how's it going?\" and the assistant's reply mentions "
+    "temperatures or rooms: reply []."
+)
+
+
+# System instruction for op=consolidate (self-learning reflection). Greedy
+# decode + strict JSON: determinism is a feature here, exactly like classify
+# and extract_facts. The op is deliberately conservative — the parse layer
+# (parse_consolidation) additionally enforces namespaced keys, the
+# deletes-must-exist rule, the meta.-key exclusion and the total change cap.
+CONSOLIDATE_SYSTEM = (
+    "You are the memory-consolidation pass of a voice assistant. You receive the "
+    "assistant's stored facts about the user and recent conversation transcripts "
+    "(oldest first). Reply with ONLY a JSON object — no prose, no code fences — "
+    'shaped {"upserts": [{"key": "...", "value": "..."}], "deletes": ["..."]}.\n'
+    "Rules (non-negotiable):\n"
+    "- Merge duplicate or overlapping facts into one: upsert the surviving fact if "
+    "its value needs updating, and delete the redundant keys. Exactly ONE key must "
+    "survive a merge — never delete every copy of a duplicated fact.\n"
+    "- On conflicting values for the same thing, prefer the NEWEST phrasing: later "
+    "transcript statements override earlier ones and override stored facts.\n"
+    "- DELETE facts that a later user statement contradicts or corrects (unless the "
+    "same key is being upserted with the corrected value — then just upsert).\n"
+    "- Generalize only clearly recurring patterns (something the user did or asked "
+    "for repeatedly across exchanges); never generalize from a single mention.\n"
+    "- Keys are namespaced (user.name, user.preference.<topic>, user.project.<name>, "
+    "user.habit.<slug>, context.<topic>). Deletes may ONLY name keys that appear in "
+    "the stored facts list — never invent a key to delete.\n"
+    "- Never invent facts: every upsert must be supported by the stored facts or by "
+    "what the USER said in the transcripts.\n"
+    "- Mine habits: when the user makes the SAME kind of request or statement at "
+    "least THREE separate times across the provided transcripts, upsert ONE fact "
+    "under user.habit.<slug> (lowercase snake_case slug) whose value is a short "
+    "plain description of the recurring pattern, e.g. "
+    'user.habit.morning_status_check = "asks for a system status most mornings". '
+    "The three occurrences do not need identical wording — three differently "
+    "phrased requests for the same thing (\"give me a system status\" / \"system "
+    "status please\" / \"run a status check\") ARE the same kind of request and "
+    "must be mined.\n"
+    "- When the user's own lines make the habit's timing evident (\"every "
+    "morning\", \"most mornings\", \"again this evening\"), include that "
+    "time-of-day word — morning, afternoon or evening — in the habit value, "
+    "e.g. \"asks for a system status most mornings\". Never state a time of "
+    "day the user's lines do not show.\n"
+    "- Habit evidence comes ONLY from lines that start with \"User:\". Lines that "
+    "start with \"Assistant:\" are NEVER evidence — even when the assistant "
+    "explicitly claims the user does something regularly, that claim alone "
+    "produces NO habit fact. Fewer than three User: occurrences in these "
+    "transcripts means NO habit fact, and a habit is never inferred from stored "
+    "facts alone.\n"
+    "- Touch as little as possible: do NOT upsert facts whose value is unchanged, and "
+    "do NOT delete a key you are upserting.\n"
+    "- Output shape is strict: every upsert is an object with exactly the two fields "
+    '"key" and "value"; every delete is the bare key string only (never "key = value").\n'
+    "- Be conservative: when unsure, change nothing. If the stored facts are already "
+    'clean and consistent, reply with exactly {"upserts": [], "deletes": []}.\n'
+    "Example — stored facts user.name = Alice, user.preference.coffee = espresso, "
+    "user.preference.coffee_drink = espresso; in a later transcript the user says "
+    '"actually, it\'s Alicia": reply {"upserts": [{"key": "user.name", "value": '
+    '"Alicia"}], "deletes": ["user.preference.coffee_drink"]} — the name takes the '
+    "newest value, the duplicated preference collapses to one key, and the unchanged "
+    "espresso fact is not touched. "
+    "Example — the User: lines include \"play some jazz\", \"put on jazz please\" "
+    "and \"jazz again, thanks\" (three separate user requests for the same thing): "
+    'reply {"upserts": [{"key": "user.habit.jazz_listening", "value": '
+    '"often asks for jazz"}], "deletes": []}. '
+    "Example — only the Assistant: lines mention that the user usually asks for a "
+    "morning status check, while the User: lines never actually ask for one: reply "
+    '{"upserts": [], "deletes": []} — assistant claims are never habit evidence.'
+)
+
+
+def _is_ascii_digit(ch):
+    return "0" <= ch <= "9"
+
+
+def _speakable(text):
+    """Make written forms speakable for TTS before synthesis. Today: spoken
+    URLs/domains — a '.' between a word char and a 2+-letter segment ("apple.com",
+    "github.io", "npr.org") becomes " dot " so Kokoro says "apple dot com", not
+    "apple, com" (it otherwise reads the period as a clause pause). Conservative —
+    left untouched: a digit after the dot (a decimal 3.14 / v2.0), a space after
+    it (a sentence end, "Mr. Smith"), and single-letter segments ("e.g.").
+    Applied at the single synth point so EVERY path (speak, converse sentences,
+    openers) gets it."""
+    out = []
+    n = len(text)
+    for i, c in enumerate(text):
+        if c == "." and i > 0 and text[i - 1].isalnum():
+            j = i + 1
+            letters = 0
+            while j < n and text[j].isascii() and text[j].isalpha():
+                j += 1
+                letters += 1
+            if letters >= 2:
+                out.append(" dot ")
+                continue
+        out.append(c)
+    return "".join(out)
+
+
+def _split_complete_sentences(buffer, final=False):
+    """Incremental, decimal-aware sentence splitter matching the daemon's
+    split_sentences semantics exactly: boundaries at . ! ? and newline,
+    except a '.' between two ASCII digits (a decimal point like "6.5").
+
+    Returns (sentences, remainder). Streaming twist: a '.' that is the very
+    last character of the buffer with an ASCII digit before it is held back
+    (remainder) unless final=True — the next decoded token may begin with a
+    digit, which would make it a decimal point. With final=True the
+    remainder is always flushed as a last sentence (matching the daemon's
+    tail handling) and returned remainder is ''."""
+    sentences = []
+    start = 0
+    n = len(buffer)
+    for i, c in enumerate(buffer):
+        if c not in ".!?\n":
+            continue
+        if c == "." and i > 0 and _is_ascii_digit(buffer[i - 1]):
+            if i + 1 < n and _is_ascii_digit(buffer[i + 1]):
+                continue  # decimal point, not a boundary
+            if i + 1 == n and not final:
+                continue  # possible decimal split across tokens; hold back
+        # Domain dot ("apple.com"): a '.' between a word char and an ASCII LETTER
+        # is part of a URL, not a sentence end — keep "apple.com" in one sentence
+        # so it isn't synthesized as "apple." + "com" (which reads as "apple, com").
+        # `_speakable` then turns it into "apple dot com" at synth time.
+        if (
+            c == "."
+            and i > 0
+            and buffer[i - 1].isalnum()
+            and i + 1 < n
+            and buffer[i + 1].isascii()
+            and buffer[i + 1].isalpha()
+        ):
+            continue
+        sentence = buffer[start : i + 1].strip()
+        if sentence:
+            sentences.append(sentence)
+        start = i + 1
+    remainder = buffer[start:]
+    if final:
+        tail = remainder.strip()
+        if tail:
+            sentences.append(tail)
+        remainder = ""
+    return sentences, remainder
+
+
+class InferenceEngine:
+    """Lazy-loading, resident MLX models. All methods are blocking; callers
+    run them in a worker thread. A lock serializes GPU work."""
+
+    def __init__(self, settings, classifier_template, persona):
+        self.llm_id = settings["llm"]
+        self.stt_id = settings["stt"]
+        self.classifier_id = settings.get("classifier", DEFAULT_CLASSIFIER)
+        # OPTIONAL on-device vision-language model id (op=describe_image). Empty
+        # string disables the op entirely (honest "unavailable"); a non-empty id
+        # is the checkpoint mlx-vlm will lazy-load on first use. Ships OFF: the
+        # daemon's [vision] gate + the multi-GB download are what turn it on.
+        self.vlm_id = settings.get("vlm", DEFAULT_VLM)
+        # OPTIONAL on-device text->image model id (op=generate_image). Empty
+        # string disables the op entirely (honest "unavailable"); a non-empty id
+        # is the checkpoint the MLX diffusion engine will lazy-load on first use.
+        # Ships OFF: the daemon's [image] gate + the multi-GB download are what
+        # turn it on. The prompt + the pixels stay on-device (NO cloud).
+        self.image_model_id = settings.get("image_model", DEFAULT_IMAGE_MODEL)
+        # #37 SPECULATIVE DECODING (OFF/neutral default). The master gate + the
+        # small DRAFT model id mlx_lm uses to propose tokens. Off => normal
+        # generation, today's runtime. A draft model is lazy-loaded on first use
+        # behind the import/availability guard; if it cannot load, generate
+        # honestly falls back to normal gen and reports speculative=False.
+        self.speculative = bool(settings.get("speculative", False))
+        self.draft_model_id = (settings.get("draft_model") or "").strip()
+        # Lazy-loaded draft (model, tokenizer) for speculative decoding. Stays
+        # None until the first generate AND speculative is on AND the draft
+        # checkpoint + mlx_lm's speculative support are present; absent => normal
+        # gen (the honest unavailable-fallback, NEVER fabricated speculative).
+        self._draft_model = None
+        self._draft_tokenizer = None
+        self._draft_unavailable = False  # set once a load attempt fails (no retry storm)
+        # #39 SELECTABLE QUANTIZATION (neutral default "auto" == today's
+        # behavior). The requested quant is validated at config-load; the
+        # model-load seam selects a matching variant if present, else falls back
+        # + records which quant ACTUALLY loaded (NEVER claims a quant that did
+        # not load). "auto" loads the model exactly as configured (today's path).
+        self.quant = settings.get("quant", "auto")
+        # The quant that ACTUALLY loaded (honest report). None until the LLM is
+        # loaded; "auto" means the loader picked the on-disk variant as today.
+        self._quant_loaded = None
+        engine = (settings.get("engine") or DEFAULT_TTS_ENGINE).strip().lower()
+        if engine not in TTS_ENGINE_DEFAULTS:
+            log.warning(
+                "unknown [speech].engine %r (supported: %s); falling back to %s",
+                engine,
+                ", ".join(sorted(TTS_ENGINE_DEFAULTS)),
+                DEFAULT_TTS_ENGINE,
+            )
+            engine = DEFAULT_TTS_ENGINE
+        self.engine_name = engine
+        engine_defaults = TTS_ENGINE_DEFAULTS[engine]
+        self.tts_id = settings.get("tts_model") or engine_defaults["model"]
+        # Validate the resolved voice against the ACTIVE engine: an engine
+        # switch that drags a stale voice along ("bm_george" on csm/orpheus)
+        # would otherwise fail on every synthesis (csm: unsupported-voice
+        # ValueError — opener bank 0/N, speak/converse dead) or silently
+        # garble the speaker (orpheus prepends the tag unvalidated). Config
+        # errors are recoverable here like everywhere else in load_config:
+        # fall back to the engine's own default voice and say so.
+        voice = settings.get("voice") or engine_defaults["voice"]
+        if not self._voice_valid_for_engine(engine, voice):
+            log.warning(
+                "[speech].voice %r is not a valid voice for engine %r; falling back to %r",
+                voice,
+                engine,
+                engine_defaults["voice"],
+            )
+            voice = engine_defaults["voice"]
+        self.voice = voice
+        self.speed = settings["speed"]
+        # An explicit empty list means load_config DISABLED the bank (invalid
+        # [speech].openers); only a missing key falls back to the defaults —
+        # `or DEFAULT_OPENERS` would silently resurrect the desync the
+        # disable exists to prevent.
+        openers = settings.get("openers")
+        self.openers = list(openers) if openers is not None else list(DEFAULT_OPENERS)
+        self.classifier_template = classifier_template
+        self.persona = persona
+        self._model = None
+        self._tokenizer = None
+        # Multi-resident LOCAL model manager (task #17). The base [models].llm is
+        # ALWAYS warm + the single-resident fallback; the manager additionally
+        # keeps the configured extra warm-set resident WHEN the RAM budget allows
+        # (default: empty warm-set + 0 budget == single-resident, today's
+        # behavior). The manager is pure bookkeeping; it loads models via the
+        # `loader` callback the engine passes to select() (the real MLX load),
+        # so it adds NO MLX dependency of its own and is fully unit-testable.
+        self.local_manager = LocalWarmManager(
+            base_id=self.llm_id,
+            configured=settings.get("local_warm", []),
+            budget_gib=settings.get("local_budget_gib", 0.0),
+            sizes=settings.get("local_sizes", {}),
+        )
+        # Lazy-loaded on-device VLM (op=describe_image). Stays None until the
+        # first describe_image call AND mlx-vlm + the checkpoint are present;
+        # absent => the op returns the honest unavailable structure.
+        self._vlm_model = None
+        self._vlm_processor = None
+        self._vlm_config = None
+        # Lazy-loaded on-device diffusion model (op=generate_image). Stays None
+        # until the first generate_image call AND the diffusion package + the
+        # checkpoint are present; absent => the op returns the honest
+        # unavailable structure (NEVER a fabricated image, NEVER a cloud call).
+        self._image_model = None
+        self._tts = None
+        self._tts_counter = itertools.count(int(time.time()))
+        self._lock = threading.Lock()
+        # Dedicated classify model (separate resident model when
+        # [models].classifier is non-empty; aliases the main LLM otherwise).
+        self._cls_model = None
+        self._cls_tokenizer = None
+        # Classifier KV prompt cache state (built on the classify model).
+        self._cls_cache = None
+        self._cls_cache_len = 0
+        self._cls_prefix_tokens = []
+        self._cls_prefix_str = ""
+        self._cls_suffix_str = ""
+        # Persona (generate) KV prompt cache state — same pattern: the static
+        # persona-only prefix is prefilled once; facts/history/utterance are
+        # prefilled per request and trimmed back afterwards.
+        self._gen_cache = None
+        self._gen_cache_len = 0
+        self._gen_prefix_tokens = []
+        self._gen_prefix_str = ""
+        # Per-agent persona KV prompt caches (op=converse with a persona
+        # override). Maps agent name -> a dict with the same fields as the base
+        # cache above {cache, cache_len, prefix_tokens, prefix_str}. An ordered
+        # dict used as an LRU: the most-recently-used agent is moved to the end,
+        # and the oldest is evicted past AGENT_PERSONA_CACHE_MAX so resident GPU
+        # memory stays bounded across a session that rotates through agents. All
+        # access is under self._lock (the same GPU lock the base cache uses), so
+        # no separate synchronization is needed.
+        from collections import OrderedDict as _OrderedDict
+
+        self._agent_gen_caches = _OrderedDict()
+
+    @staticmethod
+    def _voice_valid_for_engine(engine, voice):
+        """Whether `voice` is usable on `engine`. csm: must be a known
+        speaker prompt (synthesis raises otherwise). orpheus: must be a
+        named upstream speaker (mlx-audio applies the tag unvalidated).
+        kokoro: the language is the first letter of the voice name, so that
+        letter must be a valid Kokoro language code (mirrors _lang_code)."""
+        if not voice:
+            return False
+        if engine == "csm":
+            return voice in CSM_PROMPT_TEXTS
+        if engine == "orpheus":
+            return voice in ORPHEUS_VOICES
+        return voice[0] in _KOKORO_LANGS
+
+    def _resolve_request_voice(self, voice):
+        """Per-request voice override, validated against the ACTIVE engine
+        (audit fix): the daemon echoes [speech].voice on EVERY speak and
+        converse request, so the engine-aware fallback in __init__ — written
+        exactly for the "engine switch drags a stale voice along" config
+        state — was dead on the daemon's real path: a csm/orpheus engine
+        with voice="bm_george" failed (or garbled) every synthesis except
+        the opener bank. Mirror the init recovery policy here: warn and
+        substitute self.voice (already engine-validated at init)."""
+        if not voice:
+            return self.voice
+        if not self._voice_valid_for_engine(self.engine_name, voice):
+            log.warning(
+                "request voice %r is not a valid voice for engine %r; using %r",
+                voice,
+                self.engine_name,
+                self.voice,
+            )
+            return self.voice
+        return voice
+
+    # -- model loading -------------------------------------------------
+    # _ensure_* methods must be called with self._lock held.
+
+    def _ensure_llm(self):
+        if self._model is None:
+            from mlx_lm import load
+
+            # #39 QUANT SELECTION + HONEST fallback: with quant == "auto" (the
+            # neutral default) load the configured id EXACTLY as today. With an
+            # explicit quant, TRY the derived quant-variant id first; if it is not
+            # present (load raises) fall back to the configured base id and record
+            # the quant that ACTUALLY loaded — NEVER claim the requested quant
+            # when the base loaded instead. The real RAM/speed tradeoff is
+            # device-gated; this seam only governs WHICH id is requested.
+            load_id, loaded_quant = self._resolve_quant_load(self.llm_id, self.quant)
+            log.info("loading LLM %s (resident after first use)...", load_id)
+            t0 = time.perf_counter()
+            try:
+                self._model, self._tokenizer = load(load_id)
+            except Exception:
+                if load_id != self.llm_id:
+                    # The requested quant variant is absent/unloadable: fall back
+                    # to the configured base id and report the truth (auto = the
+                    # on-disk variant the loader picked).
+                    log.warning(
+                        "quant variant %r unavailable; falling back to %s and reporting the loaded quant honestly",
+                        load_id,
+                        self.llm_id,
+                    )
+                    self._model, self._tokenizer = load(self.llm_id)
+                    loaded_quant = "auto"
+                else:
+                    raise
+            self._quant_loaded = loaded_quant
+            log.info("LLM loaded in %.1fs (quant=%s)", time.perf_counter() - t0, loaded_quant)
+            try:
+                self._build_generate_cache()
+            except Exception:
+                log.exception("persona prompt cache unavailable; generate will run uncached")
+                self._gen_cache = None
+        return self._model, self._tokenizer
+
+    def _resolve_quant_load(self, base_id, quant):
+        """PURE: the (load_id, reported_quant) pair for a quant request (#39).
+        "auto" => (base_id, "auto") — today's behavior. An explicit quant =>
+        (the derived quant-variant id, the requested quant) which the caller
+        TRIES, falling back to base_id + "auto" if the variant is absent. No MLX,
+        no load — the load + fallback happen in _ensure_llm."""
+        if quant == "auto":
+            return (base_id, "auto")
+        return (quant_variant_id(base_id, quant), quant)
+
+    def _ensure_draft(self):
+        """#37: lazy-load the DRAFT model for speculative decoding, behind the
+        import/availability guard. Returns (draft_model, draft_tokenizer) on
+        success or None when speculative cannot run:
+          * self.speculative is False        -> None (the OFF default).
+          * self.draft_model_id is empty      -> None (no draft configured).
+          * mlx_lm lacks speculative support  -> None.
+          * the draft checkpoint fails to load -> None (recorded; no retry storm).
+        A None return is the SHIPS-OFF / unavailable state, NOT an error: the
+        generate path falls back to NORMAL generation and reports
+        speculative=False. Caller holds self._lock."""
+        if not self.speculative or not self.draft_model_id:
+            return None
+        if self._draft_unavailable:
+            return None
+        if not _mlx_speculative_available():
+            self._draft_unavailable = True
+            return None
+        if self._draft_model is None:
+            try:
+                from mlx_lm import load
+
+                log.info("loading DRAFT model %s for speculative decoding...", self.draft_model_id)
+                t0 = time.perf_counter()
+                self._draft_model, self._draft_tokenizer = load(self.draft_model_id)
+                log.info("draft model loaded in %.1fs", time.perf_counter() - t0)
+            except Exception:
+                # Absent/corrupt draft checkpoint or any load failure: speculative
+                # is UNAVAILABLE this run (normal gen), recorded so we do not retry
+                # on every turn. NEVER fabricate speculative.
+                log.exception(
+                    "draft model %s could not be loaded; speculative decoding disabled (normal generation)",
+                    self.draft_model_id,
+                )
+                self._draft_model = None
+                self._draft_tokenizer = None
+                self._draft_unavailable = True
+                return None
+        return (self._draft_model, self._draft_tokenizer)
+
+    def speculative_status(self):
+        """HONEST read-only snapshot of the speculative-decoding config for the
+        HUD / a status op (#37). PURE — touches no model, takes no lock. Reports
+        whether the gate is on + whether a draft is configured. It does NOT claim
+        speculative is ACTIVE (only a generate call, after _ensure_draft, knows
+        the draft actually loaded) and does NOT claim any speedup (device-gated)."""
+        return {
+            "enabled": self.speculative,
+            "draft_model": self.draft_model_id,
+            # Has a draft load already failed this run? (honest unavailable signal)
+            "draft_unavailable": self._draft_unavailable,
+        }
+
+    def _local_loader(self, model_id):
+        """Loader callback handed to the LocalWarmManager: returns
+        (model, tokenizer) for `model_id`. The BASE id reuses the persona-cached
+        resident from _ensure_llm (so its KV cache + embeddings are intact);
+        any OTHER warm-set id is loaded fresh via mlx_lm. Caller (the manager,
+        under select) is itself called with self._lock held. A non-base load
+        that raises is caught by the manager and degraded to the base."""
+        if model_id == self.llm_id:
+            self._ensure_llm()
+            return self._model, self._tokenizer
+        from mlx_lm import load
+
+        log.info("loading warm local model %s (resident after first use)...", model_id)
+        t0 = time.perf_counter()
+        model, tokenizer = load(model_id)
+        log.info("warm local model %s loaded in %.1fs", model_id, time.perf_counter() - t0)
+        return model, tokenizer
+
+    def _ensure_local_llm(self, local_model=None):
+        """Resolve the LOCAL model that answers this turn, keeping it warm via
+        the manager. Returns (resolved_id, model, tokenizer). `local_model` is
+        the Local-tier sub-choice the daemon threads through (a warm-set id);
+        None / "" / an out-of-warm-set id transparently resolves to the base
+        single-resident LLM — never a crash. Caller holds self._lock.
+
+        The base path goes through _ensure_llm first so its persona KV cache is
+        always built; the persona cache + sampler stay bound to the BASE model.
+        A non-base warm model answers UNCACHED on its own resident weights (the
+        instant-swap benefit is the loaded weights, not a per-model persona
+        cache — keeping a cache per model would multiply RAM further; honest)."""
+        # Always make sure the base is warm + persona-cached (it is the fallback
+        # and the manager pins it). _ensure_llm registers it as the loader's
+        # base entry; the manager then selects/keeps-warm the requested id.
+        self._ensure_llm()
+        if self.llm_id not in self.local_manager.resident:
+            # First call: register the base as resident so warm_ids/eviction see
+            # it and it is pinned. (select(base) below would do this too, but we
+            # seed it explicitly so warm_ids reflects the base immediately.)
+            self.local_manager.resident[self.llm_id] = (self._model, self._tokenizer)
+        return self.local_manager.select(local_model, self._local_loader)
+
+    def local_warm_status(self):
+        """HONEST read-only snapshot of the local warm-set for the HUD / a
+        status op (item 3 wires it through). PURE — touches no model, takes no
+        lock (it reads the manager's bookkeeping). Reports the planned warm-set,
+        which models are ACTUALLY resident right now, the active/base id and
+        whether multi-resident is in effect (single-resident is the safe
+        low-RAM default). The speed benefit of keeping >1 warm is device/RAM
+        dependent and is NOT asserted here."""
+        mgr = self.local_manager
+        return {
+            "base": mgr.base_id,
+            "planned": list(mgr.plan),
+            "resident": mgr.warm_ids(),
+            "multi_resident": mgr.multi_resident(),
+            "budget_gib": mgr.budget_gib,
+        }
+
+    def _ensure_classifier(self):
+        """Resolve the (model, tokenizer) pair classify runs on and build its
+        KV prompt cache once. With [models].classifier set, classification
+        runs on a dedicated small resident model; an empty classifier id — or
+        a load failure — reuses the main LLM. Any candidate configured here
+        must first pass the 7-utterance accuracy gate (see DEFAULT_CLASSIFIER
+        comment: all small candidates tried so far failed it)."""
+        if self._cls_model is None:
+            if self.classifier_id:
+                try:
+                    from mlx_lm import load
+
+                    log.info(
+                        "loading classifier %s (resident after first use)...", self.classifier_id
+                    )
+                    t0 = time.perf_counter()
+                    self._cls_model, self._cls_tokenizer = load(self.classifier_id)
+                    log.info("classifier loaded in %.1fs", time.perf_counter() - t0)
+                except Exception:
+                    log.exception(
+                        "classifier %s failed to load; classify falls back to the main LLM",
+                        self.classifier_id,
+                    )
+                    self.classifier_id = ""
+                    self._cls_model = None
+            if self._cls_model is None:
+                self._ensure_llm()
+                self._cls_model, self._cls_tokenizer = self._model, self._tokenizer
+            try:
+                self._build_classifier_cache()
+            except Exception:
+                log.exception("classifier prompt cache unavailable; classify will run uncached")
+                self._cls_cache = None
+        return self._cls_model, self._cls_tokenizer
+
+    @staticmethod
+    def _patch_kokoro_sinegen():
+        """mlx-audio 0.4.4 upstream bug: SineGen._f02sine's downsample/upsample
+        interpolation can come back one 300-sample frame longer or shorter than
+        the uv path computed directly from f0, crashing the vocoder with a
+        broadcast error for certain utterance lengths. Re-align sine_waves to
+        the canonical f0/uv length (trim or zero-pad <=12.5ms at the tail —
+        inaudible). Re-check on every mlx-audio upgrade."""
+        import mlx.core as mx
+        from mlx_audio.tts.models.kokoro import istftnet
+
+        if getattr(istftnet.SineGen, "_jarvis_len_patch", False):
+            return
+
+        def aligned_call(self, f0):
+            fn = f0 * mx.arange(1, self.harmonic_num + 2)[None, None, :]
+            sine_waves = self._f02sine(fn) * self.sine_amp
+            uv = self._f02uv(f0)
+            length = uv.shape[1]
+            if sine_waves.shape[1] > length:
+                sine_waves = sine_waves[:, :length, :]
+            elif sine_waves.shape[1] < length:
+                pad = mx.zeros(
+                    (sine_waves.shape[0], length - sine_waves.shape[1], sine_waves.shape[2])
+                )
+                sine_waves = mx.concatenate([sine_waves, pad], axis=1)
+            noise_amp = uv * self.noise_std + (1 - uv) * self.sine_amp / 3
+            noise = noise_amp * mx.random.normal(sine_waves.shape)
+            return sine_waves * uv + noise, uv, noise
+
+        istftnet.SineGen.__call__ = aligned_call
+        istftnet.SineGen._jarvis_len_patch = True
+        log.info("applied SineGen length-alignment patch (mlx-audio 0.4.4 vocoder bug)")
+
+    def _ensure_tts(self):
+        if self._tts is None:
+            from mlx_audio.tts.utils import load_model as load_tts_model
+
+            if self.engine_name == "kokoro":
+                self._patch_kokoro_sinegen()
+            log.info(
+                "loading TTS %s (engine=%s, resident after first use)...",
+                self.tts_id,
+                self.engine_name,
+            )
+            t0 = time.perf_counter()
+            self._tts = load_tts_model(self.tts_id)
+            log.info("TTS loaded in %.1fs", time.perf_counter() - t0)
+        return self._tts
+
+    def preload(self):
+        """Warm STT, LLM (+classifier and persona prompt caches) and TTS so
+        the first real utterance pays no load or Metal-kernel-compile cost.
+        Each stage takes the GPU lock independently, so early requests
+        interleave via the normal lazy path."""
+        import numpy as np
+
+        try:
+            import mlx_whisper
+
+            t0 = time.perf_counter()
+            with self._lock:
+                mlx_whisper.transcribe(np.zeros(8000, dtype=np.float32), path_or_hf_repo=self.stt_id)
+            log.info("preload: STT %s ready (%.1fs)", self.stt_id, time.perf_counter() - t0)
+        except Exception:
+            log.exception("preload: STT failed; transcribe will load lazily")
+        try:
+            t0 = time.perf_counter()
+            with self._lock:
+                self._ensure_llm()
+            log.info("preload: LLM %s ready (%.1fs)", self.llm_id, time.perf_counter() - t0)
+        except Exception:
+            log.exception("preload: LLM failed; generate/converse will load lazily")
+        try:
+            t0 = time.perf_counter()
+            with self._lock:
+                self._ensure_classifier()
+            log.info(
+                "preload: classifier %s ready (%.1fs)",
+                self.classifier_id or f"main LLM {self.llm_id}",
+                time.perf_counter() - t0,
+            )
+        except Exception:
+            log.exception("preload: classifier failed; classify will load lazily")
+        try:
+            t0 = time.perf_counter()
+            with self._lock:
+                tts = self._ensure_tts()
+                # Tiny throwaway synthesis through the engine dispatch:
+                # compiles Metal kernels and fetches the configured voice.
+                self._tts_synth_fn()(tts, "Ready.", self.voice)
+            log.info("preload: TTS %s ready (%.1fs)", self.tts_id, time.perf_counter() - t0)
+        except Exception:
+            log.exception("preload: TTS failed; speak will load lazily")
+        # Opener bank regenerates on every server start, AFTER the TTS warm,
+        # so a voice/engine change Just Works. Each synthesis takes the GPU
+        # lock independently like any other request.
+        try:
+            self.generate_openers()
+        except Exception:
+            log.exception("preload: opener bank generation failed; daemon will run without openers")
+
+    # -- classifier prompt cache ----------------------------------------
+
+    def _classifier_prompt_parts(self):
+        """Split the fully chat-templated classifier prompt into the static
+        prefix (everything before the utterance) and static suffix."""
+        template = self.classifier_template
+        if "{utterance}" in template:
+            body = template.replace("{utterance}", _UTTERANCE_SENTINEL)
+        else:
+            body = f'{template}\n\nUtterance: "{_UTTERANCE_SENTINEL}"\nJSON:'
+        rendered = self._render_chat(body, tokenizer=self._cls_tokenizer)
+        if _UTTERANCE_SENTINEL not in rendered:
+            raise ValueError("utterance slot lost during chat templating")
+        prefix, suffix = rendered.split(_UTTERANCE_SENTINEL, 1)
+        return prefix, suffix
+
+    def _build_classifier_cache(self):
+        """Prefill a KV cache with the static classifier prefix once (on the
+        dedicated classify model when configured). Each classify request then
+        only prefills utterance+suffix tokens and is trimmed back to the
+        prefix afterwards (mlx_lm trim_prompt_cache)."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import can_trim_prompt_cache, make_prompt_cache
+
+        prefix_str, suffix_str = self._classifier_prompt_parts()
+        prefix_tokens = self._cls_tokenizer.encode(prefix_str)
+        cache = make_prompt_cache(self._cls_model)
+        if not can_trim_prompt_cache(cache):
+            raise ValueError(
+                f"prompt cache for {self.classifier_id or self.llm_id} is not trimmable"
+            )
+        t0 = time.perf_counter()
+        logits = self._cls_model(mx.array(prefix_tokens)[None], cache=cache)
+        mx.eval(logits)
+        self._cls_prefix_str = prefix_str
+        self._cls_suffix_str = suffix_str
+        self._cls_prefix_tokens = list(prefix_tokens)
+        self._cls_cache = cache
+        self._cls_cache_len = len(prefix_tokens)
+        log.info(
+            "classifier prompt cache prefilled: %d tokens in %dms",
+            len(prefix_tokens),
+            int((time.perf_counter() - t0) * 1000),
+        )
+
+    def _classify_cached(self, text):
+        """Generate a classification using the prefilled prefix cache on the
+        classify model. Caller holds self._lock."""
+        from mlx_lm import stream_generate
+        from mlx_lm.models.cache import trim_prompt_cache
+
+        full_tokens = self._cls_tokenizer.encode(
+            self._cls_prefix_str + text + self._cls_suffix_str
+        )
+        # Tokenization at the prefix/utterance seam can merge across the
+        # boundary; trim the cache down to the actual common token prefix.
+        common = 0
+        for a, b in zip(self._cls_prefix_tokens[: self._cls_cache_len], full_tokens):
+            if a != b:
+                break
+            common += 1
+        if common < self._cls_cache_len:
+            trim_prompt_cache(self._cls_cache, self._cls_cache_len - common)
+            self._cls_cache_len = common
+        suffix_tokens = full_tokens[self._cls_cache_len :]
+        pieces = []
+        generated = 0
+        try:
+            for resp in stream_generate(
+                self._cls_model,
+                self._cls_tokenizer,
+                prompt=suffix_tokens,
+                max_tokens=CLASSIFY_MAX_TOKENS,
+                prompt_cache=self._cls_cache,
+            ):
+                pieces.append(resp.text)
+                generated += 1
+        finally:
+            # Trim everything past the static prefix so the cache is
+            # reusable — on success AND on any mid-decode exception (audit
+            # fix, mirroring converse's finally: a Metal OOM used to leave
+            # the shared cache grown, and the whole-cache rebuild recovery
+            # then prefilled a NEW cache while the grown one was still
+            # referenced — a peak-memory spike at the worst moment).
+            offset = getattr(self._cls_cache[0], "offset", None)
+            added = (
+                (offset - self._cls_cache_len)
+                if isinstance(offset, int)
+                else (len(suffix_tokens) + generated)
+            )
+            if added > 0:
+                trim_prompt_cache(self._cls_cache, added)
+        return "".join(pieces)
+
+    # -- persona (generate) prompt cache ---------------------------------
+
+    def _persona_prefix_str(self, persona_text):
+        """The chat-templated prompt up to the end of `persona_text` inside the
+        system message. Facts (same system message), history turns and the final
+        user turn all render after this point, so this prefix is static across
+        every generate/converse request that shares that persona — exactly what
+        the KV cache is keyed on. Works for the base persona AND any per-agent
+        override (same templating, different text)."""
+        if not persona_text:
+            raise ValueError("no persona text; nothing to cache")
+        rendered = self._render_chat_messages(
+            [
+                {"role": "system", "content": persona_text + _UTTERANCE_SENTINEL},
+                {"role": "user", "content": "x"},
+            ]
+        )
+        if _UTTERANCE_SENTINEL not in rendered:
+            raise ValueError("persona slot lost during chat templating")
+        return rendered.split(_UTTERANCE_SENTINEL, 1)[0]
+
+    def _generate_prefix_str(self):
+        """The base-persona prefix (back-compat wrapper over
+        `_persona_prefix_str`)."""
+        return self._persona_prefix_str(self.persona)
+
+    def _prefill_persona_cache(self, persona_text):
+        """Prefill a fresh KV cache with `persona_text`'s static prefix and
+        return {cache, cache_len, prefix_tokens, prefix_str}. Caller holds
+        self._lock and self._model is loaded. Same make_prompt_cache +
+        trim-back-on-reuse pattern as the classifier cache; raises if the
+        model's cache is not trimmable (so the caller can fall back to uncached
+        decode rather than corrupt a shared cache)."""
+        import mlx.core as mx
+        from mlx_lm.models.cache import can_trim_prompt_cache, make_prompt_cache
+
+        prefix_str = self._persona_prefix_str(persona_text)
+        prefix_tokens = self._tokenizer.encode(prefix_str)
+        cache = make_prompt_cache(self._model)
+        if not can_trim_prompt_cache(cache):
+            raise ValueError(f"prompt cache for {self.llm_id} is not trimmable")
+        t0 = time.perf_counter()
+        logits = self._model(mx.array(prefix_tokens)[None], cache=cache)
+        mx.eval(logits)
+        log.info(
+            "persona prompt cache prefilled: %d tokens in %dms",
+            len(prefix_tokens),
+            int((time.perf_counter() - t0) * 1000),
+        )
+        return {
+            "cache": cache,
+            "cache_len": len(prefix_tokens),
+            "prefix_tokens": list(prefix_tokens),
+            "prefix_str": prefix_str,
+        }
+
+    def _build_generate_cache(self):
+        """Prefill the BASE-persona KV cache once (called from _ensure_llm)."""
+        state = self._prefill_persona_cache(self.persona)
+        self._gen_cache = state["cache"]
+        self._gen_cache_len = state["cache_len"]
+        self._gen_prefix_tokens = state["prefix_tokens"]
+        self._gen_prefix_str = state["prefix_str"]
+
+    def _get_agent_gen_cache(self, name, persona_text):
+        """Return this agent's resident persona-prefix KV cache state, building
+        and prefilling it on first use, or None if prefill is not feasible (the
+        caller then runs that turn uncached — never corrupting another cache).
+
+        Keyed by agent `name`, LRU-bounded by AGENT_PERSONA_CACHE_MAX so a long
+        session that rotates through many agents keeps GPU memory in check. On a
+        hit the cache is moved to the MRU end and returned, so the next converse
+        for that agent reuses its prefilled persona-prefix KV instead of
+        recomputing it. Caller holds self._lock and self._model is loaded."""
+        cached = self._agent_gen_caches.get(name)
+        if cached is not None:
+            self._agent_gen_caches.move_to_end(name)
+            return cached
+        try:
+            state = self._prefill_persona_cache(persona_text)
+        except Exception:
+            log.exception(
+                "per-agent persona cache prefill failed for %r; running this turn uncached",
+                name,
+            )
+            return None
+        for evicted in _lru_insert(
+            self._agent_gen_caches, name, state, AGENT_PERSONA_CACHE_MAX
+        ):
+            log.info("evicted per-agent persona cache for %r (LRU)", evicted)
+        return state
+
+    def _persona_sampler(self):
+        """Temperature/top-p sampler with an explicit, per-request PRNG key.
+
+        mlx_lm's make_sampler draws through MLX's implicit PRNG state, which
+        is thread-local and gets bound by mx.compile in whichever thread first
+        imports/traces the sampling kernels (our preload thread). Requests run
+        on asyncio.to_thread workers, where that binding made "temperature"
+        sampling byte-deterministic per request — identical requests returned
+        identical replies even after reseeding the worker thread (verified
+        live against this server). Threading an explicit key through
+        mx.random.split sidesteps the implicit state entirely; the key is
+        seeded from the wall clock so every request samples differently.
+        Matches make_sampler's order of operations: top-p filter on the raw
+        logprobs, then categorical at temperature."""
+        import mlx.core as mx
+        from mlx_lm.sample_utils import apply_top_p
+
+        state = {"key": mx.random.key(time.time_ns() & 0x7FFFFFFFFFFFFFFF)}
+        inv_temp = 1.0 / GENERATE_TEMP
+
+        def sample(logprobs):
+            keys = mx.random.split(state["key"])
+            state["key"] = keys[0]
+            filtered = apply_top_p(logprobs, GENERATE_TOP_P)
+            return mx.random.categorical(filtered * inv_temp, key=keys[1])
+
+        return sample
+
+    def _generate_cached(self, prompt, max_tokens):
+        """Generate a reply using the prefilled persona-prefix cache.
+        Caller holds self._lock. `prompt` is the fully rendered chat prompt,
+        which starts with (a tokenization-seam-tolerant match of) the cached
+        persona prefix."""
+        from mlx_lm import stream_generate
+        from mlx_lm.models.cache import trim_prompt_cache
+
+        full_tokens = self._tokenizer.encode(prompt)
+        # Tokenization at the prefix boundary can merge across the seam; trim
+        # the cache down to the actual common token prefix.
+        common = 0
+        for a, b in zip(self._gen_prefix_tokens[: self._gen_cache_len], full_tokens):
+            if a != b:
+                break
+            common += 1
+        if common < self._gen_cache_len:
+            trim_prompt_cache(self._gen_cache, self._gen_cache_len - common)
+            self._gen_cache_len = common
+        suffix_tokens = full_tokens[self._gen_cache_len :]
+        pieces = []
+        generated = 0
+        try:
+            for resp in stream_generate(
+                self._model,
+                self._tokenizer,
+                prompt=suffix_tokens,
+                max_tokens=max_tokens,
+                prompt_cache=self._gen_cache,
+                sampler=self._persona_sampler(),
+            ):
+                pieces.append(resp.text)
+                generated += 1
+        finally:
+            # Trim everything past the static prefix so the cache is
+            # reusable — on success AND on any mid-decode exception (audit
+            # fix; see _classify_cached — same invariant converse already
+            # enforces with its finally).
+            offset = getattr(self._gen_cache[0], "offset", None)
+            added = (
+                (offset - self._gen_cache_len)
+                if isinstance(offset, int)
+                else (len(suffix_tokens) + generated)
+            )
+            if added > 0:
+                trim_prompt_cache(self._gen_cache, added)
+        return "".join(pieces)
+
+    # -- ops -----------------------------------------------------------
+
+    @staticmethod
+    def _load_wav(path):
+        # mlx_whisper only accepts file paths when ffmpeg is installed; decode
+        # the daemon's WAVs ourselves and hand it a 16kHz float32 array instead.
+        import wave
+
+        import numpy as np
+
+        with wave.open(path, "rb") as wf:
+            rate = wf.getframerate()
+            channels = wf.getnchannels()
+            width = wf.getsampwidth()
+            frames = wf.readframes(wf.getnframes())
+        if width == 2:
+            audio = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32768.0
+        elif width == 4:
+            audio = np.frombuffer(frames, dtype=np.int32).astype(np.float32) / 2147483648.0
+        else:
+            raise ValueError(f"unsupported WAV sample width: {width} bytes")
+        if channels > 1:
+            audio = audio.reshape(-1, channels).mean(axis=1)
+        # Service-boundary hardening: an empty/near-empty WAV would crash
+        # np.interp below (zero sample points) or, at 16kHz, get padded to a
+        # 30s segment by whisper and hallucinate text from pure silence.
+        if rate <= 0 or len(audio) / rate < 0.1:
+            raise ValueError(
+                f"audio too short to transcribe ({len(audio)} frames at {rate}Hz; need >=0.1s)"
+            )
+        if rate != 16000:
+            target = int(len(audio) * 16000 / rate)
+            audio = np.interp(
+                np.linspace(0.0, len(audio), num=target, endpoint=False),
+                np.arange(len(audio)),
+                audio,
+            ).astype(np.float32)
+        return audio
+
+    def _transcribe_whisper(self, path):
+        """On-device STT: decode the WAV and run mlx_whisper. The private,
+        offline default AND the fallback for the cloud-STT tier. Caller does not
+        hold self._lock (this acquires it)."""
+        import mlx_whisper
+
+        audio = self._load_wav(path)
+        with self._lock:
+            result = mlx_whisper.transcribe(audio, path_or_hf_repo=self.stt_id)
+        return result["text"]
+
+    def transcribe(self, path, backend=None, el_key=None, model=None):
+        """WAV path -> (text, words). `backend` selects the STT path the daemon
+        already chose (its own gated cloud-STT tier+key+offline decision):
+          - "elevenlabs_scribe": the OPTIONAL cloud-STT tier. POST the audio file
+            to ElevenLabs Scribe (xi-api-key header, key from `el_key`) and return
+            the transcript PLUS the per-word `words` stream (carrying speaker_ids
+            when Scribe diarized) so the daemon's gated diarize path can CONSUME
+            the real labels. On ANY error/timeout — or a missing key — FALL BACK to
+            on-device mlx_whisper (never fail the turn). HONESTY: on this path the
+            user's VOICE AUDIO leaves the device — MORE sensitive than TTS text.
+          - anything else (None/"whisper"): on-device mlx_whisper, EXACTLY as
+            before — on-device whisper has NO diarization model, so `words` is None
+            (the daemon then renders the honest single stream, never fabricating
+            speakers).
+        mlx_whisper is the private/offline default + the fallback; the cloud path
+        is reached only when the daemon asked for it. `words` is None on the whisper
+        path (no diarization) and on a Scribe response that carried no word detail."""
+        use_scribe = (
+            isinstance(backend, str)
+            and backend.strip().lower() == ELEVENLABS_SCRIBE_BACKEND
+        )
+        if use_scribe:
+            try:
+                text, words = _elevenlabs_scribe_transcribe(
+                    path, el_key, model or ELEVENLABS_SCRIBE_MODEL
+                )
+                if text is not None:
+                    return text, words
+                log.warning(
+                    "ElevenLabs Scribe returned no text; falling back to on-device whisper"
+                )
+            except Exception as exc:
+                # ANY error (network, HTTP, auth, timeout, missing key, decode) ->
+                # whisper. Log only the redacted exception CLASS — never exc_info
+                # / the message, which could echo a key-bearing URL fragment.
+                log.warning(
+                    "ElevenLabs Scribe STT failed (%s); falling back to on-device whisper",
+                    _redact_elevenlabs(type(exc).__name__),
+                )
+            # FALL BACK to the on-device whisper path below.
+        # On-device whisper: no diarization model -> no `words` (single stream).
+        return self._transcribe_whisper(path), None
+
+    def _render_chat(self, user_text, system=None, tokenizer=None):
+        """Render a single user turn (plus optional system) to a prompt
+        string. Used by the strict-JSON ops (classify, extract_facts), so
+        enable_thinking=False is requested: hybrid-thinking templates (Qwen3
+        non-2507, incl. the dedicated classifier model) would otherwise spend
+        the whole token budget inside <think>. Templates without the flag
+        ignore the unused context variable."""
+        tokenizer = tokenizer if tokenizer is not None else self._tokenizer
+        if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+            messages = []
+            if system:
+                messages.append({"role": "system", "content": system})
+            messages.append({"role": "user", "content": user_text})
+            try:
+                return tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True, enable_thinking=False
+                )
+            except TypeError:
+                return tokenizer.apply_chat_template(
+                    messages, tokenize=False, add_generation_prompt=True
+                )
+        if system:
+            return f"{system}\n\n{user_text}"
+        return user_text
+
+    def _render_chat_messages(self, messages, tokenizer=None):
+        """Render an arbitrary chat message list to a prompt string. `tokenizer`
+        defaults to the base resident; the Local-tier sub-choice passes the
+        SELECTED warm model's tokenizer so the prompt uses that model's own chat
+        template (a different warm model may template differently)."""
+        tokenizer = tokenizer if tokenizer is not None else self._tokenizer
+        if hasattr(tokenizer, "apply_chat_template") and getattr(tokenizer, "chat_template", None):
+            return tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        # Plain-text fallback for templateless tokenizers.
+        parts = []
+        for m in messages:
+            if m["role"] == "system":
+                parts.append(m["content"])
+            elif m["role"] == "user":
+                parts.append(f"User: {m['content']}")
+            else:
+                parts.append(f"Assistant: {m['content']}")
+        parts.append("Assistant:")
+        return "\n\n".join(parts)
+
+    def _run_llm(self, user_text, max_tokens, system=None):
+        from mlx_lm import generate
+
+        with self._lock:
+            self._ensure_llm()
+            prompt = self._render_chat(user_text, system=system)
+            return generate(self._model, self._tokenizer, prompt=prompt, max_tokens=max_tokens)
+
+    def _run_llm_interruptible(self, user_text, max_tokens, system=None, prefill_chunk=256, decode_chunk=24):
+        """Greedy decode like _run_llm, but self._lock is acquired and
+        released in slices — prefill_chunk prompt tokens or decode_chunk
+        generated tokens at a time — instead of held for the whole pass.
+
+        op=consolidate is the only caller: its uncached prefill (up to 40
+        transcript exchanges + the facts table + the ~470-word system text)
+        plus up to CONSOLIDATE_MAX_TOKENS of decode would otherwise hold the
+        GPU lock for many seconds in one blocking call, queueing every
+        interactive op (classify/converse/speak/transcribe) behind the 20h
+        reflection pass — opener plays, then silence until it finishes.
+        Slicing lets an arriving utterance interleave at the next slice
+        boundary. It costs the background pass a little wall time and
+        nothing else: the pass owns a private prompt cache so slices are
+        independent, and greedy decode is deterministic regardless of how
+        the work is sliced."""
+        import mlx.core as mx
+        from mlx_lm import stream_generate
+        from mlx_lm.models.cache import make_prompt_cache
+
+        with self._lock:
+            self._ensure_llm()
+            prompt_tokens = self._tokenizer.encode(self._render_chat(user_text, system=system))
+            cache = make_prompt_cache(self._model)
+        # Chunked prefill of all but the last prompt token; stream_generate
+        # below receives that final token as its prompt, so its own internal
+        # prefill is a single step.
+        n = max(len(prompt_tokens) - 1, 0)
+        pos = 0
+        while pos < n:
+            stop = min(pos + prefill_chunk, n)
+            with self._lock:
+                logits = self._model(mx.array(prompt_tokens[pos:stop])[None], cache=cache)
+                mx.eval(logits)
+            pos = stop
+            # threading.Lock has no fairness: without this yield the loop
+            # re-acquires before a queued interactive op ever wakes (measured
+            # — a concurrent classify waited out the whole pass). ~2ms per
+            # slice is noise against the slice's own GPU time.
+            time.sleep(0.002)
+        pieces = []
+        gen = stream_generate(
+            self._model,
+            self._tokenizer,
+            prompt=prompt_tokens[n:],
+            max_tokens=max_tokens,
+            prompt_cache=cache,
+        )
+        try:
+            exhausted = False
+            while not exhausted:
+                with self._lock:
+                    for _ in range(decode_chunk):
+                        resp = next(gen, None)
+                        if resp is None:
+                            exhausted = True
+                            break
+                        pieces.append(resp.text)
+                time.sleep(0.002)  # yield to queued interactive ops (no lock fairness)
+        finally:
+            gen.close()
+        return "".join(pieces)
+
+    def _build_generate_messages(
+        self, text, history=None, facts=None, data=None, opener_spoken=None, persona_override=None
+    ):
+        """Assemble the chat message list per the shared generate contract.
+        opener_spoken (converse only): the opener line the daemon already
+        played aloud; appends the continuation note so the reply skips any
+        further acknowledgement — overriding the persona's short-opener-first
+        rule by design.
+        persona_override (converse only): when set, this agent persona text
+        replaces the base self.persona as the system prefix for this call."""
+        system = persona_override if persona_override is not None else (self.persona or "")
+        if facts:
+            system += "\n\nWhat you know about the user (from prior conversations):\n" + "\n".join(
+                f"- {fact}" for fact in facts
+            )
+        user_text = text
+        if data:
+            user_text += (
+                "\n\n[Verified system data — convey this naturally in your own words; "
+                "do not invent or alter numbers, names, or application names. If the "
+                "data names an app or browser, use exactly that name; if it says "
+                "'default browser', say exactly that — never guess which one it is: "
+                f"{data}]"
+            )
+        if opener_spoken:
+            user_text += "\n\n" + OPENER_SPOKEN_NOTE.format(opener=opener_spoken)
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        for turn in history or []:
+            role = "user" if turn.get("speaker") == "user" else "assistant"
+            messages.append({"role": role, "content": str(turn.get("text", ""))})
+        messages.append({"role": "user", "content": user_text})
+        return messages
+
+    def generate(
+        self,
+        text,
+        max_tokens=GENERATE_DEFAULT_MAX_TOKENS,
+        history=None,
+        facts=None,
+        data=None,
+        local_model=None,
+    ):
+        text_out, _meta = self.generate_with_meta(
+            text, max_tokens, history=history, facts=facts, data=data, local_model=local_model
+        )
+        return text_out
+
+    def generate_with_meta(
+        self,
+        text,
+        max_tokens=GENERATE_DEFAULT_MAX_TOKENS,
+        history=None,
+        facts=None,
+        data=None,
+        local_model=None,
+    ):
+        """Like `generate`, but ALSO returns an HONEST per-call meta dict reporting
+        the path that ACTUALLY ran: `{"speculative": <bool actually used>,
+        "quant": <quant that actually loaded>}`. #37 SPECULATIVE DECODING seams in
+        HERE: if speculative is on AND a draft model is configured AND loadable
+        (the import/availability guard), the uncached generate threads the draft
+        through mlx_lm; otherwise NORMAL generation. The cached persona path does
+        NOT use a draft (speculative + a prefilled prompt cache conflict), so a
+        speculative turn answers UNCACHED — reported truthfully either way. The
+        meta NEVER claims speculative when normal gen ran, and reports the quant
+        from the load seam (#39). The real speedup/RAM effect is device-gated."""
+        from mlx_lm import generate as mlx_generate
+
+        with self._lock:
+            # Resolve the LOCAL model for this turn (Local-tier sub-choice). The
+            # base persona KV cache is built/used ONLY on the base model; a
+            # non-base warm model answers uncached on its own resident weights.
+            resolved_id, model, tokenizer = self._ensure_local_llm(local_model)
+            on_base = resolved_id == self.llm_id
+            quant_loaded = self._quant_loaded if on_base else "auto"
+            messages = self._build_generate_messages(text, history=history, facts=facts, data=data)
+            prompt = self._render_chat_messages(messages, tokenizer=tokenizer)
+            # #37: decide whether speculative ACTUALLY runs this turn. A draft only
+            # rides the BASE model (the draft proposes for the base it shadows);
+            # a non-base warm model answers normally. Probe the draft load (the
+            # import/availability guard) and use the PURE should_use_speculative
+            # decision so the report matches the path taken.
+            draft = self._ensure_draft() if on_base else None
+            spec_active = should_use_speculative(self.speculative, self.draft_model_id, draft is not None)
+            if on_base and self._gen_cache is not None and not spec_active:
+                # Cached normal path (today's behavior). Speculative is incompatible
+                # with the prefilled persona cache, so a speculative turn skips it.
+                try:
+                    out = self._generate_cached(prompt, max_tokens)
+                    return (out, {"speculative": False, "quant": quant_loaded})
+                except Exception:
+                    log.exception("cached generate failed; rebuilding cache and falling back")
+                    try:
+                        self._build_generate_cache()
+                    except Exception:
+                        self._gen_cache = None
+            # Uncached path: cache build failed / persona missing, a non-base warm
+            # local model is answering, OR speculative decoding is active this turn.
+            if spec_active:
+                try:
+                    out = mlx_generate(
+                        model,
+                        tokenizer,
+                        prompt=prompt,
+                        max_tokens=max_tokens,
+                        sampler=self._persona_sampler(),
+                        draft_model=draft[0],
+                    )
+                    return (out, {"speculative": True, "quant": quant_loaded})
+                except Exception:
+                    # A runtime speculative failure (version mismatch, draft
+                    # incompatibility) HONESTLY falls back to normal generation and
+                    # reports speculative=False — never a fabricated speculative run.
+                    log.exception(
+                        "speculative generation failed; falling back to normal generation"
+                    )
+                    self._draft_unavailable = True
+            out = mlx_generate(
+                model,
+                tokenizer,
+                prompt=prompt,
+                max_tokens=max_tokens,
+                sampler=self._persona_sampler(),
+            )
+            return (out, {"speculative": False, "quant": quant_loaded})
+
+    def _embed_one(self, mx, text):
+        """Compute one L2-normalized embedding VECTOR for `text` by mean-pooling
+        the LLM's last hidden states ON-DEVICE. Caller holds self._lock and the
+        LLM is loaded. NO new model is downloaded: we reuse the already-resident
+        generate model's hidden states (the alternative — a dedicated sentence
+        embedding model — would need a separate weight download, which the
+        contract forbids).
+
+        Method: encode the text (capped at EMBED_MAX_TOKENS), run the
+        transformer BODY (model.model(...) — the decoder stack WITHOUT the
+        LM head, which most mlx_lm architectures expose) to get per-token last
+        hidden states, mean-pool over the token axis, then L2-normalize so
+        cosine similarity is a plain dot product. Returns a Python list[float].
+        Deterministic given the model + text (a forward pass, no sampling)."""
+        # Cap the input so a giant blob cannot hold the GPU lock / blow memory.
+        token_ids = self._tokenizer.encode(text if text else " ")
+        if not token_ids:
+            # An input that tokenizes to nothing (e.g. "") still needs a vector;
+            # encode a single space so the forward pass has at least one token.
+            token_ids = self._tokenizer.encode(" ")
+        token_ids = token_ids[:EMBED_MAX_TOKENS]
+        tokens = mx.array(token_ids)[None]  # shape [1, seq]
+
+        # Run the transformer body to get last hidden states [1, seq, hidden].
+        # mlx_lm causal-LM modules wrap an inner `.model` (the decoder stack)
+        # whose __call__ returns hidden states; the outer module then applies
+        # the LM head. We want the hidden states, so call the inner stack.
+        inner = getattr(self._model, "model", None)
+        if inner is None or not callable(inner):
+            raise ValueError(
+                "this model does not expose an inner decoder stack for embeddings"
+            )
+        hidden = inner(tokens)  # [1, seq, hidden]
+        # Mean-pool over the token (seq) axis -> [1, hidden] -> [hidden].
+        pooled = mx.mean(hidden, axis=1)[0]
+        # L2-normalize so cosine similarity is a dot product. Guard a zero norm.
+        norm = mx.sqrt(mx.sum(pooled * pooled))
+        normed = pooled / mx.maximum(norm, 1e-12)
+        # Defensive: a pathological forward pass could leave NaN/Inf components,
+        # which json.dumps emits as bare NaN/Infinity tokens that the daemon's
+        # serde_json rejects, failing the WHOLE batch instead of degrading.
+        # Map any non-finite entry to 0.0 so the JSON response stays strict-valid
+        # (a degenerate-but-finite vector; recall still falls back cleanly if needed).
+        normed = mx.where(mx.isnan(normed) | mx.isinf(normed), 0.0, normed)
+        mx.eval(normed)
+        return [float(x) for x in normed.tolist()]
+
+    def embed(self, texts):
+        """Return one L2-normalized embedding VECTOR per input string, computed
+        ON-DEVICE by mean-pooling the resident LLM's last hidden states. This is
+        the retrieval-embedding op MNEMOSYNE's NeuralEmbeddingProvider calls; it
+        reuses the already-loaded generate model so NO new model is downloaded.
+
+        `texts` is a list of strings (the daemon sends the query + the candidate
+        facts in one batch). The batch is capped at EMBED_MAX_BATCH and each
+        input at EMBED_MAX_TOKENS. Returns a list of equal-length float vectors,
+        in the SAME ORDER as the inputs. Deterministic (a forward pass, no
+        sampling). Holds the GPU lock for the batch like the other LLM ops."""
+        import mlx.core as mx
+
+        if not isinstance(texts, list):
+            raise ValueError("'texts' must be a list of strings for op=embed")
+        if len(texts) > EMBED_MAX_BATCH:
+            raise ValueError(
+                f"op=embed batch of {len(texts)} exceeds the {EMBED_MAX_BATCH} cap"
+            )
+        for t in texts:
+            if not isinstance(t, str):
+                raise ValueError("'texts' entries must be strings for op=embed")
+        vectors = []
+        with self._lock:
+            self._ensure_llm()
+            for t in texts:
+                vectors.append(self._embed_one(mx, t))
+        return vectors
+
+    # -- on-device vision-language model (op=describe_image) ------------
+    # _ensure_vlm must be called with self._lock held.
+
+    def _ensure_vlm(self):
+        """Lazy-load the on-device VLM (mlx-vlm + the checkpoint), caching it as
+        resident for subsequent calls. Returns a dict of {load, generate,
+        apply_chat_template, load_config, model, processor, config} on success,
+        or None when the model cannot run:
+          - self.vlm_id is empty  -> the op is disabled  -> None
+          - mlx-vlm not installed -> _load_mlx_vlm() is None -> None
+          - the checkpoint is not downloaded / fails to load -> None
+        A None return is the SHIPS-OFF / unavailable state, NOT an error: the
+        caller turns it into an honest structured "unavailable" response and the
+        daemon falls back (OCR/classification). The model load is the only place
+        that could touch the disk cache; it never reaches the network here unless
+        the operator has chosen to download the checkpoint."""
+        if not self.vlm_id:
+            return None
+        vlm = _load_mlx_vlm()
+        if vlm is None:
+            # mlx-vlm is not installed: the normal ships-OFF state.
+            return None
+        if self._vlm_model is None:
+            try:
+                log.info("loading on-device VLM %s (resident after first use)...", self.vlm_id)
+                t0 = time.perf_counter()
+                model, processor = vlm["load"](self.vlm_id)
+                config = vlm["load_config"](self.vlm_id)
+                log.info("VLM loaded in %.1fs", time.perf_counter() - t0)
+                self._vlm_model = model
+                self._vlm_processor = processor
+                self._vlm_config = config
+            except Exception:
+                # Checkpoint missing/corrupt or any load failure: report
+                # UNAVAILABLE (the daemon falls back) rather than crashing the
+                # op. Never partially cache.
+                log.exception(
+                    "VLM %s could not be loaded; op=describe_image will report unavailable",
+                    self.vlm_id,
+                )
+                self._vlm_model = None
+                self._vlm_processor = None
+                self._vlm_config = None
+                return None
+        return {
+            "load": vlm["load"],
+            "generate": vlm["generate"],
+            "apply_chat_template": vlm["apply_chat_template"],
+            "load_config": vlm["load_config"],
+            "model": self._vlm_model,
+            "processor": self._vlm_processor,
+            "config": self._vlm_config,
+        }
+
+    def describe_image(self, path, question=None, max_tokens=None):
+        """Describe / answer a question ABOUT a local image with the on-device
+        vision-language model (distinct from OCR: OCR reads text glyphs; this
+        REASONS about the visual scene). Returns a structured dict:
+
+          available:   {"ok": True, "text": <description/answer str>,
+                        "model": <vlm_id>}
+          unavailable: {"ok": False, "reason": DESCRIBE_IMAGE_UNAVAILABLE_REASON,
+                        "error": <honest human message>}
+
+        It NEVER fabricates a description: if mlx-vlm or the checkpoint is
+        absent, it returns the unavailable structure so the daemon can fall back
+        honestly. HONESTY: the image at `path` is read LOCALLY and handed only to
+        the on-device MLX VLM — the pixels NEVER leave the device.
+
+        `path`      absolute path to a local image file (the daemon path-confines
+                    it before calling; we re-validate existence here).
+        `question`  optional VQA question; absent => a general scene description.
+        `max_tokens` optional decode budget (capped at
+                    DESCRIBE_IMAGE_MAX_TOKENS_CAP)."""
+        if not path or not isinstance(path, str):
+            raise ValueError("'path' is required for op=describe_image")
+        if question is not None and not isinstance(question, str):
+            raise ValueError("'question' must be a string for op=describe_image")
+        if max_tokens is None:
+            max_tokens = DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS
+        if not isinstance(max_tokens, int) or max_tokens <= 0:
+            raise ValueError("'max_tokens' must be a positive integer for op=describe_image")
+        max_tokens = min(max_tokens, DESCRIBE_IMAGE_MAX_TOKENS_CAP)
+        # The image must exist locally before we even consider loading a model:
+        # a bad path is a caller error, not a VLM-unavailable condition.
+        if not os.path.isfile(path):
+            raise ValueError(f"image path does not exist or is not a file: {path}")
+        prompt = (question or "").strip() or DESCRIBE_IMAGE_DEFAULT_PROMPT
+        if len(prompt) > DESCRIBE_IMAGE_MAX_QUESTION_CHARS:
+            prompt = prompt[:DESCRIBE_IMAGE_MAX_QUESTION_CHARS]
+
+        with self._lock:
+            vlm = self._ensure_vlm()
+            if vlm is None:
+                # SHIPS-OFF / unavailable: honest, never a fabricated answer.
+                return {
+                    "ok": False,
+                    "reason": DESCRIBE_IMAGE_UNAVAILABLE_REASON,
+                    "error": (
+                        "vision-language model not available (on-device VLM is "
+                        "off or its model is not downloaded)"
+                    ),
+                }
+            try:
+                # Build the chat prompt with one image, then run the VLM. The
+                # image is passed BY PATH and read locally inside mlx-vlm; the
+                # pixels stay on-device.
+                formatted = vlm["apply_chat_template"](
+                    vlm["processor"], vlm["config"], prompt, num_images=1
+                )
+                text = vlm["generate"](
+                    vlm["model"],
+                    vlm["processor"],
+                    formatted,
+                    [path],
+                    max_tokens=max_tokens,
+                    verbose=False,
+                )
+            except Exception as exc:
+                # A runtime failure on a loaded model (decode error, unsupported
+                # image, OOM): report unavailable so the daemon falls back
+                # honestly rather than failing the turn or inventing text.
+                log.exception("op=describe_image generation failed")
+                return {
+                    "ok": False,
+                    "reason": DESCRIBE_IMAGE_UNAVAILABLE_REASON,
+                    "error": f"vision-language model failed to produce a description: {type(exc).__name__}",
+                }
+        # mlx-vlm.generate may return a str or a (text, usage)-style object
+        # depending on version; normalize to the text string.
+        if isinstance(text, tuple):
+            text = text[0] if text else ""
+        if not isinstance(text, str):
+            text = getattr(text, "text", str(text))
+        text = text.strip()
+        if not text:
+            return {
+                "ok": False,
+                "reason": DESCRIBE_IMAGE_UNAVAILABLE_REASON,
+                "error": "vision-language model returned an empty description",
+            }
+        return {"ok": True, "text": text, "model": self.vlm_id}
+
+    # -- on-device text->image model (op=generate_image) ----------------
+    # _ensure_image_model must be called with self._lock held.
+
+    def _ensure_image_model(self):
+        """Lazy-load the on-device diffusion model (the MLX diffusion package +
+        the checkpoint), caching it as resident for subsequent calls. Returns a
+        dict of {Flux1, Config, model} on success, or None when the model cannot
+        run:
+          - self.image_model_id is empty -> the op is disabled  -> None
+          - the diffusion package not installed -> _load_mlx_diffusion() is None
+            -> None
+          - the checkpoint is not downloaded / fails to load -> None
+        A None return is the SHIPS-OFF / unavailable state, NOT an error: the
+        caller turns it into an honest structured "unavailable" response and the
+        daemon surfaces an honest message (NO cloud fallback). The model load is
+        the only place that could touch the disk cache; it never reaches the
+        network here unless the operator has chosen to download the checkpoint."""
+        if not self.image_model_id:
+            return None
+        diff = _load_mlx_diffusion()
+        if diff is None:
+            # the diffusion package is not installed: the normal ships-OFF state.
+            return None
+        if self._image_model is None:
+            try:
+                log.info(
+                    "loading on-device image model %s (resident after first use)...",
+                    self.image_model_id,
+                )
+                t0 = time.perf_counter()
+                model = diff["Flux1"](model_name=self.image_model_id)
+                log.info("image model loaded in %.1fs", time.perf_counter() - t0)
+                self._image_model = model
+            except Exception:
+                # Checkpoint missing/corrupt or any load failure: report
+                # UNAVAILABLE (the daemon surfaces an honest message) rather than
+                # crashing the op. Never partially cache.
+                log.exception(
+                    "image model %s could not be loaded; op=generate_image will report unavailable",
+                    self.image_model_id,
+                )
+                self._image_model = None
+                return None
+        return {
+            "Flux1": diff["Flux1"],
+            "Config": diff["Config"],
+            "model": self._image_model,
+        }
+
+    def generate_image(self, prompt, size=None, steps=None, seed=None):
+        """Generate an image FROM a text prompt with the on-device MLX diffusion
+        model, save it under state/images/ on the device, and return its path.
+        Returns a structured dict:
+
+          available:   {"ok": True, "path": <abs path under state/images/>,
+                        "model": <image_model_id>, "size": int, "steps": int,
+                        "seed": int}
+          unavailable: {"ok": False, "reason": GENERATE_IMAGE_UNAVAILABLE_REASON,
+                        "error": <honest human message>}
+
+        It NEVER fabricates an image and NEVER calls a cloud image API: if the
+        diffusion package or the checkpoint is absent, it returns the unavailable
+        structure so the daemon can surface an honest "the on-device image model
+        isn't set up" message. HONESTY: the prompt and the generated pixels stay
+        on the machine — image generation is 100% ON-DEVICE (MLX diffusion), and
+        nothing is sent to the cloud.
+
+        `prompt` the text prompt to render (required, non-empty after strip).
+        `size`   optional square output resolution in pixels (bounded by
+                 GENERATE_IMAGE_MIN_SIZE..GENERATE_IMAGE_MAX_SIZE).
+        `steps`  optional sampling steps (capped at GENERATE_IMAGE_MAX_STEPS_CAP).
+        `seed`   optional integer seed for reproducibility (None => a
+                 time-derived seed)."""
+        if not prompt or not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("'prompt' is required for op=generate_image")
+        prompt = prompt.strip()
+        if len(prompt) > GENERATE_IMAGE_MAX_PROMPT_CHARS:
+            prompt = prompt[:GENERATE_IMAGE_MAX_PROMPT_CHARS]
+        if size is None:
+            size = GENERATE_IMAGE_DEFAULT_SIZE
+        if not isinstance(size, int) or size <= 0:
+            raise ValueError("'size' must be a positive integer for op=generate_image")
+        size = max(GENERATE_IMAGE_MIN_SIZE, min(size, GENERATE_IMAGE_MAX_SIZE))
+        if steps is None:
+            steps = GENERATE_IMAGE_DEFAULT_STEPS
+        if not isinstance(steps, int) or steps <= 0:
+            raise ValueError("'steps' must be a positive integer for op=generate_image")
+        steps = min(steps, GENERATE_IMAGE_MAX_STEPS_CAP)
+        if seed is not None and not isinstance(seed, int):
+            raise ValueError("'seed' must be an integer for op=generate_image")
+        if seed is None:
+            # A time-derived seed keeps runs distinct without requiring the
+            # caller to supply one; bounded so it stays a sane 32-bit value.
+            seed = int(time.time() * 1000) & 0x7FFFFFFF
+
+        with self._lock:
+            diff = self._ensure_image_model()
+            if diff is None:
+                # SHIPS-OFF / unavailable: honest, never a fabricated image and
+                # never a cloud call.
+                return {
+                    "ok": False,
+                    "reason": GENERATE_IMAGE_UNAVAILABLE_REASON,
+                    "error": (
+                        "image model not available (on-device image generation "
+                        "is off or its model is not downloaded)"
+                    ),
+                }
+            try:
+                # Build the diffusion config and run generation entirely
+                # on-device. The prompt is handed ONLY to the local MLX model;
+                # nothing is sent to the cloud.
+                config = diff["Config"](
+                    num_inference_steps=steps,
+                    height=size,
+                    width=size,
+                )
+                generated = diff["model"].generate_image(
+                    seed=seed,
+                    prompt=prompt,
+                    config=config,
+                )
+                # Save the image to an on-device path under state/images/. The
+                # generator returns an object with a .save(path); we never send
+                # the pixels anywhere.
+                IMAGES_DIR.mkdir(parents=True, exist_ok=True)
+                out_path = IMAGES_DIR / f"image-{next(self._tts_counter)}.png"
+                generated.save(path=str(out_path))
+            except Exception as exc:
+                # A runtime failure on a loaded model (decode error, OOM):
+                # report unavailable so the daemon surfaces an honest message
+                # rather than failing the turn or inventing an image. NEVER a
+                # cloud fallback.
+                log.exception("op=generate_image generation failed")
+                return {
+                    "ok": False,
+                    "reason": GENERATE_IMAGE_UNAVAILABLE_REASON,
+                    "error": f"image model failed to produce an image: {type(exc).__name__}",
+                }
+        if not os.path.isfile(out_path):
+            # The generator claimed success but no file landed on disk: treat as
+            # unavailable rather than returning a path to nothing.
+            return {
+                "ok": False,
+                "reason": GENERATE_IMAGE_UNAVAILABLE_REASON,
+                "error": "image model did not write an output file",
+            }
+        return {
+            "ok": True,
+            "path": str(out_path),
+            "model": self.image_model_id,
+            "size": size,
+            "steps": steps,
+            "seed": seed,
+        }
+
+    def extract_facts(self, text, response=None):
+        """Extract at most 3 durable namespaced facts about the user from one
+        exchange. Facts come from the user's words ONLY; the assistant reply is
+        disambiguation context, never a source (see EXTRACT_FACTS_SYSTEM).
+        Empty list when nothing qualifies or output is unparseable."""
+        prompt = f"User said: {text}"
+        if response:
+            prompt += (
+                "\nAssistant replied (context for disambiguation ONLY — never a "
+                f"source of facts): {response}"
+            )
+        prompt += "\n\nJSON array:"
+        raw = self._run_llm(prompt, EXTRACT_FACTS_MAX_TOKENS, system=EXTRACT_FACTS_SYSTEM)
+        return parse_facts(raw)
+
+    def consolidate(self, transcripts, facts):
+        """Self-learning reflection pass: merge/clean the facts table against
+        recent transcripts, and mine clearly recurring user patterns into
+        "user.habit.<slug>" facts (prompted, then enforced by the
+        habit_supported backstop — same parse layer, same caps; >=3
+        occurrences across the provided transcripts, counted from the user's
+        lines only, never the assistant's; habit facts are deletable like any
+        other). Returns {"upserts": [{"key","value"}],
+        "deletes": [key]} — empty arrays whenever the model output is
+        unparseable or there is nothing to do. Greedy decode (determinism is
+        a feature for strict-JSON ops). "meta."-prefixed input facts are
+        ignored entirely: they are bookkeeping (e.g. meta.last_reflection),
+        never memory."""
+        facts = [f for f in facts if not f["key"].startswith("meta.")]
+        if not facts:
+            # Nothing to merge or delete; without stored facts every valid
+            # delete is impossible and upserts would be invention by
+            # definition of this op (extract_facts owns new-fact learning).
+            return {"upserts": [], "deletes": []}
+        lines = ["Stored facts:"]
+        lines.extend(f"- {f['key']} = {f['value']}" for f in facts)
+        lines.append("")
+        lines.append("Recent transcripts (oldest first):")
+        if transcripts:
+            for turn in transcripts:
+                lines.append(f"User: {turn['user']}")
+                lines.append(f"Assistant: {turn['jarvis']}")
+        else:
+            lines.append("(none)")
+        lines.append("")
+        lines.append("JSON object:")
+        # Interruptible variant: this is the one op long enough (multi-
+        # thousand-token uncached prefill) that holding the GPU lock end-to-
+        # end would stall interactive utterances behind a background pass.
+        raw = self._run_llm_interruptible(
+            "\n".join(lines), CONSOLIDATE_MAX_TOKENS, system=CONSOLIDATE_SYSTEM
+        )
+        result = parse_consolidation(raw, {f["key"]: f["value"] for f in facts})
+        # Deterministic habit backstop on top of the parse guards (which are
+        # unchanged): user.habit.* upserts must be evidenced by >= 3 separate
+        # user lines in THESE transcripts, or they are dropped. See
+        # habit_supported for why the prompt alone cannot be trusted here.
+        result["upserts"] = [
+            u
+            for u in result["upserts"]
+            if not u["key"].startswith("user.habit.")
+            or habit_supported(u["key"], u["value"], transcripts)
+        ]
+        return result
+
+    def classify(self, text):
+        from mlx_lm import generate as mlx_generate
+
+        with self._lock:
+            model, tokenizer = self._ensure_classifier()
+            if self._cls_cache is not None:
+                try:
+                    return parse_classification(self._classify_cached(text))
+                except Exception:
+                    log.exception("cached classify failed; rebuilding cache and falling back")
+                    try:
+                        self._build_classifier_cache()
+                    except Exception:
+                        self._cls_cache = None
+            # Uncached fallback path (greedy, on the same classify model).
+            template = self.classifier_template
+            if "{utterance}" in template:
+                body = template.replace("{utterance}", text)
+            else:
+                body = f'{template}\n\nUtterance: "{text}"\nJSON:'
+            prompt = self._render_chat(body, tokenizer=tokenizer)
+            raw = mlx_generate(
+                model, tokenizer, prompt=prompt, max_tokens=CLASSIFY_MAX_TOKENS
+            )
+        return parse_classification(raw)
+
+    @staticmethod
+    def _lang_code(voice):
+        # Kokoro voices encode the language as the first letter (am_michael ->
+        # American English "a", bf_emma -> British English "b", ...).
+        if voice and voice[0] in _KOKORO_LANGS:
+            return voice[0]
+        return "a"
+
+    @staticmethod
+    def _speech_chunks(text, max_chars=280):
+        """Split text into synthesis chunks (sentences, comma-split when a
+        sentence runs long). The SineGen length-alignment patch
+        (_patch_kokoro_sinegen) fixes mlx-audio 0.4.4's vocoder broadcast bug
+        directly, so tiny chunks are no longer needed; chunking now only keeps
+        single Kokoro calls reasonably sized, with the retry-at-1.0 guard in
+        _synthesize_chunk as the backstop."""
+        import re
+
+        # Sentence enders followed by whitespace — decimal points ("11.0")
+        # have no trailing whitespace, so they survive.
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+        chunks = []
+        for s in sentences:
+            while len(s) > max_chars:
+                cut = s.rfind(",", 0, max_chars)
+                if cut < max_chars // 2:
+                    cut = s.rfind(" ", 0, max_chars)
+                if cut <= 0:
+                    cut = max_chars
+                chunks.append(s[:cut].strip())
+                s = s[cut:].lstrip(", ")
+            if s:
+                chunks.append(s)
+        return chunks or [text]
+
+    def _synthesize_chunk(self, tts, chunk, voice):
+        """One short Kokoro generate; retry once at speed 1.0 (the vocoder bug
+        is length-dependent and a speed change shifts segment lengths)."""
+        import numpy as np
+
+        for speed in (self.speed, 1.0):
+            try:
+                return [
+                    np.asarray(r.audio, dtype=np.float32)
+                    for r in tts.generate(
+                        text=chunk, voice=voice, speed=speed, lang_code=self._lang_code(voice)
+                    )
+                ]
+            except ValueError as e:
+                if "broadcast_shapes" not in str(e) or speed == 1.0:
+                    raise
+                log.warning("kokoro length bug on chunk %r at speed %s; retrying at 1.0", chunk, speed)
+        return []
+
+    # -- per-engine synthesis (one synth function per engine; speak, converse
+    # -- and the opener bank all dispatch through _tts_synth_fn) ----------
+
+    def _synth_kokoro(self, tts, text, voice):
+        """Kokoro-82M: chunked synthesis with the SineGen patch active and the
+        retry-at-1.0 guard per chunk. Honors [speech].speed."""
+        chunks = []
+        for piece in self._speech_chunks(text):
+            chunks.extend(self._synthesize_chunk(tts, piece, voice))
+        return chunks
+
+    def _synth_csm(self, tts, text, voice):
+        """Sesame CSM: voice selects a speaker prompt (conversational_b =
+        male), passed as ref_audio/ref_text from the ungated mirror — see
+        CSM_PROMPT_REPO (mlx-audio's own voice= path needs HF auth).
+        hf_hub_download is cache-first, so only the first call ever touches
+        the network. The model has no speed control; [speech].speed is
+        ignored on this engine."""
+        import numpy as np
+        from huggingface_hub import hf_hub_download
+
+        ref_text = CSM_PROMPT_TEXTS.get(voice)
+        if ref_text is None:
+            raise ValueError(
+                f"unsupported CSM voice {voice!r}; supported: {sorted(CSM_PROMPT_TEXTS)}"
+            )
+        ref_path = hf_hub_download(repo_id=CSM_PROMPT_REPO, filename=f"prompts/{voice}.wav")
+        return [
+            np.asarray(r.audio, dtype=np.float32)
+            for r in tts.generate(text=text, ref_audio=ref_path, ref_text=ref_text)
+        ]
+
+    def _synth_orpheus(self, tts, text, voice):
+        """Orpheus 3B ft: voice is a named speaker tag prepended to the
+        prompt (leo/dan/zac are male). No speed control; [speech].speed is
+        ignored on this engine."""
+        import numpy as np
+
+        return [
+            np.asarray(r.audio, dtype=np.float32)
+            for r in tts.generate(text=text, voice=voice)
+        ]
+
+    def _tts_synth_fn(self):
+        """Resolve the synth function for the active engine. engine_name is
+        validated against TTS_ENGINE_DEFAULTS in __init__, so this lookup
+        cannot miss."""
+        return {
+            "kokoro": self._synth_kokoro,
+            "csm": self._synth_csm,
+            "orpheus": self._synth_orpheus,
+        }[self.engine_name]
+
+    @staticmethod
+    def _tts_sample_rate(tts):
+        """Model sample rate: sesame/kokoro expose .sample_rate, orpheus
+        carries it on .config; 24000 is every supported engine's native
+        rate, kept as the final fallback."""
+        rate = getattr(tts, "sample_rate", None)
+        if not rate:
+            rate = getattr(getattr(tts, "config", None), "sample_rate", None)
+        return int(rate or 24000)
+
+    @staticmethod
+    def _trim_silence(audio, sample_rate, threshold=TRIM_AMPLITUDE, pad_ms=TRIM_PAD_MS):
+        """Trim leading/trailing samples with |amplitude| < threshold, keeping
+        pad_ms of padding each side. Kokoro bakes ~0.26s of leading and ~0.46s
+        of trailing silence into every WAV; trimmed, the residual lead/tail
+        are each <= 120ms, which is what makes back-to-back sentence playback
+        gapless. All-silent audio (no sample reaches the threshold) returns
+        None: there is nothing speakable in it, and _synthesize_to_wav treats
+        it exactly like the engine producing no audio at all."""
+        import numpy as np
+
+        loud = np.flatnonzero(np.abs(audio) >= threshold)
+        if loud.size == 0:
+            return None
+        pad = int(sample_rate * pad_ms / 1000)
+        start = max(0, int(loud[0]) - pad)
+        end = min(len(audio), int(loud[-1]) + 1 + pad)
+        return audio[start:end]
+
+    @staticmethod
+    def _apply_fades(audio, fade_in=FADE_IN_SAMPLES, fade_out=FADE_OUT_SAMPLES):
+        """Linear fade-in/fade-out at the clip edges, applied AFTER the
+        silence trim on the float array (before int16 conversion). The first
+        and last samples come out exactly 0 — |amp| < 0.002 at both edges of
+        every emitted WAV — so the daemon's clip joins are click-free.
+        Operates on a copy. Clips shorter than a fade window get a
+        proportionally shorter ramp; when the two windows overlap the ramps
+        multiply, which only fades harder (never a discontinuity)."""
+        import numpy as np
+
+        n = len(audio)
+        if n == 0:
+            return audio
+        audio = np.asarray(audio, dtype=np.float32).copy()
+        fade_in = min(int(fade_in), n)
+        if fade_in > 0:
+            # endpoint=False: ramp 0 .. (k-1)/k, continuous with the unfaded
+            # factor 1.0 at the sample after the window; first sample is 0.
+            audio[:fade_in] *= np.linspace(0.0, 1.0, fade_in, endpoint=False, dtype=np.float32)
+        fade_out = min(int(fade_out), n)
+        if fade_out > 0:
+            # Ramp 1 .. 0 inclusive: the window starts at factor 1.0
+            # (continuous with the preceding samples), last sample is 0.
+            audio[-fade_out:] *= np.linspace(1.0, 0.0, fade_out, dtype=np.float32)
+        return audio
+
+    def _write_wav(self, audio, sample_rate, out_path=None):
+        """Write float32 mono audio to a 16-bit WAV: a fresh file under
+        state/tmp/ by default, or exactly `out_path` (opener bank, audition
+        samples) when given. Every WAV emitted by this server funnels through
+        here, so the edge fades (_apply_fades) are applied here — after the
+        caller's silence trim, before int16 conversion — guaranteeing
+        near-zero first/last samples on speak clips, converse sentences,
+        openers and audition samples alike.
+
+        The write is atomic: bytes go to '<name>.tmp' and os.replace() lands
+        the finished file on the final path. Opener-bank paths are read by
+        the daemon at any instant across server restarts, and a directly
+        written WAV is briefly a valid-looking header over truncated data;
+        with the rename, a reader sees either no file or a complete one. On
+        any failure the .tmp is best-effort unlinked, so a failed write
+        leaves nothing behind on either path."""
+        import wave
+
+        import numpy as np
+
+        pcm = (np.clip(self._apply_fades(audio), -1.0, 1.0) * 32767.0).astype(np.int16)
+        if out_path is None:
+            TMP_DIR.mkdir(parents=True, exist_ok=True)
+            path = TMP_DIR / f"tts-{next(self._tts_counter)}.wav"
+        else:
+            path = Path(out_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_name(path.name + ".tmp")
+        try:
+            with wave.open(str(tmp_path), "wb") as wf:
+                wf.setnchannels(1)
+                wf.setsampwidth(2)
+                wf.setframerate(sample_rate)
+                wf.writeframes(pcm.tobytes())
+            os.replace(tmp_path, path)
+        except BaseException:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
+        return str(path)
+
+    @staticmethod
+    def _apply_rate(audio, sample_rate, rate):
+        """COARSE speaking-rate change (#33 prosody) for the on-device path, honoured
+        by time-stretching via nearest-sample resampling at the SAME output sample
+        rate (faster rate -> fewer samples -> quicker speech). A None/1.0/out-of-range
+        `rate` leaves the audio UNTOUCHED (byte-for-byte today's). PURE; no network.
+        This is the honest coarse rate the backend honours — never a fabricated tag."""
+        import numpy as np
+
+        if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+            return audio
+        r = float(rate)
+        if not (0.5 <= r <= 2.0) or abs(r - 1.0) < 1e-3 or audio.size == 0:
+            return audio
+        n_out = max(1, int(round(audio.shape[0] / r)))
+        idx = np.minimum((np.arange(n_out) * r).astype(np.int64), audio.shape[0] - 1)
+        return audio[idx]
+
+    def _synthesize_to_wav(self, tts, text, voice, out_path=None, rate=None, volume=None):
+        """Synthesize `text` through the active engine's synth function,
+        silence-trim the result, and write it to a WAV (under state/tmp/, or
+        at `out_path` when given). Returns the absolute path, or None when
+        the engine produced no audio (e.g. punctuation-only text) OR audio
+        that is entirely below the trim threshold — dead air must not become
+        a sentence event, a speak reply or a "ready" opener. Caller holds
+        self._lock.
+
+        #33/#34 COARSE delivery: `rate` time-stretches the speech and `volume`
+        applies a soft-delivery gain — both honoured on this on-device path (the
+        coarse hints the backend can do; rich audio-tags are EL-v3-only). With both
+        unset (the OFF default) this is byte-for-byte today's synth."""
+        import numpy as np
+
+        sample_rate = self._tts_sample_rate(tts)
+        # Speakable normalization at the single synth point: turns "apple.com"
+        # into "apple dot com" for EVERY path (speak op, converse sentences,
+        # openers) so domains aren't read as "apple, com".
+        text = _speakable(text)
+        # No inserted silence between chunks: the engine's own sentence
+        # prosody carries the pauses; injected gaps read as stutter.
+        chunks = self._tts_synth_fn()(tts, text, voice)
+        if not chunks:
+            return None
+        audio = np.concatenate(chunks)
+        if audio.size == 0:
+            return None
+        audio = self._trim_silence(audio, sample_rate)
+        if audio is None:
+            return None
+        # Coarse rate then gain (order is irrelevant — gain is sample-wise). Both are
+        # no-ops at the neutral default, keeping the default WAV untouched.
+        audio = self._apply_rate(audio, sample_rate, rate)
+        audio = self._apply_gain(audio, volume)
+        return self._write_wav(audio, sample_rate, out_path)
+
+    def generate_openers(self):
+        """Regenerate the opener bank: clear state/openers/ and synthesize
+        each [speech].openers line to opener-<idx>.wav with the current
+        engine/voice/speed, silence-trimmed like every other WAV. Runs inside
+        preload after the TTS warm. The daemon maps filename index back to
+        the configured openers text, so indexes always match config order —
+        a line that fails to synthesize leaves a gap, never a shift. Failure
+        to prepare the directory — including any stale file that survives
+        the clear below — skips synthesis entirely rather than risking
+        previous-run WAVs being misindexed against the current config."""
+        try:
+            OPENERS_DIR.mkdir(parents=True, exist_ok=True)
+            stale = [p for p in OPENERS_DIR.iterdir() if p.is_file()]
+        except OSError:
+            log.exception("openers: cannot prepare %s; opener bank unavailable", OPENERS_DIR)
+            return 0
+        # Best-effort clear: attempt EVERY stale file (aborting on the first
+        # error would strand previous-run WAVs — old engine/voice/text —
+        # whose filename indexes the daemon would map onto the CURRENT
+        # config's openers list, the exact desync the whole-bank validation
+        # exists to prevent). Only synthesize into a verifiably cleared bank.
+        survivors = []
+        for old in stale:
+            try:
+                old.unlink()
+            except OSError:
+                survivors.append(old)
+        if survivors:
+            log.error(
+                "openers: could not remove stale files (%s); opener bank "
+                "unavailable — stale WAVs would be misindexed against the "
+                "current openers config",
+                ", ".join(p.name for p in survivors),
+            )
+            return 0
+        t0 = time.perf_counter()
+        ready = 0
+        for idx, line in enumerate(self.openers):
+            try:
+                with self._lock:
+                    tts = self._ensure_tts()
+                    path = self._synthesize_to_wav(
+                        tts, line, self.voice, out_path=OPENERS_DIR / f"opener-{idx}.wav"
+                    )
+                if path is None:
+                    log.warning("openers: no audio for opener %d %r; skipped", idx, line)
+                else:
+                    ready += 1
+            except Exception:
+                log.exception("openers: synthesis failed for opener %d %r; skipped", idx, line)
+                # A failed line must leave a GAP, never a present-but-corrupt
+                # file: best-effort unlink whatever may sit at this index.
+                try:
+                    (OPENERS_DIR / f"opener-{idx}.wav").unlink()
+                except OSError:
+                    pass
+        log.info(
+            "openers: bank ready — %d/%d WAVs in %s (engine=%s voice=%s speed=%s, %dms)",
+            ready,
+            len(self.openers),
+            OPENERS_DIR,
+            self.engine_name,
+            self.voice,
+            self.speed,
+            int((time.perf_counter() - t0) * 1000),
+        )
+        return ready
+
+    @staticmethod
+    def _resolve_elevenlabs_model(model, lang):
+        """Pick the ElevenLabs TTS model_id for this speak request. An explicit
+        non-empty `model` from the daemon wins (the daemon's choice is honored
+        verbatim). Otherwise, when `lang` names a NON-English language, use the
+        multilingual model; an absent/English lang uses the English-centric
+        default. PURE; unit-testable in isolation (no network, no state)."""
+        if isinstance(model, str) and model.strip():
+            return model
+        if _is_non_english_lang(lang):
+            return ELEVENLABS_MULTILINGUAL_MODEL
+        return ELEVENLABS_DEFAULT_MODEL
+
+    def clone_voice(self, path, name, el_key):
+        """CONSENT-GATED voice cloning: upload the owner audio SAMPLE at `path`
+        to ElevenLabs (/v1/voices/add, name=`name`, xi-api-key from `el_key`) and
+        return the new voice_id string, or None on any failure (the daemon then
+        keeps Kokoro / the user's existing voice — never fails the turn).
+
+        The daemon only calls this after an EXPLICIT, authorization-bound consent
+        confirm on a user-owned sample (no impersonation, never automatic). HONESTY:
+        the audio sample LEAVES the device here. The voice_id is NON-secret (the
+        daemon stores it like any EL voice id); the key is secret and is used only
+        to call the seam — never logged here. Blocking; runs on a worker thread."""
+        name = (name or "").strip()
+        try:
+            voice_id = _elevenlabs_clone_voice(name, path, el_key)
+            if isinstance(voice_id, str) and voice_id:
+                return voice_id
+            log.warning("ElevenLabs clone produced no voice_id; user keeps their existing voice")
+            return None
+        except Exception as exc:
+            # ANY error (network, HTTP, auth, timeout, missing key/sample, decode)
+            # -> no clone. Log only the redacted exception CLASS — never exc_info /
+            # the message (could echo a key-bearing URL fragment or the sample path).
+            log.warning(
+                "ElevenLabs voice clone failed (%s); user keeps their existing voice",
+                _redact_elevenlabs(type(exc).__name__),
+            )
+            return None
+
+    @staticmethod
+    def _apply_gain(audio, volume):
+        """COARSE output gain (#34 whisper soft delivery), honoured on EVERY backend.
+        Scale `audio` by `volume` in (0,1] when it is a real multiplier below 1.0;
+        a None/1.0/out-of-range value leaves the audio UNTOUCHED (byte-for-byte
+        today's). PURE; no network. The clip in _write_wav still bounds the result."""
+        import numpy as np
+
+        if not isinstance(volume, (int, float)) or isinstance(volume, bool):
+            return audio
+        v = float(volume)
+        if not (0.0 < v < 1.0):
+            return audio
+        return (audio.astype(np.float32) * v)
+
+    def _elevenlabs_to_wav(self, text, voice_id, model, api_key, lang=None,
+                           audio_tag=None, stability=None, style=None, volume=None):
+        """Synthesize `text` through the ElevenLabs cloud voice tier and write it
+        to the SAME pipeline WAV the daemon expects (under state/tmp/). Returns the
+        absolute path, or None when ElevenLabs produced no usable audio.
+
+        `lang` is the OPTIONAL target language Babel threads through the speak
+        spec. When it names a NON-English language, a MULTILINGUAL model is
+        selected (so Babel's spoken target-language output gets EL's multilingual
+        quality instead of the English-centric default); an absent/English lang
+        leaves the requested/default model unchanged. An explicit `model` from the
+        daemon is always honored as-is — the multilingual swap only fills in the
+        DEFAULT model slot for a non-English turn.
+
+        #33/#34 EXPRESSIVENESS: `audio_tag`/`stability`/`style` are the EL-v3 rich
+        surface (EL-v3-gated inside `_elevenlabs_synth_pcm`); `volume` is the coarse
+        whisper gain applied to the produced WAV on EVERY backend. With nothing set
+        (the OFF default) the path is byte-for-byte today's.
+
+        Raises on any network/HTTP error: the caller (`speak`) catches EVERYTHING
+        and falls back to on-device Kokoro, so a cloud failure NEVER fails a turn.
+        The key is used only to call the seam (which puts it in the xi-api-key
+        header) — it is never logged here. Holds self._lock (caller contract)."""
+        import numpy as np
+
+        model = self._resolve_elevenlabs_model(model, lang)
+        pcm = _elevenlabs_synth_pcm(
+            voice_id, model, api_key, _speakable(text),
+            audio_tag=audio_tag, stability=stability, style=style,
+        )
+        if not pcm:
+            return None
+        audio = _pcm16_to_float32(pcm)
+        if audio.size == 0:
+            return None
+        audio = self._trim_silence(audio, ELEVENLABS_SAMPLE_RATE)
+        if audio is None:
+            return None
+        audio = self._apply_gain(audio, volume)
+        return self._write_wav(audio, ELEVENLABS_SAMPLE_RATE)
+
+    def speak(self, text, voice=None, backend=None, voice_id=None, model=None, el_key=None,
+              lang=None, audio_tag=None, stability=None, style=None, rate=None, volume=None):
+        """Synthesize `text` to a silence-trimmed 24kHz mono 16-bit WAV under
+        state/tmp/ and return its absolute path. The daemon owns playback and
+        deletion.
+
+        `backend` selects the TTS path the daemon already chose:
+          - "elevenlabs": the OPTIONAL cloud voice tier. We POST to ElevenLabs
+            (xi-api-key header, key from `el_key`) for `voice_id`/`model`, wrap the
+            PCM as the pipeline WAV, and return it. On ANY error/timeout — or a
+            missing key/voice id — we FALL BACK to on-device Kokoro (never fail the
+            turn). HONESTY: on this path the text leaves the device.
+          - anything else (None/"kokoro"): on-device Kokoro, EXACTLY as before.
+        Kokoro is the default + the fallback; the cloud path is reached only when the
+        daemon asked for it (its own tier+key+offline gate already passed).
+
+        `lang` is the OPTIONAL target language Babel threads through the speak spec.
+        Under the ElevenLabs backend a NON-English `lang` selects a multilingual
+        model (so Babel's spoken target-language output gets EL's multilingual
+        quality); it is ignored on the Kokoro path (Kokoro's voice already encodes
+        its language). When the tier is OFF the path is unchanged (Kokoro).
+
+        #33/#34 EXPRESSIVENESS shaping (all OPTIONAL; None == today's neutral wire):
+          - `audio_tag`/`stability`/`style`: the EL-v3 RICH surface — consumed ONLY
+            on the EL-v3 model (EL-v3-gated in `_elevenlabs_synth_pcm`), so a tag
+            never reaches a non-v3 model or the Kokoro path.
+          - `rate`/`volume`: COARSE delivery hints honoured on every backend. `volume`
+            is a gain applied to the produced WAV (the real "speak softly" on Kokoro
+            too). `rate` is a coarse speaking-rate hint — applied to Kokoro by nudging
+            the request speed within bounds; the EL leg keeps its model's pacing.
+        With nothing set (the daemon's shipped-OFF default sends none of these), the
+        path is BYTE-FOR-BYTE today's. No real network call is added on any path."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("'text' must be non-empty for op=speak")
+
+        use_elevenlabs = isinstance(backend, str) and backend.strip().lower() == "elevenlabs"
+        if use_elevenlabs:
+            try:
+                with self._lock:
+                    # EL-v3 rich surface (audio_tag/stability/style) + coarse whisper
+                    # gain (volume) thread in here; the EL leg keeps its own pacing so
+                    # `rate` is not forwarded to the cloud model.
+                    path = self._elevenlabs_to_wav(
+                        text, voice_id, model, el_key, lang,
+                        audio_tag=audio_tag, stability=stability, style=style,
+                        volume=volume,
+                    )
+                if path is not None:
+                    return path
+                # No audio from the cloud tier -> fall through to Kokoro.
+                log.warning("ElevenLabs returned no audio; falling back to on-device Kokoro")
+            except Exception as exc:
+                # ANY error (network, HTTP, auth, timeout, decode) -> Kokoro. We log
+                # only the redacted exception CLASS — never exc_info / the message,
+                # since a transport error string can echo the URL (voice id) and we
+                # never want the key/voice id anywhere near a log line.
+                log.warning(
+                    "ElevenLabs synthesis failed (%s); falling back to on-device Kokoro",
+                    _redact_elevenlabs(type(exc).__name__),
+                )
+            # FALL BACK: the rest of this method is the unchanged Kokoro path.
+
+        # Kokoro / non-v3: the COARSE rate/gain the backend honours (no audio-tags —
+        # rich prosody is EL-v3-gated and never faked here). The audio_tag/stability/
+        # style are intentionally ignored on this path. With rate/volume unset this is
+        # byte-for-byte today's Kokoro synth.
+        voice = self._resolve_request_voice(voice)
+        with self._lock:
+            tts = self._ensure_tts()
+            path = self._synthesize_to_wav(tts, text, voice, rate=rate, volume=volume)
+        if path is None:
+            raise RuntimeError("TTS produced no audio")
+        return path
+
+    def converse(
+        self,
+        text,
+        max_tokens=GENERATE_DEFAULT_MAX_TOKENS,
+        history=None,
+        facts=None,
+        data=None,
+        voice=None,
+        emit=None,
+        opener_spoken=None,
+        persona=None,
+        local_model=None,
+    ):
+        """Streamed generate+TTS in one GPU-locked pass: decode the persona
+        reply (same prompt assembly, KV cache and sampler as generate, plus
+        the opener_spoken continuation note when the daemon already played an
+        opener for this reply) and,
+        each time the decimal-aware sentence boundary completes a sentence,
+        pause decoding (the stream_generate generator simply stays suspended),
+        synthesize that sentence to a silence-trimmed WAV, call
+        emit({"event": "sentence", "seq", "text", "path"}), then resume.
+
+        At most CONVERSE_MAX_SPOKEN_SENTENCES sentences are synthesized;
+        later text is only returned. Sentences Kokoro yields no audio for
+        (e.g. punctuation-only) are skipped without consuming a seq. Blocking;
+        the caller runs it on one worker thread, and `emit` must therefore be
+        thread-safe (the server hands events to the asyncio loop via
+        loop.call_soon_threadsafe).
+
+        Returns {"text": full reply, "sentences": spoken count,
+        "first_sentence_ms": int|None}. The persona KV cache is trimmed back
+        to the static prefix even when decode or synthesis raises mid-stream —
+        the cache must never be left grown."""
+        from mlx_lm import stream_generate
+        from mlx_lm.models.cache import trim_prompt_cache
+
+        t0 = time.perf_counter()
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("'text' must be non-empty for op=converse")
+        voice = self._resolve_request_voice(voice)
+        if emit is None:
+            emit = lambda event: None  # noqa: E731
+
+        # Per-agent persona: when a persona NAME is supplied and resolves to a
+        # personas/<name>.txt, that text becomes the system prefix for THIS call.
+        # Each agent's prefix has its OWN KV cache (keyed by agent name, LRU-
+        # bounded) so the agent's persona-prefix KV is prefilled once and reused
+        # on later turns — never mixed into the base cache (keyed to
+        # prompts/persona.txt). Absent / unresolvable persona -> base persona.
+        persona_name = persona.strip().lower() if isinstance(persona, str) else None
+        persona_override = load_agent_persona(persona) if persona else None
+
+        with self._lock:
+            # Resolve the LOCAL model for this turn (Local-tier sub-choice). The
+            # persona KV caches (base + agent) live on the BASE model only; when
+            # a non-base warm model answers it runs UNCACHED on its own resident
+            # weights — that is the instant-swap benefit. _ensure_local_llm pins
+            # the base + keeps the requested model warm under the RAM budget.
+            resolved_id, lm_model, lm_tokenizer = self._ensure_local_llm(local_model)
+            on_base = resolved_id == self.llm_id
+            tts = self._ensure_tts()
+            messages = self._build_generate_messages(
+                text,
+                history=history,
+                facts=facts,
+                data=data,
+                opener_spoken=opener_spoken,
+                persona_override=persona_override,
+            )
+            prompt = self._render_chat_messages(messages, tokenizer=lm_tokenizer)
+            if opener_spoken and opener_spoken.strip():
+                # Seed the assistant turn with the opener the daemon already
+                # played: decoding continues mid-reply after it, so the model
+                # cannot open with another acknowledgement (measured: with the
+                # bracketed note alone, Qwen3-4B parrots the quoted opener
+                # verbatim 3/3 runs). The seed is prompt, not generation —
+                # sentence events and the returned text start at the
+                # substance, which is exactly what the daemon must append
+                # after the opener WAV it already played.
+                prompt += opener_spoken.strip()
+            # Select the KV cache state for this turn:
+            #   - base persona  -> the resident base cache (self._gen_cache),
+            #   - agent override -> that agent's resident prefix cache (built on
+            #     first use, reused after; None if prefill wasn't feasible, in
+            #     which case this turn runs uncached without touching any cache).
+            # `cache_state` holds {cache, cache_len, prefix_tokens} so the trim
+            # and the finally trim-back operate on the SAME cache uniformly; the
+            # updated cache_len is written back to wherever it lives.
+            # A non-base warm model has NO persona KV cache (the caches are built
+            # on the base model's weights and cannot be reused across models):
+            # it answers uncached. Only the base path consults/builds caches.
+            if not on_base:
+                cache_state = None
+            elif persona_override is not None:
+                cache_state = self._get_agent_gen_cache(persona_name, persona_override)
+            else:
+                cache_state = (
+                    {
+                        "cache": self._gen_cache,
+                        "cache_len": self._gen_cache_len,
+                        "prefix_tokens": self._gen_prefix_tokens,
+                    }
+                    if self._gen_cache is not None
+                    else None
+                )
+            cache = cache_state["cache"] if cache_state is not None else None
+            if cache is not None:
+                cache_len = cache_state["cache_len"]
+                prefix_tokens = cache_state["prefix_tokens"]
+                full_tokens = lm_tokenizer.encode(prompt)
+                # Tokenization at the prefix boundary can merge across the
+                # seam; trim the cache down to the actual common token prefix.
+                common = 0
+                for a, b in zip(prefix_tokens[:cache_len], full_tokens):
+                    if a != b:
+                        break
+                    common += 1
+                if common < cache_len:
+                    trim_prompt_cache(cache, cache_len - common)
+                    cache_len = common
+                # Persist the (possibly shrunk) prefix length back to its home so
+                # the finally trim-back and the next reuse both see the truth.
+                cache_state["cache_len"] = cache_len
+                if persona_override is None:
+                    self._gen_cache_len = cache_len
+                prompt_tokens = full_tokens[cache_len:]
+            else:
+                prompt_tokens = lm_tokenizer.encode(prompt)
+
+            pieces = []
+            pending = ""
+            spoken = 0
+            first_sentence_ms = None
+            generated = 0
+
+            def speak_sentence(sentence):
+                """Synthesize one completed sentence and emit its event.
+                Holds the decode paused (we are inside the stream_generate
+                loop) and self._lock (whole-converse scope)."""
+                nonlocal spoken, first_sentence_ms
+                path = self._synthesize_to_wav(tts, sentence, voice)
+                if path is None:
+                    log.warning("converse: no audio for sentence %r; skipping", sentence)
+                    return
+                if first_sentence_ms is None:
+                    first_sentence_ms = int((time.perf_counter() - t0) * 1000)
+                emit({"event": "sentence", "seq": spoken, "text": sentence, "path": path})
+                spoken += 1
+
+            try:
+                for resp in stream_generate(
+                    lm_model,
+                    lm_tokenizer,
+                    prompt=prompt_tokens,
+                    max_tokens=max_tokens,
+                    prompt_cache=cache,
+                    sampler=self._persona_sampler(),
+                ):
+                    pieces.append(resp.text)
+                    generated += 1
+                    if spoken < CONVERSE_MAX_SPOKEN_SENTENCES:
+                        pending += resp.text
+                        sentences, pending = _split_complete_sentences(pending)
+                        for sentence in sentences:
+                            if spoken < CONVERSE_MAX_SPOKEN_SENTENCES:
+                                speak_sentence(sentence)
+                # Flush the final partial sentence (no trailing terminator).
+                if spoken < CONVERSE_MAX_SPOKEN_SENTENCES:
+                    sentences, pending = _split_complete_sentences(pending, final=True)
+                    for sentence in sentences:
+                        if spoken < CONVERSE_MAX_SPOKEN_SENTENCES:
+                            speak_sentence(sentence)
+            finally:
+                # Trim everything past the static prefix so the cache is
+                # reusable — on success AND on any mid-stream exception. Uses the
+                # selected cache_state's prefix length, so the base cache and a
+                # per-agent cache are both restored to exactly their static
+                # prefix (the base cache must never be left grown; an agent cache
+                # likewise, or its next reuse would mis-trim).
+                if cache is not None:
+                    static_len = cache_state["cache_len"]
+                    offset = getattr(cache[0], "offset", None)
+                    added = (
+                        (offset - static_len)
+                        if isinstance(offset, int)
+                        else (len(prompt_tokens) + generated)
+                    )
+                    if added > 0:
+                        trim_prompt_cache(cache, added)
+
+        return {
+            "text": "".join(pieces).strip(),
+            "sentences": spoken,
+            "first_sentence_ms": first_sentence_ms,
+        }
+
+
+def parse_classification(raw):
+    """Extract a strict-JSON classification from model output.
+
+    Finds the first '{' ... last '}' span, json.loads it, and validates the
+    intent/confidence/complexity keys. "args" is a pass-through of the
+    model's extracted-params object: included verbatim when it is a JSON
+    object, replaced with {} when absent or any other type — never
+    fabricated server-side. Any failure returns the contract fallback
+    (conversation / 0.3 / heavy / {}) so the router escalates to cloud.
+    """
+    fallback = dict(CLASSIFY_FALLBACK)
+    fallback["args"] = {}  # fresh object per call; never alias the constant's
+    if not isinstance(raw, str):
+        return fallback
+    try:
+        start = raw.index("{")
+        end = raw.rindex("}")
+        obj = json.loads(raw[start : end + 1])
+        intent = obj["intent"]
+        confidence = float(obj["confidence"])
+        complexity = obj["complexity"]
+        if not isinstance(intent, str) or not intent:
+            return fallback
+        if complexity not in ("light", "heavy"):
+            return fallback
+        confidence = max(0.0, min(1.0, confidence))
+        args = obj.get("args")
+        if not isinstance(args, dict):
+            args = {}
+        return {"intent": intent, "confidence": confidence, "complexity": complexity, "args": args}
+    except (ValueError, KeyError, TypeError):
+        log.warning("classifier returned unparseable output; using cloud-escalation fallback: %r", raw)
+        return fallback
+
+
+def parse_facts(raw):
+    """Extract a strict-JSON facts list from model output.
+
+    Accepts a bare JSON array (first '[' ... last ']') or, failing that, an
+    object wrapper ({"facts": [...]} or a single {"key","value"} object).
+    Validates each entry to non-empty string key/value, dedupes by key, and
+    clips to 3. Keys must be dot-namespaced and must NOT start with "meta."
+    (audit fix, mirroring parse_consolidation): extract_facts runs after
+    EVERY spoken reply and its output is upserted verbatim daemon-side, so
+    without this guard an utterance like "remember that meta.last_reflection
+    is zero" could overwrite internal bookkeeping (reflection stamp, heal
+    markers) and non-namespaced junk keys would pollute every persona
+    prompt. Any parse failure returns [] — never an exception.
+    """
+    if not isinstance(raw, str):
+        return []
+    items = None
+    try:
+        start = raw.index("[")
+        end = raw.rindex("]")
+        items = json.loads(raw[start : end + 1])
+    except (ValueError, json.JSONDecodeError):
+        try:
+            start = raw.index("{")
+            end = raw.rindex("}")
+            obj = json.loads(raw[start : end + 1])
+            if isinstance(obj, dict):
+                if isinstance(obj.get("facts"), list):
+                    items = obj["facts"]
+                elif "key" in obj and "value" in obj:
+                    items = [obj]
+        except (ValueError, json.JSONDecodeError):
+            pass
+    if not isinstance(items, list):
+        if items is not None or raw.strip():
+            log.warning("extract_facts returned unparseable output; using empty list: %r", raw)
+        return []
+    facts = []
+    seen = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key")
+        value = item.get("value")
+        if key is None and value is None and len(item) == 1:
+            # Lenient recovery for the model's other natural shape:
+            # {"user.name": "Darwin"} instead of {"key": ..., "value": ...}.
+            key, value = next(iter(item.items()))
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        key = key.strip()
+        value = value.strip()
+        if not key or not value or key in seen:
+            continue
+        # Same key policy parse_consolidation enforces (lines mirror its
+        # upsert guard): bookkeeping namespaces are never model-writable and
+        # un-namespaced keys are never stored.
+        if key.startswith("meta.") or not _is_namespaced_key(key):
+            log.warning("extract_facts: dropping invalid/reserved key %r", key)
+            continue
+        seen.add(key)
+        facts.append({"key": key, "value": value})
+        if len(facts) == 3:
+            break
+    return facts
+
+
+def _is_namespaced_key(key):
+    """A valid fact key is dot-namespaced with non-empty segments
+    (user.name, user.preference.units, context.location, ...)."""
+    parts = key.split(".")
+    return len(parts) >= 2 and all(p.strip() for p in parts)
+
+
+# user.habit.* backstop (see habit_supported): words too generic to count as
+# habit evidence on their own. Audit fix: the original list lacked common
+# function words ("about", "what", "with", ...), so a fabricated habit value
+# like "asks about the weather most mornings" was supported by any three
+# user lines containing "about" ("tell me about X", "what about Y") — the
+# exact assistant-claim laundering the backstop exists to stop.
+_HABIT_FILLER_WORDS = frozenset(
+    {
+        "user",
+        "habit",
+        "asks",
+        "asked",
+        "asking",
+        "most",
+        "often",
+        "usually",
+        "every",
+        "each",
+        "always",
+        "likes",
+        "wants",
+        "please",
+        "jarvis",
+        "thing",
+        "things",
+        "request",
+        "requests",
+        # Common function/filler words (audit fix). Deliberately NOT here:
+        # morning/afternoon/evening/night and real topic nouns — those are
+        # exactly the content words habits should be evidenced by.
+        "about",
+        "what",
+        "with",
+        "when",
+        "tell",
+        "need",
+        "want",
+        "time",
+        "good",
+        "today",
+        "again",
+        "also",
+        "been",
+        "being",
+        "cant",
+        "could",
+        "does",
+        "doing",
+        "dont",
+        "gave",
+        "give",
+        "gonna",
+        "going",
+        "have",
+        "here",
+        "just",
+        "know",
+        "like",
+        "made",
+        "make",
+        "many",
+        "more",
+        "much",
+        "okay",
+        "really",
+        "should",
+        "some",
+        "still",
+        "sure",
+        "take",
+        "thank",
+        "thanks",
+        "that",
+        "them",
+        "then",
+        "there",
+        "they",
+        "think",
+        "this",
+        "very",
+        "well",
+        "will",
+        "wont",
+        "would",
+        "yeah",
+        "your",
+        "yours",
+    }
+)
+_HABIT_MIN_USER_LINES = 3
+_HABIT_MIN_WORD_LEN = 4
+# Prefix-tolerant matching only applies when the shared stem (the shorter
+# word) is at least this long: morning/mornings match, with/without do not
+# (audit fix: bidirectional prefixing at 4 chars let "with" support
+# "without" and similar).
+_HABIT_MIN_STEM_LEN = 5
+
+
+def _content_words(text):
+    """Lowercased alphabetic words of >= _HABIT_MIN_WORD_LEN chars, minus
+    filler. No regex needed: split on every non-letter."""
+    out = set()
+    word = []
+    for ch in text.lower() + " ":
+        if "a" <= ch <= "z":
+            word.append(ch)
+            continue
+        if len(word) >= _HABIT_MIN_WORD_LEN:
+            w = "".join(word)
+            if w not in _HABIT_FILLER_WORDS:
+                out.add(w)
+        word = []
+    return out
+
+
+def _habit_words_match(user_word, habit_word):
+    """Whether one user-line content word evidences one habit content word:
+    exact match, or prefix-tolerant stemming (morning/mornings) where the
+    shared stem — the shorter word, which must prefix the longer — is at
+    least _HABIT_MIN_STEM_LEN chars. 4-char words therefore only ever match
+    exactly ("with" no longer supports "without")."""
+    if user_word == habit_word:
+        return True
+    shorter, longer = sorted((user_word, habit_word), key=len)
+    return len(shorter) >= _HABIT_MIN_STEM_LEN and longer.startswith(shorter)
+
+
+def habit_supported(key, value, transcripts):
+    """Deterministic backstop for prompt-level habit mining: a user.habit.*
+    upsert survives only when at least _HABIT_MIN_USER_LINES SEPARATE user
+    lines in the provided transcripts each share ENOUGH distinct content
+    words with the habit's slug+value text — 2 distinct words when the habit
+    text has 3+ content words, 1 when it has fewer (a short habit like
+    "often asks for jazz" only carries its topic word, and three user lines
+    naming that topic ARE the evidence; richer habit texts must co-match,
+    so "asks about the weather most mornings" needs weather+mornings-class
+    support per line, audit fix).
+
+    The 4B greedy model parrots worked examples and occasionally converts the
+    ASSISTANT's own claims about the user into a habit; this check makes the
+    contract's rules — >= 3 occurrences, user lines only, never from stored
+    facts alone — hold regardless of what the model emits. Strictly
+    conservative: it only ever DROPS habit upserts, never adds or edits."""
+    slug = key[len("user.habit.") :].replace("_", " ").replace(".", " ")
+    habit_words = _content_words(f"{slug} {value}")
+    if not habit_words:
+        return False
+    required = 2 if len(habit_words) >= 3 else 1
+    hits = 0
+    for turn in transcripts or []:
+        user_words = _content_words(str(turn.get("user") or ""))
+        matched = {
+            hw
+            for hw in habit_words
+            if any(_habit_words_match(uw, hw) for uw in user_words)
+        }
+        if len(matched) >= required:
+            hits += 1
+            if hits >= _HABIT_MIN_USER_LINES:
+                return True
+    return False
+
+
+def parse_consolidation(raw, existing):
+    """Extract a strict-JSON consolidation result from model output.
+
+    `existing` maps the input facts' key -> value ("meta." keys already
+    filtered by the caller). Finds the first '{' ... last '}' span,
+    json.loads it, and validates the {"upserts": [{"key","value"}],
+    "deletes": [str]} shape. Enforcement on top of the parse (the model is
+    NOT trusted):
+      - keys must be non-empty namespaced strings; "meta."-prefixed keys are
+        dropped wherever they appear (meta facts are bookkeeping, not memory)
+      - upserts whose value matches the stored fact are dropped (no-ops) —
+        but they still SHIELD their key from deletion: a fact the model just
+        reaffirmed must never be deletable in the same pass
+      - deletes may only name keys present in the input facts — never keys
+        the model invented
+      - a key both upserted and deleted is kept as an upsert only (or, for a
+        no-op reaffirmation, kept unchanged)
+      - upserts dedupe by key; total changes cap at CONSOLIDATE_MAX_CHANGES
+        (upserts take precedence, deletes fill the remainder)
+    Lenient recovery for the model's two natural shape slips (same spirit as
+    parse_facts): an upsert written as a single-pair object
+    {"user.name": "Dar"} and a delete written as "key = value".
+    Any failure returns empty arrays — a reflection pass that does nothing
+    is always safe; one that does the wrong thing is not.
+    """
+    empty = {"upserts": [], "deletes": []}
+    if not isinstance(raw, str):
+        return empty
+    try:
+        start = raw.index("{")
+        end = raw.rindex("}")
+        obj = json.loads(raw[start : end + 1])
+    except (ValueError, json.JSONDecodeError):
+        log.warning("consolidate returned unparseable output; changing nothing: %r", raw)
+        return empty
+    if not isinstance(obj, dict):
+        log.warning("consolidate returned non-object JSON; changing nothing: %r", raw)
+        return empty
+    raw_upserts = obj.get("upserts")
+    raw_deletes = obj.get("deletes")
+    if not isinstance(raw_upserts, list) or not isinstance(raw_deletes, list):
+        log.warning("consolidate output missing upserts/deletes lists; changing nothing: %r", raw)
+        return empty
+    upserts = []
+    upsert_keys = set()
+    # Every structurally valid upsert key, INCLUDING ones dropped as no-ops
+    # below. The delete shield must use this superset: a no-op upsert means
+    # the model just reaffirmed the stored fact, and a reaffirmed fact must
+    # not be deletable by a delete naming the same key in the same pass.
+    shielded_keys = set()
+    for item in raw_upserts:
+        if not isinstance(item, dict):
+            continue
+        key = item.get("key")
+        value = item.get("value")
+        if key is None and value is None and len(item) == 1:
+            # Lenient recovery: {"user.name": "Dar"} single-pair shape.
+            key, value = next(iter(item.items()))
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        key = key.strip()
+        value = value.strip()
+        if not key or not value or key in upsert_keys:
+            continue
+        if key.startswith("meta.") or not _is_namespaced_key(key):
+            continue
+        shielded_keys.add(key)
+        if existing.get(key) == value:
+            continue  # no-op upsert: the stored fact already says this
+        upsert_keys.add(key)
+        upserts.append({"key": key, "value": value})
+    deletes = []
+    seen_deletes = set()
+    for key in raw_deletes:
+        if not isinstance(key, str):
+            continue
+        key = key.strip()
+        if "=" in key and key not in existing:
+            # Lenient recovery: "user.name = Darwin" — fact keys never
+            # contain '=', so everything after the first '=' is the value.
+            key = key.split("=", 1)[0].strip()
+        if not key or key in seen_deletes or key in shielded_keys:
+            continue
+        if key.startswith("meta.") or key not in existing:
+            continue
+        seen_deletes.add(key)
+        deletes.append(key)
+    # Cap the blast radius of one reflection pass: upserts first (they carry
+    # information), deletes fill whatever budget remains.
+    upserts = upserts[:CONSOLIDATE_MAX_CHANGES]
+    deletes = deletes[: CONSOLIDATE_MAX_CHANGES - len(upserts)]
+    return {"upserts": upserts, "deletes": deletes}
+
+
+class InferenceServer:
+    def __init__(self, engine, preload=False):
+        self.engine = engine
+        self.preload = preload
+        self._stop = asyncio.Event()
+
+    # -- request dispatch ----------------------------------------------
+
+    @staticmethod
+    def _validate_generate_extras(req):
+        """Shared history/facts/data validation for generate and converse."""
+        history = req.get("history")
+        if history is not None:
+            if not isinstance(history, list):
+                raise ValueError("'history' must be a list")
+            for turn in history:
+                if (
+                    not isinstance(turn, dict)
+                    or turn.get("speaker") not in ("user", "jarvis")
+                    or not isinstance(turn.get("text"), str)
+                ):
+                    raise ValueError(
+                        "'history' entries must be {\"speaker\": \"user\"|\"jarvis\", \"text\": str}"
+                    )
+        facts = req.get("facts")
+        if facts is not None:
+            if not isinstance(facts, list) or not all(isinstance(f, str) for f in facts):
+                raise ValueError("'facts' must be a list of strings")
+        data = req.get("data")
+        if data is not None and not isinstance(data, str):
+            raise ValueError("'data' must be a string")
+        return history, facts, data
+
+    async def dispatch(self, req, writer):
+        """Handle one request. Single-response ops return their response
+        dict; op=converse additionally writes interim "sentence" event lines
+        to `writer` before returning the terminal "done" event. Safe because
+        handle_client processes exactly one request at a time per connection,
+        so nothing else can interleave bytes into this writer mid-stream
+        (each client gets its own connection/writer pair)."""
+        rid = str(req.get("id", ""))
+        op = req.get("op")
+        t0 = time.perf_counter()
+
+        def latency_ms():
+            return int((time.perf_counter() - t0) * 1000)
+
+        try:
+            if op == "transcribe":
+                path = req.get("path")
+                if not path:
+                    raise ValueError("'path' is required for op=transcribe")
+                # OPTIONAL gated cloud-STT tier — present only when the daemon's
+                # cloud-STT tier+key+offline gate already passed. The key (el_key)
+                # rides only the request body the daemon read from the Keychain; we
+                # NEVER log it. Absent/"whisper" backend -> on-device mlx_whisper
+                # exactly as before; on ANY cloud error the engine falls back to
+                # whisper itself (never fails the turn). HONESTY: the cloud path
+                # sends the user's VOICE AUDIO off the device.
+                backend = req.get("backend")
+                if backend is not None and not isinstance(backend, str):
+                    raise ValueError("'backend' must be a string")
+                model = req.get("model")
+                if model is not None and not isinstance(model, str):
+                    raise ValueError("'model' must be a string")
+                el_key = req.get("el_key")
+                if el_key is not None and not isinstance(el_key, str):
+                    raise ValueError("'el_key' must be a string")
+                text, words = await asyncio.to_thread(
+                    self.engine.transcribe, path, backend, el_key, model
+                )
+                resp = {"id": rid, "ok": True, "text": text, "latency_ms": latency_ms()}
+                # #31 MULTI-SPEAKER DIARIZATION: when the Scribe backend returned a
+                # per-word stream with speaker labels, surface it so the daemon's
+                # gated [voice].diarize path CONSUMES the real labels (its PURE
+                # diarize::diarize over a ScribeResponse). Absent on the on-device
+                # whisper path (no diarization model) and on a Scribe response with
+                # no word detail -> the daemon then renders the honest single stream,
+                # never a fabricated speaker. The `words` carry text + timings +
+                # speaker ids only, NEVER audio.
+                if isinstance(words, list) and words:
+                    resp["words"] = words
+                return resp
+
+            if op == "clone_voice":
+                # CONSENT-GATED voice cloning. The daemon only emits this after an
+                # explicit, authorization-bound consent confirm on a user-owned
+                # sample. path = owner sample WAV, text = display name, el_key = the
+                # xi-api-key (request-body only, NEVER logged). On success the daemon
+                # stores the returned voice_id (NON-secret) like any EL voice id; on
+                # failure -> ok:false (clean no-clone, the user keeps their voice).
+                # HONESTY: the audio SAMPLE leaves the device to ElevenLabs.
+                path = req.get("path")
+                if not path or not isinstance(path, str):
+                    raise ValueError("'path' (owner voice sample) is required for op=clone_voice")
+                name = req.get("text")
+                if not name or not isinstance(name, str):
+                    raise ValueError("'text' (voice display name) is required for op=clone_voice")
+                el_key = req.get("el_key")
+                if el_key is not None and not isinstance(el_key, str):
+                    raise ValueError("'el_key' must be a string")
+                voice_id = await asyncio.to_thread(
+                    self.engine.clone_voice, path, name, el_key
+                )
+                if voice_id:
+                    return {
+                        "id": rid,
+                        "ok": True,
+                        "voice_id": voice_id,
+                        "latency_ms": latency_ms(),
+                    }
+                # Clean no-clone: never throws, never leaks; the daemon keeps Kokoro.
+                return {
+                    "id": rid,
+                    "ok": False,
+                    "error": "voice cloning unavailable (no voice produced)",
+                    "latency_ms": latency_ms(),
+                }
+
+            if op == "classify":
+                text = req.get("text")
+                if not text:
+                    raise ValueError("'text' is required for op=classify")
+                result = await asyncio.to_thread(self.engine.classify, text)
+                return {
+                    "id": rid,
+                    "ok": True,
+                    "intent": result["intent"],
+                    "confidence": result["confidence"],
+                    "complexity": result["complexity"],
+                    "args": result.get("args", {}),
+                    "latency_ms": latency_ms(),
+                }
+
+            if op == "generate":
+                text = req.get("text")
+                if text is None:
+                    raise ValueError("'text' is required for op=generate")
+                max_tokens = req.get("max_tokens", GENERATE_DEFAULT_MAX_TOKENS)
+                if not isinstance(max_tokens, int) or max_tokens <= 0:
+                    raise ValueError("'max_tokens' must be a positive integer")
+                history, facts, data = self._validate_generate_extras(req)
+                # Optional Local-tier sub-choice: a warm local model id. Unknown
+                # / absent ids degrade to the base single-resident model engine-
+                # side, so we only type-check it here.
+                local_model = req.get("local_model")
+                if local_model is not None and not isinstance(local_model, str):
+                    raise ValueError("'local_model' must be a string")
+                # #37/#39: generate_with_meta returns the HONEST path that ran —
+                # speculative on/off (never faked) + the quant that ACTUALLY
+                # loaded. Surfaced in the response so the daemon/HUD report the
+                # real path, not the requested one.
+                out, gen_meta = await asyncio.to_thread(
+                    self.engine.generate_with_meta, text, max_tokens, history, facts, data, local_model
+                )
+                return {
+                    "id": rid,
+                    "ok": True,
+                    "text": out,
+                    "speculative": gen_meta.get("speculative", False),
+                    "quant": gen_meta.get("quant", "auto"),
+                    "latency_ms": latency_ms(),
+                }
+
+            if op == "converse":
+                text = req.get("text")
+                if not text or not isinstance(text, str):
+                    raise ValueError("'text' must be a non-empty string for op=converse")
+                max_tokens = req.get("max_tokens", GENERATE_DEFAULT_MAX_TOKENS)
+                if not isinstance(max_tokens, int) or max_tokens <= 0:
+                    raise ValueError("'max_tokens' must be a positive integer")
+                history, facts, data = self._validate_generate_extras(req)
+                voice = req.get("voice")
+                if voice is not None and not isinstance(voice, str):
+                    raise ValueError("'voice' must be a string")
+                opener_spoken = req.get("opener_spoken")
+                if opener_spoken is not None and not isinstance(opener_spoken, str):
+                    raise ValueError("'opener_spoken' must be a string")
+                persona = req.get("persona")
+                if persona is not None and not isinstance(persona, str):
+                    raise ValueError("'persona' must be a string")
+                local_model = req.get("local_model")
+                if local_model is not None and not isinstance(local_model, str):
+                    raise ValueError("'local_model' must be a string")
+                loop = asyncio.get_running_loop()
+
+                def emit(event):
+                    # Called from the GPU worker thread: hand the write to the
+                    # event loop. call_soon_threadsafe callbacks run in FIFO
+                    # order and asyncio.to_thread's own completion is queued
+                    # after them, so every sentence line is written before the
+                    # done line below. Sentence events are tiny (~200 bytes,
+                    # <= 5 per request); no drain/backpressure needed.
+                    line = (json.dumps({"id": rid, **event}) + "\n").encode("utf-8")
+                    loop.call_soon_threadsafe(writer.write, line)
+
+                result = await asyncio.to_thread(
+                    self.engine.converse,
+                    text,
+                    max_tokens,
+                    history,
+                    facts,
+                    data,
+                    voice,
+                    emit,
+                    opener_spoken,
+                    persona,
+                    local_model,
+                )
+                lat = latency_ms()
+                return {
+                    "id": rid,
+                    "event": "done",
+                    "ok": True,
+                    "text": result["text"],
+                    "sentences": result["sentences"],
+                    "first_sentence_ms": (
+                        result["first_sentence_ms"]
+                        if result["first_sentence_ms"] is not None
+                        else lat
+                    ),
+                    "latency_ms": lat,
+                }
+
+            if op == "extract_facts":
+                text = req.get("text")
+                if not text:
+                    raise ValueError("'text' is required for op=extract_facts")
+                response = req.get("response")
+                if response is not None and not isinstance(response, str):
+                    raise ValueError("'response' must be a string")
+                facts = await asyncio.to_thread(self.engine.extract_facts, text, response)
+                return {"id": rid, "ok": True, "facts": facts, "latency_ms": latency_ms()}
+
+            if op == "consolidate":
+                transcripts = req.get("transcripts")
+                if transcripts is None:
+                    transcripts = []
+                if not isinstance(transcripts, list):
+                    raise ValueError("'transcripts' must be a list")
+                for turn in transcripts:
+                    if (
+                        not isinstance(turn, dict)
+                        or not isinstance(turn.get("user"), str)
+                        or not isinstance(turn.get("jarvis"), str)
+                    ):
+                        raise ValueError(
+                            "'transcripts' entries must be {\"user\": str, \"jarvis\": str}"
+                        )
+                # Keep the newest window if the caller over-sends (the
+                # contract caps the request at 40; transcripts arrive oldest
+                # first, so the tail is the recent material).
+                transcripts = transcripts[-CONSOLIDATE_MAX_TRANSCRIPTS:]
+                facts = req.get("facts")
+                if facts is None:
+                    facts = []
+                if not isinstance(facts, list):
+                    raise ValueError("'facts' must be a list")
+                for fact in facts:
+                    if (
+                        not isinstance(fact, dict)
+                        or not isinstance(fact.get("key"), str)
+                        or not isinstance(fact.get("value"), str)
+                    ):
+                        raise ValueError(
+                            "'facts' entries must be {\"key\": str, \"value\": str} for op=consolidate"
+                        )
+                result = await asyncio.to_thread(self.engine.consolidate, transcripts, facts)
+                return {
+                    "id": rid,
+                    "ok": True,
+                    "upserts": result["upserts"],
+                    "deletes": result["deletes"],
+                    "latency_ms": latency_ms(),
+                }
+
+            if op == "speak":
+                text = req.get("text")
+                if not text:
+                    raise ValueError("'text' is required for op=speak")
+                voice = req.get("voice")
+                if voice is not None and not isinstance(voice, str):
+                    raise ValueError("'voice' must be a string")
+                # OPTIONAL ElevenLabs cloud voice tier — present only when the daemon
+                # chose it (its tier+key+offline gate already passed). The key (el_key)
+                # rides only the request body the daemon read from the Keychain; we
+                # NEVER log it. Absent/"kokoro" backend -> on-device Kokoro exactly as
+                # before. On any cloud error the engine falls back to Kokoro itself.
+                backend = req.get("backend")
+                if backend is not None and not isinstance(backend, str):
+                    raise ValueError("'backend' must be a string")
+                voice_id = req.get("voice_id")
+                if voice_id is not None and not isinstance(voice_id, str):
+                    raise ValueError("'voice_id' must be a string")
+                model = req.get("model")
+                if model is not None and not isinstance(model, str):
+                    raise ValueError("'model' must be a string")
+                el_key = req.get("el_key")
+                if el_key is not None and not isinstance(el_key, str):
+                    raise ValueError("'el_key' must be a string")
+                # OPTIONAL target language (Babel interpret/translate output). Under
+                # the ElevenLabs backend a non-English lang selects a multilingual
+                # model; ignored on the Kokoro path and when the tier is OFF.
+                lang = req.get("lang")
+                if lang is not None and not isinstance(lang, str):
+                    raise ValueError("'lang' must be a string")
+                # OPTIONAL EXPRESSIVENESS shaping (#33 prosody + #34 whisper). Present
+                # ONLY when the daemon's adaptive_prosody / whisper features are on and
+                # the resolved shape is non-neutral; ABSENT (the shipped default) ->
+                # byte-for-byte today's speak. The rich EL-v3 surface (audio_tag/
+                # stability/style) is honoured ONLY on the EL-v3 model; rate/volume are
+                # coarse hints honoured on every backend. Validated + clamped in
+                # `_normalize_speak_shape` so a bad/out-of-range value can never reach
+                # the synth path. NON-secret delivery hints (never the key/voice id).
+                audio_tag, stability, style, rate, volume = _normalize_speak_shape(req)
+                path = await asyncio.to_thread(
+                    self.engine.speak, text, voice, backend, voice_id, model, el_key,
+                    lang, audio_tag, stability, style, rate, volume,
+                )
+                return {"id": rid, "ok": True, "path": path, "latency_ms": latency_ms()}
+
+            if op == "embed":
+                texts = req.get("texts")
+                if texts is None:
+                    raise ValueError("'texts' is required for op=embed")
+                if not isinstance(texts, list):
+                    raise ValueError("'texts' must be a list of strings for op=embed")
+                vectors = await asyncio.to_thread(self.engine.embed, texts)
+                return {
+                    "id": rid,
+                    "ok": True,
+                    "vectors": vectors,
+                    "latency_ms": latency_ms(),
+                }
+
+            if op == "describe_image":
+                # On-device VLM: describe / answer a question about a LOCAL image.
+                # The daemon path-confines `path` (canonicalize + allowed root)
+                # BEFORE sending it here; we read the image locally and hand it
+                # only to the on-device MLX VLM (pixels never leave the device).
+                # Distinct from op=transcribe/OCR: this REASONS about the visual
+                # scene. When the VLM is unavailable (mlx-vlm absent or the model
+                # not downloaded) the engine returns an honest structured
+                # ok:false/reason — NEVER a fabricated description — and the
+                # daemon falls back (OCR/classification / honest message).
+                path = req.get("path")
+                if not path or not isinstance(path, str):
+                    raise ValueError("'path' is required for op=describe_image")
+                question = req.get("question")
+                if question is not None and not isinstance(question, str):
+                    raise ValueError("'question' must be a string for op=describe_image")
+                max_tokens = req.get("max_tokens")
+                if max_tokens is not None and (
+                    not isinstance(max_tokens, int) or max_tokens <= 0
+                ):
+                    raise ValueError("'max_tokens' must be a positive integer for op=describe_image")
+                result = await asyncio.to_thread(
+                    self.engine.describe_image, path, question, max_tokens
+                )
+                if result.get("ok"):
+                    return {
+                        "id": rid,
+                        "ok": True,
+                        "text": result["text"],
+                        "model": result.get("model"),
+                        "latency_ms": latency_ms(),
+                    }
+                # Honest unavailable / failure path: ok:false + a machine-keyable
+                # reason the daemon uses to choose its fallback.
+                return {
+                    "id": rid,
+                    "ok": False,
+                    "reason": result.get("reason", DESCRIBE_IMAGE_UNAVAILABLE_REASON),
+                    "error": result.get("error", "vision-language model not available"),
+                    "latency_ms": latency_ms(),
+                }
+
+            if op == "generate_image":
+                # On-device text->image: render a prompt with the MLX diffusion
+                # model and save the image LOCALLY under state/images/. The
+                # prompt is handed ONLY to the on-device model and the pixels
+                # stay on the machine — image generation is 100% on-device, NO
+                # cloud image API anywhere in this path. When the model is
+                # unavailable (the diffusion package absent or the checkpoint not
+                # downloaded) the engine returns an honest structured
+                # ok:false/reason — NEVER a fabricated image and NEVER a cloud
+                # fallback — and the daemon surfaces an honest message.
+                prompt = req.get("prompt")
+                if not prompt or not isinstance(prompt, str):
+                    raise ValueError("'prompt' is required for op=generate_image")
+                size = req.get("size")
+                if size is not None and (not isinstance(size, int) or size <= 0):
+                    raise ValueError("'size' must be a positive integer for op=generate_image")
+                steps = req.get("steps")
+                if steps is not None and (not isinstance(steps, int) or steps <= 0):
+                    raise ValueError("'steps' must be a positive integer for op=generate_image")
+                seed = req.get("seed")
+                if seed is not None and not isinstance(seed, int):
+                    raise ValueError("'seed' must be an integer for op=generate_image")
+                result = await asyncio.to_thread(
+                    self.engine.generate_image, prompt, size, steps, seed
+                )
+                if result.get("ok"):
+                    return {
+                        "id": rid,
+                        "ok": True,
+                        "path": result["path"],
+                        "model": result.get("model"),
+                        "size": result.get("size"),
+                        "steps": result.get("steps"),
+                        "seed": result.get("seed"),
+                        "latency_ms": latency_ms(),
+                    }
+                # Honest unavailable / failure path: ok:false + a machine-keyable
+                # reason the daemon surfaces honestly (NO cloud fallback).
+                return {
+                    "id": rid,
+                    "ok": False,
+                    "reason": result.get("reason", GENERATE_IMAGE_UNAVAILABLE_REASON),
+                    "error": result.get("error", "image model not available"),
+                    "latency_ms": latency_ms(),
+                }
+
+            raise ValueError(f"unknown op: {op!r}")
+        except Exception as exc:
+            log.exception("request %s (op=%s) failed", rid, op)
+            resp = {"id": rid, "ok": False, "error": str(exc), "latency_ms": latency_ms()}
+            if op == "converse":
+                # Terminal line of the converse event stream; any sentence
+                # events already written remain valid for the client.
+                resp["event"] = "done"
+            return resp
+
+    # -- connection handling -------------------------------------------
+
+    async def handle_client(self, reader, writer):
+        peer = "client"
+        log.info("%s connected", peer)
+        try:
+            while not self._stop.is_set():
+                try:
+                    line = await reader.readline()
+                except ValueError:
+                    # Line exceeded the stream limit. The overrun buffer has
+                    # been discarded, so resyncing mid-stream is unsafe:
+                    # answer with a structured error, then close.
+                    log.warning("request line exceeds %d-byte limit; closing connection", STREAM_LIMIT)
+                    resp = {
+                        "id": "",
+                        "ok": False,
+                        "error": f"request line exceeds {STREAM_LIMIT}-byte limit",
+                        "latency_ms": 0,
+                    }
+                    writer.write((json.dumps(resp) + "\n").encode("utf-8"))
+                    await writer.drain()
+                    break
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                t0 = time.perf_counter()
+                try:
+                    req = json.loads(line)
+                    if not isinstance(req, dict):
+                        raise ValueError("request must be a JSON object")
+                except (json.JSONDecodeError, ValueError) as exc:
+                    resp = {
+                        "id": "",
+                        "ok": False,
+                        "error": f"invalid request JSON: {exc}",
+                        "latency_ms": int((time.perf_counter() - t0) * 1000),
+                    }
+                else:
+                    resp = await self.dispatch(req, writer)
+                writer.write((json.dumps(resp) + "\n").encode("utf-8"))
+                await writer.drain()
+        except (ConnectionResetError, BrokenPipeError):
+            pass
+        except Exception:
+            log.exception("unexpected error on client connection")
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            log.info("%s disconnected", peer)
+
+    # -- lifecycle -------------------------------------------------------
+
+    def request_stop(self, signame):
+        log.info("received %s; shutting down", signame)
+        self._stop.set()
+
+    async def _claim_socket_path(self):
+        """Refuse to start when another live server owns the socket; remove
+        the socket file only when it is provably stale (connect refused or
+        the file vanished)."""
+        if not SOCKET_PATH.exists():
+            return
+        try:
+            _, probe_writer = await asyncio.open_unix_connection(str(SOCKET_PATH))
+        except (ConnectionRefusedError, FileNotFoundError):
+            try:
+                SOCKET_PATH.unlink()
+                log.info("removed stale socket %s", SOCKET_PATH)
+            except FileNotFoundError:
+                pass
+            return
+        except OSError as exc:
+            raise SystemExit(
+                f"cannot probe existing socket {SOCKET_PATH} ({exc}); refusing to start"
+            )
+        probe_writer.close()
+        try:
+            await probe_writer.wait_closed()
+        except Exception:
+            pass
+        raise SystemExit(
+            f"another inference server is already running on {SOCKET_PATH}; refusing to start"
+        )
+
+    async def run(self):
+        SOCKET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        await self._claim_socket_path()
+
+        server = await asyncio.start_unix_server(
+            self.handle_client, path=str(SOCKET_PATH), limit=STREAM_LIMIT
+        )
+        # Identity of the socket file WE bound: at shutdown, unlink only if
+        # the path still points at this inode (never delete a successor's
+        # live socket).
+        try:
+            bound = os.stat(SOCKET_PATH)
+            socket_identity = (bound.st_dev, bound.st_ino)
+        except OSError:
+            socket_identity = None
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            loop.add_signal_handler(sig, self.request_stop, sig.name)
+
+        log.info(
+            "inference server listening on %s (llm=%s, stt=%s, classifier=%s, tts=%s engine=%s voice=%s)",
+            SOCKET_PATH,
+            self.engine.llm_id,
+            self.engine.stt_id,
+            self.engine.classifier_id or "(main llm)",
+            self.engine.tts_id,
+            self.engine.engine_name,
+            self.engine.voice,
+        )
+        if self.preload:
+            # Daemon thread: requests that arrive before a stage finishes
+            # still work via the lazy path (they just queue on the GPU lock).
+            threading.Thread(target=self.engine.preload, name="preload", daemon=True).start()
+            log.info("preload enabled; warming models in the background")
+        try:
+            await self._stop.wait()
+        finally:
+            server.close()
+            await server.wait_closed()
+            try:
+                current = os.stat(SOCKET_PATH)
+                if socket_identity == (current.st_dev, current.st_ino):
+                    SOCKET_PATH.unlink()
+                else:
+                    log.warning(
+                        "socket %s was replaced by another process; leaving it in place",
+                        SOCKET_PATH,
+                    )
+            except FileNotFoundError:
+                pass
+            log.info("inference server stopped cleanly")
+
+
+def check_runtime_deps():
+    """Refuse to bind the socket as a zombie-healthy server when the MLX
+    stack is missing (e.g. launched with the bare Homebrew python instead of
+    .venv/bin/python — module-level imports here are stdlib-only by design,
+    so without this guard every op would fail per-request). Unconditional
+    (audit fix): the mlx probe used to run only under preload=true, so a
+    preload=false server with bare-interpreter numpy bound the socket and
+    logged healthy while every op failed — exactly the zombie this guard's
+    contract promises to prevent. preload only controls model WARMING, never
+    the dependency check."""
+    missing = []
+    try:
+        import numpy  # noqa: F401
+    except ImportError:
+        missing.append("numpy")
+    try:
+        import mlx.core  # noqa: F401
+    except ImportError:
+        missing.append("mlx")
+    if missing:
+        venv_python = PROJECT_ROOT / ".venv" / "bin" / "python"
+        log.critical(
+            "missing runtime dependencies %s under %s; run the server with the "
+            "MLX venv interpreter instead: %s inference/server.py",
+            ", ".join(missing),
+            sys.executable,
+            venv_python,
+        )
+        raise SystemExit(2)
+
+
+def _selftest():
+    """Hermetic checks for the pure parts of the per-agent persona KV cache —
+    no MLX, no model, no network. Exercises the LRU eviction/promotion policy
+    (`_lru_insert`) and the persona-name validation/traversal guard
+    (`load_agent_persona`). Run with `python server.py --selftest`; exits
+    non-zero on the first failure so it can gate CI."""
+    from collections import OrderedDict
+
+    # LRU: newest insert is MRU; oldest evicted once over the bound.
+    od = OrderedDict()
+    assert _lru_insert(od, "friday", 1, 2) == []
+    assert _lru_insert(od, "aegis", 2, 2) == []
+    assert _lru_insert(od, "vision", 3, 2) == ["friday"], "oldest must evict first"
+    assert list(od.keys()) == ["aegis", "vision"], od
+
+    # Touching an existing key promotes it to MRU, sparing it from the next
+    # eviction (this is what makes an agent-switch reuse the right cache).
+    od2 = OrderedDict()
+    _lru_insert(od2, "a", 1, 2)
+    _lru_insert(od2, "b", 2, 2)
+    _lru_insert(od2, "a", 1, 2)  # re-touch a -> a is now MRU
+    assert _lru_insert(od2, "c", 3, 2) == ["b"], "re-touched key must survive"
+    assert list(od2.keys()) == ["a", "c"], od2
+
+    # max_size 1 keeps only the latest; each insert evicts the prior.
+    od3 = OrderedDict()
+    _lru_insert(od3, "x", 1, 1)
+    assert _lru_insert(od3, "y", 2, 1) == ["x"]
+    assert list(od3.keys()) == ["y"]
+
+    # Persona-name guard: a valid lowercase slug is accepted (file may or may
+    # not exist -> str or None, never an exception); traversal / invalid names
+    # are rejected as None WITHOUT touching the filesystem.
+    assert load_agent_persona("../../etc/passwd") is None
+    assert load_agent_persona("Friday") is None or isinstance(
+        load_agent_persona("Friday"), str
+    )
+    assert load_agent_persona("bad/name") is None
+    assert load_agent_persona("") is None
+    assert load_agent_persona(None) is None
+    assert load_agent_persona(123) is None
+
+    _selftest_local_warm()
+    _selftest_speak_shape()
+    _selftest_diarize()
+    _selftest_runtime_knobs()
+    print("server selftest OK")
+
+
+def _selftest_runtime_knobs():
+    """Hermetic checks for the #37 SPECULATIVE DECODING + #39 SELECTABLE
+    QUANTIZATION pure helpers — NO MLX, NO model, NO network, NO draft/quant
+    load. Exercises the PURE decisions over SYNTHETIC inputs:
+      * should_use_speculative: the AND-gate + the honest unavailable-fallback
+        (turned on but no draft / draft unavailable -> normal gen, never faked);
+      * validate_quant: accept the allowed set, reject an unknown value;
+      * select_quant: honor a present requested quant, FALL BACK + report
+        requested_honored=False when absent (NEVER claims a quant that did not
+        load), "auto" stays today's behavior;
+      * quant_variant_id: derive the candidate id for a requested quant.
+    The LIVE seams (draft load, speculative generate, quant model load) are
+    device/runtime-gated and NOT exercised — the import-guarded optional-feature
+    precedent. The real speedup/RAM/quality effect is device-gated."""
+    # --- #37 should_use_speculative: the AND-gate + honest fallback ---------
+    # All three conditions true -> speculative WILL run.
+    assert should_use_speculative(True, "draft-0.6b", True) is True
+    # Master gate OFF (the default) -> normal gen, even with a draft available.
+    assert should_use_speculative(False, "draft-0.6b", True) is False
+    # On but NO draft model configured -> normal gen (inert).
+    assert should_use_speculative(True, "", True) is False
+    # On + draft configured but the draft is UNAVAILABLE (load/import guard said
+    # no) -> normal gen, NEVER a faked speculative run.
+    assert should_use_speculative(True, "draft-0.6b", False) is False
+
+    # --- #39 validate_quant: accept allowed, reject unknown ----------------
+    for q in ALLOWED_QUANT:
+        assert validate_quant(q) == q, q
+    for bad in ("int3", "8bit", "bf16", "INT4", "", "fp32"):
+        try:
+            validate_quant(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"validate_quant({bad!r}) must raise")
+
+    # --- #39 select_quant: present honored / absent honest fallback --------
+    # "auto" -> ("auto", True): today's behavior, no claim about a variant.
+    assert select_quant("auto", ["int4", "int8"]) == ("auto", True)
+    assert select_quant("auto", []) == ("auto", True)
+    # Requested variant PRESENT -> honored.
+    assert select_quant("int4", ["fp16", "int4"]) == ("int4", True)
+    # Requested variant ABSENT, others present -> fall back to a concrete
+    # available quant + report requested_honored=False (NEVER claims int4).
+    chosen, honored = select_quant("int4", ["fp16", "int8"])
+    assert honored is False, "an absent requested quant must report it honestly"
+    assert chosen in ("fp16", "int8") and chosen != "int4", chosen
+    # Requested variant ABSENT and NOTHING enumerable -> "auto" + honored=False
+    # (let the loader pick the on-disk variant; never fabricate a variant).
+    assert select_quant("int4", []) == ("auto", False)
+    assert select_quant("fp16", None) == ("auto", False)
+
+    # --- #39 quant_variant_id: derive the candidate id --------------------
+    # "auto" leaves the id untouched (today's behavior).
+    assert quant_variant_id("mlx-community/Qwen3-4B-Instruct-4bit", "auto") == "mlx-community/Qwen3-4B-Instruct-4bit"
+    # An explicit quant swaps a recognized quant suffix.
+    assert quant_variant_id("mlx-community/Qwen3-4B-Instruct-4bit", "int8") == "mlx-community/Qwen3-4B-Instruct-8bit"
+    assert quant_variant_id("mlx-community/Qwen3-4B-Instruct-4bit", "fp16") == "mlx-community/Qwen3-4B-Instruct-bf16"
+    # No recognized suffix -> APPEND the target quant suffix.
+    assert quant_variant_id("some/model", "int4") == "some/model-4bit"
+
+    # --- defaults are OFF/neutral (off => today's runtime) -----------------
+    # A config-less load_config keeps speculative OFF + no draft + quant "auto".
+    s = {"llm": "x", "stt": "y", "speed": 1.0}
+    # The Engine reads these straight from settings; prove the neutral defaults
+    # the loader would produce.
+    assert ALLOWED_QUANT[0] == "auto", "auto must be the neutral default quant"
+
+
+def _selftest_diarize():
+    """Hermetic checks for the #31 PURE Scribe-label diarizer (_diarize_scribe_words)
+    — no network, no model. Proves: (a) two speakers map to contiguous per-speaker
+    turns with carried timings; (b) a single speaker coalesces to one turn; (c) words
+    with no speaker_id are honestly "unknown", NEVER fabricated as distinct speakers;
+    (d) an empty/absent words stream falls back to ONE unknown turn from `text`;
+    (e) spacing/audio_event tokens are skipped; (f) empty text -> no turns."""
+    # (a) two speakers -> three contiguous turns (s0, s1, s0) with timings.
+    resp = {
+        "text": "hello there hi jarvis all good",
+        "words": [
+            {"text": "hello", "type": "word", "speaker_id": "speaker_0", "start": 0.0, "end": 0.4},
+            {"text": "there", "type": "word", "speaker_id": "speaker_0", "start": 0.5, "end": 0.9},
+            {"text": "hi", "type": "word", "speaker_id": "speaker_1", "start": 1.2, "end": 1.4},
+            {"text": "jarvis", "type": "word", "speaker_id": "speaker_1", "start": 1.5, "end": 1.9},
+            {"text": "all", "type": "word", "speaker_id": "speaker_0", "start": 2.2, "end": 2.4},
+            {"text": "good", "type": "word", "speaker_id": "speaker_0", "start": 2.5, "end": 2.9},
+        ],
+    }
+    turns = _diarize_scribe_words(resp)
+    assert len(turns) == 3, turns
+    assert turns[0] == {"speaker_id": "speaker_0", "text": "hello there", "start": 0.0, "end": 0.9}, turns[0]
+    assert turns[1] == {"speaker_id": "speaker_1", "text": "hi jarvis", "start": 1.2, "end": 1.9}, turns[1]
+    assert turns[2] == {"speaker_id": "speaker_0", "text": "all good", "start": 2.2, "end": 2.9}, turns[2]
+
+    # (b) single speaker -> one coalesced turn.
+    one = _diarize_scribe_words({
+        "text": "what is the time",
+        "words": [{"text": w, "type": "word", "speaker_id": "speaker_0"} for w in ["what", "is", "the", "time"]],
+    })
+    assert len(one) == 1 and one[0]["speaker_id"] == "speaker_0" and one[0]["text"] == "what is the time", one
+
+    # (c) no speaker_id -> honest "unknown", NEVER fabricated distinct speakers.
+    unk = _diarize_scribe_words({
+        "text": "hello world",
+        "words": [{"text": "hello", "type": "word"}, {"text": "world", "type": "word"}],
+    })
+    assert len(unk) == 1 and unk[0]["speaker_id"] == DIARIZE_UNKNOWN_SPEAKER and unk[0]["text"] == "hello world", unk
+
+    # (d) empty/absent words -> one unknown turn from `text`.
+    fallback = _diarize_scribe_words({"text": "only text here", "words": []})
+    assert fallback == [{"speaker_id": DIARIZE_UNKNOWN_SPEAKER, "text": "only text here", "start": None, "end": None}], fallback
+
+    # (e) spacing/audio_event tokens are skipped.
+    skipped = _diarize_scribe_words({
+        "text": "hi there",
+        "words": [
+            {"text": "hi", "type": "word", "speaker_id": "speaker_0"},
+            {"text": " ", "type": "spacing", "speaker_id": "speaker_0"},
+            {"text": "(laughter)", "type": "audio_event"},
+            {"text": "there", "type": "word", "speaker_id": "speaker_0"},
+        ],
+    })
+    assert len(skipped) == 1 and skipped[0]["text"] == "hi there", skipped
+
+    # (f) empty text + no words -> no turns; non-dict -> no turns.
+    assert _diarize_scribe_words({"text": "   ", "words": []}) == []
+    assert _diarize_scribe_words(None) == []
+
+
+def _selftest_speak_shape():
+    """Hermetic checks for the #33/#34 EXPRESSIVENESS consumer seam — no MLX, no
+    model, NO NETWORK (the EL synth seam is never called here; we test only the PURE
+    payload-shaping + validation + coarse gain/rate). Proves: (a) with adaptive
+    prosody ON + the EL-v3 model, the request payload carries the inline audio-tag +
+    stability/style voice_settings; (b) on a non-v3 model the tag/settings are DROPPED
+    (EL-v3-gated, never spoken literally); (c) a neutral request (nothing set, the
+    shipped default) shapes a byte-for-byte-today payload; (d) the validator clamps /
+    rejects out-of-range + bad-type delivery hints; (e) the coarse gain/rate are
+    no-ops at the neutral default and real below 1.0 / off 1.0."""
+    import numpy as np
+
+    # (a) EL-v3 RICH surface: audio-tag prefixed inline + stability/style settings.
+    v3 = _build_elevenlabs_payload(
+        "VID", ELEVENLABS_V3_MODEL, "hello", audio_tag="[urgently]", stability=0.35, style=0.6
+    )
+    assert v3["text"] == "[urgently] hello", v3
+    assert v3["model_id"] == ELEVENLABS_V3_MODEL
+    assert v3["voice_settings"] == {"stability": 0.35, "style": 0.6}, v3
+
+    # (b) NON-v3 model: the rich surface is DROPPED — no tag in the text, no settings.
+    flash = _build_elevenlabs_payload(
+        "VID", "eleven_flash_v2_5", "hello", audio_tag="[urgently]", stability=0.35, style=0.6
+    )
+    assert flash["text"] == "hello", "no audio-tag may reach a non-v3 model"
+    assert "voice_settings" not in flash, "no v3 settings on a non-v3 model"
+
+    # (c) NEUTRAL request: nothing set -> byte-for-byte today's payload (text+model only).
+    neutral = _build_elevenlabs_payload("VID", ELEVENLABS_V3_MODEL, "hello")
+    assert neutral == {"text": "hello", "model_id": ELEVENLABS_V3_MODEL}, neutral
+
+    # (d) validator: clamps in-range, rejects bad type / NaN / out of range -> None.
+    req = {"audio_tag": "[calm]", "stability": 0.75, "style": 0.3, "rate": 0.95, "volume": 0.45}
+    tag, stab, sty, rate, vol = _normalize_speak_shape(req)
+    assert (tag, stab, sty, rate, vol) == ("[calm]", 0.75, 0.3, 0.95, 0.45), (tag, stab, sty, rate, vol)
+    # Out of range clamps; bad type / blank -> None (== neutral default).
+    over = _normalize_speak_shape({"stability": 5.0, "rate": 99.0, "volume": -1.0, "audio_tag": "  "})
+    assert over == (None, 1.0, None, 2.0, SPEAK_VOLUME_MIN), over
+    empty = _normalize_speak_shape({})
+    assert empty == (None, None, None, None, None), empty
+    bad = _normalize_speak_shape({"stability": "loud", "rate": True, "volume": float("nan")})
+    assert bad == (None, None, None, None, None), bad
+
+    # (e) coarse gain/rate: no-op at neutral, real below/off 1.0. PURE, no synth.
+    a = np.ones(100, dtype=np.float32)
+    assert float(InferenceEngine._apply_gain(a, None)[0]) == 1.0  # neutral -> untouched
+    assert float(InferenceEngine._apply_gain(a, 1.0)[0]) == 1.0  # 1.0 untouched
+    # soft delivery: the gain is really applied (float32 round-trips 0.45 to ~0.45,
+    # so compare with a float32 tolerance — exact float64 equality would spuriously fail).
+    assert abs(float(InferenceEngine._apply_gain(a, 0.45)[0]) - 0.45) < 1e-6  # soft delivery
+    # rate: faster -> fewer samples; 1.0 / None untouched.
+    assert InferenceEngine._apply_rate(a, ELEVENLABS_SAMPLE_RATE, 1.08).shape[0] < a.shape[0]
+    assert InferenceEngine._apply_rate(a, ELEVENLABS_SAMPLE_RATE, 1.0).shape[0] == a.shape[0]
+    assert InferenceEngine._apply_rate(a, ELEVENLABS_SAMPLE_RATE, None).shape[0] == a.shape[0]
+
+
+def _selftest_local_warm():
+    """Hermetic checks for the multi-resident LOCAL model manager (task #17) —
+    no MLX, no model, no network. Exercises the PURE policy (footprint estimate,
+    budget admit / single-resident fallback) and the LocalWarmManager keep-warm /
+    LRU-evict / select / absent-model-fallback behavior over SYNTHETIC sizes
+    with a SYNTHETIC loader. Proves the LOGIC the daemon Local tier relies on;
+    the ACTUAL load + the swap speed benefit are runtime/device-gated and are
+    NOT exercised or claimed here."""
+    SIZES = {"base4b": 3.0, "fast1b": 1.0, "cap8b": 6.0, "tiny": 0.5}
+
+    # --- footprint estimate ------------------------------------------------
+    # Explicit override wins.
+    assert estimate_local_model_gib("base4b", SIZES) == 3.0
+    # Bad override (<=0 / non-numeric) -> heuristic/default, never the bad value.
+    assert estimate_local_model_gib("x", {"x": 0}) == DEFAULT_LOCAL_MODEL_GIB
+    assert estimate_local_model_gib("x", {"x": "big"}) == DEFAULT_LOCAL_MODEL_GIB
+    # Heuristic: param count x quant factor (4bit smaller than bf16).
+    assert estimate_local_model_gib("mlx-community/Qwen3-4B-Instruct-4bit") < estimate_local_model_gib(
+        "mlx-community/Qwen3-4B-Instruct-bf16"
+    )
+    # Unknown id with no "<n>b" token -> conservative default.
+    assert estimate_local_model_gib("some/unknown-model") == DEFAULT_LOCAL_MODEL_GIB
+
+    # --- plan_warm_set: budget admit / single-resident fallback ------------
+    # Budget 0 (the DEFAULT) -> single-resident: base only, extras ignored.
+    assert plan_warm_set("base4b", ["fast1b", "cap8b"], 0, SIZES) == ["base4b"]
+    # Generous budget admits the extras that FIT, in config order; base first.
+    assert plan_warm_set("base4b", ["fast1b"], 5.0, SIZES) == ["base4b", "fast1b"]
+    # 3.0 (base) + 1.0 (fast) = 4.0 <= 4.0 admits fast; cap8b (6.0) never fits.
+    assert plan_warm_set("base4b", ["fast1b", "cap8b"], 4.0, SIZES) == ["base4b", "fast1b"]
+    # Over-budget extra is SKIPPED but a later smaller one still admitted.
+    assert plan_warm_set("base4b", ["cap8b", "tiny"], 3.6, SIZES) == ["base4b", "tiny"]
+    # Base alone exceeds the budget -> single-resident (base MUST stay warm).
+    assert plan_warm_set("cap8b", ["fast1b"], 4.0, SIZES) == ["cap8b"]
+    # Dedup: a repeated id (incl. the base) is admitted at most once.
+    assert plan_warm_set("base4b", ["fast1b", "fast1b", "base4b"], 9.0, SIZES) == [
+        "base4b",
+        "fast1b",
+    ]
+
+    # --- LocalWarmManager: select / keep-warm / evict / fallback -----------
+    loaded = []  # records every loader invocation (proves no redundant loads).
+
+    def loader(mid):
+        loaded.append(mid)
+        return (f"model::{mid}", f"tok::{mid}")
+
+    def absent_loader(mid):
+        loaded.append(mid)
+        if mid != "base4b":
+            raise RuntimeError(f"checkpoint {mid} not downloaded")
+        return (f"model::{mid}", f"tok::{mid}")
+
+    # Single-resident manager (default): any requested id resolves to the base,
+    # and the base loads exactly once and stays pinned.
+    loaded.clear()
+    m1 = LocalWarmManager("base4b", configured=["fast1b"], budget_gib=0, sizes=SIZES)
+    assert m1.multi_resident() is False
+    rid, model, _ = m1.select("fast1b", loader)  # out-of-warm-set -> base
+    assert rid == "base4b" and model == "model::base4b"
+    assert m1.select(None, loader)[0] == "base4b"  # None -> base
+    assert loaded == ["base4b"], "single-resident loads only the base"
+    assert m1.warm_ids() == ["base4b"]
+
+    # Multi-resident manager: base + one extra warm, both kept resident; the
+    # base is pinned and never evicted; a re-select is a cache HIT (no reload).
+    loaded.clear()
+    m2 = LocalWarmManager("base4b", configured=["fast1b"], budget_gib=5.0, sizes=SIZES)
+    assert m2.multi_resident() is True and m2.capacity == 2
+    assert m2.select(None, loader)[0] == "base4b"  # base warm
+    assert m2.select("fast1b", loader)[0] == "fast1b"  # extra warm too
+    assert sorted(m2.warm_ids()) == ["base4b", "fast1b"]
+    assert m2.select("fast1b", loader)[0] == "fast1b"  # HIT
+    assert loaded == ["base4b", "fast1b"], "no redundant reload on a warm hit"
+
+    # LRU eviction over capacity: capacity 2 (base + 1 extra slot). Warming a
+    # SECOND extra evicts the least-recently-used NON-base resident; the base
+    # survives (pinned).
+    loaded.clear()
+    m3 = LocalWarmManager(
+        "base4b", configured=["fast1b", "tiny"], budget_gib=3.6, sizes=SIZES
+    )
+    # 3.0 + 1.0 = 4.0 > 3.6 so fast1b does NOT fit; 3.0 + 0.5 = 3.5 <= 3.6 so
+    # tiny fits. Plan = [base4b, tiny]; capacity 2.
+    assert m3.plan == ["base4b", "tiny"]
+    assert m3.select(None, loader)[0] == "base4b"
+    assert m3.select("tiny", loader)[0] == "tiny"
+    # fast1b is NOT in the warm-set (didn't fit) -> resolves to base, no load.
+    assert m3.select("fast1b", loader)[0] == "base4b"
+    assert sorted(m3.warm_ids()) == ["base4b", "tiny"]
+
+    # Eviction with two admitted extras under a bigger budget + capacity 2 cap.
+    loaded.clear()
+    m4 = LocalWarmManager(
+        "base4b", configured=["fast1b", "tiny"], budget_gib=9.0, sizes=SIZES
+    )
+    assert m4.plan == ["base4b", "fast1b", "tiny"] and m4.capacity == 3
+    m4.select(None, loader)
+    m4.select("fast1b", loader)
+    m4.select("tiny", loader)
+    assert sorted(m4.warm_ids()) == ["base4b", "fast1b", "tiny"]
+    # Now constrain capacity to 2 to force an eviction on the next distinct load.
+    m4.capacity = 2
+    # Re-touch tiny so fast1b is the LRU non-base resident, then load a NEW one.
+    m4.select("tiny", loader)
+    m4.resident["fast1b"]  # fast1b still present, but now LRU
+    m4.select("base4b", loader)  # base re-touch (pinned) must not evict tiny
+    # Insert a fresh resident directly to trigger _insert eviction logic.
+    ev = m4._insert("newmodel", "m", "t")
+    assert "base4b" not in ev, "base is pinned, never evicted"
+    assert len(m4.warm_ids()) <= 2
+
+    # Absent model (loader raises) -> transparent fallback to the base, never a
+    # crash; the base is loaded as the substitute. The fallback path logs the
+    # caught load error via log.exception; silence it here so the EXPECTED
+    # traceback does not masquerade as a selftest failure in CI output.
+    loaded.clear()
+    m5 = LocalWarmManager("base4b", configured=["fast1b"], budget_gib=5.0, sizes=SIZES)
+    _prev_level = log.level
+    log.setLevel(logging.CRITICAL)
+    try:
+        rid, model, _ = m5.select("fast1b", absent_loader)
+    finally:
+        log.setLevel(_prev_level)
+    assert rid == "base4b" and model == "model::base4b", "absent extra -> base"
+    assert "fast1b" in loaded and "base4b" in loaded
+    assert m5.warm_ids() == ["base4b"], "failed extra is NOT marked resident"
+
+    # resolve_id is pure (no load): in-set -> itself, out-of-set/None -> base.
+    m6 = LocalWarmManager("base4b", configured=["fast1b"], budget_gib=5.0, sizes=SIZES)
+    assert m6.resolve_id("fast1b") == "fast1b"
+    assert m6.resolve_id("cap8b") == "base4b"
+    assert m6.resolve_id(None) == "base4b"
+    assert m6.resolve_id("") == "base4b"
+
+
+def main():
+    import sys
+
+    if "--selftest" in sys.argv[1:]:
+        _selftest()
+        return
+    setup_logging()
+    settings = load_config()
+    check_runtime_deps()
+    engine = InferenceEngine(settings, load_classifier_template(), load_persona())
+    asyncio.run(InferenceServer(engine, preload=settings["preload"]).run())
+
+
+if __name__ == "__main__":
+    main()

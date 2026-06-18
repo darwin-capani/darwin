@@ -1,0 +1,26 @@
+# Algo-Core — predictive algo-trading daemon with live charting in the HUD.
+# Schema: docs/SANDBOX.md
+
+[app]
+name        = "algo-core"
+version     = "0.1.0"
+description = "Predictive algo-trading daemon: streams market data, runs signal models, manages orders, and publishes live charting telemetry to the HUD."
+entry       = "python3 main.py"
+runtime     = "python"
+
+[permissions]
+audio     = false
+net_hosts = [
+  "api.binance.com",
+  "stream.binance.com",
+  "api.kraken.com",
+  "ws.kraken.com",
+  "clob.polymarket.com",
+]
+fs_read   = ["apps/algo-core/strategies"]   # strategy definitions and model weights
+fs_write  = ["apps/algo-core/data"]         # its own data dir: candles, fills, P&L journal
+gpu       = false
+
+[ui]
+surface          = "panel"
+telemetry_topics = ["algo.prices", "algo.signals", "algo.orders", "algo.positions", "algo.pnl"]

@@ -1,0 +1,54 @@
+# Example-Plugin — the #36 PLUGIN SDK reference module.
+#
+# A minimal capability-module that illustrates the formalized contract validated
+# by daemon/src/plugin_sdk.rs::validate_manifest. It is a normal sandboxed
+# micro-app (docs/SANDBOX.md) PLUS the optional [intents]/[tools] block the SDK
+# defines. The base [app]/[permissions]/[ui] schema is unchanged; declaring an
+# intent or a tool grants NOTHING — the SBPL profile + the capability token are
+# still derived from [permissions], and a consequential tool still rides the gate.
+#
+# Validity rules this manifest demonstrates (see docs/PLUGIN_SDK.md):
+#   - [app].name must equal the directory name ("example-plugin").
+#   - every [intents].provides name is a dotted-lowercase id (a-z0-9_, dots).
+#   - every [[tools.exposes]] has a well-formed name and only ALLOWED scopes.
+#   - a requested scope must be BACKED by [permissions] (no over-privilege):
+#     this plugin requests only "generate" (the daemon-mediated proxy, no extra
+#     permission) and "fs_read" (backed by the fs_read grant below).
+
+[app]
+name        = "example-plugin"
+version     = "0.1.0"
+description = "Reference plugin for the #36 capability-module SDK: declares one read-only intent and one read-only tool to illustrate the validated [intents]/[tools] contract. Pure, offline, no consequential surface."
+entry       = "apps/example-plugin/main.py"
+runtime     = "python"
+
+[permissions]
+audio     = false
+gpu       = false
+net_hosts = []                                   # fully offline — no network at all
+# The op-restricted generate proxy socket (NOT the raw inference.sock) backs the
+# "generate" scope; the plugin's own scratch dir backs "fs_read".
+fs_read   = ["state/ipc/apps/generate.sock", "apps/example-plugin"]
+fs_write  = ["state/apps/example-plugin"]        # cache / scratch (its own app dir)
+
+[ui]
+surface          = "panel"
+telemetry_topics = ["example.status"]
+
+# --- #36 capability-module contract -----------------------------------------
+[intents]
+# The intents this plugin answers. Each is a well-formed dotted-lowercase id.
+provides = ["example.status"]
+
+# The tools this plugin exposes. Each scope must be in plugin_sdk::ALLOWED_SCOPES
+# AND backed by the [permissions] block above. Both tools here are READ-ONLY
+# (consequential = false) — this reference plugin has no side-effecting surface.
+[[tools.exposes]]
+name          = "example.read_status"
+scopes        = ["fs_read"]      # backed by the fs_read grant above
+consequential = false
+
+[[tools.exposes]]
+name          = "example.summarize"
+scopes        = ["generate"]     # the daemon-mediated generate proxy (no extra permission)
+consequential = false

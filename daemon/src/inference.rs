@@ -1,0 +1,1960 @@
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
+use tokio::net::UnixStream;
+use tokio::sync::mpsc;
+use tracing::warn;
+
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// op=consolidate only: the largest generation in the system (up to 40
+/// transcript pairs + 200 facts prefilled into the 4B on the M1 Pro), and its
+/// 30s window used to include server-side queueing behind the engine lock —
+/// a consolidation landing behind a live reply timed out, the server kept
+/// generating anyway, and the unstamped cycle re-burned a full generation
+/// every 6h forever (audit fix).
+const CONSOLIDATE_TIMEOUT: Duration = Duration::from_secs(120);
+/// A converse stream must produce its done event within this budget...
+const CONVERSE_DONE_TIMEOUT: Duration = Duration::from_secs(30);
+/// ...and never go quiet for longer than this between lines.
+const CONVERSE_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Classification {
+    pub intent: String,
+    pub confidence: f64,
+    pub complexity: String,
+    /// Pass-through of the classifier's args JSON (e.g. {"url": "apple.com",
+    /// "browser": "safari"} for web.open). Old servers omit the field —
+    /// serde(default) keeps the daemon backward compatible (Value::Null);
+    /// the router treats Null exactly like an empty object.
+    #[serde(default)]
+    pub args: serde_json::Value,
+}
+
+/// One turn of prior conversation, oldest first on the wire.
+/// Shared contract: speaker is exactly "user" or "jarvis".
+#[derive(Serialize)]
+struct HistoryTurn<'a> {
+    speaker: &'static str,
+    text: &'a str,
+}
+
+#[derive(Serialize)]
+struct Request<'a> {
+    id: String,
+    op: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<&'a str>,
+    /// describe_image only (op="describe_image"): the OPTIONAL VQA question.
+    /// Absent => the server uses its DESCRIBE_IMAGE_DEFAULT_PROMPT (a general
+    /// scene description). NON-secret; carried only when present so an old
+    /// server (no VLM op) sees a clean shape it simply rejects as unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    question: Option<&'a str>,
+    /// generate_image only (op="generate_image", task #18): the REQUIRED text
+    /// prompt to render. NON-secret but PRIVATE — it is handed ONLY to the
+    /// on-device MLX diffusion model; the prompt + the pixels stay on the
+    /// machine, nothing goes to the cloud. Carried only on the generate_image
+    /// path so an old server (no image op) sees a clean shape it rejects as
+    /// unknown (which the daemon reads as "image model unavailable").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt: Option<&'a str>,
+    /// generate_image only: OPTIONAL square output resolution in pixels. Absent
+    /// => the server's GENERATE_IMAGE_DEFAULT_SIZE (512). The server floors/caps
+    /// it to [GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_MAX_SIZE]; the daemon also
+    /// clamps before sending so a caller can never ask for an out-of-range size.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    size: Option<u32>,
+    /// generate_image only: OPTIONAL sampling steps. Absent => the server's
+    /// GENERATE_IMAGE_DEFAULT_STEPS (4). Capped at GENERATE_IMAGE_MAX_STEPS_CAP
+    /// (50) by the server; the daemon clamps too so a caller can never request
+    /// an unbounded sampler run on-device.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    steps: Option<u32>,
+    /// generate_image only: OPTIONAL integer seed for reproducibility. Absent
+    /// => the server derives a time-based 31-bit seed. Carried only when the
+    /// caller pins one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    history: Option<Vec<HistoryTurn<'a>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    facts: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response: Option<&'a str>,
+    /// converse only: the instant-acknowledgment line the daemon already
+    /// played aloud for this reply; the server tells the model to continue
+    /// from it rather than acknowledge twice.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    opener_spoken: Option<&'a str>,
+    /// converse only: the active agent's persona name. The server maps it to
+    /// inference/personas/<persona>.txt and uses that text as the system
+    /// prefix for this one reply (per-agent voicing), falling back to its
+    /// default persona when absent — so an old server simply ignores it and
+    /// every agent speaks in the base JARVIS persona. The daemon passes the
+    /// agent NAME (not the file text) so the server can KV-cache each agent's
+    /// prefix; see this module's wire-contract note for what server.py must
+    /// accept.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persona: Option<&'a str>,
+    /// generate/converse only (multi-resident LOCAL, task #17): the warm-set id
+    /// the Local tier sub-choice picked (a "local-fast" model vs the capable
+    /// base). The server SELECTS this warm local model for the reply, keeping it
+    /// warm under the RAM budget. UNKNOWN / absent / "" -> the base
+    /// single-resident model, NEVER an error — so an old server (no manager) or a
+    /// single-resident config simply answers on the base. Carried on the wire only
+    /// when present, so the default single-resident wire is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    local_model: Option<&'a str>,
+    /// embed only: the batch of strings to embed (query + candidate facts).
+    /// Old servers without the embed op simply reject op=embed (unknown op) —
+    /// the daemon treats that as "embedder unavailable" and falls back to BM25.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    texts: Option<&'a [String]>,
+    /// speak only: the TTS backend the daemon chose for THIS sentence —
+    /// "elevenlabs" for the cloud voice tier, "kokoro" (or absent) for on-device.
+    /// An old server that does not know the field simply ignores it and uses
+    /// Kokoro, so the wire stays backward compatible. The daemon only ever sets
+    /// this to "elevenlabs" after `voice_tier::resolve_voice_backend` cleared the
+    /// full gate (tier on + key + non-Local + mapped); otherwise it is omitted.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<&'a str>,
+    /// speak only (backend=elevenlabs): the ElevenLabs voice id for this agent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    voice_id: Option<&'a str>,
+    /// speak only (backend=elevenlabs): the ElevenLabs model id ([voice].model).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+    /// speak only (backend=elevenlabs): the resolved ElevenLabs API key, read from
+    /// the Keychain by the daemon and passed to the server ONLY in this request
+    /// body so the server can set the `xi-api-key` header. SECURITY: it is NEVER
+    /// logged, never on argv, never in telemetry/Debug; it is `Some` ONLY on the
+    /// (gated) cloud path and omitted from the wire entirely on every Kokoro turn.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    el_key: Option<&'a str>,
+    /// speak only (Babel, build 2/2): the TARGET LANGUAGE of this sentence (e.g.
+    /// "Spanish", "Japanese"), threaded from the interpreter so the ElevenLabs
+    /// backend can select a MULTILINGUAL model (eleven_multilingual_v2 / eleven_v3)
+    /// for non-English output instead of the English-centric default. Omitted for
+    /// ordinary English replies and on the Kokoro path (an old server simply ignores
+    /// it), so the wire stays backward compatible. NON-SECRET (a language name).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lang: Option<&'a str>,
+    /// speak only (#33 ADAPTIVE PROSODY, EL-v3 path): the inline audio-tag the
+    /// expressiveness layer chose for THIS sentence (e.g. "[calm]", "[urgently]").
+    /// Set ONLY when the resolved backend is EL-v3-capable AND adaptive prosody is on;
+    /// on Kokoro / non-v3 EL / prosody-off it is absent so the wire is byte-for-byte
+    /// today's. NON-secret — a delivery hint, never the key/voice id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    audio_tag: Option<&'a str>,
+    /// speak only (#33, EL-v3 voice-settings): `stability` in [0,1]. Set ONLY on the
+    /// rich EL-v3 path; absent on every other path (byte-for-byte today's wire).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stability: Option<f32>,
+    /// speak only (#33, EL-v3 voice-settings): `style` in [0,1]. Set ONLY on the rich
+    /// EL-v3 path; absent on every other path.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    style: Option<f32>,
+    /// speak only (#33/#34 COARSE delivery): a rate multiplier the server honours on
+    /// EVERY backend (1.0 = today's neutral rate). Carried ONLY when the shape is
+    /// non-neutral (prosody on with a non-Neutral profile, or whisper engaged); a
+    /// neutral shape omits it so the default wire is unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rate: Option<f32>,
+    /// speak only (#34 WHISPER, coarse delivery): an output volume/gain multiplier in
+    /// (0,1] the server applies to the produced WAV (1.0 = today's level). Carried ONLY
+    /// when whisper lowered it below 1.0; a full-volume shape omits it so the default
+    /// wire is unchanged. A required confirmation is NEVER lowered (apply_whisper
+    /// guards it), so this never softens a gate's words below audibility.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    volume: Option<f32>,
+}
+
+impl<'a> Request<'a> {
+    fn new(id: String, op: &'a str) -> Self {
+        Self {
+            id,
+            op,
+            path: None,
+            text: None,
+            question: None,
+            prompt: None,
+            size: None,
+            steps: None,
+            seed: None,
+            max_tokens: None,
+            voice: None,
+            history: None,
+            facts: None,
+            data: None,
+            response: None,
+            opener_spoken: None,
+            persona: None,
+            local_model: None,
+            texts: None,
+            backend: None,
+            voice_id: None,
+            model: None,
+            el_key: None,
+            lang: None,
+            audio_tag: None,
+            stability: None,
+            style: None,
+            rate: None,
+            volume: None,
+        }
+    }
+}
+
+/// Thread the EXPRESSIVENESS shaping (#33 prosody + #34 whisper) onto a `speak`
+/// request, carrying ONLY the non-neutral fields so a NEUTRAL shape (the OFF default)
+/// leaves the request BYTE-FOR-BYTE today's. Factored out of [`InferenceClient::speak`]
+/// so the wire shaping is hermetically testable (build a request, apply a real
+/// [`crate::prosody::SpeakShape`], assert the JSON) without a server/EL/mic.
+///
+///   * The RICH EL-v3 surface (`audio_tag`/`stability`/`style`) is gated on
+///     `shape.rich`, which the shaper only ever sets true on the EL-v3 backend — so an
+///     audio-tag or v3 voice-setting can NEVER ride a Kokoro / non-v3 request even if
+///     the struct carried one.
+///   * The COARSE `rate`/`volume` ride on EVERY backend, but ONLY when they differ
+///     from today's neutral 1.0, so the default wire stays untouched. A whisper-lowered
+///     volume rides here; a required-confirmation shape (never lowered by
+///     `apply_whisper`) keeps volume at 1.0 and so omits the field.
+fn apply_shape_to_request(req: &mut Request<'_>, shape: &crate::prosody::SpeakShape) {
+    if shape.rich {
+        req.audio_tag = shape.audio_tag;
+        req.stability = shape.stability;
+        req.style = shape.style;
+    }
+    if shape.rate != 1.0 {
+        req.rate = Some(shape.rate);
+    }
+    if shape.volume != 1.0 {
+        req.volume = Some(shape.volume);
+    }
+}
+
+/// extract_facts/consolidate wire item: {"key": "user.name", "value": "..."}.
+#[derive(Deserialize)]
+struct FactItem {
+    key: String,
+    value: String,
+}
+
+/// One prior exchange on the consolidate wire.
+#[derive(Serialize)]
+struct TranscriptPair<'a> {
+    user: &'a str,
+    jarvis: &'a str,
+}
+
+/// One stored fact on the consolidate wire — key/value objects, unlike the
+/// pre-formatted "key: value" strings the generate/converse ops carry.
+#[derive(Serialize)]
+struct FactPair<'a> {
+    key: &'a str,
+    value: &'a str,
+}
+
+/// op=consolidate request: its own shape, so it serializes independently of
+/// the flat Request struct (whose `facts` field is a &[String]).
+#[derive(Serialize)]
+struct ConsolidateRequest<'a> {
+    id: String,
+    op: &'static str,
+    transcripts: Vec<TranscriptPair<'a>>,
+    facts: Vec<FactPair<'a>>,
+}
+
+/// What a consolidate round trip asks the daemon to apply.
+#[derive(Debug, Default)]
+pub struct ConsolidateOutcome {
+    pub upserts: Vec<(String, String)>,
+    pub deletes: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)] // id/latency_ms are part of the wire contract even if unused here
+struct Response {
+    id: String,
+    ok: bool,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    intent: Option<String>,
+    #[serde(default)]
+    confidence: Option<f64>,
+    #[serde(default)]
+    complexity: Option<String>,
+    /// classify only: the model's args object, passed through verbatim by
+    /// the server ({} on absence/parse trouble; never fabricated). Absent
+    /// entirely on old servers — deserializes as None.
+    #[serde(default)]
+    args: Option<serde_json::Value>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    facts: Option<Vec<FactItem>>,
+    #[serde(default)]
+    upserts: Option<Vec<FactItem>>,
+    #[serde(default)]
+    deletes: Option<Vec<String>>,
+    /// embed only: one L2-normalized vector per input text, in input order.
+    /// Absent on old servers (they reject op=embed before producing this).
+    #[serde(default)]
+    vectors: Option<Vec<Vec<f64>>>,
+    /// clone_voice only: the ElevenLabs voice id minted for the uploaded sample.
+    /// Absent on old servers (they reject op=clone_voice as an unknown op) and on
+    /// every non-clone op — deserializes as None. Non-secret (the daemon stores it
+    /// in [voice.voices]); NEVER a key.
+    #[serde(default)]
+    voice_id: Option<String>,
+    /// describe_image only: the VLM id that produced `text` (AVAILABLE path).
+    /// NON-secret (a model repo id). Absent on every other op and on old
+    /// servers — deserializes as None.
+    #[serde(default)]
+    model: Option<String>,
+    /// describe_image only (UNAVAILABLE/FAILURE path, ok:false): the stable
+    /// machine reason the daemon keys off to FALL BACK honestly rather than
+    /// surface a fabricated description. The server sets it to
+    /// `DESCRIBE_IMAGE_UNAVAILABLE_REASON` ("vlm_unavailable") when mlx-vlm is
+    /// absent, [models].vlm is empty, the checkpoint isn't downloaded/failed to
+    /// load, decode failed, or the model produced empty output. Absent on a
+    /// caller-bug ValueError (the daemon then shows the validation message) and
+    /// on every non-VLM response. NEVER carries pixels or a description.
+    #[serde(default)]
+    reason: Option<String>,
+    /// generate_image only (AVAILABLE path, task #18): the square output
+    /// resolution / sampling steps / seed the server actually used. NON-secret
+    /// metadata the daemon surfaces in `image.generated` telemetry (never over
+    /// the network). Absent on every non-image op — deserialize as None.
+    #[serde(default)]
+    size: Option<u32>,
+    #[serde(default)]
+    steps: Option<u32>,
+    #[serde(default)]
+    seed: Option<u32>,
+    /// transcribe only (#31 diarization): the per-word Scribe stream, present ONLY
+    /// when the EL-Scribe STT backend diarized (carried speaker labels). Absent on the
+    /// on-device whisper path (no diarization model) and on a Scribe response with no
+    /// word detail — deserializes as None, and the daemon then renders the honest
+    /// single stream (never a fabricated speaker). Carries text + timings + speaker
+    /// ids only, NEVER audio.
+    #[serde(default)]
+    words: Option<Vec<crate::diarize::ScribeWord>>,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    latency_ms: i64,
+}
+
+/// The stable machine reason the server sends on the describe_image
+/// UNAVAILABLE/FAILURE path (`ok:false`). MUST equal the server's
+/// `DESCRIBE_IMAGE_UNAVAILABLE_REASON`. The daemon keys off this exact string
+/// to FALL BACK honestly (to OCR/classification or an "isn't downloaded" line)
+/// rather than surface a fabricated description.
+pub const DESCRIBE_IMAGE_UNAVAILABLE_REASON: &str = "vlm_unavailable";
+
+/// Hard cap on the describe_image decode budget (mirrors the server's
+/// `DESCRIBE_IMAGE_MAX_TOKENS_CAP`). The daemon clamps any requested budget to
+/// this so a caller can never ask the on-device VLM for an unbounded decode.
+pub const DESCRIBE_IMAGE_MAX_TOKENS_CAP: u32 = 1024;
+
+/// The default describe_image decode budget when the caller names none.
+pub const DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS: u32 = 256;
+
+/// The stable machine reason the server sends on the generate_image
+/// UNAVAILABLE/FAILURE path (`ok:false`). MUST equal the server's
+/// `GENERATE_IMAGE_UNAVAILABLE_REASON`. The daemon keys off this exact string
+/// to surface an honest "the on-device image model isn't set up" line —
+/// NEVER a fabricated image and NEVER a silent cloud fallback (image
+/// generation is LOCAL only).
+pub const GENERATE_IMAGE_UNAVAILABLE_REASON: &str = "image_model_unavailable";
+
+/// generate_image size bounds — MUST mirror the server's
+/// `GENERATE_IMAGE_MIN_SIZE`/`GENERATE_IMAGE_MAX_SIZE`. The daemon clamps any
+/// requested square resolution into this window before sending, so a caller can
+/// never ask the on-device diffusion model for an out-of-range canvas (the
+/// server clamps too — defense in depth at both ends).
+pub const GENERATE_IMAGE_MIN_SIZE: u32 = 64;
+pub const GENERATE_IMAGE_MAX_SIZE: u32 = 1536;
+/// The default square resolution when the caller names none (mirrors the
+/// server's `GENERATE_IMAGE_DEFAULT_SIZE`).
+pub const GENERATE_IMAGE_DEFAULT_SIZE: u32 = 512;
+
+/// generate_image sampling-step bounds — MUST mirror the server's
+/// `GENERATE_IMAGE_DEFAULT_STEPS`/`GENERATE_IMAGE_MAX_STEPS_CAP`. The default is
+/// the fast schnell-class budget; the cap is a real ceiling the daemon clamps to
+/// so a caller can never request an unbounded sampler run on-device.
+pub const GENERATE_IMAGE_DEFAULT_STEPS: u32 = 4;
+pub const GENERATE_IMAGE_MAX_STEPS_CAP: u32 = 50;
+
+/// The outcome of one generate_image round trip, seen from the daemon. The
+/// op is DEVICE/RUNTIME-GATED: it needs an MLX diffusion package + a multi-GB
+/// on-device checkpoint + enough RAM, so the UNAVAILABLE arm is a FIRST-CLASS,
+/// expected result — NOT an error — and the daemon surfaces it honestly. The
+/// prompt is handed ONLY to the on-device model and the generated PIXELS are
+/// saved on-device under state/images/; nothing leaves the machine (NO cloud
+/// image API anywhere on this path). The image QUALITY/speed are device/runtime-
+/// gated and are NEVER claimed measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenerateOutcome {
+    /// The on-device diffusion model rendered the prompt and saved the image.
+    /// `path` is the ON-DEVICE absolute path under state/images/ the server
+    /// wrote (the daemon surfaces it; the pixels never leave the device).
+    /// `model`/`size`/`steps`/`seed` are NON-secret metadata for the HUD readout
+    /// + the `image.generated` telemetry.
+    Available {
+        path: PathBuf,
+        model: String,
+        size: u32,
+        steps: u32,
+        seed: u32,
+    },
+    /// The image model was not available (the diffusion package absent, [image]
+    /// off / no model named server-side, the checkpoint not downloaded / failed
+    /// to load, or a runtime failure) — the server sent `ok:false` with reason
+    /// [`GENERATE_IMAGE_UNAVAILABLE_REASON`]. The daemon surfaces an honest "the
+    /// on-device image model isn't set up" line; it NEVER fabricates an image and
+    /// NEVER falls back to a cloud image API. `error` is an honest human message.
+    Unavailable { error: String },
+}
+
+/// The outcome of one describe_image round trip, seen from the daemon. The VLM
+/// op is DEVICE/RUNTIME-GATED: it needs mlx-vlm + a multi-GB on-device VLM
+/// checkpoint + enough RAM, so the UNAVAILABLE arm is a FIRST-CLASS, expected
+/// result — NOT an error — and the daemon falls back honestly on it. The image
+/// is read ON-DEVICE by the server; pixels NEVER leave the machine. The actual
+/// description QUALITY is device/runtime-gated and is never claimed measured.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DescribeOutcome {
+    /// The on-device VLM produced a description/answer. `model` is the VLM id
+    /// (non-secret). `text` is the description — distinct from OCR text glyphs:
+    /// it is the model's visual understanding of the scene.
+    Available { text: String, model: String },
+    /// The VLM was not available (mlx-vlm absent, [models].vlm empty, the
+    /// checkpoint isn't downloaded / failed to load, decode failed, or empty
+    /// output) — the server sent `ok:false` with reason
+    /// [`DESCRIBE_IMAGE_UNAVAILABLE_REASON`]. The daemon falls back HONESTLY
+    /// (OCR/classification or "the model isn't downloaded"); it NEVER fabricates
+    /// a description. `error` is an honest human message for the spoken reply.
+    Unavailable { error: String },
+}
+
+/// One spoken sentence streamed out of a converse request: its text plus the
+/// synthesized WAV, ready for the playback sink while the model is still
+/// generating the rest of the reply.
+#[derive(Debug)]
+pub struct SentenceEvent {
+    pub seq: u64,
+    pub text: String,
+    pub path: PathBuf,
+}
+
+/// Terminal summary of a successful converse stream.
+#[derive(Debug)]
+pub struct ConverseDone {
+    /// Full reply text (may extend past the sentences that were synthesized).
+    pub text: String,
+}
+
+/// One line of a converse stream: a sentence event or the done event. The
+/// server also sends sentences/first_sentence_ms/latency_ms on done; serde
+/// ignores what the daemon does not consume.
+#[derive(Deserialize)]
+struct ConverseLine {
+    id: String,
+    #[serde(default)]
+    event: Option<String>,
+    #[serde(default)]
+    seq: Option<u64>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    ok: Option<bool>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// How one converse round trip ended, seen from the transport layer.
+enum ConverseOutcome {
+    Done(ConverseDone),
+    /// The server reported failure in a well-formed done line; the
+    /// connection itself is still healthy.
+    ServerFail(String),
+}
+
+/// Lazy JSONL client for the Python inference server. The daemon must keep
+/// running when the server is down, so every failure surfaces as Err and the
+/// connection is dropped for a fresh attempt next time.
+pub struct InferenceClient {
+    socket_path: PathBuf,
+    conn: Option<(BufReader<OwnedReadHalf>, OwnedWriteHalf)>,
+    next_id: u64,
+}
+
+impl InferenceClient {
+    pub fn new(socket_path: PathBuf) -> Self {
+        Self {
+            socket_path,
+            conn: None,
+            next_id: 0,
+        }
+    }
+
+    /// On-device / cloud STT. The server transcribes the WAV at `wav` and returns
+    /// the text. `backend` is the STT backend the daemon already resolved
+    /// ([`voice_tier::resolve_stt_backend`]): on-device whisper (the default +
+    /// fallback) or the opt-in ElevenLabs Scribe cloud-STT tier. `el_key` is the
+    /// resolved ElevenLabs API key — it MUST be `Some` only when `backend` is
+    /// `ElevenLabsScribe` (the gated cloud path) and rides ONLY the request body for
+    /// the server's `xi-api-key` header; never logged/argv/telemetry.
+    ///
+    /// HONESTY: with the Whisper backend the wire is byte-for-byte today's
+    /// transcribe request (just {op, path}), so an old server is unaffected and the
+    /// user's audio stays on-device. With Scribe the audio LEAVES the device — more
+    /// sensitive than the TTS text leg. On ANY Scribe error the SERVER falls back to
+    /// mlx_whisper, so this never fails a turn merely because the cloud leg failed.
+    #[allow(dead_code)] // text-only convenience seam; the live pipeline uses transcribe_diarized
+    pub async fn transcribe(
+        &mut self,
+        wav: &Path,
+        backend: &crate::voice_tier::SttBackend,
+        el_key: Option<&str>,
+    ) -> Result<String> {
+        // Same single request as the diarized form; the plain-text callers simply drop
+        // the per-word Scribe stream. Keeping ONE implementation means the wire shape +
+        // honesty rails never drift between the two entry points.
+        self.transcribe_diarized(wav, backend, el_key)
+            .await
+            .map(|(text, _words)| text)
+    }
+
+    /// #31 DIARIZED transcribe: the SAME single transcribe request, but ALSO returning
+    /// the Scribe per-word stream (`words`) when the EL-Scribe backend diarized. Used
+    /// only on the gated [voice].diarize path so the daemon can feed `diarize::diarize`
+    /// the REAL speaker labels. Returns `(text, words)` where `words` is empty on the
+    /// on-device whisper path (no diarization model) and on a Scribe response with no
+    /// word detail — the caller then falls back to the honest single stream, never a
+    /// fabricated speaker. No extra audio leaves the device beyond the one request the
+    /// plain `transcribe` would have made.
+    pub async fn transcribe_diarized(
+        &mut self,
+        wav: &Path,
+        backend: &crate::voice_tier::SttBackend,
+        el_key: Option<&str>,
+    ) -> Result<(String, Vec<crate::diarize::ScribeWord>)> {
+        use crate::voice_tier::SttBackend;
+        let mut req = Request::new(self.fresh_id(), "transcribe");
+        req.path = Some(wav.display().to_string());
+        match backend {
+            SttBackend::Whisper => {}
+            SttBackend::ElevenLabsScribe { model } => {
+                req.backend = Some("elevenlabs_scribe");
+                req.model = Some(model);
+                req.el_key = el_key;
+            }
+        }
+        let resp = self.request(&req).await?;
+        let text = resp
+            .text
+            .ok_or_else(|| anyhow!("transcribe response missing text"))?;
+        Ok((text, resp.words.unwrap_or_default()))
+    }
+
+    /// VOICE CLONING (consent-gated): hand the server an OWNER audio sample (a path
+    /// the daemon confined and the user authorized) plus a display `name` and the
+    /// resolved ElevenLabs key; the server uploads it to ElevenLabs
+    /// (POST /v1/voices/add, multipart: name + audio sample) and returns the new
+    /// `voice_id`. The daemon then stores that id in `[voice.voices]` so it is usable
+    /// like any EL voice.
+    ///
+    /// HONESTY: this is the ONE path where the audio SAMPLE leaves the device — to
+    /// clone a voice you must first AUTHORIZE the sample (consent-gated upstream; this
+    /// op is only ever reached after an explicit confirm). On any error (no key /
+    /// network / quota) the server returns a clean failure and the user keeps Kokoro
+    /// / their existing voice — nothing is silently changed.
+    ///
+    /// SECURITY: `el_key` rides ONLY the request body for the server's `xi-api-key`
+    /// header — never logged/argv/telemetry. The returned `voice_id` is non-secret.
+    pub async fn clone_voice(
+        &mut self,
+        sample_path: &Path,
+        name: &str,
+        el_key: &str,
+    ) -> Result<String> {
+        let mut req = Request::new(self.fresh_id(), "clone_voice");
+        req.path = Some(sample_path.display().to_string());
+        req.text = Some(name); // the voice's display name on ElevenLabs
+        req.el_key = Some(el_key);
+        let resp = self.request(&req).await?;
+        resp.voice_id
+            .ok_or_else(|| anyhow!("clone_voice response missing voice_id"))
+    }
+
+    pub async fn classify(&mut self, text: &str) -> Result<Classification> {
+        let mut req = Request::new(self.fresh_id(), "classify");
+        req.text = Some(text);
+        let resp = self.request(&req).await?;
+        Ok(Classification {
+            intent: resp
+                .intent
+                .ok_or_else(|| anyhow!("classify response missing intent"))?,
+            confidence: resp
+                .confidence
+                .ok_or_else(|| anyhow!("classify response missing confidence"))?,
+            complexity: resp
+                .complexity
+                .ok_or_else(|| anyhow!("classify response missing complexity"))?,
+            // Old servers send no args field at all; Null and {} are both
+            // "no args" to the router.
+            args: resp.args.unwrap_or_default(),
+        })
+    }
+
+    /// Context-aware generation. `history` is (user, jarvis) exchange pairs
+    /// oldest first — each pair becomes two alternating wire turns. `facts`
+    /// are pre-formatted "key: value" strings; `data` is verified handler
+    /// output the model must convey without inventing numbers. All three are
+    /// omitted from the wire when empty so the server's persona-prefix KV
+    /// cache sees a stable request shape.
+    ///
+    /// `local_model` is the multi-resident LOCAL sub-choice (task #17): the warm
+    /// local model id the Local tier picked (a "local-fast" model vs the capable
+    /// base). `None`/empty -> the base single-resident model. It is carried on the
+    /// wire only when present, so the default single-resident path is unchanged and
+    /// an old server simply ignores it (answering on the base).
+    #[allow(clippy::too_many_arguments)] // mirrors the wire request shape
+    pub async fn generate(
+        &mut self,
+        text: &str,
+        max_tokens: u32,
+        history: &[(String, String)],
+        facts: &[String],
+        data: Option<&str>,
+        local_model: Option<&str>,
+    ) -> Result<String> {
+        let turns: Vec<HistoryTurn> = history
+            .iter()
+            .flat_map(|(user, jarvis)| {
+                [
+                    HistoryTurn { speaker: "user", text: user },
+                    HistoryTurn { speaker: "jarvis", text: jarvis },
+                ]
+            })
+            .collect();
+        let mut req = Request::new(self.fresh_id(), "generate");
+        req.text = Some(text);
+        req.max_tokens = Some(max_tokens);
+        req.history = if turns.is_empty() { None } else { Some(turns) };
+        req.facts = if facts.is_empty() { None } else { Some(facts) };
+        req.data = data.filter(|d| !d.is_empty());
+        req.local_model = local_model.filter(|m| !m.trim().is_empty());
+        let resp = self.request(&req).await?;
+        resp.text
+            .ok_or_else(|| anyhow!("generate response missing text"))
+    }
+
+    /// Ask the server's LLM for at most 3 durable, namespaced facts about the
+    /// user from one exchange. An empty list is the common, correct result.
+    pub async fn extract_facts(
+        &mut self,
+        text: &str,
+        response: Option<&str>,
+    ) -> Result<Vec<(String, String)>> {
+        let mut req = Request::new(self.fresh_id(), "extract_facts");
+        req.text = Some(text);
+        req.response = response.filter(|r| !r.is_empty());
+        let resp = self.request(&req).await?;
+        Ok(resp
+            .facts
+            .unwrap_or_default()
+            .into_iter()
+            .map(|f| (f.key, f.value))
+            .collect())
+    }
+
+    /// Memory consolidation: hand the server the recent transcripts plus the
+    /// stored facts; it returns merge upserts and contradiction deletes for
+    /// the daemon to apply. Conservative by contract — empty arrays are the
+    /// common, correct result.
+    pub async fn consolidate(
+        &mut self,
+        transcripts: &[(String, String)],
+        facts: &[(String, String)],
+    ) -> Result<ConsolidateOutcome> {
+        let req = ConsolidateRequest {
+            id: self.fresh_id(),
+            op: "consolidate",
+            transcripts: transcripts
+                .iter()
+                .take(40) // wire contract: at most 40 exchanges
+                .map(|(user, jarvis)| TranscriptPair { user, jarvis })
+                .collect(),
+            facts: facts
+                .iter()
+                .map(|(key, value)| FactPair { key, value })
+                .collect(),
+        };
+        let resp = self
+            .request_generic(&req, "consolidate", CONSOLIDATE_TIMEOUT)
+            .await?;
+        Ok(ConsolidateOutcome {
+            upserts: resp
+                .upserts
+                .unwrap_or_default()
+                .into_iter()
+                .map(|f| (f.key, f.value))
+                .collect(),
+            deletes: resp.deletes.unwrap_or_default(),
+        })
+    }
+
+    /// Neural TTS: the server synthesizes `text` and returns the path of a WAV
+    /// under state/tmp/ for the daemon to play and delete.
+    ///
+    /// `backend` is the TTS backend the daemon already resolved for this sentence
+    /// ([`voice_tier::resolve_voice_backend`]): on-device Kokoro (the default +
+    /// fallback) or the opt-in ElevenLabs cloud voice tier. `el_key` is the
+    /// resolved ElevenLabs API key — it MUST be `Some` only when `backend` is
+    /// `ElevenLabs` (the gated cloud path) and is passed ONLY in the request body
+    /// for the server's `xi-api-key` header; it is never logged/argv/telemetry. On
+    /// ANY ElevenLabs error the SERVER falls back to Kokoro, so this never fails a
+    /// turn merely because the cloud leg failed.
+    ///
+    /// `lang` is the TARGET LANGUAGE for this sentence (Babel, build 2/2): when
+    /// present and non-English, the ElevenLabs backend selects a MULTILINGUAL model
+    /// (eleven_multilingual_v2 / eleven_v3) instead of the English-centric default.
+    /// `None` (an ordinary English reply) leaves the model selection unchanged. It is
+    /// carried on the wire only when present, so it never affects the Kokoro path or
+    /// an old server.
+    ///
+    /// `shape` is the EXPRESSIVENESS shaping (#33 prosody + #34 whisper) the daemon
+    /// resolved for this reply ([`crate::prosody::SpeakShape`]). The rich EL-v3 surface
+    /// (`audio_tag`/`stability`/`style`) rides the wire ONLY on the EL-v3 path; the
+    /// coarse `rate`/`volume` ride on every backend — but each field is carried ONLY
+    /// when it differs from the neutral default, so a NEUTRAL shape (both features off,
+    /// the shipped default) is BYTE-FOR-BYTE today's request and an old server simply
+    /// ignores the added fields.
+    pub async fn speak(
+        &mut self,
+        text: &str,
+        backend: &crate::voice_tier::Backend,
+        el_key: Option<&str>,
+        lang: Option<&str>,
+        shape: &crate::prosody::SpeakShape,
+    ) -> Result<PathBuf> {
+        use crate::voice_tier::Backend;
+        let mut req = Request::new(self.fresh_id(), "speak");
+        req.text = Some(text);
+        // Babel target language threads on BOTH backends: the EL backend uses it to
+        // pick a multilingual model; the server may also pass it to Kokoro. Omitted
+        // when absent so the default English wire is unchanged.
+        req.lang = lang.filter(|l| !l.trim().is_empty());
+        match backend {
+            Backend::Kokoro { voice } => {
+                // The exact pre-tier wire: just the Kokoro voice. `backend` is left
+                // absent so an old server sees the identical request shape.
+                req.voice = Some(voice);
+            }
+            Backend::ElevenLabs { voice_id, model } => {
+                req.backend = Some("elevenlabs");
+                req.voice_id = Some(voice_id);
+                req.model = Some(model);
+                // The key rides ONLY the request body (server -> xi-api-key header).
+                req.el_key = el_key;
+            }
+        }
+        // EXPRESSIVENESS (#33/#34): thread the shaped fields onto the request. A
+        // neutral shape (the OFF default) sets NOTHING extra -> byte-for-byte today's.
+        apply_shape_to_request(&mut req, shape);
+        let resp = self.request(&req).await?;
+        resp.path
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("speak response missing path"))
+    }
+
+    /// On-device retrieval embeddings: hand the server a batch of strings and
+    /// get back one L2-normalized vector per input, in the SAME ORDER. The
+    /// server mean-pools the resident LLM's last hidden states — no new model
+    /// download. MNEMOSYNE's [`crate::recall::NeuralEmbeddingProvider`] calls
+    /// this for cosine-similarity recall ranking. When the inference server is
+    /// down OR predates the embed op, this returns Err (unknown op / socket
+    /// unavailable) and the recall layer falls back to lexical BM25. NOT
+    /// exercised by any test (the call is runtime/MLX-gated); the ranking LOGIC
+    /// is unit-tested with injected vectors.
+    pub async fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f64>>> {
+        let mut req = Request::new(self.fresh_id(), "embed");
+        req.texts = Some(texts);
+        let resp = self.request(&req).await?;
+        let vectors = resp
+            .vectors
+            .ok_or_else(|| anyhow!("embed response missing vectors"))?;
+        if vectors.len() != texts.len() {
+            bail!(
+                "embed returned {} vectors for {} inputs",
+                vectors.len(),
+                texts.len()
+            );
+        }
+        Ok(vectors)
+    }
+
+    /// ON-DEVICE VISUAL DESCRIPTION (VLM). Hand the server a LOCAL image `path`
+    /// (the DAEMON path-confines it via canonicalize + allowed-root BEFORE this
+    /// call) and an OPTIONAL `question` (absent => a general scene description
+    /// from the server's DESCRIBE_IMAGE_DEFAULT_PROMPT). The server reads the
+    /// image ON-DEVICE and runs an mlx-vlm (Qwen2-VL-class) model — pixels NEVER
+    /// leave the machine, nothing goes to the cloud.
+    ///
+    /// Returns a [`DescribeOutcome`], NOT a bare String, because the VLM op is
+    /// DEVICE/RUNTIME-GATED: when mlx-vlm is absent, [models].vlm is empty, the
+    /// checkpoint isn't downloaded / failed to load, decode failed, or the model
+    /// produced empty output, the server replies `ok:false` with
+    /// reason=[`DESCRIBE_IMAGE_UNAVAILABLE_REASON`] — an EXPECTED outcome the
+    /// daemon reads as "unavailable" and FALLS BACK honestly (OCR/classification
+    /// or an honest "the model isn't downloaded"), NEVER a fabricated
+    /// description. A transport/socket failure (server down) is the only `Err`
+    /// here; an `ok:false` WITHOUT the unavailable reason (a caller-bug
+    /// ValueError: missing/empty path, non-string question, non-positive
+    /// max_tokens, nonexistent image) surfaces its honest message as
+    /// `Unavailable { error }` too (the daemon shows it; it is never a
+    /// description). NOT exercised against a real model by any test — the op
+    /// dispatch + the unavailable path are proven with a stub; the description
+    /// QUALITY is device-gated and never claimed measured.
+    pub async fn describe_image(
+        &mut self,
+        path: &Path,
+        question: Option<&str>,
+        max_tokens: Option<u32>,
+    ) -> Result<DescribeOutcome> {
+        let mut req = Request::new(self.fresh_id(), "describe_image");
+        req.path = Some(path.display().to_string());
+        req.question = question.filter(|q| !q.trim().is_empty());
+        // Clamp the decode budget to the shared cap so the daemon can never ask
+        // the on-device VLM for an unbounded decode; absent => the server's
+        // default (we still send the daemon default for an explicit contract).
+        req.max_tokens = Some(
+            max_tokens
+                .unwrap_or(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS)
+                .min(DESCRIBE_IMAGE_MAX_TOKENS_CAP),
+        );
+        // describe_image needs the raw Response (ok true AND false) so the
+        // structured unavailable reason survives — request_generic collapses
+        // ok:false into an opaque Err, which would lose the fall-back signal.
+        let resp = self.request_raw(&req, "describe_image", REQUEST_TIMEOUT).await?;
+        if resp.ok {
+            let text = resp
+                .text
+                .filter(|t| !t.trim().is_empty())
+                .ok_or_else(|| anyhow!("describe_image ok response missing text"))?;
+            // The model id is non-secret; default to a neutral label if an older
+            // server omits it on the ok path.
+            let model = resp.model.unwrap_or_else(|| "on-device VLM".to_string());
+            return Ok(DescribeOutcome::Available { text, model });
+        }
+        // ok:false — UNAVAILABLE or a caller-bug ValueError. Either way the
+        // daemon must NOT show a description: surface the honest server message
+        // (or a neutral default) so the caller falls back. The `reason` field
+        // distinguishes the DEVICE-GATED case (reason == the contract's
+        // DESCRIBE_IMAGE_UNAVAILABLE_REASON, "vlm_unavailable": mlx-vlm/model
+        // absent) from a caller-bug ValueError (no reason). We log it for the
+        // device-gated honest copy; the outcome is "no description, here's why"
+        // either way (never a fabricated description).
+        let device_gated = resp.reason.as_deref() == Some(DESCRIBE_IMAGE_UNAVAILABLE_REASON);
+        let error = resp.error.unwrap_or_else(|| {
+            if device_gated {
+                "the on-device vision-language model is not available".to_string()
+            } else {
+                "the image could not be described".to_string()
+            }
+        });
+        if !device_gated {
+            // A caller-bug ValueError (missing/empty path, bad question, etc.) —
+            // surfaced honestly but NOT the device-gated reason. warn so a wiring
+            // bug is visible without being read as a "model not downloaded".
+            warn!(error = %error, "describe_image rejected the request (not the device gate)");
+        }
+        Ok(DescribeOutcome::Unavailable { error })
+    }
+
+    /// ON-DEVICE TEXT->IMAGE GENERATION (task #18). Hand the server a text
+    /// `prompt` (and optional square `size` / sampling `steps` / `seed`); the
+    /// server runs an MLX diffusion (Stable-Diffusion / FLUX-schnell-class) model
+    /// ENTIRELY ON-DEVICE, saves the image under state/images/ on the machine, and
+    /// returns its ON-DEVICE path. The prompt is handed ONLY to the local model
+    /// and the generated pixels stay on the machine — image generation is 100%
+    /// on-device, with NO cloud image API anywhere on this path.
+    ///
+    /// Returns a [`GenerateOutcome`], NOT a bare path, because the op is
+    /// DEVICE/RUNTIME-GATED: when the diffusion package is absent, [image] is off /
+    /// no model is named server-side, the checkpoint isn't downloaded / failed to
+    /// load, or generation failed at runtime, the server replies `ok:false` with
+    /// reason=[`GENERATE_IMAGE_UNAVAILABLE_REASON`] — an EXPECTED outcome the daemon
+    /// surfaces HONESTLY ("the on-device image model isn't set up"), NEVER a
+    /// fabricated image and NEVER a silent cloud fallback. A transport/socket
+    /// failure (server down) is the only `Err` here; an `ok:false` WITHOUT the
+    /// unavailable reason (a caller-bug ValueError: empty prompt, non-positive
+    /// size/steps, non-int seed) surfaces its honest message as
+    /// `Unavailable { error }` too. NOT exercised against a real model by any test —
+    /// the op dispatch + the unavailable path are proven with a stub; the image
+    /// QUALITY/speed are device-gated and never claimed measured.
+    ///
+    /// `size`/`steps` are clamped to the shared bounds at the daemon boundary too
+    /// (the server clamps as well) so a caller can never ask the on-device model
+    /// for an out-of-range canvas or an unbounded sampler run. `None` lets the
+    /// server apply its defaults; `seed` is passed through only when pinned.
+    pub async fn generate_image(
+        &mut self,
+        prompt: &str,
+        size: Option<u32>,
+        steps: Option<u32>,
+        seed: Option<u32>,
+    ) -> Result<GenerateOutcome> {
+        let mut req = Request::new(self.fresh_id(), "generate_image");
+        req.prompt = Some(prompt);
+        // Clamp size/steps into the shared bounds so the daemon can never push an
+        // out-of-range canvas / unbounded sampler at the on-device model; absent
+        // => the server applies its own default + clamp.
+        req.size = size.map(|s| s.clamp(GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_MAX_SIZE));
+        req.steps = steps.map(|s| s.clamp(1, GENERATE_IMAGE_MAX_STEPS_CAP));
+        req.seed = seed;
+        // generate_image needs the raw Response (ok true AND false) so the
+        // structured unavailable reason survives — request_generic collapses
+        // ok:false into an opaque Err, which would lose the honest "image model
+        // isn't set up" signal (and could read as a transport failure).
+        let resp = self.request_raw(&req, "generate_image", REQUEST_TIMEOUT).await?;
+        if resp.ok {
+            let path = resp
+                .path
+                .filter(|p| !p.trim().is_empty())
+                .map(PathBuf::from)
+                .ok_or_else(|| anyhow!("generate_image ok response missing path"))?;
+            // The model id is non-secret; default to a neutral label if an older
+            // server omits it on the ok path. size/steps/seed are NON-secret
+            // metadata; default to the daemon defaults if absent.
+            let model = resp.model.unwrap_or_else(|| "on-device diffusion".to_string());
+            return Ok(GenerateOutcome::Available {
+                path,
+                model,
+                size: resp.size.unwrap_or(GENERATE_IMAGE_DEFAULT_SIZE),
+                steps: resp.steps.unwrap_or(GENERATE_IMAGE_DEFAULT_STEPS),
+                seed: resp.seed.unwrap_or(0),
+            });
+        }
+        // ok:false — UNAVAILABLE or a caller-bug ValueError. Either way the daemon
+        // must NOT show an image: surface the honest server message (or a neutral
+        // default) so the caller renders the honest "not set up" copy. The `reason`
+        // field distinguishes the DEVICE-GATED case (reason == the contract's
+        // GENERATE_IMAGE_UNAVAILABLE_REASON) from a caller-bug ValueError (no
+        // reason). NEVER a fabricated image, NEVER a cloud fallback.
+        let device_gated = resp.reason.as_deref() == Some(GENERATE_IMAGE_UNAVAILABLE_REASON);
+        let error = resp.error.unwrap_or_else(|| {
+            if device_gated {
+                "the on-device image-generation model is not available".to_string()
+            } else {
+                "the image could not be generated".to_string()
+            }
+        });
+        if !device_gated {
+            // A caller-bug ValueError (empty prompt, non-positive size/steps,
+            // non-int seed) — surfaced honestly but NOT the device-gated reason.
+            warn!(error = %error, "generate_image rejected the request (not the device gate)");
+        }
+        Ok(GenerateOutcome::Unavailable { error })
+    }
+
+    /// Streamed generate+TTS in one request. Sentence events are pushed into
+    /// `events` the moment the server synthesizes them — the caller plays
+    /// them while the model is still decoding — and the matching done event
+    /// resolves this future. Errors after sentences were emitted are final
+    /// (the caller keeps what already played); a transport error before any
+    /// event gets the same single stale-connection retry as `request`.
+    /// `opener_spoken` is the acknowledgment line already played aloud, when
+    /// one fired (no-double-ack contract).
+    #[allow(clippy::too_many_arguments)] // mirrors the wire request shape
+    pub async fn converse(
+        &mut self,
+        text: &str,
+        max_tokens: u32,
+        history: &[(String, String)],
+        facts: &[String],
+        data: Option<&str>,
+        voice: &str,
+        opener_spoken: Option<&str>,
+        persona: Option<&str>,
+        local_model: Option<&str>,
+        events: mpsc::UnboundedSender<SentenceEvent>,
+    ) -> Result<ConverseDone> {
+        let turns: Vec<HistoryTurn> = history
+            .iter()
+            .flat_map(|(user, jarvis)| {
+                [
+                    HistoryTurn { speaker: "user", text: user },
+                    HistoryTurn { speaker: "jarvis", text: jarvis },
+                ]
+            })
+            .collect();
+        let mut req = Request::new(self.fresh_id(), "converse");
+        req.text = Some(text);
+        req.max_tokens = Some(max_tokens);
+        req.voice = Some(voice);
+        req.history = if turns.is_empty() { None } else { Some(turns) };
+        req.facts = if facts.is_empty() { None } else { Some(facts) };
+        req.data = data.filter(|d| !d.is_empty());
+        req.opener_spoken = opener_spoken.filter(|o| !o.is_empty());
+        req.persona = persona.filter(|p| !p.is_empty());
+        // Multi-resident LOCAL sub-choice (task #17): the warm local model the
+        // Local tier picked. Carried only when present so the default
+        // single-resident wire is unchanged and an old server ignores it.
+        req.local_model = local_model.filter(|m| !m.trim().is_empty());
+
+        for attempt in 0..2 {
+            self.ensure_connected().await?;
+            let mut emitted = 0u64;
+            match self.converse_roundtrip(&req, &events, &mut emitted).await {
+                Ok(ConverseOutcome::Done(done)) => return Ok(done),
+                Ok(ConverseOutcome::ServerFail(msg)) => {
+                    return Err(anyhow!("inference converse failed: {msg}"));
+                }
+                Err(e) => {
+                    self.conn = None;
+                    // Retrying after sentences were handed out would speak
+                    // them twice; only a clean pre-stream failure (stale
+                    // socket from a restarted server) is retried.
+                    if emitted > 0 || attempt == 1 {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        unreachable!("converse retry loop returns on its second attempt")
+    }
+
+    /// Write one converse request and pump its multi-line response, sending
+    /// sentence events to the caller as they arrive. `emitted` counts the
+    /// sentences pushed so far even when this returns Err.
+    async fn converse_roundtrip(
+        &mut self,
+        req: &Request<'_>,
+        events: &mpsc::UnboundedSender<SentenceEvent>,
+        emitted: &mut u64,
+    ) -> Result<ConverseOutcome> {
+        let (reader, writer) = self.conn.as_mut().expect("connection established by caller");
+        let mut line = serde_json::to_string(req)?;
+        line.push('\n');
+        writer.write_all(line.as_bytes()).await?;
+        writer.flush().await?;
+
+        // Rolling deadline (audit fix): the done budget counts time since
+        // the LAST received line, not the whole stream — when the afplay
+        // degrade rung plays clips inline, the converse future goes unpolled
+        // for whole clip durations and an absolute budget would discard a
+        // done line that is already sitting in the socket buffer. The check
+        // also runs only AFTER a read attempt, so a buffered line is always
+        // drained before any timeout fires.
+        let mut deadline = tokio::time::Instant::now() + CONVERSE_DONE_TIMEOUT;
+        let mut buf = String::new();
+        loop {
+            // Never sleep past the rolling deadline, but always grant a
+            // short window so an already-buffered line is read, not dropped.
+            let per_read = CONVERSE_EVENT_TIMEOUT
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
+                .max(Duration::from_millis(50));
+            buf.clear();
+            let read = tokio::time::timeout(per_read, reader.read_line(&mut buf)).await;
+            let now = tokio::time::Instant::now();
+            let n = match read {
+                Ok(result) => result?,
+                Err(_) if now >= deadline => bail!(
+                    "converse timed out after {}s without a done event",
+                    CONVERSE_DONE_TIMEOUT.as_secs()
+                ),
+                Err(_) => bail!(
+                    "converse stream stalled (no event within {}s)",
+                    per_read.as_secs()
+                ),
+            };
+            if n == 0 {
+                bail!("inference server closed the connection mid-converse");
+            }
+            // Any well-formed line is progress: reset the done budget.
+            deadline = now + CONVERSE_DONE_TIMEOUT;
+            let msg: ConverseLine =
+                serde_json::from_str(buf.trim()).context("malformed converse line")?;
+            if msg.id != req.id {
+                warn!(got = %msg.id, want = %req.id, "converse: mismatched response id; skipping line");
+                continue;
+            }
+            match msg.event.as_deref() {
+                Some("sentence") => {
+                    let (Some(text), Some(path)) = (msg.text, msg.path) else {
+                        bail!("converse sentence event missing text/path");
+                    };
+                    let seq = msg.seq.unwrap_or(*emitted);
+                    *emitted += 1;
+                    // A dropped receiver means the caller stopped playing;
+                    // keep reading to done so the connection stays in sync.
+                    let _ = events.send(SentenceEvent {
+                        seq,
+                        text,
+                        path: PathBuf::from(path),
+                    });
+                }
+                Some("done") => {
+                    return if msg.ok == Some(true) {
+                        Ok(ConverseOutcome::Done(ConverseDone {
+                            text: msg.text.unwrap_or_default(),
+                        }))
+                    } else {
+                        Ok(ConverseOutcome::ServerFail(
+                            msg.error.unwrap_or_else(|| "unknown error".to_string()),
+                        ))
+                    };
+                }
+                other => {
+                    warn!(event = ?other, "converse: unexpected event; ignoring line");
+                }
+            }
+        }
+    }
+
+    fn fresh_id(&mut self) -> String {
+        self.next_id += 1;
+        format!("req-{}", self.next_id)
+    }
+
+    async fn ensure_connected(&mut self) -> Result<()> {
+        if self.conn.is_none() {
+            let stream = UnixStream::connect(&self.socket_path)
+                .await
+                .with_context(|| {
+                    format!(
+                        "inference socket unavailable at {}",
+                        self.socket_path.display()
+                    )
+                })?;
+            let (r, w) = stream.into_split();
+            self.conn = Some((BufReader::new(r), w));
+        }
+        Ok(())
+    }
+
+    async fn request(&mut self, req: &Request<'_>) -> Result<Response> {
+        let op = req.op;
+        self.request_generic(req, op, REQUEST_TIMEOUT).await
+    }
+
+    /// One-line-out, one-line-in round trip for any serializable request
+    /// shape (the flat Request struct, ConsolidateRequest, ...). `timeout`
+    /// is per attempt: the interactive ops keep the shared 30s ceiling,
+    /// consolidate gets its own generous one.
+    async fn request_generic<T: Serialize>(
+        &mut self,
+        req: &T,
+        op: &str,
+        timeout: Duration,
+    ) -> Result<Response> {
+        // One retry: a stale connection left over from a restarted inference
+        // server fails fast, so reconnect once before reporting failure.
+        let mut last_err = None;
+        for _ in 0..2 {
+            self.ensure_connected().await?;
+            match tokio::time::timeout(timeout, self.roundtrip(req)).await {
+                Ok(Ok(resp)) => {
+                    if resp.ok {
+                        return Ok(resp);
+                    }
+                    return Err(anyhow!(
+                        "inference {} failed: {}",
+                        op,
+                        resp.error.unwrap_or_else(|| "unknown error".to_string())
+                    ));
+                }
+                Ok(Err(e)) => {
+                    self.conn = None;
+                    last_err = Some(e);
+                }
+                Err(_) => {
+                    self.conn = None;
+                    return Err(anyhow!(
+                        "inference {} timed out after {}s",
+                        op,
+                        timeout.as_secs()
+                    ));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("inference request failed")))
+    }
+
+    /// Like [`request_generic`] but returns the RAW [`Response`] WITHOUT
+    /// collapsing `ok:false` into an `Err`. Used by describe_image, whose
+    /// `ok:false + reason` is a FIRST-CLASS unavailable outcome the caller must
+    /// inspect to fall back honestly (not an opaque failure). The same single
+    /// stale-connection retry applies to a transport error; a well-formed
+    /// response (ok true OR false) is returned as-is. An `Err` here means the
+    /// socket itself failed (server down) — never a server-reported `ok:false`.
+    async fn request_raw<T: Serialize>(
+        &mut self,
+        req: &T,
+        op: &str,
+        timeout: Duration,
+    ) -> Result<Response> {
+        let mut last_err = None;
+        for _ in 0..2 {
+            self.ensure_connected().await?;
+            match tokio::time::timeout(timeout, self.roundtrip(req)).await {
+                // A well-formed line — ok true OR false — is the caller's to read.
+                Ok(Ok(resp)) => return Ok(resp),
+                Ok(Err(e)) => {
+                    self.conn = None;
+                    last_err = Some(e);
+                }
+                Err(_) => {
+                    self.conn = None;
+                    return Err(anyhow!(
+                        "inference {} timed out after {}s",
+                        op,
+                        timeout.as_secs()
+                    ));
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow!("inference request failed")))
+    }
+
+    async fn roundtrip<T: Serialize>(&mut self, req: &T) -> Result<Response> {
+        let (reader, writer) = self.conn.as_mut().expect("connection established above");
+        let mut line = serde_json::to_string(req)?;
+        line.push('\n');
+        writer.write_all(line.as_bytes()).await?;
+        writer.flush().await?;
+
+        let mut buf = String::new();
+        let n = reader.read_line(&mut buf).await?;
+        if n == 0 {
+            bail!("inference server closed the connection");
+        }
+        let resp: Response =
+            serde_json::from_str(buf.trim()).context("malformed inference response")?;
+        Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        apply_shape_to_request, Classification, ConsolidateRequest, FactPair, Request, Response,
+        TranscriptPair, CONSOLIDATE_TIMEOUT, DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS,
+        DESCRIBE_IMAGE_MAX_TOKENS_CAP, DESCRIBE_IMAGE_UNAVAILABLE_REASON, GENERATE_IMAGE_DEFAULT_SIZE,
+        GENERATE_IMAGE_DEFAULT_STEPS, GENERATE_IMAGE_MAX_SIZE, GENERATE_IMAGE_MAX_STEPS_CAP,
+        GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_UNAVAILABLE_REASON, REQUEST_TIMEOUT,
+    };
+    use serde_json::json;
+
+    /// Converse wire contract for the per-agent persona: when set, the request
+    /// carries a "persona" string (the agent NAME the server maps to
+    /// inference/personas/<name>.txt). When absent it is omitted entirely, so
+    /// an old server sees the exact same shape it always did (backward compat).
+    #[test]
+    fn converse_request_carries_optional_persona() {
+        let mut req = Request::new("req-1".to_string(), "converse");
+        req.text = Some("hello");
+        req.voice = Some("bf_emma");
+        req.persona = Some("friday");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "converse");
+        assert_eq!(v["voice"], "bf_emma");
+        assert_eq!(v["persona"], "friday", "persona name must reach the wire");
+
+        // Absent persona is omitted, not null — old servers never see the key.
+        let mut bare = Request::new("req-2".to_string(), "converse");
+        bare.text = Some("hello");
+        let bv = serde_json::to_value(&bare).unwrap();
+        assert!(bv.get("persona").is_none(), "persona must be omitted when unset");
+    }
+
+    /// Multi-resident LOCAL wire contract (task #17): when the Local tier picked a
+    /// warm local model the generate/converse request carries a "local_model"
+    /// string (the warm-set id). When absent it is OMITTED entirely, so the default
+    /// single-resident wire is identical to today and an old server (no manager)
+    /// simply ignores it and answers on the base. Mirrors the persona contract.
+    #[test]
+    fn request_carries_optional_local_model() {
+        // Present -> on the wire.
+        let mut req = Request::new("g-1".to_string(), "generate");
+        req.text = Some("hi");
+        req.local_model = Some("fast-0.6b-4bit");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "generate");
+        assert_eq!(
+            v["local_model"], "fast-0.6b-4bit",
+            "the warm local model id must reach the wire"
+        );
+
+        // Absent -> omitted, not null (the single-resident default wire).
+        let mut bare = Request::new("g-2".to_string(), "converse");
+        bare.text = Some("hi");
+        let bv = serde_json::to_value(&bare).unwrap();
+        assert!(
+            bv.get("local_model").is_none(),
+            "local_model must be omitted when unset (default single-resident wire)"
+        );
+    }
+
+    /// speak wire contract — Kokoro path (the default + fallback). The request
+    /// carries ONLY {op, text, voice}: NO backend/voice_id/model/el_key fields, so
+    /// an old server sees the EXACT pre-tier shape and behaves identically. This is
+    /// what every turn sends with the cloud voice tier OFF.
+    #[test]
+    fn speak_request_kokoro_is_the_pre_tier_shape() {
+        let mut req = Request::new("s-1".to_string(), "speak");
+        req.text = Some("hello there");
+        req.voice = Some("bm_george");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "speak");
+        assert_eq!(v["text"], "hello there");
+        assert_eq!(v["voice"], "bm_george");
+        // None of the cloud-tier fields appear on the Kokoro wire.
+        for absent in ["backend", "voice_id", "model", "el_key"] {
+            assert!(v.get(absent).is_none(), "{absent} must be omitted on the Kokoro path");
+        }
+    }
+
+    /// speak wire contract — ElevenLabs path (the gated cloud voice tier). The
+    /// request adds {backend:"elevenlabs", voice_id, model, el_key}; the daemon only
+    /// builds this after the tier decision cleared the full gate. The key rides ONLY
+    /// the request body (the server sets the xi-api-key header from it). `voice`
+    /// (the Kokoro voice) is NOT set on this path.
+    #[test]
+    fn speak_request_elevenlabs_carries_backend_voice_model_and_key() {
+        let mut req = Request::new("s-2".to_string(), "speak");
+        req.text = Some("hello there");
+        req.backend = Some("elevenlabs");
+        req.voice_id = Some("EL_VOICE_ID");
+        req.model = Some("eleven_flash_v2_5");
+        req.el_key = Some("sk-secret-key");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "speak");
+        assert_eq!(v["backend"], "elevenlabs");
+        assert_eq!(v["voice_id"], "EL_VOICE_ID");
+        assert_eq!(v["model"], "eleven_flash_v2_5");
+        assert_eq!(v["el_key"], "sk-secret-key", "key reaches the server in the body only");
+        // The Kokoro voice field is not used on the ElevenLabs path.
+        assert!(v.get("voice").is_none(), "voice (Kokoro) must be omitted on the EL path");
+    }
+
+    /// The ElevenLabs key is carried ONLY in `el_key` and ONLY when present — it is
+    /// never folded into any other field, and on the Kokoro path it is omitted
+    /// entirely. (Key-hygiene at the wire boundary; the Debug-never-leaks property
+    /// of the Backend enum is proven in voice_tier.rs.)
+    #[test]
+    fn speak_key_field_is_omitted_when_absent() {
+        // ElevenLabs backend chosen but no key supplied (the server then falls back
+        // to Kokoro): el_key must be absent, never null/empty placeholder.
+        let mut req = Request::new("s-3".to_string(), "speak");
+        req.text = Some("hi");
+        req.backend = Some("elevenlabs");
+        req.voice_id = Some("EL");
+        req.model = Some("eleven_flash_v2_5");
+        req.el_key = None;
+        let v = serde_json::to_value(&req).unwrap();
+        assert!(v.get("el_key").is_none(), "no key field when the key is absent");
+        // The serialized line never contains the literal account name either.
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(!line.contains("elevenlabs_api_key"), "the Keychain account name never rides the wire");
+    }
+
+    // === #33/#34 EXPRESSIVENESS wire shaping (prosody + whisper) ============
+    // These exercise the SAME `apply_shape_to_request` the live `speak` path calls,
+    // asserting the produced request struct/JSON — NO audio playback, NO EL call, NO
+    // mic. The SpeakShape values come from the real `prosody` shaper/whisper folder.
+
+    use crate::config::Config;
+    use crate::prosody::{
+        apply_whisper, classify_prosody, shape_speak_request, ReplyKind, SpeakShape,
+        ELEVENLABS_V3_MODEL,
+    };
+    use crate::voice_tier::Backend;
+
+    fn cfg_prosody_on() -> Config {
+        let mut c = Config::default();
+        c.voice.adaptive_prosody = true;
+        c
+    }
+    fn el_v3() -> Backend {
+        Backend::ElevenLabs { voice_id: "EL".into(), model: ELEVENLABS_V3_MODEL.into() }
+    }
+    fn kokoro() -> Backend {
+        Backend::Kokoro { voice: "bm_george".into() }
+    }
+
+    /// Build the speak request EXACTLY as `InferenceClient::speak` does (ElevenLabs
+    /// arm), then apply the shape — so the test asserts the real wire the daemon
+    /// sends. No client/socket needed.
+    fn el_speak_req_with(shape: &SpeakShape) -> serde_json::Value {
+        let mut req = Request::new("s-x".to_string(), "speak");
+        req.text = Some("hello there");
+        req.backend = Some("elevenlabs");
+        req.voice_id = Some("EL");
+        req.model = Some(ELEVENLABS_V3_MODEL);
+        apply_shape_to_request(&mut req, shape);
+        serde_json::to_value(&req).unwrap()
+    }
+    fn kokoro_speak_req_with(shape: &SpeakShape) -> serde_json::Value {
+        let mut req = Request::new("s-y".to_string(), "speak");
+        req.text = Some("hello there");
+        req.voice = Some("bm_george");
+        apply_shape_to_request(&mut req, shape);
+        serde_json::to_value(&req).unwrap()
+    }
+
+    /// (a) adaptive_prosody ON + EL-v3: an Urgent (Alert) reply carries the
+    /// `[urgently]` audio-tag + stability/style; a Calm (Wellness) reply the `[calm]`
+    /// tag. The rich surface rides the wire only on this v3 path.
+    #[test]
+    fn prosody_on_el_v3_request_carries_audio_tag_and_v3_settings() {
+        let cfg = cfg_prosody_on();
+        // Urgent (an alert/heal/urgent telemetry reply -> Alert -> Urgent).
+        let urgent = shape_speak_request(&cfg, classify_prosody(ReplyKind::Alert, false), &el_v3());
+        let v = el_speak_req_with(&urgent);
+        assert_eq!(v["audio_tag"], "[urgently]");
+        assert!(v["stability"].is_number() && v["style"].is_number(), "v3 carries stability+style");
+        // Calm (a wellness/biometric reply -> Wellness -> Calm).
+        let calm = shape_speak_request(&cfg, classify_prosody(ReplyKind::Wellness, false), &el_v3());
+        let vc = el_speak_req_with(&calm);
+        assert_eq!(vc["audio_tag"], "[calm]");
+    }
+
+    /// (b) adaptive_prosody ON + Kokoro: ONLY a coarse rate rides the wire — NO
+    /// audio-tag, NO v3 settings (rich prosody is EL-v3-gated and never faked).
+    #[test]
+    fn prosody_on_kokoro_request_carries_only_coarse_rate_no_tag() {
+        let cfg = cfg_prosody_on();
+        let urgent = shape_speak_request(&cfg, classify_prosody(ReplyKind::Alert, false), &kokoro());
+        let v = kokoro_speak_req_with(&urgent);
+        assert!(v.get("audio_tag").is_none(), "no faked audio-tag on Kokoro");
+        assert!(v.get("stability").is_none() && v.get("style").is_none(), "no v3 settings on Kokoro");
+        assert!(v["rate"].is_number(), "the one coarse signal Kokoro gets is rate");
+        assert!(v["rate"].as_f64().unwrap() > 1.0, "Urgent nudges the coarse rate up");
+    }
+
+    /// (c) whisper ON -> the request carries the lowered volume (terse is a
+    /// reply-builder flag, not a wire field); whisper OFF -> byte-for-byte today's
+    /// (no rate/volume/tag added on a Neutral routine reply).
+    #[test]
+    fn whisper_on_request_lowers_volume_off_is_byte_for_byte() {
+        let cfg = cfg_prosody_on();
+        // Routine reply (Neutral profile) on EL-v3, whisper ENGAGED.
+        let base = shape_speak_request(&cfg, classify_prosody(ReplyKind::Routine, false), &el_v3());
+        let whispered = apply_whisper(base.clone(), /*whisper_on=*/ true, /*required=*/ false);
+        let v = el_speak_req_with(&whispered);
+        assert!(v["volume"].is_number(), "whisper lowers the volume on the wire");
+        assert!(v["volume"].as_f64().unwrap() < 1.0);
+        // Whisper does NOT invent an audio-tag.
+        assert!(v.get("audio_tag").is_none());
+        // Whisper OFF on the same Neutral routine reply -> NOTHING extra on the wire.
+        let off = apply_whisper(base, false, false);
+        let vo = el_speak_req_with(&off);
+        for absent in ["audio_tag", "stability", "style", "rate", "volume"] {
+            assert!(vo.get(absent).is_none(), "whisper-off Neutral reply must omit {absent}");
+        }
+    }
+
+    /// (d) a REQUIRED confirmation is NOT softened/silenced even while whispering: the
+    /// request keeps full volume (no `volume` field) and no terse trimming.
+    #[test]
+    fn whisper_never_softens_a_required_confirmation_on_the_wire() {
+        let cfg = cfg_prosody_on();
+        // required_confirm=true -> classify stays Neutral; apply_whisper leaves it
+        // full-volume even with whisper engaged.
+        let shape = shape_speak_request(&cfg, classify_prosody(ReplyKind::Alert, true), &el_v3());
+        let guarded = apply_whisper(shape, /*whisper_on=*/ true, /*required=*/ true);
+        let v = el_speak_req_with(&guarded);
+        assert!(v.get("volume").is_none(), "a required confirm must stay full-volume on the wire");
+        assert!(v.get("audio_tag").is_none(), "a required confirm is delivered plainly");
+        assert!(!guarded.terse, "a required confirm is never trimmed");
+    }
+
+    /// (e) FEATURE OFF (the shipped default): the speak request is BYTE-FOR-BYTE
+    /// today's on every backend — the shape is the identity and adds nothing.
+    #[test]
+    fn prosody_off_speak_request_is_byte_for_byte_today() {
+        let cfg = Config::default(); // adaptive_prosody = false, whisper = false
+        for kind in [ReplyKind::Routine, ReplyKind::Alert, ReplyKind::Wellness, ReplyKind::Greeting] {
+            for backend in [el_v3(), kokoro()] {
+                let shape = shape_speak_request(&cfg, classify_prosody(kind, false), &backend);
+                let folded = apply_whisper(shape, /*whisper_on=*/ false, false);
+                assert!(folded.is_neutral(), "off path must be the identity shape");
+                // The reference request WITHOUT any shaping, vs WITH the neutral shape:
+                // they must be identical JSON (byte-for-byte today's wire).
+                let mut bare = Request::new("ref".to_string(), "speak");
+                let mut shaped = Request::new("ref".to_string(), "speak");
+                match &backend {
+                    Backend::ElevenLabs { voice_id, model } => {
+                        for r in [&mut bare, &mut shaped] {
+                            r.text = Some("hello");
+                            r.backend = Some("elevenlabs");
+                            r.voice_id = Some(voice_id);
+                            r.model = Some(model);
+                        }
+                    }
+                    Backend::Kokoro { voice } => {
+                        for r in [&mut bare, &mut shaped] {
+                            r.text = Some("hello");
+                            r.voice = Some(voice);
+                        }
+                    }
+                }
+                apply_shape_to_request(&mut shaped, &folded);
+                assert_eq!(
+                    serde_json::to_value(&bare).unwrap(),
+                    serde_json::to_value(&shaped).unwrap(),
+                    "feature OFF must be byte-for-byte today's request for {kind:?} on {backend:?}"
+                );
+            }
+        }
+    }
+
+    /// SpeakShape::neutral() (the identity) must add NOTHING to the request — the
+    /// invariant the whole OFF-default byte-for-byte guarantee rests on.
+    #[test]
+    fn neutral_shape_adds_nothing_to_the_request() {
+        let v = el_speak_req_with(&SpeakShape::neutral());
+        for absent in ["audio_tag", "stability", "style", "rate", "volume"] {
+            assert!(v.get(absent).is_none(), "neutral shape must omit {absent}");
+        }
+    }
+
+    /// transcribe wire contract — Whisper path (the default + fallback). The request
+    /// carries ONLY {op, path}: NO backend/model/el_key fields, so an old server sees
+    /// the EXACT pre-tier shape and the user's audio stays on-device. This is what
+    /// every turn sends with the cloud-STT tier OFF (the pinned default).
+    #[test]
+    fn transcribe_request_whisper_is_the_pre_tier_shape() {
+        let mut req = Request::new("t-1".to_string(), "transcribe");
+        req.path = Some("/tmp/utt.wav".to_string());
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "transcribe");
+        assert_eq!(v["path"], "/tmp/utt.wav");
+        for absent in ["backend", "model", "el_key", "lang", "voice"] {
+            assert!(v.get(absent).is_none(), "{absent} must be omitted on the whisper path");
+        }
+    }
+
+    /// transcribe wire contract — ElevenLabs Scribe path (the gated cloud-STT tier).
+    /// The request adds {backend:"elevenlabs_scribe", model, el_key}; the daemon only
+    /// builds this after the tier decision cleared the full gate. The key rides ONLY
+    /// the request body (the server sets the xi-api-key header from it). HONESTY: on
+    /// this path the user's VOICE AUDIO (the wav at `path`) leaves the device.
+    #[test]
+    fn transcribe_request_scribe_carries_backend_model_and_key() {
+        let mut req = Request::new("t-2".to_string(), "transcribe");
+        req.path = Some("/tmp/utt.wav".to_string());
+        req.backend = Some("elevenlabs_scribe");
+        req.model = Some("scribe_v1");
+        req.el_key = Some("sk-secret-key");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "transcribe");
+        assert_eq!(v["backend"], "elevenlabs_scribe");
+        assert_eq!(v["model"], "scribe_v1");
+        assert_eq!(v["el_key"], "sk-secret-key", "key reaches the server in the body only");
+        // The serialized line never contains the literal account name.
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(!line.contains("elevenlabs_api_key"), "the Keychain account name never rides the wire");
+    }
+
+    /// clone_voice wire contract — the consent-gated clone seam. The request carries
+    /// {op:"clone_voice", path (the owner sample), text (the display name), el_key}.
+    /// The audio SAMPLE at `path` is what leaves the device; the key rides ONLY the
+    /// body. The voice_id comes back in the response (NON-secret), and the account
+    /// name never appears on the wire.
+    #[test]
+    fn clone_voice_request_carries_sample_name_and_key_only() {
+        let mut req = Request::new("c-1".to_string(), "clone_voice");
+        req.path = Some("/root/state/voiceid/owner.wav".to_string());
+        req.text = Some("JARVIS cloned voice (jarvis)");
+        req.el_key = Some("sk-secret-key");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "clone_voice");
+        assert_eq!(v["path"], "/root/state/voiceid/owner.wav");
+        assert_eq!(v["text"], "JARVIS cloned voice (jarvis)");
+        assert_eq!(v["el_key"], "sk-secret-key");
+        let line = serde_json::to_string(&req).unwrap();
+        assert!(!line.contains("elevenlabs_api_key"), "the Keychain account name never rides the wire");
+
+        // The clone response carries a NON-secret voice_id; non-clone responses don't.
+        let cloned = serde_json::from_str::<Response>(
+            r#"{"id":"c-1","ok":true,"voice_id":"EL_CLONED_ID","latency_ms":900}"#,
+        )
+        .unwrap();
+        assert_eq!(cloned.voice_id.as_deref(), Some("EL_CLONED_ID"));
+        let other = serde_json::from_str::<Response>(
+            r#"{"id":"req-1","ok":true,"text":"hi","latency_ms":3}"#,
+        )
+        .unwrap();
+        assert!(other.voice_id.is_none(), "voice_id is absent on non-clone responses");
+    }
+
+    /// speak wire contract — Babel target language (build 2/2). The `lang` field
+    /// rides the speak request ONLY when present + non-empty, so the EL backend can
+    /// pick a multilingual model; an English/absent target omits it entirely (the
+    /// default wire is unchanged). NON-secret (a language name).
+    #[test]
+    fn speak_request_carries_target_language_only_when_present() {
+        // Babel non-English: the lang field reaches the wire alongside the EL fields.
+        let mut req = Request::new("s-4".to_string(), "speak");
+        req.text = Some("Hola");
+        req.backend = Some("elevenlabs");
+        req.voice_id = Some("EL_VOICE");
+        req.model = Some("eleven_multilingual_v2");
+        req.lang = Some("Spanish");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["lang"], "Spanish", "the Babel target language must reach the wire");
+
+        // Ordinary English reply: no lang field at all.
+        let mut eng = Request::new("s-5".to_string(), "speak");
+        eng.text = Some("Hello there");
+        eng.voice = Some("bm_george");
+        let ev = serde_json::to_value(&eng).unwrap();
+        assert!(ev.get("lang").is_none(), "lang must be omitted on an English reply");
+    }
+
+    /// Audit fix: consolidate is the largest generation in the system and
+    /// shares the server's engine lock with live replies — its budget must
+    /// dwarf the interactive ceiling, not equal it.
+    #[test]
+    fn consolidate_gets_its_own_generous_timeout() {
+        assert!(CONSOLIDATE_TIMEOUT.as_secs() >= 120);
+        assert!(CONSOLIDATE_TIMEOUT > REQUEST_TIMEOUT * 2);
+    }
+
+    /// Backward compat: an old server's classify response carries no args
+    /// field at all — it must deserialize with the default (Null), which the
+    /// router treats as "no args".
+    #[test]
+    fn classification_args_default_on_old_server_responses() {
+        let c: Classification = serde_json::from_str(
+            r#"{"intent":"app.launch","confidence":0.92,"complexity":"light"}"#,
+        )
+        .unwrap();
+        assert_eq!(c.args, serde_json::Value::Null);
+        assert!(c.args.get("url").is_none());
+
+        // The full wire Response shape, also argless.
+        let resp: Response = serde_json::from_str(
+            r#"{"id":"req-1","ok":true,"intent":"system.query","confidence":0.95,"complexity":"light","latency_ms":12}"#,
+        )
+        .unwrap();
+        assert!(resp.args.is_none());
+    }
+
+    /// #31 DIARIZATION wire contract: a transcribe response that carries a Scribe
+    /// `words` stream (with speaker_ids) deserializes onto `Response.words`, and feeding
+    /// it through the PURE `diarize::diarize` mapper yields the REAL per-speaker turns —
+    /// this is the live seam `transcribe_diarized` returns. An OLD server / the whisper
+    /// path carries NO `words` field, which must default to None (the daemon then renders
+    /// the honest single stream, never a fabricated speaker).
+    #[test]
+    fn transcribe_response_words_stream_flows_to_diarize() {
+        // EL-Scribe diarized: two speakers in the per-word stream.
+        let resp: Response = serde_json::from_str(
+            r#"{"id":"t-9","ok":true,"text":"hello hi",
+                "words":[
+                    {"text":"hello","type":"word","speaker_id":"speaker_0","start":0.0,"end":0.4},
+                    {"text":"hi","type":"word","speaker_id":"speaker_1","start":0.5,"end":0.7}
+                ],
+                "latency_ms":20}"#,
+        )
+        .unwrap();
+        let words = resp.words.clone().expect("scribe words present on the response");
+        assert_eq!(words.len(), 2);
+        let scribe = crate::diarize::ScribeResponse { text: resp.text.clone().unwrap(), words };
+        let turns = crate::diarize::diarize(&scribe);
+        assert_eq!(turns.len(), 2, "two distinct speakers -> two turns");
+        assert_eq!(turns[0].speaker_id, "speaker_0");
+        assert_eq!(turns[1].speaker_id, "speaker_1");
+        assert!(crate::diarize::is_multi_speaker(&turns), "real Scribe labels, multi-speaker");
+
+        // Old server / whisper path: no `words` field at all -> None (honest single
+        // stream is the daemon's fallback, never a fabricated speaker).
+        let plain: Response = serde_json::from_str(
+            r#"{"id":"t-10","ok":true,"text":"what is the time","latency_ms":11}"#,
+        )
+        .unwrap();
+        assert!(plain.words.is_none(), "absent words must default to None (whisper/old server)");
+    }
+
+    /// New servers pass the model's args object through verbatim.
+    #[test]
+    fn classification_args_pass_through_when_present() {
+        let c: Classification = serde_json::from_str(
+            r#"{"intent":"web.open","confidence":0.9,"complexity":"light","args":{"url":"apple.com","browser":"safari"}}"#,
+        )
+        .unwrap();
+        assert_eq!(c.args["url"], "apple.com");
+        assert_eq!(c.args["browser"], "safari");
+    }
+
+    /// Shared wire contract for op=consolidate: the request must serialize
+    /// exactly as the server parses it.
+    #[test]
+    fn consolidate_request_serializes_to_the_wire_shape() {
+        let req = ConsolidateRequest {
+            id: "req-7".to_string(),
+            op: "consolidate",
+            transcripts: vec![TranscriptPair {
+                user: "my name is Darwin",
+                jarvis: "Noted, sir.",
+            }],
+            facts: vec![FactPair {
+                key: "user.name",
+                value: "Darwin",
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            json!({
+                "id": "req-7",
+                "op": "consolidate",
+                "transcripts": [{"user": "my name is Darwin", "jarvis": "Noted, sir."}],
+                "facts": [{"key": "user.name", "value": "Darwin"}],
+            })
+        );
+    }
+
+    /// Wire contract for op=embed: the request carries op="embed" and the
+    /// "texts" batch (and nothing else — no text/path/voice keys leak in), so
+    /// the server parses exactly what the daemon sends. A server WITHOUT the
+    /// embed op rejects this as an unknown op, which the recall layer reads as
+    /// "embedder unavailable" and falls back to BM25.
+    #[test]
+    fn embed_request_serializes_to_the_wire_shape() {
+        let texts = vec!["my car".to_string(), "user.car blue Subaru".to_string()];
+        let mut req = Request::new("req-9".to_string(), "embed");
+        req.texts = Some(&texts);
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "embed");
+        assert_eq!(v["texts"][0], "my car");
+        assert_eq!(v["texts"][1], "user.car blue Subaru");
+        // Unrelated fields stay omitted so an old server sees a clean shape.
+        assert!(v.get("text").is_none());
+        assert!(v.get("path").is_none());
+        assert!(v.get("voice").is_none());
+    }
+
+    /// Backward compat / forward compat: the embed response carries a "vectors"
+    /// array (one L2-normalized vector per input); ops that don't return it
+    /// deserialize with vectors == None, and a present array round-trips.
+    #[test]
+    fn embed_response_vectors_round_trip_and_default() {
+        let with = serde_json::from_str::<Response>(
+            r#"{"id":"req-9","ok":true,"vectors":[[0.1,0.2],[0.3,0.4]],"latency_ms":7}"#,
+        )
+        .unwrap();
+        let vecs = with.vectors.expect("vectors present");
+        assert_eq!(vecs.len(), 2);
+        assert_eq!(vecs[0], vec![0.1, 0.2]);
+
+        // A non-embed response (or an old server) carries no vectors field.
+        let without = serde_json::from_str::<Response>(
+            r#"{"id":"req-1","ok":true,"text":"hi","latency_ms":3}"#,
+        )
+        .unwrap();
+        assert!(without.vectors.is_none());
+    }
+
+    /// describe_image wire contract — the request carries op="describe_image",
+    /// the LOCAL image `path` (the daemon confines it BEFORE this), an OPTIONAL
+    /// `question` (the VQA), and a `max_tokens` decode budget. Unrelated fields
+    /// stay omitted so an old server (no VLM op) sees a clean shape it rejects as
+    /// unknown (which the daemon reads as unavailable -> falls back honestly).
+    #[test]
+    fn describe_image_request_serializes_to_the_wire_shape() {
+        let mut req = Request::new("d-1".to_string(), "describe_image");
+        req.path = Some("/root/state/vision/frame.png".to_string());
+        req.question = Some("what color is the car?");
+        req.max_tokens = Some(256);
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "describe_image");
+        assert_eq!(v["path"], "/root/state/vision/frame.png");
+        assert_eq!(v["question"], "what color is the car?", "the VQA question must reach the wire");
+        assert_eq!(v["max_tokens"], 256);
+        // None of the unrelated op fields leak in.
+        for absent in ["text", "voice", "voice_id", "backend", "el_key", "texts"] {
+            assert!(v.get(absent).is_none(), "{absent} must be omitted on the describe_image wire");
+        }
+    }
+
+    /// describe_image wire contract — a GENERAL scene describe (no question): the
+    /// `question` field is OMITTED entirely (not null), so the server applies its
+    /// DESCRIBE_IMAGE_DEFAULT_PROMPT.
+    #[test]
+    fn describe_image_request_omits_question_for_a_general_describe() {
+        let mut req = Request::new("d-2".to_string(), "describe_image");
+        req.path = Some("/root/img.jpg".to_string());
+        req.max_tokens = Some(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS);
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "describe_image");
+        assert!(v.get("question").is_none(), "no question => the field is omitted (server uses its default prompt)");
+        assert_eq!(v["max_tokens"], DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS);
+    }
+
+    /// describe_image AVAILABLE response: ok:true carries the description `text`
+    /// and the non-secret VLM `model`. (The daemon maps this to
+    /// DescribeOutcome::Available — the description is the model's VISUAL
+    /// understanding, distinct from OCR glyphs.)
+    #[test]
+    fn describe_image_available_response_carries_text_and_model() {
+        let resp = serde_json::from_str::<Response>(
+            r#"{"id":"d-1","ok":true,"text":"A red car parked on a street.","model":"mlx-community/Qwen2-VL-2B-Instruct-4bit","latency_ms":1200}"#,
+        )
+        .unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.text.as_deref(), Some("A red car parked on a street."));
+        assert_eq!(resp.model.as_deref(), Some("mlx-community/Qwen2-VL-2B-Instruct-4bit"));
+        assert!(resp.reason.is_none(), "the available path carries no unavailable reason");
+    }
+
+    /// describe_image UNAVAILABLE response: ok:false carries the stable
+    /// `reason`="vlm_unavailable" + an honest `error` and NO text — NEVER a
+    /// fabricated description. The daemon keys off the reason to fall back.
+    /// PIN: the reason string equals DESCRIBE_IMAGE_UNAVAILABLE_REASON (the
+    /// daemon<->server contract).
+    #[test]
+    fn describe_image_unavailable_response_carries_reason_no_text() {
+        let resp = serde_json::from_str::<Response>(
+            r#"{"id":"d-3","ok":false,"reason":"vlm_unavailable","error":"mlx-vlm is not installed","latency_ms":2}"#,
+        )
+        .unwrap();
+        assert!(!resp.ok, "the unavailable path is ok:false");
+        assert_eq!(resp.reason.as_deref(), Some(DESCRIBE_IMAGE_UNAVAILABLE_REASON));
+        assert_eq!(resp.error.as_deref(), Some("mlx-vlm is not installed"));
+        assert!(resp.text.is_none(), "the unavailable path NEVER carries a (fabricated) description");
+    }
+
+    /// The decode budget is HARD-CAPPED: the default is sane and the cap is a real
+    /// ceiling the daemon clamps to, so a caller can never ask the on-device VLM
+    /// for an unbounded decode (the client `min`s the request against the cap).
+    #[test]
+    fn describe_image_decode_budget_is_capped() {
+        assert!(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS > 0);
+        assert!(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS <= DESCRIBE_IMAGE_MAX_TOKENS_CAP);
+        assert_eq!(DESCRIBE_IMAGE_MAX_TOKENS_CAP, 1024, "cap pinned to the server's contract");
+        // The clamp the client applies: an over-budget ask collapses to the cap.
+        let asked = 99_999u32;
+        assert_eq!(asked.min(DESCRIBE_IMAGE_MAX_TOKENS_CAP), DESCRIBE_IMAGE_MAX_TOKENS_CAP);
+    }
+
+    // ----- generate_image (task #18) — on-device text->image wire contract ----
+
+    /// generate_image wire contract — the request carries op="generate_image",
+    /// the REQUIRED `prompt`, and the OPTIONAL `size`/`steps`/`seed`. Unrelated
+    /// fields stay omitted so an old server (no image op) sees a clean shape it
+    /// rejects as unknown (which the daemon reads as "image model unavailable").
+    /// The prompt is handed ONLY to the on-device model; nothing here is a cloud
+    /// call.
+    #[test]
+    fn generate_image_request_serializes_to_the_wire_shape() {
+        let mut req = Request::new("g-1".to_string(), "generate_image");
+        req.prompt = Some("a red bicycle on a beach at sunset");
+        req.size = Some(512);
+        req.steps = Some(4);
+        req.seed = Some(42);
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "generate_image");
+        assert_eq!(v["prompt"], "a red bicycle on a beach at sunset", "the prompt must reach the wire");
+        assert_eq!(v["size"], 512);
+        assert_eq!(v["steps"], 4);
+        assert_eq!(v["seed"], 42);
+        // None of the unrelated op fields leak in.
+        for absent in ["text", "question", "voice", "voice_id", "backend", "el_key", "texts", "path"] {
+            assert!(v.get(absent).is_none(), "{absent} must be omitted on the generate_image wire");
+        }
+    }
+
+    /// generate_image wire contract — a BARE prompt (no size/steps/seed): those
+    /// optional fields are OMITTED entirely (not null), so the server applies its
+    /// own defaults (GENERATE_IMAGE_DEFAULT_SIZE/STEPS + a time-derived seed).
+    #[test]
+    fn generate_image_request_omits_optional_params_when_absent() {
+        let mut req = Request::new("g-2".to_string(), "generate_image");
+        req.prompt = Some("an astronaut riding a horse");
+        let v = serde_json::to_value(&req).unwrap();
+        assert_eq!(v["op"], "generate_image");
+        assert_eq!(v["prompt"], "an astronaut riding a horse");
+        for absent in ["size", "steps", "seed"] {
+            assert!(v.get(absent).is_none(), "{absent} must be omitted when unset (server uses its default)");
+        }
+    }
+
+    /// generate_image AVAILABLE response: ok:true carries the ON-DEVICE saved
+    /// `path` plus NON-secret `model`/`size`/`steps`/`seed` metadata — never any
+    /// pixels (the image lives on the machine). The daemon maps this to the saved
+    /// on-device path it surfaces.
+    #[test]
+    fn generate_image_available_response_carries_path_and_metadata() {
+        let resp = serde_json::from_str::<Response>(
+            r#"{"id":"g-1","ok":true,"path":"/root/state/images/image-7.png","model":"schnell","size":512,"steps":4,"seed":42,"latency_ms":8000}"#,
+        )
+        .unwrap();
+        assert!(resp.ok);
+        assert_eq!(resp.path.as_deref(), Some("/root/state/images/image-7.png"));
+        assert_eq!(resp.model.as_deref(), Some("schnell"));
+        assert_eq!(resp.size, Some(512));
+        assert_eq!(resp.steps, Some(4));
+        assert_eq!(resp.seed, Some(42));
+        assert!(resp.reason.is_none(), "the available path carries no unavailable reason");
+    }
+
+    /// generate_image UNAVAILABLE response: ok:false carries the stable
+    /// `reason`="image_model_unavailable" + an honest `error` and NO path — NEVER
+    /// a fabricated image, NEVER a cloud fallback. The daemon keys off the reason
+    /// to surface the honest "not set up" line. PIN: the reason string equals
+    /// GENERATE_IMAGE_UNAVAILABLE_REASON (the daemon<->server contract).
+    #[test]
+    fn generate_image_unavailable_response_carries_reason_no_path() {
+        let resp = serde_json::from_str::<Response>(
+            r#"{"id":"g-3","ok":false,"reason":"image_model_unavailable","error":"image model not available (on-device image generation is off or its model is not downloaded)","latency_ms":2}"#,
+        )
+        .unwrap();
+        assert!(!resp.ok, "the unavailable path is ok:false");
+        assert_eq!(resp.reason.as_deref(), Some(GENERATE_IMAGE_UNAVAILABLE_REASON));
+        assert!(resp.error.as_deref().unwrap().contains("not available"));
+        assert!(resp.path.is_none(), "the unavailable path NEVER carries a (fabricated) image path");
+    }
+
+    /// The size/steps bounds are real ceilings the daemon clamps to, so a caller
+    /// can never push an out-of-range canvas or an unbounded sampler run at the
+    /// on-device model (the client `clamp`s the request; the server clamps too).
+    #[test]
+    fn generate_image_size_and_steps_are_bounded() {
+        assert_eq!(GENERATE_IMAGE_MIN_SIZE, 64, "min size pinned to the server's contract");
+        assert_eq!(GENERATE_IMAGE_MAX_SIZE, 1536, "max size pinned to the server's contract");
+        assert_eq!(GENERATE_IMAGE_DEFAULT_SIZE, 512, "default size pinned");
+        assert!(GENERATE_IMAGE_DEFAULT_SIZE >= GENERATE_IMAGE_MIN_SIZE);
+        assert!(GENERATE_IMAGE_DEFAULT_SIZE <= GENERATE_IMAGE_MAX_SIZE);
+        assert_eq!(GENERATE_IMAGE_DEFAULT_STEPS, 4, "default steps pinned to the fast schnell budget");
+        assert_eq!(GENERATE_IMAGE_MAX_STEPS_CAP, 50, "steps cap pinned to the server's contract");
+        assert!(GENERATE_IMAGE_DEFAULT_STEPS <= GENERATE_IMAGE_MAX_STEPS_CAP);
+        // The clamps the client applies: an over/under-range ask collapses inward.
+        assert_eq!(8.clamp(GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_MAX_SIZE), GENERATE_IMAGE_MIN_SIZE);
+        assert_eq!(99_999u32.clamp(GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_MAX_SIZE), GENERATE_IMAGE_MAX_SIZE);
+        assert_eq!(9_999u32.clamp(1, GENERATE_IMAGE_MAX_STEPS_CAP), GENERATE_IMAGE_MAX_STEPS_CAP);
+    }
+}

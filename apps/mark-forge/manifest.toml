@@ -1,0 +1,20 @@
+# Mark-Forge — deterministic 3D rigid-body physics sandbox.
+# Schema: docs/SANDBOX.md  (mirror of apps/silicon-canvas)
+
+[app]
+name        = "mark-forge"
+version     = "0.1.0"
+description = "Deterministic 3D rigid-body physics sandbox: a fixed-timestep impulse-based engine (CPU/f64) that emits body-transform telemetry the HUD renders in a React-Three-Fiber sandbox panel."
+entry       = "mark-forge"            # prebuilt native binary in the app dir
+runtime     = "binary"
+
+[permissions]
+audio     = false
+net_hosts = []                                    # fully offline — no network at all
+fs_read   = []                                    # scenes are built via IPC ops, not files
+fs_write  = ["state/tmp/mark-forge"]              # optional deterministic replay-trace dump
+gpu       = false                                 # engine is CPU/f64; the HUD renders the bodies
+
+[ui]
+surface          = "panel"
+telemetry_topics = ["physics.bodies", "physics.step", "physics.scene"]
