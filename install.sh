@@ -2,7 +2,7 @@
 # install.sh — the ONE command that installs ALL of J.A.R.V.I.S., built FRESH,
 # into a per-user home with no sudo.
 #
-#   curl -fsSL https://raw.githubusercontent.com/<YOUR-GH-USER>/jarvis/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/darwin-capani/jarvis/main/install.sh | bash
 #
 # (./install.sh also works from a local clone — it copies *this* clone into the
 #  install home, builds every artifact fresh there, and loads the LaunchAgents.)
