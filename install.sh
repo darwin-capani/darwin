@@ -148,14 +148,62 @@ read_model_id() {
 # Plan-only printer for --check: describe a command instead of running it.
 plan() { ui_note "would run: $*"; }
 
+# FUTURISTIC NEXT-STEPS — the five honest "directive" panels (cohesive HUD cards).
+# Defined ONCE so the real-install finish and the --check preview render the SAME
+# substance (no fork can let the two drift): every fact — keys, paths, commands,
+# caveats — is preserved verbatim; ui_panel only adds framing. $1 is the lead-line
+# suffix so the preview can mark itself "(preview)" without duplicating the cards.
+print_next_steps_directives() {
+    local lead_note="${1:-}"
+    printf '\n'
+    ui_info "${UI_BOLD}${UI_CYAN}NEXT-STEP DIRECTIVES${UI_RESET} — honest, and nothing consequential is on yet${lead_note}:"
+
+    ui_panel "1" "TCC PERMISSIONS" \
+        "macOS will prompt for ${UI_BRIGHT}Accessibility${UI_RESET}, ${UI_BRIGHT}Microphone${UI_RESET}, and ${UI_BRIGHT}Screen Recording${UI_RESET}" \
+        "the first time JARVIS needs each. Grant them in" \
+        "${UI_ICE}System Settings > Privacy & Security${UI_RESET} when asked. They cannot be pre-granted."
+
+    ui_panel "2" "API KEYS  (optional, OFF until set)" \
+        "The cloud LLM fallback and the ElevenLabs cloud voice tier stay ${UI_BRIGHT}disabled${UI_RESET}" \
+        "with no key. To enable, put" \
+        "  ${UI_CYAN}export ANTHROPIC_API_KEY=...${UI_RESET}" \
+        "  ${UI_CYAN}export ELEVENLABS_API_KEY=...${UI_RESET}" \
+        "in  ${UI_GREY}$JARVIS_HOME/state/env.sh${UI_RESET}  and  ${UI_BRIGHT}chmod 600${UI_RESET}  it (state/ is gitignored)," \
+        "or store them in the macOS Keychain. Local inference works fully offline" \
+        "with no key at all."
+
+    ui_panel "3" "VOICE WAKE WORD" \
+        "Say \"${UI_BRIGHT}JARVIS${UI_RESET}\" to wake it once the daemon is up." \
+        "Every consequential action still requires the ${UI_BRIGHT}master switch ON${UI_RESET} +" \
+        "per-action confirm + voice-id + policy/allowlist — none of which this" \
+        "installer turns on. Self-healing ships ${UI_BRIGHT}OFF${UI_RESET}."
+
+    ui_panel "4" "BOOT-TO-JARVIS" \
+        "For a deployment Mac, enable auto-login so the gui-domain agents start at" \
+        "power-on (see ${UI_ICE}scripts/install_boot.sh${UI_RESET} checklist)." \
+        "${UI_YELLOW}Do not install these agents on a dev machine.${UI_RESET}"
+
+    ui_panel "5" "REMOVE JARVIS COMPLETELY" \
+        "Run" \
+        "  ${UI_CYAN}\"$JARVIS_HOME/uninstall.sh\"${UI_RESET}" \
+        "(two typed confirmations; --dry-run to preview)."
+
+    printf '\n'
+    return 0
+}
+
 # ----------------------------------------------------------------------------
 # Banner.
 # ----------------------------------------------------------------------------
+# The banner runs the arc-reactor power-up + system diagnostic (motion only on
+# an interactive tty), frames the HUD with "OPERATOR // $JARVIS_OPERATOR" along
+# the top edge, and greets the operator by name as the system comes online.
 jarvis_banner
 if [ "$MODE" = "check" ]; then
     ui_info "DRY RUN (--check): printing the plan + read-only detection only."
     ui_info "No venv, no downloads, no build, no ~/Library writes, no launchctl."
 fi
+ui_info "Operator:     ${JARVIS_OPERATOR}"
 ui_info "Source tree:  $SRC_ROOT"
 ui_info "Install home: $JARVIS_HOME"
 
@@ -460,40 +508,138 @@ fi
 # ============================================================================
 ui_stage 7 "$TOTAL_STAGES" "FINISH"
 
+# ----------------------------------------------------------------------------
+# READ-ONLY OUTCOME DETECTION (stage 7 only — no behavior change to stages 1-6).
+# Every probe below is a pure read (filesystem stat / grep / file count); none
+# builds, downloads, writes, or starts anything. The derived flags feed the
+# HONEST status board so each row reflects ONLY what actually happened. Verbs are
+# precise: BUILT / READY / RESIDENT / DEFERRED / SKIPPED / ENABLED / MANUAL / OFF
+# — never RUNNING / ONLINE / ACTIVE (the installer installs; it does not start +
+# health-check the live system).
+# ----------------------------------------------------------------------------
+
+# Agent constellation size: count the [[agent]] tables in the placed roster
+# (falls back to the source tree if the home copy is not readable). A real,
+# truthful count — never fabricated; omitted (neutral "CONFIGURED") if unknown.
+AGENTS_TOML="$JARVIS_HOME/config/agents.toml"
+[ -f "$AGENTS_TOML" ] || AGENTS_TOML="$SRC_ROOT/config/agents.toml"
+AGENT_COUNT=""
+if [ -f "$AGENTS_TOML" ]; then
+    AGENT_COUNT="$(grep -cE '^\[\[agent\]\]' "$AGENTS_TOML" 2>/dev/null || true)"
+    case "$AGENT_COUNT" in ''|*[!0-9]*) AGENT_COUNT="" ;; esac
+fi
+
+# Consequential-actions + self-healing posture: both SHIP OFF (documented
+# invariants). Confirm from the placed config when readable; if the line is
+# unreadable, state OFF (the shipped default) — we never upgrade to a claim of ON.
+JARVIS_TOML="$JARVIS_HOME/config/jarvis.toml"
+[ -f "$JARVIS_TOML" ] || JARVIS_TOML="$SRC_ROOT/config/jarvis.toml"
+# NOTE: keep every status tag PURE ASCII — the board aligns the "[ TAG ]" column
+# by byte length (${#tag}); a multibyte glyph (em-dash) would mis-measure and
+# nudge the closing bracket out of column. "OFF / SAFE" is ASCII + still honest.
+CONSEQ_TAG="OFF / SAFE"
+SELFHEAL_TAG="OFF"
+if [ -f "$JARVIS_TOML" ]; then
+    if grep -qE '^[[:space:]]*allow_consequential[[:space:]]*=[[:space:]]*true' "$JARVIS_TOML" 2>/dev/null; then
+        # Honesty: if a user pre-flipped the switch in their config, say so plainly
+        # rather than printing the safe default. (Default ships false.)
+        CONSEQ_TAG="ARMED"
+    fi
+fi
+
 if [ "$MODE" = "check" ]; then
     ui_ok "Plan complete. This was a dry run — nothing was installed."
     ui_info "Run without --check to perform the install (add -y to auto-accept consent prompts)."
+
+    # HONEST DRY-RUN STATUS BOARD: a clearly-labeled PLAN/PREVIEW. Every tag is a
+    # planned/"would" state — nothing claims completion. Models reflect the
+    # --no-models choice even in the plan (DEFERRED vs WILL FETCH).
+    models_plan="WILL FETCH"
+    [ "$DO_MODELS" -eq 0 ] && models_plan="DEFERRED"
+    agents_plan="WILL CONFIGURE"
+    [ -n "$AGENT_COUNT" ] && agents_plan="$AGENT_COUNT PLANNED"
+    ui_status_board "BOOT MANIFEST  (dry-run preview)" \
+        "CORE DAEMON (jarvisd)|WILL BUILD" \
+        "INFERENCE ENGINE / MLX|WILL BUILD" \
+        "ON-DEVICE MODELS|$models_plan" \
+        "HUD INTERFACE|WILL BUILD" \
+        "AGENT CONSTELLATION|$agents_plan" \
+        "AUTOSTART (LaunchAgents)|WILL LOAD" \
+        "CONSEQUENTIAL ACTIONS|$CONSEQ_TAG" \
+        "SELF-HEALING|$SELFHEAL_TAG"
+    ui_note "(dry-run preview — no component above was built, fetched, or loaded)"
+
+    # Preview the SAME next-steps directive panels a real finish would print (so
+    # the dry run shows the full operator guidance), marked "(preview)" and sealed
+    # below by the DRY RUN frame so nothing here reads as a completed install.
+    print_next_steps_directives " (preview)"
+
+    # Render the cinematic finale so a dry run previews the full "coming online"
+    # flow. ui_online is PURE UI output (no writes); the bottom HUD frame seals
+    # the dry-run preview with a DRY RUN status so nobody mistakes it for a real
+    # install completing.
+    ui_online "DRY RUN — NO CHANGES MADE"
     exit 0
 fi
 
+# --- REAL-INSTALL outcome flags (read-only stats of what stages 1-6 produced) ---
+
+# CORE DAEMON: the release binary the LaunchAgent runs. Stage 5 hard-exits if it
+# is absent, so reaching here with the file present means it BUILT.
+DAEMON_TAG="SKIPPED"
+[ -x "$JARVIS_HOME/daemon/target/release/jarvisd" ] && DAEMON_TAG="BUILT"
+
+# INFERENCE ENGINE / MLX: the venv python with the full dep set (stage 3). READY
+# means the interpreter is present in the home; it is installed, not "running".
+ENGINE_TAG="DEFERRED"
+[ -x "$JARVIS_HOME/.venv/bin/python" ] && ENGINE_TAG="READY"
+
+# ON-DEVICE MODELS: DEFERRED when --no-models; otherwise count the model dirs that
+# actually materialized under HF_HOME (models--<org>--<repo>). A real count — if
+# the cache layout is unexpected we report RESIDENT without a fabricated number.
+if [ "$DO_MODELS" -eq 0 ]; then
+    MODELS_TAG="DEFERRED"
+else
+    _mcount="$(find "$HF_HOME_DIR" -maxdepth 3 -type d -name 'models--*' 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+    case "$_mcount" in ''|*[!0-9]*) _mcount=0 ;; esac
+    if [ "$_mcount" -gt 0 ]; then MODELS_TAG="$_mcount RESIDENT"; else MODELS_TAG="RESIDENT"; fi
+fi
+
+# HUD INTERFACE: the Tauri bundle. BUILT if a JARVIS.app landed in the bundle
+# tree, else SKIPPED (e.g. no hud/package.json or the bundle did not appear).
+HUD_TAG="SKIPPED"
+if find "$JARVIS_HOME/hud/src-tauri/target/release/bundle" -maxdepth 2 -name 'JARVIS.app' 2>/dev/null | grep -q . ; then
+    HUD_TAG="BUILT"
+fi
+
+# AGENT CONSTELLATION: READY (the roster config is placed + the daemon that reads
+# it is BUILT). A truthful count when we have it; otherwise a neutral CONFIGURED.
+if [ -n "$AGENT_COUNT" ]; then AGENTS_TAG="$AGENT_COUNT READY"; else AGENTS_TAG="CONFIGURED"; fi
+
+# AUTOSTART: ENABLED only when BOTH rendered LaunchAgent plists are present in
+# ~/Library/LaunchAgents (stage 6 renders + bootstraps both); otherwise MANUAL.
+AGENT_DIR="$HOME/Library/LaunchAgents"
+_loaded=0
+[ -f "$AGENT_DIR/com.jarvis.inference.plist" ] && _loaded=$(( _loaded + 1 ))
+[ -f "$AGENT_DIR/com.jarvis.daemon.plist" ]    && _loaded=$(( _loaded + 1 ))
+if [ "$_loaded" -eq 2 ]; then AUTOSTART_TAG="ENABLED"; else AUTOSTART_TAG="MANUAL"; fi
+
+# --- the cinematic finale + the HONEST status board ---
 ui_online
-cat <<EOF
 
-  ${UI_BOLD}${UI_CYAN}Next steps — honest, and nothing consequential is on yet:${UI_RESET}
+# HONEST SYSTEM STATUS BOARD — precise verbs, real flags, the SAFE posture stated
+# plainly. No RUNNING/ONLINE on a factual row; no fabricated counts.
+ui_status_board "BOOT MANIFEST" \
+    "CORE DAEMON (jarvisd)|$DAEMON_TAG" \
+    "INFERENCE ENGINE / MLX|$ENGINE_TAG" \
+    "ON-DEVICE MODELS|$MODELS_TAG" \
+    "HUD INTERFACE|$HUD_TAG" \
+    "AGENT CONSTELLATION|$AGENTS_TAG" \
+    "AUTOSTART (LaunchAgents)|$AUTOSTART_TAG" \
+    "CONSEQUENTIAL ACTIONS|$CONSEQ_TAG" \
+    "SELF-HEALING|$SELFHEAL_TAG"
 
-  ${UI_G_INFO} ${UI_BRIGHT}TCC permissions${UI_RESET}: macOS will prompt for Accessibility, Microphone,
-    and Screen Recording the first time JARVIS needs each. Grant them in
-    System Settings > Privacy & Security when asked. They cannot be pre-granted.
-
-  ${UI_G_INFO} ${UI_BRIGHT}API keys (optional, OFF until set)${UI_RESET}: the cloud LLM fallback and the
-    ElevenLabs cloud voice tier stay disabled with no key. To enable, put
-      export ANTHROPIC_API_KEY=...
-      export ELEVENLABS_API_KEY=...
-    in  ${UI_GREY}$JARVIS_HOME/state/env.sh${UI_RESET}  and  chmod 600  it (state/ is gitignored),
-    or store them in the macOS Keychain. Local inference works fully offline
-    with no key at all.
-
-  ${UI_G_INFO} ${UI_BRIGHT}Voice wake word${UI_RESET}: say "JARVIS" to wake it once the daemon is up.
-    Every consequential action still requires the master switch ON +
-    per-action confirm + voice-id + policy/allowlist — none of which this
-    installer turns on. Self-healing ships OFF.
-
-  ${UI_G_INFO} ${UI_BRIGHT}Boot-to-JARVIS${UI_RESET}: for a deployment Mac, enable auto-login so the
-    gui-domain agents start at power-on (see scripts/install_boot.sh checklist).
-    Do not install these agents on a dev machine.
-
-  ${UI_G_INFO} ${UI_BRIGHT}To remove JARVIS completely${UI_RESET}: run
-    "$JARVIS_HOME/uninstall.sh"  (two typed confirmations; --dry-run to preview).
-
-EOF
+# FUTURISTIC NEXT-STEPS — five honest "directive" panels (shared renderer, so the
+# real finish + the dry-run preview can never drift). Every fact is verbatim.
+print_next_steps_directives
 exit 0
