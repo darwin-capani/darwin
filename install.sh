@@ -227,6 +227,35 @@ read_model_id() {
 # Plan-only printer for --check: describe a command instead of running it.
 plan() { ui_note "would run: $*"; }
 
+# QUIET-SUB-INSTALLER runner. Runs a (usually noisy) sub-installer with its
+# stdout+stderr CAPTURED to a temp log so only the cinematic ui_spin spinner +
+# a clean ui_ok appear on the HUD — never the raw rustup/Homebrew/brew chatter.
+# On FAILURE it prints the last ~15 lines of that log (the actual cause) via a
+# ui_err + dim tail, then returns non-zero so the caller can gate. The temp log
+# is always removed. Usage:  run_quiet "installing <tool>" -- <command> [args...]
+# (Pass the command through `--`, exactly like ui_spin.) Returns the command's
+# exit status. set -e safe: callers MUST use it inside `if run_quiet ...; then`.
+run_quiet() {
+    local label="$1"; shift
+    [ "${1:-}" = "--" ] && shift
+    if [ "$#" -eq 0 ]; then ui_warn "run_quiet: no command given"; return 0; fi
+    local log rc=0
+    log="$(mktemp "${TMPDIR:-/tmp}/jarvis-provision.XXXXXX")" || { ui_err "$label (could not create a log file)"; return 1; }
+    # ui_spin animates the spinner and reports ok/err; the inner bash -c funnels
+    # BOTH streams of the real installer into $log so nothing leaks onto the HUD.
+    # `set -e` would abort on ui_spin's non-zero, so capture rc behind `|| rc=$?`.
+    ui_spin "$label" -- bash -c '"$@" >"$0" 2>&1' "$log" "$@" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        ui_note "last lines of the install log:"
+        # Last ~15 lines, indented + dimmed so the cause is legible but quiet.
+        tail -n 15 "$log" 2>/dev/null | while IFS= read -r _ln; do
+            printf '      %s%s%s\n' "${UI_DIM:-}" "$_ln" "${UI_RESET:-}"
+        done
+    fi
+    rm -f "$log" 2>/dev/null || true
+    return "$rc"
+}
+
 # ----------------------------------------------------------------------------
 # Build-prereq provisioning helpers (STAGE 1).
 #
@@ -249,15 +278,27 @@ find_brew() {
 
 # Ensure Homebrew is available + on PATH for the rest of THIS process. Called
 # LAZILY — only when python3.11 OR node is missing (never on a fully-provisioned
-# machine). Returns 0 if brew is usable, 1 if it could not be made available.
+# machine). Returns 0 if brew is usable, 1 if it could not be made available
+# (the caller then sets PREFLIGHT_FATAL so the run STOPS before STAGE 2 PLACE).
 #
 #   - If brew is already present -> eval its shellenv (puts brew + its installs
-#     on PATH for this process) and return 0.
-#   - MODE=check  -> plan the NONINTERACTIVE bootstrap, return 0 (no install).
-#   - MODE=install -> run the official NONINTERACTIVE installer (macOS may prompt
-#     ONCE for the login password; sudo inside the script reads it from /dev/tty,
-#     so it works even though our own stdin is a curl pipe — we do NOT feed it),
-#     then re-locate brew + eval shellenv. Return 0 on success, 1 on failure.
+#     on PATH for this process) and return 0 (idempotent, NO prompt).
+#   - MODE=check  -> plan the bootstrap line, return 0 (installs NOTHING).
+#   - MODE=install + absent -> a robust INTERACTIVE bootstrap that actually
+#     succeeds under `curl … | bash` (where stdin is the pipe, not a terminal):
+#       a. require a usable controlling terminal (/dev/tty);
+#       b. announce honestly that admin access is needed;
+#       c. ACQUIRE sudo through /dev/tty so the macOS password prompt works
+#          despite our piped stdin (`sudo -v < /dev/tty`);
+#       d. KEEP the sudo timestamp ALIVE with a background refresher during the
+#          slow install, KILLED on every exit path (NOT via a competing trap —
+#          we kill the PID explicitly so ui.sh's cursor EXIT trap is untouched);
+#       e. run the official Homebrew installer (NONINTERACTIVE, sudo now cached),
+#          output captured to a temp log (quiet HUD);
+#       f. kill the refresher, re-locate brew, eval shellenv, and VERIFY
+#          `brew --version` actually runs before returning success.
+#     Returns 0 only when brew VERIFIES; 1 (with a clear ui_err + ui_note) on
+#     no-tty, not-admin, or an install that did not produce a usable brew.
 ensure_homebrew() {
     local brew
     brew="$(find_brew)"
@@ -267,19 +308,98 @@ ensure_homebrew() {
     fi
 
     if [ "$MODE" = "check" ]; then
-        plan "NONINTERACTIVE=1 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"   # install Homebrew (NONINTERACTIVE)"
+        plan "sudo -v   # cache admin (password via /dev/tty); then:"
+        plan "NONINTERACTIVE=1 /bin/bash -c \"\$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"   # install Homebrew"
         return 0
     fi
 
-    ui_info "Homebrew not found — installing Homebrew (macOS may prompt once for your login password)."
-    ui_spin "installing Homebrew (NONINTERACTIVE)" -- bash -c \
-        'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"'
+    # --- (a) require a usable controlling terminal --------------------------
+    # Under `curl … | bash` our own stdin is the pipe, so we cannot read a
+    # password from it. The Homebrew installer's sudo needs a real terminal; we
+    # supply /dev/tty. If there is none (true non-interactive run / CI), we
+    # cannot prompt for admin at all — fail honestly instead of looping.
+    if ! { : < /dev/tty; } 2>/dev/null; then
+        ui_err "Homebrew install needs an interactive terminal."
+        ui_note "Run the installer in Terminal, or install Homebrew first (https://brew.sh) then re-run."
+        return 1
+    fi
+
+    # --- (b) announce honestly ---------------------------------------------
+    ui_info "Homebrew is required and needs administrator access — macOS will ask for your Mac login password (your account must be an administrator)."
+
+    # --- (c) acquire sudo THROUGH the terminal ------------------------------
+    # `< /dev/tty` lets the password prompt reach the user even though our stdin
+    # is the curl pipe. A wrong password or a non-admin account fails here.
+    if ! sudo -v < /dev/tty; then
+        ui_err "Could not get administrator access (wrong password, or this account is not an admin)."
+        ui_note "Have an admin run the installer, or pre-install Homebrew / Python 3.11 + Node, then re-run."
+        return 1
+    fi
+
+    # --- (d) keep the sudo timestamp alive during the slow install ----------
+    # A background refresher tops up the cached credential every 50s; it stops
+    # itself the instant sudo can no longer refresh non-interactively. We KILL
+    # it explicitly on every exit path below (success AND failure) so we never
+    # add a competing EXIT trap that would clobber ui.sh's cursor-restore trap.
+    #
+    # Hardened against leaving a stray `sleep` behind on EVERY teardown path:
+    #   - Normal end (success/failure): the caller `kill`s + `wait`s this PID; the
+    #     subshell's INT/TERM trap kills its own current `sleep` child first, so
+    #     nothing is reparented. (We kill only our OWN child "$_s" — never the
+    #     process group: `kill 0` / `kill -<pgid>` would also hit the installer.)
+    #   - Abnormal end (Ctrl-C delivered to the whole group, or a SIGKILL where no
+    #     trap can run): the 50s wait is split into short `sleep 2` chunks, so even
+    #     an orphaned chunk self-exits within ~2s instead of lingering up to ~50s.
+    # Net: the refresher still tops up sudo on the ~50s cadence, but no stray
+    # process can outlive the install by more than a couple of seconds on any path.
+    local _sudo_keepalive_pid=""
+    ( _s=""
+      trap 'kill "$_s" 2>/dev/null; exit 0' INT TERM
+      while true; do
+          sudo -n true 2>/dev/null || break    # stop the instant we can't refresh
+          _i=0
+          while [ "$_i" -lt 25 ]; do           # 25 x 2s ~= 50s between refreshes
+              sleep 2 & _s=$!
+              wait "$_s" || break
+              _i=$(( _i + 1 ))
+          done
+      done ) &
+    _sudo_keepalive_pid=$!
+
+    # --- (e) run the official Homebrew installer (quiet, sudo cached) -------
+    # NONINTERACTIVE=1 so it does not pause for confirmation; sudo is already
+    # cached so its internal sudo calls are passwordless. </dev/tty as belt-and-
+    # suspenders. run_quiet captures all output to a temp log + shows the clean
+    # spinner; on failure it prints the last ~15 log lines (the real cause).
+    local _hb_rc=0
+    run_quiet "installing Homebrew" -- bash -c \
+        'NONINTERACTIVE=1 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" </dev/tty' \
+        || _hb_rc=$?
+
+    # --- (f) kill the refresher, then re-locate + VERIFY brew ---------------
+    # Kill the keep-alive on BOTH the success and failure path (explicit PID
+    # kill — never a trap), so no orphaned refresher survives this function.
+    if [ -n "$_sudo_keepalive_pid" ]; then
+        kill "$_sudo_keepalive_pid" 2>/dev/null || true
+        wait "$_sudo_keepalive_pid" 2>/dev/null || true
+    fi
+
+    if [ "$_hb_rc" -ne 0 ]; then
+        ui_err "Homebrew installation failed (see the log lines above)."
+        ui_note "Check your network / disk, or install Homebrew manually from https://brew.sh, then re-run."
+        return 1
+    fi
+
     brew="$(find_brew)"
     if [ -n "$brew" ]; then
         eval "$("$brew" shellenv)"
-        ui_ok "Homebrew installed: $("$brew" --version 2>/dev/null | head -1)"
-        return 0
+        if "$brew" --version >/dev/null 2>&1; then
+            ui_ok "Homebrew installed: $("$brew" --version 2>/dev/null | head -1)"
+            return 0
+        fi
     fi
+    ui_err "Homebrew installer ran but produced no working 'brew' (could not verify brew --version)."
+    ui_note "Install Homebrew manually from https://brew.sh, then re-run."
     return 1
 }
 
@@ -393,18 +513,26 @@ elif [ "$DO_PROVISION" -eq 0 ]; then
     PREFLIGHT_FATAL=1
 else
     # MODE=install + provisioning ON: install via rustup, no confirm() gate (a
-    # build toolchain is a prerequisite, not JARVIS actuation).
+    # build toolchain is a prerequisite, not JARVIS actuation). rustup's verbose
+    # "Rust is installed now. Great! … add ~/.cargo/bin to PATH …" block is
+    # captured to a temp log by run_quiet so only the clean spinner shows; the
+    # log tail surfaces on failure.
     ui_info "Rust toolchain not found — installing Rust via rustup (no sudo, into ~/.rustup + ~/.cargo)."
-    ui_spin "installing Rust (rustup)" -- bash -c \
-        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path"
+    _rust_rc=0
+    run_quiet "installing Rust (rustup)" -- bash -c \
+        "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path" \
+        || _rust_rc=$?
     CARGO="$HOME/.cargo/bin/cargo"
     # Propagate PATH for the rest of THIS process (build stages run cargo).
     case ":$PATH:" in *":$HOME/.cargo/bin:"*) : ;; *) PATH="$HOME/.cargo/bin:$PATH"; export PATH ;; esac
     [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-    if [ -x "$CARGO" ] && "$CARGO" --version >/dev/null 2>&1; then
-        ui_ok "Rust installed: $("$CARGO" --version)"
+    # VERIFY-AND-GATE: re-detect cargo + run its version command; proceed only if
+    # it verifies, else set PREFLIGHT_FATAL with a clear, actionable error.
+    if [ "$_rust_rc" -eq 0 ] && [ -x "$CARGO" ] && "$CARGO" --version >/dev/null 2>&1; then
+        ui_ok "Rust ready: $("$CARGO" --version)"
     else
-        ui_err "rustup install did not produce a working $CARGO"
+        ui_err "Rust toolchain did not install/verify (no working cargo at $CARGO)."
+        ui_note "Install manually:  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y   (then re-run)."
         PREFLIGHT_FATAL=1
     fi
 fi
@@ -429,18 +557,25 @@ elif [ "$DO_PROVISION" -eq 0 ]; then
     PREFLIGHT_FATAL=1
 else
     # MODE=install + provisioning ON: ensure Homebrew, then brew install.
+    # ensure_homebrew already gates (no-tty / not-admin / unverifiable brew); if
+    # it fails we stop here rather than build on a missing toolchain.
     ui_info "Python 3.11 not found — provisioning via Homebrew."
     if ensure_homebrew; then
-        ui_spin "installing python@3.11" -- brew install python@3.11
+        _py_rc=0
+        run_quiet "installing python@3.11" -- brew install python@3.11 || _py_rc=$?
+        # VERIFY-AND-GATE: re-detect a real 3.11 (find_py311 confirms version)
+        # and only then proceed; otherwise set PREFLIGHT_FATAL.
         PY311="$(find_py311)"
-        if [ -n "$PY311" ]; then
-            ui_ok "Python 3.11 installed: $PY311 ($("$PY311" --version 2>&1))"
+        if [ "$_py_rc" -eq 0 ] && [ -n "$PY311" ]; then
+            ui_ok "Python 3.11 ready: $PY311 ($("$PY311" --version 2>&1))"
         else
-            ui_err "brew install python@3.11 did not produce a usable python3.11"
+            ui_err "Python 3.11 did not install/verify (brew install python@3.11 produced no usable python3.11)."
+            ui_note "Install manually:  brew install python@3.11   (then re-run)."
             PREFLIGHT_FATAL=1
         fi
     else
-        ui_err "could not make Homebrew available — cannot install python@3.11"
+        ui_err "Could not make Homebrew available — cannot install python@3.11."
+        ui_note "Resolve the Homebrew error above (or install Python 3.11 yourself), then re-run."
         PREFLIGHT_FATAL=1
     fi
 fi
@@ -464,17 +599,25 @@ elif [ "$DO_PROVISION" -eq 0 ]; then
     PREFLIGHT_FATAL=1
 else
     # MODE=install + provisioning ON: ensure Homebrew, then brew install.
+    # ensure_homebrew already gates (no-tty / not-admin / unverifiable brew); if
+    # it fails we stop here rather than build on a missing toolchain.
     ui_info "Node + npm not found — provisioning via Homebrew."
     if ensure_homebrew; then
-        ui_spin "installing node" -- brew install node
-        if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
-            ui_ok "Node installed: $(node --version) / npm $(npm --version)"
+        _node_rc=0
+        run_quiet "installing node" -- brew install node || _node_rc=$?
+        # VERIFY-AND-GATE: re-detect node + npm and run their version commands;
+        # only proceed if BOTH verify, else set PREFLIGHT_FATAL.
+        if [ "$_node_rc" -eq 0 ] && command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1 \
+           && node --version >/dev/null 2>&1 && npm --version >/dev/null 2>&1; then
+            ui_ok "Node ready: $(node --version) / npm $(npm --version)"
         else
-            ui_err "brew install node did not produce a usable node + npm"
+            ui_err "Node did not install/verify (brew install node produced no usable node + npm)."
+            ui_note "Install manually:  brew install node   (then re-run)."
             PREFLIGHT_FATAL=1
         fi
     else
-        ui_err "could not make Homebrew available — cannot install node"
+        ui_err "Could not make Homebrew available — cannot install node."
+        ui_note "Resolve the Homebrew error above (or install Node yourself), then re-run."
         PREFLIGHT_FATAL=1
     fi
 fi
