@@ -4510,6 +4510,124 @@ svg.tri circle {
   }
 }
 
+/* ABOUT PANEL — the custom "About J.A.R.V.I.S." panel. Replaces the macOS
+   standard about panel so it can host a working Check-for-Updates button + the
+   credit. Centered, compact, with a self-contained reactor glyph. */
+.about-backdrop {
+  z-index: 70;
+}
+
+.about-panel {
+  width: 340px;
+  align-items: center;
+  text-align: center;
+  gap: 12px;
+  padding: 26px 24px 22px;
+}
+
+/* A compact reactor glyph — no CoreScene/three.js dependency. */
+.about-orb {
+  position: relative;
+  width: 64px;
+  height: 64px;
+  margin-bottom: 2px;
+}
+.about-orb-ring,
+.about-orb-core {
+  position: absolute;
+  border-radius: 50%;
+}
+.about-orb-ring {
+  inset: 0;
+  border: 2px solid var(--cyan);
+  box-shadow: 0 0 18px rgba(26, 214, 255, 0.5), inset 0 0 14px rgba(26, 214, 255, 0.35);
+  animation: about-orb-spin 6s linear infinite;
+}
+.about-orb-ring::before {
+  content: "";
+  position: absolute;
+  top: -3px;
+  left: 50%;
+  width: 6px;
+  height: 6px;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: var(--cyan-bright);
+  box-shadow: 0 0 10px var(--cyan-bright);
+}
+.about-orb-core {
+  inset: 20px;
+  background: radial-gradient(circle at 50% 40%, var(--cyan-bright), var(--cyan) 55%, rgba(26, 214, 255, 0.15) 100%);
+  box-shadow: 0 0 16px rgba(125, 243, 255, 0.7);
+  animation: about-orb-pulse 2.4s ease-in-out infinite;
+}
+@keyframes about-orb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@keyframes about-orb-pulse {
+  0%,
+  100% {
+    opacity: 0.85;
+    transform: scale(0.96);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.04);
+  }
+}
+
+.about-name {
+  font-family: var(--mono);
+  font-size: 18px;
+  letter-spacing: 0.26em;
+  color: var(--cyan-bright);
+  text-shadow: 0 0 12px rgba(125, 243, 255, 0.5);
+  padding-left: 0.26em; /* optical centering against the letter-spacing */
+}
+.about-version {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  color: var(--cyan-dim);
+  margin-top: -4px;
+}
+
+/* The Check-for-Updates button sits directly under the version. */
+.about-check-btn {
+  margin-top: 4px;
+  min-width: 168px;
+}
+
+.about-status {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  letter-spacing: 0.06em;
+  line-height: 1.4;
+  color: var(--cyan);
+  max-width: 280px;
+}
+.about-status.ok {
+  color: var(--cyan-bright);
+}
+.about-status.err {
+  color: #ffb4a2;
+}
+
+/* The credit, directly under the button. Uppercase to match the install-UI
+   byline style ("MADE BY DARWIN CAPANI"). */
+.about-credit {
+  margin-top: 2px;
+  font-family: var(--mono);
+  font-size: 9.5px;
+  letter-spacing: 0.34em;
+  text-transform: uppercase;
+  color: var(--cyan-dim);
+  opacity: 0.8;
+  padding-left: 0.34em;
+}
+
 .syscfg-confirm-title {
   font-family: var(--mono);
   font-size: 11px;

@@ -7,6 +7,7 @@
  * logged, stored, or echoed back.
  */
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 export function inTauri(): boolean {
@@ -293,6 +294,27 @@ export async function relaunchApp(): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/* ---------------------------------------------------- About menu (native) */
+
+/** The native-menu event the Rust shell emits when the user picks
+ *  "About J.A.R.V.I.S." from the macOS app menu. The payload is the app version
+ *  string (from the bundle), so the panel always shows the real version. */
+export const ABOUT_MENU_EVENT = "menu://about";
+
+/** Subscribe to the native "About J.A.R.V.I.S." menu click. The Rust shell
+ *  replaces the system about panel with a custom menu item that emits
+ *  `menu://about` carrying the app version; this opens our custom About panel
+ *  (which has the working "Check for Updates" button + the credit). Returns an
+ *  unsubscribe fn. In a plain browser (no shell) there is no native menu — this
+ *  is a no-op that returns a no-op unsubscribe, so callers need no guard. */
+export function onAboutMenu(cb: (version: string) => void): () => void {
+  if (!inTauri()) return () => {};
+  const unlisten = listen<string>(ABOUT_MENU_EVENT, (e) => cb(e.payload || ""));
+  return () => {
+    void unlisten.then((un) => un()).catch(() => {});
+  };
 }
 
 /* ----------------------------------------------------------- uninstall (WS4a) */

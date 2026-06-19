@@ -22,7 +22,8 @@ mod uninstall;
 
 use std::time::Duration;
 
-use tauri::WebviewWindow;
+use tauri::menu::{Menu, MenuItem, PredefinedMenuItem, Submenu};
+use tauri::{Emitter, WebviewWindow};
 
 use takeover::{reset_presentation_to_default, Mutation, Takeover};
 
@@ -781,9 +782,86 @@ async fn exit_takeover(
     }
 }
 
+/// The id of the custom "About J.A.R.V.I.S." menu item, shared by the menu
+/// construction and the menu-event handler so they can never drift.
+const ABOUT_MENU_ID: &str = "about_jarvis";
+/// The event the About menu item emits to the webview (payload = app version).
+/// Must match `ABOUT_MENU_EVENT` in `hud/src/tauri/bridge.ts`.
+const ABOUT_MENU_EVENT: &str = "menu://about";
+
+/// Build the macOS app menu. We REPLACE Tauri's default menu so the
+/// "About J.A.R.V.I.S." item opens our CUSTOM About panel (which carries a
+/// working "Check for Updates" button + the credit) instead of the system about
+/// panel. Everything else is reconstructed from PREDEFINED items so the standard
+/// behavior is preserved — in particular the Edit menu keeps Cut/Copy/Paste/
+/// Select-All working (the credential paste-boxes depend on it), and Hide/
+/// Services/Quit/Window keep their conventional shortcuts.
+fn build_app_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<Menu<R>> {
+    let about = MenuItem::with_id(handle, ABOUT_MENU_ID, "About J.A.R.V.I.S.", true, None::<&str>)?;
+
+    let app_menu = Submenu::with_items(
+        handle,
+        "J.A.R.V.I.S.",
+        true,
+        &[
+            &about,
+            &PredefinedMenuItem::separator(handle)?,
+            &PredefinedMenuItem::services(handle, None)?,
+            &PredefinedMenuItem::separator(handle)?,
+            &PredefinedMenuItem::hide(handle, None)?,
+            &PredefinedMenuItem::hide_others(handle, None)?,
+            &PredefinedMenuItem::show_all(handle, None)?,
+            &PredefinedMenuItem::separator(handle)?,
+            &PredefinedMenuItem::quit(handle, None)?,
+        ],
+    )?;
+
+    // Edit — REQUIRED for Cut/Copy/Paste in the credential paste-boxes.
+    let edit_menu = Submenu::with_items(
+        handle,
+        "Edit",
+        true,
+        &[
+            &PredefinedMenuItem::undo(handle, None)?,
+            &PredefinedMenuItem::redo(handle, None)?,
+            &PredefinedMenuItem::separator(handle)?,
+            &PredefinedMenuItem::cut(handle, None)?,
+            &PredefinedMenuItem::copy(handle, None)?,
+            &PredefinedMenuItem::paste(handle, None)?,
+            &PredefinedMenuItem::select_all(handle, None)?,
+        ],
+    )?;
+
+    let window_menu = Submenu::with_items(
+        handle,
+        "Window",
+        true,
+        &[
+            &PredefinedMenuItem::minimize(handle, None)?,
+            &PredefinedMenuItem::maximize(handle, None)?,
+            &PredefinedMenuItem::separator(handle)?,
+            &PredefinedMenuItem::close_window(handle, None)?,
+        ],
+    )?;
+
+    Menu::with_items(handle, &[&app_menu, &edit_menu, &window_menu])
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let app = tauri::Builder::default()
+        // Custom macOS menu: the "About J.A.R.V.I.S." item opens our custom About
+        // panel (emits ABOUT_MENU_EVENT to the webview) instead of the system
+        // about panel; everything else is the standard predefined menu.
+        .menu(|handle| build_app_menu(handle))
+        // When About is picked, emit the app version to the webview, which mounts
+        // the custom About panel. No other menu id is consequential here.
+        .on_menu_event(|handle, event| {
+            if event.id() == ABOUT_MENU_ID {
+                let version = handle.package_info().version.to_string();
+                let _ = handle.emit(ABOUT_MENU_EVENT, version);
+            }
+        })
         // WS4a auto-updater. The plugin reads its endpoint + the OWNER's PUBLIC
         // updater key from tauri.conf.json (plugins.updater). It performs NO work
         // on its own — it only exposes the update API the `check_for_updates`
@@ -847,6 +925,15 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn about_menu_contract_matches_the_frontend() {
+        // These two strings are the contract with hud/src/tauri/bridge.ts: the
+        // menu item id the handler matches on, and the event the webview listens
+        // for. If either drifts, the About menu click stops opening the panel.
+        assert_eq!(ABOUT_MENU_ID, "about_jarvis");
+        assert_eq!(ABOUT_MENU_EVENT, "menu://about");
+    }
 
     #[test]
     fn unknown_account_is_rejected_before_any_keychain_op() {

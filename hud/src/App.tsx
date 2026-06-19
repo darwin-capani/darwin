@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import AboutPanel from "./components/AboutPanel";
 import ActionPanel from "./components/ActionPanel";
 import AgentPanel from "./components/AgentPanel";
 import AlertPanel from "./components/AlertPanel";
@@ -56,7 +57,7 @@ import {
   isExitKey,
   takeoverReduce,
 } from "./core/takeover";
-import { backendInstalled, bindFullscreenKey, checkForUpdates, inTauri, relaunchApp } from "./tauri/bridge";
+import { backendInstalled, bindFullscreenKey, checkForUpdates, inTauri, onAboutMenu, relaunchApp } from "./tauri/bridge";
 import { decideShowSetup } from "./core/firstRunSetup";
 import {
   decideLaunchUpdateAction,
@@ -86,6 +87,13 @@ export default function App() {
   // ONCE-PER-LAUNCH guard: a ref (not state) so a re-render never re-fires the
   // launch check, and the StrictMode double-invoke in dev never double-checks.
   const launchUpdateChecked = useRef(false);
+
+  // ABOUT PANEL — the custom "About J.A.R.V.I.S." panel (replaces the macOS
+  // standard about panel so it can carry a working "Check for Updates" button +
+  // the credit). `aboutOpen` is driven ONLY by the native menu event below;
+  // `appVersion` is the version that event carries (the real bundle version).
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [appVersion, setAppVersion] = useState("1.0.0");
 
   // FIRST-RUN SETUP — the honest backend-install gate. `backendIsInstalled` is
   // the RESOLVED backend_installed() result, or null until the shell check
@@ -225,6 +233,19 @@ export default function App() {
 
   // F11 fullscreen.
   useEffect(() => bindFullscreenKey(), []);
+
+  // ABOUT MENU — open the custom About panel when the user picks
+  // "About J.A.R.V.I.S." from the native macOS menu. The Rust shell emits
+  // `menu://about` with the bundle version as payload; we stash it and open the
+  // panel. No-op (no native menu) outside the Tauri shell. Unsubscribe on unmount.
+  useEffect(
+    () =>
+      onAboutMenu((v) => {
+        if (v) setAppVersion(v);
+        setAboutOpen(true);
+      }),
+    [],
+  );
 
   // FIRST-RUN SETUP CHECK — resolve backend_installed() ONCE per launch, and ONLY
   // inside the real Tauri shell (a plain browser / vitest render has no backend to
@@ -520,6 +541,21 @@ export default function App() {
         <UpdateDialog
           version={updateDialogVersion}
           onClose={() => setUpdateDialogVersion(null)}
+        />
+      )}
+
+      {/* ABOUT PANEL — the custom "About J.A.R.V.I.S." panel. Mounts when the
+          native "About" menu item is picked (App listens for menu://about). It
+          carries the version, a working Check-for-Updates button, and the
+          credit. A real available version routes to the signed UpdateDialog. */}
+      {aboutOpen && (
+        <AboutPanel
+          version={appVersion}
+          onClose={() => setAboutOpen(false)}
+          onUpdateAvailable={(v) => {
+            setAboutOpen(false);
+            setUpdateDialogVersion(v);
+          }}
         />
       )}
 
