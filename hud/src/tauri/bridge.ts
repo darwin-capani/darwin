@@ -326,6 +326,54 @@ export async function uninstallOpen(): Promise<UninstallOpen> {
   }
 }
 
+/* ------------------------------------------------------ first-run setup */
+
+/** The honest outcome of opening the installer (mirrors the Rust `SetupOpen`).
+ *  `opened` is true only when Terminal.app was launched on the public install.sh
+ *  one-liner; `detail` is a short human line (never a secret — only a public URL). */
+export interface SetupOpen {
+  opened: boolean;
+  detail: string;
+}
+
+/** HONEST presence check of the installed JARVIS backend. Drives the FIRST-RUN
+ *  SETUP gate. Returns true ONLY when the install home
+ *  (`~/Library/Application Support/JARVIS`) has BOTH the built daemon binary AND
+ *  the venv python. In a plain browser there is no shell + no install to check —
+ *  return false (the gate then ALSO requires not-connected, so a browser/dev
+ *  render never shows the setup screen anyway). A thrown shell error also reads
+ *  false: when unsure, we never nag. */
+export async function backendInstalled(): Promise<boolean> {
+  if (!inTauri()) return false;
+  try {
+    return await invoke<boolean>("backend_installed", {});
+  } catch {
+    return false;
+  }
+}
+
+/** OPEN Terminal.app running the public `install.sh` one-liner
+ *  (`curl -fsSL …/install.sh | bash -s -- -y`). This REUSES the real working
+ *  installer; it does NOT reimplement provisioning. Terminal is required so the
+ *  Homebrew sudo prompt has a tty. In a plain browser there is no shell — return
+ *  an honest not-opened result rather than throwing. */
+export async function openSetupInstall(): Promise<SetupOpen> {
+  if (!inTauri()) {
+    return {
+      opened: false,
+      detail: "Installing JARVIS runs from the desktop app (it opens Terminal on install.sh).",
+    };
+  }
+  try {
+    return await invoke<SetupOpen>("open_setup_install", {});
+  } catch (e) {
+    return {
+      opened: false,
+      detail: typeof e === "string" ? e : "could not open the installer",
+    };
+  }
+}
+
 export async function toggleFullscreen(): Promise<void> {
   if (!inTauri()) {
     // Browser fallback for development.

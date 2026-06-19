@@ -13,6 +13,7 @@ import UiActuatePanel from "./components/UiActuatePanel";
 import DiagnosticsPanel from "./components/DiagnosticsPanel";
 import DocSearchPanel from "./components/DocSearchPanel";
 import EvalPanel from "./components/EvalPanel";
+import FirstRunSetup from "./components/FirstRunSetup";
 import ForgePanel from "./components/ForgePanel";
 import GlobalScanPanel, { GLOBAL_SCAN_APP } from "./components/GlobalScanPanel";
 import ImagePanel from "./components/ImagePanel";
@@ -55,7 +56,8 @@ import {
   isExitKey,
   takeoverReduce,
 } from "./core/takeover";
-import { bindFullscreenKey, checkForUpdates, inTauri, relaunchApp } from "./tauri/bridge";
+import { backendInstalled, bindFullscreenKey, checkForUpdates, inTauri, relaunchApp } from "./tauri/bridge";
+import { decideShowSetup } from "./core/firstRunSetup";
 import {
   decideLaunchUpdateAction,
   isAutoUpdateOn,
@@ -84,6 +86,16 @@ export default function App() {
   // ONCE-PER-LAUNCH guard: a ref (not state) so a re-render never re-fires the
   // launch check, and the StrictMode double-invoke in dev never double-checks.
   const launchUpdateChecked = useRef(false);
+
+  // FIRST-RUN SETUP — the honest backend-install gate. `backendIsInstalled` is
+  // the RESOLVED backend_installed() result, or null until the shell check
+  // returns (and it stays null outside the Tauri shell, where there is nothing to
+  // install). The gate (decideShowSetup) shows the setup screen ONLY when, in the
+  // shell, the backend is KNOWN-not-installed AND the daemon is not reachable
+  // (state.connected === false). A running daemon connects the channel, so a
+  // healthy install NEVER sees this. The check is ref-guarded to fire once.
+  const [backendIsInstalled, setBackendIsInstalled] = useState<boolean | null>(null);
+  const backendCheckStarted = useRef(false);
 
   // FIRST-RUN ONBOARDING (WS4b item 1): shown ONCE, gated on the REAL persisted
   // flag (localStorage via hasSeenOnboarding). Dismissing/finishing/skipping (or
@@ -214,6 +226,29 @@ export default function App() {
   // F11 fullscreen.
   useEffect(() => bindFullscreenKey(), []);
 
+  // FIRST-RUN SETUP CHECK — resolve backend_installed() ONCE per launch, and ONLY
+  // inside the real Tauri shell (a plain browser / vitest render has no backend to
+  // install). The ref guard makes it idempotent across re-renders + the StrictMode
+  // double mount. Outside the shell it stays null (the gate also requires
+  // not-connected, so a browser render never shows the setup screen regardless).
+  //
+  // CONSERVATIVE: an unavailable/erroring check reads false from the bridge, but
+  // the gate ALSO requires the command channel to be disconnected — so a running
+  // daemon (channel connected) keeps the screen hidden even on a false-negative.
+  useEffect(() => {
+    if (backendCheckStarted.current) return;
+    backendCheckStarted.current = true;
+    if (!inTauri()) return; // shell-only: nothing to install in a browser/dev
+    let cancelled = false;
+    void (async () => {
+      const installed = await backendInstalled();
+      if (!cancelled) setBackendIsInstalled(installed);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   // LAUNCH AUTO-CHECK FOR UPDATES — fire ONCE per launch, and ONLY inside the
   // real Tauri shell (never a plain browser / vite dev / vitest render). The
   // ref guard makes it idempotent across re-renders + the StrictMode double
@@ -294,6 +329,15 @@ export default function App() {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [takeoverActive, exitTakeover]);
+
+  // FIRST-RUN SETUP gate (pure): show ONLY when in the shell, the backend is
+  // KNOWN-not-installed, AND the daemon is not reachable. A connected daemon or a
+  // resolved-installed backend (or an unresolved check) keeps it hidden.
+  const showSetup = decideShowSetup({
+    inTauri: inTauri(),
+    installed: backendIsInstalled,
+    connected: state.connected,
+  });
 
   return (
     <div className="hud">
@@ -483,6 +527,13 @@ export default function App() {
           takeover is active (windowed HUD above is the default), and always
           renders the visible EXIT control inside, so exit is never hideable. */}
       {takeoverActive && <TakeoverStage state={state} onExit={exitTakeover} />}
+
+      {/* FIRST-RUN SETUP — the install gate for a freshly-downloaded app. Mounts
+          ONLY when (in the Tauri shell) the backend is genuinely NOT installed
+          AND the daemon is not reachable; NEVER when JARVIS is installed +
+          running (decideShowSetup). It opens Terminal on the real install.sh and
+          auto-dismisses when the daemon connects (state.connected flips true). */}
+      {showSetup && <FirstRunSetup connected={state.connected} />}
     </div>
   );
 }

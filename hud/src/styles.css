@@ -4482,6 +4482,34 @@ svg.tri circle {
   gap: 10px;
 }
 
+/* FIRST-RUN SETUP — the install gate. Sits ABOVE every other overlay (it is the
+   pre-backend state, so nothing else is meaningfully interactive yet) and is a
+   touch wider so the honest multi-paragraph copy stays readable. */
+.first-run-setup-backdrop {
+  z-index: 60;
+}
+
+.first-run-setup {
+  width: 520px;
+}
+
+/* A minimal, dependency-free progress spinner for the "waiting for JARVIS to
+   come online…" state. */
+.setup-spinner {
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--stroke);
+  border-top-color: var(--cyan-bright);
+  border-radius: 50%;
+  animation: setup-spin 0.9s linear infinite;
+}
+
+@keyframes setup-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .syscfg-confirm-title {
   font-family: var(--mono);
   font-size: 11px;

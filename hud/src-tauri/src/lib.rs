@@ -15,6 +15,7 @@ mod command;
 mod config_settings;
 mod credentials;
 mod heal;
+mod setup;
 mod takeover;
 mod updates;
 mod uninstall;
@@ -823,6 +824,8 @@ pub fn run() {
             updates::check_for_updates,
             updates::relaunch_app,
             uninstall::uninstall_open,
+            setup::backend_installed,
+            setup::open_setup_install,
             enter_takeover,
             exit_takeover
         ])
