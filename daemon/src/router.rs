@@ -307,8 +307,8 @@ pub async fn route(
     // NO safety gate — the consequential confirmation gate, the allow_consequential
     // master switch, the owner voice-id gate, lockdown and per-action policy are all
     // untouched, and a required confirmation is NEVER softened/silenced (apply_whisper
-    // guards it). The [voice].whisper master switch (OFF by default) makes a stray
-    // command INERT: apply_command_global honours it, so with the feature off the
+    // guards it). The [voice].whisper master switch (ON by default; delivery-only)
+    // gates a stray command: apply_command_global honours it, so with the feature off the
     // global stays OFF and this whole arm is a no-op toggle. Runs AFTER the owner
     // voice-id all-scope gate, so an unrecognized bystander cannot flip it.
     if let Some(cmd) = crate::prosody::parse_whisper_command(text) {
@@ -354,7 +354,7 @@ pub async fn route(
     // routing so a macro control utterance never falls through to the model. The
     // REPLAY command is handled one level up (in the turn loop), where it re-runs
     // each recorded command through the FULL classify->route->gate pipeline FRESH;
-    // here we handle the non-replay control verbs. OFF by default ([macros].enabled):
+    // here we handle the non-replay control verbs. ON by default ([macros].enabled):
     // with it off these report the subsystem is off and record/persist nothing — no
     // store accrues. Recording captures only the UTTERANCE + intent name, redacted at
     // persist time (macros.rs), so a secret is never stored; and recording NEVER
@@ -389,8 +389,8 @@ pub async fn route(
     // The recalled text is kept TRANSIENT by the main.rs gate (is_screen_read unions
     // the recall here) so it never seeds lifelong memory / optimizer traces, exactly
     // like the one-shot screen read. The CONTINUOUS capture loop that FEEDS the ring
-    // is OFF by default ([screen_context].enabled) + TCC-device-gated — these voice
-    // commands only READ/CLEAR the ring, they never start a capture. Runs after the
+    // ships ON ([screen_context].enabled) but is INERT WITHOUT Screen-Recording TCC
+    // consent — these voice commands only READ/CLEAR the ring, they never start a capture. Runs after the
     // owner voice-id all-scope gate, so an unrecognized bystander cannot recall the
     // owner's screen context or wipe it.
     if let Some(intent) = crate::screen_context::classify_screen_context_intent(text) {
@@ -498,8 +498,8 @@ pub async fn route(
     // report about X". CONSERVATIVELY anchored (classify_report_intent requires
     // "report" + an explicit build verb + a topic, so a question about an existing
     // report and an ordinary "research X" never trip it). GATED by [report].enabled
-    // (ships OFF) — when off the op declines honestly and reads nothing, so routing
-    // is byte-for-byte today's. READ-ONLY: it pulls the agent-scoped, already-cited
+    // (ships ON; read-only, safe to enable) — when off the op declines honestly and
+    // reads nothing. READ-ONLY: it pulls the agent-scoped, already-cited
     // notebook runs on the topic and folds them into a BOUNDED markdown report under
     // research.rs's cite discipline (every citation a REAL source ref an input claim
     // carried; an uncited run contributes nothing; no citable source -> an
@@ -555,14 +555,14 @@ pub async fn route(
     // CHART VOICE COMMAND (#41): "chart this" / "plot the system load" / "graph the
     // cpu". CONSERVATIVELY anchored (classify_chart_intent requires a chart/plot/
     // graph verb + a chartable subject, so an ordinary "what's the cpu" never trips
-    // it). GATED by [chart].enabled (ships OFF) — when off the op declines and emits
-    // nothing, so behavior is byte-for-byte today's. NEUTRAL presentation: it
+    // it). GATED by [chart].enabled (ships ON — a neutral presentation act, safe to
+    // enable outright) — when off the op declines and emits nothing. NEUTRAL presentation: it
     // serializes a ChartSpec from the latest REAL system snapshot the telemetry bus
     // already publishes (the EXACT cpu/mem values — no interpolation, no invented
     // point; no snapshot -> an honest-empty chart) and fire-and-forget emits it as a
     // `chart.data` envelope the HUD plots exactly. It changes no gate, takes no
-    // action, reaches no network. Only entered when the flag is on, so it adds no
-    // surface by default.
+    // action, reaches no network. Only entered when the flag is on (it ships on),
+    // and emitting is a pure presentation act with no safety surface.
     if cfg.chart.enabled {
         if let Some(_intent) = crate::chart::classify_chart_intent(text) {
             let prime = agents.orchestrator();
@@ -697,7 +697,8 @@ pub async fn route(
     //     a HARD recurring cue routes straight to the (still gated) standing setup.
     //   * Rail 2 (no silent autonomy): the standing mode only PROPOSES — it routes
     //     to standing_create, which PARKS behind the cross-turn confirmation gate
-    //     (and the OFF-by-default master switch). world_update writes ONLY the
+    //     (and the armed-by-default master switch, which still requires a fresh
+    //     per-action confirm). world_update writes ONLY the
     //     shared user.world.* tier, never a consequential external action.
     //
     // one_shot falls THROUGH to the existing pipeline unchanged (so current fast
@@ -1736,8 +1737,8 @@ fn local_sub_for_turn(cfg: &Config, class: &Classification) -> Option<&'static s
 ///     decompose -> dispatch each sub-task under its owning specialist's allowlist
 ///     + the consequential gate -> synthesize. Degrades to a friendly line offline.
 ///   * `Standing`    -> PROPOSE ONLY (`propose_standing_mission`): parks behind the
-///     cross-turn confirmation gate + the OFF-by-default master switch. Creates
-///     nothing here (Rail 2).
+///     cross-turn confirmation gate + the armed-by-default master switch (a confirmed
+///     action still needs a fresh per-action confirm). Creates nothing here (Rail 2).
 ///
 /// `OneShot` never reaches this function (the caller falls straight through).
 async fn route_capability(
@@ -1861,7 +1862,7 @@ async fn route_capability(
 
         Mode::Standing => {
             // PROPOSE ONLY (Rail 2): park behind the confirmation gate + the
-            // OFF-by-default master switch. Nothing is established here. The
+            // armed-by-default master switch (still per-action gated). Nothing is established here. The
             // proposing agent is the orchestrator; its allowlist is carried into
             // the pending so the spoken-yes replay re-checks it.
             emit_agent_active(prime);
@@ -3767,7 +3768,8 @@ pub fn is_screen_read(text: &str) -> bool {
 // `describe_image` op (an on-device mlx-vlm model). The image's pixels go ONLY
 // to the on-device VLM — NEVER to the cloud, never off the device.
 //
-// DEVICE-GATED + OFF by default ([vision].enabled, [vision].model): the VLM
+// DEVICE-GATED + ON by default but INERT WITHOUT A MODEL ([vision].enabled ships
+// true, [vision].model ships empty): the VLM
 // needs mlx-vlm + a multi-GB checkpoint + enough RAM, so when it is off / the
 // model isn't named / isn't downloaded, the op honestly reports "unavailable"
 // and the daemon FALLS BACK honestly (to the OCR read.screen path for a screen
@@ -4096,7 +4098,8 @@ async fn describe_confined_path(
 // saved on-device under state/images/ — NEVER to the cloud, never off the device
 // (there is NO cloud image API anywhere on this path).
 //
-// DEVICE-GATED + OFF by default ([image].enabled, [image].model): the diffusion
+// DEVICE-GATED + ON by default but INERT WITHOUT A MODEL ([image].enabled ships
+// true, [image].model ships empty): the diffusion
 // model needs an MLX package + a multi-GB checkpoint + enough RAM, so when it is
 // off / the model isn't named / isn't downloaded, the op honestly reports
 // "image_model_unavailable" and the daemon surfaces an honest "the on-device
@@ -4572,15 +4575,15 @@ async fn handle_identify_sound(
     }
 }
 
-/// PURE gate for the OPT-IN ambient sound monitor (task #15). The monitor
-/// PERIODICALLY classifies ambient audio + emits sound-class events ONLY when the
-/// operator has explicitly opted in. Factored out so the "ships OFF + never
-/// auto-starts" invariant is unit-testable without a clock, a mic, or a spawn.
+/// PURE gate for the ambient sound monitor (task #15). The monitor
+/// PERIODICALLY classifies ambient audio + emits sound-class events ONLY when
+/// `[audio].sound_monitor` is on. Factored out so the "inert without consent + never
+/// auto-starts the mic" invariant is unit-testable without a clock, a mic, or a spawn.
 ///
 /// Returns `true` (the monitor may start) ONLY when `[audio].sound_monitor` is
-/// true. With it false (the SHIPPED default, pinned in config) this returns
-/// false: the monitor NEVER starts, the mic is never opened for ambient
-/// classification, and the audio path is byte-for-byte today's. macOS mic/TCC
+/// true (the SHIPPED default is true, but INERT WITHOUT mic/TCC consent). With it
+/// false this returns false: the monitor NEVER starts, the mic is never opened for
+/// ambient classification, and the audio path is byte-for-byte today's. macOS mic/TCC
 /// consent is a SEPARATE on-device gate the daemon cannot grant — even when this
 /// returns true, the actual ambient capture is device-gated and is NOT exercised
 /// here (the one-shot intent + this gate are what the tests cover).
@@ -6347,15 +6350,17 @@ mod tests {
         }
     }
 
-    /// GATE + FALLBACK (honesty-first): with [vision] OFF, an IMAGE describe
-    /// NEVER calls the VLM op and NEVER fabricates a description — it returns an
-    /// honest gate line and emits the vision.describe telemetry as unavailable.
-    /// Hermetic: no real model, no socket touched (the gate short-circuits before
-    /// any op call), an empty app registry.
+    /// GATE + FALLBACK (honesty-first): [vision] ships ON (full-power default) but
+    /// INERT WITHOUT A MODEL (model="") — an IMAGE describe NEVER calls the VLM op and
+    /// NEVER fabricates a description; it returns an honest gate line and emits the
+    /// vision.describe telemetry as unavailable. Hermetic: no real model, no socket
+    /// touched (the empty-model gate short-circuits before any op call), an empty app
+    /// registry.
     #[tokio::test]
-    async fn describe_image_gate_off_falls_back_honestly_no_op_call() {
-        let cfg = Config::default(); // [vision] ships OFF (enabled=false)
-        assert!(!cfg.vision.enabled, "precondition: VLM ships off");
+    async fn describe_image_gate_inert_without_model_falls_back_honestly_no_op_call() {
+        let cfg = Config::default(); // [vision] enabled=true but model="" => inert
+        assert!(cfg.vision.enabled, "precondition: VLM ships ON (full-power default)");
+        assert!(cfg.vision.model.trim().is_empty(), "precondition: no VLM model configured (inert)");
         let registry = crate::apps::AppRegistry::discover(std::path::Path::new("/nonexistent"));
         // A lazy client pointed at a socket that does not exist; the gate path
         // must NOT reach it (proving no op is called when off).
@@ -6543,17 +6548,18 @@ mod tests {
         }
     }
 
-    /// GATE + FALLBACK (honesty-first): with [image] OFF (the shipped default), an
-    /// image-generation request NEVER calls the generate_image op and NEVER
-    /// fabricates an image — it returns an honest "not set up" line and emits the
-    /// image.generated telemetry as unavailable. CRUCIALLY there is NO cloud
-    /// fallback. Hermetic: no real model, no socket touched (the gate short-circuits
-    /// before any op call) — the client points at a nonexistent socket to prove no
-    /// op is reached when off.
+    /// GATE + FALLBACK (honesty-first): [image] ships ON (full-power default) but
+    /// INERT WITHOUT A MODEL (model=""), an image-generation request NEVER calls the
+    /// generate_image op and NEVER fabricates an image — it returns an honest "not set
+    /// up" line and emits the image.generated telemetry as unavailable. CRUCIALLY there
+    /// is NO cloud fallback. Hermetic: no real model, no socket touched (the
+    /// empty-model gate short-circuits before any op call) — the client points at a
+    /// nonexistent socket to prove no op is reached.
     #[tokio::test]
-    async fn generate_image_gate_off_reports_honestly_no_op_no_cloud() {
-        let cfg = Config::default(); // [image] ships OFF (enabled=false)
-        assert!(!cfg.image.enabled, "precondition: image generation ships off");
+    async fn generate_image_gate_inert_without_model_reports_honestly_no_op_no_cloud() {
+        let cfg = Config::default(); // [image] enabled=true but model="" => inert
+        assert!(cfg.image.enabled, "precondition: image generation ships ON (full-power default)");
+        assert!(cfg.image.model.trim().is_empty(), "precondition: no image model configured (inert)");
         // A lazy client pointed at a socket that does not exist; the gate path must
         // NOT reach it (proving no op is called when off).
         let mut infer = InferenceClient::new(std::path::PathBuf::from("/nonexistent/inference.sock"));
@@ -6807,30 +6813,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// OPT-IN MONITOR GATE: the ambient sound monitor starts ONLY when opted in.
-    /// With [audio].sound_monitor OFF (the SHIPPED default, pinned in config) the
-    /// gate is false — the monitor NEVER auto-starts, the mic stays closed for
-    /// ambient classification. This is the pure half of main.rs's spawn gate.
+    /// MONITOR GATE: the ambient sound monitor's spawn gate is the pure
+    /// `ambient_monitor_should_start(enabled)`. With the flag OFF the gate is false —
+    /// the monitor never auto-starts. The shipped DEFAULT is now ON (full-power), but
+    /// it is INERT WITHOUT MIC/TCC: even with the gate true the device-gated mic loop
+    /// captures nothing without Microphone consent. This is the pure half of main.rs's
+    /// spawn gate.
     #[test]
-    fn ambient_monitor_ships_off_and_never_auto_starts() {
-        // Shipped default: OFF -> the monitor must not start.
+    fn ambient_monitor_gate_is_the_flag_and_default_is_on() {
+        // Flag OFF -> the monitor must not start (the off path is intact).
         assert!(
             !ambient_monitor_should_start(false),
-            "the ambient sound monitor MUST NOT auto-start (it ships OFF; continuous listening is opt-in)"
+            "with the flag off the ambient monitor must NOT auto-start"
         );
-        // The config default agrees (pinned OFF) — defense in depth across layers.
+        // The config default is now ON (full-power) — defense in depth: the gate
+        // tracks the flag, and the mic loop is still TCC-gated at runtime.
         assert!(
-            !Config::default().audio.sound_monitor,
-            "[audio].sound_monitor ships OFF"
+            Config::default().audio.sound_monitor,
+            "[audio].sound_monitor ships ON (full-power default; inert without mic/TCC)"
         );
         assert!(
-            !ambient_monitor_should_start(Config::default().audio.sound_monitor),
-            "the default config must leave the monitor off"
+            ambient_monitor_should_start(Config::default().audio.sound_monitor),
+            "the default config arms the gate (the mic loop still needs TCC consent at runtime)"
         );
-        // Only an explicit opt-in arms it.
+        // The flag is the only thing the pure gate reads.
         assert!(
             ambient_monitor_should_start(true),
-            "an explicit opt-in is the ONLY path to a running monitor"
+            "an enabled flag opens the spawn gate"
         );
     }
 
@@ -7539,16 +7548,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn router_report_off_by_default_declines_and_reads_nothing() {
-        // With the op OFF (the shipped default) dispatch declines honestly and reads
-        // nothing — proving the OFF-by-default surface adds nothing.
+    async fn router_report_when_disabled_declines_and_reads_nothing() {
+        // With the op explicitly DISABLED (an operator override; the shipped default
+        // is ON) dispatch declines honestly and reads nothing.
         let db = TempDb::new("report-off");
         let mem = Memory::open(&db.0).unwrap();
         let ns = "agent.jarvis";
         let intent = crate::report::classify_report_intent("generate a report on anything")
             .expect("classifies");
-        let off = crate::report::ReportConfig::default();
-        assert!(!off.enabled, "ships OFF");
+        let off = crate::report::ReportConfig { enabled: false };
+        assert!(!off.enabled, "explicitly disabled");
         let out = crate::report::dispatch(&mem, ns, intent, &off).await.unwrap();
         assert_eq!(out.verb, "report_off", "the disabled op declines");
         assert!(out.report.is_none(), "nothing was built");

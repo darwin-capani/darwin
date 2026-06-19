@@ -1521,7 +1521,14 @@ pub fn install(manager: McpManager) {
 pub fn global() -> &'static McpManager {
     GLOBAL.get().unwrap_or_else(|| {
         static DISABLED: std::sync::OnceLock<McpManager> = std::sync::OnceLock::new();
-        DISABLED.get_or_init(|| McpManager::new(McpConfig::default()))
+        // The UNINSTALLED fallback is explicitly disabled (fail-safe) — independent
+        // of the [mcp].enabled config default (now ON, full-power). Until install()
+        // wires the real, config-driven manager, every reader sees an inert manager:
+        // no tools, no server usable. (A configured-ON manager still connects to
+        // nothing without a [[mcp.servers]] entry — see install().)
+        DISABLED.get_or_init(|| {
+            McpManager::new(McpConfig { enabled: false, ..McpConfig::default() })
+        })
     })
 }
 

@@ -233,7 +233,8 @@ pub fn is_enabled() -> bool {
 pub fn ingest_continuous_snapshot(ts: u64, raw_text: &str, source_tag: &str) -> bool {
     let settings = *SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     if !settings.enabled {
-        // OFF by default — never grow the ring without an explicit enable.
+        // Disabled — never grow the ring. (Ships ON by default but is inert without
+        // Screen-Recording TCC consent; this guards the explicit-disable case.)
         return false;
     }
     let before = global_len();

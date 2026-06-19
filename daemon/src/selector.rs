@@ -40,7 +40,8 @@
 //!
 //! **Rail 2 — no silent autonomy.** The `Standing` mode only ever PROPOSES the
 //! standing mission: it routes to `standing_create`, which PARKS behind the
-//! cross-turn confirmation gate (and the OFF-by-default master switch) before
+//! cross-turn confirmation gate (and the armed-by-default master switch, which still
+//! requires a fresh per-action confirm) before
 //! anything is established. The selector NEVER creates a standing mission itself.
 //! `WorldUpdate` writes ONLY the shared `user.world.*` tier — never a consequential
 //! external action, never a private agent namespace.

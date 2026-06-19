@@ -5,13 +5,13 @@
 ### An on-device-first autonomous AI desktop OS for Apple Silicon.
 
 **A local MLX brain with cloud fallback · a 27-agent constellation · a holographic HUD · a sandboxed micro-app runtime.**
-**Everything consequential ships OFF, behind a master switch, per-action confirm, on-device voice-id, and lockdown.**
+**Consequential power ships ARMED by default — still behind a per-action confirm, on-device voice-id, per-action policy, and lockdown, every one of which stays enforced.**
 
 </div>
 
 ---
 
-JARVIS turns an Apple Silicon Mac into a voice-driven, always-on AI environment that **owns the machine end to end** — yet never does anything consequential until you explicitly arm it. A Rust daemon (`jarvisd`) runs the always-on audio/intent loop; MLX serves local inference on the Apple GPU; the Anthropic API handles what the local models can't; and a fullscreen HUD (Tauri 2 + React-Three-Fiber) renders the machine's live state as a dark-glass, cyan-holographic heads-up display. macOS stays underneath as an invisible host kernel.
+JARVIS turns an Apple Silicon Mac into a voice-driven, always-on AI environment that **owns the machine end to end** — it can act consequentially by default, but never **without a fresh per-action confirmation** (plus voice-id, per-action policy, and lockdown, all still enforced). A Rust daemon (`jarvisd`) runs the always-on audio/intent loop; MLX serves local inference on the Apple GPU; the Anthropic API handles what the local models can't; and a fullscreen HUD (Tauri 2 + React-Three-Fiber) renders the machine's live state as a dark-glass, cyan-holographic heads-up display. macOS stays underneath as an invisible host kernel.
 
 It is built **honestly**: the headline features below are real and tested, the device-gated ones are labeled, and nothing here is a fabricated benchmark.
 
@@ -65,7 +65,7 @@ JARVIS **acts on the machine, not just talks about it.** The built-in actuator (
 | **Find files** | "find my budget spreadsheet" | Spotlight under your home folder, filenames then contents, newest first |
 | **Set volume / report status** | "volume to 40%", "system status" | live CPU/MEM/DISK/UPTIME from the telemetry cache |
 | **Remember & recall facts** | "my name is Dar", "what are my projects?" | durable facts in SQLite, folded into every later reply; corrections overwrite |
-| **Search your own docs, on-device** | "index my documents", "search my files for the lease clause" | **OFF by default**, allowlisted folders only, embeddings never leave the device; honest BM25 fallback that reports which method ran |
+| **Search your own docs, on-device** | "index my documents", "search my files for the lease clause" | **ON by default but inert until you allowlist a folder** (never a whole-disk scan); embeddings never leave the device; honest BM25 fallback that reports which method ran |
 
 Heavy or low-confidence requests route to the cloud and run the **same** actions through an Anthropic Messages-API tool loop (bounded: ≤ 3 model calls, 75 s), so *"could you possibly get that browser thing going"* works as well as *"open Safari."* Every executed action emits an `action.executed` telemetry event.
 
@@ -130,10 +130,10 @@ JARVIS was developed on an M4 Mac Mini, but the whole stack (arm64 + Metal/MLX +
 
 ## Safety model
 
-**Everything consequential is OFF by default, and arming it takes more than one switch.** Read-only lookups always work; anything that posts/sends/spends or controls the machine must clear every layer:
+**Consequential power is ON by default — what protects you is that every consequential action must clear the per-action layers below, and those are NOT defaults you can flip away: they are enforced at the chokepoints.** Read-only lookups always work; anything that posts/sends/spends or controls the machine must clear every layer:
 
-1. **Master switch — OFF.** `[integrations].allow_consequential` ships `false`. Every consequential subsystem (self-heal, app forge, standing missions, MCP, trace optimizer, cloud voice/STT, doc search, screen capture, proactive speech) has its **own** independent OFF-default switch — none piggyback.
-2. **Per-action confirm.** Each consequential action parks behind a fresh, cross-turn spoken confirmation. No batching past the gate — a macro or standing mission re-runs every consequential step through the gate individually.
+1. **Master switch — ON (armed).** `[integrations].allow_consequential` ships `true`. Each consequential subsystem (self-heal, app forge, standing missions, MCP, trace optimizer, cloud voice/STT, doc search, screen capture, proactive speech, shell, UI automation) has its **own** switch, now ON by default — but several are **honestly inert until you supply a dependency**: an API key (cloud LLM, ElevenLabs voice/STT, self-heal/forge drafting), a downloaded model (vision VLM, image diffusion, speculative draft), a macOS TCC grant (UI automation, mic, screen context), an allowlisted folder (doc search, code), or a configured server/mapping (MCP, webhooks). Enabling a switch ≠ active without its dependency.
+2. **Per-action confirm.** Each consequential action parks behind a fresh, cross-turn spoken confirmation. No batching past the gate — a macro or standing mission re-runs every consequential step through the gate individually. `ui_actuate` and `shell_run` are pinned **NEVER-auto-approve**: they re-park per action even under an "Always" policy.
 3. **On-device voice-id (optional).** When enrolled + enabled, an unrecognized speaker can't trigger or confirm a consequential action. **Fail-closed**: an embed error is treated as unverified for the consequential path, never bricking ordinary replies. The profile is a local feature vector; no audio leaves the device.
 4. **Lockdown.** One command hard-disables the consequential surface regardless of the other switches.
 5. **Policy + allowlists.** A per-action policy plus per-feature allowlists bound what each path can touch (e.g. doc-search `roots` ships **empty** — never a whole-disk scan).
@@ -174,10 +174,10 @@ The git repo tracks **source only**. The entire `state/` tree, all secrets, ever
 
 Some things only **you** can grant — a config flag cannot substitute:
 
-- **macOS consent (TCC).** The OS will prompt for **Microphone** (the always-on loop), and — only if you turn the relevant OFF-by-default features on — **Screen Recording**, **Accessibility/Automation**, and broader **Files & Folders** access. These are yours to approve or deny.
-- **API keys in Keychain.** Paste your `ANTHROPIC_API_KEY` (and optional `elevenlabs_api_key`) once in the HUD's Settings — masked, stored in the Keychain (service `com.jarvis.daemon`), never plaintext on disk. Restart JARVIS after changing a key.
+- **macOS consent (TCC).** The features ship enabled, but several stay **inert until the OS grants you the permission**: the always-on **Microphone** loop (wake word, live interpret, sound monitor), **Screen Recording** (screen context), and **Accessibility/Automation** (UI automation). The flag cannot grant these — they are yours to approve or deny in System Settings.
+- **API keys in Keychain.** Paste your `ANTHROPIC_API_KEY` (and optional `elevenlabs_api_key`) once in the HUD's Settings — masked, stored in the Keychain (service `com.jarvis.daemon`), never plaintext on disk. The cloud LLM fallback, the ElevenLabs voice/STT tier, and self-heal/forge drafting are enabled but stay inert until the key is present. Restart JARVIS after changing a key.
 - **Auto-login (optional).** For true boot-to-JARVIS, enable "Automatically log in as" in System Settings → Users & Groups (requires FileVault off). The LaunchAgents do the rest.
-- **Arming consequential features.** Nothing side-effecting runs until you deliberately flip its switch *and* confirm each action.
+- **Confirming consequential actions.** The features are enabled by default; nothing side-effecting runs until you **confirm each action** (and, where applicable, supply the key / grant the permission / allowlist the folder).
 
 ---
 
@@ -193,6 +193,6 @@ Some things only **you** can grant — a config flag cannot substitute:
 
 <div align="center">
 
-*Built on-device. Off by default. Honest about its limits.*
+*Built on-device. Armed by default, gated per action. Honest about its limits.*
 
 </div>

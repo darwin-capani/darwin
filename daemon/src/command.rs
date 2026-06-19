@@ -12,9 +12,10 @@
 //!
 //!   * a consequential `ask` STILL parks via the cross-turn confirmation gate
 //!     (confirm.rs); the channel never pre-confirms,
-//!   * the OFF-by-default master switch (`integrations.allow_consequential`)
-//!     STILL gates every fire — a `confirm {id}` with the switch OFF only
-//!     previews and fires nothing (the replay re-checks it),
+//!   * the armed-by-default master switch (`integrations.allow_consequential`,
+//!     ships ON) STILL gates every fire — even armed, a `confirm {id}` only fires a
+//!     previously-parked action; with the switch OFF it only previews and fires
+//!     nothing (the replay re-checks it),
 //!   * per-agent allowlist isolation STILL applies — an `ask {agent}` uses that
 //!     agent's tools only; a `confirm` re-checks the parked agent's allowlist,
 //!   * Self-Forge stays PROPOSE-ONLY — `dismiss_forge` clears the pending marker

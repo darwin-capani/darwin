@@ -26,9 +26,9 @@
 //!      [`crate::standing::create`] path (the confirmed `standing_create`
 //!      target) — there is NO new ungated create here. A predictive suggestion
 //!      carries no action at all.
-//!   3. GATED BY `[proactive].suggest` (SHIPS OFF). [`detect`] returns EMPTY
+//!   3. GATED BY `[proactive].suggest` (SHIPS ON). [`detect`] returns EMPTY
 //!      unless `[proactive].suggest` is on. That flag is the suggester's OWN
-//!      master switch and ships FALSE (config.rs default + jarvis.toml pin),
+//!      master switch and ships TRUE (config.rs default + jarvis.toml pin),
 //!      mirroring `[proactive].speak` — it is deliberately NOT `[proactive].enabled`
 //!      (which ships ON only to power the unrelated first-contact brief). So with
 //!      the shipped config NO suggestion surfaces. Even with `suggest` on, a
@@ -346,8 +346,8 @@ pub fn detect(
     dismissed: &DismissLedger,
 ) -> Vec<Suggestion> {
     // GATE: with the suggester off, surface nothing at all. This is the
-    // suggester's OWN master switch — `[proactive].suggest` — which SHIPS OFF
-    // (config.rs default false + jarvis.toml `suggest = false`), mirroring
+    // suggester's OWN master switch — `[proactive].suggest` — which SHIPS ON
+    // (config.rs default true + jarvis.toml `suggest = true`), mirroring
     // `[proactive].speak`. It is deliberately NOT `[proactive].enabled` (which
     // ships ON only for the first-contact brief), so the suggestion feed is gated
     // by a flag that actually ships off, not by being dead code.
@@ -817,17 +817,18 @@ mod tests {
     }
 
     #[test]
-    fn the_shipped_default_config_has_the_suggestion_gate_off() {
-        // HONESTY / SHIPS-OFF CONTRACT: the suggester is gated by `suggest`, which
-        // MUST default false (config.rs default) so the feature ships off by the
-        // documented gate — not merely by being dead code. The struct default is
-        // what `Config::load` falls back to and what the shipped jarvis.toml pins.
+    fn the_shipped_default_config_has_the_suggestion_gate_on() {
+        // FULL-POWER DEFAULT: the suggester is gated by `suggest`, which now defaults
+        // TRUE (config.rs default) so the feature ships ON. The struct default is what
+        // `Config::load` falls back to and what the shipped jarvis.toml pins. Accepting
+        // a surfaced habit offer STILL routes through the gated standing_create
+        // confirmation — surfacing a suggestion is never an auto-action.
         let shipped = ProactiveConfig::default();
-        assert!(!shipped.suggest, "the suggester gate MUST ship OFF (suggest=false)");
-        // And a strong pattern under the SHIPPED default surfaces nothing.
+        assert!(shipped.suggest, "the suggester gate ships ON (suggest=true, full-power default)");
+        // And a strong pattern under the SHIPPED default DOES surface a suggestion.
         let eps: Vec<Episode> = (1..=6).map(|d| ep("agent.jarvis", "budget.review", &morning_ts(d))).collect();
         let out = detect(&shipped, "agent.jarvis", &eps, &DismissLedger::default());
-        assert!(out.is_empty(), "shipped-default config must surface NOTHING: {out:?}");
+        assert!(!out.is_empty(), "shipped-default config (suggest on) must surface the observed pattern: {out:?}");
     }
 
     #[test]

@@ -431,8 +431,9 @@ fn metric_or_awaiting(v: Option<f64>) -> Value {
 /// and the `eval.report` telemetry carries. Contains ONLY percentiles, sums,
 /// rates, counts, and the honest optimizer posture — no utterance, no per-turn
 /// row, no identifier. `optimizer_enabled`/`optimizer_mode` describe the
-/// PROPOSE-ONLY + OFF-by-default optimizer so the panel's copy is grounded in the
-/// real config (the eval framework NEVER changes that posture).
+/// PROPOSE-ONLY optimizer (ships ON; mode stays "propose" — there is no
+/// auto-apply-to-live path) so the panel's copy is grounded in the real config (the
+/// eval framework NEVER changes that posture).
 pub fn report_snapshot(
     latency: &LatencyAggregate,
     cost: &CostAggregate,
@@ -489,8 +490,8 @@ pub fn report_snapshot(
         "cost": cost_json,
         "accuracy": accuracy_json,
         "optimizer": {
-            // Honest posture: PROPOSE-ONLY, OFF by default. The eval framework
-            // only MEASURES; it never tunes anything.
+            // Honest posture: PROPOSE-ONLY (ships ON; mode stays "propose"). The eval
+            // framework only MEASURES; it never tunes anything.
             "enabled": optimizer_enabled,
             "mode": optimizer_mode,
             "posture": "propose-only",

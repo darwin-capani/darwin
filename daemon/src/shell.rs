@@ -666,12 +666,13 @@ mod tests {
     use std::path::PathBuf;
 
     // =====================================================================
-    // (0) GATE — shell_permitted: off by default semantics
+    // (0) GATE — shell_permitted: enabled-flag semantics
+    // (ships ON; this pins the explicit-disable path)
     // =====================================================================
 
     #[test]
     fn shell_permitted_requires_the_master_switch() {
-        assert!(!shell_permitted(false), "off => not permitted (the shipped default)");
+        assert!(!shell_permitted(false), "disabled => not permitted");
         assert!(shell_permitted(true), "on => permitted (still gated above by confirm/master/voice-id)");
     }
 

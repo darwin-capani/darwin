@@ -1491,11 +1491,15 @@ mod tests {
         assert!(!guarded.terse, "a required confirm is never trimmed");
     }
 
-    /// (e) FEATURE OFF (the shipped default): the speak request is BYTE-FOR-BYTE
-    /// today's on every backend — the shape is the identity and adds nothing.
+    /// (e) FEATURE OFF (explicit): the speak request is BYTE-FOR-BYTE today's on every
+    /// backend — the shape is the identity and adds nothing. (The shipped DEFAULT is
+    /// now ON, full-power; this proves the off path still produces today's exact wire
+    /// when an operator disables prosody.)
     #[test]
     fn prosody_off_speak_request_is_byte_for_byte_today() {
-        let cfg = Config::default(); // adaptive_prosody = false, whisper = false
+        let mut cfg = Config::default();
+        cfg.voice.adaptive_prosody = false; // explicit off-path
+        cfg.voice.whisper = false;
         for kind in [ReplyKind::Routine, ReplyKind::Alert, ReplyKind::Wellness, ReplyKind::Greeting] {
             for backend in [el_v3(), kokoro()] {
                 let shape = shape_speak_request(&cfg, classify_prosody(kind, false), &backend);

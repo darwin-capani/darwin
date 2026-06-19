@@ -14,10 +14,11 @@
 //!     "unknown" (a single stream). It NEVER fabricates distinct speakers the backend
 //!     did not report.
 //!
-//! ## Posture (OFF by default; EL-Scribe-gated)
+//! ## Posture (ON by default; INERT ON-DEVICE; EL-Scribe-gated)
 //!
-//! `[voice].diarize` SHIPS OFF: with it false the transcript is rendered exactly as
-//! today (no labels). When ON, diarization is still EL-SCRIBE-GATED — only when the
+//! `[voice].diarize` SHIPS ON (full-power default) but is INERT ON-DEVICE: with it
+//! false the transcript is rendered exactly as today (no labels). When ON,
+//! diarization is still EL-SCRIBE-GATED — only when the
 //! EL-Scribe backend actually returned a per-word `words` stream does [`diarize`] run on
 //! the real labels (live-wired via `InferenceClient::transcribe_diarized` ->
 //! `run_pipeline`); the on-device whisper path (no `words`) gets the honest single-stream

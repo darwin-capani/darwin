@@ -1,4 +1,4 @@
-//! VOICE TIER — the honest, OFF-by-default ElevenLabs cloud-TTS layer that sits
+//! VOICE TIER — the honest ElevenLabs cloud-TTS layer (ships ON, INERT WITHOUT A KEY) that sits
 //! ON TOP of the on-device Kokoro engine. This module is the pure tier-decision
 //! brain: given the config, the active model-swap tier, and whether an ElevenLabs
 //! key is present, it answers ONE question — which TTS backend speaks this
@@ -11,8 +11,10 @@
 //!   * It is NOT a replacement for Kokoro, and NOT a hosted "Conversational
 //!     Agents" platform — JARVIS owns its own brain/router/turn-taking. ElevenLabs
 //!     is used purely to synthesize speech from text JARVIS already produced.
-//!   * It SHIPS OFF ([voice].cloud_tier=false), exactly like self_heal/forge/
-//!     standing/mcp/optimize. Turning it on is a deliberate operator step.
+//!   * It SHIPS ON ([voice].cloud_tier=true, full-power default) but is INERT
+//!     WITHOUT AN ELEVENLABS KEY: reached only when the key is present AND the tier
+//!     is non-Local; otherwise on-device Kokoro (the private default + fallback).
+//!     When active the TTS TEXT leaves the device.
 //!
 //! ## The precedence (resolve_voice_backend) — ElevenLabs only when ALL hold
 //!
@@ -257,10 +259,12 @@ mod tests {
 
     #[test]
     fn tier_off_always_picks_kokoro() {
-        // The shipped default has cloud_tier=false; even with a key + heavy tier,
-        // the backend is on-device Kokoro with the agent's Kokoro voice.
-        let cfg = Config::default();
-        assert!(!cfg.voice.cloud_tier, "must ship OFF");
+        // With cloud_tier explicitly OFF, even with a key + heavy tier, the backend is
+        // on-device Kokoro with the agent's Kokoro voice. (The shipped DEFAULT is now
+        // ON, full-power, but INERT WITHOUT A KEY; this proves the explicit off path.)
+        let mut cfg = Config::default();
+        cfg.voice.cloud_tier = false;
+        assert!(!cfg.voice.cloud_tier, "explicitly disabled cloud tier");
         let b = resolve_voice_backend(&cfg, "jarvis", "bm_george", Tier::Heavy, true);
         assert_eq!(b, Backend::Kokoro { voice: "bm_george".to_string() });
         assert!(!b.is_cloud(), "Kokoro never leaves the device");
@@ -376,12 +380,13 @@ mod tests {
     // -- STT (a) ships OFF (pinned): whisper regardless of key/tier ----------
 
     #[test]
-    fn stt_tier_ships_off_pinned_and_picks_whisper() {
-        // The shipped default has cloud_stt=false; even with a key + heavy tier,
-        // transcription is on-device whisper. STT is MORE sensitive than TTS, so
-        // its switch is pinned OFF.
-        let cfg = Config::default();
-        assert!(!cfg.voice.cloud_stt, "the Scribe cloud-STT tier MUST ship OFF (pinned)");
+    fn stt_tier_when_disabled_picks_whisper() {
+        // With cloud_stt explicitly OFF, even with a key + heavy tier, transcription is
+        // on-device whisper. (The shipped DEFAULT is now ON, full-power, but INERT
+        // WITHOUT A KEY; STT is MORE sensitive than TTS — this proves the off path.)
+        let mut cfg = Config::default();
+        cfg.voice.cloud_stt = false;
+        assert!(!cfg.voice.cloud_stt, "explicitly disabled Scribe cloud-STT tier");
         let b = resolve_stt_backend(&cfg, Tier::Heavy, true);
         assert_eq!(b, SttBackend::Whisper);
         assert!(!b.is_cloud(), "whisper never sends the user's audio off-device");
@@ -492,8 +497,9 @@ mod tests {
                 "key={key} tier={tier:?} should be cloud={want_cloud}, got {b:?}"
             );
         }
-        // And with the switch OFF, NO cell is ever cloud (the pinned-off guard).
-        let off = Config::default();
+        // And with the switch explicitly OFF, NO cell is ever cloud (the off guard).
+        let mut off = Config::default();
+        off.voice.cloud_stt = false;
         for tier in [Tier::Heavy, Tier::Fast, Tier::Local] {
             assert!(
                 !resolve_stt_backend(&off, tier, true).is_cloud(),

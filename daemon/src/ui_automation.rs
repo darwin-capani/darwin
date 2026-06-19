@@ -850,12 +850,13 @@ mod tests {
     use super::*;
 
     // =====================================================================
-    // (2) CONFIG GATE — ui_automation_permitted: off by default semantics
+    // (2) CONFIG GATE — ui_automation_permitted: enabled-flag semantics
+    // (ships ON; this pins the explicit-disable path)
     // =====================================================================
 
     #[test]
     fn ui_automation_permitted_requires_the_master_switch() {
-        assert!(!ui_automation_permitted(false), "off => not permitted (the shipped default)");
+        assert!(!ui_automation_permitted(false), "disabled => not permitted");
         assert!(
             ui_automation_permitted(true),
             "on => permitted (still gated above by confirm/master/voice-id, and below by TCC)"

@@ -311,26 +311,29 @@ pub fn render_markdown(report: &Report) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// CONFIG — the OFF-by-default flag the live op reads
+// CONFIG — the ON-by-default flag the live op reads
 // ---------------------------------------------------------------------------
 
 /// The report op's runtime knobs, mirrored from [`crate::config::ReportConfig`] so
 /// the pure builder stays config-shaped without depending on the whole `Config`.
-/// `enabled` is the master gate (ships OFF): with it false the live "generate a
-/// report on X" op declines (it never builds), and routing is byte-for-byte
-/// today's. The pure [`build_report`] does not consult `enabled` — the gate lives
-/// at the op boundary; the builder is always available to tests.
+/// `enabled` is the master gate (ships ON — full-power default; the report op is
+/// READ-ONLY and folds already-cited material into a bounded report, safe to enable
+/// outright): with it false the live "generate a report on X" op declines (it never
+/// builds). The pure [`build_report`] does not consult `enabled` — the gate lives at
+/// the op boundary; the builder is always available to tests. In lockstep with
+/// `config::ReportConfig::default()`.
 #[derive(Debug, Clone, Copy)]
 pub struct ReportConfig {
-    /// Whether the live report op is enabled. OFF by default.
+    /// Whether the live report op is enabled. ON by default.
     pub enabled: bool,
 }
 
 impl Default for ReportConfig {
     fn default() -> Self {
-        // SHIPS OFF — the report op is opt-in; nothing builds a report until the
-        // operator turns it on. Read-only/neutral when off.
-        Self { enabled: false }
+        // SHIPS ON (full-power default) — the report op is READ-ONLY (folds saved,
+        // already-cited material into a bounded report; honest-empty when none),
+        // safe to enable outright. In lockstep with config::ReportConfig::default().
+        Self { enabled: true }
     }
 }
 
@@ -757,10 +760,10 @@ mod tests {
         assert!(md.to_lowercase().contains("no sources to report on"), "{md}");
     }
 
-    // ---- config: OFF by default --------------------------------------------
+    // ---- config: ON by default (full-power; read-only report op) -----------
 
     #[test]
-    fn report_config_ships_off_by_default() {
-        assert!(!ReportConfig::default().enabled, "the report op ships OFF");
+    fn report_config_ships_on_by_default() {
+        assert!(ReportConfig::default().enabled, "the report op ships ON (full-power default)");
     }
 }

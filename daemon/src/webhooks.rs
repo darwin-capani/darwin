@@ -15,14 +15,15 @@
 //!      ([`crate::confirm::is_consequential_tool`]) the action PARKS for the
 //!      user's spoken confirm (or is rejected) — a webhook can NEVER satisfy the
 //!      cross-turn spoken confirmation, so it can never auto-execute a
-//!      side-effecting action. The existing gate (the OFF-by-default
-//!      `[integrations].allow_consequential` master switch + the per-turn confirm
-//!      + voice-id + lockdown + the agent allowlist + policy) is intact and
-//!      unbypassed; the webhook PARKS into exactly that gate, it does not route
-//!      around it.
+//!      side-effecting action. The existing gate (the armed-by-default
+//!      `[integrations].allow_consequential` master switch — ON, but a confirmed
+//!      action still needs a fresh confirm — + the per-turn confirm + voice-id +
+//!      lockdown + the agent allowlist + policy) is intact and unbypassed; the
+//!      webhook PARKS into exactly that gate, it does not route around it.
 //!
 //! LIVE LISTENER (runtime-gated). [`serve`] binds 127.0.0.1 LOOPBACK by default
-//! (`[webhooks].bind`) and ships OFF (`[webhooks].enabled = false`). The
+//! (`[webhooks].bind`) and ships ON (`[webhooks].enabled = true`) but is INERT
+//! WITHOUT MAPPINGS + A KEYCHAIN HMAC SECRET. The
 //! bind/accept-loop is reached ONLY when the flag is on — it is wired behind the
 //! flag (the mic-loop / vision-capture precedent), not exercised in tests. The
 //! HMAC secret is resolved from the macOS Keychain (account

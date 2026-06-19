@@ -6,12 +6,12 @@
 //! consults to decide "is this utterance for JARVIS" — but the always-listening
 //! mic loop itself is DEVICE-GATED; only this pure matcher is proven headlessly.
 //!
-//! ## Posture (OFF by default; the default phrase preserves today's behavior)
+//! ## Posture (ON by default; the default phrase preserves today's behavior)
 //!
-//! `[wake].enabled` SHIPS OFF: with it false the matcher is never consulted and
-//! activation is byte-for-byte today's. `[wake].phrase` defaults to "jarvis", so even
-//! when the feature is flipped on with no override, the default phrase preserves
-//! today's wake behavior. [`wake_gate`] folds the switch in so a caller can pass the
+//! `[wake].enabled` SHIPS ON (full-power default): since `[wake].phrase` defaults to
+//! "jarvis", activation is byte-for-byte today's unless the phrase is changed (the
+//! always-listening loop that consults the matcher is DEVICE-GATED on mic/TCC). With
+//! it false the matcher is never consulted. [`wake_gate`] folds the switch in so a caller can pass the
 //! config straight through.
 //!
 //! ## Conservatism (the whole point — never a false wake)
@@ -211,14 +211,22 @@ mod tests {
     }
 
     #[test]
-    fn gate_is_open_by_default_off_and_phrase_preserves_default() {
-        // Shipped default: wake.enabled = false -> the gate is OPEN regardless of text
-        // (activation is byte-for-byte today's). The default phrase is "jarvis".
+    fn gate_ships_on_by_default_with_phrase_jarvis_and_off_path_opens_the_gate() {
+        // Shipped default: wake.enabled = true with phrase "jarvis" -> activation
+        // requires the "jarvis" wake word, which IS today's behavior (the phrase
+        // default preserves it). Turning the switch OFF opens the gate regardless of
+        // text (the off path still exists).
         let cfg = Config::default();
-        assert!(!cfg.wake.enabled, "wake gating MUST ship OFF");
+        assert!(cfg.wake.enabled, "wake gating ships ON (full-power default)");
         assert_eq!(cfg.wake.phrase, "jarvis", "default phrase preserves today's behavior");
-        assert!(wake_gate(&cfg, "turn on the lights"), "off => gate open (today's behavior)");
-        assert!(wake_gate(&cfg, ""), "off => gate open even for empty text");
+        assert!(wake_gate(&cfg, "jarvis status report"), "default phrase present -> gate open");
+        assert!(!wake_gate(&cfg, "status report"), "default phrase absent -> gate closed");
+
+        // Explicitly OFF: the gate is OPEN regardless of text.
+        let mut off = Config::default();
+        off.wake.enabled = false;
+        assert!(wake_gate(&off, "turn on the lights"), "off => gate open");
+        assert!(wake_gate(&off, ""), "off => gate open even for empty text");
     }
 
     #[test]

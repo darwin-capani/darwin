@@ -1141,7 +1141,7 @@ fn tool_defs() -> &'static Value {
             },
             {
                 "name": "code_explain",
-                "description": "Explain or answer a question about the USER'S OWN CODE — grounded in the on-device code index over the folders the user explicitly allowlisted as a codebase root. It retrieves the relevant real code chunks (the same on-device, cited retrieval as file search) and answers from THEM, CITING each real file + byte offset. READ-ONLY — it reads, stores nothing, changes nothing. Call this when the user asks how their code works, where something is implemented, what a function/module does, or to understand a bug in THEIR code ('how does the config get parsed in my project', 'where is the retry logic', 'explain what this module does'). GROUNDED + CITED + HONEST: it answers ONLY from code that is actually in the index and NEVER fabricates code that isn't there — when the index is empty, code intelligence is off, or nothing matches, it says so honestly (tell the user they may need to enable code intelligence and allowlist a codebase root) and never invents a function, file, or quote. 100% ON-DEVICE retrieval: code contents and embeddings never leave the device for retrieval; the answering model is whatever tier is active. Code intelligence ships OFF and indexes only allowlisted roots (never the whole disk).",
+                "description": "Explain or answer a question about the USER'S OWN CODE — grounded in the on-device code index over the folders the user explicitly allowlisted as a codebase root. It retrieves the relevant real code chunks (the same on-device, cited retrieval as file search) and answers from THEM, CITING each real file + byte offset. READ-ONLY — it reads, stores nothing, changes nothing. Call this when the user asks how their code works, where something is implemented, what a function/module does, or to understand a bug in THEIR code ('how does the config get parsed in my project', 'where is the retry logic', 'explain what this module does'). GROUNDED + CITED + HONEST: it answers ONLY from code that is actually in the index and NEVER fabricates code that isn't there — when the index is empty, code intelligence is off, or nothing matches, it says so honestly (tell the user they may need to enable code intelligence and allowlist a codebase root) and never invents a function, file, or quote. 100% ON-DEVICE retrieval: code contents and embeddings never leave the device for retrieval; the answering model is whatever tier is active. Code intelligence ships ON but is INERT until you allowlist a codebase root — it indexes only allowlisted roots (never the whole disk), so with no root it does nothing and says so.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -1152,7 +1152,7 @@ fn tool_defs() -> &'static Value {
             },
             {
                 "name": "code_propose_diff",
-                "description": "Propose a code change to the USER'S OWN CODE as a REVIEWABLE unified diff — PROPOSE-ONLY. This NEVER edits the user's code: it grounds a draft in the indexed code, writes a reviewable diff to a proposal store (state/code/proposals/<ts>/), and returns the diff plus the exact MANUAL apply command (scripts/apply_code_diff.sh <ts>) a human must run after reviewing. Call this when the user asks you to MAKE / WRITE / APPLY a change to their code ('change X to Y', 'add a function that …', 'fix this in my code'). HUMAN-GATED + CONFINED: the diff is never auto-applied; the only path that touches code is the human apply script, which is confined BY CONSTRUCTION to the allowlisted codebase root (it re-validates the diff and writes ONLY under that root — never out-of-tree). The proposed diff is grounded in the real indexed code; the model's diff CORRECTNESS (does it compile / work) is not guaranteed here — the human reviews and the apply re-validates. Code intelligence ships OFF: when [code] is disabled or no codebase root is allowlisted it does nothing and says so. Be explicit that nothing was applied — you only proposed a diff for review.",
+                "description": "Propose a code change to the USER'S OWN CODE as a REVIEWABLE unified diff — PROPOSE-ONLY. This NEVER edits the user's code: it grounds a draft in the indexed code, writes a reviewable diff to a proposal store (state/code/proposals/<ts>/), and returns the diff plus the exact MANUAL apply command (scripts/apply_code_diff.sh <ts>) a human must run after reviewing. Call this when the user asks you to MAKE / WRITE / APPLY a change to their code ('change X to Y', 'add a function that …', 'fix this in my code'). HUMAN-GATED + CONFINED: the diff is never auto-applied; the only path that touches code is the human apply script, which is confined BY CONSTRUCTION to the allowlisted codebase root (it re-validates the diff and writes ONLY under that root — never out-of-tree). The proposed diff is grounded in the real indexed code; the model's diff CORRECTNESS (does it compile / work) is not guaranteed here — the human reviews and the apply re-validates. Code intelligence ships ON but is INERT until a codebase root is allowlisted: when [code] is disabled or no codebase root is allowlisted it does nothing and says so. Be explicit that nothing was applied — you only proposed a diff for review.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -1163,7 +1163,7 @@ fn tool_defs() -> &'static Value {
             },
             {
                 "name": "shell_run",
-                "description": "Run a SHELL COMMAND in an on-device SANDBOX — the HIGHEST-RISK capability (arbitrary command execution), maximally gated and OFF by default. Call this ONLY when the user explicitly asks you to run a terminal/shell command on their machine ('run `ls`', 'execute this command', 'run a quick git status'). It NEVER auto-runs: every command is treated as CONSEQUENTIAL, so it PARKS for the user's spoken 'yes' on a later turn and only then executes — and only when the consequential-actions master switch is on, the speaker's voice is recognized, and the system isn't in lockdown. A destructive or exfiltration command (rm -rf, dd, mkfs, sudo, a fork bomb, curl|sh, writes to /etc or ~/.claude or the daemon's own state, killing the daemon, any networking tool like ssh/nc/curl) is REFUSED outright before it can even be confirmed. When it does run, it runs under a DENY-DEFAULT sandbox: NO network at all, file writes confined to a throwaway scratch directory, and the Keychain / ~/.claude / the daemon's secrets categorically unreachable. The command's real output is returned faithfully (bounded + with a timeout) — NEVER fabricated; if it produced no output or failed, say so honestly. The sandboxed shell ships OFF: when [shell] is disabled it does nothing and says so. Be explicit that you are proposing to run a command and that it needs the user's confirmation; never claim a command ran or report output unless it actually executed.",
+                "description": "Run a SHELL COMMAND in an on-device SANDBOX — the HIGHEST-RISK capability (arbitrary command execution), maximally gated; it ships ON but NEVER auto-runs (every command parks per-action for a spoken yes). Call this ONLY when the user explicitly asks you to run a terminal/shell command on their machine ('run `ls`', 'execute this command', 'run a quick git status'). It NEVER auto-runs: every command is treated as CONSEQUENTIAL, so it PARKS for the user's spoken 'yes' on a later turn and only then executes — and only when the consequential-actions master switch is on, the speaker's voice is recognized, and the system isn't in lockdown. A destructive or exfiltration command (rm -rf, dd, mkfs, sudo, a fork bomb, curl|sh, writes to /etc or ~/.claude or the daemon's own state, killing the daemon, any networking tool like ssh/nc/curl) is REFUSED outright before it can even be confirmed. When it does run, it runs under a DENY-DEFAULT sandbox: NO network at all, file writes confined to a throwaway scratch directory, and the Keychain / ~/.claude / the daemon's secrets categorically unreachable. The command's real output is returned faithfully (bounded + with a timeout) — NEVER fabricated; if it produced no output or failed, say so honestly. The sandboxed shell ships ON but is INERT WITHOUT device support (needs /usr/bin/sandbox-exec + /bin/sh); when [shell] is disabled it does nothing and says so. Be explicit that you are proposing to run a command and that it needs the user's confirmation; never claim a command ran or report output unless it actually executed.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -1174,7 +1174,7 @@ fn tool_defs() -> &'static Value {
             },
             {
                 "name": "ui_actuate",
-                "description": "ACTUATE the macOS UI — perform ONE physical action on the user's screen: a single mouse CLICK at a located control, TYPE one run of text, or press one KEY combo. This is the SINGLE MOST DANGEROUS capability (it physically operates the machine), maximally gated and OFF by default. Call this ONLY when the user explicitly asks you to click/type/press something on their screen ('click the Send button', 'type my email into the field', 'press cmd+s'), AFTER locating the control with the read-only Vision screen-read (which gives the on-screen x/y). It NEVER auto-runs and NEVER batches: EVERY actuation is CONSEQUENTIAL, so it PARKS for the user's spoken 'yes' on a later turn and only then performs EXACTLY ONE action — one confirmation authorizes one actuation, and any further action needs a fresh confirmation. It performs the one action only when the consequential-actions master switch is on, the speaker's voice is recognized, the system isn't in lockdown, AND the macOS Accessibility permission has been granted by the user (runtime consent it cannot self-grant). A degenerate or off-screen instruction (no target, an empty type/key, a click outside the real display) is REFUSED before it can even be confirmed. The action's real outcome is reported faithfully — NEVER fabricated; if the Accessibility permission is missing or the post failed, say so honestly and never claim it acted. Gated UI automation ships OFF: when [ui_automation] is disabled it does nothing and says so. Be explicit that you are proposing ONE action and that it needs the user's confirmation; never claim you clicked/typed/pressed unless it actually happened.",
+                "description": "ACTUATE the macOS UI — perform ONE physical action on the user's screen: a single mouse CLICK at a located control, TYPE one run of text, or press one KEY combo. This is the SINGLE MOST DANGEROUS capability (it physically operates the machine), maximally gated; it ships ON but NEVER auto-runs and NEVER batches (every actuation parks per-action for a spoken yes). Call this ONLY when the user explicitly asks you to click/type/press something on their screen ('click the Send button', 'type my email into the field', 'press cmd+s'), AFTER locating the control with the read-only Vision screen-read (which gives the on-screen x/y). It NEVER auto-runs and NEVER batches: EVERY actuation is CONSEQUENTIAL, so it PARKS for the user's spoken 'yes' on a later turn and only then performs EXACTLY ONE action — one confirmation authorizes one actuation, and any further action needs a fresh confirmation. It performs the one action only when the consequential-actions master switch is on, the speaker's voice is recognized, the system isn't in lockdown, AND the macOS Accessibility permission has been granted by the user (runtime consent it cannot self-grant). A degenerate or off-screen instruction (no target, an empty type/key, a click outside the real display) is REFUSED before it can even be confirmed. The action's real outcome is reported faithfully — NEVER fabricated; if the Accessibility permission is missing or the post failed, say so honestly and never claim it acted. Gated UI automation ships ON but is INERT WITHOUT Accessibility TCC consent + a real display; when [ui_automation] is disabled it does nothing and says so. Be explicit that you are proposing ONE action and that it needs the user's confirmation; never claim you clicked/typed/pressed unless it actually happened.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -1439,7 +1439,7 @@ fn tool_defs() -> &'static Value {
             },
             {
                 "name": "forge_app",
-                "description": "Kick off Self-Forge: have JARVIS DRAFT a brand-new, sandboxed micro-app from a goal, VALIDATE it (build + tests) in a CONFINED staging copy, and PROPOSE it for human review. Call this when the user asks you to BUILD / CREATE / FORGE a new little app or tool for a specific job ('build me an app that …', 'forge a tool to …'). PROPOSE-ONLY and HUMAN-GATED: this NEVER deploys the app, NEVER installs it into apps/, and NEVER runs the generated code live — it only writes a reviewable proposal under state/forge/proposals/<ts>/ and tells you the exact manual command (scripts/apply_forge.sh <ts>) a human must run to install it after reviewing. The forged app is born sandboxed (default-deny profile, minimal declared permissions). Self-Forge ships OFF: when [forge] is disabled in config it does nothing and says so (it must be turned on first). It needs the cloud to author; offline it reports it could not draft. goal is the plain-language description of the app to build.",
+                "description": "Kick off Self-Forge: have JARVIS DRAFT a brand-new, sandboxed micro-app from a goal, VALIDATE it (build + tests) in a CONFINED staging copy, and PROPOSE it for human review. Call this when the user asks you to BUILD / CREATE / FORGE a new little app or tool for a specific job ('build me an app that …', 'forge a tool to …'). PROPOSE-ONLY and HUMAN-GATED: this NEVER deploys the app, NEVER installs it into apps/, and NEVER runs the generated code live — it only writes a reviewable proposal under state/forge/proposals/<ts>/ and tells you the exact manual command (scripts/apply_forge.sh <ts>) a human must run to install it after reviewing. The forged app is born sandboxed (default-deny profile, minimal declared permissions). Self-Forge ships ON but is PROPOSE-ONLY and INERT WITHOUT A CLOUD KEY: when [forge] is disabled in config it does nothing and says so, and it needs the cloud to author (offline it reports it could not draft). goal is the plain-language description of the app to build.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -1450,7 +1450,7 @@ fn tool_defs() -> &'static Value {
             },
             {
                 "name": "standing_create",
-                "description": "ESTABLISH a STANDING MISSION: a durable, scheduled, autonomous goal JARVIS runs on a recurring schedule (e.g. 'every morning, review my deadlines and flag anything slipping'; 'every 6 hours, check the world model for blocked tasks'). Each run reasons over the shared World Model and runs through FURY's bounded mission engine. Call this ONLY when the user asks for something to happen REPEATEDLY / ON A SCHEDULE / STANDINGLY — not for a one-shot request (answer that directly) and not for a single multi-step job (use fury_mission). SAFETY — establishing a standing mission is a CONFIRMED action: this never silently spawns recurring autonomy. When consequential actions are enabled it PARKS for a spoken human 'yes' on a later turn (it previews 'I'll set up a standing mission to <goal>, <schedule> — confirm?' and creates nothing until confirmed); when they are off it only previews. Note the mission RUNS autonomously but can NEVER auto-send/post/spend — every consequential step a run proposes still waits for confirmation. Standing missions ship OFF at the subsystem level ([standing].enabled = false): even a created mission does not fire until the operator turns the subsystem on. Bounded: at most a few active missions. 'goal' is the recurring objective; 'schedule' is the cadence in plain words ('daily', 'daily at 7am', 'every 6 hours', 'on mail').",
+                "description": "ESTABLISH a STANDING MISSION: a durable, scheduled, autonomous goal JARVIS runs on a recurring schedule (e.g. 'every morning, review my deadlines and flag anything slipping'; 'every 6 hours, check the world model for blocked tasks'). Each run reasons over the shared World Model and runs through FURY's bounded mission engine. Call this ONLY when the user asks for something to happen REPEATEDLY / ON A SCHEDULE / STANDINGLY — not for a one-shot request (answer that directly) and not for a single multi-step job (use fury_mission). SAFETY — establishing a standing mission is a CONFIRMED action: this never silently spawns recurring autonomy. When consequential actions are enabled it PARKS for a spoken human 'yes' on a later turn (it previews 'I'll set up a standing mission to <goal>, <schedule> — confirm?' and creates nothing until confirmed); when they are off it only previews. Note the mission RUNS autonomously but can NEVER auto-send/post/spend — every consequential step a run proposes still waits for confirmation. The standing-missions subsystem ships ON ([standing].enabled = true), but establishing a mission is still confirmation-gated and no run can auto-send/post/spend; if the operator disables the subsystem, a created mission does not fire. Bounded: at most a few active missions. 'goal' is the recurring objective; 'schedule' is the cadence in plain words ('daily', 'daily at 7am', 'every 6 hours', 'on mail').",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -1479,7 +1479,7 @@ fn tool_defs() -> &'static Value {
             },
             {
                 "name": "mission_save",
-                "description": "SAVE a DURABLE MISSION: persist a multi-step goal so the campaign survives a restart and can be resumed later. Call this when the user wants a one-off (NOT recurring) multi-step job they can pause and pick up across sessions ('save a mission to migrate the database, I'll resume it tomorrow'). It does NOT run anything — it records the goal PAUSED. SAFETY: a saved mission never auto-runs (it loads PAUSED on restart); resuming it later re-runs FURY's bounded engine and re-gates every consequential step fresh (the saved record carries no pre-approval). Durable missions are OFF by default ([missions].durable = false) — with it off this reports it is disabled and saves nothing. For a RECURRING scheduled goal use standing_create; for a one-shot job to run RIGHT NOW use fury_mission. 'goal' is the multi-step objective to persist.",
+                "description": "SAVE a DURABLE MISSION: persist a multi-step goal so the campaign survives a restart and can be resumed later. Call this when the user wants a one-off (NOT recurring) multi-step job they can pause and pick up across sessions ('save a mission to migrate the database, I'll resume it tomorrow'). It does NOT run anything — it records the goal PAUSED. SAFETY: a saved mission never auto-runs (it loads PAUSED on restart); resuming it later re-runs FURY's bounded engine and re-gates every consequential step fresh (the saved record carries no pre-approval). Durable missions ship ON by default ([missions].durable = true) — a persisted mission still loads PAUSED and re-gates on resume; if the operator disables persistence this reports it is disabled and saves nothing. For a RECURRING scheduled goal use standing_create; for a one-shot job to run RIGHT NOW use fury_mission. 'goal' is the multi-step objective to persist.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -1517,7 +1517,7 @@ fn tool_defs() -> &'static Value {
             },
             {
                 "name": "draft_compose",
-                "description": "COMPOSE a REVIEWABLE DRAFT: write a suggested email reply / message / document body and SAVE it as a PENDING DRAFT the user reviews and then sends THEMSELVES. This NEVER sends anything — there is no send path here; a draft is always a suggestion. The user reads the draft and, if they want it sent, issues the normal SEND action (gmail_send / slack_post_message / x_post), which is separately gated (it parks for a spoken yes when consequential actions are enabled, and only previews when off). Call this when the user asks you to DRAFT / WRITE / COMPOSE a reply or message for them to review (not when they ask you to actually SEND something — that is the gated send tool). Proactive drafting is OFF by default ([drafts].enabled); with it off, only an explicit ask composes a draft. 'kind' is email_reply | message | doc; 'subject' a short summary line; 'body' the full draft text; 'preview' an optional one-liner.",
+                "description": "COMPOSE a REVIEWABLE DRAFT: write a suggested email reply / message / document body and SAVE it as a PENDING DRAFT the user reviews and then sends THEMSELVES. This NEVER sends anything — there is no send path here; a draft is always a suggestion. The user reads the draft and, if they want it sent, issues the normal SEND action (gmail_send / slack_post_message / x_post), which is separately gated (it parks for a spoken yes when consequential actions are enabled, and only previews when off). Call this when the user asks you to DRAFT / WRITE / COMPOSE a reply or message for them to review (not when they ask you to actually SEND something — that is the gated send tool). Proactive drafting ships ON by default ([drafts].enabled); a draft is always a reviewable suggestion with no send path. If the operator disables it, only an explicit ask composes a draft. 'kind' is email_reply | message | doc; 'subject' a short summary line; 'body' the full draft text; 'preview' an optional one-liner.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -1780,7 +1780,7 @@ pub async fn complete_with_tools(
     .await
     {
         Ok(Ok(draft)) => {
-            // SELF-VERIFICATION (#7, [answers].verify, ships OFF). With the gate OFF
+            // SELF-VERIFICATION (#7, [answers].verify, ships ON). With the gate OFF
             // `run_verify_pass` returns the draft UNCHANGED + outcome `Off` and makes
             // ZERO brain calls, so the response is byte-for-byte today's. With the
             // gate ON it runs the GATED (skip-trivial) BOUNDED (at most one critique +
@@ -1809,7 +1809,7 @@ pub async fn complete_with_tools(
             verify::set_outcome(result.outcome);
             let mut answer = result.answer;
 
-            // TOOL-RESULT VERIFICATION (#21, [answers].cross_check, ships OFF). With
+            // TOOL-RESULT VERIFICATION (#21, [answers].cross_check, ships ON). With
             // the gate OFF `run_cross_check` returns `Off` and does NO work — the
             // answer is byte-for-byte today's. With it ON it runs the DETERMINISTIC
             // plausibility checks (always) + the OPTIONAL bounded model pass (only
@@ -1844,7 +1844,7 @@ pub async fn complete_with_tools(
                 crosscheck::set_outcome(cc.outcome);
             }
 
-            // MULTI-MODEL DEBATE (#22, [answers].debate, ships OFF). CONSERVATIVE:
+            // MULTI-MODEL DEBATE (#22, [answers].debate, ships ON). CONSERVATIVE:
             // `run_debate` only debates when the gate is on AND `should_debate`
             // returns true — and on this GENERIC tool-loop path neither the
             // consequential nor the caller-high-stakes signal is set, so ordinary
@@ -3266,7 +3266,8 @@ struct DocSearchArgs {
 // -- CODE INTELLIGENCE tool args (crate::code) -----------------------------------
 // code_explain is READ-ONLY (a grounded, cited answer over the on-device code
 // index); code_propose_diff is PROPOSE-ONLY (a reviewable diff to the proposal
-// store — it NEVER edits the tree). Both ship OFF + need an allowlisted [code].roots.
+// store — it NEVER edits the tree). Both ship ON but stay INERT until an
+// allowlisted [code].roots is set (and propose-diff drafting also needs the cloud key).
 #[derive(Deserialize)]
 struct CodeExplainArgs {
     /// The question about the user's code, in their own words.
@@ -3279,8 +3280,9 @@ struct CodeProposeDiffArgs {
 }
 
 // shell_run (crate::shell) is the HIGHEST-RISK tool — arbitrary command
-// execution. It ships OFF ([shell].enabled=false), is CONSEQUENTIAL (always parks
-// for a spoken yes), is denylist-screened PRE-exec, and only ever runs under the
+// execution. It ships ON ([shell].enabled=true) but NEVER auto-runs: it is
+// CONSEQUENTIAL (always parks for a spoken yes), is denylist-screened PRE-exec,
+// and only ever runs under the
 // master switch + confirm + voice-id + !lockdown, inside a deny-default
 // sandbox-exec profile. The exec is DEVICE-gated (built, not run in any test).
 #[derive(Deserialize)]
@@ -3296,8 +3298,9 @@ struct ShellRunArgs {
 
 // ui_actuate (crate::ui_automation, #44, the CAPSTONE) is the single most
 // DANGEROUS tool — physically actuating the macOS UI (click/type/key). It ships
-// OFF ([ui_automation].enabled=false), is CONSEQUENTIAL (it parks PER ACTION for a
-// spoken yes — ONE confirm = ONE actuation; a second re-parks), is planned by the
+// ON ([ui_automation].enabled=true) but NEVER auto-runs: it is CONSEQUENTIAL (it
+// parks PER ACTION for a spoken yes — ONE confirm = ONE actuation; a second
+// re-parks), is planned by the
 // PURE single-action planner (can't batch), and only ever actuates under the
 // master switch + confirm + voice-id + !lockdown, AND the device Accessibility-TCC
 // consent. The actuation is DEVICE-gated (built, not run in any test).
@@ -3857,7 +3860,7 @@ pub use answers::{
 #[cfg(test)]
 pub use answers::clear_sources;
 
-/// SELF-VERIFICATION PASS (#7) — a GATED, BOUNDED, OFF-by-default second self-check
+/// SELF-VERIFICATION PASS (#7) — a GATED, BOUNDED, ON-by-default second self-check
 /// of a turn's DRAFT answer against the REAL sources the turn actually used.
 ///
 /// HONESTY-FIRST. This is NOT a correctness oracle: a second self-critique REDUCES
@@ -4341,7 +4344,7 @@ mod verify {
     /// badge honestly. Carries ONLY: whether the gate is on, the outcome token + its
     /// badge, and honest copy stating what the badge means (a second self-check that
     /// REDUCES — not eliminates — errors; the model critiques itself against the
-    /// sources it used; runs only on important turns; OFF by default). NO content
+    /// sources it used; runs only on important turns; ON by default). NO content
     /// beyond the answer, NO flagged-claim text (that rides the answer when it does),
     /// NO embedding/audio/secret. Pure, so the shape is testable.
     pub fn verify_telemetry(verify_on: bool, outcome: VerifyOutcome) -> Value {
@@ -4353,7 +4356,7 @@ mod verify {
             "note": "A second self-check against the sources this turn used. It REDUCES \
                      hallucination on important turns; it is NOT a correctness guarantee. \
                      Runs only on important turns, at most one critique + one revise, and \
-                     ships OFF by default.",
+                     ships ON (engaging only on important turns).",
         })
     }
 }
@@ -4369,7 +4372,7 @@ pub use verify::{current_outcome, verify_telemetry, TurnVerifyGuard, VerifyOutco
 #[cfg(test)]
 pub use verify::{clear_outcome, set_outcome, should_verify, VerifyResult};
 
-/// TOOL-RESULT VERIFICATION (#21) — a GATED, BOUNDED, OFF-by-default plausibility
+/// TOOL-RESULT VERIFICATION (#21) — a GATED, BOUNDED, ON-by-default plausibility
 /// cross-check of a TOOL RESULT before the OS (a) surfaces it to the user AS FACT
 /// or (b) builds a consequential action from it. A SIBLING of the #7 verify pass:
 /// same bounded, OFF-default, mock-brain-tested discipline — applied to a tool's
@@ -4796,7 +4799,7 @@ mod crosscheck {
     /// honestly. Carries ONLY: the gate flag, the outcome token + badge, the bounded
     /// flag reasons (no raw result), the optional model reason, and honest copy
     /// stating what the check means (a plausibility cross-check that DOWNGRADES /
-    /// flags — never removes a gate, never proves correctness; OFF by default). Pure.
+    /// flags — never removes a gate, never proves correctness; ON by default). Pure.
     /// Test-only (the HUD path uses the lean `cross_check_badge_telemetry`); this
     /// richer variant carries the flag reasons + reconciled level for the tests that
     /// assert the secret-free shape.
@@ -5143,7 +5146,7 @@ mod debate {
     /// Carries ONLY: the gate flag, the outcome token + badge, the reconciled level,
     /// and honest copy (agreement = independent corroboration raises confidence;
     /// disagreement = both shown, never picked/averaged; fallback = no second opinion;
-    /// OFF by default). NO raw answers beyond what rides the response. Pure.
+    /// ON by default, engaging only on high-stakes asks). NO raw answers beyond what rides the response. Pure.
     /// Test-only (the HUD path uses the lean `debate_badge_telemetry`).
     #[cfg(test)]
     pub fn debate_telemetry(debate_on: bool, res: &DebateResult) -> Value {
@@ -5160,7 +5163,7 @@ mod debate {
         "For high-stakes asks only, a second independent model answers the same \
          question. Agreement RAISES confidence; disagreement SURFACES BOTH answers \
          (never silently picked or averaged); if the second model is unavailable it \
-         falls back to one and says so. At most two model calls; ships OFF by default.";
+         falls back to one and says so. At most two model calls; ships ON but engages only on high-stakes asks (ordinary turns never debate).";
 
     /// The LEAN per-turn HUD badge payload (the analogue of `verify_telemetry`): just
     /// the gate flag + the recorded outcome token + badge + honest copy. Used on the
@@ -5446,9 +5449,10 @@ pub struct AnnotatedAnswer {
 }
 
 /// Apply the [answers] annotations to a turn's `response`, reading the per-turn
-/// REAL source accumulator + the [answers] gate. HONESTY-FIRST and OFF-by-default:
-///   * BOTH gates off (the shipped default) → returns the response UNCHANGED and
-///     a payload with no sources/confidence — byte-for-byte today's behavior.
+/// REAL source accumulator + the [answers] gate. HONESTY-FIRST; cite + confidence
+/// ship ON by default (each still has its own switch):
+///   * BOTH gates off (an operator who disabled them) → returns the response UNCHANGED
+///     and a payload with no sources/confidence — byte-for-byte today's behavior.
 ///   * `confidence` on → parse the model's trailing `Confidence:` line, STRIP it
 ///     from the spoken body, and surface the parsed level+reason (the model's
 ///     self-report; calibration is runtime-gated, never claimed measured). An
@@ -7181,9 +7185,9 @@ async fn dispatch_tool(
         // over the allowlisted roots). It retrieves the relevant chunks, feeds them
         // to the model, and CITES the real file+offset chunks — it NEVER fabricates
         // code not in the index. Nothing is stored/sent (the only network is the
-        // LOCAL embed socket + the per-tier authoring model). GATED OFF by default
-        // ([code].enabled AND a non-empty roots); off/no-root => an honest "off"
-        // reply. The live arm injects the on-device embedder + the cloud model
+        // LOCAL embed socket + the per-tier authoring model). [code].enabled ships
+        // ON but is INERT WITHOUT an allowlisted root (needs a non-empty roots);
+        // off/no-root => an honest "off" reply. The live arm injects the on-device embedder + the cloud model
         // brain; tests drive the crate::code core with mocks.
         "code_explain" => match serde_json::from_value::<CodeExplainArgs>(input.clone()) {
             Ok(args) => Ok(code_explain_tool(&args.question).await),
@@ -7196,15 +7200,15 @@ async fn dispatch_tool(
         // (confined-by-construction to the allowlisted root). It is NOT a
         // consequential outward action (it sends/launches/moves nothing — it only
         // writes a proposal under state/), so it does not park; the human apply is
-        // the gate. GATED OFF by default; off/no-root => an honest "off" reply.
+        // the gate. Ships ON but INERT WITHOUT an allowlisted root; off/no-root => an honest "off" reply.
         "code_propose_diff" => match serde_json::from_value::<CodeProposeDiffArgs>(input.clone()) {
             Ok(args) => Ok(code_propose_diff_tool(&args.request).await),
             Err(e) => Err(anyhow!("invalid code_propose_diff arguments: {e}")),
         },
         // -- SANDBOXED SHELL / TERMINAL (crate::shell, #43) -------------------
-        // The HIGHEST-RISK tool: arbitrary command execution. It ships OFF
-        // ([shell].enabled=false), is CONSEQUENTIAL (it is in CONSEQUENTIAL_TOOLS,
-        // so execute_tool PARKS it for a spoken yes — it NEVER auto-runs), is
+        // The HIGHEST-RISK tool: arbitrary command execution. It ships ON
+        // ([shell].enabled=true) but NEVER auto-runs: it is CONSEQUENTIAL (it is in
+        // CONSEQUENTIAL_TOOLS, so execute_tool PARKS it for a spoken yes), is
         // LOCKDOWN-aware, is denylist-screened PRE-exec, and only ever execs under
         // gate(confirm)=Execute (master switch ON + the confirm replay + voice-id +
         // !lockdown) inside a DENY-DEFAULT sandbox-exec profile (no net, write-
@@ -7216,9 +7220,10 @@ async fn dispatch_tool(
         },
         // -- GATED UI AUTOMATION / ACTUATION (crate::ui_automation, #44) ------
         // The CAPSTONE — the single most DANGEROUS tool: physically actuating the
-        // macOS UI (click/type/key). It ships OFF ([ui_automation].enabled=false),
-        // is CONSEQUENTIAL (it is in CONSEQUENTIAL_TOOLS, so execute_tool PARKS it
-        // PER ACTION for a spoken yes — ONE confirm = ONE actuation; a second
+        // macOS UI (click/type/key). It ships ON ([ui_automation].enabled=true) but
+        // NEVER auto-runs: it is CONSEQUENTIAL (it is in CONSEQUENTIAL_TOOLS, so
+        // execute_tool PARKS it PER ACTION for a spoken yes — ONE confirm = ONE
+        // actuation; a second
         // re-parks; it NEVER auto-runs, NEVER batches, NEVER loops), is LOCKDOWN-
         // aware, is planned by the PURE single-action planner (a degenerate/off-
         // screen instruction is refused PRE-actuation), and only ever actuates under
@@ -7343,9 +7348,10 @@ async fn dispatch_tool(
         // naming the goal+schedule and CREATES NOTHING; only confirm=true — which
         // ONLY the spoken-yes replay sets — actually persists the mission. So
         // execute_tool parks a create for a human yes, and JARVIS never silently
-        // spawns a recurring mission. The CREATED mission still ships behind the
-        // [standing].enabled subsystem master switch (off by default) and every
-        // consequential step a RUN proposes parks again. Honest about cost: it
+        // spawns a recurring mission. The [standing].enabled subsystem master switch
+        // ships ON, so a created mission runs on schedule — but every consequential
+        // step a RUN proposes parks again (it can never auto-send/post/spend), and
+        // disabling the subsystem stops a created mission from firing. Honest about cost: it
         // persists nothing on a preview, and reports exactly what it set up.
         "standing_create" => match serde_json::from_value::<StandingCreateArgs>(input.clone()) {
             Ok(args) => Ok(standing_create_tool(memory, &args.goal, &args.schedule, args.confirm).await),
@@ -7366,8 +7372,9 @@ async fn dispatch_tool(
         // re-runs FURY's bounded engine, which re-routes each sub-task to its owner
         // and RE-GATES every consequential step FRESH — the persisted record carries
         // NO pre-approval. mission_list/mission_cancel are read-only/reversible. All
-        // gated at the subsystem level by [missions].durable (OFF by default): with
-        // it off the tools report the subsystem is off and persist/resume nothing.
+        // gated at the subsystem level by [missions].durable (ships ON; persistence
+        // only — a persisted mission still loads PAUSED and re-gates on resume): if
+        // an operator disables it the tools report the subsystem is off and persist/resume nothing.
         "mission_save" => match serde_json::from_value::<MissionSaveArgs>(input.clone()) {
             Ok(args) => Ok(mission_save_tool(memory, &args.goal).await),
             Err(e) => Err(anyhow!("invalid mission_save arguments: {e}")),
@@ -8458,8 +8465,9 @@ async fn doc_search_tool(
         // hasn't been built / file search is off" rather than a true no-match.
         return format!(
             "I found nothing in your indexed files for that, sir. If you haven't yet, \
-             enable on-device file search and add a folder to index (it's off by default \
-             and indexes only the folders you allowlist — never your whole disk). \
+             add a folder to index — on-device file search is on by default but stays \
+             inert until you allowlist a folder, and it indexes only the folders you \
+             allowlist — never your whole disk. \
              Note: this is {method_note}",
         );
     }
@@ -8560,7 +8568,7 @@ fn open_code_index() -> Result<crate::docsearch::DocIndex> {
 }
 
 /// Run the `code_explain` tool: a grounded, CITED answer over the on-device code
-/// index. GATED OFF by default. LOCKDOWN-aware (the emergency stop forces it off,
+/// index. Ships ON but INERT WITHOUT an allowlisted root. LOCKDOWN-aware (the emergency stop forces it off,
 /// mirroring forge_app). It retrieves the relevant chunks and answers from THEM,
 /// citing the real file+offset — never fabricating code not in the index. Nothing
 /// is stored or sent beyond the LOCAL embed socket + the per-tier model.
@@ -8748,7 +8756,7 @@ fn ui_screen_bounds() -> crate::ui_automation::ScreenBounds {
 /// Run the `ui_actuate` tool: gated UI automation (#44), the CAPSTONE — the single
 /// most DANGEROUS capability (physically actuating the macOS UI). The SAFETY
 /// SPINE, in order:
-///   1. CONFIG GATE: [ui_automation].enabled (OFF by default) AND LOCKDOWN-aware —
+///   1. CONFIG GATE: [ui_automation].enabled (ON by default; INERT WITHOUT Accessibility TCC + a display) AND LOCKDOWN-aware —
 ///      when off or locked, the feature is inert (an honest "off" reply); NOTHING
 ///      is planned, parked, or actuated.
 ///   2. PURE PLANNER: plan_actuation validates + bounds the ONE requested action.
@@ -8860,7 +8868,7 @@ fn shell_scratch_dir(ts: u64) -> std::path::PathBuf {
 
 /// Run the `shell_run` tool: the sandboxed shell / terminal (#43), the HIGHEST-
 /// RISK capability. The SAFETY SPINE, in order:
-///   1. CONFIG GATE: [shell].enabled (OFF by default) AND LOCKDOWN-aware — when off
+///   1. CONFIG GATE: [shell].enabled (ON by default; INERT WITHOUT /usr/bin/sandbox-exec + /bin/sh) AND LOCKDOWN-aware — when off
 ///      or locked, the feature is inert (an honest "off" reply); NOTHING is
 ///      classified, parked, or run.
 ///   2. DENYLIST: classify_shell_command screens the command PRE-exec. A
@@ -9541,7 +9549,8 @@ async fn user_model_forget_tool(memory: &Memory) -> String {
 ///   - `confirm == true` (set ONLY by the confirmed replay): actually persist the
 ///     mission via the bounded `standing::create` (which enforces the active cap),
 ///     emit the `standing.created` HUD card, and report what was set up — noting
-///     honestly that the subsystem ships OFF, so it won't fire until enabled.
+///     honestly that the subsystem is on by default and runs on schedule, but every
+///     consequential step a run proposes still waits for confirmation.
 ///
 /// The schedule phrase is parsed conservatively (ambiguous -> at-most-daily), so
 /// an unclear establish can never become a fast recurring run.
@@ -9571,9 +9580,9 @@ async fn standing_create_tool(memory: &Memory, goal: &str, schedule: &str, confi
             );
             format!(
                 "Standing mission established: \"{}\" — {}. It's saved (id {}). \
-                 Standing missions ship off at the subsystem level, so it won't run \
-                 until [standing] is enabled; even then, any consequential step it \
-                 proposes will still wait for your confirmation.",
+                 The standing-missions subsystem is on by default, so it will run on \
+                 schedule; any consequential step it proposes will still wait for your \
+                 confirmation (it can never auto-send, post, or spend).",
                 m.goal,
                 m.schedule.describe(),
                 m.id,
@@ -9594,9 +9603,10 @@ async fn standing_create_tool(memory: &Memory, goal: &str, schedule: &str, confi
 ///     with `confirm=true` as the replay payload — so a spoken human "yes" on a
 ///     later turn replays `standing_create` in Execute mode and ONLY THEN persists
 ///     the mission. Returns the spoken confirmation prompt. Nothing is created now.
-///   * Master switch OFF (the shipped default): return the OFF-mode establish
-///     preview verbatim and park NOTHING — there is nothing to confirm because the
-///     create path is disabled at the gate; the mission is neither created nor armed.
+///   * Master switch OFF (e.g. lockdown, or an operator who disarmed it): return the
+///     OFF-mode establish preview verbatim and park NOTHING — there is nothing to
+///     confirm because the create path is disabled at the gate; the mission is neither
+///     created nor armed.
 ///
 /// Either way this CREATES NOTHING itself (Rail 2: no silent autonomy). The
 /// schedule is parsed conservatively from the utterance (ambiguous -> at-most-
@@ -9745,7 +9755,7 @@ async fn standing_list_tool(memory: &Memory) -> String {
             return "I couldn't read the standing missions just now, sir.".to_string();
         }
     };
-    // The subsystem master switch (off by default): read it from the live config
+    // The subsystem master switch (on by default; persistence only): read it from the live config
     // so the listing tells the user honestly whether saved missions actually fire.
     let enabled = standing_subsystem_enabled();
     let state_note = if enabled {
@@ -9791,8 +9801,8 @@ async fn standing_cancel_tool(memory: &Memory, id: &str) -> String {
 }
 
 /// The Standing-Missions subsystem master switch ([standing].enabled), read from
-/// the live config. Falls back to OFF (the shipped-safe posture) when the root is
-/// unknown or the config is unreadable — the listing then honestly reports off.
+/// the live config (which ships ON). Falls back to OFF (a fail-safe) when the root
+/// is unknown or the config is unreadable — the listing then honestly reports off.
 fn standing_subsystem_enabled() -> bool {
     let Some(root) = ROOT.get() else { return false };
     let (cfg, _issues) = crate::config::Config::load(&root.join("config").join("jarvis.toml"));
@@ -9803,9 +9813,9 @@ fn standing_subsystem_enabled() -> bool {
 // DURABLE MISSIONS (#26) tool helpers — wire crate::durable_missions live
 // ---------------------------------------------------------------------------
 
-/// Read the [missions] config (durable flag + retention) from the live config.
-/// Falls back to OFF + the default retention when the root/config is unavailable —
-/// the shipped-safe posture (durable persistence stays off, nothing is stored).
+/// Read the [missions] config (durable flag + retention) from the live config
+/// (which ships durable ON). Falls back to OFF + the default retention when the
+/// root/config is unavailable — a fail-safe (nothing is stored when unreadable).
 fn missions_config() -> (bool, usize) {
     let Some(root) = ROOT.get() else {
         return (false, crate::durable_missions::DEFAULT_RETENTION);
@@ -12869,18 +12879,18 @@ mod tests {
     /// at the tool surface, with NO real command ever executed (the exec is
     /// device-gated). This proves:
     ///   (1a) steve OWNS shell_run (passes the allowlist); a non-owner is refused;
-    ///   (1b) it ships OFF ([shell].enabled=false in this sandbox) — an honest "off"
-    ///        reply, NOT a refusal, and nothing parks / runs;
+    ///   (1b) the OFF-path honest reply still exists (proven via the pure
+    ///        `shell_permitted(false)` + the lockdown overlay); the feature now SHIPS
+    ///        ON (full-power default) and even ON it NEVER auto-runs (see 3/4);
     ///   (2)  a DENYLISTED command is refused PRE-exec even with the master switch ON
-    ///        — it never parks; the deeper gates are never reached. (This needs the
-    ///        feature on, so we just assert the pure classifier here — the off-config
-    ///        in this sandbox short-circuits before classification.)
+    ///        — it never parks; the deeper gates are never reached. (Asserted on the
+    ///        pure classifier.)
     ///   (3)  shell_run is in CONSEQUENTIAL_TOOLS, so it is recognized as a
     ///        park-needing tool (the cross-turn confirm machinery);
     ///   (4)  voice-id unverified REFUSES it before it can even park (master ON).
     /// No real exec, no network, no daemon — the exec seam is built, never invoked.
     #[tokio::test]
-    async fn shell_tool_is_owned_ships_off_consequential_and_voiceid_gated() {
+    async fn shell_tool_is_owned_ships_on_consequential_and_voiceid_gated() {
         use std::time::Instant;
         // Parks would land in the shared slot; serialize + start empty.
         let _lock = crate::confirm::PENDING_TEST_LOCK
@@ -12892,23 +12902,27 @@ mod tests {
         let steve = steve_tools();
         let veronica = veronica_tools();
 
+        // (1b) The OFF-path honest reply still EXISTS — the config gate is the pure
+        //      `shell_permitted(enabled)`: false => inert (the safety logic is
+        //      unchanged; only the shipped DEFAULT flipped to ON). The lockdown
+        //      overlay also forces it off regardless of config.
+        assert!(
+            !crate::shell::shell_permitted(false),
+            "shell_permitted(false) must be inert (the off honest-reply path is intact)"
+        );
+        assert!(
+            crate::shell::shell_permitted(true),
+            "shell_permitted(true) is the full-power default — but even on it never auto-runs (see 3/4)"
+        );
+
         // (1a) steve OWNS shell_run — it passes the allowlist (not "not permitted").
-        // (1b) OFF by default (no [shell].enabled in this sandbox) => the honest
-        //      "off" reply, reaching NO classifier/gate/exec.
+        //      With the ON default, an unconfirmed call does NOT auto-run: it is a
+        //      consequential tool, so it parks / previews rather than executing.
         let (outcome, _is_error) =
             exec_t("shell_run", &json!({"command": "ls -la"}), &mem, &steve).await;
         assert!(
             !outcome.contains("not permitted"),
             "steve must OWN shell_run (not refused by the allowlist): {outcome}"
-        );
-        assert!(
-            outcome.to_lowercase().contains("sandboxed shell is off"),
-            "shell_run must ship OFF-by-default with an honest reply: {outcome}"
-        );
-        // And OFF parked NOTHING — there is nothing for a later 'yes' to confirm.
-        assert!(
-            crate::confirm::take_live(Instant::now()).is_none(),
-            "an OFF shell_run must not park anything"
         );
 
         // (1b') a NON-owner (veronica) is REFUSED shell_run by the allowlist gate —
@@ -12982,8 +12996,9 @@ mod tests {
     /// HERMETICALLY (no real actuation, no display, no daemon — the actuation seam
     /// is built, never invoked):
     ///   (1a) steve OWNS ui_actuate (passes the allowlist); a non-owner is refused;
-    ///   (1b) it ships OFF ([ui_automation].enabled=false in this sandbox) — an
-    ///        honest "off" reply, NOT a refusal, and nothing parks / actuates;
+    ///   (1b) the OFF-path honest reply still exists (proven via the pure
+    ///        `ui_automation_permitted(false)`); the feature now SHIPS ON (full-power
+    ///        default) and even ON it NEVER auto-runs (see 2/3/4);
     ///   (2)  ui_actuate is in CONSEQUENTIAL_TOOLS, so it is recognized as a
     ///        park-needing tool (the cross-turn confirm machinery);
     ///   (3)  PER-ACTION PARK: under the master switch ON it registers as a
@@ -12994,7 +13009,7 @@ mod tests {
     ///   (5)  the PURE planner refuses a degenerate / off-screen instruction.
     /// No real actuation, no display, no daemon — the seam is built, never invoked.
     #[tokio::test]
-    async fn ui_actuate_is_owned_ships_off_consequential_and_per_action_gated() {
+    async fn ui_actuate_is_owned_ships_on_consequential_and_per_action_gated() {
         use std::time::Instant;
         // Parks would land in the shared slot; serialize + start empty.
         let _lock = crate::confirm::PENDING_TEST_LOCK
@@ -13009,22 +13024,24 @@ mod tests {
         let click_a = json!({"action": "click", "target": "the Send button", "x": 100, "y": 100});
         let click_b = json!({"action": "click", "target": "the Cancel button", "x": 200, "y": 200});
 
+        // (1b) The OFF-path honest reply still EXISTS — the config gate is the pure
+        //      `ui_automation_permitted(enabled)`: false => inert (the safety logic is
+        //      unchanged; only the shipped DEFAULT flipped to ON). Even ON it never
+        //      auto-runs (consequential park + voice-id + planner; see 2/3/4/5).
+        assert!(
+            !crate::ui_automation::ui_automation_permitted(false),
+            "ui_automation_permitted(false) must be inert (the off honest-reply path is intact)"
+        );
+        assert!(
+            crate::ui_automation::ui_automation_permitted(true),
+            "ui_automation_permitted(true) is the full-power default — but even on it never auto-runs"
+        );
+
         // (1a) steve OWNS ui_actuate — it passes the allowlist (not "not permitted").
-        // (1b) OFF by default (no [ui_automation].enabled in this sandbox) => the
-        //      honest "off" reply, reaching NO planner/gate/actuation.
         let (outcome, _is_error) = exec_t("ui_actuate", &click_a, &mem, &steve).await;
         assert!(
             !outcome.contains("not permitted"),
             "steve must OWN ui_actuate (not refused by the allowlist): {outcome}"
-        );
-        assert!(
-            outcome.to_lowercase().contains("ui automation is off"),
-            "ui_actuate must ship OFF-by-default with an honest reply: {outcome}"
-        );
-        // And OFF parked NOTHING — there is nothing for a later 'yes' to confirm.
-        assert!(
-            crate::confirm::take_live(Instant::now()).is_none(),
-            "an OFF ui_actuate must not park anything"
         );
 
         // (1b') a NON-owner (veronica) is REFUSED ui_actuate by the allowlist gate —
@@ -17472,10 +17489,11 @@ mod tests {
     // #21 TOOL-RESULT VERIFICATION (cross-check) + #22 MULTI-MODEL DEBATE —
     // HERMETIC tests with SCRIPTED brains. No network, no real model. They
     // assert: the deterministic checks catch an implausible/empty/uncited
-    // result; the optional model pass is bounded + OFF by default; should_debate
+    // result; the optional model pass is bounded (its own sub-flag); should_debate
     // is conservative; two scripted brains agreeing => higher confidence,
     // disagreeing => BOTH surfaced + flagged (no fabricated consensus); both
-    // features OFF by default; honest fallback when the second brain is absent.
+    // features ship ON but engage only on important/high-stakes turns; honest
+    // fallback when the second brain is absent.
     // =======================================================================
 
     /// A scripted brain that returns a fixed sequence of text replies and COUNTS its
@@ -17935,7 +17953,7 @@ mod tests {
 
     /// #22 TELEMETRY: secret-free + honest — carries the gate, outcome token, badge,
     /// level, and copy stating agreement raises / disagreement surfaces both / fallback
-    /// says so / ≤2 calls / OFF by default.
+    /// says so / ≤2 calls / ON by default (engages only on high-stakes asks).
     #[test]
     fn debate_telemetry_is_secret_free_and_honest() {
         let res = DebateResult {
@@ -17970,15 +17988,17 @@ mod tests {
         assert_eq!(debate::current_outcome(), DebateOutcome::Off, "guard cleared N's outcome");
     }
 
-    /// BOTH FEATURES OFF BY DEFAULT: the shipped default config has cross_check,
-    /// cross_check_model_pass, AND debate all false — the gate accessors fall back to
-    /// OFF when init was never called, so the plumbing is inert and the response is
-    /// byte-for-byte today's.
+    /// BOTH FEATURES ON BY DEFAULT (full-power): the shipped default config has
+    /// cross_check, cross_check_model_pass, AND debate all TRUE. Note the RUNTIME gate
+    /// accessors still fall back to OFF when `init` was never called (so an
+    /// un-initialized process is inert) — this asserts the shipped DEFAULT, not the
+    /// uninitialized runtime fallback. cross_check only downgrades/flags (never removes
+    /// a confirmation gate); debate is high-stakes-only + bounded to <=2 calls.
     #[test]
-    fn cross_check_and_debate_ship_off_by_default() {
+    fn cross_check_and_debate_ship_on_by_default() {
         let defaults = crate::config::AnswersConfig::default();
-        assert!(!defaults.cross_check, "#21 ships OFF");
-        assert!(!defaults.cross_check_model_pass, "#21 model pass ships OFF");
-        assert!(!defaults.debate, "#22 ships OFF");
+        assert!(defaults.cross_check, "#21 ships ON (full-power default; downgrades/flags only)");
+        assert!(defaults.cross_check_model_pass, "#21 model pass ships ON (full-power default)");
+        assert!(defaults.debate, "#22 ships ON (full-power default; high-stakes-only, <=2 calls)");
     }
 }

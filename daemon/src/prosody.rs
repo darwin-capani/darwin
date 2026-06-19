@@ -25,8 +25,9 @@
 //!
 //! ## Posture
 //!
-//! Both features SHIP OFF / neutral by default behind their own config flags
-//! (`[voice].adaptive_prosody`, `[voice].whisper`, `[voice].whisper_auto`). With them
+//! Both features SHIP ON (full-power default) behind their own config flags
+//! (`[voice].adaptive_prosody`, `[voice].whisper`, `[voice].whisper_auto`); they are
+//! EXPRESSIVENESS-ONLY (delivery, never a gate). With them
 //! off, the [`SpeakShape`] this module produces is the IDENTITY shaping — the speak
 //! request is byte-for-byte today's neutral request on every backend. Whisper changes
 //! DELIVERY only: it never changes WHETHER a gate speaks, never suppresses a required
@@ -42,7 +43,7 @@
 // This module is the PURE, verified expressiveness CONTRACT (#33 + #34): a
 // deterministic classifier, the per-backend speak-request shaper, the whisper state
 // machine + auto-engage heuristic, and the thin process-global binding the live sites
-// toggle/read. It is now WIRED LIVE behind its OFF-by-default flags:
+// toggle/read. It is now WIRED LIVE behind its ON-by-default (expressiveness-only) flags:
 //   * speech.rs (+ router.rs roll-call) call `classify_prosody` + `shape_speak_request`
 //     + `apply_whisper` and thread the `SpeakShape` onto the inference speak request;
 //   * router.rs routes `parse_whisper_command` -> `apply_command_global` into the
@@ -393,9 +394,10 @@ pub fn parse_whisper_command(utterance: &str) -> Option<WhisperCommand> {
 
 use std::sync::Mutex;
 
-/// The process-global whisper state. Default OFF — the only state reachable while
-/// `[voice].whisper` ships off (every mutation goes through `WhisperState::apply_*`,
-/// which honour the master switch). Process-local: resets to OFF on restart, exactly
+/// The process-global whisper STATE (distinct from the `[voice].whisper` feature
+/// flag, which ships ON). Default OFF — whisper delivery is off until the user
+/// explicitly engages it (every mutation goes through `WhisperState::apply_*`, which
+/// honour the feature flag). Process-local: resets to OFF on restart, exactly
 /// like `model_tier::OVERRIDE` and the voice-id turn gate.
 static WHISPER_GLOBAL: Mutex<WhisperState> = Mutex::new(WhisperState::new());
 
@@ -575,15 +577,24 @@ mod tests {
         c.voice.whisper = true;
         c
     }
+    /// A config with the prosody EXPRESSIVENESS features explicitly OFF — used by the
+    /// off-path tests, since the shipped DEFAULT is now ON (full-power).
+    fn cfg_prosody_off() -> Config {
+        let mut c = Config::default();
+        c.voice.adaptive_prosody = false;
+        c.voice.whisper = false;
+        c.voice.whisper_auto = false;
+        c
+    }
 
-    // === Defaults: everything OFF/neutral ==================================
+    // === Defaults: everything ON (full-power) ==============================
 
     #[test]
-    fn features_ship_off_by_default() {
+    fn features_ship_on_by_default() {
         let cfg = Config::default();
-        assert!(!cfg.voice.adaptive_prosody, "#33 must ship OFF");
-        assert!(!cfg.voice.whisper, "#34 must ship OFF");
-        assert!(!cfg.voice.whisper_auto, "#34 auto-engage must ship OFF");
+        assert!(cfg.voice.adaptive_prosody, "#33 ships ON (full-power default)");
+        assert!(cfg.voice.whisper, "#34 ships ON (full-power default)");
+        assert!(cfg.voice.whisper_auto, "#34 auto-engage ships ON (full-power default)");
     }
 
     // === #33 classifier: deterministic + conservative =====================
@@ -617,7 +628,7 @@ mod tests {
 
     #[test]
     fn prosody_off_is_neutral_on_every_backend() {
-        let cfg = Config::default(); // adaptive_prosody = false
+        let cfg = cfg_prosody_off(); // adaptive_prosody = false (explicit off-path)
         for profile in [ProsodyProfile::Neutral, ProsodyProfile::Calm, ProsodyProfile::Urgent, ProsodyProfile::Warm] {
             for backend in [kokoro(), el_v3(), el_flash()] {
                 let s = shape_speak_request(&cfg, profile, &backend);
@@ -668,7 +679,7 @@ mod tests {
 
     #[test]
     fn whisper_command_is_inert_while_feature_off() {
-        let cfg = Config::default(); // whisper = false
+        let cfg = cfg_prosody_off(); // whisper = false (explicit off-path)
         let mut st = WhisperState::new();
         assert!(!st.apply_command(&cfg, WhisperCommand::On), "feature off -> stays off");
         assert!(!st.is_on());
@@ -740,9 +751,12 @@ mod tests {
     // === #34 auto-engage heuristic: pure, sustained-quiet only, OFF default =
 
     #[test]
-    fn auto_engage_off_by_default_never_trips() {
-        // Feature on but whisper_auto OFF -> a sustained-quiet series does NOT engage.
-        let cfg = cfg_whisper_on(); // whisper=true, whisper_auto=false
+    fn auto_engage_when_disabled_never_trips() {
+        // Feature on but whisper_auto explicitly OFF -> a sustained-quiet series does
+        // NOT engage. (The shipped DEFAULT is now ON, full-power; this proves the
+        // off path still exists when an operator disables auto-engage.)
+        let mut cfg = cfg_whisper_on(); // whisper=true
+        cfg.voice.whisper_auto = false; // explicit off-path
         let mut st = WhisperState::new();
         let quiet = [0.02_f32; 10];
         assert!(!st.apply_auto_engage(&cfg, &quiet), "auto-engage off -> no change");
@@ -824,7 +838,7 @@ mod tests {
         // Isolate to this thread's seam (starts OFF) so we read back exactly the write
         // this test made, never a value another parallel global-mutating test set.
         let _g = WhisperGuard::force(false);
-        let cfg = Config::default(); // whisper = false
+        let cfg = cfg_prosody_off(); // whisper = false (explicit off-path)
         let cmd = parse_whisper_command("whisper mode").expect("parses On");
         assert!(!apply_command_global(&cfg, cmd), "feature off -> global stays off");
         assert!(!whisper_state_is_on(), "a stray command is inert while the feature is off");
@@ -849,7 +863,9 @@ mod tests {
     #[test]
     fn full_off_path_is_byte_for_byte_neutral() {
         // Both features off + whisper state off -> the composed shape is the identity.
-        let cfg = Config::default();
+        // (The shipped DEFAULT is now ON, full-power; this proves the off path still
+        // produces today's exact request when an operator disables both features.)
+        let cfg = cfg_prosody_off();
         let profile = classify_prosody(ReplyKind::Alert, false); // Urgent
         let shaped = shape_speak_request(&cfg, profile, &el_v3());
         let final_shape = apply_whisper(shaped, /*whisper_on=*/ false, /*required=*/ false);

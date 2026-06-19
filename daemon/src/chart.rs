@@ -20,8 +20,9 @@
 //!   * NEUTRAL: emitting a chart is a PURE presentation act — fire-and-forget over
 //!     the existing telemetry hub, dropped silently when no HUD is connected
 //!     (exactly like every other telemetry envelope). It changes no gate, takes no
-//!     action, reaches no network. The `chart this` op is OFF by default
-//!     ([`ChartConfig`]); the emit itself is neutral.
+//!     action, reaches no network. The `chart this` op ships ON by default
+//!     (the router reads `cfg.chart.enabled`, which ships true; this op is safe to
+//!     enable outright); the emit itself is neutral.
 //!
 //! Nothing here speaks or acts. It surfaces numbers the daemon already has.
 
@@ -157,30 +158,31 @@ pub fn emit_chart(spec: &ChartSpec) {
 }
 
 // ---------------------------------------------------------------------------
-// CONFIG — the OFF-by-default flag the live "chart this" op reads
+// CONFIG — the ON-by-default flag the live "chart this" op reads
 // ---------------------------------------------------------------------------
 
 /// The chart op's runtime knob, mirrored from [`crate::config::ChartConfig`].
-/// `enabled` is the master gate (ships OFF): with it false the live "chart this"
-/// op declines (it never emits) and behavior is byte-for-byte today's. The pure
-/// [`ChartSpec`] + [`emit_chart`] do not consult `enabled` — the gate lives at the
-/// op boundary; the type is always available to tests / structured-series
-/// producers that already have a HUD panel. The router reads the flag straight off
-/// `cfg.chart.enabled` (the chart emit takes no ChartConfig), so this op-boundary
-/// mirror reads as unused in the binary while its off-by-default invariant is
-/// asserted by its own test.
+/// `enabled` is the master gate (ships ON — full-power default; the chart op is a
+/// neutral presentation act, safe to enable outright): with it false the live
+/// "chart this" op declines (it never emits). The pure [`ChartSpec`] + [`emit_chart`]
+/// do not consult `enabled` — the gate lives at the op boundary; the type is always
+/// available to tests / structured-series producers that already have a HUD panel.
+/// The router reads the flag straight off `cfg.chart.enabled` (the chart emit takes
+/// no ChartConfig), so this op-boundary mirror reads as unused in the binary while
+/// its default stays in lockstep with `config::ChartConfig` (its own test pins it).
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub struct ChartConfig {
-    /// Whether the live "chart this" op is enabled. OFF by default.
+    /// Whether the live "chart this" op is enabled. ON by default.
     pub enabled: bool,
 }
 
 impl Default for ChartConfig {
     fn default() -> Self {
-        // SHIPS OFF — the chart op is opt-in; nothing emits a user-driven chart
-        // until the operator turns it on. Neutral when off.
-        Self { enabled: false }
+        // SHIPS ON (full-power default) — the chart op is a neutral presentation act
+        // (it changes no gate, reaches no network), safe to enable outright. In
+        // lockstep with config::ChartConfig::default().
+        Self { enabled: true }
     }
 }
 
@@ -387,10 +389,10 @@ mod tests {
         assert_eq!(spec.to_telemetry()["empty"], true);
     }
 
-    // ---- config: OFF by default --------------------------------------------
+    // ---- config: ON by default (full-power; neutral presentation act) -------
 
     #[test]
-    fn chart_config_ships_off_by_default() {
-        assert!(!ChartConfig::default().enabled, "the chart op ships OFF");
+    fn chart_config_ships_on_by_default() {
+        assert!(ChartConfig::default().enabled, "the chart op ships ON (full-power default)");
     }
 }

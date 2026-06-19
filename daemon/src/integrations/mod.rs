@@ -272,7 +272,8 @@ const ALLOWED_ACCOUNTS: &[&str] = &[
     // user pastes their own ElevenLabs `elevenlabs_api_key` in Settings. It rides
     // ONLY the `xi-api-key` request HEADER at the inference server's TTS call —
     // never the URL, never argv, never a log/Debug/telemetry line. The cloud tier
-    // SHIPS OFF ([voice].cloud_tier=false) and is the ADDED tier on top of the
+    // SHIPS ON ([voice].cloud_tier=true) but is INERT WITHOUT A KEY, the ADDED tier
+    // on top of the
     // on-device Kokoro default; with it off (or no key, or the model-swap is
     // "work offline/local") TTS behaves exactly as today (on-device Kokoro). This
     // constant lives in `crate::voice_tier::ELEVENLABS_ACCOUNT`; a mirror test keeps
@@ -752,8 +753,11 @@ thread_local! {
 }
 
 /// Is the operator currently permitting consequential (side-effecting)
-/// actions at all? Defaults to `false` until [`init`] installs the configured
-/// value — consequential integrations ship OFF, exactly like self-heal.
+/// actions at all? Reads `false` until [`init`] installs the configured value —
+/// a code-level FAIL-SAFE: if startup is ever skipped (any test, a code path that
+/// never calls `init`), the gate is OFF, never accidentally on. The SHIPPED config
+/// default is `true` (full-power), which `init` propagates; the runtime gate still
+/// requires a fresh per-action confirm (see `gate`) + voice-id + !lockdown.
 ///
 /// LOCKDOWN OVERLAY (task #12): while the emergency stop is engaged
 /// ([`crate::lockdown::is_locked_down`]) this is FORCED false — the master
@@ -807,9 +811,11 @@ impl Drop for ConsequentialOverride {
 
 /// The gate every consequential action calls. Returns [`ActionMode::Execute`]
 /// ONLY when BOTH the global switch is on AND the call site passed an explicit
-/// `confirm` — any other combination is [`ActionMode::DryRun`]. So with the
-/// flag false (the shipped default) a consequential action ALWAYS returns a
-/// dry-run preview and performs no side effect, regardless of `confirm`.
+/// `confirm` — any other combination is [`ActionMode::DryRun`]. So even with the
+/// switch ON (the shipped full-power default) a consequential action without a
+/// fresh `confirm` ALWAYS returns a dry-run preview and performs no side effect:
+/// the master switch alone never executes anything. With the switch off (lockdown,
+/// or an operator who disarmed it) it is DryRun regardless of `confirm`.
 pub fn gate(confirm: bool) -> ActionMode {
     if consequential_allowed() && confirm {
         ActionMode::Execute
@@ -1448,27 +1454,34 @@ mod tests {
         assert_eq!(gate_mode(true, true), ActionMode::Execute);
     }
 
-    /// The shipped default is OFF: with the global gate UNINITIALIZED (as in
-    /// any test that does not call `init`), `consequential_allowed()` is false
-    /// and `gate(true)` is therefore a DryRun — no side effect can happen.
+    /// Code-level FAIL-SAFE (NOT the shipped config default, which is ON): with the
+    /// global gate UNINITIALIZED (as in any test that does not call `init`, or any
+    /// code path that skips startup), `consequential_allowed()` is false and
+    /// `gate(true)` is therefore a DryRun — no side effect can happen until `init`
+    /// propagates the (full-power) config AND a fresh confirm clears.
     #[test]
     fn consequential_ships_off_and_gate_is_dryrun_by_default() {
         // `init` is never called in this test, so the OnceLock is unset ->
         // false. (Other tests in this binary also never enable it.)
-        assert!(!consequential_allowed(), "consequential actions must ship OFF");
+        assert!(!consequential_allowed(), "uninitialized gate must FAIL SAFE to off");
         assert_eq!(gate(true), ActionMode::DryRun, "off + confirm must still be a preview");
         assert_eq!(gate(false), ActionMode::DryRun);
     }
 
-    /// Config lockstep: `[integrations].allow_consequential` defaults to false,
-    /// and `init` would propagate that — so the wired default matches the
-    /// contract (OFF) even when the operator writes nothing.
+    /// Config lockstep: `[integrations].allow_consequential` defaults to TRUE
+    /// (full-power default — the master gate ships ARMED), and `init` would
+    /// propagate that. This is INERT-SAFE: the RUNTIME gate
+    /// (`consequential_allowed()` / `gate()`) still enforces voice-id + confirm +
+    /// !lockdown + policy at the chokepoints regardless of this default — see
+    /// `consequential_ships_off_and_gate_is_dryrun_by_default`, which proves the
+    /// runtime gate is DryRun until `init` propagates the (now ON) config AND a
+    /// fresh confirm clears.
     #[test]
-    fn config_default_for_allow_consequential_is_false() {
+    fn config_default_for_allow_consequential_is_true() {
         let cfg = Config::default();
         assert!(
-            !cfg.integrations.allow_consequential,
-            "allow_consequential must default to false"
+            cfg.integrations.allow_consequential,
+            "allow_consequential defaults to true (full-power default; runtime gate still enforces per-action)"
         );
     }
 

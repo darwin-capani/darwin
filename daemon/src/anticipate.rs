@@ -885,8 +885,9 @@ mod tests {
         assert_eq!(p.min_gap_secs, d.min_gap_secs);
         assert_eq!(p.max_per_window, d.max_per_window);
         assert_eq!(p.window_secs, d.window_secs);
-        // Default config -> speak OFF (the shipped posture).
-        assert!(!Policy::from_config(&crate::config::ProactiveConfig::default()).speak);
+        // Default config -> speak ON (the full-power shipped posture; EDITH voices
+        // its brief through the echo-safe speech path, never while already speaking).
+        assert!(Policy::from_config(&crate::config::ProactiveConfig::default()).speak);
     }
 
     #[test]

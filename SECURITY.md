@@ -1,9 +1,12 @@
 # Security Policy
 
-JARVIS is an autonomous, on-device-first AI desktop environment that can — once
-you explicitly arm it — act on your machine and reach the network. Security is a
-first-class concern, and the project is built so that **everything consequential
-is OFF by default**.
+JARVIS is an autonomous, on-device-first AI desktop environment that can act on
+your machine and reach the network. Security is a first-class concern, and the
+project ships **full-power by default — consequential power is ARMED**, with every
+consequential action held behind multiple independent per-action gates that stay
+enforced at the runtime chokepoints (a per-action confirmation, on-device voice-id,
+per-action policy, and lockdown). Arming the master switch does **not** bypass any
+of them: the switch alone never executes anything.
 
 ## Reporting a vulnerability
 
@@ -23,21 +26,33 @@ credential immediately** — do not wait for a response.
 
 ## Security posture (what protects you)
 
-JARVIS defaults to the least-privilege, fail-closed end of every choice. The
-consequential surface is layered behind multiple independent gates, each of
-which must pass:
+JARVIS ships full-power, but the consequential surface is layered behind multiple
+independent gates that stay enforced at the runtime chokepoints — each of which must
+pass, and none of which is a default you can flip away:
 
-1. **Master switch — OFF by default.** Side-effecting / outward action is gated
-   by `[integrations].allow_consequential`, which ships `false`. With it off,
-   read-only lookups still work, but nothing that posts/sends/spends/controls
-   the machine can fire. Every consequential subsystem (self-heal, app forge,
-   standing missions, MCP, trace optimizer, voice cloud tiers, doc search,
-   screen capture, proactive speech) has its **own** independent master switch
-   that also ships OFF — none piggyback on another.
-2. **Per-action confirmation gate.** Even with the master switch on, each
+1. **Master switch — ARMED by default, still per-action gated.** Side-effecting /
+   outward action is gated by `[integrations].allow_consequential`, which ships
+   `true`. Arming it does **not** bypass anything: a confirmed action still requires
+   a fresh per-action confirmation + voice-id (if enrolled) + per-action policy +
+   `!lockdown`. With the master switch armed, a consequential action without a fresh
+   confirm is still a dry-run preview — the switch alone never executes. With it off
+   (lockdown, or an operator who disarms it) everything reverts to dry-run preview.
+   Every consequential subsystem (self-heal, app forge, standing missions, MCP, trace
+   optimizer, voice cloud tiers, doc search, screen capture, proactive speech, shell,
+   UI automation) has its **own** independent master switch; several are **honestly
+   inert** until you supply a dependency (an API key, a downloaded model, a macOS TCC
+   grant, an allowlisted folder, or a configured server/mapping). Self-heal, app
+   forge, and the optimizer ship ON but are **PROPOSE-ONLY** — they write a validated
+   proposal a human applies; there is no auto-apply path. The one deliberate OFF
+   default is **`[voice_id]`** (a fail-closed gate, enrolled explicitly), plus at-rest
+   encryption (`[security].encrypt_memory`, an irreversible on-disk migration).
+2. **Per-action confirmation gate.** Even with the master switch armed, each
    consequential action parks behind a fresh, cross-turn spoken confirmation.
    There is no batching past the gate: a macro or standing mission re-runs every
    consequential step through the gate individually, exactly as if spoken live.
+   `ui_actuate` (UI automation) and `shell_run` (sandboxed shell) are pinned
+   **never-auto-approve**: they re-park per action even under an "Always" policy, so
+   one confirmation authorizes exactly one actuation/command.
 3. **On-device voice identity (optional).** When enrolled and enabled
    (`[voice_id]`, ships OFF), an unrecognized speaker cannot trigger or confirm a
    consequential action. It is **fail-closed**: an embedding error or unusable
@@ -71,7 +86,8 @@ Some capabilities require macOS to grant runtime consent (TCC) — a config flag
 **cannot** substitute for it:
 
 - **Microphone** — the always-on audio loop.
-- **Screen Recording** — the (OFF-by-default) screen-context ring.
+- **Screen Recording** — the screen-context ring (ships ON, but inert without this
+  consent — the flag cannot grant it).
 - **Accessibility / Automation** — any UI automation path.
 - **Full Disk / Files & Folders** — beyond the home-folder + `/Applications`
   defaults.

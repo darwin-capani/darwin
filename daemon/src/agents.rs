@@ -1089,8 +1089,8 @@ impl AgentRegistry {
             "docsearch.index" | "docsearch.forget" => Some("mnemosyne"),
             // KNOWLEDGE GRAPH: building/mapping the user's indexed documents into
             // the shared world model is MNEMOSYNE's knowledge-keeping remit (she
-            // owns the file-RAG surface AND the world-model write). Gated OFF by
-            // default ([docsearch].build_graph); routes to her so the turn is
+            // owns the file-RAG surface AND the world-model write). Ships ON
+            // ([docsearch].build_graph) but INERT WITHOUT indexed docs; routes to her so the turn is
             // attributed to the knowledge agent.
             "docsearch.build_graph" | "knowledge.build" => Some("mnemosyne"),
             _ => None,
@@ -1609,7 +1609,8 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
             // Self-Forge (PROPOSE-ONLY): steve, the CTO/builds agent, may DRAFT a
             // new sandboxed micro-app for human review. The tool never deploys or
             // runs anything — it stages, validates, and proposes; a human runs
-            // scripts/apply_forge.sh to install. Gated OFF by default in [forge].
+            // scripts/apply_forge.sh to install. Ships ON in [forge] but PROPOSE-ONLY
+            // and inert without a cloud key.
             "forge_app",
             // CODE INTELLIGENCE (task #16): steve, the CTO/Builds agent, owns the
             // read-only + propose-only code surface — code_explain (a grounded,
@@ -1617,11 +1618,12 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
             // indexed) and code_propose_diff (a PROPOSE-ONLY reviewable diff to
             // state/code/proposals/<ts>/ — it NEVER edits the tree; the human runs
             // scripts/apply_code_diff.sh, confined-by-construction to the
-            // allowlisted [code].roots root). Both ship OFF by default in [code].
+            // allowlisted [code].roots root). Both ship ON in [code] but are INERT
+            // until a codebase root is allowlisted.
             "code_explain", "code_propose_diff",
             // SANDBOXED SHELL / TERMINAL (task #43): steve, the CTO/Builds agent,
             // owns the HIGHEST-RISK tool — arbitrary command execution. It ships
-            // OFF by default in [shell]; even on, every command is CONSEQUENTIAL
+            // ON in [shell] but NEVER auto-runs; every command is CONSEQUENTIAL
             // (parks for a spoken yes, never auto-runs), denylist-screened PRE-exec,
             // and only ever runs under the master switch + confirm + voice-id +
             // !lockdown inside a deny-default sandbox-exec profile (no net, write-
@@ -1629,8 +1631,9 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
             "shell_run",
             // GATED UI AUTOMATION (task #44, the CAPSTONE): steve, the CTO/Builds
             // agent, owns the single most DANGEROUS tool — physically actuating the
-            // macOS UI (click/type/key). It ships OFF by default in [ui_automation];
-            // even on, EVERY actuation is CONSEQUENTIAL (it parks PER ACTION for a
+            // macOS UI (click/type/key). It ships ON in [ui_automation] but NEVER
+            // auto-runs (inert without Accessibility TCC + a display); EVERY actuation
+            // is CONSEQUENTIAL (it parks PER ACTION for a
             // spoken yes — ONE confirm = ONE actuation; a second re-parks; it never
             // auto-runs, never batches, never loops), is planned by the pure single-
             // action planner, and only ever actuates under the master switch +
@@ -1652,13 +1655,13 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
             // Self-Forge (PROPOSE-ONLY): oracle, the workflows agent, may DRAFT a
             // new sandboxed micro-app for human review (forging a tool into the
             // app surface fits its automation remit). Never deploys/runs — it
-            // proposes; a human installs via scripts/apply_forge.sh. Gated OFF.
+            // proposes; a human installs via scripts/apply_forge.sh. Ships ON but PROPOSE-ONLY (inert without a cloud key).
             "forge_app",
             // STANDING MISSIONS: a standing mission IS a repeatable scheduled
             // workflow, squarely oracle's (Workflows) remit. It may ESTABLISH one
             // (standing_create, confirmation-gated — parks for a spoken yes),
-            // LIST, and CANCEL. The subsystem ships off; a run still gates every
-            // consequential step.
+            // LIST, and CANCEL. The subsystem ships on; establishing is still
+            // confirmation-gated and a run still gates every consequential step.
             "standing_create", "standing_list", "standing_cancel",
             "world_query",
         ],
@@ -1785,7 +1788,7 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
             // missions, RESUME one (which re-runs FURY's bounded engine and re-gates
             // every consequential step — the persistence carries no pre-approval),
             // and CANCEL one. A saved mission loads PAUSED; resume is an explicit
-            // user-driven step, never an auto-run. OFF by default ([missions].durable).
+            // user-driven step, never an auto-run. ON by default ([missions].durable; persistence only).
             "mission_save", "mission_list", "mission_resume", "mission_cancel",
             "world_query",
         ],
@@ -1888,8 +1891,8 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
             // The file-RAG WRITE/FORGET triggers (the local intents the classifier
             // emits for "index my documents"/"reindex" and "forget my file index").
             // Both are CONFINED to the user's OWN allowlisted folders + the local
-            // state/docsearch.db; the index path is config-gated (OFF by default,
-            // empty allowlist => no whole-disk scan) and forget only clears the
+            // state/docsearch.db; the index path is config-gated (ON by default but
+            // INERT with an empty allowlist => no whole-disk scan) and forget only clears the
             // local store. Listed here so the router attributes the turn to
             // Mnemosyne (she owns the whole file-RAG surface) rather than rerouting.
             "docsearch.index", "docsearch.forget",
@@ -1899,8 +1902,9 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
             // provenance-tagged entities/relationships and upserts them into the
             // SHARED world model (world_update's structured cousin) — never an
             // agent's private namespace, never a fabricated node, bounded by the
-            // world-model caps. DOUBLE-GATED OFF by default ([docsearch].enabled AND
-            // [docsearch].build_graph). Both the canonical token and the
+            // world-model caps. Both [docsearch].enabled AND [docsearch].build_graph
+            // ship ON, but the build is INERT WITHOUT indexed docs (needs an allowlisted
+            // root + an index). Both the canonical token and the
             // `knowledge.build` alias are listed (select() routes both to her) so the
             // router attributes EITHER intent to Mnemosyne instead of rerouting the
             // alias to the orchestrator — she owns the whole document-knowledge surface.
@@ -1994,7 +1998,7 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
             // has NO send path — a persisted draft is always a suggestion, never
             // auto-sent. draft_list/draft_forget are read-only/reversible. An actual
             // send still rides the existing gated gmail_send/slack_post_message/x_post
-            // exactly as today (gate ON + confirm). OFF by default ([drafts].enabled).
+            // exactly as today (gate ON + confirm). ON by default ([drafts].enabled; a draft has no send path).
             "draft_compose", "draft_list", "draft_forget",
             "gmail_list_recent", "gmail_read_message", "gmail_send",
             "slack_list_channels", "slack_read_channel", "slack_post_message",

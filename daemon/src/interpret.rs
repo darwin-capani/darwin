@@ -365,13 +365,14 @@ mod tests {
     }
 
     #[test]
-    fn live_interpret_ships_off_by_default() {
-        // The continuous live-interpret mode SHIPS OFF: with it false the device-gated
-        // mic loop never feeds segments through interpret_segment. speak ships off too;
-        // the default target is a sensible "English" and the source auto-detects.
+    fn live_interpret_ships_on_inert_without_mic_by_default() {
+        // The continuous live-interpret mode SHIPS ON (full-power default) — INERT
+        // WITHOUT TCC/MIC: the device-gated mic loop captures nothing without
+        // Microphone consent. `speak` stays its OWN opt-in (render-only default); the
+        // default target is a sensible "English" and the source auto-detects.
         let cfg = Config::default();
-        assert!(!cfg.interpret.live, "continuous live interpretation MUST ship OFF");
-        assert!(!cfg.interpret.speak, "voicing the translation MUST ship OFF");
+        assert!(cfg.interpret.live, "continuous live interpretation ships ON (inert without mic/TCC)");
+        assert!(!cfg.interpret.speak, "voicing the translation stays its OWN opt-in (render-only default)");
         assert_eq!(cfg.interpret.target_lang, "English");
         assert_eq!(cfg.interpret.source_lang, "", "empty source => auto-detect");
     }

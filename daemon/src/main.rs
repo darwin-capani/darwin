@@ -18,7 +18,7 @@ mod brief;
 // path. The HUD's Chart component renders the EXACT emitted points (no
 // interpolation, no invented/extrapolated point, honest axes), with an honest-empty
 // state. NEUTRAL presentation (fire-and-forget telemetry, dropped with no HUD); the
-// "chart this" op ships OFF ([chart].enabled). Hermetically tested in chart.rs.
+// "chart this" op ships ON ([chart].enabled; a neutral presentation act, safe to enable). Hermetically tested in chart.rs.
 mod chart;
 mod code;
 mod command;
@@ -28,21 +28,22 @@ mod crypto;
 // MULTI-SPEAKER DIARIZATION (#31): the PURE mapper that CONSUMES the speaker labels the
 // ElevenLabs Scribe STT backend reports into a per-speaker diarized transcript, and the
 // HONEST single-stream "speaker: unknown" labeling on the on-device whisper path (which
-// has no diarization model — NEVER fabricated speakers). OFF by default ([voice].diarize)
-// and EL-Scribe-gated. Wired on the transcript path (main.rs run_pipeline); the pure
+// has no diarization model — NEVER fabricated speakers). ON by default ([voice].diarize)
+// but INERT ON-DEVICE; EL-Scribe-gated. Wired on the transcript path (main.rs run_pipeline); the pure
 // label-mapper + the on-device honest fallback are hermetically tested in diarize.rs.
 mod diarize;
 mod docsearch;
 // AUTO-DRAFT (#25): compose a REVIEWABLE pending draft (email reply / message /
 // doc) the user reads and sends THEMSELVES via the existing gated send. The draft
-// module has NO send path — a draft is always a suggestion, never auto-sent. OFF by
-// default ([drafts].enabled). Hermetically tested in drafts.rs.
+// module has NO send path — a draft is always a suggestion, never auto-sent. ON by
+// default ([drafts].enabled; a draft has no send path). Hermetically tested in drafts.rs.
 mod drafts;
 // DURABLE MISSIONS (#26): persist FURY mission state to SQLite (resume/list/cancel).
 // A persisted mission loads PAUSED (no auto-run on restart) and re-runs each
 // consequential step through the SAME gate on resume (the persistence carries no
-// pre-approval); inherits FURY's <=6 / 1-deep bounds. OFF by default
-// ([missions].durable). Hermetically tested in durable_missions.rs.
+// pre-approval); inherits FURY's <=6 / 1-deep bounds. ON by default
+// ([missions].durable; persistence only — a persisted mission loads PAUSED).
+// Hermetically tested in durable_missions.rs.
 mod durable_missions;
 mod episodic;
 mod eval;
@@ -56,7 +57,7 @@ mod integrations;
 // CONTINUOUS LIVE INTERPRETATION (#30): the PURE per-segment interpret pipeline
 // (interpret_segment: transcript -> on-device-LLM translate -> rendered translation +
 // optional speak request) using an injectable translator; offline/unavailable degrades
-// HONESTLY (never a fabricated translation). OFF by default ([interpret].live). The
+// HONESTLY (never a fabricated translation). ON by default ([interpret].live) but INERT WITHOUT MIC/TCC. The
 // continuous live-interpret mode that feeds each VAD segment through it is DEVICE-GATED:
 // wired behind the flag at the audio.rs segment site; only the pure core is proven
 // headlessly (hermetic tests in interpret.rs).
@@ -74,8 +75,8 @@ mod lockdown;
 // MACRO RECORD/REPLAY (#27): record a NAMED sequence of commands (utterances +
 // intent names ONLY — never secrets) and replay it. Replay re-runs each command
 // through the NORMAL router path + the gate FRESH (a consequential step re-hits the
-// confirmation gate + master switch, no pre-approval, no batching). OFF by default
-// ([macros].enabled). Hermetically tested in macros.rs.
+// confirmation gate + master switch, no pre-approval, no batching). ON by default
+// ([macros].enabled; replay re-gates each consequential step). Hermetically tested in macros.rs.
 mod macros;
 mod mcp;
 mod memory;
@@ -101,7 +102,8 @@ mod notebook;
 // The Trace Store + Optimizer: the local, PII-redacted record the
 // optimization-from-usage loop learns from, plus the propose-only optimizer that
 // reads it. Now WIRED LIVE: the turn loop calls optimize::record_trace at the
-// bookkeeping site (gated by [optimize].enabled, ships OFF) and a periodic
+// bookkeeping site (gated by [optimize].enabled, ships ON; live recording is
+// runtime-gated + PII-redacted) and a periodic
 // optimize_task calls optimize::run_optimizer (propose-only, never mutates the
 // live config). Exercised in full by optimize.rs's own hermetic tests.
 mod optimize;
@@ -112,8 +114,8 @@ mod posture;
 mod power;
 mod proactive;
 // Expressiveness layer (#33 adaptive prosody + #34 whisper/discreet mode). PURE +
-// OFF/neutral by default ([voice].adaptive_prosody / [voice].whisper / whisper_auto
-// all ship false). Rich prosody is EL-v3-GATED (Kokoro gets a coarse/neutral mapping,
+// ON by default ([voice].adaptive_prosody / [voice].whisper / whisper_auto all ship
+// true); EXPRESSIVENESS-ONLY (delivery, never a gate). Rich prosody is EL-v3-GATED (Kokoro gets a coarse/neutral mapping,
 // stated honestly, never faked); whisper changes DELIVERY only — it NEVER silences a
 // safety confirmation the gate requires. No audio/EL/mic touched here: this is the
 // pure context->profile classifier + shape_speak_request + whisper state machine,
@@ -121,7 +123,7 @@ mod proactive;
 mod prosody;
 // The proactive-intelligence core (habit detector #13 + predictive suggester
 // #14). NOW WIRED LIVE: the anticipation tick calls proactive_intel::surface_pass
-// every tick, GATED by [proactive].suggest (ships OFF) — when on it mines the
+// every tick, GATED by [proactive].suggest (ships ON) — when on it mines the
 // agent-scoped redacted episodes and emits each over-threshold pattern as a
 // `proactive.suggestion` HUD card (a SUGGESTION only; it never acts/speaks/
 // creates). The accept-mapper (accept_request / AcceptRequest::to_standing_create_input)
@@ -144,8 +146,8 @@ mod reflect;
 // is HONEST-EMPTY. NOW WIRED LIVE: the router classifies a "generate a report on X"
 // utterance (read-only, orchestrator-scoped), pulls the agent-scoped notebook
 // entries on X (the already-cited runs), and builds + renders the report — so the
-// intent reaches the report end-to-end. OFF by default ([report].enabled). Hermetic
-// tests in report.rs.
+// intent reaches the report end-to-end. ON by default ([report].enabled; read-only,
+// folds already-cited material, honest-empty when none). Hermetic tests in report.rs.
 mod report;
 mod research;
 mod router;
@@ -160,8 +162,9 @@ mod telemetry;
 // GATED UI AUTOMATION (#44, the CAPSTONE): the single most dangerous capability —
 // actually ACTUATING the macOS UI (click/type/key). A PURE single-action planner
 // (ONE plan = ONE actuation, can't batch) + the device-gated CGEvent/AX seam
-// (built, never run in a test). Ships OFF, per-action gated (master + confirm +
-// voice-id + lockdown), device-gated (Accessibility TCC). Hermetically tested.
+// (built, never run in a test). Ships ON but NEVER auto-runs: per-action gated
+// (master + confirm + voice-id + lockdown), device-gated (Accessibility TCC; inert
+// without it). Hermetically tested.
 mod ui_automation;
 mod unified_search;
 mod user_model;
@@ -171,15 +174,15 @@ mod voiceid;
 // Pure intent/consent/confinement/store logic; the upload itself is the inference
 // clone seam. Hermetically tested in voiceclone.rs.
 mod voiceclone;
-// VOICE TIER: the OFF-by-default ElevenLabs cloud-TTS layer on top of on-device
+// VOICE TIER: the ON-by-default (INERT WITHOUT A KEY) ElevenLabs cloud-TTS layer on top of on-device
 // Kokoro. Pure tier-decision brain (resolve_voice_backend / resolve_stt_backend) +
 // the Backend contracts the speak/transcribe paths thread to the inference server.
 // Changes NO safety gate; Kokoro/whisper stay the default + fallback. Hermetically
 // tested in voice_tier.rs.
 mod voice_tier;
 // CUSTOM WAKE-WORD (#32): the PURE, conservative wake-phrase matcher (wake_match) +
-// the activation gate (wake_gate) that folds in the [wake].enabled switch. OFF by
-// default and the default phrase ("jarvis") preserves today's activation behavior. The
+// the activation gate (wake_gate) that folds in the [wake].enabled switch. ON by
+// default; the default phrase ("jarvis") preserves today's activation behavior. The
 // matcher is case/punct/whitespace-insensitive with a small edit-distance tolerance,
 // never matches an empty/blank phrase, and never triggers on a substring of a larger
 // unrelated word. Wired into the activation path (router.rs); the always-listening loop
@@ -187,12 +190,13 @@ mod voice_tier;
 mod wake;
 // #35 WEBHOOK TRIGGERS — an inbound, HMAC-authenticated, loopback-default surface
 // that maps a signed event to a JARVIS intent and PARKS a consequential mapping
-// (never auto-executes). Ships OFF; the pure handle_webhook is tested, the live
-// loopback bind is RUNTIME-gated (the mic-loop / vision-capture precedent).
+// (never auto-executes). Ships ON but INERT WITHOUT MAPPINGS + A KEYCHAIN HMAC
+// SECRET; the pure handle_webhook is tested, the live loopback bind is RUNTIME-gated
+// (the mic-loop / vision-capture precedent).
 mod webhooks;
 // #36 PLUGIN SDK — the capability-module contract validator + register-on-launch
 // handshake + capability-token scoping. The validator is pure + tested; the live
-// handshake ships OFF behind [plugin_sdk].enabled.
+// handshake ships ON behind [plugin_sdk].enabled (the validator rejects over-privileged manifests).
 // (declared above as `mod plugin_sdk;` near the alphabetical p-block)
 mod world_model;
 
@@ -673,7 +677,7 @@ async fn retention_task(
 }
 
 /// Periodic optimizer cadence. The live loop is runtime-only (it only fires when
-/// [optimize].enabled is true, which ships OFF) and is NOT exercised by tests —
+/// [optimize].enabled is true, which ships ON) and is NOT exercised by tests —
 /// the pure [`optimize::run_optimizer`]/[`optimize::optimize`] are. A generous
 /// startup delay keeps it out of the first exchanges; a slow tick is plenty
 /// because it only ever reads an accruing corpus and PROPOSES — it never blocks
@@ -689,7 +693,8 @@ const OPTIMIZE_RECENT_WINDOW: usize = optimize::MAX_TRACES;
 /// Mirrors `retention_task`'s scheduling exactly: startup delay, then a slow
 /// loop. Each tick reads the recent trace window and calls
 /// [`optimize::run_optimizer`] — which is a complete NO-OP returning `Disabled`
-/// when `[optimize].enabled` is false (the shipped default), and otherwise
+/// when `[optimize].enabled` is false (an operator override; the shipped default is
+/// ON), and otherwise
 /// writes a REVIEWABLE proposal under `state/optimize/proposals/<ts>/` and STOPS.
 /// It NEVER mutates the live routing config (the human applies a proposal via
 /// scripts/apply_optimization.sh). Warn-and-continue throughout: a read failure
@@ -799,8 +804,9 @@ const ANTICIPATE_PRESENCE_WINDOW_SECS: u64 = 10 * 60;
 /// presence, runs the PURE [`anticipate::evaluate`] with the configured policy +
 /// the injected clock + the carried `FiredState`, and acts on the decision:
 ///   - `Nothing`  -> nothing.
-///   - `Surface`  -> emit the `proactive.surface` HUD card (the shipped default
-///                   with `[proactive].speak = false`).
+///   - `Surface`  -> emit the `proactive.surface` HUD card (the behavior when
+///                   `[proactive].speak = false`; the shipped default is `true`,
+///                   which ALSO voices the brief via the echo-safe speech path).
 ///   - `Speak`    -> emit the card AND voice the brief — but ONLY through the
 ///                   EXISTING speech path (`speech::speak`), and ONLY when
 ///                   `is_speaking()` is false, so the SPEAKING refcount /
@@ -875,7 +881,7 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
         // PROACTIVE-INTELLIGENCE SUGGESTIONS (#13 habit detector + #14 predictive
         // suggester). Runs every tick, INDEPENDENT of the EDITH brief decision
         // below (a suggestion is a separate surface). GATED by [proactive].suggest
-        // (ships OFF) inside surface_pass -> detect: with it off this is a true
+        // (ships ON) inside surface_pass -> detect: with it off this is a true
         // no-op (no store read, no card). When on it mines the agent-scoped,
         // redacted episodes for a recurring pattern over threshold and emits each
         // as a `proactive.suggestion` card — a SUGGESTION only: it never acts,
@@ -1145,7 +1151,7 @@ async fn main() -> Result<()> {
     // into apps/ — the human runs scripts/apply_forge.sh <ts> after reviewing.
     // This is the same function a future "build me an app" voice command calls;
     // exposing it as a CLI keeps the trigger explicit and out of the always-on
-    // path while the feature is gated OFF by default.
+    // path. The feature ships ON but PROPOSE-ONLY (inert without a cloud key).
     if let Some(pos) = std::env::args().position(|a| a == "--forge-goal") {
         let goal = std::env::args().nth(pos + 1).unwrap_or_default();
         if goal.trim().is_empty() {
@@ -1214,9 +1220,11 @@ async fn main() -> Result<()> {
     integrations::init(&cfg);
     // CONTINUOUS SCREEN CONTEXT (#42): install the [screen_context] settings ONCE
     // so the relay-side continuous-snapshot push path reads one process-global gate
-    // (mirrors integrations::init). SHIPS OFF (enabled=false) — until the operator
-    // turns it on the daemon push path is INERT (the bounded in-RAM ring never
-    // grows on its own) and no WATCHING indicator fires. Even ON, the live capture
+    // (mirrors integrations::init). SHIPS ON (enabled=true) but INERT WITHOUT
+    // Screen-Recording TCC consent — the live capture is TCC-device-gated in the
+    // Vision app, so without consent the daemon push path captures NOTHING (the
+    // bounded in-RAM ring never grows on its own) and no WATCHING indicator fires.
+    // The flag cannot grant the consent. With consent the live capture
     // is TCC-device-gated in the Vision app; the ring stays bounded/redacted/
     // transient + forgettable. Only the bool + cap are installed (no secrets).
     screen_context::install_settings(
@@ -1238,13 +1246,14 @@ async fn main() -> Result<()> {
     // it from config ONCE so the fury_mission tool arm reads one process-global
     // (mirrors init_persona — no model threading through execute_tool).
     anthropic::init_mission(&cfg.cloud.heavy_model);
-    // Self-Forge gate ([forge].enabled / mode, ships OFF): wire it ONCE so the
+    // Self-Forge gate ([forge].enabled / mode, ships ON; PROPOSE-ONLY, inert without
+    // a cloud key): wire it ONCE so the
     // forge_app tool arm reads one process-global to decide whether to run the
     // gated PROPOSE-ONLY pipeline (forge::forge_app still owns every gate) —
     // mirrors init_mission, no Config threading through execute_tool.
     anthropic::init_forge(cfg.forge.enabled, &cfg.forge.mode);
     // ANSWER ANNOTATIONS + SELF-VERIFICATION gate ([answers].cite / confidence /
-    // verify, all ship OFF): wire it ONCE so the prompt-building path (the
+    // verify, all ship ON): wire it ONCE so the prompt-building path (the
     // confidence instruction), the response path (the cite annotation), and the
     // self-verification pass (the gated, bounded critique-revise loop) read one
     // process-global — mirrors init_forge, no Config threading through
@@ -1260,9 +1269,10 @@ async fn main() -> Result<()> {
     // MCP CLIENT (docs/SANDBOX.md): connect every configured external tool server
     // ONCE at startup, then install the connected manager as the process-global so
     // the cloud tool loop can offer + route its tools WITHOUT threading a manager
-    // through `execute_tool` (mirrors `init_mission` / `init_forge`). SHIPS OFF:
-    // with `[mcp].enabled = false` (the default) `connect_all` is a no-op and the
-    // installed manager is inert — no server connects, no MCP tool is offered. Each
+    // through `execute_tool` (mirrors `init_mission` / `init_forge`). SHIPS ON but
+    // INERT WITHOUT SERVERS: the `servers` list ships EMPTY, so even enabled
+    // `connect_all` is a no-op and the installed manager is inert — no server
+    // connects, no MCP tool is offered until a [[mcp.servers]] entry is added. Each
     // stdio server is spawned under a default-deny sandbox-exec profile; a server
     // that fails to connect is logged and skipped (one bad server never blocks the
     // rest). The connect is the ONLY place a real subprocess is spawned.
@@ -1325,8 +1335,9 @@ async fn main() -> Result<()> {
     // The optimizer Trace Store: opened + held for the daemon's life exactly like
     // Memory, in its OWN dedicated SQLite file (state/optimize.db). The turn loop
     // records a redacted trace per turn THROUGH this handle — but ONLY when
-    // [optimize].enabled (ships OFF), so the shipped default opens an empty store
-    // and writes nothing. Threaded into run_pipeline alongside Memory and read by
+    // [optimize].enabled (ships ON; live recording is runtime-gated + PII-redacted),
+    // so with it disabled the store stays empty and nothing is written. Threaded into
+    // run_pipeline alongside Memory and read by
     // the periodic propose-only optimize_task below.
     let optimize_root = root.join("state").join("optimize");
     if let Err(e) = std::fs::create_dir_all(&optimize_root) {
@@ -1471,9 +1482,9 @@ async fn main() -> Result<()> {
     // idling deaf forever behind a healthy-looking process.
     audio::spawn_capture(root.clone(), cfg.clone(), tx);
 
-    // OPT-IN AMBIENT SOUND MONITOR (task #15). The continuous ambient
-    // sound-class monitor starts ONLY when [audio].sound_monitor is opted in
-    // (SHIPS OFF + pinned). With it off — the shipped default — the monitor
+    // AMBIENT SOUND MONITOR (task #15). The continuous ambient
+    // sound-class monitor starts when [audio].sound_monitor is on (SHIPS ON, but
+    // INERT WITHOUT MIC/TCC consent). With it off the monitor
     // NEVER starts and no microphone is opened for ambient classification; the
     // one-shot "what was that sound" intent (over a clip already captured above)
     // works regardless. Even when opted in, the actual continuous ambient capture
@@ -1551,7 +1562,8 @@ async fn main() -> Result<()> {
     }
     // #35 WEBHOOK TRIGGERS — the inbound, HMAC-authenticated, loopback-default
     // receiver. RUNTIME-GATED: webhooks::serve returns immediately (never opens a
-    // port) unless [webhooks].enabled is true (ships OFF), the bind is loopback,
+    // port) unless [webhooks].enabled is true (ships ON, but INERT WITHOUT MAPPINGS +
+    // A KEYCHAIN HMAC SECRET), the bind is loopback,
     // AND a Keychain HMAC secret is configured. Every request it would accept is
     // verified (constant-time HMAC over the raw body), mapped via the explicit
     // event->intent allowlist, and — if the mapped intent is consequential —
@@ -1569,7 +1581,7 @@ async fn main() -> Result<()> {
     tokio::spawn(reflect::reflection_task(sock_path.clone(), memory.clone()));
     // EDITH anticipation: the runtime-only proactive loop. The pure evaluator
     // (anticipate.rs) is what the tests cover; this live tick surfaces a HUD
-    // card unprompted and, ONLY when [proactive].speak is on (ships OFF) and the
+    // card unprompted and, ONLY when [proactive].speak is on (ships ON) and the
     // daemon is not already speaking, voices it through the existing speech path.
     tokio::spawn(anticipation_task(
         root.clone(),
@@ -1601,7 +1613,7 @@ async fn main() -> Result<()> {
         cfg.notebooks.enabled.then_some(cfg.notebooks.retention),
     ));
     // Periodic PROPOSE-ONLY optimizer pass: reads the accruing redacted trace
-    // corpus and, ONLY when [optimize].enabled (ships OFF), writes a reviewable
+    // corpus and, ONLY when [optimize].enabled (ships ON), writes a reviewable
     // routing-tuning proposal under state/optimize/proposals/<ts>/. It NEVER
     // mutates the live routing config — a human reviews + applies via
     // scripts/apply_optimization.sh. A no-op while the master switch is off.
@@ -1662,7 +1674,7 @@ async fn main() -> Result<()> {
             Ok(()) => {
                 info!(app = %name, "autostarted micro-app");
                 // #36 PLUGIN SDK — the register-on-launch HANDSHAKE, RUNTIME-GATED
-                // by [plugin_sdk].enabled (ships OFF). When on, re-validate the
+                // by [plugin_sdk].enabled (ships ON). When on, re-validate the
                 // launched plugin's manifest contract ([intents]/[tools]) AND
                 // verify its just-minted capability token (the SAME HMAC machinery
                 // the per-app relay uses). The outcome is surfaced secret-free to
@@ -1703,10 +1715,10 @@ async fn main() -> Result<()> {
 
     // CONTINUOUS SCREEN CONTEXT (#42): if [screen_context].enabled, START the
     // device-gated continuous OCR loop in the Vision app by sending it the
-    // `screen.context.start` op. STRICTLY GATED: this fires ONLY when the operator
-    // turned the feature on (ships OFF — with enabled=false this whole block is
-    // skipped, so today's behavior is byte-for-byte unchanged and no loop ever
-    // arms). Best-effort: if the Vision app is not autostarted/running the op is
+    // `screen.context.start` op. STRICTLY GATED: this fires ONLY when
+    // [screen_context].enabled is on (ships ON — with enabled=false this whole block
+    // is skipped and no loop ever arms; even ON it is INERT WITHOUT Screen-Recording
+    // TCC consent). Best-effort: if the Vision app is not autostarted/running the op is
     // dropped with a warning (the live capture still requires the app + runtime
     // Screen-Recording TCC consent — the daemon flag alone can grant neither). The
     // app side honors the device gate; a TCC denial stops the loop cleanly,
@@ -1860,23 +1872,23 @@ async fn run_pipeline(
     // "Sources:" line when [answers].cite is on. This guard CLEARS that accumulator
     // on EVERY return path so a retrieval turn's sources can never annotate the
     // NEXT turn (the no-cross-turn-leak contract) — the exact analogue of
-    // TurnGateGuard / TurnLangGuard. Inert when [answers] ships OFF.
+    // TurnGateGuard / TurnLangGuard. Inert when [answers] is disabled.
     let _sources_guard = anthropic::TurnSourcesGuard;
 
-    // Per-turn SELF-VERIFICATION outcome ([answers].verify, ships OFF): the cloud
+    // Per-turn SELF-VERIFICATION outcome ([answers].verify, ships ON): the cloud
     // path records THIS turn's verify outcome (off | verified-clean | revised |
     // flagged) into a process-global the response path below surfaces as the HUD
     // badge. This guard CLEARS it on EVERY return path so turn N's outcome can never
     // label turn N+1 — the exact analogue of TurnSourcesGuard. Inert when verify
-    // ships OFF (the outcome stays `Off` and the HUD renders nothing).
+    // is disabled (the outcome stays `Off` and the HUD renders nothing).
     let _verify_guard = anthropic::TurnVerifyGuard;
 
-    // Per-turn TOOL-RESULT CROSS-CHECK outcome (#21, [answers].cross_check, ships
-    // OFF) and MULTI-MODEL DEBATE outcome (#22, [answers].debate, ships OFF): the
+    // Per-turn TOOL-RESULT CROSS-CHECK outcome (#21, [answers].cross_check, ships ON)
+    // and MULTI-MODEL DEBATE outcome (#22, [answers].debate, ships ON): the
     // cloud path records THIS turn's outcome into a process-global the response path
     // surfaces as a SECRET-FREE HUD badge. Each guard CLEARS its slot on EVERY return
     // path so turn N's outcome can never label turn N+1 — the exact analogues of
-    // TurnVerifyGuard. Inert when both ship OFF (the outcomes stay `Off`).
+    // TurnVerifyGuard. Inert when disabled (the outcomes stay `Off`).
     let _cross_check_guard = anthropic::TurnCrossCheckGuard;
     let _debate_guard = anthropic::TurnDebateGuard;
 
@@ -1910,7 +1922,8 @@ async fn run_pipeline(
 
     telemetry::emit("audio", "utterance.captured", json!({"path": wav_str}));
     // Resolve the STT backend ONCE for this utterance BEFORE the concurrent legs:
-    // with the cloud-STT tier OFF (the shipped default) this is on-device whisper
+    // with the cloud-STT tier inactive (no key / offline; the flag ships ON but is
+    // INERT WITHOUT A KEY) this is on-device whisper
     // with ZERO Keychain access and the EXACT pre-tier transcribe wire; the Scribe
     // branch is reached only when [voice].cloud_stt is on + a key is present + the
     // operator is not offline. The resolved key (Scribe only) is threaded straight
@@ -2002,8 +2015,8 @@ async fn run_pipeline(
         return None;
     }
 
-    // #31 MULTI-SPEAKER DIARIZATION (diarize.rs), on the transcript path. OFF by default
-    // ([voice].diarize) and EL-Scribe-gated. When ON, a diarized transcript flows to the
+    // #31 MULTI-SPEAKER DIARIZATION (diarize.rs), on the transcript path. ON by default
+    // ([voice].diarize) but INERT ON-DEVICE; EL-Scribe-gated. When active, a diarized transcript flows to the
     // HUD/telemetry: on the EL-Scribe STT backend (which carries speaker labels) the PURE
     // `diarize` mapper would render distinct per-speaker turns; on the on-device whisper
     // backend (no diarization model) we use the HONEST single-stream "speaker: unknown"
@@ -2050,7 +2063,7 @@ async fn run_pipeline(
     }
 
     // #30 CONTINUOUS LIVE INTERPRETATION (interpret.rs), the DEVICE-GATED live feed of
-    // each VAD segment. OFF by default ([interpret].live) — with it off this whole branch
+    // each VAD segment. ON by default ([interpret].live) but INERT WITHOUT MIC/TCC — with it off this whole branch
     // is skipped and the segment is classified/routed exactly as today. When ON, the
     // freshly-transcribed segment is run through the PURE `interpret::interpret_segment`
     // pipeline (transcript -> on-device-LLM translate -> rendered translation), which
@@ -2162,7 +2175,7 @@ async fn run_pipeline(
     // SAFETY: a consequential recorded step therefore hits the cross-turn
     // confirmation gate + the [integrations] master switch FRESH (it parks for a
     // spoken yes; replay grants NO pre-approval and NEVER batches past the gate).
-    // OFF by default ([macros].enabled): with it off this reports the subsystem is
+    // ON by default ([macros].enabled): with it off this reports the subsystem is
     // off and runs nothing. The recorded steps hold only utterances + intent names
     // (redacted at record time), never a secret.
     if let Some(crate::macros::MacroCommand::Replay { name }) =
@@ -2264,7 +2277,7 @@ async fn run_pipeline(
                     None
                 }
             };
-            // ANSWER ANNOTATIONS ([answers], ships OFF): surface the REAL
+            // ANSWER ANNOTATIONS ([answers], ships ON): surface the REAL
             // tool-result SOURCES that fed this turn (cite) — or "from my own
             // knowledge" when no retrieval ran — and the model's SELF-REPORTED
             // confidence (parsed off the answer + carried on the structured HUD
@@ -2279,7 +2292,7 @@ async fn run_pipeline(
             let annotated = anthropic::annotate_answer(&outcome.response);
             outcome.response = annotated.response;
             telemetry::emit("system", "answer.annotated", annotated.telemetry);
-            // SELF-VERIFICATION badge ([answers].verify, ships OFF): surface THIS
+            // SELF-VERIFICATION badge ([answers].verify, ships ON): surface THIS
             // turn's verify outcome (off | verified-clean | revised | flagged) the
             // cloud path recorded, as a SECRET-FREE HUD payload (the outcome token +
             // badge + honest copy — never the flagged-claim text or any content
@@ -2293,7 +2306,7 @@ async fn run_pipeline(
                 "answer.verified",
                 anthropic::verify_telemetry(cfg.answers.verify, verify_outcome),
             );
-            // TOOL-RESULT CROSS-CHECK badge (#21, [answers].cross_check, ships OFF):
+            // TOOL-RESULT CROSS-CHECK badge (#21, [answers].cross_check, ships ON):
             // surface THIS turn's cross-check outcome (off | plausible | flagged) the
             // cloud path recorded, as a SECRET-FREE HUD payload (the outcome token +
             // badge + honest copy — never the raw tool result; the flag reasons +
@@ -2307,7 +2320,7 @@ async fn run_pipeline(
                 "answer.cross_checked",
                 anthropic::cross_check_badge_telemetry(cfg.answers.cross_check, cross_check_outcome),
             );
-            // MULTI-MODEL DEBATE badge (#22, [answers].debate, ships OFF): surface
+            // MULTI-MODEL DEBATE badge (#22, [answers].debate, ships ON): surface
             // THIS turn's debate outcome (off | agree | disagree | fallback). With
             // debate off the outcome is `Off` and the HUD renders nothing. Cleared
             // each turn by the guard above. HONEST: agreement raises confidence;
@@ -2486,7 +2499,7 @@ async fn run_pipeline(
             // OPTIMIZER TRACE (round: WireOptimizer). Record THIS completed turn
             // as a redacted optimizer trace — GATED by exactly the same posture as
             // the transcript/episodic/learning loop above: a NO-OP unless
-            // [optimize].enabled (ships OFF) AND the turn is NOT a transient
+            // [optimize].enabled (ships ON) AND the turn is NOT a transient
             // screen read (a screen read can carry on-screen secrets and must
             // never seed the corpus, mirroring the episodic gate). The mode is the
             // selector's pure classification of this utterance (no I/O); the agent

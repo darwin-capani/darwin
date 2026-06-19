@@ -1,6 +1,6 @@
 //! STANDING MISSIONS — durable, scheduled, autonomous goals that run on the
 //! standing-missions scheduler tick (a dedicated runtime loop in `main.rs`,
-//! distinct from EDITH's anticipation tick; OFF by default via [standing].enabled)
+//! distinct from EDITH's anticipation tick; ON by default via [standing].enabled)
 //! and reason over the shared World Model.
 //!
 //! A STANDING MISSION is a saved goal plus a SCHEDULE: "every morning, review my
@@ -20,21 +20,23 @@
 //!    create PARKS for a spoken human "yes" on a later turn (the cross-turn
 //!    confirmation gate) instead of spawning recurring autonomy on a guess. The
 //!    DRY-RUN preview names the goal + schedule precisely ("I'll set up a standing
-//!    mission to <goal>, <schedule> — confirm?"). With the master switch OFF (the
-//!    shipped default) it previews and creates nothing.
+//!    mission to <goal>, <schedule> — confirm?"). The master switch ships ON
+//!    (armed), so a create PARKS for a spoken yes; with the master switch OFF
+//!    (lockdown, or an operator who disarmed it) it previews and creates nothing.
 //!
 //! 2. **NO SILENT AUTONOMY when a mission RUNS.** A run reuses
 //!    [`crate::mission::run_mission`], so every sub-task executes as its OWNING
 //!    specialist under that specialist's tool allowlist, and every CONSEQUENTIAL
 //!    step (post/send/spend/control) STILL routes through the SAME confirmation
-//!    gate + the OFF-by-default master switch — a standing mission can never
-//!    auto-send, auto-post, or auto-spend; those steps PARK exactly as a direct
-//!    request would. A run does autonomous READING/REASONING; any outward action
-//!    waits for a human yes.
+//!    gate + the armed-by-default master switch (ON, but a confirmed action still
+//!    needs a fresh confirm) — a standing mission can never auto-send, auto-post, or
+//!    auto-spend; those steps PARK exactly as a direct request would. A run does
+//!    autonomous READING/REASONING; any outward action waits for a human yes.
 //!
-//! Standing missions ship OFF (`[standing] enabled = false`, like
-//! proactive/self-heal/forge). Bounded: at most [`MAX_ACTIVE`] active missions,
-//! and each RUN is bounded by FURY's per-mission caps.
+//! The standing-missions subsystem ships ON (`[standing] enabled = true`, full-power
+//! default), but establishing a mission is still confirmation-gated and every
+//! consequential step a run proposes still parks. Bounded: at most [`MAX_ACTIVE`]
+//! active missions, and each RUN is bounded by FURY's per-mission caps.
 //!
 //! ## Where it lives (persistence + isolation)
 //!
@@ -504,7 +506,8 @@ impl RunReport {
 /// [`RunReport`]. The run is identical to a `fury_mission` call — decompose ->
 /// dispatch each sub-task as its OWNING specialist (under that specialist's
 /// allowlist) -> synthesize — so EVERY consequential step inside the run STILL
-/// parks behind the confirmation gate + the OFF-by-default master switch. A
+/// parks behind the confirmation gate + the armed-by-default master switch (a
+/// confirmed action still needs a fresh per-action confirm). A
 /// standing mission therefore does autonomous reasoning but can never auto-fire an
 /// outward action. Generic over the [`Planner`]/[`Dispatcher`] seams so tests
 /// drive it with the mission engine's mocks (no real cloud); the live tick wires

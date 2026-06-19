@@ -1,7 +1,7 @@
 //! Cross-turn SPOKEN confirmation gate for consequential actions.
 //!
-//! This is the SECOND factor that sits ABOVE the off-by-default master switch
-//! ([`crate::integrations::consequential_allowed`]). The master switch decides
+//! This is the SECOND factor that sits ABOVE the armed-by-default master switch
+//! ([`crate::integrations::consequential_allowed`], which ships ON). The master switch decides
 //! whether outward actions are permitted AT ALL; this module decides whether a
 //! specific, named action the model proposed is actually allowed to fire — and
 //! the ONLY thing that lets it fire is a real human saying "yes" on a LATER

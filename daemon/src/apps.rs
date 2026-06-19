@@ -1781,8 +1781,9 @@ async fn relay_line(
             // continuous capture loop — route its recognized text into the daemon's
             // bounded/redacted/transient context ring (the redaction + bounding
             // happen inside `ingest_continuous_snapshot`, which is itself GATED on
-            // [screen_context].enabled — OFF by default => a no-op, the ring never
-            // grows). The raw text is NOT echoed to telemetry; only the honest
+            // [screen_context].enabled — ships ON but INERT WITHOUT Screen-Recording
+            // TCC consent (and a no-op when disabled, the ring never grows). The raw
+            // text is NOT echoed to telemetry; only the honest
             // WATCHING indicator (the loop is active) rides, so the HUD can show the
             // prominent watching state without the sensitive glyphs. A one-shot
             // read (read_kind=screen/handwriting/document) is left UNTOUCHED — it is

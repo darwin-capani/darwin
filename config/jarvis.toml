@@ -14,17 +14,18 @@ barge_in_rms = 0.06     # how loud you must be to cut him off — above his own 
                         #   this to just under your interruption level.
 barge_in_ms = 250       # accumulated loud time before he stops (dwell; brief
                         #   inter-word dips are tolerated, not reset)
-sound_monitor = false   # OPT-IN ambient sound monitor (task #15). SHIPS OFF + pinned.
-                        #   When ON (+ mic/TCC consent on-device) the daemon
-                        #   PERIODICALLY classifies a short ambient clip via the
-                        #   Vision app's on-device classify.sound op (Apple Sound
+sound_monitor = true    # Ambient sound monitor (task #15). SHIPS ON (full-power
+                        #   default) — INERT WITHOUT MIC/TCC: it captures nothing
+                        #   until you grant Microphone consent in System Settings;
+                        #   the flag cannot grant it. When active (+ mic/TCC consent)
+                        #   the daemon PERIODICALLY classifies a short ambient clip via
+                        #   the Vision app's on-device classify.sound op (Apple Sound
                         #   Analysis, the fixed ~300-class classifier) and emits
                         #   sound-class events (doorbell/alarm/glass-break/…). Only
                         #   the LABELS leave the op — the AUDIO never leaves the
-                        #   device. Continuous ambient listening is opt-in only and
-                        #   NEVER always-on without this switch. DISTINCT from STT.
-                        #   The one-shot "what was that sound" intent (on a clip the
-                        #   daemon already captured) works regardless of this flag.
+                        #   device. DISTINCT from STT. The one-shot "what was that
+                        #   sound" intent (on a clip the daemon already captured)
+                        #   works regardless of this flag. Set false to disable.
 
 [models]
 llm = "mlx-community/Qwen3-4B-Instruct-2507-4bit"   # local generation (+ converse decode) (MLX, Metal GPU)
@@ -43,28 +44,65 @@ speed = 1.2             # kokoro only (csm/orpheus have no speed control); clipp
 sentence_pause_ms = 250 # pure silence the daemon inserts between consecutive clips in a reply (after the opener and between content sentences, never after the last); 120ms gapless playback read as rushed
 opener_delay_ms = 300   # natural beat between end-of-utterance and the opener WAV; the daemon sleeps this inside the ReplySession while STT runs CONCURRENTLY (never serialized in front of transcription); first_audio_ms includes it. Only consulted when instant_opener = true
 openers = ["Right away, sir.", "Of course.", "One moment.", "On it, sir.", "Let me see."]  # opener bank: synthesized to state/openers/opener-<idx>.wav at every server start (preload, after TTS warm); the daemon plays one the instant an utterance ends and maps filename index -> this list. Only used when instant_opener = true
-instant_opener = false  # master gate for the canned instant acknowledgment. SHIPS OFF: a task-ack ("Right away, sir.") played BEFORE STT/classify reads as programmed — "Hi JARVIS" should get a warm, varied greeting, not an acknowledgment. With false the converse stream IS the whole reply (the persona greets/answers naturally from its first word) and no opener_spoken is passed. Set true to restore the prior instant-ack behavior; all the opener machinery stays intact either way
+instant_opener = true   # master gate for the canned instant acknowledgment. SHIPS ON (full-power default): a task-ack ("Right away, sir.") plays the instant an utterance ends while STT runs concurrently. Pure UX feature, no safety surface. (Owner tradeoff: set false for a warmer, varied greeting — then the converse stream IS the whole reply, the persona greets/answers naturally from its first word. All the opener machinery stays intact either way.)
 
 [inference]
 preload = true          # warm STT, LLM (+classifier prompt cache) and TTS in a background thread at server startup
-speculative = false     # #37 SPECULATIVE/DRAFT DECODING — master gate. SHIPS OFF => NORMAL generation (today's exact runtime). On ALSO needs a loadable draft_model below; absent that, generate falls back to normal gen and reports speculative=false (NEVER faked). The real speedup is device/model-dependent and only on-device.
-draft_model = ""        # #37 small DRAFT checkpoint mlx_lm uses to propose tokens the main model verifies (e.g. "mlx-community/Qwen3-0.6B-Instruct-4bit"). Empty (default) => speculative is inert even if speculative=true (honest: no draft, normal gen). Unloadable => normal gen + speculative=false reported.
+speculative = true      # #37 SPECULATIVE/DRAFT DECODING — master gate. SHIPS ON (full-power default) — INERT WITHOUT A DRAFT MODEL: it ALSO needs a loadable draft_model below (ships empty); absent that, generate falls back to NORMAL gen and HONESTLY reports speculative=false (NEVER faked). Set draft_model to engage. The real speedup is device/model-dependent and only on-device.
+draft_model = ""        # #37 small DRAFT checkpoint mlx_lm uses to propose tokens the main model verifies. SHIPS EMPTY => speculative is inert even though speculative=true (honest: no draft, normal gen, speculative=false reported). Set a real downloadable checkpoint (e.g. "mlx-community/Qwen3-0.6B-Instruct-4bit") to actually engage speculative; unloadable => normal gen + speculative=false reported.
 quant = "auto"          # #39 SELECTABLE QUANTIZATION for the local model load. "auto" (default) == today's behavior (load as configured). Allowed: auto/fp16/int8/int4. An explicit value selects a matching variant; if absent the loader falls back + reports the quant that ACTUALLY loaded (never claims int4 when fp16 loaded). Unknown value => reported + kept "auto". Real RAM/speed/quality tradeoff is device-gated.
 
 [power]                  # #38 BATTERY/THERMAL ADAPTIVE THROTTLING. PERF/RUNTIME ONLY: influences only the LOCAL model sub-choice (prefer the cheaper Fast warm model + defer heavy work) on low battery / serious thermal pressure. NEVER loosens a gate, never makes a cloud call.
-adaptive = false        # master gate. SHIPS OFF => nothing reads power/thermal, the throttle is always neutral, routing is byte-for-byte today's. The live pmset/thermal read is DEVICE-GATED behind this flag. On => the conservative policy may prefer Fast + defer heavy on low battery (discharging) or serious/critical thermal pressure.
+adaptive = true         # master gate. SHIPS ON (full-power default). PERF-ONLY: the conservative policy may prefer the cheaper local Fast sub-tier + defer heavy work on low battery (discharging) or serious/critical thermal pressure. Never loosens a gate, never makes a cloud call. The live pmset/thermal read is DEVICE-GATED behind this flag. Set false to disable.
 low_battery_pct = 20    # #38 discharge threshold: below this % ON BATTERY, prefer the cheaper local Fast sub-tier + defer heavy work. On AC + nominal thermal the policy never throttles regardless.
 
 [report]                 # #40 REPORT GENERATION. READ-ONLY/PRESENTATION: folds the agent-scoped, ALREADY-CITED notebook/research material into one BOUNDED markdown report under research.rs's cite discipline. NEVER fabricates a source/citation/body; no citable source => an HONEST-EMPTY report. Speaks/displays only — acts/reaches nothing.
-enabled = false         # master gate. SHIPS OFF => the "generate a report on X" op declines and reads nothing, routing is byte-for-byte today's. On => the read-only op pulls the saved cited runs on X and assembles a bounded report citing ONLY their real sources.
+enabled = true          # master gate. SHIPS ON (full-power default). The read-only op pulls the saved cited runs on X and assembles a bounded report citing ONLY their real sources (honest-empty when none). Speaks/displays only — safe to enable outright. Set false to disable.
 
 [chart]                  # #41 DATA -> CHART. NEUTRAL PRESENTATION: serializes a ChartSpec (the EXACT data points) as a `chart.data` telemetry envelope the HUD plots exactly — no interpolation, no invented/extrapolated point, honest axes + honest-empty. Changes no gate, takes no action, reaches no network.
-enabled = false         # master gate. SHIPS OFF => the "chart this" op declines and emits nothing. On => "chart this"/"plot the system load" surfaces the latest REAL system snapshot's exact cpu/mem values as a chart.data envelope (honest-empty when no reading is available yet).
+enabled = true          # master gate. SHIPS ON (full-power default). "chart this"/"plot the system load" surfaces the latest REAL system snapshot's exact cpu/mem values as a chart.data envelope (honest-empty when no reading is available yet). Changes no gate, reaches no network — safe to enable outright. Set false to disable.
 
 [screen_context]         # #42 CONTINUOUS SCREEN CONTEXT — the MOST privacy-sensitive read feature. A bounded/redacted/transient in-RAM ring of recent on-screen OCR snapshots, fed by a DEVICE-gated continuous capture loop, recallable ("what was I working on") + forgettable ("forget my screen context"). Glyph-only, never a face/identity; pixels never leave the device; READ-ONLY.
-enabled = false         # master gate. SHIPS OFF => the continuous capture loop NEVER runs, the in-RAM ring NEVER grows on its own, no WATCHING indicator fires, routing is byte-for-byte today's. On STILL requires runtime macOS Screen-Recording consent (TCC) — the flag cannot grant it. The ring is redacted + transient (off lifelong memory / optimizer / disk) + bounded + forgettable.
+enabled = true          # master gate. SHIPS ON (full-power default), the MOST privacy-sensitive read — INERT WITHOUT TCC: the continuous capture loop STILL requires runtime macOS Screen-Recording consent; the flag cannot grant it, so without consent it captures NOTHING (the ring never grows, no WATCHING indicator fires). The ring stays redacted + transient (off lifelong memory / optimizer / disk) + bounded (cap below) + forgettable, with the WATCHING indicator. Set false to disable.
 interval_secs = 30      # cadence the device-gated loop grabs ONE frame (floored to >= 1). A calmer/faster watch.
 cap = 50                # HARD bound on the in-RAM ring — past it the OLDEST snapshot is evicted (no unbounded accumulation, no disk-spill). Floored to >= 1.
+
+[vision]                 # On-device VISION-LANGUAGE model (VLM) describe path (distinct from OCR read.screen).
+enabled = true          # master gate. SHIPS ON (full-power default) — INERT WITHOUT A MODEL: with `model` empty the describe op returns honest vlm_unavailable (never fabricates). Needs mlx-vlm + a multi-GB Qwen2-VL-class checkpoint + RAM; pixels stay on-device. Set false to disable.
+model = ""              # SHIPS EMPTY — name + download an on-device VLM repo id (e.g. a Qwen2-VL-class mlx-vlm model) to engage; empty => honest unavailable.
+
+[image]                  # On-device TEXT->IMAGE generation (MLX diffusion, 100% on-device; NO cloud image API).
+enabled = true          # master gate. SHIPS ON (full-power default) — INERT WITHOUT A MODEL: with `model` empty the op returns honest image_model_unavailable (never fabricates). Needs an MLX diffusion pkg + a multi-GB FLUX.1-schnell-class checkpoint + RAM. Set false to disable.
+model = ""              # SHIPS EMPTY — name + download an on-device diffusion model id to engage; empty => honest unavailable.
+
+[interpret]              # #30 CONTINUOUS LIVE INTERPRETATION. The device-gated mic loop feeds each VAD segment through the PURE interpret pipeline.
+live = true             # master gate. SHIPS ON (full-power default) — INERT WITHOUT TCC/MIC: the per-segment pipeline runs from the device-gated mic loop, so without Microphone consent it interprets nothing. Quality is bounded by the local ~4B model; offline degrades honestly (never a fabricated translation). Set false to disable.
+speak = false           # render-only by default — voicing the translation stays its OWN opt-in (set true to also speak each rendered translation through the echo-safe speech path).
+source_lang = ""        # SOURCE language to interpret FROM. Empty => auto-detect (the translator is told the source is unknown — never claims a source it only guessed).
+target_lang = "English" # TARGET language to interpret INTO.
+
+[wake]                   # #32 CUSTOM WAKE-WORD. The configured phrase that gates "is this utterance for JARVIS".
+enabled = true          # master gate. SHIPS ON (full-power default) — since `phrase` defaults to "jarvis", behavior is identical to today unless you change the phrase. The always-listening loop that consults the matcher is DEVICE-GATED (mic/TCC). Set false to disable wake-word gating.
+phrase = "jarvis"       # the wake phrase (case/punct/whitespace-insensitive + small edit-distance tolerance; an empty/blank phrase NEVER matches — fail-safe).
+
+[shell]                  # #43 SANDBOXED SHELL / TERMINAL — the HIGHEST-RISK capability (arbitrary command execution).
+enabled = true          # master gate. SHIPS ON (full-power default). Even ON it NEVER auto-runs: shell_run is in CONSEQUENTIAL_TOOLS + NEVER_AUTO_APPROVE_TOOLS (parks per-action even under an "Always" policy), clears a destructive denylist pre-exec, and execs only under allow_consequential + confirm + voice-id + !lockdown in a deny-default sandbox-exec profile. INERT WITHOUT DEVICE SUPPORT: exec needs /usr/bin/sandbox-exec + /bin/sh. Set false to disable.
+
+[ui_automation]          # #44 GATED UI AUTOMATION (the CAPSTONE) — the SINGLE MOST DANGEROUS capability (physically actuating the macOS UI).
+enabled = true          # master gate. SHIPS ON (full-power default). Even ON it NEVER auto-runs: ui_actuate is in CONSEQUENTIAL_TOOLS + NEVER_AUTO_APPROVE_TOOLS (parks PER ACTION — one confirm = one actuation; a second re-parks — even under "Always"), fires only under allow_consequential + confirm + voice-id + !lockdown, never batched. INERT WITHOUT TCC: the CGEvent/AX post needs Accessibility consent (runtime, not SBPL-grantable) + a real display. Set false to disable.
+
+[webhooks]               # #35 INBOUND WEBHOOK TRIGGERS — the most security-sensitive inbound surface.
+enabled = true          # master gate. SHIPS ON (full-power default) — INERT WITHOUT MAPPINGS + SECRET: `mappings` ships EMPTY (an unmapped event is rejected, never guessed) and the HMAC secret resolves from the Keychain (account webhook_hmac_secret, NEVER this file). The bind stays loopback (a non-loopback bind is refused). A mapped CONSEQUENTIAL intent still PARKS for a spoken confirm — a webhook can never auto-execute. Add mappings + set the Keychain secret to use. Set false to disable.
+bind = "127.0.0.1"      # loopback-ONLY listen address; a non-loopback value is refused at bind time.
+port = 8723             # loopback receiver port.
+max_body_bytes = 65536  # hard cap on a received request body (a larger body is rejected, never buffered).
+# mappings ship EMPTY (an unmapped event is rejected). Example (commented):
+# [[webhooks.mappings]]
+# event = "ci.failed"          # the external X-Jarvis-Event / event name this entry maps
+# intent = "system.query"      # the JARVIS intent it routes to (a consequential intent still PARKS for a spoken confirm)
+
+[plugin_sdk]             # #36 PLUGIN SDK — the micro-app capability-module contract validator + register-on-launch handshake.
+enabled = true          # master gate. SHIPS ON (full-power default): the live handshake scopes a plugin's declared intents/tools. A plugin still can't request a capability outside the allowed set (the validator rejects over-privileged manifests), can't escape the default-deny SBPL profile, and any consequential tool it exposes still rides the gate. The validator is pure and always available regardless. Set false to disable the live handshake.
 
 [router]
 cloud_confidence_threshold = 0.6   # route to cloud iff complexity == "heavy" OR confidence < this
@@ -84,8 +122,8 @@ max_tokens = 4096
 enabled = true      # first-contact brief: after an away gap the next reply opens with verified context (time of day, system status, matching user.habit.* facts, pending heal proposal, facts learned while away)
 idle_gap_hours = 4  # away gap (vs meta.last_interaction, unix-secs) that triggers the brief
 # EDITH anticipation (anticipate.rs): the daemon surfaces what matters UNPROMPTED.
-speak = false       # master gate for SPOKEN proactivity, ships OFF (like self_heal/allow_consequential): when false EDITH only emits a HUD proactive card and NEVER speaks on its own; when true it ALSO voices the brief — strictly through the existing speech path (is_speaking/MUTE_TAIL/barge cover it) and never while already speaking. Turn on deliberately.
-suggest = false     # proactive-intelligence suggester (habit detector #13 + predictive suggester #14, proactive_intel.rs) master gate, ships OFF — its OWN switch, NOT piggybacked on `enabled` above (which is on only for the first-contact brief). When false the anticipation tick mines no patterns and emits no `proactive.suggestion` card; the HUD suggestions feed stays empty. When true it SURFACES observed-pattern suggestions only — accepting a habit offer still routes through the gated standing_create confirmation; JARVIS never auto-acts. Turn on deliberately.
+speak = true        # master gate for SPOKEN proactivity, SHIPS ON (full-power default): EDITH ALSO voices the brief — strictly through the existing echo-safe speech path (is_speaking/MUTE_TAIL/barge cover it) and never while already speaking — in addition to the HUD proactive card. Set false for HUD-card-only.
+suggest = true      # proactive-intelligence suggester (habit detector #13 + predictive suggester #14, proactive_intel.rs) master gate, SHIPS ON (full-power default) — its OWN switch, NOT piggybacked on `enabled` above. When on it SURFACES observed-pattern suggestion cards — accepting a habit offer still routes through the gated standing_create confirmation; JARVIS never auto-acts. Set false to silence the suggestions feed.
 lead_minutes = 15   # surface a calendar event this many minutes away (or nearer)
 unread_floor = 3    # surface important-unread mail at or above this count
 quiet_start = 22    # quiet-hours band start (local hour, 0-23); within [start,end) EDITH stays fully silent — no card either. Wraps midnight when start > end.
@@ -95,14 +133,14 @@ quiet_end = 7       # quiet-hours band end (local hour, exclusive); quiet_start 
 profile = "default"      # SHIPS NEUTRAL: "default" is the IDENTITY — today's proactive behavior byte-for-byte. Other values: "work" (silences news/routine/market, keeps calendar/mail/health), "sleep" (only CRITICAL surfaces, suggestions quieted), "deep_focus" (only critical, no digest, suggestions quieted), or any other string = a NAMED CUSTOM profile (itself restrict-only). An unknown value degrades to "default" (fail safe to today's behavior). Critical signals (imminent calendar / low disk) survive even deep_focus — the floor a profile can never silence.
 
 [self_heal]
-enabled = false   # master gate, ships OFF: when false the watchdog only observes error bursts and emits heal.suppressed — no cloud call, no patch. When true: edge-triggered ERROR burst (or a single total-loss "audio capture stopped" line) -> collect last ~80 daemon.log lines + implicated src/<file>.rs paths -> heavy-model unified-diff draft (requires the cloud key; emits heal.blocked{reason:"no_api_key"} otherwise) -> staged copy of daemon/ under state/heal/staging-<ts>/ -> /usr/bin/patch -p1 + cargo check + cargo test (10min cap) -> propose or auto per mode below. Rate-limited to one draft attempt per 6h (meta.heal_last_attempt); failures land in state/heal/rejected/<ts>/.
+enabled = true    # master gate, SHIPS ON (full-power default) — INERT WITHOUT A CLOUD KEY: the heavy-model unified-diff draft requires ANTHROPIC_API_KEY; with no key the watchdog emits heal.blocked{reason:"no_api_key"} and patches NOTHING (needs the key to actually draft). When active: edge-triggered ERROR burst (or a single total-loss "audio capture stopped" line) -> collect last ~80 daemon.log lines + implicated src/<file>.rs paths -> heavy-model unified-diff draft -> staged copy of daemon/ under state/heal/staging-<ts>/ -> /usr/bin/patch -p1 + cargo check + cargo test (10min cap) -> propose per mode below. Rate-limited to one draft attempt per 6h (meta.heal_last_attempt); failures land in state/heal/rejected/<ts>/. Set false to disable.
 mode = "propose"  # "propose" (default): write the validated patch + report to state/heal/proposals/<ts>/, stamp meta.heal_pending, and wait for a human to run scripts/apply_heal.sh <ts>. "auto" is DANGEROUS and additionally requires enabled = true: the daemon applies the validated patch to daemon/ itself, rebuilds --release, and EXITS cleanly so its supervisor restarts it (under launchd KeepAlive that is a restart; under `cargo run` it is a stop). Unknown values behave as "propose".
 
 [forge]
 # Self-Forge (forge.rs): JARVIS AUTHORS A NEW sandboxed micro-app from a goal —
 # the self-heal gated-codegen pattern generalized from "patch the daemon" to
-# "build an app". Same OFF-by-default, propose-only contract as [self_heal].
-enabled = false   # master gate, SHIPS OFF: when false the forge does nothing — no cloud draft, no staging, no proposal. When true: forge_draft(goal) asks the heavy cloud model (requires the cloud key; emits forge.blocked{reason:"no_api_key"} otherwise) to author a complete micro-app (manifest with MINIMAL permissions + source file(s) + tests) -> stage to state/forge/staging-<ts>/ (NEVER apps/) -> validate the manifest (safe name, permissions on the allowed minimal set, default-deny SBPL generates) + build/test the app under a timeout cap -> on pass, PROPOSE to state/forge/proposals/<ts>/ + stamp meta.forge_pending and STOP; on fail, quarantine to state/forge/rejected/<ts>/. The proposed app is NOT in apps/, NOT registered, NOT running.
+# "build an app". Same propose-only contract as [self_heal] (now armed by default).
+enabled = true    # master gate, SHIPS ON (full-power default) — INERT WITHOUT A CLOUD KEY: forge_draft requires the cloud key (emits forge.blocked{reason:"no_api_key"} otherwise). When active: forge_draft(goal) asks the heavy cloud model to author a complete micro-app (manifest with MINIMAL permissions + source file(s) + tests) -> stage to state/forge/staging-<ts>/ (NEVER apps/) -> validate the manifest (safe name, permissions on the allowed minimal set, default-deny SBPL generates) + build/test the app under a timeout cap -> on pass, PROPOSE to state/forge/proposals/<ts>/ + stamp meta.forge_pending and STOP; on fail, quarantine to state/forge/rejected/<ts>/. The proposed app is NOT in apps/, NOT registered, NOT running. Set false to disable.
 mode = "propose"  # "propose" (default): write the validated app + report to state/forge/proposals/<ts>/, stamp meta.forge_pending, and wait for a human to run scripts/apply_forge.sh <ts>. "auto" (additionally requires enabled = true) ONLY governs the forge's own staged artifact — IT NEVER DEPLOYS. DEPLOYING a forged app into apps/ (where AppRegistry::discover would pick it up and run it on next start) is ALWAYS a separate human step: there is no auto-deploy path in the daemon, period. Unknown values behave as "propose".
 
 [optimize]
@@ -111,11 +149,11 @@ mode = "propose"  # "propose" (default): write the validated app + report to sta
 # next turn, or complete cleanly?), and a later Optimizer phase PROPOSES a measured
 # tuning (start with routing/selection — agent-pick + mode + cue weights) that is
 # adopted ONLY IF it beats the current baseline on HELD-OUT traces. The SAME
-# OFF-by-default, propose-only contract as [self_heal]/[forge]. This is a bounded,
+# propose-only contract as [self_heal]/[forge] (now armed by default). This is a bounded,
 # measured, reversible loop — not self-improving AGI. The LIVE recording is
 # runtime-gated (traces accrue only while the daemon runs with this ON); tests use
 # mock traces.
-enabled = false   # master gate, SHIPS OFF: when false the trace recorder is a NO-OP — nothing is stored, no learning corpus accrues, the optimizer has nothing to act on. Traces are PII-REDACTED before storage (emails / phone numbers / >=6-digit runs / URLs with embedded credentials / api-key- and token-shaped strings are stripped) and NEVER contain a secret or token; retention is bounded (oldest rows evicted past the cap). Turn on deliberately, exactly like self_heal/forge/standing/mcp.
+enabled = true    # master gate, SHIPS ON (full-power default). Live trace recording is runtime-gated (traces accrue only while the daemon runs with this on); traces are PII-REDACTED before storage (emails / phone numbers / >=6-digit runs / URLs with embedded credentials / api-key- and token-shaped strings are stripped) and NEVER contain a secret or token; retention is bounded (oldest rows evicted past the cap). The optimizer still only PROPOSES diffs a human applies (mode below stays "propose"). Set false to disable.
 mode = "propose"  # "propose" (default): the downstream Optimizer reuses the self-heal posture — it writes a measured config/prompt/example diff for a HUMAN to review+apply and NEVER silently mutates a live config or behavior; an optimization is adopted ONLY IF it MEASURABLY beats the current baseline on held-out traces, and every adoption is reversible. "auto" is reserved and behaves as "propose" for now — there is no auto-apply-to-live path. Unknown values behave as "propose".
 
 [standing]
@@ -123,27 +161,27 @@ mode = "propose"  # "propose" (default): the downstream Optimizer reuses the sel
 # on the standing-missions scheduler tick (a dedicated runtime loop, separate from
 # EDITH's anticipation tick) and reason over the shared World Model — the
 # self-heal/forge gated-autonomy pattern applied to "a recurring goal".
-enabled = false   # subsystem MASTER switch, SHIPS OFF (like self_heal/forge/proactive.speak): when false the pure scheduler marks NOTHING due, so no standing mission ever fires on the live tick. Turn on deliberately. Independent of this switch: ESTABLISHING a standing mission is itself a cross-turn confirmation-gated action (JARVIS never silently spawns recurring autonomy), and every CONSEQUENTIAL step a running mission proposes (post/send/spend/control) STILL parks behind the confirmation gate + the [integrations] master switch — a standing mission can never auto-send/post/spend even with this on. Bounded: at most 8 active missions; each run is bounded by FURY's per-mission caps.
+enabled = true    # subsystem MASTER switch, SHIPS ON (full-power default). Even on: ESTABLISHING a standing mission is itself a cross-turn confirmation-gated action (standing_create is in CONSEQUENTIAL_TOOLS; JARVIS never silently spawns recurring autonomy), and every CONSEQUENTIAL step a running mission proposes (post/send/spend/control) STILL parks behind the confirmation gate + the [integrations] master switch — a standing mission can never auto-send/post/spend. Bounded: at most 8 active missions; each run is bounded by FURY's per-mission caps. Set false to disable.
 
 [drafts]
 # AUTO-DRAFT (#25, drafts.rs): compose a REVIEWABLE pending draft (an email reply /
 # message / doc) the user reads and then sends THEMSELVES through the existing gated
 # send. The draft module has NO send path — a draft is ALWAYS a suggestion.
-enabled = false   # SHIPS OFF (like self_heal/forge/standing): when false JARVIS never drafts PROACTIVELY. Even with it on a draft is only ever a reviewable suggestion; an actual send is a SEPARATE explicit action that rides the existing gate ([integrations].allow_consequential && a fresh confirm) exactly like a normal send. JARVIS never auto-sends a draft.
+enabled = true    # SHIPS ON (full-power default). A draft is ALWAYS a reviewable suggestion — the drafts module has NO send path; an actual send is a SEPARATE explicit action that rides the existing gate ([integrations].allow_consequential && a fresh confirm) exactly like a normal send. Enabling never enables an autonomous send. Set false to disable proactive drafting.
 retention = 200   # evict-oldest cap on persisted pending drafts (bounded store)
 
 [missions]
 # DURABLE MISSIONS (#26, durable_missions.rs): persist FURY mission state (a mission
 # record + per-sub-task status) so a campaign survives a restart and can be resumed /
 # listed / cancelled.
-durable = false   # SHIPS OFF (like self_heal/forge/standing): when false missions are in-memory exactly as today. KEY SAFETY (even with it on): a persisted mission does NOT auto-run on restart — it loads PAUSED and the user must explicitly resume it; a resumed mission re-runs each CONSEQUENTIAL step through the SAME gate (the persistence carries NO pre-approval); it inherits FURY's <=6 sub-task / 1-deep bounds.
+durable = true    # SHIPS ON (full-power default). KEY SAFETY preserved: a persisted mission does NOT auto-run on restart — it loads PAUSED and the user must explicitly resume it; a resumed mission re-runs each CONSEQUENTIAL step through the SAME gate (the persistence carries NO pre-approval); it inherits FURY's <=6 sub-task / 1-deep bounds. Enabling only adds persistence, never autonomy. Set false for in-memory-only missions.
 retention = 50   # evict-oldest cap on persisted missions (bounded store)
 
 [macros]
 # MACRO RECORD/REPLAY (#27, macros.rs): record a NAMED sequence of commands (the
 # utterances / classifier intent names ONLY — NEVER secrets, tokens, or resolved
 # credentials) and replay it.
-enabled = false   # SHIPS OFF (like self_heal/forge/standing): when false no macro is recorded or replayed. KEY SAFETY (even with it on): replay re-runs EACH recorded command through the NORMAL router path + the gate EACH time — a consequential step in a macro hits the confirmation gate + the master switch FRESH, exactly as if spoken live (NO pre-approval, NO batching past the gate). The store holds only the utterance + intent name; a secret can never be persisted.
+enabled = true    # SHIPS ON (full-power default). KEY SAFETY preserved: replay re-runs EACH recorded command through the NORMAL router path + the gate EACH time — a consequential step in a macro hits the confirmation gate + the master switch FRESH, exactly as if spoken live (NO pre-approval, NO batching past the gate). The store holds only the utterance + intent name; a secret can never be persisted. Enabling only allows record/replay. Set false to disable.
 max_steps = 12   # max commands one macro may hold (a bounded sequence)
 retention = 100   # evict-oldest cap on stored macros (bounded store)
 
@@ -160,13 +198,17 @@ autostart = []
 
 [integrations]
 # Shared substrate for the Chart-2 integrations (GitHub, Slack, Google
-# Drive/Calendar). allow_consequential is the master gate for side-effecting
-# actions (post a message, create an event). SHIPS OFF (false): with it false a
-# consequential action returns a DRY-RUN PREVIEW and performs no side effect,
-# even when the call site confirmed — read-only lookups always work. Only when
-# you flip this true AND the action is explicitly confirmed does the real,
-# irreversible action run. Treat like [self_heal].enabled: turn on deliberately.
-allow_consequential = false
+# Drive/Calendar). allow_consequential is THE master gate for outward/
+# side-effecting actions (post a message, create an event). SHIPS ON (true,
+# full-power default) — the headline of the full-power posture. INERT-SAFE:
+# flipping it ON does NOT bypass anything — every consequential action STILL
+# requires a fresh per-action confirm + voice-id (if enrolled) + !lockdown + the
+# per-action policy at the runtime chokepoints. With it true a CONFIRMED
+# consequential action runs for real instead of returning a DryRun preview; with
+# it false a consequential action returns a DRY-RUN PREVIEW and performs no side
+# effect even when confirmed (read-only lookups always work either way). Set
+# false to disarm (back to dry-run-only).
+allow_consequential = true
 
 [mcp]
 # Model Context Protocol client (mcp.rs) — connect to external MCP tool servers
@@ -175,14 +217,16 @@ allow_consequential = false
 # in JARVIS: an MCP server runs code on YOUR machine and exposes tools an agent
 # can call. Treat it like [self_heal].enabled — turn on deliberately.
 #
-# enabled SHIPS OFF (false): with it false the manager is fully inert — no server
-# connects, no tool is discovered, no tool can be called, period. Even with it
-# true, NOTHING connects until you add at least one [[mcp.servers]] entry below.
+# enabled SHIPS ON (true, full-power default) — INERT WITHOUT SERVERS: the
+# servers list ships EMPTY and the installer must NOT add any, so even enabled
+# NOTHING connects until you add at least one [[mcp.servers]] entry below — no
+# server connects, no tool is discovered, no tool can be called until then.
 #
 # DEFENSE IN DEPTH (always on, independent of these switches):
 #   * Every CONSEQUENTIAL MCP tool parks behind the cross-turn confirmation gate +
-#     the OFF-by-default [integrations].allow_consequential master switch — an MCP
-#     tool can never auto-send/post/spend/mutate without a spoken yes.
+#     the [integrations].allow_consequential master switch (now ON, but a confirmed
+#     action still needs a fresh confirm + voice-id + !lockdown) — an MCP tool can
+#     never auto-send/post/spend/mutate without a spoken yes.
 #   * Unknown/mutating tools default to CONSEQUENTIAL (fail-safe); a tool is only
 #     ungated if its server's config asserts it read-only.
 #   * A per-server `agents` allowlist controls WHICH agents may use it (default:
@@ -191,7 +235,7 @@ allow_consequential = false
 #     grants only the filesystem/network the server's config declares.
 #   * A server's optional token resolves from the Keychain (mcp_<name>_token) and
 #     is NEVER in this file, in logs, in Debug, on argv, or in a URL.
-enabled = false
+enabled = true             # SHIPS ON (full-power default); INERT WITHOUT SERVERS (add a [[mcp.servers]] entry to connect). Set false to fully disable the MCP client.
 max_servers = 8            # cap on concurrently-connected servers
 max_tools_per_server = 64  # cap on tools accepted from any one server
 call_timeout_ms = 30000    # per-call wall-clock ceiling; a slow/hung server is abandoned here
@@ -223,11 +267,11 @@ max_output_bytes = 262144  # reject any single server response larger than this 
 # manifest; see docs/SKILLS.md). It is NOT a populated community marketplace, and
 # the catalog reports the REAL shipped count.
 #
-# enabled SHIPS ON (true) — UNLIKE self_heal/forge/standing/mcp, which ship off —
+# enabled SHIPS ON (true) — like the rest of the full-power default —
 # because every shipped skill is pure + read-only and safe to offer by default.
 # Setting it false only HIDES the meta-tools; it loosens nothing. A CONSEQUENTIAL
 # skill (one that mutates/acts outside the process) is ALWAYS parked behind the
-# cross-turn confirmation gate + the OFF-by-default [integrations]
+# cross-turn confirmation gate + the [integrations]
 # allow_consequential master switch when invoked — this flag never lets a
 # side-effecting skill fire unconfirmed.
 enabled = true
@@ -243,11 +287,11 @@ enabled = true
 # NOT a high-assurance biometric — it is SPOOFABLE by a replayed recording or a
 # good impersonation, and its accuracy is threshold- and voice-dependent and
 # DEVICE-gated (never a measured FAR/FRR). The hard security backstop for outward
-# actions remains the OFF-by-default [integrations] allow_consequential master
+# actions remains the [integrations] allow_consequential master
 # switch + the cross-turn spoken confirmation gate; voice-id is an ADDED layer on
 # top of them, never a replacement. Raw audio is NEVER persisted: the owner
 # profile (state/voiceid/owner.json, 0600) is a local feature VECTOR only.
-enabled = false              # master switch, SHIPS OFF (like self_heal/forge/standing/mcp/optimize): when false, OR with no enrolled profile, NOTHING is gated by voice — behavior is unchanged. Enrollment is ALWAYS explicit ("enroll my voice"), never automatic; "forget my voice" clears the profile. When enabled+enrolled: an UNRECOGNIZED speaker may not trigger a consequential/outward action and may not confirm (replay) a parked action a bystander could otherwise approve. FAIL-CLOSED for consequential: an embed error / no usable audio while enforcing is treated as UNVERIFIED (deny the consequential path) but never bricks ordinary replies.
+enabled = false              # master switch, SHIPS OFF deliberately (voice-id is a fail-closed GATE, not a full-power feature — enrollment is ALWAYS explicit): when false, OR with no enrolled profile, NOTHING is gated by voice — behavior is unchanged. Enrollment is ALWAYS explicit ("enroll my voice"), never automatic; "forget my voice" clears the profile. When enabled+enrolled: an UNRECOGNIZED speaker may not trigger a consequential/outward action and may not confirm (replay) a parked action a bystander could otherwise approve. FAIL-CLOSED for consequential: an embed error / no usable audio while enforcing is treated as UNVERIFIED (deny the consequential path) but never bricks ordinary replies. (Enrolling it ADDS a layer on top of the now-armed master switch + per-action confirm + lockdown.)
 threshold = 0.86             # cosine ACCEPT on the acoustic embedding (max over enrolled centroids). The operating point — voice/device-dependent, tune on the real mic. Higher = stricter (fewer false accepts, more false rejects). NOT a measured accuracy.
 min_enroll_samples = 3       # how many owner utterances the explicit "enroll my voice" flow captures before the local profile is saved.
 gate_scope = "consequential" # "consequential" (default): gate only outward/consequential actions + the confirmation replay. "all": ALSO block non-consequential commands from an unrecognized speaker (a stricter posture). Unknown values fall back to "consequential" (never silently to "all").
@@ -284,8 +328,8 @@ retention = 5000
 [voice]
 # OPTIONAL ElevenLabs cloud VOICE TIER (daemon/src/voice_tier.rs). An ADDED
 # premium-TTS layer on top of the on-device Kokoro default ([speech].voice) — it
-# is NEVER a replacement. Same OFF-by-default, opt-in posture as
-# self_heal/forge/standing/mcp/optimize: it SHIPS DISABLED.
+# is NEVER a replacement. SHIPS ON (full-power default) but INERT WITHOUT a key —
+# add an elevenlabs_api_key (Keychain); without it, on-device Kokoro is used.
 #
 # HONESTY: when this tier is ON, the text JARVIS is about to speak LEAVES the
 # device — a cloud round trip to api.elevenlabs.io to synthesize the audio. The
@@ -305,25 +349,29 @@ retention = 5000
 # Otherwise (this off, OR no key, OR offline) TTS is EXACTLY today's on-device
 # Kokoro. The key rides ONLY the xi-api-key request header — never the URL, argv,
 # logs, Debug, or telemetry.
-cloud_tier = false             # TTS master switch, SHIPS OFF. true = allow the cloud voice tier (subject to key + non-offline tier).
+cloud_tier = true              # TTS master switch, SHIPS ON (full-power default) — INERT WITHOUT A KEY: reached only when true AND elevenlabs_api_key is in the Keychain AND the tier is non-Local; otherwise on-device Kokoro (the private default + fallback). When active the TTS TEXT leaves the device. Set false to force on-device Kokoro.
 # cloud_stt — the SEPARATE master switch for the ElevenLabs Scribe cloud-STT tier
-# (transcription). SHIPS OFF and is gated INDEPENDENTLY of cloud_tier on purpose:
+# (transcription). SHIPS ON (full-power default), gated INDEPENDENTLY of cloud_tier:
 # STT sends the user's VOICE AUDIO to the cloud, which is MORE sensitive than the
 # TTS text leg. With it false (OR no `elevenlabs_api_key`, OR offline/Local tier)
 # transcription is EXACTLY today's on-device mlx_whisper — which is also the
 # FALLBACK on ANY Scribe error/offline, so a turn is never failed by the cloud leg.
 # On-device whisper is the private/offline default. Same precedence as cloud_tier:
 # Scribe runs ONLY when cloud_stt = true AND a key is present AND the tier is non-Local.
-cloud_stt = false              # STT master switch, SHIPS OFF. true = allow the Scribe cloud-STT tier (subject to key + non-offline tier).
+cloud_stt = true               # STT master switch, SHIPS ON (full-power default) — INERT WITHOUT A KEY, gated SEPARATELY from cloud_tier on purpose (STT sends VOICE AUDIO, more sensitive than TTS text): needs the EL key + a non-Local tier; otherwise on-device mlx_whisper (the private default + fallback). When active the VOICE AUDIO leaves the device. Set false to force on-device whisper.
 model = "eleven_flash_v2_5"    # ElevenLabs model id used when the tier is active. eleven_flash_v2_5 (~75ms, real-time, cheapest); eleven_multilingual_v2 (stable); eleven_v3 (most expressive). Read by the inference server.
+adaptive_prosody = true        # #33 ADAPTIVE TONE/PROSODY, SHIPS ON (full-power default). Expressiveness-only: picks a ProsodyProfile and emits EL-v3 audio-tags ONLY on EL-v3 backends; on Kokoro the mapping is coarse/neutral (rich prosody is EL-v3-gated, stated honestly). Changes delivery, never a gate. Set false for neutral delivery.
+whisper = true                 # #34 WHISPER / DISCREET MODE, SHIPS ON (full-power default). Explicit-command terse + soft delivery. Changes DELIVERY ONLY — never suppresses a required safety confirmation (a required confirm still speaks, softly). Set false to disable.
+whisper_auto = true            # #34 auto-engage whisper by sustained low-amplitude input, SHIPS ON (full-power default). PURE energy-series heuristic; does NOT open the mic itself. Delivery-only. Set false to require the explicit command.
+diarize = true                 # #31 MULTI-SPEAKER DIARIZATION, SHIPS ON (full-power default) — INERT ON-DEVICE: consumes speaker labels the EL SCRIBE STT backend reports; on-device whisper has no diarization model => honest single-stream "speaker: unknown" (never fabricated speakers). EL-Scribe-gated. Set false for single-stream always.
 
 # [docsearch] — ON-DEVICE FILE RAG (docsearch.rs): index + search the user's OWN
 # text-like files, 100% on-device. File CONTENTS + EMBEDDINGS NEVER LEAVE THE
 # DEVICE — embedding is the on-device MLX embed op, and search falls back to
 # lexical BM25 (reporting which actually ran) when that server is down; nothing is
-# uploaded. SHIPS DISABLED and indexes NOTHING by default — the SAME OFF-by-default
-# posture as self_heal/forge/standing/mcp/optimize/voice_id, with the EXTRA guard
-# that the folder allowlist (`roots`) ships EMPTY, so it is never a whole-disk scan:
+# uploaded. SHIPS ON (full-power default) but INERT WITHOUT ROOTS, with the EXTRA
+# guard that the folder allowlist (`roots`) ships EMPTY, so it is never a whole-disk
+# scan: even with `enabled` true it indexes nothing until you allowlist a folder:
 # even flipping `enabled` true indexes nothing until you allowlist a folder. Every
 # candidate file is PATH-CONFINED (canonicalized + must live under an allowlisted
 # root; symlink-escape / `..` / absolute-elsewhere are REJECTED), the index is
@@ -331,35 +379,35 @@ model = "eleven_flash_v2_5"    # ElevenLabs model id used when the tier is activ
 # TEXT-LIKE files only — PDFs/binaries are OUT OF SCOPE (a PDF needs a parser
 # dependency); they are skipped, never silently treated as indexed.
 [docsearch]
-enabled = false                # master switch, SHIPS OFF. true = allow indexing (subject to a non-empty `roots`).
-roots = []                     # EXPLICIT folder allowlist, SHIPS EMPTY. Add absolute paths to the folders you want searchable; nothing else is ever read.
+enabled = true                 # master switch, SHIPS ON (full-power default) — INERT WITHOUT ROOTS: even enabled it indexes NOTHING until you allowlist a folder below. Set false to fully disable indexing.
+roots = []                     # EXPLICIT folder allowlist, SHIPS EMPTY (the installer must NOT guess). Add absolute paths to the folders you want searchable; nothing else is ever read. Contents + embeddings never leave the device.
 max_files = 5000               # bound: max files indexed across all roots.
 max_chunks = 50000             # bound: max chunks stored.
 max_file_bytes = 2097152       # bound: per-file size cap (2 MiB); larger files are skipped.
 max_depth = 16                 # bound: recursion depth under each root (root = depth 0).
 chunk_chars = 1200             # chunk window size in chars.
 chunk_overlap = 200            # overlap between consecutive chunks (must be < chunk_chars).
+build_graph = true             # KNOWLEDGE-GRAPH build over already-indexed chunks, SHIPS ON (full-power default) — INERT WITHOUT INDEXED DOCS: the deterministic extractor only reads chunks the confined allowlisted indexer produced (never re-walks disk) and writes the shared user.world.* tier (provenance-tagged, deduped, bounded). Inert until docsearch has roots + an index. Set false to disable.
 
 # [code] — CODE INTELLIGENCE (code.rs): code_explain (a grounded, CITED answer over
 # the on-device code index — never fabricating code not indexed) + code_propose_diff
 # (a PROPOSE-ONLY reviewable unified diff written to state/code/proposals/<ts>/ — it
-# NEVER edits your code). The SAME OFF-by-default, opt-in posture as
-# [self_heal]/[forge]/[docsearch]: because it READS and PROPOSES EDITS to your code,
-# it SHIPS DISABLED and does NOTHING until you BOTH flip `enabled` AND allowlist a
+# NEVER edits your code). SHIPS ON (full-power default) but INERT WITHOUT ROOTS:
+# because it READS and PROPOSES EDITS to your code, it does NOTHING until you
+# allowlist a
 # `roots` codebase root. The ONLY path that touches your code is the human-reviewed
 # scripts/apply_code_diff.sh, which is CONFINED BY CONSTRUCTION (sandbox-exec
 # deny-default-write) to the canonicalized allowlisted root — it re-validates the
 # diff and writes ONLY under that root, never out-of-tree. The model's diff QUALITY
 # (does it compile/work) is runtime/model-gated and is NOT claimed measured.
 [code]
-enabled = false                # master switch, SHIPS OFF. true = allow code_explain + code_propose_diff (subject to a non-empty `roots`).
-roots = []                     # EXPLICIT codebase-root allowlist, SHIPS EMPTY. Add the absolute path to your project; the apply script writes ONLY under a root here (never an arbitrary path). NOTE: this `roots` is the ENABLE + APPLY-CONFINEMENT gate; retrieval for code_explain/code_propose_diff is over the on-device file index, so also allowlist the same root under [docsearch].roots (and reindex) so your code is actually retrievable.
+enabled = true                 # master switch, SHIPS ON (full-power default) — INERT WITHOUT ROOTS: code_explain answers only from the on-device index and the apply script writes ONLY under an allowlisted root, so it reaches nothing until `roots` is set. code_propose_diff drafting also needs the cloud key. Set false to fully disable.
+roots = []                     # EXPLICIT codebase-root allowlist, SHIPS EMPTY (the installer must NOT guess). Add the absolute path to your project; the apply script writes ONLY under a root here (never an arbitrary path). NOTE: this `roots` is the ENABLE + APPLY-CONFINEMENT gate; retrieval for code_explain/code_propose_diff is over the on-device file index, so also allowlist the same root under [docsearch].roots (and reindex) so your code is actually retrievable.
 max_diff_bytes = 262144        # bound: a proposed diff larger than this (256 KiB) is refused before it is stored.
 
 # [answers] — ANSWER ANNOTATIONS (anthropic.rs `answers` module): always-cite
-# source-tracking (#5) + self-reported confidence (#8). The SAME OFF-by-default,
-# opt-in posture as [self_heal]/[forge]/[voice_id]/[docsearch] — BOTH ship OFF
-# and are honesty-gated.
+# source-tracking (#5) + self-reported confidence (#8). These SHIP ON (full-power
+# default) and are honesty-gated.
 #   - cite: when true, an answer is followed by a "Sources:" line naming the REAL
 #     tool-result sources that fed it (the citation-carrying reads), or "from my
 #     own knowledge" when no retrieval ran (NEVER a fabricated citation). Off =>
@@ -389,12 +437,12 @@ max_diff_bytes = 262144        # bound: a proposed diff larger than this (256 Ki
 #     averaged into a fake consensus); an unavailable second brain falls back to one
 #     and SAYS SO. Bounded to <=2 model calls. Off => one model, unchanged.
 [answers]
-cite = false                   # SHIPS OFF. true = surface the real tool-result sources (or "from my own knowledge").
-confidence = false             # SHIPS OFF. true = ask the model to self-report its confidence + a one-line why.
-verify = false                 # SHIPS OFF (#7). true = one bounded self-critique of the draft on important turns.
-cross_check = false            # SHIPS OFF (#21). true = bounded plausibility cross-check of a tool result (downgrades/flags only, never removes a gate).
-cross_check_model_pass = false # SHIPS OFF (#21). true = add the optional single model "does this look right?" pass (under cross_check).
-debate = false                 # SHIPS OFF (#22). true = high-stakes-only two-model debate; agree raises, disagree surfaces both, <=2 calls.
+cite = true                    # SHIPS ON (full-power default, #5). Surfaces the real tool-result sources (or "from my own knowledge") — never a fabricated citation. Set false to disable.
+confidence = true              # SHIPS ON (full-power default, #8). The model self-reports grounded/inferred/uncertain + a one-line why; calibration quality is model-behavior-gated (not measured). Set false to disable.
+verify = true                  # SHIPS ON (full-power default, #7). One bounded self-critique of the draft on IMPORTANT turns + at most one revise (skips trivial turns; needs the cloud tier for the cloud path). Reduces hallucination; not a correctness guarantee; costs one extra model call. Set false to disable.
+cross_check = true             # SHIPS ON (full-power default, #21). Bounded deterministic plausibility cross-check of a tool result before it is surfaced/built into an action — downgrades confidence + flags a caveat only, NEVER removes a confirmation gate. Set false to disable.
+cross_check_model_pass = true  # SHIPS ON (full-power default, #21). The optional single model "does this look right?" pass under cross_check (a latency/cost add; needs the cloud tier for the cloud path; the deterministic layer runs regardless). Set false to drop the model pass.
+debate = true                  # SHIPS ON (full-power default, #22). High-stakes-only two-model debate (conservative predicate; ordinary turns never debate); agreement raises confidence, disagreement surfaces BOTH (never a fake consensus); bounded to <=2 model calls; needs the cloud tier. Inert on ordinary turns. Set false to disable.
 
 # [audit] — APPEND-ONLY, HASH-CHAINED, TAMPER-EVIDENT audit log (audit.rs) of every
 # CONSEQUENTIAL decision (proposed / parked / blocked-by-policy / auto-approved /
@@ -433,8 +481,8 @@ enabled = true                 # layer master switch, SHIPS ON but INERT (store 
 # whole-file SQLCipher AES-256 over the four sensitive SQLite DBs (the main memory Db:
 # facts/transcripts/episodes/events + the world-model facts tier; the docsearch index;
 # the audit log; the optimizer trace store) PLUS the voiceid owner profile (wrapped in its
-# own encrypted blob). SHIPS OFF, exactly like self_heal/forge/standing/mcp/optimize/
-# voice_id/docsearch — because enabling CHANGES THE ON-DISK FORMAT.
+# own encrypted blob). SHIPS OFF by deliberate choice (NOT part of the full-power
+# default) — because enabling CHANGES THE ON-DISK FORMAT (an irreversible migration).
 #   - false (the default): every store opens PLAINTEXT (byte-for-byte today's SQLite). No
 #     key is generated or read; nothing migrates.
 #   - true: on first enable a fresh 256-bit master key is generated, written to the macOS

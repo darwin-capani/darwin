@@ -29,8 +29,9 @@
 //!   * HONEST: a search returns ONLY chunks that were really indexed (the snippet
 //!     is the stored chunk text, the citation is its real file + offset). An empty
 //!     index or a no-match query returns NOTHING — never a fabricated citation.
-//!   * OFF by default: gated by `[docsearch].enabled` (ships false) AND a non-empty
-//!     `roots` (ships empty). The daemon checks both before ever indexing.
+//!   * ON by default but INERT WITHOUT ROOTS: gated by `[docsearch].enabled` (ships
+//!     true) AND a non-empty `roots` (ships empty). The daemon checks both before ever
+//!     indexing, so even enabled it indexes NOTHING until a folder is allowlisted.
 //!
 //! v1 indexes TEXT-LIKE files only (an extension allowlist). PDFs / binaries are
 //! OUT OF SCOPE — a PDF needs a parser dependency; such files are skipped, never
@@ -731,8 +732,9 @@ pub fn indexing_permitted(enabled: bool, roots: &[String]) -> bool {
 
 /// The DAEMON ENTRY POINT for the "index my documents" / "reindex" intent:
 /// CONFIG-GATED reindex over the allowlisted roots. This is the single function
-/// the daemon's index/reindex trigger calls — it enforces the OFF-by-default gate
-/// ([`indexing_permitted`]: `[docsearch].enabled` AND a non-empty `roots`) BEFORE
+/// the daemon's index/reindex trigger calls — it enforces the gate (ON by default
+/// but inert without roots; [`indexing_permitted`]: `[docsearch].enabled` AND a
+/// non-empty `roots`) BEFORE
 /// touching the disk, so an OFF subsystem or an empty allowlist indexes NOTHING
 /// (never a whole-disk scan). When permitted, it lifts the bounds from config and
 /// runs [`DocIndex::reindex`] (the confined, bounded, on-device walk+chunk+embed).

@@ -97,7 +97,7 @@ handed. The daemon:
    `InvalidManifest(reason)`; a bad token → `Unauthorized`.
 
 The live wiring is `AppRegistry::register_on_launch`, called from the autostart
-loop in `main.rs` **only when `[plugin_sdk].enabled` is true** (ships OFF). It
+loop in `main.rs` **only when `[plugin_sdk].enabled` is true** (ships ON). It
 emits a secret-free `plugin.handshake` telemetry event (`{name, status, detail}`
 — never the token).
 
@@ -119,8 +119,9 @@ handshake. See `SANDBOX.md` → *Capability tokens*.
   unknown or over-privileged scope before the plugin is admitted.
 - **Auto-execute a consequential action.** A tool marked `consequential = true`
   (or any consequential intent it answers) still **parks** behind the cross-turn
-  spoken-confirmation gate + the OFF-by-default `[integrations].allow_consequential`
-  master switch when invoked. Declaring it in the manifest only makes the contract
+  spoken-confirmation gate + the armed-by-default `[integrations].allow_consequential`
+  master switch (ON, but a confirmed action still needs a fresh per-action confirm)
+  when invoked. Declaring it in the manifest only makes the contract
   auditable — it never bypasses the gate.
 
 ## The reference plugin
@@ -136,8 +137,9 @@ shipped manifest validates against this contract.
 
 ```toml
 [plugin_sdk]
-enabled = false   # SHIPS OFF. The live register-on-launch handshake is opt-in.
-                  # The pure validator is always available regardless of this flag.
+enabled = true    # SHIPS ON (full-power default). The live register-on-launch handshake
+                  # scopes a plugin's declared intents/tools; the validator rejects
+                  # over-privileged manifests. The pure validator is always available.
 ```
 
 ## Honesty

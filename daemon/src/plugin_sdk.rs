@@ -31,10 +31,11 @@
 //! untouched — declaring an intent grants nothing), can NOT request a capability
 //! outside the allowed set (this validator rejects it), and any consequential
 //! tool it exposes still rides the cross-turn confirmation gate + the
-//! OFF-by-default `[integrations].allow_consequential` master switch when invoked.
+//! armed-by-default `[integrations].allow_consequential` master switch (ON, but a
+//! confirmed action still needs a fresh confirm) when invoked.
 //!
-//! SHIPS OFF / opt-in. The LIVE handshake is gated by `[plugin_sdk].enabled`
-//! (default false). The validator is PURE and always callable. HERMETIC: the
+//! SHIPS ON (full-power default). The LIVE handshake is gated by `[plugin_sdk].enabled`
+//! (default true). The validator is PURE and always callable. HERMETIC: the
 //! tests validate a good manifest (accepts), a malformed one (precise error), an
 //! over-privileged one (rejected), and prove the example plugin validates — NO
 //! real spawn, NO socket.

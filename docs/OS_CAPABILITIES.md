@@ -31,7 +31,8 @@ rewrites and reloads its own code with no gate is how you get a bricked machine
 or a silent takeover of its own safety checks. The committed design (and the
 standing project rule) is: detect crash-loop → request a diff from Opus → apply
 to a **staging copy** → `cargo check` must pass → **human approves** the
-hot-swap. Ships OFF (`[self_heal] enabled=false`), never auto-enables, and the
+hot-swap. Ships ON (`[self_heal] enabled=true`) but **PROPOSE-ONLY** (`mode = "propose"`)
+and inert without a cloud key; it never auto-applies, and the
 verification gates are never removed. Phase 1 activates the *pipeline up to the
 gate*, not past it.
 
@@ -66,7 +67,7 @@ A semantic search over the user's OWN files (`daemon/src/docsearch.rs`), on the
 same classify→route spine: intents `docsearch.index` / `docsearch.forget`, plus
 the read-only `doc_search` tool owned by Mnemosyne. Honest properties:
 
-- **Opt-in, ships OFF** — `[docsearch].enabled = false`, `roots = []`. It indexes
+- **Ships ON, inert without roots** — `[docsearch].enabled = true`, `roots = []`. It indexes
   ONLY the folders the user explicitly allowlists — **never a whole-disk scan** —
   and only text-like files (markdown / txt / code / json / csv …).
 - **On-device + private** — file contents and their embeddings **never leave the
@@ -177,9 +178,10 @@ self-healing pipeline up to (not past) the human gate.
   app, which stays read-only above). It pairs with the OCR locate — *OCR locates a
   control → the user confirms → the daemon actuates* — but the actuation is its
   own op: it performs **exactly ONE** UI action (a single CGEvent mouse click / a
-  keyboard type / a key combo). It **ships OFF by default**
-  (`[ui_automation].enabled = false`); with it off the actuate intent is never
-  classified and the tool is inert. A PURE single-action **planner** validates +
+  keyboard type / a key combo). It **ships ON by default**
+  (`[ui_automation].enabled = true`) but NEVER auto-runs and is **inert without
+  Accessibility TCC consent + a real display**; with it off the actuate intent is
+  never classified and the tool is inert. A PURE single-action **planner** validates +
   bounds each action (a click must land on a real on-screen pixel; an empty
   type/key or a degenerate instruction is refused) and **can never carry a batch**
   — one plan is one actuation by construction. It is **PER-ACTION gated**: every

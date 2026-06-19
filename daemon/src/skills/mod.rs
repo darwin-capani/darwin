@@ -24,8 +24,9 @@
 //! honestly `source_gated` — it returns a "needs a data source" notice until one
 //! is configured, and NEVER fabricates a result. A skill that mutates or acts
 //! OUTSIDE the process is `consequential` and routes through the SAME cross-turn
-//! confirmation gate + OFF-by-default master switch a built-in consequential tool
-//! uses (parked unless the switch is on AND a human confirmed).
+//! confirmation gate + armed-by-default master switch a built-in consequential tool
+//! uses (parked unless the switch is on AND a human confirmed — even with the
+//! switch armed, a fresh confirm is still required).
 
 use anyhow::{anyhow, Result};
 use serde_json::Value;
@@ -145,9 +146,9 @@ pub struct SkillDef {
     pub run: RunFn,
     /// Does invoking this skill MUTATE or ACT outside the process? A pure skill is
     /// `false` and runs ungated. A `true` skill routes through the cross-turn
-    /// confirmation gate + the OFF-by-default master switch (it PARKS for a spoken
-    /// human yes instead of acting on first call) exactly like a built-in
-    /// consequential tool. Defaults to `false` via [`SkillDef::new`].
+    /// confirmation gate + the armed-by-default master switch (it PARKS for a spoken
+    /// human yes instead of acting on first call — even with the switch armed) exactly
+    /// like a built-in consequential tool. Defaults to `false` via [`SkillDef::new`].
     pub consequential: bool,
     /// Is this skill's honest answer dependent on an EXTERNAL data source that is
     /// not bundled (live dictionary, FX rate, weather)? When `true` the skill is

@@ -220,11 +220,11 @@ A manifest can never smuggle in an ungated side effect.
 
 ```toml
 [skills]
-enabled = true   # SHIPS ON — pure skills are safe to offer by default. UNLIKE
-                 # self_heal/forge/standing/mcp (which ship off), this only governs
-                 # whether the meta-tools are offered. A consequential skill is
-                 # ALWAYS parked behind the confirmation gate + the OFF-by-default
-                 # [integrations].allow_consequential switch when invoked — this
+enabled = true   # SHIPS ON — pure skills are safe to offer by default. This only
+                 # governs whether the meta-tools are offered. A consequential skill
+                 # is ALWAYS parked behind the confirmation gate + the armed-by-default
+                 # [integrations].allow_consequential switch (ON, but a confirmed action
+                 # still needs a fresh per-action confirm) when invoked — this
                  # flag never lets a side-effecting skill fire unconfirmed.
 ```
 

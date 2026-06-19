@@ -3,7 +3,8 @@
 //! edits the user's tree. The only path that touches code is the human-reviewed
 //! `scripts/apply_code_diff.sh`, confined BY CONSTRUCTION to a `[code].roots` root.
 //!
-//! Two capabilities, both gated OFF by default ([`crate::config::CodeConfig`]):
+//! Two capabilities, both SHIP ON ([`crate::config::CodeConfig`]) but INERT WITHOUT
+//! an allowlisted `[code].roots` (and propose-diff drafting also needs the cloud key):
 //!   * `code_explain` — answer a question about the user's code GROUNDED in the
 //!     on-device file index (the shared docsearch chunk store, which already indexes
 //!     rs/py/ts/... source). NOTE: `[code].roots` is the ENABLE + apply-confinement
@@ -21,8 +22,9 @@
 //!     tests inject a scripted/mock model and a canned diff.
 //!
 //! ## The CONTRACT (non-negotiable)
-//!   * OFF by default: gated by `[code].enabled` (ships false) AND a non-empty
-//!     `roots` (ships empty). With either unmet, both tools are inert and say so.
+//!   * ON by default but INERT WITHOUT ROOTS: gated by `[code].enabled` (ships true)
+//!     AND a non-empty `roots` (ships empty). With the root unset, both tools are
+//!     inert and say so.
 //!   * GROUNDED + CITED: `code_explain` answers ONLY from the real indexed chunks
 //!     and CITES each (file + offset). No index / no match => honest "not indexed".
 //!     It never invents code that is not retrieved.

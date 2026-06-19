@@ -85,10 +85,12 @@ daemon after adding/changing any credential.**
 
 ---
 
-## 4. Smoke test (everything still OFF — read-only)
+## 4. Smoke test (read-only)
 
-With `allow_consequential = false` (the shipped default), nothing can act outward. Verify
-the basics:
+The master switch ships `allow_consequential = true` (armed), but a consequential action
+still requires a fresh per-action confirmation, so read-only lookups are the safe first
+smoke test. (To run the daemon disarmed during bring-up, set `allow_consequential = false`,
+which reverts every consequential action to a dry-run preview.) Verify the basics:
 
 - Ask **"list my agents"** → JARVIS names the 27-agent roster (deterministic, grounded).
 - A pure read: **"what's on my calendar"** (Friday/Pepper, needs Google connected) or
@@ -130,10 +132,11 @@ Do this only once reads work and the previews look right.
 ## 6. Optional gates (leave OFF until comfortable)
 
 - **Proactive speech** — `config/jarvis.toml [proactive] speak = true` lets Edith *voice*
-  briefs (otherwise she only surfaces a HUD card). Ships OFF. (`enabled = true` is just the
-  non-spoken first-contact brief and is fine to leave on.)
-- **Self-heal** — `[self_heal] enabled = false`, `mode = "propose"`. Leave it; "auto" is
-  dangerous and is its own deliberate decision (see `docs/SANDBOX.md` / the self-heal notes).
+  briefs (set false for a HUD card only). Ships ON. (`enabled = true` is the non-spoken
+  first-contact brief and is fine to leave on.)
+- **Self-heal** — `[self_heal] enabled = true`, `mode = "propose"`. Ships ON but
+  PROPOSE-ONLY (inert without a cloud key); "auto" is dangerous and is its own deliberate
+  decision (see `docs/SANDBOX.md` / the self-heal notes). Keep `mode = "propose"`.
 
 ---
 

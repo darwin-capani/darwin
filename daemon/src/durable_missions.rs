@@ -23,9 +23,11 @@
 //!   FURY's `<= MAX_SUBTASKS` / depth-1 bounds and the mission budget — a durable
 //!   mission can never exceed what a live one could.
 //!
-//! OFF by default ([missions].durable = false): with it off nothing is persisted
-//! and missions are in-memory exactly as today. HONESTY: a durable mission never
-//! auto-resumes and never carries a stored approval — resuming re-runs the gate.
+//! ON by default ([missions].durable = true): this adds PERSISTENCE only — a
+//! persisted mission ALWAYS loads PAUSED (never auto-runs on restart). With it off
+//! nothing is persisted and missions are in-memory exactly as today. HONESTY: a
+//! durable mission never auto-resumes and never carries a stored approval —
+//! resuming re-runs the gate.
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};

@@ -1572,20 +1572,33 @@ mod tests {
         cfg
     }
 
-    /// OFF default ([power].adaptive=false): the policy is ALWAYS neutral
+    /// EXPLICITLY OFF ([power].adaptive=false): the policy is ALWAYS neutral
     /// regardless of the reading — nothing reads power, routing is today's. This
-    /// PINS the off-by-default contract: even a 1%-battery, critical-thermal
-    /// reading produces a neutral plan when the flag is off.
+    /// PINS the off-path contract: even a 1%-battery, critical-thermal reading
+    /// produces a neutral plan when the flag is off. (The shipped DEFAULT is now ON,
+    /// full-power; this proves the off path still exists when an operator disables it.)
     #[test]
-    fn throttle_off_default_never_throttles() {
-        let cfg = Config::default();
-        assert!(!cfg.power.adaptive, "[power].adaptive must ship OFF");
+    fn throttle_when_disabled_never_throttles() {
+        let cfg = power_cfg(false);
+        assert!(!cfg.power.adaptive, "explicitly-disabled [power].adaptive");
         // The worst possible reading still yields a neutral plan when OFF.
         let plan = throttle_decision(Some(1), false, ThermalState::Critical, &cfg);
         assert_eq!(plan.reason, ThrottleReason::Disabled);
         assert_eq!(plan.tier_pref, LocalSubTier::Auto);
         assert!(!plan.defer_heavy);
-        assert!(!plan.is_throttled(), "OFF default must never throttle");
+        assert!(!plan.is_throttled(), "disabled adaptive must never throttle");
+    }
+
+    /// The shipped DEFAULT is ON (full-power) — a low-battery discharging reading
+    /// under the default config throttles (proves the default actually engages the
+    /// perf-only policy; it never loosens a gate or makes a cloud call).
+    #[test]
+    fn throttle_default_is_on_and_engages_on_low_battery() {
+        let cfg = Config::default();
+        assert!(cfg.power.adaptive, "[power].adaptive ships ON (full-power default)");
+        let plan = throttle_decision(Some(5), false, ThermalState::Nominal, &cfg);
+        assert!(plan.is_throttled(), "low battery while discharging must throttle under the ON default");
+        assert_eq!(plan.tier_pref, LocalSubTier::Fast);
     }
 
     /// ON + on AC + nominal thermal + healthy battery -> no throttle (the machine

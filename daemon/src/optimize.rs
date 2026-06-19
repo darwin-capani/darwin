@@ -663,8 +663,9 @@ fn has_redirect_cue(lower: &str) -> bool {
 // corpus (above) and PROPOSES a measured tuning of routing/selection that is
 // ADOPTED ONLY IF it MEASURABLY beats the current baseline on HELD-OUT traces.
 // It mirrors self-heal's posture EXACTLY: propose-only, human-applied,
-// reversible; ships OFF ([optimize].enabled = false); never silently mutates a
-// live config.
+// reversible; ships ON ([optimize].enabled = true) — live trace recording is
+// runtime-gated + PII-redacted, and the optimizer still only PROPOSES (mode stays
+// "propose"); never silently mutates a live config.
 //
 // WHAT IT TUNES (honest + bounded): the ROUTING decision — which agent a turn
 // is delegated to. The shipped router (agents.rs `select`/`select_with_fallback`)
@@ -1671,9 +1672,10 @@ mod tests {
     async fn record_trace_is_a_noop_when_disabled() {
         let db = TempDb::new("disabled");
         let store = TraceStore::open(&db.0).unwrap();
-        let cfg = Config::default(); // ships OFF
+        let mut cfg = Config::default(); // full-power default is ON; disable explicitly
+        cfg.optimize.enabled = false;
 
-        assert!(!cfg.optimize.enabled, "default must be OFF");
+        assert!(!cfg.optimize.enabled, "explicitly disabled => recorder is a no-op");
         record_trace(
             &cfg,
             &store,
@@ -1800,8 +1802,10 @@ mod tests {
         let db = TempDb::new("wire-id");
         let store = TraceStore::open(&db.0).unwrap();
 
-        // Disabled => no row, Ok(None) (the gate the daemon relies on to stay OFF).
-        let off = Config::default();
+        // Disabled => no row, Ok(None) (the off path the operator gets by disabling;
+        // the full-power default is ON, so disable explicitly here).
+        let mut off = Config::default();
+        off.optimize.enabled = false;
         let id_off = record_trace(
             &off, &store, "track the crypto", "action", "gecko", "one_shot", "",
             Outcome::Success, 100, 1_700_000_000,

@@ -31,8 +31,10 @@
 //!   * DEDUP. Two chunks naming the same entity collapse to ONE node (the slug is
 //!     stable); a re-run merges rather than duplicates. The source attribute keeps
 //!     the FIRST grounding (re-running is idempotent, never a churned provenance).
-//!   * OFF by default. Gated by `[docsearch].build_graph` (ships false) on top of
-//!     the `[docsearch].enabled` master switch — exactly like docsearch itself.
+//!   * ON by default but INERT WITHOUT INDEXED DOCS. Gated by
+//!     `[docsearch].build_graph` (ships true) on top of the `[docsearch].enabled`
+//!     master switch (also true) — it runs only over chunks the confined indexer
+//!     already produced, so it does nothing until docsearch has roots + an index.
 //!
 //! Nothing here speaks, acts, or reaches the network. It reads stored chunks and
 //! writes the shared world tier. The extraction is PURE; only the OPTIONAL LLM
@@ -739,13 +741,13 @@ fn is_cap_error(e: &anyhow::Error) -> bool {
 }
 
 // ===========================================================================
-// THE INTENT ENTRY POINT (gated OFF; routed to Mnemosyne/Pepper)
+// THE INTENT ENTRY POINT (gated; ON but inert without indexed docs; routed to Mnemosyne/Pepper)
 // ===========================================================================
 
 /// Whether building the knowledge graph is PERMITTED: the docsearch master switch
 /// must be on (the graph reads its chunks), AND the `build_graph` flag must be on.
-/// SHIPS OFF (both default false) — exactly like docsearch. Checked before any
-/// chunk is read so an off subsystem mines nothing.
+/// SHIPS ON (both default true) — exactly like docsearch — but INERT WITHOUT
+/// INDEXED DOCS. Checked before any chunk is read so an off subsystem mines nothing.
 pub fn build_permitted(enabled: bool, build_graph: bool) -> bool {
     enabled && build_graph
 }

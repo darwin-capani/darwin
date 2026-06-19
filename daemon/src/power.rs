@@ -7,13 +7,14 @@
 //! hint — it NEVER changes which TIER is chosen, NEVER loosens a gate, and NEVER
 //! makes a cloud call.
 //!
-//! ## Device-gated — OFF by default
+//! ## Device-gated — ON by default (perf-only)
 //!
 //! The live reader (`/usr/bin/pmset -g batt` for the battery + AC state) is
-//! consulted ONLY when [power].adaptive is on. With the flag OFF (the shipped
-//! default) [`read_power`] short-circuits to a NEUTRAL reading WITHOUT spawning
-//! anything, so the throttle is always neutral and routing is byte-for-byte
-//! today's behavior. This mirrors the mic-loop / vision-capture / posture
+//! consulted ONLY when [power].adaptive is on (the shipped default; the live read is
+//! DEVICE-gated behind the flag). With the flag OFF [`read_power`] short-circuits to
+//! a NEUTRAL reading WITHOUT spawning anything, so the throttle is always neutral and
+//! routing is byte-for-byte today's behavior. This is PERF-ONLY: it never loosens a
+//! gate, never makes a cloud call. This mirrors the mic-loop / vision-capture / posture
 //! precedent: the PURE policy + the PURE parser are always testable; the live
 //! read is wired behind the flag and NEVER exercised in tests.
 //!
@@ -230,14 +231,21 @@ mod tests {
         assert_eq!(pct, None, "an impossible >100% reading must not pass through");
     }
 
-    // The neutral reading fed through current_plan with the OFF default is neutral
-    // (the shipped state: nothing reads power, routing unchanged).
+    // adaptive ships ON (full-power default) but a NEUTRAL reading is still neutral
+    // (no battery info, on AC, nominal thermal => never throttles); and an explicit
+    // OFF config is also neutral on any reading.
     #[test]
-    fn current_plan_off_default_is_neutral() {
+    fn current_plan_neutral_reading_never_throttles() {
         let cfg = Config::default();
-        assert!(!cfg.power.adaptive, "[power].adaptive must ship OFF");
+        assert!(cfg.power.adaptive, "[power].adaptive ships ON (full-power default)");
         let plan = current_plan(&cfg, PowerReading::neutral());
-        assert!(!plan.is_throttled(), "OFF default must never throttle");
+        assert!(!plan.is_throttled(), "a neutral reading must never throttle, even with adaptive on");
+
+        // Explicitly OFF: nothing reads power, never throttles on any reading.
+        let mut off = Config::default();
+        off.power.adaptive = false;
+        let low = PowerReading { battery_pct: Some(5), on_ac: false, thermal: ThermalState::Nominal };
+        assert!(!current_plan(&off, low).is_throttled(), "adaptive OFF must never throttle");
     }
 
     // With adaptive ON, a synthetic low-battery reading routed through current_plan

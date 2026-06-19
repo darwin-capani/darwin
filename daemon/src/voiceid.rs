@@ -25,7 +25,8 @@
 //! ### Where it sits in the safety stack — an ADDED layer, never a replacement
 //! Voice-ID is an ADDITIVE factor on top of the existing backstops, never a
 //! substitute for them:
-//!   * The OFF-by-default `[integrations].allow_consequential` master switch and
+//!   * The armed-by-default `[integrations].allow_consequential` master switch (ON,
+//!     but a confirmed action still needs a fresh per-action confirm) and
 //!   * the cross-turn SPOKEN confirmation gate ([`crate::confirm`])
 //! remain the hard security backstop for outward actions. Voice-ID, when enabled
 //! AND a profile is enrolled, adds: an unrecognized speaker may not trigger a

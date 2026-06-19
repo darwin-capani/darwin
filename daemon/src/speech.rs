@@ -1097,7 +1097,9 @@ mod tests {
 
         let root = temp_root();
         let mut cfg = crate::config::Config::default();
-        assert!(!cfg.speech.instant_opener, "default must be OFF");
+        // This test asserts the COLD begin path (no opener), so disable the
+        // now-ON-by-default instant_opener explicitly.
+        cfg.speech.instant_opener = false;
         cfg.speech.opener_delay_ms = 0;
 
         let base = super::SPEAKING.load(Ordering::Relaxed);
@@ -1337,7 +1339,9 @@ mod tests {
     async fn instant_opener_off_fires_no_opener_and_skips_the_breath() {
         let root = temp_root();
         let mut cfg = crate::config::Config::default();
-        assert!(!cfg.speech.instant_opener, "default must be OFF");
+        // The shipped DEFAULT is now ON (full-power); disable explicitly to exercise
+        // the off path (no opener fires, the breath is skipped).
+        cfg.speech.instant_opener = false;
         // A breath this long would dominate the measurement IF it were taken.
         cfg.speech.opener_delay_ms = 5_000;
 

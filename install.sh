@@ -43,11 +43,16 @@
 # Idempotent + resumable: re-running skips work already done (existing venv,
 # already-downloaded models, up-to-date release binaries) and is safe to ctrl-C.
 #
-# HONESTY: nothing consequential is enabled. The daemon's actuation stays
-# OFF-by-default behind its master switch + per-turn/per-action confirm +
-# voice-id + lockdown + policy + allowlist. The optional ElevenLabs cloud voice
-# tier and the cloud LLM fallback stay OFF until YOU add a key. No secret, key,
-# state DB, venv, model, or build artifact is ever written into the source repo.
+# HONESTY: this is a FULL-POWER default — consequential actions are ARMED (the
+# master switch ships ON). What protects you is that every consequential action
+# STILL requires a fresh per-action confirm + voice-id (if enrolled) + per-action
+# policy + !lockdown, all enforced at the chokepoints (not defaults you can flip
+# away). Lockdown/panic forces everything off. Many features ship ON but stay
+# inert until you supply the dependency: cloud LLM / ElevenLabs voice+STT / self-
+# heal+forge drafting need an API key; UI automation / mic / screen-context need a
+# macOS TCC grant; docsearch/code need an allowlisted folder; MCP/webhooks need a
+# server-or-mapping. No secret, key, state DB, venv, model, or build artifact is
+# ever written into the source repo.
 
 set -euo pipefail
 
@@ -411,27 +416,32 @@ ensure_homebrew() {
 print_next_steps_directives() {
     local lead_note="${1:-}"
     printf '\n'
-    ui_info "${UI_BOLD}${UI_CYAN}NEXT-STEP DIRECTIVES${UI_RESET} — honest, and nothing consequential is on yet${lead_note}:"
+    ui_info "${UI_BOLD}${UI_CYAN}NEXT-STEP DIRECTIVES${UI_RESET} — full-power default: consequential actions are ARMED, still gated per action${lead_note}:"
 
     ui_panel "1" "TCC PERMISSIONS" \
         "macOS will prompt for ${UI_BRIGHT}Accessibility${UI_RESET}, ${UI_BRIGHT}Microphone${UI_RESET}, and ${UI_BRIGHT}Screen Recording${UI_RESET}" \
-        "the first time JARVIS needs each. Grant them in" \
-        "${UI_ICE}System Settings > Privacy & Security${UI_RESET} when asked. They cannot be pre-granted."
+        "the first time JARVIS needs each. Many full-power features (UI automation," \
+        "live interpret, sound monitor, screen context) stay ${UI_BRIGHT}inert${UI_RESET} until you grant" \
+        "these in ${UI_ICE}System Settings > Privacy & Security${UI_RESET}. They cannot be pre-granted."
 
-    ui_panel "2" "API KEYS  (optional, OFF until set)" \
-        "The cloud LLM fallback and the ElevenLabs cloud voice tier stay ${UI_BRIGHT}disabled${UI_RESET}" \
-        "with no key. To enable, put" \
+    ui_panel "2" "API KEYS  (gates ON, but inert until set)" \
+        "The feature gates ship ${UI_BRIGHT}ON${UI_RESET}, but key-dependent capabilities stay" \
+        "${UI_BRIGHT}inert until a key is supplied${UI_RESET}: the cloud LLM fallback, the ElevenLabs cloud" \
+        "voice/STT tier, and self-heal/forge drafting all need a key. To enable, put" \
         "  ${UI_CYAN}export ANTHROPIC_API_KEY=...${UI_RESET}" \
         "  ${UI_CYAN}export ELEVENLABS_API_KEY=...${UI_RESET}" \
         "in  ${UI_GREY}$JARVIS_HOME/state/env.sh${UI_RESET}  and  ${UI_BRIGHT}chmod 600${UI_RESET}  it (state/ is gitignored)," \
         "or store them in the macOS Keychain. Local inference works fully offline" \
-        "with no key at all."
+        "with no key at all; enabling a gate != active without the key."
 
-    ui_panel "3" "VOICE WAKE WORD" \
+    ui_panel "3" "VOICE WAKE WORD  +  GATES THAT STAY ENFORCED" \
         "Say \"${UI_BRIGHT}JARVIS${UI_RESET}\" to wake it once the daemon is up." \
-        "Every consequential action still requires the ${UI_BRIGHT}master switch ON${UI_RESET} +" \
-        "per-action confirm + voice-id + policy/allowlist — none of which this" \
-        "installer turns on. Self-healing ships ${UI_BRIGHT}OFF${UI_RESET}."
+        "The installer ships the ${UI_BRIGHT}master switch ON${UI_RESET} (consequential actions ARMED)," \
+        "but every consequential action STILL requires a ${UI_BRIGHT}fresh per-action confirm${UI_RESET} +" \
+        "voice-id (if enrolled) + per-action policy + ${UI_BRIGHT}!lockdown${UI_RESET} — these are enforced at" \
+        "the chokepoints, not defaults you can flip away. Self-healing is ${UI_BRIGHT}ON but" \
+        "PROPOSE-ONLY${UI_RESET} (drafts a validated patch you apply via scripts/apply_heal.sh," \
+        "and inert until ANTHROPIC_API_KEY is set). Lockdown/panic forces everything off."
 
     ui_panel "4" "BOOT-TO-JARVIS" \
         "For a deployment Mac, enable auto-login so the gui-domain agents start at" \
@@ -881,21 +891,30 @@ if [ -f "$AGENTS_TOML" ]; then
     case "$AGENT_COUNT" in ''|*[!0-9]*) AGENT_COUNT="" ;; esac
 fi
 
-# Consequential-actions + self-healing posture: both SHIP OFF (documented
-# invariants). Confirm from the placed config when readable; if the line is
-# unreadable, state OFF (the shipped default) — we never upgrade to a claim of ON.
+# Consequential-actions + self-healing posture: both SHIP ON (full-power default).
+# ARMED-but-gated is the shipped truth: the master switch is on, but every
+# consequential action still requires a fresh per-action confirm + voice-id +
+# policy + !lockdown (enforced at the chokepoints, not by this tag). Self-healing
+# is ON but PROPOSE-ONLY and inert without ANTHROPIC_API_KEY. Confirm from the
+# placed config when readable; if the line is unreadable, state the ON default —
+# we report the shipped truth, and detect a user OVERRIDE to OFF if present.
 JARVIS_TOML="$JARVIS_HOME/config/jarvis.toml"
 [ -f "$JARVIS_TOML" ] || JARVIS_TOML="$SRC_ROOT/config/jarvis.toml"
 # NOTE: keep every status tag PURE ASCII — the board aligns the "[ TAG ]" column
 # by byte length (${#tag}); a multibyte glyph (em-dash) would mis-measure and
-# nudge the closing bracket out of column. "OFF / SAFE" is ASCII + still honest.
-CONSEQ_TAG="OFF / SAFE"
-SELFHEAL_TAG="OFF"
+# nudge the closing bracket out of column. "ARMED (gated)" is ASCII + honest.
+CONSEQ_TAG="ARMED (gated)"
+SELFHEAL_TAG="ON (propose)"
 if [ -f "$JARVIS_TOML" ]; then
-    if grep -qE '^[[:space:]]*allow_consequential[[:space:]]*=[[:space:]]*true' "$JARVIS_TOML" 2>/dev/null; then
-        # Honesty: if a user pre-flipped the switch in their config, say so plainly
-        # rather than printing the safe default. (Default ships false.)
-        CONSEQ_TAG="ARMED"
+    if grep -qE '^[[:space:]]*allow_consequential[[:space:]]*=[[:space:]]*false' "$JARVIS_TOML" 2>/dev/null; then
+        # Honesty: if a user pre-flipped the master switch OFF in their config, say
+        # so plainly rather than printing the ON default. (Default ships true.)
+        CONSEQ_TAG="OFF (disarmed)"
+    fi
+    # Self-heal is under [self_heal].enabled; report a user OVERRIDE to OFF if present.
+    if grep -qE '^[[:space:]]*enabled[[:space:]]*=[[:space:]]*false[[:space:]]*#?.*' "$JARVIS_TOML" 2>/dev/null \
+        && awk '/^\[self_heal\]/{f=1;next} /^\[/{f=0} f && /^[[:space:]]*enabled[[:space:]]*=[[:space:]]*false/{print;exit}' "$JARVIS_TOML" 2>/dev/null | grep -q .; then
+        SELFHEAL_TAG="OFF"
     fi
 fi
 
