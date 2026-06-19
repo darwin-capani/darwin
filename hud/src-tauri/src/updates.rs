@@ -173,15 +173,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholder_constant_matches_the_committed_config() {
-        // The sentinel MUST equal the placeholder committed in tauri.conf.json so
-        // the shipped build short-circuits to `not_configured`. If someone edits
-        // the config placeholder without updating this constant (or vice versa),
-        // this test is the tripwire.
+    fn committed_config_carries_a_real_updater_pubkey() {
+        // v1.0.0 ARMED: the owner has swapped the placeholder for their real updater
+        // PUBLIC key, so the shipped build's updater is live (it no longer
+        // short-circuits to `not_configured`). This tripwire now guards the OPPOSITE
+        // of before — the committed config must NOT regress to the placeholder and
+        // must not carry an empty key. PUBKEY_PLACEHOLDER is still used at runtime by
+        // updater_unarmed() to defensively detect an empty/placeholder key.
         let cfg = include_str!("../tauri.conf.json");
         assert!(
-            cfg.contains(PUBKEY_PLACEHOLDER),
-            "tauri.conf.json must carry the same updater pubkey PLACEHOLDER as updates.rs"
+            !cfg.contains(PUBKEY_PLACEHOLDER),
+            "tauri.conf.json regressed to the updater pubkey PLACEHOLDER — paste the real \
+             public key (see docs/RELEASE.md)"
+        );
+        assert!(
+            !cfg.contains("\"pubkey\": \"\""),
+            "the updater pubkey is empty — the auto-updater would be unarmed"
         );
     }
 
