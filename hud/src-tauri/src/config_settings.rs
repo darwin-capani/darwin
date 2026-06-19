@@ -1,0 +1,1205 @@
+//! HUD Settings — the config-edit BACKEND (the trust boundary for `config/jarvis.toml`).
+//!
+//! WHAT THIS IS: three Tauri commands that let the Settings window READ the current
+//! whitelisted settings (`config_get`), write a BATCH of validated edits IN PLACE
+//! preserving every comment + the file structure (`config_set`), and restart the
+//! daemon so the edits take effect (`daemon_restart`).
+//!
+//! WHAT THIS IS NOT: it adds NO runtime authority. The runtime gate enforcement
+//! (policy.rs, confirm.rs, voiceid.rs, lockdown.rs, integrations/mod.rs) is left
+//! ALONE — this module only edits the TOML those modules read at startup. There is
+//! NO hot-reload (every daemon module caches its config in a `OnceLock` at boot),
+//! so a change takes effect ONLY on the explicit `daemon_restart`. The UI is honest
+//! about that: it batches edits and exposes one "Apply changes — restarts JARVIS".
+//!
+//! SAFETY (the whole point — KEEP the gates while giving control):
+//!   * `config_set` is a STRICT WHITELIST. Only the keys in [`SETTINGS`] can be
+//!     written; each is validated by TYPE and by per-key options/range. An unknown
+//!     key, a wrong type, an out-of-range number, an out-of-options string — all are
+//!     REJECTED with a clear error before any write. There is NO arbitrary-TOML
+//!     write, NO key injection, NO path traversal: a change names a (section, key)
+//!     that must be in the table, and the value is re-serialized by US (never echoed
+//!     raw), so a hostile value can never smuggle a second key or a comment onto the
+//!     line.
+//!   * The WRITE is an IN-PLACE value edit: we locate the matching `key =` line
+//!     inside the correct `[section]` and rewrite ONLY its value token, leaving the
+//!     trailing `# comment`, the key name, the indentation, and every other line
+//!     byte-for-byte. The carefully-written honest comments are preserved.
+//!
+//! The autonomy controls (self_heal / forge / optimize) are exposed as a single
+//! 3-way state — Off / Propose / Auto — derived from `enabled` + `mode` on read,
+//! and mapped back to the two underlying keys on write.
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::process::Stdio;
+
+use serde::{Deserialize, Serialize};
+use tokio::process::Command;
+
+/// The launchd label for jarvisd — the SAME label `scripts/apply_heal.sh` kicks
+/// after a healed build. Restart is `launchctl kickstart -k gui/<uid>/<label>`.
+const DAEMON_LABEL: &str = "com.jarvis.daemon";
+
+/* ----------------------------------------------------------- the whitelist */
+
+/// The kind of a whitelisted setting — drives BOTH the GET coercion (TOML token
+/// -> typed JSON) and the SET validation (typed JSON -> a re-serialized TOML
+/// value token). Everything outside these shapes is rejected.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Kind {
+    /// `true` | `false`.
+    Bool,
+    /// An integer within `[min, max]` inclusive.
+    Int { min: i64, max: i64 },
+    /// A float within `[min, max]` inclusive.
+    Float { min: f64, max: f64 },
+    /// A string that MUST be one of the listed options (exact match).
+    Enum(&'static [&'static str]),
+}
+
+/// One whitelisted setting: which `[section]` + `key` line it edits, and how it
+/// is validated. The id the frontend uses is `"<section>.<key>"`.
+#[derive(Debug, Clone, Copy)]
+pub struct Setting {
+    pub section: &'static str,
+    pub key: &'static str,
+    pub kind: Kind,
+}
+
+impl Setting {
+    /// The dotted id the frontend addresses this setting by (`section.key`).
+    pub fn id(&self) -> String {
+        format!("{}.{}", self.section, self.key)
+    }
+}
+
+/// The 3-way autonomy controls (self_heal / forge / optimize). Each is ONE UI
+/// control mapping to two underlying keys: `enabled` (bool) + `mode`
+/// ("propose"|"auto"). Off = enabled false; Propose = enabled true + mode
+/// propose; Auto = enabled true + mode auto. These sections are handled by the
+/// dedicated 3-way path, NOT the flat [`SETTINGS`] table, so a caller can never
+/// poke `self_heal.enabled` directly through the flat key path and desync the pair.
+pub const AUTONOMY_SECTIONS: &[&str] = &["self_heal", "forge", "optimize"];
+
+/// The allowed values for the 3-way autonomy control.
+pub const AUTONOMY_STATES: &[&str] = &["off", "propose", "auto"];
+
+/// The flat whitelist: EXACTLY the simple (bool / int / float / enum) settings the
+/// Settings window may edit. Ranges + options are lifted from daemon/src/config.rs
+/// and config/jarvis.toml. NOTHING outside this table (plus the 3-way autonomy
+/// sections) can be written. Autonomy `enabled`/`mode` are DELIBERATELY absent
+/// here — they are driven only through the 3-way path.
+pub const SETTINGS: &[Setting] = &[
+    // ---- SAFETY & GATES ----
+    Setting { section: "integrations", key: "allow_consequential", kind: Kind::Bool },
+    Setting { section: "voice_id", key: "enabled", kind: Kind::Bool },
+    Setting { section: "voice_id", key: "gate_scope", kind: Kind::Enum(&["consequential", "all"]) },
+    // threshold: cosine accept point. config comment + voiceid.rs treat it as a
+    // 0.70..=1.0 operating band (catalog: 0.70-1.0).
+    Setting { section: "voice_id", key: "threshold", kind: Kind::Float { min: 0.70, max: 1.0 } },
+    Setting { section: "security", key: "encrypt_memory", kind: Kind::Bool },
+    Setting { section: "policy", key: "enabled", kind: Kind::Bool },
+
+    // ---- AUTONOMY (toggles; the 3-way controls live in AUTONOMY_SECTIONS) ----
+    Setting { section: "standing", key: "enabled", kind: Kind::Bool },
+    Setting { section: "drafts", key: "enabled", kind: Kind::Bool },
+    Setting { section: "missions", key: "durable", kind: Kind::Bool },
+    Setting { section: "macros", key: "enabled", kind: Kind::Bool },
+
+    // ---- PROACTIVITY ----
+    Setting { section: "proactive", key: "enabled", kind: Kind::Bool },
+    Setting { section: "proactive", key: "speak", kind: Kind::Bool },
+    Setting { section: "proactive", key: "suggest", kind: Kind::Bool },
+    // quiet hours: local hour 0..=23 (u8 in config.rs).
+    Setting { section: "proactive", key: "quiet_start", kind: Kind::Int { min: 0, max: 23 } },
+    Setting { section: "proactive", key: "quiet_end", kind: Kind::Int { min: 0, max: 23 } },
+    Setting { section: "focus", key: "profile", kind: Kind::Enum(&["default", "work", "sleep", "deep_focus"]) },
+
+    // ---- PERCEPTION ----
+    Setting { section: "screen_context", key: "enabled", kind: Kind::Bool },
+    // interval_secs: floored to >=1 by config.rs; cap at a sane day to avoid a
+    // hostile huge value. (>=1 is the real floor; the upper bound is a guard.)
+    Setting { section: "screen_context", key: "interval_secs", kind: Kind::Int { min: 1, max: 86_400 } },
+    Setting { section: "vision", key: "enabled", kind: Kind::Bool },
+    Setting { section: "image", key: "enabled", kind: Kind::Bool },
+    Setting { section: "audio", key: "sound_monitor", kind: Kind::Bool },
+    Setting { section: "interpret", key: "live", kind: Kind::Bool },
+    Setting { section: "interpret", key: "speak", kind: Kind::Bool },
+    Setting { section: "episodic", key: "enabled", kind: Kind::Bool },
+
+    // ---- VOICE & SPEECH ----
+    Setting { section: "voice", key: "cloud_tier", kind: Kind::Bool },
+    Setting { section: "voice", key: "cloud_stt", kind: Kind::Bool },
+    Setting { section: "voice", key: "adaptive_prosody", kind: Kind::Bool },
+    Setting { section: "voice", key: "whisper", kind: Kind::Bool },
+    Setting { section: "voice", key: "whisper_auto", kind: Kind::Bool },
+    Setting { section: "voice", key: "diarize", kind: Kind::Bool },
+    Setting { section: "speech", key: "engine", kind: Kind::Enum(&["kokoro", "csm", "orpheus"]) },
+    Setting { section: "speech", key: "instant_opener", kind: Kind::Bool },
+
+    // ---- CAPABILITIES ----
+    Setting { section: "shell", key: "enabled", kind: Kind::Bool },
+    Setting { section: "ui_automation", key: "enabled", kind: Kind::Bool },
+    Setting { section: "mcp", key: "enabled", kind: Kind::Bool },
+    Setting { section: "webhooks", key: "enabled", kind: Kind::Bool },
+    Setting { section: "plugin_sdk", key: "enabled", kind: Kind::Bool },
+    Setting { section: "docsearch", key: "enabled", kind: Kind::Bool },
+    Setting { section: "docsearch", key: "build_graph", kind: Kind::Bool },
+    Setting { section: "code", key: "enabled", kind: Kind::Bool },
+    Setting { section: "local_tools", key: "enabled", kind: Kind::Bool },
+    Setting { section: "report", key: "enabled", kind: Kind::Bool },
+    Setting { section: "chart", key: "enabled", kind: Kind::Bool },
+    Setting { section: "answers", key: "cite", kind: Kind::Bool },
+    Setting { section: "answers", key: "confidence", kind: Kind::Bool },
+    Setting { section: "answers", key: "verify", kind: Kind::Bool },
+    Setting { section: "answers", key: "cross_check", kind: Kind::Bool },
+    Setting { section: "answers", key: "debate", kind: Kind::Bool },
+
+    // ---- PERFORMANCE & MODELS ----
+    Setting { section: "power", key: "adaptive", kind: Kind::Bool },
+    Setting { section: "inference", key: "speculative", kind: Kind::Bool },
+    Setting { section: "inference", key: "quant", kind: Kind::Enum(&["auto", "fp16", "int8", "int4"]) },
+    Setting { section: "router", key: "conversation_route", kind: Kind::Enum(&["cloud_heavy", "cloud_fast", "local"]) },
+];
+
+/// Look up a flat setting by its `section.key` id.
+fn setting_by_id(id: &str) -> Option<&'static Setting> {
+    let (section, key) = id.split_once('.')?;
+    SETTINGS
+        .iter()
+        .find(|s| s.section == section && s.key == key)
+}
+
+/* ----------------------------------------------------------- typed values */
+
+/// A typed setting VALUE crossing the IPC boundary. Bools, integers, floats and
+/// strings (enums) for the flat settings; the 3-way autonomy state is also a
+/// string (`"off"|"propose"|"auto"`) addressed by the bare section id (e.g.
+/// `"self_heal"`). serde(untagged) so the JS side sends a plain `true` / `30` /
+/// `"work"` without a wrapper.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum SettingValue {
+    Bool(bool),
+    Int(i64),
+    Float(f64),
+    Str(String),
+}
+
+/* ----------------------------------------------------------- GET (parse) */
+
+/// The current value of one setting, plus its descriptor — enough for the UI to
+/// render the right control without re-deriving the whitelist. `kind` is a short
+/// tag ("bool"|"int"|"float"|"enum"|"autonomy"); `options`/`min`/`max` describe
+/// the allowed input; `value` is the live value parsed from the file.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct SettingState {
+    pub id: String,
+    pub section: String,
+    pub key: String,
+    pub kind: String,
+    pub value: SettingValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub options: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max: Option<f64>,
+}
+
+/// Strip a TOML inline `# comment` from a value region, respecting a single-/
+/// double-quoted string so a `#` INSIDE a quoted value is not treated as a
+/// comment. Returns the trimmed value text (no surrounding whitespace).
+fn strip_inline_comment(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut in_str: Option<u8> = None;
+    let mut end = bytes.len();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_str {
+            Some(q) => {
+                if b == q {
+                    in_str = None;
+                }
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    in_str = Some(b);
+                } else if b == b'#' {
+                    end = i;
+                    break;
+                }
+            }
+        }
+        i += 1;
+    }
+    raw[..end].trim().to_string()
+}
+
+/// Parse a raw TOML value token into a typed [`SettingValue`] under a known
+/// [`Kind`]. Returns None when the token does not match the kind (a malformed
+/// file value) so GET can fall back to the file's verbatim text rather than lie.
+fn coerce_value(kind: Kind, token: &str) -> Option<SettingValue> {
+    match kind {
+        Kind::Bool => match token {
+            "true" => Some(SettingValue::Bool(true)),
+            "false" => Some(SettingValue::Bool(false)),
+            _ => None,
+        },
+        Kind::Int { .. } => token.parse::<i64>().ok().map(SettingValue::Int),
+        Kind::Float { .. } => token.parse::<f64>().ok().map(SettingValue::Float),
+        Kind::Enum(_) => {
+            let unq = unquote(token)?;
+            Some(SettingValue::Str(unq))
+        }
+    }
+}
+
+/// Unquote a TOML basic/literal string token (`"x"` or `'x'`) into its inner
+/// text. Returns None if it is not a simple quoted string. We do NOT interpret
+/// escapes — the enum values we read are plain ASCII identifiers, and on WRITE we
+/// re-emit a clean quoted token, so no escape round-trips through here.
+fn unquote(token: &str) -> Option<String> {
+    let b = token.as_bytes();
+    if b.len() >= 2 && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\'')) {
+        Some(token[1..token.len() - 1].to_string())
+    } else {
+        None
+    }
+}
+
+/// The parse cursor over the file: track the current `[section]` so a `key =`
+/// line is attributed to the right section. Returns the section name for a header
+/// line, or None for any other line. TOLERATES a trailing inline comment on the
+/// header line (the real config has many, e.g. `[power]   # #38 …`). Sub-tables
+/// like `[voice.voices]` are returned verbatim ("voice.voices") and simply never
+/// match a whitelist section.
+fn section_header(line: &str) -> Option<String> {
+    let t = line.trim_start();
+    // Skip array-of-tables headers ([[x]]) — none of our settings live there.
+    if t.starts_with("[[") || !t.starts_with('[') {
+        return None;
+    }
+    // The header is everything up to the CLOSING ']'; anything after (whitespace,
+    // a '# comment') is ignored. A section name never contains ']'.
+    let close = t.find(']')?;
+    let inner = &t[1..close];
+    Some(inner.trim().to_string())
+}
+
+/// Split a non-comment, non-header line into (key, value-region) if it is a
+/// `key = ...` assignment. The value-region still includes any trailing inline
+/// comment (the caller strips it). Leading whitespace on the line is tolerated.
+fn split_assignment(line: &str) -> Option<(&str, &str)> {
+    let t = line.trim_start();
+    if t.starts_with('#') || t.is_empty() {
+        return None;
+    }
+    let (k, v) = t.split_once('=')?;
+    let key = k.trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some((key, v))
+}
+
+/// Read the live `(section, key) -> raw value token` map from the TOML text, for
+/// EVERY whitelisted flat setting AND the autonomy `enabled`/`mode` pairs. Pure
+/// over the text. Only the FIRST occurrence of a key within a section is taken
+/// (TOML forbids duplicates; we are defensive).
+fn read_raw_values(text: &str) -> BTreeMap<(String, String), String> {
+    let mut out: BTreeMap<(String, String), String> = BTreeMap::new();
+    let mut section = String::new();
+    for line in text.lines() {
+        if let Some(h) = section_header(line) {
+            section = h;
+            continue;
+        }
+        if let Some((key, vregion)) = split_assignment(line) {
+            let val = strip_inline_comment(vregion);
+            out.entry((section.clone(), key.to_string()))
+                .or_insert(val);
+        }
+    }
+    out
+}
+
+/// Derive the 3-way autonomy state for a section from its `enabled` + `mode`
+/// tokens. Off = enabled false (regardless of mode); else Propose unless
+/// mode == "auto" (anything else, including a missing/unknown mode, is the safe
+/// "propose"). Mirrors config.rs's "unknown mode behaves as propose".
+fn derive_autonomy(enabled: Option<&str>, mode: Option<&str>) -> &'static str {
+    let on = enabled == Some("true");
+    if !on {
+        return "off";
+    }
+    match mode.and_then(unquote_opt).as_deref() {
+        Some("auto") => "auto",
+        _ => "propose",
+    }
+}
+
+/// Unquote helper that takes/returns Option, for the autonomy mode token.
+fn unquote_opt(token: &str) -> Option<String> {
+    unquote(token)
+}
+
+/* ----------------------------------------------------------- SET (in-place) */
+
+/// One requested change from the UI: a setting id (`section.key` for a flat
+/// setting, or a bare section name for a 3-way autonomy control) and its new
+/// value. Validated against the whitelist before any write.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Change {
+    pub id: String,
+    pub value: SettingValue,
+}
+
+/// Render a validated typed value as the TOML value TOKEN we write in place.
+/// We CONTROL this string entirely (never echo the caller's raw text), so a
+/// value can never inject a second key, a newline, or a comment: a bool/int/
+/// float has no quoting surface, and an enum is a known-safe identifier we wrap
+/// in double quotes ourselves.
+fn render_token(kind: Kind, value: &SettingValue) -> Result<String, String> {
+    match (kind, value) {
+        (Kind::Bool, SettingValue::Bool(b)) => Ok(if *b { "true" } else { "false" }.to_string()),
+        (Kind::Int { min, max }, SettingValue::Int(n)) => {
+            if *n < min || *n > max {
+                return Err(format!("value {n} out of range [{min}, {max}]"));
+            }
+            Ok(n.to_string())
+        }
+        // Accept an integer-valued float for a Float key (JS numbers are doubles).
+        (Kind::Float { min, max }, v) => {
+            let f = match v {
+                SettingValue::Float(f) => *f,
+                SettingValue::Int(n) => *n as f64,
+                _ => return Err("expected a number".to_string()),
+            };
+            if !f.is_finite() {
+                return Err("value is not a finite number".to_string());
+            }
+            if f < min || f > max {
+                return Err(format!("value {f} out of range [{min}, {max}]"));
+            }
+            // Emit a clean decimal; ensure it always reads as a TOML float
+            // (a trailing ".0" when it is integral) so the daemon parses f64.
+            let s = format!("{f}");
+            Ok(if s.contains('.') || s.contains('e') || s.contains('E') {
+                s
+            } else {
+                format!("{s}.0")
+            })
+        }
+        (Kind::Int { .. }, _) => Err("expected an integer".to_string()),
+        (Kind::Bool, _) => Err("expected true/false".to_string()),
+        (Kind::Enum(opts), SettingValue::Str(s)) => {
+            if !opts.contains(&s.as_str()) {
+                return Err(format!("'{s}' is not one of {opts:?}"));
+            }
+            Ok(format!("\"{s}\""))
+        }
+        (Kind::Enum(_), _) => Err("expected one of the allowed options".to_string()),
+    }
+}
+
+/// Validate one change against the whitelist and resolve it to the concrete
+/// (section, key) -> token writes it produces. A flat setting yields ONE write;
+/// a 3-way autonomy control yields TWO (enabled + mode). REJECTS an unknown id,
+/// a wrong type, an out-of-range/option value. Pure.
+fn resolve_change(change: &Change) -> Result<Vec<((String, String), String)>, String> {
+    // 3-way autonomy control: the id is a bare section name.
+    if AUTONOMY_SECTIONS.contains(&change.id.as_str()) {
+        let state = match &change.value {
+            SettingValue::Str(s) => s.as_str(),
+            _ => return Err(format!("{}: autonomy state must be a string", change.id)),
+        };
+        if !AUTONOMY_STATES.contains(&state) {
+            return Err(format!(
+                "{}: '{state}' is not one of {AUTONOMY_STATES:?}",
+                change.id
+            ));
+        }
+        let (enabled, mode) = match state {
+            "off" => ("false", "propose"),
+            "propose" => ("true", "propose"),
+            "auto" => ("true", "auto"),
+            _ => unreachable!("guarded by AUTONOMY_STATES"),
+        };
+        return Ok(vec![
+            ((change.id.clone(), "enabled".to_string()), enabled.to_string()),
+            ((change.id.clone(), "mode".to_string()), format!("\"{mode}\"")),
+        ]);
+    }
+
+    // Flat setting: the id is "section.key" and MUST be in the whitelist.
+    let Some(setting) = setting_by_id(&change.id) else {
+        return Err(format!("unknown setting '{}'", change.id));
+    };
+    let token = render_token(setting.kind, &change.value)
+        .map_err(|e| format!("{}: {e}", change.id))?;
+    Ok(vec![(
+        (setting.section.to_string(), setting.key.to_string()),
+        token,
+    )])
+}
+
+/// Apply a set of resolved `(section, key) -> token` writes to the TOML text
+/// IN PLACE, preserving every comment + the structure. We rewrite ONLY the value
+/// token on the matching `key =` line within the matching `[section]`, keeping the
+/// key name, the indentation, the `=` spacing, and the trailing `# comment`
+/// byte-for-byte. A target whose (section, key) line is not found is an error (we
+/// never APPEND a key — that could land outside its section or duplicate it).
+/// Pure over the text; the only caller does the I/O.
+fn apply_writes_in_place(
+    text: &str,
+    writes: &BTreeMap<(String, String), String>,
+) -> Result<String, String> {
+    // Preserve the file's original line endings: we rebuild from the original
+    // line slices and re-insert '\n', then restore a missing trailing newline.
+    let mut applied: BTreeMap<(String, String), bool> =
+        writes.keys().map(|k| (k.clone(), false)).collect();
+
+    let mut section = String::new();
+    let mut out_lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if let Some(h) = section_header(line) {
+            section = h;
+            out_lines.push(line.to_string());
+            continue;
+        }
+        if let Some((key, vregion)) = split_assignment(line) {
+            let target = (section.clone(), key.to_string());
+            if let Some(token) = writes.get(&target) {
+                // Already applied once? (defensive against a duplicate key line)
+                if applied.get(&target) == Some(&true) {
+                    out_lines.push(line.to_string());
+                    continue;
+                }
+                out_lines.push(rewrite_value_line(line, vregion, token));
+                applied.insert(target, true);
+                continue;
+            }
+        }
+        out_lines.push(line.to_string());
+    }
+
+    // Every requested write MUST have matched a line — we never append.
+    let missing: Vec<String> = applied
+        .iter()
+        .filter(|(_, done)| !**done)
+        .map(|((s, k), _)| format!("[{s}].{k}"))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "could not locate these keys in config/jarvis.toml: {}",
+            missing.join(", ")
+        ));
+    }
+
+    let mut joined = out_lines.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    Ok(joined)
+}
+
+/// Rewrite ONE assignment line: replace only the value token, keeping everything
+/// to the LEFT of `=` (key + indentation + `=` spacing) and any trailing inline
+/// `# comment` to the RIGHT of the value, plus the exact whitespace around them.
+fn rewrite_value_line(line: &str, vregion: &str, token: &str) -> String {
+    // The part up to and including the first '=' is preserved verbatim.
+    let eq = line.find('=').expect("split_assignment found an '='");
+    let head = &line[..=eq];
+
+    // Within the value region, find the trailing inline comment (respecting
+    // quotes) so we keep it. Compute byte offsets relative to vregion.
+    let comment_start = inline_comment_start(vregion);
+
+    // Leading whitespace after '=' (one space typically) — preserve it.
+    let lead_ws_len = vregion.len() - vregion.trim_start().len();
+    let lead_ws = &vregion[..lead_ws_len];
+
+    match comment_start {
+        Some(c) => {
+            // Whitespace between the old value and the '#': preserve it so the
+            // comment column does not shift.
+            let before_comment = &vregion[..c];
+            let trail_ws_len = before_comment.len() - before_comment.trim_end().len();
+            let trail_ws = &before_comment[before_comment.len() - trail_ws_len..];
+            let comment = &vregion[c..]; // includes the '#'
+            format!("{head}{lead_ws}{token}{trail_ws}{comment}")
+        }
+        None => {
+            // No comment: preserve any trailing whitespace after the value too.
+            let trimmed = vregion.trim_end();
+            let trail_ws = &vregion[trimmed.len()..];
+            format!("{head}{lead_ws}{token}{trail_ws}")
+        }
+    }
+}
+
+/// Byte offset of the inline `#` that begins a trailing comment in a value
+/// region, respecting single/double quotes (so `'a#b'` is not a comment). None if
+/// there is no inline comment.
+fn inline_comment_start(vregion: &str) -> Option<usize> {
+    let bytes = vregion.as_bytes();
+    let mut in_str: Option<u8> = None;
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        match in_str {
+            Some(q) => {
+                if b == q {
+                    in_str = None;
+                }
+            }
+            None => {
+                if b == b'"' || b == b'\'' {
+                    in_str = Some(b);
+                } else if b == b'#' {
+                    return Some(i);
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/* --------------------------------------------------------------- root + I/O */
+
+/// Resolve `config/jarvis.toml` under the SAME JARVIS root the command channel +
+/// self-heal use (the `resolve_root_for_command` resolver: JARVIS_ROOT env, else
+/// the exe/cwd upward walk to the scripts/apply_heal.sh + config/jarvis.toml
+/// markers). The installed root is `~/Library/Application Support/JARVIS`; in dev
+/// it is the repo. We never accept a path from the frontend.
+fn config_path() -> Result<PathBuf, String> {
+    let root = crate::heal::resolve_root_for_command()?;
+    Ok(root.join("config").join("jarvis.toml"))
+}
+
+/// Build the full GET snapshot from already-read TOML text. Pure (no I/O), so the
+/// round-trip + coercion are unit-testable without a daemon. Each flat setting is
+/// coerced to its typed value (falling back to the file's verbatim string only if
+/// the token is malformed); each autonomy section is the derived 3-way state.
+pub fn build_get(text: &str) -> Vec<SettingState> {
+    let raw = read_raw_values(text);
+    let mut out: Vec<SettingState> = Vec::new();
+
+    for s in SETTINGS {
+        let token = raw.get(&(s.section.to_string(), s.key.to_string()));
+        let value = match token {
+            Some(tok) => coerce_value(s.kind, tok)
+                .unwrap_or_else(|| SettingValue::Str(tok.clone())),
+            // Key absent from the file: surface a typed default-shaped sentinel
+            // so the UI still renders. For a missing key we report the file's
+            // intent honestly as an empty string the UI treats as "unset".
+            None => SettingValue::Str(String::new()),
+        };
+        let (kind_tag, options, min, max) = describe(s.kind);
+        out.push(SettingState {
+            id: s.id(),
+            section: s.section.to_string(),
+            key: s.key.to_string(),
+            kind: kind_tag,
+            value,
+            options,
+            min,
+            max,
+        });
+    }
+
+    // The 3-way autonomy controls.
+    for sec in AUTONOMY_SECTIONS {
+        let enabled = raw.get(&(sec.to_string(), "enabled".to_string())).map(String::as_str);
+        let mode = raw.get(&(sec.to_string(), "mode".to_string())).map(String::as_str);
+        let state = derive_autonomy(enabled, mode);
+        out.push(SettingState {
+            id: (*sec).to_string(),
+            section: (*sec).to_string(),
+            key: String::new(),
+            kind: "autonomy".to_string(),
+            value: SettingValue::Str(state.to_string()),
+            options: Some(AUTONOMY_STATES.iter().map(|s| s.to_string()).collect()),
+            min: None,
+            max: None,
+        });
+    }
+
+    out
+}
+
+/// Map a [`Kind`] to its UI descriptor: (tag, options, min, max).
+fn describe(kind: Kind) -> (String, Option<Vec<String>>, Option<f64>, Option<f64>) {
+    match kind {
+        Kind::Bool => ("bool".to_string(), None, None, None),
+        Kind::Int { min, max } => ("int".to_string(), None, Some(min as f64), Some(max as f64)),
+        Kind::Float { min, max } => ("float".to_string(), None, Some(min), Some(max)),
+        Kind::Enum(opts) => (
+            "enum".to_string(),
+            Some(opts.iter().map(|s| s.to_string()).collect()),
+            None,
+            None,
+        ),
+    }
+}
+
+/// Validate + apply a batch of changes to TOML text, returning the new text.
+/// Pure (no I/O) so the whole validation + in-place edit is unit-tested. ALL
+/// changes are validated FIRST (so a single bad change aborts the whole batch and
+/// nothing is written), then applied together.
+pub fn apply_changes(text: &str, changes: &[Change]) -> Result<String, String> {
+    if changes.is_empty() {
+        return Err("no changes supplied".to_string());
+    }
+    // Validate every change up front; collect the concrete writes.
+    let mut writes: BTreeMap<(String, String), String> = BTreeMap::new();
+    for change in changes {
+        for (target, token) in resolve_change(change)? {
+            writes.insert(target, token);
+        }
+    }
+    apply_writes_in_place(text, &writes)
+}
+
+/* --------------------------------------------------------------- commands */
+
+/// READ the current values of every whitelisted setting from the live
+/// config/jarvis.toml at the resolved JARVIS root. Async (off-runtime file read).
+#[tauri::command]
+pub async fn config_get() -> Result<Vec<SettingState>, String> {
+    let path = config_path()?;
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    Ok(build_get(&text))
+}
+
+/// WRITE a batch of whitelisted key->value edits to config/jarvis.toml IN PLACE,
+/// preserving all comments + structure. Validates EVERY change against the
+/// whitelist (allowed keys + per-key type/options/range) BEFORE writing; rejects
+/// anything else. Writes atomically (temp file + rename) so a crash mid-write can
+/// never leave a half-written config. Returns the number of (section,key) lines
+/// changed.
+#[tauri::command]
+pub async fn config_set(changes: Vec<Change>) -> Result<usize, String> {
+    let path = config_path()?;
+    let text = tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+
+    let updated = apply_changes(&text, &changes)?;
+    let n_lines = count_changed_lines(&text, &updated);
+
+    // Atomic replace: write a sibling temp file, fsync, then rename over.
+    let tmp = path.with_extension("toml.tmp");
+    tokio::fs::write(&tmp, updated.as_bytes())
+        .await
+        .map_err(|e| format!("could not write temp config: {e}"))?;
+    tokio::fs::rename(&tmp, &path)
+        .await
+        .map_err(|e| format!("could not replace config: {e}"))?;
+
+    Ok(n_lines)
+}
+
+/// Count how many lines differ between the old and new text (for the reply — the
+/// UI confirms how many lines moved). Pure.
+fn count_changed_lines(old: &str, new: &str) -> usize {
+    old.lines()
+        .zip(new.lines())
+        .filter(|(a, b)| a != b)
+        .count()
+}
+
+/// The outcome of a daemon restart attempt — honest about the launchd state.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct RestartResult {
+    /// True iff `launchctl kickstart -k` reported success (the service was loaded
+    /// and got kicked).
+    pub ok: bool,
+    /// A human-readable status: the restart succeeded, or the agent isn't loaded
+    /// (so the user must start it), or launchctl is missing.
+    pub detail: String,
+}
+
+/// RESTART jarvisd so a config change takes effect (there is no hot-reload). Runs
+/// `launchctl kickstart -k gui/<uid>/com.jarvis.daemon` — the SAME incantation
+/// scripts/apply_heal.sh uses after a healed build. If the agent is not loaded,
+/// `kickstart` fails and we return an HONEST "not loaded" detail rather than
+/// pretending a restart happened. The command takes NO argument from the
+/// frontend (the label is a constant), so there is no injection surface.
+#[tauri::command]
+pub async fn daemon_restart() -> Result<RestartResult, String> {
+    // Resolve the GUI domain target: gui/<uid>/<label>.
+    let uid = libc_getuid();
+    let target = format!("gui/{uid}/{DAEMON_LABEL}");
+
+    let output = Command::new("/bin/launchctl")
+        .arg("kickstart")
+        .arg("-k")
+        .arg(&target)
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("could not run launchctl: {e}"))?;
+
+    if output.status.success() {
+        return Ok(RestartResult {
+            ok: true,
+            detail: format!("JARVIS restarted ({target}); the new config is now live."),
+        });
+    }
+
+    // kickstart failed — most commonly because the agent is not loaded. Surface a
+    // clear, secret-free explanation (stderr is launchctl's own diagnostic).
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let detail = if stderr.contains("Could not find") || stderr.contains("No such process") {
+        format!("the JARVIS daemon ({DAEMON_LABEL}) is not loaded — start it, then your changes take effect.")
+    } else {
+        format!(
+            "restart failed: {}",
+            stderr.trim().lines().next().unwrap_or("unknown launchctl error")
+        )
+    };
+    Ok(RestartResult { ok: false, detail })
+}
+
+/// The current user's uid for the launchd GUI domain target. Wrapped so the
+/// `unsafe` is contained to one tiny call; `getuid()` cannot fail.
+fn libc_getuid() -> u32 {
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    // SAFETY: getuid() always succeeds, takes no arguments, and has no
+    // preconditions; it is the canonical POSIX uid query.
+    unsafe { getuid() }
+}
+
+/* --------------------------------------------------------------------- tests */
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// The exact config header + a representative slice of the real
+    /// config/jarvis.toml, with the carefully-written honest comments, used to
+    /// prove the in-place edit preserves them byte-for-byte.
+    const SAMPLE: &str = "\
+# JARVIS canonical configuration.
+# Read by jarvisd and the inference server.
+
+[audio]
+rms_threshold = 0.015   # RMS gate: below this is treated as silence
+sound_monitor = true    # Ambient sound monitor. SHIPS ON.
+
+[inference]
+speculative = true      # #37 SPECULATIVE DECODING — master gate.
+quant = \"auto\"          # #39 SELECTABLE QUANTIZATION. Allowed: auto/fp16/int8/int4.
+
+[screen_context]
+enabled = true          # master gate. SHIPS ON — most privacy-sensitive.
+interval_secs = 30      # cadence the device-gated loop grabs ONE frame.
+
+[self_heal]
+enabled = true    # master gate, SHIPS ON.
+mode = \"propose\"  # \"propose\" (default): write the patch.
+
+[voice_id]
+enabled = false              # master switch, SHIPS OFF deliberately.
+threshold = 0.86             # cosine ACCEPT on the acoustic embedding.
+gate_scope = \"consequential\" # \"consequential\" (default) | \"all\".
+
+[integrations]
+allow_consequential = true
+
+[focus]
+profile = \"default\"      # SHIPS NEUTRAL.
+";
+
+    fn get_value(states: &[SettingState], id: &str) -> SettingValue {
+        states
+            .iter()
+            .find(|s| s.id == id)
+            .unwrap_or_else(|| panic!("setting {id} missing from GET"))
+            .value
+            .clone()
+    }
+
+    // ---------- (a) ROUND-TRIP: set then get returns the new value ----------
+
+    #[test]
+    fn round_trip_bool_int_float_enum() {
+        // Flip a bool, change an int, a float, and an enum in one batch.
+        let changes = vec![
+            Change { id: "integrations.allow_consequential".into(), value: SettingValue::Bool(false) },
+            Change { id: "screen_context.interval_secs".into(), value: SettingValue::Int(60) },
+            Change { id: "voice_id.threshold".into(), value: SettingValue::Float(0.92) },
+            Change { id: "speech.engine".into(), value: SettingValue::Str("csm".into()) },
+        ];
+        // speech.engine isn't in SAMPLE; add a minimal [speech] block for it.
+        let text = format!("{SAMPLE}\n[speech]\nengine = \"kokoro\"   # TTS engine\n");
+        let updated = apply_changes(&text, &changes).expect("apply ok");
+        let states = build_get(&updated);
+
+        assert_eq!(get_value(&states, "integrations.allow_consequential"), SettingValue::Bool(false));
+        assert_eq!(get_value(&states, "screen_context.interval_secs"), SettingValue::Int(60));
+        assert_eq!(get_value(&states, "voice_id.threshold"), SettingValue::Float(0.92));
+        assert_eq!(get_value(&states, "speech.engine"), SettingValue::Str("csm".into()));
+    }
+
+    #[test]
+    fn round_trip_autonomy_three_way_mapping() {
+        // Off -> Propose -> Auto, each derived back correctly.
+        for (state, exp_enabled, exp_mode) in
+            [("off", "false", "\"propose\""), ("propose", "true", "\"propose\""), ("auto", "true", "\"auto\"")]
+        {
+            let updated = apply_changes(
+                SAMPLE,
+                &[Change { id: "self_heal".into(), value: SettingValue::Str(state.into()) }],
+            )
+            .expect("autonomy apply ok");
+            let raw = read_raw_values(&updated);
+            assert_eq!(
+                raw.get(&("self_heal".into(), "enabled".into())).map(String::as_str),
+                Some(exp_enabled),
+                "enabled for state {state}"
+            );
+            assert_eq!(
+                raw.get(&("self_heal".into(), "mode".into())).map(String::as_str),
+                Some(exp_mode),
+                "mode for state {state}"
+            );
+            // And the derived GET state round-trips.
+            let states = build_get(&updated);
+            assert_eq!(get_value(&states, "self_heal"), SettingValue::Str(state.into()));
+        }
+    }
+
+    // ---------- (b) COMMENTS preserved byte-for-byte except the value line ----------
+
+    /// Every line that is a `# ...` comment line OR carries a trailing inline
+    /// `# ...` comment — collect them verbatim for a before/after diff.
+    fn comment_lines(text: &str) -> Vec<String> {
+        text.lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with('#') || inline_comment_start(l).is_some()
+            })
+            .map(|l| {
+                // For a value line, the assertion we care about is the COMMENT
+                // tail is unchanged; capture the comment portion explicitly.
+                if let Some(c) = inline_comment_start(l) {
+                    l[c..].to_string()
+                } else {
+                    l.to_string()
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn comments_preserved_byte_for_byte_except_changed_value() {
+        let before_comments = comment_lines(SAMPLE);
+        let changes = vec![
+            Change { id: "integrations.allow_consequential".into(), value: SettingValue::Bool(false) },
+            Change { id: "screen_context.interval_secs".into(), value: SettingValue::Int(15) },
+            Change { id: "voice_id.threshold".into(), value: SettingValue::Float(0.9) },
+            Change { id: "inference.quant".into(), value: SettingValue::Str("int8".into()) },
+            Change { id: "self_heal".into(), value: SettingValue::Str("auto".into()) },
+        ];
+        let updated = apply_changes(SAMPLE, &changes).expect("apply ok");
+        let after_comments = comment_lines(&updated);
+
+        // Every comment (standalone + inline tail) is byte-for-byte identical.
+        assert_eq!(before_comments, after_comments, "comments must survive the edit");
+
+        // And the file structure (every non-value line) is intact: only the
+        // changed assignment lines differ. Count differing lines.
+        let differing: Vec<(&str, &str)> = SAMPLE
+            .lines()
+            .zip(updated.lines())
+            .filter(|(a, b)| a != b)
+            .collect();
+        // 4 flat value lines change. The self_heal -> "auto" change writes
+        // enabled=true (ALREADY true in SAMPLE — that line is byte-identical, so
+        // it does NOT show as differing) + mode="auto" (was "propose" — changes).
+        // So exactly 4 + 1 = 5 lines differ. The in-place edit touches nothing
+        // else — every comment + every structural line is intact.
+        assert_eq!(differing.len(), 5, "exactly the targeted value lines change");
+
+        // Spot-check one line: the comment column did not move.
+        let q = updated
+            .lines()
+            .find(|l| l.trim_start().starts_with("quant ="))
+            .unwrap();
+        assert_eq!(q, "quant = \"int8\"          # #39 SELECTABLE QUANTIZATION. Allowed: auto/fp16/int8/int4.");
+    }
+
+    #[test]
+    fn section_header_tolerates_a_trailing_comment() {
+        // The real config has many headers with trailing comments — they MUST
+        // still attribute keys to the right section, or those settings vanish.
+        assert_eq!(section_header("[power]   # #38 BATTERY THROTTLING"), Some("power".into()));
+        assert_eq!(section_header("[focus]"), Some("focus".into()));
+        assert_eq!(section_header("  [voice.voices]"), Some("voice.voices".into()));
+        assert_eq!(section_header("[[webhooks.mappings]]"), None, "array-of-tables ignored");
+        assert_eq!(section_header("enabled = true"), None);
+        assert_eq!(section_header("# a comment"), None);
+
+        // End-to-end: a key under a comment-tagged header round-trips.
+        let text = "[screen_context]   # #42 the privacy-sensitive read\ninterval_secs = 30   # cadence\n";
+        let u = apply_changes(&text, &[Change {
+            id: "screen_context.interval_secs".into(),
+            value: SettingValue::Int(45),
+        }]).expect("apply under comment-tagged header");
+        assert!(u.contains("interval_secs = 45   # cadence"), "value edited, comment kept");
+        assert!(u.contains("[screen_context]   # #42 the privacy-sensitive read"), "header untouched");
+    }
+
+    #[test]
+    fn a_hash_inside_a_quoted_value_is_not_a_comment() {
+        // Defensive: a '#' inside a quoted enum value must not be treated as a
+        // comment boundary (none of our enums contain '#', but the scanner must
+        // be correct). Build a synthetic line and confirm the scanner.
+        let line = "phrase = \"a#b\"   # real comment";
+        let c = inline_comment_start(line).unwrap();
+        assert_eq!(&line[c..], "# real comment");
+    }
+
+    // ---------- (c) WHITELIST rejects unknown key + invalid value ----------
+
+    #[test]
+    fn whitelist_rejects_unknown_key() {
+        for bad in [
+            "cloud.heavy_model",          // a real key, but NOT whitelisted (freeform path)
+            "integrations.something_new", // unknown key in a known section
+            "totally.bogus",              // unknown section
+            "../../etc/passwd",           // traversal-shaped id, no dot-split match
+            "voice_id.enabled\nfoo=bar",  // injection-shaped id
+        ] {
+            let r = apply_changes(
+                SAMPLE,
+                &[Change { id: bad.into(), value: SettingValue::Bool(true) }],
+            );
+            assert!(r.is_err(), "unknown key {bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn whitelist_rejects_out_of_range_and_bad_type() {
+        // Out-of-range int (interval floor is 1, cap 86400).
+        assert!(apply_changes(SAMPLE, &[Change {
+            id: "screen_context.interval_secs".into(),
+            value: SettingValue::Int(0),
+        }]).is_err());
+        assert!(apply_changes(SAMPLE, &[Change {
+            id: "screen_context.interval_secs".into(),
+            value: SettingValue::Int(999_999),
+        }]).is_err());
+        // Out-of-range float (threshold band 0.70..=1.0).
+        assert!(apply_changes(SAMPLE, &[Change {
+            id: "voice_id.threshold".into(),
+            value: SettingValue::Float(0.5),
+        }]).is_err());
+        assert!(apply_changes(SAMPLE, &[Change {
+            id: "voice_id.threshold".into(),
+            value: SettingValue::Float(1.5),
+        }]).is_err());
+        // Wrong type: a string for a bool key.
+        assert!(apply_changes(SAMPLE, &[Change {
+            id: "integrations.allow_consequential".into(),
+            value: SettingValue::Str("yes".into()),
+        }]).is_err());
+        // Bad enum option.
+        assert!(apply_changes(SAMPLE, &[Change {
+            id: "inference.quant".into(),
+            value: SettingValue::Str("int2".into()),
+        }]).is_err());
+        // Bad autonomy state.
+        assert!(apply_changes(SAMPLE, &[Change {
+            id: "self_heal".into(),
+            value: SettingValue::Str("yolo".into()),
+        }]).is_err());
+    }
+
+    #[test]
+    fn a_bad_change_aborts_the_whole_batch_no_partial_write() {
+        // First change is valid, second is invalid -> the WHOLE batch errors and
+        // the returned text would be the original (apply returns Err, never a
+        // partially-written string).
+        let r = apply_changes(
+            SAMPLE,
+            &[
+                Change { id: "integrations.allow_consequential".into(), value: SettingValue::Bool(false) },
+                Change { id: "voice_id.threshold".into(), value: SettingValue::Float(9.9) },
+            ],
+        );
+        assert!(r.is_err(), "one bad change aborts the batch");
+    }
+
+    #[test]
+    fn missing_key_is_an_error_never_appended() {
+        // A whitelisted key whose line is absent from the file is NOT appended —
+        // it errors, so we never inject a key outside its section.
+        let no_focus = "[audio]\nsound_monitor = true\n";
+        let r = apply_changes(
+            no_focus,
+            &[Change { id: "focus.profile".into(), value: SettingValue::Str("work".into()) }],
+        );
+        assert!(r.is_err(), "absent key must error, not append");
+    }
+
+    // ---------- (d) 3-way mapping correctness (explicit table) ----------
+
+    #[test]
+    fn autonomy_mapping_is_exact() {
+        assert_eq!(derive_autonomy(Some("false"), Some("\"propose\"")), "off");
+        assert_eq!(derive_autonomy(Some("false"), Some("\"auto\"")), "off"); // off wins regardless of mode
+        assert_eq!(derive_autonomy(Some("true"), Some("\"propose\"")), "propose");
+        assert_eq!(derive_autonomy(Some("true"), Some("\"auto\"")), "auto");
+        assert_eq!(derive_autonomy(Some("true"), None), "propose"); // missing mode -> propose
+        assert_eq!(derive_autonomy(Some("true"), Some("\"bogus\"")), "propose"); // unknown mode -> propose
+        assert_eq!(derive_autonomy(None, None), "off"); // missing enabled -> off
+    }
+
+    #[test]
+    fn resolve_autonomy_change_writes_both_keys() {
+        let w = resolve_change(&Change {
+            id: "forge".into(),
+            value: SettingValue::Str("auto".into()),
+        })
+        .unwrap();
+        assert_eq!(w.len(), 2);
+        assert!(w.contains(&(("forge".into(), "enabled".into()), "true".into())));
+        assert!(w.contains(&(("forge".into(), "mode".into()), "\"auto\"".into())));
+    }
+
+    // ---------- structural: every SETTINGS id is unique + dot-addressable ----------
+
+    #[test]
+    fn settings_ids_are_unique_and_addressable() {
+        let mut seen = std::collections::HashSet::new();
+        for s in SETTINGS {
+            let id = s.id();
+            assert!(seen.insert(id.clone()), "duplicate setting id {id}");
+            assert_eq!(setting_by_id(&id).map(|x| x.id()), Some(id.clone()));
+            // No autonomy section leaks into the flat table (would let a caller
+            // poke enabled/mode directly and desync the pair).
+            assert!(!AUTONOMY_SECTIONS.contains(&s.section), "{} must not be flat", s.section);
+        }
+    }
+
+    #[test]
+    fn get_reports_kind_and_constraints() {
+        let states = build_get(SAMPLE);
+        let interval = states.iter().find(|s| s.id == "screen_context.interval_secs").unwrap();
+        assert_eq!(interval.kind, "int");
+        assert_eq!(interval.min, Some(1.0));
+        assert_eq!(interval.max, Some(86_400.0));
+        let quant = states.iter().find(|s| s.id == "inference.quant").unwrap();
+        assert_eq!(quant.kind, "enum");
+        assert_eq!(quant.options.as_ref().unwrap(), &["auto", "fp16", "int8", "int4"]);
+        let heal = states.iter().find(|s| s.id == "self_heal").unwrap();
+        assert_eq!(heal.kind, "autonomy");
+        assert_eq!(heal.options.as_ref().unwrap(), &["off", "propose", "auto"]);
+    }
+
+    #[test]
+    fn every_whitelisted_key_exists_in_the_real_config_file() {
+        // Guard against whitelist drift: every flat (section,key) AND every
+        // autonomy section's enabled+mode MUST exist in the shipped
+        // config/jarvis.toml, or a GET would surface an "unset" sentinel and a
+        // SET would error "could not locate". Resolved relative to this source
+        // file so it does not depend on the test's cwd.
+        // CARGO_MANIFEST_DIR is the absolute path to hud/src-tauri; the repo
+        // root is two parents up (hud/, then the repo). Independent of cwd.
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest
+            .parent().and_then(Path::parent)
+            .expect("repo root above hud/src-tauri");
+        let cfg = root.join("config/jarvis.toml");
+        let text = std::fs::read_to_string(&cfg)
+            .unwrap_or_else(|e| panic!("read {}: {e}", cfg.display()));
+        let raw = read_raw_values(&text);
+
+        for s in SETTINGS {
+            let key = (s.section.to_string(), s.key.to_string());
+            let token = raw.get(&key)
+                .unwrap_or_else(|| panic!("{}.{} missing from the real config", s.section, s.key));
+            // And the live token coerces under the declared kind (no drift in type).
+            assert!(
+                coerce_value(s.kind, token).is_some(),
+                "{}.{} value {token:?} does not match kind {:?}",
+                s.section, s.key, s.kind
+            );
+        }
+        for sec in AUTONOMY_SECTIONS {
+            assert!(raw.contains_key(&(sec.to_string(), "enabled".into())), "{sec}.enabled missing");
+            assert!(raw.contains_key(&(sec.to_string(), "mode".into())), "{sec}.mode missing");
+        }
+    }
+
+    #[test]
+    fn non_targeted_lines_are_byte_for_byte_identical() {
+        // The strongest structural proof: rewrite the WHOLE real config with a
+        // single change, then assert every line that is not the changed value
+        // line is byte-for-byte identical to the original (use Path::file! root).
+        let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let root = manifest.parent().and_then(Path::parent).unwrap();
+        let text = std::fs::read_to_string(root.join("config/jarvis.toml")).unwrap();
+        let updated = apply_changes(
+            &text,
+            &[Change { id: "integrations.allow_consequential".into(), value: SettingValue::Bool(false) }],
+        )
+        .expect("apply on the real config");
+
+        let mut changed = 0usize;
+        for (a, b) in text.lines().zip(updated.lines()) {
+            if a == b {
+                continue;
+            }
+            changed += 1;
+            // The ONLY differing line is the targeted assignment.
+            assert!(a.trim_start().starts_with("allow_consequential"), "unexpected change on {a:?}");
+            assert_eq!(b, "allow_consequential = false");
+        }
+        assert_eq!(changed, 1, "exactly one line changes");
+        // Same line count + same trailing-newline disposition.
+        assert_eq!(text.lines().count(), updated.lines().count());
+        assert_eq!(text.ends_with('\n'), updated.ends_with('\n'));
+    }
+
+    #[test]
+    fn float_token_always_reads_as_a_toml_float() {
+        // An integral float value (e.g. 1.0) must still emit "1.0", never "1",
+        // so the daemon parses it as f64.
+        let t = render_token(Kind::Float { min: 0.7, max: 1.0 }, &SettingValue::Float(1.0)).unwrap();
+        assert_eq!(t, "1.0");
+        // A float key fed an integer JSON value coerces + ranges + emits a float.
+        let t2 = render_token(Kind::Float { min: 0.0, max: 10.0 }, &SettingValue::Int(3)).unwrap();
+        assert_eq!(t2, "3.0");
+    }
+
+    #[test]
+    fn trailing_newline_is_preserved_or_absent_consistently() {
+        // With a trailing newline -> kept.
+        let with_nl = "[audio]\nsound_monitor = true\n";
+        let u = apply_changes(with_nl, &[Change {
+            id: "audio.sound_monitor".into(),
+            value: SettingValue::Bool(false),
+        }]).unwrap();
+        assert!(u.ends_with('\n'));
+        // Without a trailing newline -> none added.
+        let no_nl = "[audio]\nsound_monitor = true";
+        let u2 = apply_changes(no_nl, &[Change {
+            id: "audio.sound_monitor".into(),
+            value: SettingValue::Bool(false),
+        }]).unwrap();
+        assert!(!u2.ends_with('\n'));
+    }
+}

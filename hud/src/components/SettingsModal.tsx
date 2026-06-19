@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Frame from "./Frame";
+import SystemSettingsPanel from "./SystemSettingsPanel";
 import {
   BEARER_CREDENTIALS,
   Credential,
@@ -180,6 +181,10 @@ export default function SettingsModal({
   onClose: () => void;
 }) {
   const shell = inTauri();
+  // Which top-level Settings surface is showing. "credentials" is the existing
+  // keys/gates/policy view; "system" is the dedicated SYSTEM SETTINGS panel that
+  // edits config/jarvis.toml (batched, applied on a daemon restart).
+  const [tab, setTab] = useState<"credentials" | "system">("credentials");
   // The configured MCP servers that declare a token (mcp.status carries only the
   // usesToken bool — never a secret), so a server's token can be stored under its
   // mcp_<server>_token Keychain account through the SAME guarded path.
@@ -195,9 +200,43 @@ export default function SettingsModal({
 
   return (
     <div className="modal-backdrop" onClick={onClose}>
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
-        <Frame title="SETTINGS // CREDENTIALS" tag="com.jarvis.daemon">
-          <div className="body">
+      <div className="modal settings-modal" onClick={(e) => e.stopPropagation()}>
+        <Frame
+          title={tab === "system" ? "SETTINGS // SYSTEM CONFIG" : "SETTINGS // CREDENTIALS"}
+          tag="com.jarvis.daemon"
+        >
+          <div className="settings-tabs" role="tablist" aria-label="Settings sections">
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "credentials"}
+              className={`settings-tab${tab === "credentials" ? " active" : ""}`}
+              onClick={() => setTab("credentials")}
+            >
+              Credentials &amp; Gates
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "system"}
+              className={`settings-tab${tab === "system" ? " active" : ""}`}
+              onClick={() => setTab("system")}
+            >
+              System Settings
+            </button>
+          </div>
+
+          {tab === "system" ? (
+            <div className="body" role="tabpanel" aria-label="System Settings">
+              <SystemSettingsPanel />
+              <div className="field-row" style={{ justifyContent: "flex-end" }}>
+                <button className="icon-btn" onClick={onClose}>
+                  Close
+                </button>
+              </div>
+            </div>
+          ) : (
+          <div className="body" role="tabpanel" aria-label="Credentials &amp; Gates">
             <div className="cred-section-title">
               PANIC // EMERGENCY STOP (LOCKDOWN)
             </div>
@@ -278,6 +317,7 @@ export default function SettingsModal({
               </button>
             </div>
           </div>
+          )}
         </Frame>
       </div>
     </div>

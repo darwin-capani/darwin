@@ -12,6 +12,7 @@
 //! (`x-api-key` / `Authorization: Bearer`) the user explicitly triggers.
 
 mod command;
+mod config_settings;
 mod credentials;
 mod heal;
 mod takeover;
@@ -806,6 +807,9 @@ pub fn run() {
             heal::heal_proposal_detail,
             heal::heal_apply,
             command::send_command,
+            config_settings::config_get,
+            config_settings::config_set,
+            config_settings::daemon_restart,
             enter_takeover,
             exit_takeover
         ])
