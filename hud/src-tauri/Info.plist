@@ -32,6 +32,16 @@
 -->
 <plist version="1.0">
 <dict>
+  <!-- USER-VISIBLE APP NAME: the Dock label, Finder name, and the menu-bar app
+       menu all show "J.A.R.V.I.S.". The bundle FILE stays JARVIS.app (from
+       tauri.conf.json productName) so the updater + release assets are unaffected;
+       only the displayed name changes. CFBundleDisplayName drives the Dock/Finder;
+       CFBundleName drives the menu bar. -->
+  <key>CFBundleDisplayName</key>
+  <string>J.A.R.V.I.S.</string>
+  <key>CFBundleName</key>
+  <string>J.A.R.V.I.S.</string>
+
   <key>NSMicrophoneUsageDescription</key>
   <string>JARVIS uses the microphone for the voice assistant: the wake word, dictation, and one-time voice-id enrolment. Audio is processed on-device by default; nothing is recorded or uploaded unless you turn on a cloud voice tier.</string>
 
