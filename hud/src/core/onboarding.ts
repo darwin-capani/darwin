@@ -69,7 +69,7 @@ export const ONBOARDING_STEPS: readonly OnboardingStep[] = [
     title: "Welcome — JARVIS is armed but gated",
     body: [
       "JARVIS can see, hear, and act — but every consequential or outward action is GATED. Nothing reaches the world without passing the confirmation gate, the master switch, and (when enabled) the owner voice-id check.",
-      "Autonomy ships OFF: self-heal, the app forge, and the optimizer are all disabled by default and only ever PROPOSE until you turn them on. Answers stay on-device unless you opt into a cloud tier.",
+      "Autonomy is ARMED but propose-only: self-heal, the app forge, and the optimizer are enabled by default, yet they only ever PROPOSE — each one drafts a change and waits for you to apply it, never acting on its own. Answers stay on-device unless you opt into a cloud tier.",
       "This quick tour just points you at the existing setup surfaces. It never changes a setting or grants a permission for you — you do each gated step yourself.",
     ],
     route: null,

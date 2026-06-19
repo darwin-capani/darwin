@@ -125,8 +125,8 @@ body,
   inset: 0;
   z-index: 3;
   display: grid;
-  grid-template-rows: auto auto 1fr auto;
-  grid-template-columns: minmax(260px, 24vw) 1fr minmax(260px, 24vw);
+  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-columns: minmax(240px, 24vw) minmax(0, 1fr) minmax(240px, 24vw);
   grid-template-areas:
     "status status status"
     "latency latency latency"
@@ -147,6 +147,47 @@ body,
   flex-direction: column;
   gap: 12px;
   min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Panels keep their natural height; if the stack is taller than the column
+   (a small window), the COLUMN scrolls — nothing is ever clipped or overlapped. */
+.left-col > *,
+.right-col > * {
+  flex: 0 0 auto;
+}
+
+/* Thin, HUD-styled scrollbars for every scroll container introduced by the
+   responsive layout (columns, panel bodies, modal bodies) — the native bar
+   would clash with the cyan HUD. */
+.left-col,
+.right-col,
+.frame-inner {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(26, 214, 255, 0.3) transparent;
+}
+.left-col::-webkit-scrollbar,
+.right-col::-webkit-scrollbar,
+.frame-inner::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+.left-col::-webkit-scrollbar-track,
+.right-col::-webkit-scrollbar-track,
+.frame-inner::-webkit-scrollbar-track {
+  background: transparent;
+}
+.left-col::-webkit-scrollbar-thumb,
+.right-col::-webkit-scrollbar-thumb,
+.frame-inner::-webkit-scrollbar-thumb {
+  background: rgba(26, 214, 255, 0.26);
+  border-radius: 3px;
+}
+.left-col::-webkit-scrollbar-thumb:hover,
+.right-col::-webkit-scrollbar-thumb:hover,
+.frame-inner::-webkit-scrollbar-thumb:hover {
+  background: rgba(26, 214, 255, 0.5);
 }
 
 /* Center column holds the R3F core (painted by .core-layer beneath) plus the
@@ -207,6 +248,9 @@ body,
   display: flex;
   flex-direction: column;
   min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  overscroll-behavior: contain;
   background: var(--panel-bg);
   clip-path: polygon(
     var(--cut) 0,
@@ -352,8 +396,10 @@ svg.tri circle {
 .statusbar {
   grid-area: status;
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 18px;
+  column-gap: 14px;
+  row-gap: 4px;
   padding: 7px 16px;
   font-family: var(--mono);
   font-size: 10.5px;
@@ -570,7 +616,10 @@ svg.tri circle {
    sub-500ms reconnect flap never flashes the overlay at all. */
 .link-offline {
   position: absolute;
-  top: 46%;
+  /* Compact, just below the status + latency chrome (whose combined height is
+     roughly constant), in the dim band above the orb's bright core — never in the
+     sphere, never under the chrome. */
+  top: 158px;
   left: 50%;
   transform: translate(-50%, -50%);
   z-index: 6;
@@ -593,8 +642,8 @@ svg.tri circle {
 }
 
 .link-offline .big {
-  font-size: 20px;
-  margin-bottom: 6px;
+  font-size: 15px;
+  margin-bottom: 3px;
 }
 
 .link-offline .small {
@@ -3508,6 +3557,8 @@ svg.tri circle {
   flex-direction: column;
   gap: 12px;
   min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 /* ------------------------------------------------------------- diagnostics */
@@ -3879,6 +3930,16 @@ svg.tri circle {
 .modal {
   width: 500px;
   max-width: 92vw;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Let the framed body fill the height-capped modal so its inner scroll engages
+   (otherwise a tall body overflows the cap + gets cut off below the screen). */
+.modal > .frame {
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .modal .body {
@@ -4033,6 +4094,7 @@ svg.tri circle {
 /* The system tab is denser than credentials — give it more room. */
 .settings-modal {
   width: 640px;
+  max-height: 90vh;
 }
 
 /* The tab bar at the top of the Settings body. */
