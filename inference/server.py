@@ -1428,6 +1428,11 @@ def load_config():
         # only the repo we'd load IF present; the op is gated on the model
         # actually being downloaded, so this never forces a download.
         "vlm": DEFAULT_VLM,
+        # OPTIONAL on-device text->image diffusion checkpoint (op=generate_image).
+        # Like the VLM this default id is only what we'd load IF present; the op is
+        # gated on availability so it never forces a download, and an empty/unset
+        # [image].model still resolves to DEFAULT_IMAGE_MODEL (coerced below).
+        "image_model": DEFAULT_IMAGE_MODEL,
         "engine": DEFAULT_TTS_ENGINE,
         # "" = resolve from TTS_ENGINE_DEFAULTS for the active engine; the
         # engine knows its own default repo/voice, so the empty string keeps
@@ -1473,6 +1478,7 @@ def load_config():
     models = cfg.get("models", {})
     speech = cfg.get("speech", {})
     inference = cfg.get("inference", {})
+    image = cfg.get("image", {})
     sources = (
         ("llm", models, "llm", str),
         ("stt", models, "stt", str),
@@ -1486,6 +1492,10 @@ def load_config():
         # #37 SPECULATIVE DECODING (OFF/neutral): the master gate + the draft id.
         ("speculative", inference, "speculative", bool),
         ("draft_model", inference, "draft_model", str),
+        # [image].model — the operator's on-device diffusion id. Empty/unset is
+        # coerced to DEFAULT_IMAGE_MODEL after the loop; the op still reports
+        # image_model_unavailable when the package/weights are absent.
+        ("image_model", image, "model", str),
     )
     for key, section, cfg_key, conv in sources:
         if not isinstance(section, dict) or cfg_key not in section:
@@ -1526,6 +1536,12 @@ def load_config():
             )
             continue
         settings[key] = value
+    # [image].model: an explicit EMPTY value resolves to the canonical default
+    # (image generation has a real default model, unlike draft_model which is
+    # legitimately empty=off). The op still reports image_model_unavailable when
+    # the diffusion package/weights are absent — this only picks the id.
+    if not str(settings["image_model"]).strip():
+        settings["image_model"] = DEFAULT_IMAGE_MODEL
     # [speech].openers: a non-empty list of non-empty strings, validated as a
     # whole (a half-applied opener bank would desync the daemon's filename
     # index -> opener text mapping). An INVALID list disables the bank
