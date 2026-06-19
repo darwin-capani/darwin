@@ -1882,29 +1882,70 @@ roots = []                     # EXPLICIT codebase-root allowlist, SHIPS EMPTY.
         let root = manifest.parent().and_then(Path::parent).unwrap();
         let text = std::fs::read_to_string(root.join("config/jarvis.toml")).unwrap();
 
+        // DRIFT-PROOF BY CONSTRUCTION: read each field's CURRENT shipped value and
+        // pick a target proven to DIFFER (asserted below). This keeps the "exactly
+        // five lines change" guard SOUND no matter what the installer later
+        // populates for any of these keys — a target that happened to equal the
+        // shipped value would silently be a no-op and drop the changed count (this
+        // test broke once when a release set vision.model to the literal it used).
+        // The assert_ne! turns any future collision into a loud, obvious failure
+        // here instead of a confusing off-by-one count mismatch.
+        let cur = build_get(&text);
+        let cur_str = |id: &str| match get_value(&cur, id) {
+            SettingValue::Str(s) => s,
+            other => panic!("expected {id} to be a string, got {other:?}"),
+        };
+        let cur_list = |id: &str| match get_value(&cur, id) {
+            SettingValue::StrList(l) => l,
+            other => panic!("expected {id} to be a list, got {other:?}"),
+        };
+        let cur_f = |id: &str| match get_value(&cur, id) {
+            SettingValue::Float(f) => f,
+            other => panic!("expected {id} to be a float, got {other:?}"),
+        };
+
+        // Distinct, validation-passing targets (absolute roots; in-range [0,8] budget).
+        let t_vision = "rt-sentinel/vlm".to_string();
+        let t_docroots = vec!["/rt-sentinel/notes".to_string()];
+        let t_coderoots = vec!["/rt-sentinel/proj".to_string()];
+        let t_warm = vec!["rt-sentinel/warm-model".to_string()];
+        let t_budget = if cur_f("models.local_budget_gib") != 2.5 { 2.5 } else { 3.5 };
+
+        // Every target genuinely differs from the shipped value => all five lines change.
+        assert_ne!(t_vision, cur_str("vision.model"), "pick a vision.model target that differs from the shipped config");
+        assert_ne!(t_docroots, cur_list("docsearch.roots"), "pick docsearch.roots that differ from the shipped config");
+        assert_ne!(t_coderoots, cur_list("code.roots"), "pick code.roots that differ from the shipped config");
+        assert_ne!(t_warm, cur_list("models.local_warm"), "pick local_warm that differs from the shipped config");
+        assert_ne!(t_budget, cur_f("models.local_budget_gib"), "pick a budget that differs from the shipped config");
+
         let changes = vec![
-            // A distinct sentinel id (NOT the shipped default) so this line always
-            // changes regardless of what config/jarvis.toml ships vision.model as —
-            // this test exercises the round-trip mechanics, not a specific model id.
-            Change { id: "vision.model".into(), value: SettingValue::Str("test-org/distinct-vlm-sentinel".into()) },
-            Change { id: "docsearch.roots".into(), value: SettingValue::StrList(vec!["/Users/me/Notes".into()]) },
-            Change { id: "code.roots".into(), value: SettingValue::StrList(vec!["/Users/me/proj".into()]) },
-            Change { id: "models.local_warm".into(), value: SettingValue::StrList(vec!["mlx-community/Qwen3-0.6B-Instruct-4bit".into()]) },
-            Change { id: "models.local_budget_gib".into(), value: SettingValue::Float(2.5) },
+            Change { id: "vision.model".into(), value: SettingValue::Str(t_vision.clone()) },
+            Change { id: "docsearch.roots".into(), value: SettingValue::StrList(t_docroots.clone()) },
+            Change { id: "code.roots".into(), value: SettingValue::StrList(t_coderoots.clone()) },
+            Change { id: "models.local_warm".into(), value: SettingValue::StrList(t_warm.clone()) },
+            Change { id: "models.local_budget_gib".into(), value: SettingValue::Float(t_budget) },
         ];
         let updated = apply_changes(&text, &changes).expect("apply on the real config");
         let states = build_get(&updated);
-        assert_eq!(get_value(&states, "vision.model"), SettingValue::Str("test-org/distinct-vlm-sentinel".into()));
-        assert_eq!(get_value(&states, "docsearch.roots"), SettingValue::StrList(vec!["/Users/me/Notes".into()]));
-        assert_eq!(get_value(&states, "code.roots"), SettingValue::StrList(vec!["/Users/me/proj".into()]));
-        assert_eq!(get_value(&states, "models.local_warm"), SettingValue::StrList(vec!["mlx-community/Qwen3-0.6B-Instruct-4bit".into()]));
-        assert_eq!(get_value(&states, "models.local_budget_gib"), SettingValue::Float(2.5));
+        assert_eq!(get_value(&states, "vision.model"), SettingValue::Str(t_vision));
+        assert_eq!(get_value(&states, "docsearch.roots"), SettingValue::StrList(t_docroots));
+        assert_eq!(get_value(&states, "code.roots"), SettingValue::StrList(t_coderoots));
+        assert_eq!(get_value(&states, "models.local_warm"), SettingValue::StrList(t_warm));
+        assert_eq!(get_value(&states, "models.local_budget_gib"), SettingValue::Float(t_budget));
 
-        // Exactly five lines changed; same line count + trailing-newline state.
+        // Exactly five lines changed (sound: all five targets provably differ above);
+        // same line count + trailing-newline state => no collateral change.
         let changed = text.lines().zip(updated.lines()).filter(|(a, b)| a != b).count();
         assert_eq!(changed, 5, "exactly the five targeted lines change");
         assert_eq!(text.lines().count(), updated.lines().count());
         assert_eq!(text.ends_with('\n'), updated.ends_with('\n'));
+        // Comments preserved: no full-line comment ever changes (the value lines'
+        // inline trailing comments are covered by the dedicated comment tests).
+        for (a, b) in text.lines().zip(updated.lines()) {
+            if a.trim_start().starts_with('#') {
+                assert_eq!(a, b, "a comment line must never change");
+            }
+        }
     }
 
     #[test]
