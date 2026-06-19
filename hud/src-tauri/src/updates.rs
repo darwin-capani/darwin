@@ -68,7 +68,7 @@ impl UpdateCheck {
         }
     }
     fn up_to_date() -> Self {
-        Self { status: "up_to_date".into(), detail: "JARVIS is up to date.".into(), version: None }
+        Self { status: "up_to_date".into(), detail: "JARVIS is on the latest version.".into(), version: None }
     }
     fn error(detail: impl Into<String>) -> Self {
         Self { status: "error".into(), detail: detail.into(), version: None }
