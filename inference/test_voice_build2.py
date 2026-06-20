@@ -92,7 +92,7 @@ class MultilingualModelSelection(unittest.TestCase):
         orig = server._elevenlabs_synth_pcm
 
         def fake_seam(voice_id, model, api_key, text, timeout_s=server.ELEVENLABS_TIMEOUT_S,
-                      audio_tag=None, stability=None, style=None):
+                      audio_tag=None, stability=None, style=None, locators=None):
             seen_models.append(model)
             samples = np.zeros(2400, dtype="<i2")
             samples[1000:1100] = 8000

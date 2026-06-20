@@ -59,7 +59,7 @@ def _install_stubs(engine, rec, el_pcm=None, el_raises=None):
     orig_seam = server._elevenlabs_synth_pcm
 
     def fake_seam(voice_id, model, api_key, text, timeout_s=server.ELEVENLABS_TIMEOUT_S,
-                  audio_tag=None, stability=None, style=None):
+                  audio_tag=None, stability=None, style=None, locators=None):
         rec.el_calls += 1
         rec.last_el_args = {
             "voice_id": voice_id,

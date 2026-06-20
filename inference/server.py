@@ -306,6 +306,27 @@ ELEVENLABS_TIMEOUT_S = 15.0
 # request — the key, and the header that carries it. Used by the redaction guard.
 _ELEVENLABS_HEADER = "xi-api-key"
 
+# STREAMING TTS (OPT-IN, latency tier): the SAME TTS surface as the blocking seam
+# but hitting POST /v1/text-to-speech/{voice_id}/stream, which returns the audio as
+# chunked-transfer binary instead of one buffered body. We request the SAME PCM
+# output (pcm_24000) so the concatenated chunks decode through the IDENTICAL
+# _pcm16_to_float32 + _write_wav pipeline — no new decoder, no new pip dependency
+# (stdlib urllib reads the chunked body for us). This LOWERS time-to-first-byte but
+# is INERT by default: `STREAM_TTS` ships False, so the default speak path is the
+# existing blocking _elevenlabs_synth_pcm BYTE-FOR-BYTE, and any streaming error
+# FALLS BACK to it. `optimize_streaming_latency` (0-4; deprecated upstream but still
+# accepted) trades a little quality for lower latency; we pin a conservative level.
+# A true bidirectional WebSocket (wss .../stream-input multi-context) is intentionally
+# NOT used: the stdlib has no WebSocket client, so a clean WS path would require a new
+# pip dependency (e.g. `websockets`) — out of scope for this dependency-free seam. The
+# HTTP /stream path already delivers the latency win with urllib alone.
+ELEVENLABS_STREAM_OUTPUT_FORMAT = "pcm_24000"
+ELEVENLABS_STREAM_LATENCY = 3
+ELEVENLABS_STREAM_CHUNK_BYTES = 16384
+# Module-level DEFAULT for the streaming tier. SHIPS OFF — flip to True (or pass
+# stream=True per call) to opt in. While False, speak() behaves exactly as today.
+STREAM_TTS = False
+
 # --- build 2/2 ElevenLabs endpoints + model selection ----------------------
 # CLONE: POST /v1/voices/add (multipart name + audio sample) -> {"voice_id"}.
 # The voice_id is NON-secret (the daemon stores it like any EL voice id); the
@@ -356,6 +377,43 @@ ELEVENLABS_SFX_URL = "https://api.elevenlabs.io/v1/sound-generation"
 ELEVENLABS_SFX_OUTPUT_FORMAT = "pcm_24000"
 ELEVENLABS_SFX_DURATION_MIN = 0.5
 ELEVENLABS_SFX_DURATION_MAX = 22.0
+
+# VOICE DESIGN (prompt-to-voice): a TWO-STEP cloud flow that mints a brand-new
+# NON-secret voice_id from a TEXT DESCRIPTION (no audio sample uploaded, unlike
+# clone). Step 1 POST /v1/text-to-voice/design ({"voice_description", optional
+# "text"}) -> {"previews": [{"generated_voice_id", ...}, ...]}; we take the FIRST
+# preview's generated_voice_id. Step 2 POST /v1/text-to-voice ({"voice_name",
+# "voice_description", "generated_voice_id"}) -> {"voice_id"} which is the saved
+# library voice. Like TTS/clone, the key rides ONLY the xi-api-key header (never
+# URL/query/log). There is NO on-device voice designer, so this is a PURE cloud
+# capability: gated on the key, INERT (honest 'unavailable', never a faked id)
+# without one. EL requires the description be 20-1000 chars; bad/short input just
+# raises in the seam and surfaces as a clean ok:false (never a fabricated voice).
+ELEVENLABS_DESIGN_URL = "https://api.elevenlabs.io/v1/text-to-voice/design"
+ELEVENLABS_DESIGN_CREATE_URL = "https://api.elevenlabs.io/v1/text-to-voice"
+ELEVENLABS_DESIGN_DESC_MIN = 20
+ELEVENLABS_DESIGN_DESC_MAX = 1000
+
+# PRONUNCIATION DICTIONARIES: a TEXT-ONLY cloud capability (no audio leaves the
+# device on the create leg) that mints a NON-secret pronunciation dictionary from
+# a list of replacement rules. Step 1 POST /v1/pronunciation-dictionaries/add-from-
+# rules ({"name", "rules": [{"string_to_replace", "type": "alias"|"phoneme",
+# "alias"/"phoneme", ...}]}) -> {"id", "version_id", ...}. Both ids are NON-secret
+# (the daemon stores them like any EL id); the key is secret and rides ONLY the
+# xi-api-key header (never URL/query/log). The minted (id, version_id) pair is then
+# applied to a TTS turn via the speak body field `pronunciation_dictionary_locators`
+# ([{"pronunciation_dictionary_id", "version_id"}], up to 3, applied in order) —
+# folded ADDITIVELY into the TTS payload by `_build_elevenlabs_payload` ONLY when a
+# non-empty locators list is threaded through, so a speak with no locators is
+# byte-for-byte today's. There is NO on-device equivalent: this is a PURE cloud
+# capability, gated on the key, INERT (honest 'unavailable', never a fabricated id)
+# without one. EL requires a non-empty rules list; bad input just raises in the seam
+# and surfaces as a clean ok:false (never a fabricated dictionary).
+ELEVENLABS_PRONUNCIATION_URL = (
+    "https://api.elevenlabs.io/v1/pronunciation-dictionaries/add-from-rules"
+)
+# EL applies pronunciation dictionaries to a TTS turn in order and caps the count.
+ELEVENLABS_PRONUNCIATION_MAX_LOCATORS = 3
 
 
 def _is_non_english_lang(lang):
@@ -424,7 +482,40 @@ def _redact_elevenlabs(s):
     return s.replace(_ELEVENLABS_HEADER, "[redacted-header]")
 
 
-def _build_elevenlabs_payload(voice_id, model, text, audio_tag=None, stability=None, style=None):
+def _normalize_pronunciation_locators(locators):
+    """Validate + normalize a list of pronunciation-dictionary LOCATORS for a TTS
+    turn, returning a fresh list of {"pronunciation_dictionary_id", "version_id"}
+    dicts (at most EL's cap) or [] when nothing valid was passed. PURE; no network.
+
+    Each locator must carry a non-empty string `pronunciation_dictionary_id`; the
+    `version_id` is OPTIONAL (omitted -> EL uses the latest version) and only kept
+    when it is a non-empty string. A non-list, an empty list, or entries missing a
+    dictionary id all read as 'none' so a malformed value can never reach the wire —
+    and, crucially, so the ABSENT case folds NOTHING into the payload (keeping the
+    no-locators speak path byte-for-byte today's). Order is preserved (EL applies
+    locators in order); the list is truncated to EL's max so an over-long input is
+    clamped rather than rejected."""
+    if not isinstance(locators, list):
+        return []
+    out = []
+    for loc in locators:
+        if not isinstance(loc, dict):
+            continue
+        did = loc.get("pronunciation_dictionary_id")
+        if not (isinstance(did, str) and did.strip()):
+            continue
+        entry = {"pronunciation_dictionary_id": did}
+        vid = loc.get("version_id")
+        if isinstance(vid, str) and vid.strip():
+            entry["version_id"] = vid
+        out.append(entry)
+        if len(out) >= ELEVENLABS_PRONUNCIATION_MAX_LOCATORS:
+            break
+    return out
+
+
+def _build_elevenlabs_payload(voice_id, model, text, audio_tag=None, stability=None,
+                              style=None, locators=None):
     """Build the ElevenLabs TTS request JSON (as a dict) for `voice_id`/`model`.
 
     #33 ADAPTIVE PROSODY: the rich surface is EL-v3-GATED here too (defense in
@@ -434,7 +525,14 @@ def _build_elevenlabs_payload(voice_id, model, text, audio_tag=None, stability=N
     be spoken literally and a non-v3 model never gets v3-only settings. PURE; no
     network — split out from the seam so the payload shaping is unit-testable without
     HTTP. The daemon already withholds these fields off the v3 path, so this is a
-    belt-and-suspenders gate, not the primary one."""
+    belt-and-suspenders gate, not the primary one.
+
+    PRONUNCIATION DICTIONARIES: `locators` is OPTIONAL — when a non-empty list of
+    valid {pronunciation_dictionary_id[, version_id]} locators is threaded through,
+    it is folded ADDITIVELY into `pronunciation_dictionary_locators` (on EVERY model
+    — pronunciation rules are not v3-gated). When ABSENT (None / empty / all
+    invalid) the field is OMITTED entirely so the payload is BYTE-FOR-BYTE today's —
+    keeping the existing no-locators tests + the default speak path unchanged."""
     resolved = model or ELEVENLABS_DEFAULT_MODEL
     body = {"text": text, "model_id": resolved}
     if resolved == ELEVENLABS_V3_MODEL:
@@ -448,11 +546,16 @@ def _build_elevenlabs_payload(voice_id, model, text, audio_tag=None, stability=N
             settings["style"] = float(style)
         if settings:
             body["voice_settings"] = settings
+    # ADDITIVE + model-agnostic: only present when a non-empty locators list survives
+    # validation, so the no-locators path is unchanged byte-for-byte.
+    norm_locators = _normalize_pronunciation_locators(locators)
+    if norm_locators:
+        body["pronunciation_dictionary_locators"] = norm_locators
     return body
 
 
 def _elevenlabs_synth_pcm(voice_id, model, api_key, text, timeout_s=ELEVENLABS_TIMEOUT_S,
-                          audio_tag=None, stability=None, style=None):
+                          audio_tag=None, stability=None, style=None, locators=None):
     """THE network seam (and the ONLY place that touches the ElevenLabs network).
 
     POST the text to ElevenLabs TTS for `voice_id` and return raw PCM16 mono bytes
@@ -464,6 +567,11 @@ def _elevenlabs_synth_pcm(voice_id, model, api_key, text, timeout_s=ELEVENLABS_T
     #33 ADAPTIVE PROSODY: `audio_tag`/`stability`/`style` are the EL-v3 rich surface;
     they are folded into the payload by `_build_elevenlabs_payload`, which acts on
     them ONLY when `model` is the EL-v3 model (EL-v3-gated, defense in depth).
+
+    PRONUNCIATION DICTIONARIES: `locators` is the OPTIONAL list of pronunciation-
+    dictionary locators ([{pronunciation_dictionary_id[, version_id]}]) the daemon
+    threads through; `_build_elevenlabs_payload` folds it in ADDITIVELY only when it
+    is a non-empty valid list, so a speak with no locators is byte-for-byte today's.
 
     This function is the mock seam: tests monkeypatch
     `server._elevenlabs_synth_pcm` to return canned bytes (or raise) WITHOUT
@@ -485,7 +593,7 @@ def _elevenlabs_synth_pcm(voice_id, model, api_key, text, timeout_s=ELEVENLABS_T
 
     url = f"{ELEVENLABS_API_BASE}/{voice_id}?output_format={ELEVENLABS_OUTPUT_FORMAT}"
     payload = json.dumps(
-        _build_elevenlabs_payload(voice_id, model, text, audio_tag, stability, style)
+        _build_elevenlabs_payload(voice_id, model, text, audio_tag, stability, style, locators)
     ).encode("utf-8")
     req = urllib.request.Request(url, data=payload, method="POST")
     # The key rides ONLY this header. Never a URL/query param, never logged.
@@ -494,6 +602,78 @@ def _elevenlabs_synth_pcm(voice_id, model, api_key, text, timeout_s=ELEVENLABS_T
     req.add_header("Accept", "audio/pcm")
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         return resp.read()
+
+
+def _elevenlabs_synth_pcm_stream(voice_id, model, api_key, text,
+                                 timeout_s=ELEVENLABS_TIMEOUT_S, audio_tag=None,
+                                 stability=None, style=None, locators=None,
+                                 latency=ELEVENLABS_STREAM_LATENCY,
+                                 chunk_bytes=ELEVENLABS_STREAM_CHUNK_BYTES):
+    """THE STREAMING network seam (OPT-IN low-latency sibling of
+    `_elevenlabs_synth_pcm`). POST `text` to the ElevenLabs STREAMING TTS endpoint
+    (`/v1/text-to-speech/{voice_id}/stream`) and return raw PCM16 mono @24kHz bytes
+    by reading the CHUNKED-TRANSFER response incrementally and concatenating the
+    chunks. The wire body is IDENTICAL to the blocking seam (same
+    `_build_elevenlabs_payload`), only the URL differs (it gains `/stream` plus an
+    `optimize_streaming_latency` query param) — so the returned bytes are the same
+    pcm_24000 the blocking path produces and they decode through the IDENTICAL
+    `_pcm16_to_float32` + `_write_wav` pipeline.
+
+    LATENCY WIN: chunked transfer lets the first audio bytes arrive before the whole
+    clip is synthesized, lowering time-to-first-byte. We still buffer the full clip
+    here (the daemon owns playback of a finished WAV), but the server can begin
+    writing/forwarding sooner. STDLIB-ONLY (urllib) — no WebSocket, no new pip
+    dependency; `urlopen`'s file-like response yields the de-chunked bytes via
+    `resp.read(chunk_bytes)`.
+
+    KEY HYGIENE — identical to the blocking seam: `api_key` rides ONLY the
+    `xi-api-key` request header (constant `_ELEVENLABS_HEADER`), NEVER the URL/query
+    (only the NON-secret output_format + latency level go on the query string) and
+    NEVER a log line. Raises on any HTTP/transport error; the caller catches
+    EVERYTHING and FALLS BACK to the blocking seam, so streaming never fails a turn.
+
+    Mock seam: tests monkeypatch `server._elevenlabs_synth_pcm_stream` to return
+    canned bytes (or raise) WITHOUT touching the network — there is no real HTTP in
+    any test.
+
+    CREDENTIAL+RUNTIME GATED: reached ONLY from the speak op's elevenlabs branch
+    when the streaming tier is opted in (stream=True / STREAM_TTS), and only after
+    the daemon's tier+key+offline gate."""
+    import urllib.request
+
+    if not api_key:
+        # Defense in depth: never send a keyless cloud request (same gate as blocking).
+        raise ValueError("ElevenLabs streaming synthesis requires an API key (none supplied)")
+    if not voice_id:
+        raise ValueError("ElevenLabs streaming synthesis requires a voice id")
+
+    # Only NON-secret shaping goes on the query string; the key stays in the header.
+    lat = int(latency) if isinstance(latency, (int, float)) and not isinstance(latency, bool) else ELEVENLABS_STREAM_LATENCY
+    lat = max(0, min(4, lat))
+    url = (
+        f"{ELEVENLABS_API_BASE}/{voice_id}/stream"
+        f"?output_format={ELEVENLABS_STREAM_OUTPUT_FORMAT}"
+        f"&optimize_streaming_latency={lat}"
+    )
+    payload = json.dumps(
+        _build_elevenlabs_payload(voice_id, model, text, audio_tag, stability, style, locators)
+    ).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST")
+    # The key rides ONLY this header. Never a URL/query param, never logged.
+    req.add_header(_ELEVENLABS_HEADER, api_key)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "audio/pcm")
+    chunks = []
+    step = chunk_bytes if isinstance(chunk_bytes, int) and chunk_bytes > 0 else ELEVENLABS_STREAM_CHUNK_BYTES
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        # Read the chunked-transfer body incrementally and concatenate the PCM. An
+        # empty read signals the de-chunked stream is complete.
+        while True:
+            chunk = resp.read(step)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def _pcm16_to_float32(pcm_bytes):
@@ -633,6 +813,154 @@ def _elevenlabs_clone_voice(name, sample_path, api_key, timeout_s=ELEVENLABS_TIM
     if not isinstance(voice_id, str) or not voice_id:
         raise ValueError("ElevenLabs clone response had no voice_id")
     return voice_id
+
+
+def _build_design_payload(description, text=None):
+    """Build the ElevenLabs text-to-voice DESIGN request JSON (a dict) for step 1.
+    `voice_description` is required (EL needs 20-1000 chars); `text` is OPTIONAL
+    (a sample line EL speaks in the preview) and is included only when it is a
+    non-empty string. PURE; no network — split out so the payload shaping is
+    unit-testable without HTTP."""
+    body = {"voice_description": description}
+    if isinstance(text, str) and text.strip():
+        body["text"] = text
+    return body
+
+
+def _build_design_create_payload(name, description, generated_voice_id):
+    """Build the ElevenLabs text-to-voice CREATE request JSON (a dict) for step 2 —
+    saves a chosen preview into the library. All three fields are REQUIRED by EL:
+    `voice_name` (display name), `voice_description` (same description used to
+    design), `generated_voice_id` (from the step-1 preview). PURE; no network."""
+    return {
+        "voice_name": name,
+        "voice_description": description,
+        "generated_voice_id": generated_voice_id,
+    }
+
+
+def _elevenlabs_design_voice(description, name, api_key, text=None,
+                             timeout_s=ELEVENLABS_TIMEOUT_S):
+    """THE voice-design network seam (the ONLY place design touches the EL net).
+
+    Runs the TWO-STEP prompt-to-voice flow and returns the new NON-secret
+    voice_id (a string):
+      1. POST /v1/text-to-voice/design ({voice_description, optional text}) and
+         read the FIRST preview's `generated_voice_id`.
+      2. POST /v1/text-to-voice ({voice_name, voice_description,
+         generated_voice_id}) and read the saved library `voice_id`.
+    The `api_key` rides ONLY the `xi-api-key` request header — never the URL/query,
+    never a log line. Raises on any HTTP/transport/parse error (or a missing
+    preview/voice_id); the caller (`design_voice`) catches EVERYTHING and returns a
+    clean no-voice result, so a failure never fabricates a voice id and never
+    crashes a turn.
+
+    This is the mock seam: tests monkeypatch `server._elevenlabs_design_voice` to
+    return a stub voice_id (or raise) WITHOUT touching the network. Stdlib-only.
+
+    CREDENTIAL+RUNTIME GATED: reached ONLY from the design_voice op, which the
+    daemon enters only after its key gate. Unlike clone, NO audio sample leaves the
+    device — the voice is minted purely from the TEXT description."""
+    import json as _json
+    import urllib.request
+
+    if not api_key:
+        # Defense in depth: never send a keyless cloud request.
+        raise ValueError("ElevenLabs voice design requires an API key (none supplied)")
+    if not (isinstance(description, str) and description.strip()):
+        raise ValueError("ElevenLabs voice design requires a non-empty description")
+    if not (isinstance(name, str) and name.strip()):
+        raise ValueError("ElevenLabs voice design requires a display name")
+
+    def _post_json(url, body):
+        payload = _json.dumps(body).encode("utf-8")
+        req = urllib.request.Request(url, data=payload, method="POST")
+        # The key rides ONLY this header. Never a URL/query param, never logged.
+        req.add_header(_ELEVENLABS_HEADER, api_key)
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Accept", "application/json")
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            return _json.loads(resp.read().decode("utf-8"))
+
+    # Step 1: design previews from the text description.
+    designed = _post_json(ELEVENLABS_DESIGN_URL, _build_design_payload(description, text))
+    previews = designed.get("previews") if isinstance(designed, dict) else None
+    if not isinstance(previews, list) or not previews:
+        raise ValueError("ElevenLabs design response had no previews")
+    first = previews[0]
+    generated_voice_id = first.get("generated_voice_id") if isinstance(first, dict) else None
+    if not isinstance(generated_voice_id, str) or not generated_voice_id:
+        raise ValueError("ElevenLabs design preview had no generated_voice_id")
+
+    # Step 2: save the chosen preview into the library as a real voice.
+    created = _post_json(
+        ELEVENLABS_DESIGN_CREATE_URL,
+        _build_design_create_payload(name, description, generated_voice_id),
+    )
+    voice_id = created.get("voice_id") if isinstance(created, dict) else None
+    if not isinstance(voice_id, str) or not voice_id:
+        raise ValueError("ElevenLabs create-voice response had no voice_id")
+    return voice_id
+
+
+def _build_pronunciation_payload(name, rules):
+    """Build the ElevenLabs add-from-rules request JSON (a dict) for `name`/`rules`.
+    `name` (a non-empty identifier) and `rules` (a non-empty list of rule dicts) are
+    BOTH required by EL. Each rule is passed through as-is — EL validates the per-rule
+    shape ({string_to_replace, type:'alias'|'phoneme', alias/phoneme, ...}); we only
+    enforce the outer shape so a malformed top-level value never reaches the wire.
+    PURE; no network — split out so the payload shaping is unit-testable without HTTP."""
+    if not (isinstance(name, str) and name.strip()):
+        raise ValueError("pronunciation dictionary requires a non-empty name")
+    if not isinstance(rules, list) or not rules:
+        raise ValueError("pronunciation dictionary requires a non-empty rules list")
+    return {"name": name, "rules": rules}
+
+
+def _elevenlabs_create_pronunciation(name, rules, api_key, timeout_s=ELEVENLABS_TIMEOUT_S):
+    """THE pronunciation-dictionary network seam (the ONLY place this capability
+    touches the EL net). POST {name, rules} to /v1/pronunciation-dictionaries/add-
+    from-rules and return the NON-secret (dictionary_id, version_id) pair (both
+    strings). The `api_key` rides ONLY the `xi-api-key` request header — never the
+    URL/query, never a log line. Raises on any HTTP/transport/parse error (or a
+    missing id/version_id); the caller (`create_pronunciation`) catches EVERYTHING
+    and returns a clean no-dictionary result, so a failure never fabricates an id and
+    never crashes a turn.
+
+    Unlike clone/Scribe, NO audio leaves the device — the dictionary is minted purely
+    from the text rules. This is the mock seam: tests monkeypatch
+    `server._elevenlabs_create_pronunciation` to return a stub pair (or raise) WITHOUT
+    touching the network. Stdlib-only (urllib).
+
+    CREDENTIAL+RUNTIME GATED: reached ONLY from the create_pronunciation op, which the
+    daemon enters only after its key gate."""
+    import json as _json
+    import urllib.request
+
+    if not api_key:
+        # Defense in depth: never send a keyless cloud request.
+        raise ValueError("ElevenLabs pronunciation dictionary requires an API key (none supplied)")
+    if not (isinstance(name, str) and name.strip()):
+        raise ValueError("ElevenLabs pronunciation dictionary requires a non-empty name")
+    if not isinstance(rules, list) or not rules:
+        raise ValueError("ElevenLabs pronunciation dictionary requires a non-empty rules list")
+
+    payload = _json.dumps(_build_pronunciation_payload(name, rules)).encode("utf-8")
+    req = urllib.request.Request(ELEVENLABS_PRONUNCIATION_URL, data=payload, method="POST")
+    # The key rides ONLY this header. Never a URL/query param, never logged.
+    req.add_header(_ELEVENLABS_HEADER, api_key)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        raw = resp.read()
+    data = _json.loads(raw.decode("utf-8"))
+    dictionary_id = data.get("id") if isinstance(data, dict) else None
+    version_id = data.get("version_id") if isinstance(data, dict) else None
+    if not isinstance(dictionary_id, str) or not dictionary_id:
+        raise ValueError("ElevenLabs pronunciation response had no id")
+    if not isinstance(version_id, str) or not version_id:
+        raise ValueError("ElevenLabs pronunciation response had no version_id")
+    return dictionary_id, version_id
 
 
 def _elevenlabs_scribe_transcribe(audio_path, api_key, model=ELEVENLABS_SCRIBE_MODEL,
@@ -3834,6 +4162,63 @@ class InferenceEngine:
             )
             return None
 
+    def design_voice(self, description, name, el_key):
+        """PROMPT-TO-VOICE design: mint a brand-new voice from the TEXT
+        `description` (display name `name`) via ElevenLabs text-to-voice and return
+        the new voice_id string, or None on any failure (the daemon then keeps
+        Kokoro / the user's existing voice — never fails the turn).
+
+        Unlike clone_voice, NO audio sample leaves the device — the voice is
+        synthesized purely from the text description. The voice_id is NON-secret
+        (the daemon stores it like any EL voice id); the key is secret and is used
+        only to call the seam — never logged here. Blocking; runs on a worker
+        thread."""
+        description = (description or "").strip()
+        name = (name or "").strip()
+        try:
+            voice_id = _elevenlabs_design_voice(description, name, el_key)
+            if isinstance(voice_id, str) and voice_id:
+                return voice_id
+            log.warning("ElevenLabs voice design produced no voice_id; user keeps their existing voice")
+            return None
+        except Exception as exc:
+            # ANY error (network, HTTP, auth, timeout, missing key/description,
+            # decode) -> no voice. Log only the redacted exception CLASS — never
+            # exc_info / the message (could echo a key-bearing URL fragment).
+            log.warning(
+                "ElevenLabs voice design failed (%s); user keeps their existing voice",
+                _redact_elevenlabs(type(exc).__name__),
+            )
+            return None
+
+    def create_pronunciation(self, name, rules, el_key):
+        """Mint a NON-secret pronunciation dictionary from `name` + `rules` via
+        ElevenLabs add-from-rules and return the (dictionary_id, version_id) pair, or
+        None on any failure (the daemon then simply has no dictionary to apply —
+        never fails a turn, never fabricates an id).
+
+        Unlike clone_voice, NO audio leaves the device — the dictionary is built
+        purely from the text rules. Both ids are NON-secret (the daemon stores them
+        like any EL id and later threads them into a speak as pronunciation locators);
+        the key is secret and is used only to call the seam — never logged here.
+        Blocking; runs on a worker thread."""
+        try:
+            result = _elevenlabs_create_pronunciation(name, rules, el_key)
+            if (isinstance(result, tuple) and len(result) == 2
+                    and all(isinstance(x, str) and x for x in result)):
+                return result
+            log.warning("ElevenLabs pronunciation dictionary produced no id; nothing to apply")
+            return None
+        except Exception as exc:
+            # ANY error (network, HTTP, auth, timeout, missing key/name/rules, decode)
+            # -> no dictionary. Log only the redacted exception CLASS — never exc_info
+            # / the message (could echo a key-bearing URL fragment).
+            log.warning(
+                "ElevenLabs pronunciation dictionary failed (%s); nothing to apply",
+                _redact_elevenlabs(type(exc).__name__),
+            )
+            return None
+
     def sound_effect(self, prompt, el_key, duration_s=None, prompt_influence=None):
         """Generate a NON-speech SOUND-EFFECT cue from `prompt` via ElevenLabs
         sound-generation and return a pipeline WAV path, or None on any failure.
@@ -3875,8 +4260,44 @@ class InferenceEngine:
             return audio
         return (audio.astype(np.float32) * v)
 
+    def _elevenlabs_synth_pcm_with_optional_stream(self, voice_id, model, api_key, text,
+                                                   audio_tag=None, stability=None,
+                                                   style=None, locators=None, stream=False):
+        """Fetch ElevenLabs PCM, preferring the OPT-IN streaming seam when `stream`
+        is on and FALLING BACK to the blocking seam on ANY streaming error.
+
+        With `stream` False (the default) this is BYTE-FOR-BYTE the blocking call:
+        it invokes `_elevenlabs_synth_pcm` directly and the streaming seam is never
+        touched — so the existing speak path is unchanged.
+
+        With `stream` True it tries `_elevenlabs_synth_pcm_stream` first; if that
+        raises (network/HTTP/timeout/decode) we log ONLY the redacted exception
+        CLASS and retry once via the blocking seam, so a streaming failure degrades
+        to today's behaviour rather than failing. (If the blocking retry also
+        raises, the exception propagates to `speak`, which falls back to Kokoro.)
+        The key reaches only the seams (which put it in the xi-api-key header) —
+        never logged here. Returns the raw PCM bytes (possibly empty)."""
+        if stream:
+            try:
+                return _elevenlabs_synth_pcm_stream(
+                    voice_id, model, api_key, text,
+                    audio_tag=audio_tag, stability=stability, style=style, locators=locators,
+                )
+            except Exception as exc:
+                # Streaming failed -> fall back to the blocking seam (same wire body).
+                # Log ONLY the redacted exception class (never the message/URL/key).
+                log.warning(
+                    "ElevenLabs streaming synthesis failed (%s); falling back to blocking synth",
+                    _redact_elevenlabs(type(exc).__name__),
+                )
+        return _elevenlabs_synth_pcm(
+            voice_id, model, api_key, text,
+            audio_tag=audio_tag, stability=stability, style=style, locators=locators,
+        )
+
     def _elevenlabs_to_wav(self, text, voice_id, model, api_key, lang=None,
-                           audio_tag=None, stability=None, style=None, volume=None):
+                           audio_tag=None, stability=None, style=None, volume=None,
+                           locators=None, stream=False):
         """Synthesize `text` through the ElevenLabs cloud voice tier and write it
         to the SAME pipeline WAV the daemon expects (under state/tmp/). Returns the
         absolute path, or None when ElevenLabs produced no usable audio.
@@ -3901,9 +4322,13 @@ class InferenceEngine:
         import numpy as np
 
         model = self._resolve_elevenlabs_model(model, lang)
-        pcm = _elevenlabs_synth_pcm(
+        # STREAMING TTS (opt-in): when `stream` is on we hit the low-latency /stream
+        # seam and fall back to the blocking seam on any streaming error; with stream
+        # False (the default) this is the blocking seam BYTE-FOR-BYTE.
+        pcm = self._elevenlabs_synth_pcm_with_optional_stream(
             voice_id, model, api_key, _speakable(text),
-            audio_tag=audio_tag, stability=stability, style=style,
+            audio_tag=audio_tag, stability=stability, style=style, locators=locators,
+            stream=stream,
         )
         if not pcm:
             return None
@@ -3917,7 +4342,8 @@ class InferenceEngine:
         return self._write_wav(audio, ELEVENLABS_SAMPLE_RATE)
 
     def speak(self, text, voice=None, backend=None, voice_id=None, model=None, el_key=None,
-              lang=None, audio_tag=None, stability=None, style=None, rate=None, volume=None):
+              lang=None, audio_tag=None, stability=None, style=None, rate=None, volume=None,
+              locators=None, stream=None):
         """Synthesize `text` to a silence-trimmed 24kHz mono 16-bit WAV under
         state/tmp/ and return its absolute path. The daemon owns playback and
         deletion.
@@ -3946,12 +4372,23 @@ class InferenceEngine:
             is a gain applied to the produced WAV (the real "speak softly" on Kokoro
             too). `rate` is a coarse speaking-rate hint — applied to Kokoro by nudging
             the request speed within bounds; the EL leg keeps its model's pacing.
+        PRONUNCIATION DICTIONARIES: `locators` is the OPTIONAL list of pronunciation-
+        dictionary locators ([{pronunciation_dictionary_id[, version_id]}]) the daemon
+        threads through; under the ElevenLabs backend they are folded ADDITIVELY into
+        the TTS payload (ignored on the Kokoro path). With none set the wire is
+        unchanged.
+
         With nothing set (the daemon's shipped-OFF default sends none of these), the
         path is BYTE-FOR-BYTE today's. No real network call is added on any path."""
         text = (text or "").strip()
         if not text:
             raise ValueError("'text' must be non-empty for op=speak")
 
+        # STREAMING TTS is OPT-IN: an explicit per-call `stream` wins; otherwise the
+        # module default `STREAM_TTS` (ships False). With both False the EL leg uses
+        # the blocking seam BYTE-FOR-BYTE today's. Only consulted on the elevenlabs
+        # backend (Kokoro never streams over the cloud).
+        use_stream = STREAM_TTS if stream is None else bool(stream)
         use_elevenlabs = isinstance(backend, str) and backend.strip().lower() == "elevenlabs"
         if use_elevenlabs:
             try:
@@ -3962,7 +4399,7 @@ class InferenceEngine:
                     path = self._elevenlabs_to_wav(
                         text, voice_id, model, el_key, lang,
                         audio_tag=audio_tag, stability=stability, style=style,
-                        volume=volume,
+                        volume=volume, locators=locators, stream=use_stream,
                     )
                 if path is not None:
                     return path
@@ -4674,6 +5111,43 @@ class InferenceServer:
                     "latency_ms": latency_ms(),
                 }
 
+            if op == "design_voice":
+                # CLOUD-ONLY prompt-to-voice design (ElevenLabs text-to-voice). The
+                # daemon emits this only after its key gate. text = the voice
+                # DESCRIPTION (EL needs 20-1000 chars); voice/name = the display
+                # name; el_key = the xi-api-key (request-body only, NEVER logged).
+                # Unlike clone_voice, NO audio sample leaves the device — the voice
+                # is minted purely from the text. There is NO on-device voice
+                # designer, so on any failure (or no key) -> ok:false (honest
+                # 'unavailable', never a fabricated voice_id). On success the daemon
+                # stores the returned voice_id (NON-secret) like any EL voice id.
+                description = req.get("text")
+                if not description or not isinstance(description, str):
+                    raise ValueError("'text' (voice description) is required for op=design_voice")
+                name = req.get("voice") or req.get("name")
+                if not name or not isinstance(name, str):
+                    raise ValueError("'voice' (voice display name) is required for op=design_voice")
+                el_key = req.get("el_key")
+                if el_key is not None and not isinstance(el_key, str):
+                    raise ValueError("'el_key' must be a string")
+                voice_id = await asyncio.to_thread(
+                    self.engine.design_voice, description, name, el_key
+                )
+                if voice_id:
+                    return {
+                        "id": rid,
+                        "ok": True,
+                        "voice_id": voice_id,
+                        "latency_ms": latency_ms(),
+                    }
+                # Honest unavailable: there is no on-device designer to substitute.
+                return {
+                    "id": rid,
+                    "ok": False,
+                    "error": "voice design unavailable (no voice produced)",
+                    "latency_ms": latency_ms(),
+                }
+
             if op == "sound_effect":
                 # CLOUD-ONLY sound-effect cue (ElevenLabs sound-generation). The
                 # daemon emits this only after its [voice].cloud_sfx + key gate.
@@ -4703,6 +5177,47 @@ class InferenceServer:
                     "id": rid,
                     "ok": False,
                     "error": "sound effects unavailable (cloud SFX tier off or no key)",
+                    "latency_ms": latency_ms(),
+                }
+
+            if op == "create_pronunciation":
+                # CLOUD-ONLY pronunciation dictionary (ElevenLabs add-from-rules). The
+                # daemon emits this only after its key gate. name = the dictionary
+                # display name; rules = the non-empty list of replacement rules
+                # ({string_to_replace, type:'alias'|'phoneme', alias/phoneme, ...});
+                # el_key = the xi-api-key (request-body only, NEVER logged). NO audio
+                # leaves the device — the dictionary is minted purely from the text
+                # rules. There is NO on-device equivalent, so on any failure (or no
+                # key) -> ok:false (honest 'unavailable', never a fabricated id). On
+                # success the daemon stores the returned NON-secret (dictionary_id,
+                # version_id) pair to later thread into a speak as pronunciation
+                # locators.
+                name = req.get("name")
+                if not name or not isinstance(name, str):
+                    raise ValueError("'name' (dictionary name) is required for op=create_pronunciation")
+                rules = req.get("rules")
+                if not isinstance(rules, list) or not rules:
+                    raise ValueError("'rules' (non-empty list) is required for op=create_pronunciation")
+                el_key = req.get("el_key")
+                if el_key is not None and not isinstance(el_key, str):
+                    raise ValueError("'el_key' must be a string")
+                result = await asyncio.to_thread(
+                    self.engine.create_pronunciation, name, rules, el_key
+                )
+                if result:
+                    dictionary_id, version_id = result
+                    return {
+                        "id": rid,
+                        "ok": True,
+                        "dictionary_id": dictionary_id,
+                        "version_id": version_id,
+                        "latency_ms": latency_ms(),
+                    }
+                # Honest unavailable: there is no on-device dictionary to substitute.
+                return {
+                    "id": rid,
+                    "ok": False,
+                    "error": "pronunciation dictionary unavailable (no dictionary produced)",
                     "latency_ms": latency_ms(),
                 }
 
@@ -4902,9 +5417,27 @@ class InferenceServer:
                 # `_normalize_speak_shape` so a bad/out-of-range value can never reach
                 # the synth path. NON-secret delivery hints (never the key/voice id).
                 audio_tag, stability, style, rate, volume = _normalize_speak_shape(req)
+                # OPTIONAL pronunciation-dictionary locators (NON-secret ids the daemon
+                # minted via op=create_pronunciation). Folded ADDITIVELY into the EL TTS
+                # payload ONLY when a non-empty list survives validation; ABSENT (the
+                # shipped default) -> byte-for-byte today's speak. Validated/clamped in
+                # `_normalize_pronunciation_locators` so a malformed value can never
+                # reach the wire. NON-secret (never the key/voice id).
+                pron_locators = req.get("pronunciation_locators")
+                if pron_locators is not None and not isinstance(pron_locators, list):
+                    raise ValueError("'pronunciation_locators' must be a list")
+                locators = _normalize_pronunciation_locators(pron_locators)
+                # OPTIONAL low-latency STREAMING TTS tier. Present only when the daemon
+                # opts in per-call; ABSENT (None) -> the module STREAM_TTS default
+                # (ships False), i.e. the existing blocking cloud synth. Only consulted
+                # on the elevenlabs backend; any streaming error falls back to the
+                # blocking seam (then Kokoro), so this never fails a turn. NON-secret.
+                stream = req.get("stream")
+                if stream is not None and not isinstance(stream, bool):
+                    raise ValueError("'stream' must be a boolean")
                 path = await asyncio.to_thread(
                     self.engine.speak, text, voice, backend, voice_id, model, el_key,
-                    lang, audio_tag, stability, style, rate, volume,
+                    lang, audio_tag, stability, style, rate, volume, locators, stream,
                 )
                 return {"id": rid, "ok": True, "path": path, "latency_ms": latency_ms()}
 
