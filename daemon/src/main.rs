@@ -1679,6 +1679,13 @@ async fn main() -> Result<()> {
             agents: agents.clone(),
             heavy_model: cfg.cloud.heavy_model.clone(),
             max_tokens: cfg.cloud.max_tokens,
+            // The SFX-cue Play button (play_cue) routes through trigger_cue, which
+            // needs the config (the sfx_enabled gate) + root (the cue cache) and a
+            // per-call inference client on the SAME inference socket the rest of the
+            // daemon uses. cfg is cheap to clone and read-only here.
+            cfg: (*cfg).clone(),
+            root: root.clone(),
+            inference_sock: sock_path.clone(),
         });
         let dispatcher = Arc::new(command::LiveDispatcher {
             memory: memory.clone(),
@@ -3312,7 +3319,6 @@ async fn trigger_sound_effect(
 /// SECURITY: the resolved key is read here ONLY to thread into the request body
 /// (server → xi-api-key); it is never logged/argv/telemetry — same handling as
 /// [`trigger_sound_effect`].
-#[allow(dead_code)] // Phase-2 command seam; wired to the cue command/intent surface next
 async fn trigger_cue(
     cfg: &Config,
     name: &str,
@@ -3366,6 +3372,42 @@ async fn trigger_cue(
             telemetry::emit("system", "sfx.cue.failed", json!({"cue": name}));
             Err(msg)
         }
+    }
+}
+
+/// `Send`-safe entry point for the HUD command channel's `play_cue` verb.
+///
+/// [`trigger_cue`] drives the SFX seam through `&mut dyn SfxGenerator`, whose
+/// trait object is not `Send` — so its future is not `Send` and cannot be awaited
+/// directly inside the `tokio::spawn`ed command-channel task (whose pipeline
+/// future is required to be `Send`). Rather than widen the SFX seam, we run the
+/// (genuinely non-`Send`) cue play to completion on a dedicated thread with its
+/// own current-thread runtime and hand back ONLY the `Send` `Result`. The cue's
+/// own gate is unchanged: switch-off / no-key / offline is still the honest silent
+/// no-op produced inside `trigger_cue`; this wrapper fabricates nothing. `el_key`
+/// is read ONLY inside `trigger_cue` (never on this thread's stack as a value we
+/// log or return). The wrapper opens its OWN per-call inference client on
+/// `inference_sock`, the same lazy-connect pattern the other background tasks use.
+pub(crate) async fn play_cue_for_command(
+    cfg: Config,
+    cue: String,
+    root: PathBuf,
+    inference_sock: PathBuf,
+) -> Result<std::path::PathBuf, String> {
+    let join = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return Err(format!("Couldn't start the cue runtime: {e}")),
+        };
+        rt.block_on(async move {
+            let mut infer = InferenceClient::new(inference_sock);
+            trigger_cue(&cfg, &cue, &root, &mut infer).await
+        })
+    });
+    // A panic on the cue thread becomes an honest failure, never a faked play.
+    match tokio::task::spawn_blocking(move || join.join()).await {
+        Ok(Ok(result)) => result,
+        _ => Err("I couldn't play that cue just now — nothing was produced.".to_string()),
     }
 }
 

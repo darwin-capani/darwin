@@ -96,6 +96,8 @@ struct RawCommand {
     #[serde(default)]
     id: String,
     #[serde(default)]
+    cue: String,
+    #[serde(default)]
     ts: Option<u64>,
 }
 
@@ -142,6 +144,14 @@ pub enum Command {
     /// the ONLY way to `lockdown::unlock()` (gates return to their configured
     /// values; the marker is removed). NEVER model-routed.
     Unlock,
+    /// PLAY a named, built-in SFX cue (the HUD's SFX-cue Play button). A DEDICATED
+    /// benign verb, NOT `ask` — it NEVER reaches the model/tool loop. The cue name
+    /// is validated in [`decide`] against the fixed catalog
+    /// ([`crate::sfx_cue::is_known_cue`]), so only a known cue can route; the daemon
+    /// then calls `trigger_cue` directly, whose own gate
+    /// ([`crate::voice_tier::sfx_enabled`] + offline check) turns switch-off / no-key
+    /// / offline into an honest silent no-op. There is no model/agent/tool path to it.
+    PlayCue { cue: String },
 }
 
 /// The pre-auth decision for one inbound line. PURE and exhaustively unit-tested:
@@ -231,6 +241,24 @@ fn decide(raw: &str) -> Decision {
         // the model. They still pass the SAME token + rate gate every command does.
         "panic" => Command::Panic,
         "unlock" => Command::Unlock,
+        // The HUD SFX-cue Play button. A benign verb that plays a NAMED built-in
+        // cue. The name is validated TWICE-over: non-empty AND a member of the
+        // fixed catalog (`sfx_cue::is_known_cue`). An empty or unknown cue is a
+        // BadRequest — it NEVER routes — keeping this verb's input as tight an
+        // allowlist as the command set itself. The play_cue gate (off/no-key/
+        // offline) is honest about availability downstream; here we only admit a
+        // structurally-valid, known cue.
+        "play_cue" => {
+            let cue = clamp_text(req.cue);
+            let cue = cue.trim();
+            if cue.is_empty() {
+                return Decision::BadRequest { reason: "play_cue requires a cue name" };
+            }
+            if !crate::sfx_cue::is_known_cue(cue) {
+                return Decision::BadRequest { reason: "play_cue requires a known cue name" };
+            }
+            Command::PlayCue { cue: cue.to_string() }
+        }
         // Anything else — including the empty string — is rejected here. There is
         // NO route for an unknown command.
         other => return Decision::UnknownCommand { cmd: other.to_string() },
@@ -291,6 +319,11 @@ pub trait CommandPipeline: Send + Sync {
     fn roster(&self) -> impl std::future::Future<Output = String> + Send;
     /// Read-only state snapshot (pending + agent state).
     fn state(&self) -> impl std::future::Future<Output = String> + Send;
+    /// Play a NAMED built-in SFX cue (already validated as a known cue by
+    /// [`decide`]). Delegates to the daemon's `trigger_cue`, whose gate handles
+    /// switch-off / no-key / offline as an HONEST silent no-op — the returned text
+    /// is the honest outcome (played / cached / unavailable), never a faked play.
+    fn play_cue(&self, cue: &str) -> impl std::future::Future<Output = String> + Send;
 }
 
 /// The seam to the confirmation gate + forge marker — the SECURITY-critical
@@ -571,6 +604,16 @@ where
             let reply = dispatcher.unlock().await;
             json!({"ok": true, "reply": reply, "locked": crate::lockdown::is_locked_down()})
         }
+        Command::PlayCue { cue } => {
+            // The HUD SFX-cue Play button. The cue name is already a validated
+            // catalog member (decide). Route into the daemon's `trigger_cue` via
+            // the pipeline — its gate (sfx_enabled + offline) makes switch-off /
+            // no-key / offline an HONEST silent no-op; we surface whatever it
+            // returns (played/cached/unavailable), never faking a play. The cue
+            // NAME is non-secret, so telemetry records it like the other verbs.
+            telemetry::emit("system", "command.routed", json!({"cmd": "play_cue", "cue": cue}));
+            json!({"ok": true, "reply": pipeline.play_cue(&cue).await})
+        }
     }
 }
 
@@ -679,6 +722,18 @@ pub struct LivePipeline {
     pub agents: Arc<crate::agents::AgentRegistry>,
     pub heavy_model: String,
     pub max_tokens: u32,
+    /// Full daemon config — the `play_cue` arm needs it to evaluate the SFX gate
+    /// ([`crate::voice_tier::sfx_enabled`] / the active tier) inside `trigger_cue`,
+    /// exactly as the spoken SFX path does. Cheap clone, read-only here.
+    pub cfg: crate::config::Config,
+    /// Daemon root — the cue WAV cache lives under `state/tmp/sfx-cache/`.
+    pub root: PathBuf,
+    /// The inference socket path. The command channel owns NO mutable
+    /// `InferenceClient` (the main loop holds the others); `play_cue` opens a fresh
+    /// per-call client on this socket, the same lazy-connect pattern the other
+    /// background tasks use — it spends a model call ONLY on a cache miss with the
+    /// gate open.
+    pub inference_sock: PathBuf,
 }
 
 impl LivePipeline {
@@ -751,6 +806,31 @@ impl CommandPipeline for LivePipeline {
             .map(|p| format!("A {} action is awaiting confirmation (id {}).", p.tool, p.id))
             .unwrap_or_else(|| "Nothing awaiting confirmation.".to_string());
         format!("{}\n{}", self.agents.roster_spoken(), pending)
+    }
+
+    async fn play_cue(&self, cue: &str) -> String {
+        // Delegate to the daemon's `play_cue_for_command`, the Send-safe wrapper
+        // around `trigger_cue`. That path performs the SAME cheap offline/switch
+        // pre-checks + the SAME Keychain read as the spoken SFX path, then
+        // plays/caches the cue or returns an HONEST unavailable/failed message.
+        // The el_key is read ONLY inside trigger_cue and threaded into the request
+        // — never logged, never surfaced here.
+        match crate::play_cue_for_command(
+            self.cfg.clone(),
+            cue.to_string(),
+            self.root.clone(),
+            self.inference_sock.clone(),
+        )
+        .await
+        {
+            // Played or cached: surface a short honest ack. We do NOT echo the WAV
+            // path (an internal cache path is not the user's business); the HUD
+            // already knows which cue it asked to play.
+            Ok(_path) => format!("Playing the {cue} cue."),
+            // switch-off / no-key / offline / generation failure: the honest line
+            // from trigger_cue, never a faked play.
+            Err(msg) => msg,
+        }
     }
 }
 
@@ -848,6 +928,7 @@ mod tests {
             (json!({"token": "t", "cmd": "deny", "id": "abc"}), true),
             (json!({"token": "t", "cmd": "dismiss_forge", "ts": 42}), true),
             (json!({"token": "t", "cmd": "policy", "text": "always allow the gmail_send action"}), true),
+            (json!({"token": "t", "cmd": "play_cue", "cue": "confirm"}), true),
         ];
         for (line, _ok) in cases {
             assert!(
@@ -879,6 +960,8 @@ mod tests {
             json!({"token": "t", "cmd": "dismiss_forge"}),
             json!({"token": "t", "cmd": "policy", "text": "   "}),
             json!({"token": "t", "cmd": "policy"}),
+            json!({"token": "t", "cmd": "play_cue", "cue": "   "}),
+            json!({"token": "t", "cmd": "play_cue"}),
         ];
         for line in bad {
             assert!(
@@ -886,6 +969,47 @@ mod tests {
                 "must be BadRequest: {line}"
             );
         }
+    }
+
+    /// SECURITY: the `play_cue` verb is an allowlist over the SFX catalog, not a
+    /// free-text field. A KNOWN cue routes; an UNKNOWN cue name is a BadRequest
+    /// (never routed) — keeping this benign verb's input as tight as the command
+    /// set itself. An empty cue is likewise rejected. This pins that `play_cue`
+    /// cannot become a smuggling channel for an arbitrary string.
+    #[test]
+    fn play_cue_admits_only_known_catalog_cues() {
+        // Every catalog cue is accepted and parses to the PlayCue variant.
+        for name in crate::sfx_cue::cue_names() {
+            let line = json!({"token": "t", "cmd": "play_cue", "cue": name}).to_string();
+            match decide(&line) {
+                Decision::Ok { command: Command::PlayCue { cue }, .. } => {
+                    assert_eq!(cue, name, "the validated cue name is carried verbatim");
+                }
+                other => panic!("known cue {name:?} must be Ok(PlayCue), got {other:?}"),
+            }
+        }
+        // An unknown cue name is a BadRequest — NOT routed, NOT UnknownCommand
+        // (the cmd is known; only the cue is not). The cmd itself stays valid.
+        for bad in ["kaboom", "explode", "rm -rf", "alert; drop", ""] {
+            let line = json!({"token": "t", "cmd": "play_cue", "cue": bad}).to_string();
+            assert!(
+                matches!(decide(&line), Decision::BadRequest { .. }),
+                "unknown/empty cue {bad:?} must be BadRequest (never routed)"
+            );
+        }
+        // Whitespace around a known cue is trimmed, then accepted.
+        let line = json!({"token": "t", "cmd": "play_cue", "cue": "  confirm  "}).to_string();
+        match decide(&line) {
+            Decision::Ok { command: Command::PlayCue { cue }, .. } => assert_eq!(cue, "confirm"),
+            other => panic!("trimmed known cue must be Ok(PlayCue), got {other:?}"),
+        }
+        // An entirely unknown cmd is STILL UnknownCommand (the allowlist boundary
+        // is unchanged by adding play_cue).
+        let line = json!({"token": "t", "cmd": "play_sound", "cue": "confirm"}).to_string();
+        assert!(
+            matches!(decide(&line), Decision::UnknownCommand { .. }),
+            "an unknown cmd remains UnknownCommand"
+        );
     }
 
     /// A non-JSON line is Malformed; an oversized line is Oversized (before parse).
@@ -935,6 +1059,8 @@ mod tests {
     struct MockPipeline {
         ask_calls: AtomicU32,
         last_agent: StdMutex<Option<String>>,
+        play_cue_calls: AtomicU32,
+        last_cue: StdMutex<Option<String>>,
     }
     impl CommandPipeline for MockPipeline {
         async fn ask(&self, text: &str, agent: Option<&str>) -> String {
@@ -946,6 +1072,11 @@ mod tests {
         async fn mission(&self, goal: &str) -> String { format!("mission:{goal}") }
         async fn roster(&self) -> String { "roster".into() }
         async fn state(&self) -> String { "state".into() }
+        async fn play_cue(&self, cue: &str) -> String {
+            self.play_cue_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_cue.lock().unwrap() = Some(cue.to_string());
+            format!("cue:{cue}")
+        }
     }
 
     #[derive(Default)]
@@ -1098,6 +1229,40 @@ mod tests {
         assert_eq!(dispatcher.last_policy_text.lock().unwrap().as_deref(), Some(phrase));
         // It did NOT route through the model pipeline (ask) — no model path to a policy.
         assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "policy never reaches the model");
+    }
+
+    /// The `play_cue` verb routes to the pipeline's dedicated `play_cue` arm with
+    /// the validated cue name — NOT to `ask` (so it NEVER reaches the model tool
+    /// loop). It is the HUD SFX-cue Play button: a benign, authenticated,
+    /// rate-passed verb with no model path.
+    #[tokio::test]
+    async fn play_cue_verb_routes_to_the_cue_arm_not_the_model() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "play_cue", "cue": "confirm"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "cue:confirm");
+        assert_eq!(pipeline.play_cue_calls.load(Ordering::SeqCst), 1, "reached the cue arm");
+        assert_eq!(pipeline.last_cue.lock().unwrap().as_deref(), Some("confirm"));
+        // It did NOT route through the model pipeline (ask) — no model path to a cue.
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "play_cue never reaches the model");
+    }
+
+    /// An UNKNOWN cue name is rejected as a bad_request through the handler and the
+    /// pipeline's cue arm is NEVER reached — the catalog allowlist holds end-to-end,
+    /// even with a valid token.
+    #[tokio::test]
+    async fn unknown_cue_is_rejected_through_the_handler() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "play_cue", "cue": "kaboom"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["error"], "bad_request", "unknown cue is a bad_request");
+        assert_eq!(pipeline.play_cue_calls.load(Ordering::SeqCst), 0, "unknown cue never routes");
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "and never reaches the model");
     }
 
     /// Task #12: the `panic` verb routes to the dispatcher's lockdown engage —
@@ -1336,6 +1501,7 @@ mod tests {
             async fn mission(&self, _g: &str) -> String { unreachable!() }
             async fn roster(&self) -> String { unreachable!() }
             async fn state(&self) -> String { unreachable!() }
+            async fn play_cue(&self, _cue: &str) -> String { unreachable!() }
         }
         let pipeline = Arc::new(ParkingPipeline);
         let dispatcher = Arc::new(ProbeDispatcher::default());
