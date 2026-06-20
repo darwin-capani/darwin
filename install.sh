@@ -14,12 +14,15 @@
 #
 # What it does (staged):
 #   1. PREFLIGHT  — macOS + arm64, Xcode CLT, Rust, Python 3.11, Node/npm.
-#                   AUTO-PROVISIONS the installable build prereqs (Rust via
-#                   rustup; Python 3.11 + Node via Homebrew, bootstrapping
-#                   Homebrew itself if absent) so a fresh Mac just works.
+#                   AUTO-PROVISIONS every installable build prereq so a fresh Mac
+#                   just works: the Xcode Command Line Tools (triggers Apple's
+#                   installer + WAITS for it), Rust via rustup, and Python 3.11 +
+#                   Node via Homebrew (bootstrapping Homebrew itself if absent).
 #                   Opt out with --no-provision (then a missing dep is fatal).
-#                   macOS / arm64 / Xcode CLT remain HONEST hard checks (CLT
-#                   needs the GUI installer; it cannot be installed unattended).
+#                   macOS / arm64 remain HONEST hard checks (no software fixes a
+#                   non-Apple-Silicon Mac). CLT has no unattended installer, so we
+#                   open its GUI dialog and poll until it verifies (one click,
+#                   like the Homebrew password prompt).
 #   2. PLACE      — copy the project tree into the install home (excluding
 #                   built/fetched dirs: target .venv node_modules .build state models)
 #   3. PYTHON ENV — python3.11 -m venv, upgrade pip, install the FULL dep set
@@ -282,6 +285,53 @@ find_brew() {
     return 0
 }
 
+# Is a USABLE Command Line Tools toolchain present? True only when a developer
+# dir is selected AND clang actually runs. The short-circuit is deliberate: we
+# never invoke clang until `xcode-select -p` succeeds, so mere DETECTION can't
+# trip macOS's own "install command line tools" GUI prompt out from under us.
+clt_present() {
+    xcode-select -p >/dev/null 2>&1 && clang --version >/dev/null 2>&1
+}
+
+# Ensure the Xcode Command Line Tools (clang / git / make) are installed — the
+# FOUNDATIONAL build prereq: Homebrew's bootstrap, the Rust linker, every native
+# `cargo build`, and `swift build` ALL require them. Run FIRST in preflight so the
+# brew/rustup/python/node steps that follow have a working toolchain.
+#
+# Unlike brew/rustup, CLT has NO silent unattended installer — `xcode-select
+# --install` opens a macOS GUI dialog and returns immediately. So we TRIGGER that
+# dialog and then WAIT (poll) until clang actually runs, with honest heartbeats
+# and a generous timeout. Same interaction model as the Homebrew password prompt:
+# the installer runs in Terminal, the user completes one OS dialog, we proceed
+# once it is really done. Returns 0 only when clang verifies; 1 on timeout / no
+# GUI session to complete the dialog (the caller then sets PREFLIGHT_FATAL).
+ensure_xcode_clt() {
+    clt_present && return 0
+
+    # Trigger Apple's GUI installer. Non-zero if a download is already in progress
+    # or the tools are partially present — harmless; we poll regardless. </dev/null
+    # so a piped stdin (curl | bash) can't wedge it.
+    ui_info "Opening the macOS ${UI_BRIGHT}Command Line Tools${UI_RESET} installer — click ${UI_BRIGHT}Install${UI_RESET} in the dialog and accept the licence."
+    xcode-select --install >/dev/null 2>&1 </dev/null || true
+
+    # Poll until clang works, up to ~40 min (the CLT download is ~1 GB and can be
+    # slow on a poor connection); the common case exits the instant clang runs.
+    # Heartbeat every 60s so a long download never looks hung, and the user can
+    # Ctrl-C if they dismissed the dialog.
+    local waited=0 max=2400
+    while ! clt_present; do
+        sleep 10
+        waited=$(( waited + 10 ))
+        if [ "$waited" -ge "$max" ]; then
+            return 1
+        fi
+        if [ $(( waited % 60 )) -eq 0 ]; then
+            ui_info "…still installing the Command Line Tools (${waited}s elapsed; this is a large download)."
+        fi
+    done
+    return 0
+}
+
 # Ensure Homebrew is available + on PATH for the rest of THIS process. Called
 # LAZILY — only when python3.11 OR node is missing (never on a fully-provisioned
 # machine). Returns 0 if brew is usable, 1 if it could not be made available
@@ -494,13 +544,37 @@ else
     ui_ok "macOS $OS_VER on $ARCH (Apple Silicon)"
 fi
 
-# --- Xcode Command Line Tools (needed for swift + native compiles) ---
-if xcode-select -p >/dev/null 2>&1; then
+# --- Xcode Command Line Tools (clang/git/make — the FOUNDATIONAL build prereq:
+#     Homebrew, the Rust linker, every native compile + swift build need them;
+#     AUTO-PROVISIONED when missing, exactly like Rust/Python/Node below) ---
+if clt_present; then
     ui_ok "Xcode Command Line Tools: $(xcode-select -p)"
-else
+elif [ "$MODE" = "check" ]; then
     ui_warn "Xcode Command Line Tools not found."
-    ui_note "install with:  xcode-select --install   (then re-run this installer)"
+    if [ "$DO_PROVISION" -eq 1 ]; then
+        plan "xcode-select --install   # opens the macOS dialog; the installer WAITS for it (no fatal in a normal install)"
+    else
+        ui_note "--no-provision: install with:  xcode-select --install   (then re-run)"
+        PREFLIGHT_FATAL=1
+    fi
+elif [ "$DO_PROVISION" -eq 0 ]; then
+    # Opt-out: revert to the old detect + instruct + fatal behavior.
+    ui_warn "Xcode Command Line Tools not found."
+    ui_note "--no-provision: install with:  xcode-select --install   (then re-run)"
+    ui_err "The Command Line Tools (clang/git/make) are required to build JARVIS."
     PREFLIGHT_FATAL=1
+else
+    # MODE=install + provisioning ON: trigger Apple's CLT installer and WAIT for
+    # it to finish (it has no unattended mode — see ensure_xcode_clt). This runs
+    # FIRST so Homebrew/rustup below have a working toolchain.
+    ui_info "Xcode Command Line Tools not found — installing them now (a macOS dialog will open)."
+    if ensure_xcode_clt; then
+        ui_ok "Xcode Command Line Tools ready: $(xcode-select -p)"
+    else
+        ui_err "Xcode Command Line Tools did not install in time (or there is no GUI session to complete the dialog)."
+        ui_note "Run  xcode-select --install  in Terminal, complete the dialog, then re-run this installer."
+        PREFLIGHT_FATAL=1
+    fi
 fi
 
 # --- Rust toolchain (auto-provisioned via rustup when missing) ---
@@ -634,10 +708,11 @@ else
 fi
 
 # PREFLIGHT_FATAL is now set ONLY for genuinely-unrecoverable gaps: non-macOS,
-# non-arm64, a missing Xcode CLT (the GUI-only installer cannot run unattended),
-# a --no-provision run with a real missing dep, or a provisioning step that
-# actually FAILED. Missing-but-installable deps are auto-provisioned above in a
-# normal install and are NOT fatal.
+# non-arm64, a --no-provision run with a real missing dep, or a provisioning step
+# that actually FAILED (including the Xcode CLT install timing out / having no GUI
+# session to complete its dialog). Missing-but-installable deps — CLT, Rust,
+# Python 3.11, Node — are auto-provisioned above in a normal install and are NOT
+# fatal unless their install genuinely fails.
 if [ "$PREFLIGHT_FATAL" -ne 0 ]; then
     if [ "$MODE" = "check" ]; then
         ui_warn "Preflight reported gaps (above). Resolve them, then run a real install."
