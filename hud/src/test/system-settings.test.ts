@@ -103,6 +103,7 @@ const BACKEND_WHITELIST_IDS: string[] = [
   "voice.cloud_stt",
   "voice.cloud_sfx",
   "voice.stream_tts",
+  "voice.event_cues",
   "voice.pronunciation_dictionary_id",
   "voice.pronunciation_dictionary_version",
   "voice.adaptive_prosody",
@@ -292,6 +293,21 @@ describe("new ElevenLabs [voice] daemon keys are surfaced in the HUD catalog", (
     expect(hint).toContain("falls back");
   });
 
+  it("event_cues is an honest opt-in toggle in the Voice & Speech group", () => {
+    const e = entryById("voice.event_cues");
+    expect(e?.control).toBe("toggle");
+    expect(e?.group).toBe("Voice & Speech");
+    expect(e?.label).toBe("Event sound cues");
+    const hint = e!.hint.toLowerCase();
+    // Honest: opt-in (ships off), fire-and-forget cue on key events, never changes
+    // the outcome, requires cloud_sfx + a key (silent no-op otherwise).
+    expect(hint).toContain("opt-in");
+    expect(hint).toContain("ships off");
+    expect(hint).toContain("fire-and-forget");
+    expect(hint).toContain("cloud_sfx");
+    expect(hint).toMatch(/silent no-op/);
+  });
+
   it("pronunciation dictionary id + version are text fields (empty = none)", () => {
     for (const id of [
       "voice.pronunciation_dictionary_id",
@@ -318,6 +334,7 @@ describe("new ElevenLabs [voice] daemon keys are surfaced in the HUD catalog", (
       "voice.cloud_stt",
       "voice.cloud_sfx",
       "voice.stream_tts",
+      "voice.event_cues",
       "voice.pronunciation_dictionary_id",
       "voice.pronunciation_dictionary_version",
     ]) {
@@ -326,7 +343,7 @@ describe("new ElevenLabs [voice] daemon keys are surfaced in the HUD catalog", (
   });
 
   it("the new toggles/text fields are never marked dangerous (no confirm gate)", () => {
-    for (const id of ["voice.cloud_sfx", "voice.stream_tts"]) {
+    for (const id of ["voice.cloud_sfx", "voice.stream_tts", "voice.event_cues"]) {
       const e = entryById(id)!;
       expect(e.danger).toBeFalsy();
       expect(isDangerousChange(e, true)).toBe(false);

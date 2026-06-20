@@ -408,6 +408,16 @@ export const CATALOG: CatalogEntry[] = [
       "Active only when the resolved backend is ElevenLabs; the server FALLS BACK to the standard blocking path on ANY streaming error (a turn is never failed by the streaming leg). Inert on on-device Kokoro. Delivery timing only — never a gate.",
   },
   {
+    id: "voice.event_cues",
+    group: "Voice & Speech",
+    label: "Event sound cues",
+    control: "toggle",
+    hint:
+      "Opt-in (ships OFF): plays a short fire-and-forget ElevenLabs cue on a couple of key events (a confirmed action plays \"success\", a denied one plays \"notify\"). " +
+      "The cue is spawned AFTER the action already completed, so it NEVER blocks, delays, or changes the outcome/reply. " +
+      "Requires cloud_sfx + an EL key (rides the same gate); without that it is a silent no-op. Delivery only — never a gate.",
+  },
+  {
     id: "voice.pronunciation_dictionary_id",
     group: "Voice & Speech",
     label: "Pronunciation dictionary id",

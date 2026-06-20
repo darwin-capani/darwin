@@ -512,8 +512,12 @@ pub trait Dispatcher: Send + Sync {
 /// `state/ipc/command.sock` (creating the `0700` dir, `chmod 0600` on the
 /// socket), then accepts HUD connections and handles each JSONL line through
 /// [`handle_line`]. Spawned from main.rs alongside the other socket servers.
-pub async fn serve<P, D>(command_sock: PathBuf, pipeline: Arc<P>, dispatcher: Arc<D>)
-where
+pub async fn serve<P, D>(
+    command_sock: PathBuf,
+    pipeline: Arc<P>,
+    dispatcher: Arc<D>,
+    event_cues: bool,
+) where
     P: CommandPipeline + 'static,
     D: Dispatcher + 'static,
 {
@@ -534,7 +538,7 @@ where
                 let dispatcher = dispatcher.clone();
                 let limiter = limiter.clone();
                 tokio::spawn(async move {
-                    handle_conn(stream, pipeline, dispatcher, limiter).await;
+                    handle_conn(stream, pipeline, dispatcher, limiter, event_cues).await;
                 });
             }
             Err(e) => warn!(error = %e, "command channel accept failed"),
@@ -578,8 +582,9 @@ async fn handle_conn<P, D>(
     pipeline: Arc<P>,
     dispatcher: Arc<D>,
     limiter: Arc<Mutex<RateLimiter>>,
+    event_cues: bool,
 ) where
-    P: CommandPipeline,
+    P: CommandPipeline + 'static,
     D: Dispatcher,
 {
     let (read_half, mut write_half) = stream.into_split();
@@ -590,7 +595,7 @@ async fn handle_conn<P, D>(
         match reader.read_line(&mut line).await {
             Ok(0) => return, // client closed
             Ok(_) => {
-                let reply = handle_line(&line, &pipeline, &dispatcher, &limiter).await;
+                let reply = handle_line(&line, &pipeline, &dispatcher, &limiter, event_cues).await;
                 let mut out = reply.to_string();
                 out.push('\n');
                 if write_half.write_all(out.as_bytes()).await.is_err() {
@@ -623,9 +628,10 @@ async fn handle_line<P, D>(
     pipeline: &Arc<P>,
     dispatcher: &Arc<D>,
     limiter: &Arc<Mutex<RateLimiter>>,
+    event_cues: bool,
 ) -> Value
 where
-    P: CommandPipeline,
+    P: CommandPipeline + 'static,
     D: Dispatcher,
 {
     let (token, command) = match decide(raw) {
@@ -669,7 +675,7 @@ where
     }
 
     // (4) ROUTE into the existing gated pipeline (never around it).
-    route_command(command, pipeline, dispatcher).await
+    route_command(command, pipeline, dispatcher, event_cues).await
 }
 
 /// Route an AUTHENTICATED, rate-passed command into the gated pipeline. Each arm
@@ -678,9 +684,23 @@ where
 /// here bypasses a gate: a consequential `ask` parks in `pipeline.ask`; a
 /// `confirm` fires ONLY through `dispatcher.confirm`, which re-checks the master
 /// switch + the agent allowlist; `dismiss_forge` clears a marker only.
-async fn route_command<P, D>(command: Command, pipeline: &Arc<P>, dispatcher: &Arc<D>) -> Value
+///
+/// `event_cues` is the OPT-IN [voice].event_cues flag (ships OFF). When true, a
+/// confirm/deny — AFTER its existing handling has fully completed and its reply is
+/// built — FIRE-AND-FORGETS a cosmetic SFX cue (`confirm` -> "success", `deny` ->
+/// "notify") via `tokio::spawn`; the spawned future's result is dropped, the cue's
+/// OWN sfx gate makes off/no-key/offline a silent no-op, and a cue error is
+/// swallowed. The cue can NEVER change the command's return value or timing — the
+/// `Value` is already built and returned regardless of the cue. With the flag false
+/// NO cue is spawned, so confirm/deny behave byte-for-byte as today.
+async fn route_command<P, D>(
+    command: Command,
+    pipeline: &Arc<P>,
+    dispatcher: &Arc<D>,
+    event_cues: bool,
+) -> Value
 where
-    P: CommandPipeline,
+    P: CommandPipeline + 'static,
     D: Dispatcher,
 {
     match command {
@@ -708,11 +728,25 @@ where
         }
         Command::Confirm { id } => {
             telemetry::emit("system", "command.routed", json!({"cmd": "confirm"}));
-            json!({"ok": true, "reply": dispatcher.confirm(&id).await})
+            // The existing handling + reply are UNCHANGED: confirm runs to
+            // completion and its reply is built FIRST.
+            let reply = json!({"ok": true, "reply": dispatcher.confirm(&id).await});
+            // Then, ONLY if opted in, fire-and-forget a cosmetic "success" cue. The
+            // future is spawned detached and its result dropped — the cue's own SFX
+            // gate handles off/no-key/offline as a silent no-op, and a cue error is
+            // swallowed. This runs AFTER the reply is built, so it can never block,
+            // delay, or change the reply we return on the next line.
+            spawn_event_cue(pipeline, event_cues, "success");
+            reply
         }
         Command::Deny { id } => {
             telemetry::emit("system", "command.routed", json!({"cmd": "deny"}));
-            json!({"ok": true, "reply": dispatcher.deny(&id).await})
+            // Same shape as Confirm: deny's existing handling + reply are UNCHANGED
+            // and built FIRST; the opt-in cue is a detached, result-dropped
+            // fire-and-forget that can never affect the outcome or timing.
+            let reply = json!({"ok": true, "reply": dispatcher.deny(&id).await});
+            spawn_event_cue(pipeline, event_cues, "notify");
+            reply
         }
         Command::DismissForge { ts } => {
             telemetry::emit("system", "command.routed", json!({"cmd": "dismiss_forge", "ts": ts}));
@@ -774,6 +808,29 @@ where
             json!({"ok": true, "reply": pipeline.create_pronunciation(&word, &say, &name).await})
         }
     }
+}
+
+/// FIRE-AND-FORGET an opt-in event cue. A no-op unless `event_cues` is true. When
+/// enabled, clones the `Arc<P>` and `tokio::spawn`s `pipeline.play_cue(cue)` as a
+/// DETACHED task whose result is DROPPED — the cue's own sfx gate inside
+/// `play_cue` makes off/no-key/offline a silent no-op, and any error string it
+/// returns is discarded here. Crucially this NEVER awaits the cue: the caller has
+/// already built and is about to return the command's reply, so the cue cannot
+/// block, delay, or change the command's outcome or timing. The `JoinHandle` is
+/// intentionally dropped (the task runs to completion on its own).
+fn spawn_event_cue<P>(pipeline: &Arc<P>, event_cues: bool, cue: &'static str)
+where
+    P: CommandPipeline + 'static,
+{
+    if !event_cues {
+        return;
+    }
+    let pipeline = pipeline.clone();
+    tokio::spawn(async move {
+        // Result dropped on purpose: the cue is cosmetic, its gate already handles
+        // off/no-key/offline honestly, and an error must never surface here.
+        let _ = pipeline.play_cue(cue).await;
+    });
 }
 
 // ===========================================================================
@@ -1473,12 +1530,12 @@ mod tests {
 
         // Missing token.
         let line = json!({"cmd": "ask", "text": "do something"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["error"], "unauthorized", "missing token");
 
         // Forged token.
         let line = json!({"token": "deadbeef", "cmd": "ask", "text": "x"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["error"], "unauthorized", "forged token");
 
         // Tampered: a valid token with a flipped hex nibble.
@@ -1487,7 +1544,7 @@ mod tests {
         chars[0] = if chars[0] == 'a' { 'b' } else { 'a' };
         let tampered: String = chars.into_iter().collect();
         let line = json!({"token": tampered, "cmd": "ask", "text": "x"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["error"], "unauthorized", "tampered token");
 
         // The pipeline was NEVER reached.
@@ -1502,7 +1559,7 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "apply_forge", "ts": 1}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["error"], "unknown_command");
         assert_eq!(dispatcher.dismiss_calls.load(Ordering::SeqCst), 0, "unknown cmd never dispatched");
     }
@@ -1515,7 +1572,7 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "ask", "text": "status", "agent": "edith"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["ok"], true);
         assert_eq!(r["reply"], "routed:status");
         assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 1);
@@ -1535,7 +1592,7 @@ mod tests {
             (json!({"token": valid_token(), "cmd": "state"}), "state"),
         ];
         for (line, want) in cases {
-            let r = handle_line(&line.to_string(), &pipeline, &dispatcher, &lim).await;
+            let r = handle_line(&line.to_string(), &pipeline, &dispatcher, &lim, false).await;
             assert_eq!(r["reply"], want, "for {line}");
         }
     }
@@ -1550,7 +1607,7 @@ mod tests {
         let lim = fresh_limiter();
         let phrase = "always allow the gmail_send action";
         let line = json!({"token": valid_token(), "cmd": "policy", "text": phrase}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["ok"], true);
         assert_eq!(r["reply"], format!("policy:{phrase}"));
         // It reached the dispatcher's policy arm, with the phrase verbatim.
@@ -1570,7 +1627,7 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "play_cue", "cue": "confirm"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["ok"], true);
         assert_eq!(r["reply"], "cue:confirm");
         assert_eq!(pipeline.play_cue_calls.load(Ordering::SeqCst), 1, "reached the cue arm");
@@ -1588,10 +1645,98 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "play_cue", "cue": "kaboom"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["error"], "bad_request", "unknown cue is a bad_request");
         assert_eq!(pipeline.play_cue_calls.load(Ordering::SeqCst), 0, "unknown cue never routes");
         assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "and never reaches the model");
+    }
+
+    // -- event cues ([voice].event_cues) -------------------------------------
+    //
+    // The event-cue feature fire-and-forgets a cosmetic cue on confirm/deny when
+    // (and ONLY when) the opt-in flag is true. Because the cue is `tokio::spawn`ed
+    // detached, the assertion must let the spawned task run: drain a bounded number
+    // of yields on the current-thread test runtime so the detached future is polled
+    // to completion (it only touches an atomic + a mutex, so it finishes in one
+    // poll). A bounded loop means a never-spawned cue can't hang the test.
+    async fn drain_spawned_tasks() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// With [voice].event_cues OFF (the default), a `confirm` runs its existing
+    /// handling and returns its existing reply, and NO event cue is spawned — proof
+    /// the default is a ZERO-behavior-change no-op. Same for `deny`.
+    #[tokio::test]
+    async fn event_cues_off_spawns_no_cue_on_confirm_or_deny() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+
+        // confirm (event_cues = false)
+        let line = json!({"token": valid_token(), "cmd": "confirm", "id": "abc"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "confirm:abc", "confirm reply is UNCHANGED with cues off");
+        assert_eq!(dispatcher.confirm_calls.load(Ordering::SeqCst), 1, "confirm handling ran exactly once");
+
+        // deny (event_cues = false)
+        let line = json!({"token": valid_token(), "cmd": "deny", "id": "xyz"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "deny:xyz", "deny reply is UNCHANGED with cues off");
+        assert_eq!(dispatcher.deny_calls.load(Ordering::SeqCst), 1, "deny handling ran exactly once");
+
+        // Even after draining the runtime, NO cue was ever spawned.
+        drain_spawned_tasks().await;
+        assert_eq!(
+            pipeline.play_cue_calls.load(Ordering::SeqCst), 0,
+            "cues OFF => no event cue is spawned on confirm/deny (zero behavior change)"
+        );
+    }
+
+    /// With [voice].event_cues ON, a `confirm` STILL returns its existing reply
+    /// (the cue can't change the outcome) AND fire-and-forgets the "success" cue.
+    #[tokio::test]
+    async fn event_cues_on_confirm_spawns_success_without_changing_the_reply() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "confirm", "id": "abc"}).to_string();
+        // event_cues = true
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, true).await;
+        // The reply + handling are UNCHANGED — the cue is purely additive.
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "confirm:abc", "confirm reply is UNCHANGED even with cues on");
+        assert_eq!(dispatcher.confirm_calls.load(Ordering::SeqCst), 1, "confirm handling ran exactly once");
+
+        // The detached cue fires "success" once it is polled.
+        drain_spawned_tasks().await;
+        assert_eq!(pipeline.play_cue_calls.load(Ordering::SeqCst), 1, "confirm fire-and-forgets one cue");
+        assert_eq!(pipeline.last_cue.lock().unwrap().as_deref(), Some("success"), "confirm plays the success cue");
+        // The cue NEVER reaches the model.
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "event cue never reaches the model");
+    }
+
+    /// With [voice].event_cues ON, a `deny` STILL returns its existing reply AND
+    /// fire-and-forgets the "notify" cue.
+    #[tokio::test]
+    async fn event_cues_on_deny_spawns_notify_without_changing_the_reply() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "deny", "id": "xyz"}).to_string();
+        // event_cues = true
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, true).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "deny:xyz", "deny reply is UNCHANGED even with cues on");
+        assert_eq!(dispatcher.deny_calls.load(Ordering::SeqCst), 1, "deny handling ran exactly once");
+
+        drain_spawned_tasks().await;
+        assert_eq!(pipeline.play_cue_calls.load(Ordering::SeqCst), 1, "deny fire-and-forgets one cue");
+        assert_eq!(pipeline.last_cue.lock().unwrap().as_deref(), Some("notify"), "deny plays the notify cue");
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "event cue never reaches the model");
     }
 
     /// The `design_voice` verb routes to the pipeline's dedicated `design_voice`
@@ -1605,7 +1750,7 @@ mod tests {
         let lim = fresh_limiter();
         let desc = "a calm warm british woman, mid-thirties";
         let line = json!({"token": valid_token(), "cmd": "design_voice", "agent": "edith", "description": desc, "name": "Edith Voice"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["ok"], true);
         assert_eq!(r["reply"], "design:edith:Edith Voice");
         assert_eq!(pipeline.design_voice_calls.load(Ordering::SeqCst), 1, "reached the design arm");
@@ -1627,7 +1772,7 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "design_voice", "agent": "edith", "description": "too short"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["error"], "bad_request", "a sub-floor description is a bad_request");
         assert_eq!(pipeline.design_voice_calls.load(Ordering::SeqCst), 0, "never routes");
         assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "and never reaches the model");
@@ -1643,7 +1788,7 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "create_pronunciation", "word": "JARVIS", "say": "jarviss"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["ok"], true);
         assert_eq!(r["reply"], "pron:JARVIS:jarviss");
         assert_eq!(pipeline.create_pron_calls.load(Ordering::SeqCst), 1, "reached the pronunciation arm");
@@ -1665,7 +1810,7 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "create_pronunciation", "word": "JARVIS", "say": ""}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["error"], "bad_request", "an empty alias is a bad_request");
         assert_eq!(pipeline.create_pron_calls.load(Ordering::SeqCst), 0, "never routes");
         assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "and never reaches the model");
@@ -1680,7 +1825,7 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "panic"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["ok"], true);
         assert_eq!(r["reply"], "panic-engaged");
         assert_eq!(dispatcher.panic_calls.load(Ordering::SeqCst), 1, "panic reached the dispatcher");
@@ -1696,7 +1841,7 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "unlock"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["ok"], true);
         assert_eq!(r["reply"], "unlock-lifted");
         assert_eq!(dispatcher.unlock_calls.load(Ordering::SeqCst), 1, "unlock reached the dispatcher");
@@ -1712,7 +1857,7 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": "wrong-token", "cmd": "unlock"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["ok"], false, "a bad token is rejected");
         assert_eq!(dispatcher.unlock_calls.load(Ordering::SeqCst), 0, "unauth unlock never dispatched");
     }
@@ -1755,10 +1900,10 @@ mod tests {
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "brief"}).to_string();
         for _ in 0..RATE {
-            let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+            let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
             assert_eq!(r["ok"], true);
         }
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["error"], "rate_limited");
     }
 
@@ -1770,7 +1915,7 @@ mod tests {
         let lim = fresh_limiter();
         let huge = "x".repeat(MAX_LINE_BYTES + 10);
         let line = json!({"token": valid_token(), "cmd": "ask", "text": huge}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         assert_eq!(r["error"], "oversized");
         assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0);
     }
@@ -1917,7 +2062,7 @@ mod tests {
         let dispatcher = Arc::new(ProbeDispatcher::default());
         let lim = fresh_limiter();
         let line = json!({"token": valid_token(), "cmd": "ask", "text": "email alice"}).to_string();
-        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
         // The reply is the PARK prompt, not an executed action; the channel never
         // invoked the dispatcher's confirm — a fire can only follow an explicit
         // confirm {id}.

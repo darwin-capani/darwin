@@ -380,6 +380,15 @@ cloud_sfx = true               # SFX cue master switch, SHIPS ON (full-power def
 # is never failed by the streaming leg. Inert on Kokoro (the on-device path is
 # unchanged). Delivery timing only — never a gate/policy surface.
 stream_tts = false             # low-latency streaming TTS, OPT-IN (ships OFF) — default is today's blocking synthesis. When true AND the backend is ElevenLabs, speak streams for first-audio latency (falls back to blocking on any streaming error). Inert on Kokoro. Set true to opt in.
+# event_cues — EVENT CUES. OPT-IN (ships OFF) so DEFAULT BEHAVIOR IS UNCHANGED. When
+# true, a short ElevenLabs SFX cue is played as FIRE-AND-FORGET cosmetic feedback on a
+# couple of key system events (a `confirm` plays the "success" cue, a `deny` plays the
+# "notify" cue). The cue is spawned detached AFTER the action has already completed, so
+# it NEVER blocks, delays, or changes the outcome/reply of the confirm/deny, and a cue
+# error is swallowed. It rides the SAME gate as cloud_sfx (needs cloud_sfx = true + an
+# elevenlabs_api_key in the Keychain + a non-Local tier); without that it is a silent
+# no-op. Set true to opt in.
+event_cues = false             # play a fire-and-forget SFX cue on key system events (confirm -> "success", deny -> "notify"), OPT-IN (ships OFF). Requires cloud_sfx + an EL key; silent no-op otherwise. Never affects the action's outcome or timing. Set true to opt in.
 # pronunciation_dictionary_id / pronunciation_dictionary_version — the ACTIVE
 # ElevenLabs pronunciation-dictionary locator threaded into `speak`. Both DEFAULT ""
 # (none): empty id = NO locator is sent, so speech is byte-for-byte today's. The

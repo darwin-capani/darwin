@@ -155,6 +155,7 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "voice", key: "diarize", kind: Kind::Bool },
     Setting { section: "voice", key: "cloud_sfx", kind: Kind::Bool },
     Setting { section: "voice", key: "stream_tts", kind: Kind::Bool },
+    Setting { section: "voice", key: "event_cues", kind: Kind::Bool },
     Setting { section: "voice", key: "pronunciation_dictionary_id", kind: Kind::Str },
     Setting { section: "voice", key: "pronunciation_dictionary_version", kind: Kind::Str },
     Setting { section: "speech", key: "engine", kind: Kind::Enum(&["kokoro", "csm", "orpheus"]) },

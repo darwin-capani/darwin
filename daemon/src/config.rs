@@ -351,7 +351,11 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // `pronunciation_dictionary_id` / `pronunciation_dictionary_version` (both
     // DEFAULT "") thread an EL pronunciation-dictionary locator into speak — empty =
     // none (today's speech). All four listed so none reads as a typo.
-    ("voice", &["cloud_tier", "cloud_stt", "model", "voices", "adaptive_prosody", "whisper", "whisper_auto", "diarize", "cloud_sfx", "stream_tts", "pronunciation_dictionary_id", "pronunciation_dictionary_version"]),
+    // `event_cues` is OPT-IN (ships OFF): when true a fire-and-forget SFX cue plays
+    // on key system events (confirm -> "success", deny -> "notify"), riding the same
+    // cloud_sfx gate (no key => silent no-op); it never affects the action's outcome
+    // or timing. Listed so it never reads as a typo.
+    ("voice", &["cloud_tier", "cloud_stt", "model", "voices", "adaptive_prosody", "whisper", "whisper_auto", "diarize", "cloud_sfx", "stream_tts", "pronunciation_dictionary_id", "pronunciation_dictionary_version", "event_cues"]),
     // [wake] — CUSTOM WAKE-WORD (#32, wake.rs). `enabled` SHIPS ON (full-power
     // default): since `phrase` defaults to "jarvis", behavior is identical to today
     // unless the phrase is changed. The always-listening loop that consults the
@@ -964,6 +968,16 @@ pub struct VoiceConfig {
     /// non-empty = this exact version_id is sent alongside the dictionary id. Inert
     /// when `pronunciation_dictionary_id` is empty.
     pub pronunciation_dictionary_version: String,
+    /// EVENT CUES. OPT-IN (ships OFF) so DEFAULT BEHAVIOR IS UNCHANGED. When true,
+    /// a short ElevenLabs SFX cue is FIRE-AND-FORGOTTEN on a couple of key system
+    /// events (a `confirm` plays "success", a `deny` plays "notify"). The cue is
+    /// purely cosmetic feedback: it is spawned detached AFTER the underlying action
+    /// has completed, so it NEVER blocks, delays, or changes the outcome/reply of
+    /// the confirm/deny, and a cue error is swallowed. It rides the SAME gate as the
+    /// SFX cue tier (`cloud_sfx` + an `elevenlabs_api_key` in the Keychain + a
+    /// non-Local tier); without that it is a silent no-op. Default off => ZERO
+    /// behavior change.
+    pub event_cues: bool,
 }
 
 impl Default for VoiceConfig {
@@ -1021,6 +1035,12 @@ impl Default for VoiceConfig {
             // DEFAULT "" (none): no version pinned — the latest dictionary version is
             // used. Inert when pronunciation_dictionary_id is empty.
             pronunciation_dictionary_version: String::new(),
+            // OPT-IN (ships OFF) so DEFAULT BEHAVIOR IS UNCHANGED: with it false NO
+            // event cue is ever spawned, so confirm/deny behave byte-for-byte as
+            // today. Even when true the cue is fire-and-forget cosmetic feedback
+            // that rides the cloud_sfx gate (no key => silent no-op) and can never
+            // affect the action's outcome or timing.
+            event_cues: false,
         }
     }
 }
@@ -4013,6 +4033,10 @@ mod tests {
             cfg.voice.pronunciation_dictionary_version.is_empty(),
             "no pronunciation-dictionary version pinned by default (empty = latest)"
         );
+        assert!(
+            !cfg.voice.event_cues,
+            "event cues are OPT-IN (ship OFF) — DEFAULT BEHAVIOR IS UNCHANGED: no cue is spawned on confirm/deny"
+        );
         assert_eq!(cfg.voice.model, "eleven_flash_v2_5", "default EL model");
         assert!(cfg.voice.voices.is_empty(), "no per-agent EL voice mapped by default");
 
@@ -4024,6 +4048,7 @@ mod tests {
             diarize = false
             cloud_sfx = false
             stream_tts = true
+            event_cues = true
             pronunciation_dictionary_id = "EL_PD_ID"
             pronunciation_dictionary_version = "EL_PD_VER"
             model = "eleven_multilingual_v2"
@@ -4039,6 +4064,7 @@ mod tests {
         assert!(!cfg.voice.diarize, "diarize must round-trip as a known key");
         assert!(!cfg.voice.cloud_sfx, "cloud_sfx must round-trip as a known key (operator can turn the SFX cue tier off)");
         assert!(cfg.voice.stream_tts, "stream_tts must round-trip as a known key (operator can opt in to streaming TTS)");
+        assert!(cfg.voice.event_cues, "event_cues must round-trip as a known key (operator can opt in to event cues)");
         assert_eq!(
             cfg.voice.pronunciation_dictionary_id, "EL_PD_ID",
             "pronunciation_dictionary_id must round-trip as a known key"

@@ -1703,8 +1703,14 @@ async fn main() -> Result<()> {
             "command.channel_up",
             json!({"path": command_sock.display().to_string(), "token_handoff": token_written}),
         );
+        // The OPT-IN [voice].event_cues flag (ships OFF): when true, a confirm/deny
+        // routed through this channel fire-and-forgets a cosmetic SFX cue AFTER its
+        // handling completes — it can never block, delay, or change the action. Read
+        // here (out of band of the move) and threaded into serve; default off => no
+        // cue is ever spawned.
+        let event_cues = cfg.voice.event_cues;
         tokio::spawn(async move {
-            command::serve(command_sock, pipeline, dispatcher).await;
+            command::serve(command_sock, pipeline, dispatcher, event_cues).await;
         });
     }
     // #35 WEBHOOK TRIGGERS — the inbound, HMAC-authenticated, loopback-default
