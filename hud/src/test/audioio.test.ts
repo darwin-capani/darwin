@@ -330,4 +330,31 @@ describe("AudioIoPanel render", () => {
     expect(html).not.toContain("x.wav");
     expect(html).not.toContain("sk-");
   });
+
+  /* ---- SFX cue trigger affordance (read-only catalog + honest gate) ---- */
+
+  it("renders the read-only SFX cue catalog with a Play control per cue", () => {
+    const html = renderPanel(audioIoInitial());
+    expect(html).toContain("SFX CUES");
+    // Every built-in cue label is listed (read-only catalog).
+    for (const label of ["Confirm", "Alert", "Error", "Success", "Notify", "Wake"]) {
+      expect(html).toContain(label);
+    }
+    // A Play button per cue (six rows) — the static markup has one per cue.
+    expect(html.match(/audioio-cue-play/g)?.length).toBe(6);
+  });
+
+  it("in the no-shell (node) render the cues are OFF and the buttons are disabled", () => {
+    // The server render has no Tauri shell, so the gate is closed: the pill reads
+    // OFF and every Play button is disabled — never a fabricated "ready" state.
+    const html = renderPanel(audioIoInitial());
+    expect(html).toContain(">OFF<");
+    // React serializes a disabled button with the `disabled` attribute.
+    expect(html).toContain('class="icon-btn audioio-cue-play"');
+    expect(html).toContain("disabled");
+    // Honest copy: cues require the key + cloud SFX on, else nothing plays.
+    const lower = html.toLowerCase();
+    expect(lower).toContain("desktop app");
+    expect(lower).toContain("else nothing plays");
+  });
 });

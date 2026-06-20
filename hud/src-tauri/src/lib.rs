@@ -895,6 +895,7 @@ pub fn run() {
             heal::heal_proposal_detail,
             heal::heal_apply,
             command::send_command,
+            command::play_sfx_cue,
             config_settings::config_get,
             config_settings::config_set,
             config_settings::daemon_restart,

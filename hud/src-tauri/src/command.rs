@@ -61,6 +61,14 @@ const ALLOWED_COMMANDS: &[&str] = &[
     // route to unlock). Each reply carries `locked` so the HUD flips its indicator
     // immediately on the button press.
     "panic", "unlock",
+    // Phase-2 SFX cue — play a BUILT-IN named cue (confirm/alert/error/success/
+    // notify/wake; the daemon's sfx_cue::CATALOG is the source of truth). Carries
+    // ONLY the cue name. The daemon gates it on its already-shipped
+    // voice_tier::sfx_enabled (cloud_sfx + an ElevenLabs key, online) and returns
+    // an honest silent no-op when the gate is closed — this adds NO new authority
+    // and NO new tier. Relayed through the SAME token-injecting socket as every
+    // other verb (defense-in-depth: an unknown cue name is rejected daemon-side).
+    "play_cue",
 ];
 
 /// The typed request the React layer hands `send_command`. Every field is
@@ -80,6 +88,10 @@ pub struct CommandRequest {
     pub id: Option<String>,
     #[serde(default)]
     pub ts: Option<u64>,
+    /// Phase-2 SFX cue — the BUILT-IN cue NAME to play (`play_cue` only). A
+    /// catalog atom (confirm/alert/error/…); never a key, prompt, or path.
+    #[serde(default)]
+    pub cue: Option<String>,
 }
 
 /// The reply surfaced to the UI. `ok` mirrors the daemon's `{ok}`; `reply` is the
@@ -197,6 +209,17 @@ pub fn build_request(req: &CommandRequest, token: &str) -> Result<Value, String>
                 return Err("policy requires the phrase text".to_string());
             }
             obj.insert("text".to_string(), json!(text));
+        }
+        "play_cue" => {
+            // Carry ONLY the cue name (a catalog atom). It is normalized to a lower
+            // bound here (trimmed, lowercased) so the daemon's case-insensitive
+            // lookup is exact; an unknown name is rejected daemon-side (honest
+            // no-cue). No key, prompt, or path ever rides this verb.
+            let cue = req.cue.as_deref().map(str::trim).unwrap_or("");
+            if cue.is_empty() {
+                return Err("play_cue requires a cue name".to_string());
+            }
+            obj.insert("cue".to_string(), json!(cue.to_ascii_lowercase()));
         }
         // brief / roster / state / pending carry no extra fields. The task #12
         // emergency-stop verbs `panic` / `unlock` are also bare (the daemon calls
@@ -386,6 +409,71 @@ pub async fn send_command(request: CommandRequest) -> Result<CommandReply, Strin
     .map_err(|e| format!("command task failed: {e}"))?
 }
 
+/* ------------------------------------------------------- SFX cue (Phase-2) */
+
+/// The honest play-cue outcome the HUD maps to prose. Mirrors the daemon's
+/// `PlayOutcome` vocabulary (played/cached/disabled/unknown/failed). It NEVER
+/// claims a cue played when the daemon reported a silent no-op. `detail` is a
+/// short, secret-free human line (never the produced WAV path).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct PlayCueReply {
+    pub outcome: String,
+    pub detail: String,
+}
+
+/// Map a daemon `CommandReply` (the `play_cue` relay's reply) into the bounded
+/// [`PlayCueReply`] vocabulary. PURE — unit-tested without any socket.
+///
+/// HONESTY: an `ok:false` reply NEVER becomes "played". The daemon's
+/// `trigger_cue` returns prose, so we classify on the secret-free reply/error
+/// text: a "cache"/"cached" success → `cached` (no cloud call), any other success
+/// → `played`; a switch-off/no-key/offline rejection → `disabled` (honest silent
+/// no-op); an unknown-cue rejection → `unknown`; anything else → `failed`. No path
+/// or secret is ever forwarded — only the contracted `{outcome, detail}`.
+pub fn cue_outcome(reply: &CommandReply) -> PlayCueReply {
+    if reply.ok {
+        let line = reply.reply.as_deref().unwrap_or("");
+        let lower = line.to_ascii_lowercase();
+        let outcome = if lower.contains("cache") { "cached" } else { "played" };
+        return PlayCueReply {
+            outcome: outcome.to_string(),
+            detail: if line.is_empty() { "Cue played.".to_string() } else { line.to_string() },
+        };
+    }
+    let err = reply.error.as_deref().unwrap_or("command_failed");
+    let lower = err.to_ascii_lowercase();
+    // A closed-gate no-op: switch off / no key / offline. The daemon's copy
+    // mentions these explicitly; "disabled"/"off"/"cloud_sfx" are its markers.
+    let outcome = if lower.contains("cloud_sfx")
+        || lower.contains("cue tier is off")
+        || lower.contains("turn on")
+        || lower.contains("disabled")
+    {
+        "disabled"
+    } else if lower.contains("no built-in cue") || lower.contains("no cue") {
+        // The daemon's honest cue-not-found phrasing — distinct from the
+        // protocol-level `unknown_command` (which is a relay failure, not a cue).
+        "unknown"
+    } else {
+        "failed"
+    };
+    PlayCueReply { outcome: outcome.to_string(), detail: err.to_string() }
+}
+
+/// Play a BUILT-IN SFX cue by NAME. Relays a bounded `play_cue {cue}` request
+/// through the SAME token-injecting command socket as [`send_command`] — it adds
+/// NO new authority and NO new tier. The daemon gates the cue on its
+/// already-shipped `voice_tier::sfx_enabled` (`[voice].cloud_sfx` + an ElevenLabs
+/// key, online) and returns an honest silent no-op when the gate is closed; this
+/// command faithfully maps that into the [`PlayCueReply`] vocabulary. The cue NAME
+/// is the only thing that leaves the UI; no key value or path ever crosses here.
+#[tauri::command]
+pub async fn play_sfx_cue(cue: String) -> Result<PlayCueReply, String> {
+    let request = CommandRequest { cmd: "play_cue".to_string(), cue: Some(cue), ..Default::default() };
+    let reply = send_command(request).await?;
+    Ok(cue_outcome(&reply))
+}
+
 /* --------------------------------------------------------------------- tests */
 
 #[cfg(test)]
@@ -413,6 +501,8 @@ mod tests {
             // Task #12 — the bare emergency-stop verbs build with just {token, cmd}.
             req("panic"),
             req("unlock"),
+            // Phase-2 SFX cue — carries the cue name.
+            { let mut r = req("play_cue"); r.cue = Some("confirm".into()); r },
         ];
         for r in ok {
             let v = build_request(&r, "TOK").expect("known verb builds");
@@ -439,6 +529,50 @@ mod tests {
         let mut blank_policy = req("policy");
         blank_policy.text = Some("   ".into());
         assert!(build_request(&blank_policy, "T").is_err()); // whitespace phrase
+        assert!(build_request(&req("play_cue"), "T").is_err()); // no cue name
+        let mut blank_cue = req("play_cue");
+        blank_cue.cue = Some("   ".into());
+        assert!(build_request(&blank_cue, "T").is_err()); // whitespace cue
+    }
+
+    #[test]
+    fn build_request_play_cue_carries_only_the_normalized_cue_name() {
+        let mut r = req("play_cue");
+        r.cue = Some("  Confirm  ".into());
+        let v = build_request(&r, "TOK").unwrap();
+        assert_eq!(v["cmd"], "play_cue");
+        // Normalized to the catalog atom (trimmed, lowercased) for an exact lookup.
+        assert_eq!(v["cue"], "confirm");
+        assert_eq!(v["token"], "TOK", "token injected by the backend");
+        // ONLY token + cmd + cue ride the wire — no key/prompt/path field.
+        assert_eq!(v.as_object().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn cue_outcome_maps_the_daemon_reply_honestly() {
+        // A successful generation → played; a cache-mentioning success → cached.
+        let played = parse_reply(r#"{"ok":true,"reply":"Cue played."}"#);
+        assert_eq!(cue_outcome(&played).outcome, "played");
+        let cached = parse_reply(r#"{"ok":true,"reply":"Served from cache — no cloud call."}"#);
+        assert_eq!(cue_outcome(&cached).outcome, "cached");
+        // A closed-gate rejection NEVER reads as played — it is an honest no-op.
+        let off = parse_reply(
+            r#"{"ok":false,"error":"Cue tier is off. Turn on [voice].cloud_sfx and add an ElevenLabs key."}"#,
+        );
+        assert_eq!(cue_outcome(&off).outcome, "disabled");
+        // An unknown cue is an honest no-cue, not a play.
+        let unknown = parse_reply(r#"{"ok":false,"error":"There's no built-in cue called 'kaboom'."}"#);
+        assert_eq!(cue_outcome(&unknown).outcome, "unknown");
+        // Anything else (e.g. the daemon hasn't wired the verb yet) → failed,
+        // never a fabricated success.
+        let other = parse_reply(r#"{"ok":false,"error":"unknown_command"}"#);
+        assert_eq!(cue_outcome(&other).outcome, "failed");
+        // The mapped detail never carries a path/secret-shaped marker.
+        for r in [&played, &cached, &off, &unknown, &other] {
+            let mapped = cue_outcome(r);
+            assert!(!mapped.detail.contains(".wav"));
+            assert!(!mapped.detail.contains("sk-"));
+        }
     }
 
     #[test]

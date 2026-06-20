@@ -154,6 +154,12 @@ mod router;
 mod screen_context;
 mod selector;
 mod selfcheck;
+// NAMED SFX CUE CATALOG (Phase-2): a code-level catalog of named HUD cues
+// (confirm/alert/error/success/notify/wake) + a by-name play_cue that GATES
+// exactly like trigger_sound_effect (voice_tier::sfx_enabled), REUSES the existing
+// op=sound_effect seam, and CACHES the produced WAV by cue name so a repeated cue
+// does not re-hit the cloud. Off/no-key ⇒ honest silent no-op. Tested in sfx_cue.rs.
+mod sfx_cue;
 mod shell;
 mod signals;
 mod skills;
@@ -3286,6 +3292,79 @@ async fn trigger_sound_effect(
             Err("I couldn't generate that sound effect just now — the cloud cue didn't go \
                  through. Nothing was produced."
                 .to_string())
+        }
+    }
+}
+
+/// NAMED CUE trigger (Phase-2). The agent-intent/HUD-facing surface for playing a
+/// BUILT-IN cue by NAME (see [`sfx_cue::CATALOG`]: confirm/alert/error/success/
+/// notify/wake). This sits ON TOP of the sound-effect seam and does NOT duplicate
+/// its gate: it performs the SAME cheap offline/switch pre-checks and the SAME
+/// Keychain read as [`trigger_sound_effect`], then delegates to
+/// [`sfx_cue::play_cue`], which resolves name→prompt, gates on
+/// [`voice_tier::sfx_enabled`], serves a cached WAV on a repeat (NO network call),
+/// or reuses `op=sound_effect` on a cache miss.
+///
+/// HONESTY: an unknown name → honest no-cue; switch-off/no-key/offline → honest
+/// silent no-op — never a fabricated cue. `root` is the daemon root the cue cache
+/// lives under (`state/tmp/sfx-cache/`).
+///
+/// SECURITY: the resolved key is read here ONLY to thread into the request body
+/// (server → xi-api-key); it is never logged/argv/telemetry — same handling as
+/// [`trigger_sound_effect`].
+#[allow(dead_code)] // Phase-2 command seam; wired to the cue command/intent surface next
+async fn trigger_cue(
+    cfg: &Config,
+    name: &str,
+    root: &Path,
+    infer: &mut InferenceClient,
+) -> Result<std::path::PathBuf, String> {
+    // Unknown cue: honest no-cue BEFORE any tier/Keychain work (the catalog is the
+    // sole source of truth; an unknown name is never fabricated).
+    if !sfx_cue::is_known_cue(name) {
+        return Err(format!(
+            "There's no built-in cue called '{name}'. Known cues: {}.",
+            sfx_cue::cue_names().join(", ")
+        ));
+    }
+    // Cheap pre-checks mirror trigger_sound_effect: never touch the Keychain when
+    // offline or the switch is off.
+    let offline =
+        model_tier::active_tier(cfg, model_tier::current_override()) == model_tier::Tier::Local;
+    let key = if offline || !cfg.voice.cloud_sfx {
+        // Don't read the Keychain when the gate is already provably closed; pass
+        // None so play_cue reports the honest Disabled no-op.
+        None
+    } else {
+        crate::integrations::resolve_secret(voice_tier::ELEVENLABS_ACCOUNT).await
+    };
+
+    match sfx_cue::play_cue(name, cfg, offline, key.as_deref(), root, infer).await {
+        sfx_cue::PlayOutcome::Played(p) => {
+            telemetry::emit("system", "sfx.cue.generated", json!({"cue": name}));
+            Ok(p)
+        }
+        sfx_cue::PlayOutcome::Cached(p) => {
+            // Served from cache — NO cloud call this time.
+            telemetry::emit("system", "sfx.cue.cached", json!({"cue": name}));
+            Ok(p)
+        }
+        sfx_cue::PlayOutcome::Disabled => {
+            // Honest silent no-op: switch off / no key / offline.
+            debug_assert!(!voice_tier::sfx_enabled(cfg, key.is_some()) || offline);
+            telemetry::emit("system", "sfx.cue.disabled", json!({"cue": name}));
+            Err("Cue tier is off. Turn on [voice].cloud_sfx and add an ElevenLabs key \
+                 (and be online) to play cues."
+                .to_string())
+        }
+        sfx_cue::PlayOutcome::Unknown => {
+            // Already screened above; kept exhaustive for safety.
+            Err(format!("There's no built-in cue called '{name}'."))
+        }
+        sfx_cue::PlayOutcome::Failed(msg) => {
+            warn!(cue = %name, "sfx-cue: play_cue generation failed");
+            telemetry::emit("system", "sfx.cue.failed", json!({"cue": name}));
+            Err(msg)
         }
     }
 }

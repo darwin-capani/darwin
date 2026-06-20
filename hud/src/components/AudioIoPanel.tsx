@@ -1,3 +1,4 @@
+import { useCallback, useEffect, useState } from "react";
 import type { AudioIoStatus } from "../core/events";
 import {
   interpretLabel,
@@ -7,6 +8,15 @@ import {
   diarizationTone,
   diarizationDetail,
 } from "../core/events";
+import {
+  CUE_CATALOG,
+  buildPlayCueRequest,
+  cueDisabledReason,
+  cueGateCopy,
+  cueOutcomeCopy,
+  type CuePlayOutcome,
+} from "../core/sfxCue";
+import { inTauri, keychainStatus, playSfxCue } from "../tauri/bridge";
 import Frame from "./Frame";
 
 /**
@@ -131,6 +141,9 @@ export default function AudioIoPanel({
             </span>
           </div>
 
+          {/* SFX CUES — read-only catalog + honest per-cue test triggers ---- */}
+          <SfxCueTrigger />
+
           <div className="verify-foot dim-note">
             All three audio-input features ship <b>OFF / neutral</b>. Live
             interpretation and the always-listening wake loop are{" "}
@@ -143,6 +156,139 @@ export default function AudioIoPanel({
           </div>
         </div>
       </Frame>
+    </div>
+  );
+}
+
+/**
+ * SFX CUES (Phase-2) — a small, HONEST way to TEST the built-in sound-effect
+ * cues from the HUD. It surfaces the READ-ONLY cue catalog (the daemon's
+ * code-level palette) and a per-cue "Play" button that sends the `play_sfx_cue`
+ * command through the existing token-injecting command seam.
+ *
+ * HONESTY CONTRACT (do not regress):
+ *   - Cues require the ElevenLabs key + cloud SFX ON. The buttons are DISABLED
+ *     (with copy that names exactly what's missing) until the gate is open; with
+ *     the switch off / no key / offline, NOTHING plays — never a fabricated cue.
+ *   - The control adds NO authority and NO new tier. The daemon makes the real,
+ *     gated call (`voice_tier::sfx_enabled`) and returns an honest silent no-op
+ *     when closed; this surface only reflects that outcome, never claims a cue
+ *     played when it didn't.
+ *   - SECRET-FREE. It reads only two booleans (switch on, key present) and sends
+ *     the cue NAME — never the key value, never the produced WAV path.
+ *
+ * The gate inputs are probed ONCE on mount (config `voice.cloud_sfx` + key
+ * presence); the pure catalog/gate/outcome logic lives in core/sfxCue.ts and is
+ * unit-tested headlessly.
+ */
+function SfxCueTrigger() {
+  const shell = inTauri();
+  const [cloudSfxOn, setCloudSfxOn] = useState(false);
+  const [keyPresent, setKeyPresent] = useState(false);
+  const [playing, setPlaying] = useState<string | null>(null);
+  const [note, setNote] = useState("");
+
+  // Probe the secret-free gate inputs once: the cloud-SFX switch (from config)
+  // and whether an ElevenLabs key is on file (presence only — never the value).
+  // In a plain browser both stay false and the controls render disabled.
+  useEffect(() => {
+    if (!shell) return;
+    let live = true;
+    void (async () => {
+      try {
+        const { configGet } = await import("../tauri/configSettings");
+        const settings = await configGet();
+        const sfx = settings.find((s) => s.key === "voice.cloud_sfx");
+        if (live) setCloudSfxOn(sfx?.value === true);
+      } catch {
+        if (live) setCloudSfxOn(false);
+      }
+    })();
+    void keychainStatus("elevenlabs_api_key")
+      .then((present) => {
+        if (live) setKeyPresent(present);
+      })
+      .catch(() => {
+        if (live) setKeyPresent(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [shell]);
+
+  const reason = cueDisabledReason(shell, { cloudSfxOn, keyPresent });
+  const gateOpen = reason === null;
+
+  const play = useCallback(
+    async (name: string) => {
+      if (playing) return;
+      const req = buildPlayCueRequest(name);
+      if (!req) return; // unknown name — never fabricated (defense-in-depth)
+      setPlaying(name);
+      setNote("");
+      try {
+        const r = await playSfxCue(req.cue);
+        // Map the bounded daemon outcome to honest prose (never claims a play
+        // that didn't happen). `detail` is the daemon's own secret-free line; we
+        // prefer it, falling back to the contract copy.
+        setNote(r.detail || cueOutcomeCopy(r.outcome as CuePlayOutcome, req.cue));
+      } catch {
+        setNote(cueOutcomeCopy("failed", req.cue));
+      } finally {
+        setPlaying(null);
+      }
+    },
+    [playing],
+  );
+
+  return (
+    <div className="audioio-sfx" aria-label="Sound-effect cues">
+      <div className="verify-row">
+        <span className="verify-head">SFX CUES</span>
+        <span
+          className={`verify-pill audioio-${gateOpen ? "good" : "idle"}`}
+          title={
+            "Built-in sound-effect cues you can test from here. They require the " +
+            "ElevenLabs key + cloud SFX ([voice].cloud_sfx) ON; with either off (or " +
+            "offline) nothing plays — never a fabricated cue. The cue NAME is the " +
+            "only thing sent; no key value or audio path crosses this surface."
+          }
+        >
+          <span className={`dot ${gateOpen ? "good" : "idle"}`} />
+          {gateOpen ? "READY" : "OFF"}
+        </span>
+        <span className="verify-meaning">{cueGateCopy(reason)}</span>
+      </div>
+
+      <ul className="audioio-cue-list">
+        {CUE_CATALOG.map((cue) => (
+          <li className="audioio-cue-row" key={cue.name}>
+            <button
+              type="button"
+              className="icon-btn audioio-cue-play"
+              onClick={() => void play(cue.name)}
+              disabled={!gateOpen || playing !== null}
+              title={
+                gateOpen
+                  ? `Play the “${cue.label}” cue — ${cue.blurb}`
+                  : `“${cue.label}” — ${cueGateCopy(reason)}`
+              }
+            >
+              {playing === cue.name ? "Playing…" : "Play"}
+            </button>
+            <span className="audioio-cue-name">{cue.label}</span>
+            <span className="audioio-cue-blurb dim-note">{cue.blurb}</span>
+          </li>
+        ))}
+      </ul>
+
+      <div className="audioio-sub dim-note" role="status">
+        {note ||
+          "Built-in cues (read-only): " +
+            CUE_CATALOG.map((c) => c.name).join(", ") +
+            ". They generate once via ElevenLabs, then play from cache. " +
+            "Cues require the key + cloud SFX on — else nothing plays."}
+      </div>
     </div>
   );
 }

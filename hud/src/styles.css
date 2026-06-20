@@ -6485,6 +6485,29 @@ svg.tri circle {
   flex: 1 1 100%;
 }
 
+/* SFX CUES — read-only catalog + per-cue test triggers. The cue layer adds no
+   authority: a Play button is enabled only when the daemon gate is open
+   ([voice].cloud_sfx + an ElevenLabs key); otherwise it renders disabled with
+   honest copy. */
+.audioio-sfx { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.audioio-cue-list {
+  list-style: none;
+  margin: 0;
+  padding: 0 0 0 2px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.audioio-cue-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.audioio-cue-play { min-width: 64px; font-size: 0.74em; padding: 2px 8px; }
+.audioio-cue-name {
+  font-weight: 600;
+  font-size: 0.78em;
+  letter-spacing: 0.02em;
+  min-width: 64px;
+}
+.audioio-cue-blurb { font-size: 0.72em; line-height: 1.3; flex: 1 1 200px; }
+
 /* ---------------------------------------------- ANSWER CROSS-CHECK panel */
 /* ANSWER // CROSS-CHECK — the last answer's two OPTIONAL answer-quality passes,
    siblings of SELF-CHECK: #21 tool-result plausibility cross-check (emitted as

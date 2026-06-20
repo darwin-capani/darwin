@@ -396,6 +396,53 @@ export async function openSetupInstall(): Promise<SetupOpen> {
   }
 }
 
+/* ------------------------------------------------------- SFX cues (Phase-2) */
+
+/** The honest outcome of a play-cue attempt (mirrors the Rust `PlayCueReply`).
+ *  `outcome` is the small contract vocabulary the UI maps to prose; it NEVER
+ *  claims a cue played when the daemon reported a silent no-op. `detail` is a
+ *  short human line (never a secret, never the produced WAV path). */
+export interface PlayCueReply {
+  /** "played" | "cached" | "disabled" | "unknown" | "failed" | "no_shell". */
+  outcome:
+    | "played"
+    | "cached"
+    | "disabled"
+    | "unknown"
+    | "failed"
+    | "no_shell";
+  detail: string;
+}
+
+/**
+ * Play a built-in SFX cue by NAME via the `play_sfx_cue` backend command. This
+ * adds NO authority and NO new tier: the backend relays a bounded `play_cue`
+ * request through the SAME token-injecting command socket the deck uses, and the
+ * daemon's already-shipped gate (`[voice].cloud_sfx` + an ElevenLabs key, online)
+ * makes the real, honest call. With the switch off / no key / offline the daemon
+ * returns an honest silent no-op (`disabled`) — never a fabricated cue.
+ *
+ * In a plain browser (no shell) there is nothing to play — return an honest
+ * `no_shell` outcome rather than throwing. The cue NAME is the only thing that
+ * leaves the UI here; no key value and no path ever cross this boundary.
+ */
+export async function playSfxCue(cue: string): Promise<PlayCueReply> {
+  if (!inTauri()) {
+    return {
+      outcome: "no_shell",
+      detail: "Playing cues requires the JARVIS desktop app.",
+    };
+  }
+  try {
+    return await invoke<PlayCueReply>("play_sfx_cue", { cue });
+  } catch (e) {
+    return {
+      outcome: "failed",
+      detail: typeof e === "string" ? e : "could not play the cue",
+    };
+  }
+}
+
 export async function toggleFullscreen(): Promise<void> {
   if (!inTauri()) {
     // Browser fallback for development.
