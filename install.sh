@@ -856,7 +856,7 @@ EVERYBIT_EXTRAS=(
     "mlx-vlm>=0.1"        # on-device VLM (op=describe_image)
     "mflux>=0.4"          # on-device text->image (op=generate_image)
     "soundfile>=0.12"     # WAV/PCM IO for the voice pipeline
-    "huggingface_hub>=0.24"  # model pre-download (huggingface-cli)
+    "huggingface_hub>=0.24"  # model pre-download (hf CLI / snapshot_download API)
     "elevenlabs>=1.0"     # OPTIONAL cloud voice tier SDK (stays OFF until a key is set)
 )
 
@@ -909,7 +909,7 @@ VLM_ID="$(read_model_id DEFAULT_VLM "$FALLBACK_VLM")"
 # speculative support. Tiny relative to the others (~0.5 GB class).
 DRAFT_ID="$(read_model_id DEFAULT_DRAFT "$FALLBACK_DRAFT")"
 # The image model id (server.py DEFAULT_IMAGE_MODEL == "schnell") is an mflux
-# ALIAS, not an HF repo id, so we cannot huggingface-cli download "schnell".
+# ALIAS, not an HF repo id, so we cannot "hf download" the bare "schnell".
 # "schnell" resolves to this FLUX.1-schnell repo inside mflux's own resolver; we
 # name the repo here so the pre-download covers the same weights mflux fetches on
 # first generate. This is the LARGEST download by far (multi-GB diffusion weights).
@@ -932,7 +932,7 @@ if [ "$DO_MODELS" -eq 0 ]; then
 elif [ "$MODE" = "check" ]; then
     plan "mkdir -p \"$HF_HOME_DIR\""
     for m in "${MODELS[@]}"; do
-        plan "HF_HOME=\"$HF_HOME_DIR\" \"$VENV/bin/huggingface-cli\" download \"$m\""
+        plan "HF_HOME=\"$HF_HOME_DIR\" \"$VENV/bin/hf\" download \"$m\"   # (or the snapshot_download API if 'hf' is absent)"
     done
     ui_note "Total download is LARGE, multi-GB (the VLM and especially the IMAGE"
     ui_note "diffusion model dominate; the DRAFT model is small). Each download shows"
@@ -941,14 +941,23 @@ elif [ "$MODE" = "check" ]; then
 else
     mkdir -p "$HF_HOME_DIR"
     export HF_HOME="$HF_HOME_DIR"
-    HFCLI="$VENV/bin/huggingface-cli"
-    if [ ! -x "$HFCLI" ]; then ui_err "huggingface-cli missing in the venv (Stage 3 should have installed it)"; exit 1; fi
+    # `huggingface-cli` was REMOVED from current huggingface_hub — it now errors
+    # with "deprecated and no longer works. Use `hf` instead." Resolve a working
+    # downloader ONCE: prefer the new `hf` CLI (live progress); else fall back to
+    # the STABLE Python snapshot_download API (immune to CLI renames). Both are
+    # cache-first + resumable and honor HF_HOME, so re-runs are cheap.
+    if [ -x "$VENV/bin/hf" ]; then
+        DL=("$VENV/bin/hf" download)
+    elif [ -x "$VENV_PY" ]; then
+        DL=("$VENV_PY" -c 'import sys; from huggingface_hub import snapshot_download; snapshot_download(sys.argv[1])')
+    else
+        ui_err "no model downloader in the venv (need 'hf' or huggingface_hub — Stage 3 installs huggingface_hub)"; exit 1
+    fi
     n=0; total="${#MODELS[@]}"
     for m in "${MODELS[@]}"; do
         n=$((n + 1))
         ui_progress $(( (n - 1) * 100 / total )) "model $n/$total: $m"
-        # huggingface-cli download is cache-first + resumable, so re-runs are cheap.
-        ui_spin "download $m" -- "$HFCLI" download "$m"
+        ui_spin "download $m" -- "${DL[@]}" "$m"
     done
     ui_progress 100 "all models cached"
     ui_ok "Every model the OS uses is pre-downloaded into $HF_HOME_DIR"
