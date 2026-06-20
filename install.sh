@@ -459,23 +459,97 @@ ensure_homebrew() {
     return 1
 }
 
-# FUTURISTIC NEXT-STEPS — the five honest "directive" panels (cohesive HUD cards).
+# ----------------------------------------------------------------------------
+# HUD-APP PLACEMENT (STAGE 5 helper).
+#
+# The Tauri build produces JARVIS.app inside the build tree. On its own that is
+# not discoverable — a user can't find or launch it. These helpers INSTALL the
+# built app into /Applications (or ~/Applications) so the command-line install
+# ends with a launchable app right where macOS users expect it, and set
+# INSTALLED_APP_PATH for the "OPEN JARVIS" next-step.
+# ----------------------------------------------------------------------------
+
+# Is the app at $1 a NOTARIZED / Developer-ID-signed build (i.e. the official
+# .dmg release) rather than an ad-hoc local build? Used so we NEVER overwrite the
+# signed app with this locally-built one (that would downgrade the signature and
+# could clobber a running copy in the .dmg first-run flow).
+is_notarized_app() {
+    codesign -dvv "$1" 2>&1 | grep -q "Authority=Developer ID Application"
+}
+
+# Install the freshly-built JARVIS.app ($1) into the first writable Applications
+# dir. Sets the global INSTALLED_APP_PATH to where it ended up. Never fatal — if
+# every copy fails, INSTALLED_APP_PATH falls back to the build path (the app DOES
+# exist there) with an honest "move it yourself" note. Idempotent: a prior local
+# build is replaced (an update); a notarized app is LEFT IN PLACE.
+place_hud_app() {
+    local src="$1"
+    INSTALLED_APP_PATH=""
+    if [ -z "$src" ] || [ ! -d "$src" ]; then
+        ui_warn "tauri build produced no JARVIS.app to install"
+        return 0
+    fi
+
+    local cand dest
+    # Preference order: system /Applications (where users look first), then the
+    # user's ~/Applications (always writable — no admin needed).
+    for cand in "/Applications" "$HOME/Applications"; do
+        { [ -d "$cand" ] || mkdir -p "$cand" 2>/dev/null; } || continue
+        [ -w "$cand" ] || continue
+        dest="$cand/JARVIS.app"
+
+        # Never downgrade/clobber the official signed app (the .dmg build, which
+        # may also be RUNNING in the first-run flow) — leave it, point the user at it.
+        if [ -d "$dest" ] && is_notarized_app "$dest"; then
+            ui_ok "JARVIS.app already installed (signed) at $dest — left in place."
+            INSTALLED_APP_PATH="$dest"
+            return 0
+        fi
+
+        # Fresh install, or updating a prior LOCAL build: replace it cleanly.
+        if rm -rf "$dest" 2>/dev/null && ditto "$src" "$dest" 2>/dev/null; then
+            ui_ok "HUD app installed: $dest"
+            INSTALLED_APP_PATH="$dest"
+            return 0
+        fi
+        # else: not writable for this item / ditto failed — try the next candidate.
+    done
+
+    # Could not place it anywhere — honest: the app exists in the build tree.
+    ui_warn "Could not copy JARVIS.app into Applications (permissions?)."
+    ui_note "It is built at:  $src"
+    ui_note "Move it with:    ditto \"$src\" \"\$HOME/Applications/JARVIS.app\""
+    INSTALLED_APP_PATH="$src"
+    return 0
+}
+
+# FUTURISTIC NEXT-STEPS — the honest "directive" panels (cohesive HUD cards).
 # Defined ONCE so the real-install finish and the --check preview render the SAME
 # substance (no fork can let the two drift): every fact — keys, paths, commands,
 # caveats — is preserved verbatim; ui_panel only adds framing. $1 is the lead-line
 # suffix so the preview can mark itself "(preview)" without duplicating the cards.
 print_next_steps_directives() {
     local lead_note="${1:-}"
+    # Where the HUD app landed (set by place_hud_app in a real install); in --check
+    # the build has not run, so show the default destination it WOULD install to.
+    local _app_path="${INSTALLED_APP_PATH:-/Applications/JARVIS.app}"
     printf '\n'
     ui_info "${UI_BOLD}${UI_CYAN}NEXT-STEP DIRECTIVES${UI_RESET} — full-power default: consequential actions are ARMED, still gated per action${lead_note}:"
 
-    ui_panel "1" "TCC PERMISSIONS" \
+    ui_panel "1" "OPEN JARVIS" \
+        "The HUD app is installed at ${UI_BRIGHT}${_app_path}${UI_RESET}." \
+        "Open it from ${UI_ICE}Finder > Applications${UI_RESET}, or run:" \
+        "  ${UI_CYAN}open -a JARVIS${UI_RESET}" \
+        "It connects to the daemon automatically; the first launch triggers the" \
+        "macOS permission prompts described next."
+
+    ui_panel "2" "TCC PERMISSIONS" \
         "macOS will prompt for ${UI_BRIGHT}Accessibility${UI_RESET}, ${UI_BRIGHT}Microphone${UI_RESET}, and ${UI_BRIGHT}Screen Recording${UI_RESET}" \
         "the first time JARVIS needs each. Many full-power features (UI automation," \
         "live interpret, sound monitor, screen context) stay ${UI_BRIGHT}inert${UI_RESET} until you grant" \
         "these in ${UI_ICE}System Settings > Privacy & Security${UI_RESET}. They cannot be pre-granted."
 
-    ui_panel "2" "API KEYS  (gates ON, but inert until set)" \
+    ui_panel "3" "API KEYS  (gates ON, but inert until set)" \
         "The feature gates ship ${UI_BRIGHT}ON${UI_RESET}, but key-dependent capabilities stay" \
         "${UI_BRIGHT}inert until a key is supplied${UI_RESET}: the cloud LLM fallback, the ElevenLabs cloud" \
         "voice/STT tier, and self-heal/forge drafting all need a key. To enable, put" \
@@ -485,7 +559,7 @@ print_next_steps_directives() {
         "or store them in the macOS Keychain. Local inference works fully offline" \
         "with no key at all; enabling a gate != active without the key."
 
-    ui_panel "3" "VOICE WAKE WORD  +  GATES THAT STAY ENFORCED" \
+    ui_panel "4" "VOICE WAKE WORD  +  GATES THAT STAY ENFORCED" \
         "Say \"${UI_BRIGHT}JARVIS${UI_RESET}\" to wake it once the daemon is up." \
         "The installer ships the ${UI_BRIGHT}master switch ON${UI_RESET} (consequential actions ARMED)," \
         "but every consequential action STILL requires a ${UI_BRIGHT}fresh per-action confirm${UI_RESET} +" \
@@ -494,12 +568,12 @@ print_next_steps_directives() {
         "PROPOSE-ONLY${UI_RESET} (drafts a validated patch you apply via scripts/apply_heal.sh," \
         "and inert until ANTHROPIC_API_KEY is set). Lockdown/panic forces everything off."
 
-    ui_panel "4" "BOOT-TO-JARVIS" \
+    ui_panel "5" "BOOT-TO-JARVIS" \
         "For a deployment Mac, enable auto-login so the gui-domain agents start at" \
         "power-on (see ${UI_ICE}scripts/install_boot.sh${UI_RESET} checklist)." \
         "${UI_YELLOW}Do not install these agents on a dev machine.${UI_RESET}"
 
-    ui_panel "5" "REMOVE JARVIS COMPLETELY" \
+    ui_panel "6" "REMOVE JARVIS COMPLETELY" \
         "Run" \
         "  ${UI_CYAN}\"$JARVIS_HOME/uninstall.sh\"${UI_RESET}" \
         "(two typed confirmations; --dry-run to preview)."
@@ -899,6 +973,7 @@ if [ "$MODE" = "check" ]; then
     done
     plan "swift build -c release --package-path \"$JARVIS_HOME/apps/vision\""
     plan "(cd \"$JARVIS_HOME/hud\" && npm ci && npm run tauri build)   # -> JARVIS.app"
+    plan "ditto <built JARVIS.app> /Applications/JARVIS.app   # install the app (left alone if a SIGNED copy is already there)"
     ui_note "every artifact is built FRESH in the install home (never shipped prebuilt)."
 else
     for mf in "${CARGO_MANIFESTS[@]}"; do
@@ -926,7 +1001,14 @@ else
         ui_spin "npm ci (HUD deps)" -- bash -c "cd '$JARVIS_HOME/hud' && npm ci"
         ui_spin "npm run tauri build (-> JARVIS.app)" -- bash -c "cd '$JARVIS_HOME/hud' && npm run tauri build"
         APP_BUNDLE="$(find "$JARVIS_HOME/hud/src-tauri/target/release/bundle" -maxdepth 2 -name 'JARVIS.app' 2>/dev/null | head -1 || true)"
-        if [ -n "$APP_BUNDLE" ]; then ui_ok "HUD bundled: $APP_BUNDLE"; else ui_warn "tauri build finished but JARVIS.app not located"; fi
+        if [ -n "$APP_BUNDLE" ]; then
+            ui_ok "HUD bundled: $APP_BUNDLE"
+            # INSTALL the app into /Applications (or ~/Applications) so it is
+            # launchable — never clobbering an already-installed signed copy.
+            place_hud_app "$APP_BUNDLE"
+        else
+            ui_warn "tauri build finished but JARVIS.app not located"
+        fi
     fi
     ui_ok "All release artifacts built fresh in the install home."
 fi
@@ -1021,7 +1103,7 @@ if [ "$MODE" = "check" ]; then
         "CORE DAEMON (jarvisd)|WILL BUILD" \
         "INFERENCE ENGINE / MLX|WILL BUILD" \
         "ON-DEVICE MODELS|$models_plan" \
-        "HUD INTERFACE|WILL BUILD" \
+        "HUD INTERFACE|WILL INSTALL" \
         "AGENT CONSTELLATION|$agents_plan" \
         "AUTOSTART (LaunchAgents)|WILL LOAD" \
         "CONSEQUENTIAL ACTIONS|$CONSEQ_TAG" \
@@ -1064,12 +1146,16 @@ else
     if [ "$_mcount" -gt 0 ]; then MODELS_TAG="$_mcount RESIDENT"; else MODELS_TAG="RESIDENT"; fi
 fi
 
-# HUD INTERFACE: the Tauri bundle. BUILT if a JARVIS.app landed in the bundle
-# tree, else SKIPPED (e.g. no hud/package.json or the bundle did not appear).
+# HUD INTERFACE: the Tauri bundle. INSTALLED if place_hud_app put JARVIS.app into
+# an Applications dir; BUILT if it landed in the bundle tree but wasn't placed;
+# else SKIPPED (e.g. no hud/package.json or the bundle did not appear).
 HUD_TAG="SKIPPED"
 if find "$JARVIS_HOME/hud/src-tauri/target/release/bundle" -maxdepth 2 -name 'JARVIS.app' 2>/dev/null | grep -q . ; then
     HUD_TAG="BUILT"
 fi
+case "${INSTALLED_APP_PATH:-}" in
+    /Applications/*|"$HOME"/Applications/*) HUD_TAG="INSTALLED" ;;
+esac
 
 # AGENT CONSTELLATION: READY (the roster config is placed + the daemon that reads
 # it is BUILT). A truthful count when we have it; otherwise a neutral CONFIGURED.
