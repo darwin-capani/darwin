@@ -3411,6 +3411,95 @@ pub(crate) async fn play_cue_for_command(
     }
 }
 
+/// Send-safe wrapper around [`trigger_design_voice`] for the command channel's
+/// `design_voice` verb — the SAME isolation pattern as [`play_cue_for_command`].
+/// The trigger loads + mutates + persists the cloned-voice store and opens a
+/// per-call inference client; we run the whole thing to completion on a dedicated
+/// thread with its own current-thread runtime and hand back ONLY the `Send`
+/// `Result<String, String>` (the voice id, or the honest failure prose). The
+/// trigger's own gates are unchanged: offline / no-key is still the honest `Err`
+/// produced INSIDE `trigger_design_voice`; this wrapper fabricates nothing. The
+/// store is LOADED fresh on the thread (so a concurrent session's clone is not
+/// clobbered) and the trigger persists it. `el_key` is read ONLY inside the
+/// trigger — never on a stack we log or return.
+pub(crate) async fn design_voice_for_command(
+    cfg: Config,
+    description: String,
+    name: String,
+    agent: String,
+    root: PathBuf,
+    inference_sock: PathBuf,
+) -> Result<String, String> {
+    let join = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return Err(format!("Couldn't start the voice-design runtime: {e}")),
+        };
+        rt.block_on(async move {
+            let mut infer = InferenceClient::new(inference_sock);
+            let mut cloned_voices = voiceclone::load_clones(&root);
+            trigger_design_voice(
+                &cfg,
+                &description,
+                &name,
+                &agent,
+                &root,
+                &mut cloned_voices,
+                &mut infer,
+            )
+            .await
+        })
+    });
+    // A panic on the design thread becomes an honest failure, never a faked voice.
+    match tokio::task::spawn_blocking(move || join.join()).await {
+        Ok(Ok(result)) => result,
+        _ => Err("I couldn't design that voice just now — nothing was created.".to_string()),
+    }
+}
+
+/// Send-safe wrapper around [`trigger_create_pronunciation`] for the command
+/// channel's `create_pronunciation` verb — the SAME isolation pattern as
+/// [`play_cue_for_command`]. The trigger loads + mutates + persists the
+/// active-pronunciation store and opens a per-call inference client; we run it on
+/// a dedicated thread and hand back ONLY the `Send` `Result<(String, String),
+/// String>` (the non-secret (dictionary_id, version_id), or the honest failure
+/// prose). The trigger's gates are unchanged: offline / no-key is the honest
+/// `Err` produced INSIDE the trigger; this wrapper fabricates nothing. `el_key`
+/// is read ONLY inside the trigger.
+pub(crate) async fn create_pronunciation_for_command(
+    cfg: Config,
+    name: String,
+    rules: Vec<crate::inference::PronunciationRule>,
+    root: PathBuf,
+    inference_sock: PathBuf,
+) -> Result<(String, String), String> {
+    let join = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return Err(format!("Couldn't start the pronunciation runtime: {e}")),
+        };
+        rt.block_on(async move {
+            let mut infer = InferenceClient::new(inference_sock);
+            let mut active_pron = voiceclone::load_pronunciation(&root);
+            trigger_create_pronunciation(
+                &cfg,
+                &name,
+                &rules,
+                &root,
+                &mut active_pron,
+                &mut infer,
+            )
+            .await
+        })
+    });
+    // A panic on the pronunciation thread becomes an honest failure, never a faked id.
+    match tokio::task::spawn_blocking(move || join.join()).await {
+        Ok(Ok(result)) => result,
+        _ => Err("I couldn't create that pronunciation dictionary just now — nothing was created."
+            .to_string()),
+    }
+}
+
 /// DESIGN VOICE provisioning trigger (Phase-2). Mirrors the clone seam, but with NO
 /// consent/audio gate (text-only — no audio leaves the device): gate on the key -> emit
 /// op=design_voice with the voice DESCRIPTION + display name -> store the returned
@@ -3420,7 +3509,6 @@ pub(crate) async fn play_cue_for_command(
 ///
 /// SECURITY: the resolved key is read here ONLY to thread into the request body; it is
 /// never logged/argv/telemetry. The returned voice_id is non-secret.
-#[allow(dead_code)] // Phase-2 provisioning seam; wired to the design-voice command next
 async fn trigger_design_voice(
     cfg: &Config,
     description: &str,
@@ -3477,7 +3565,6 @@ async fn trigger_design_voice(
 ///
 /// SECURITY: the resolved key is read here ONLY to thread into the request body; it is
 /// never logged/argv/telemetry. Both returned ids are non-secret.
-#[allow(dead_code)] // Phase-2 provisioning seam; wired to the pronunciation command next
 async fn trigger_create_pronunciation(
     cfg: &Config,
     name: &str,

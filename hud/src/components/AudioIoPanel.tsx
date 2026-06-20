@@ -16,7 +16,24 @@ import {
   cueOutcomeCopy,
   type CuePlayOutcome,
 } from "../core/sfxCue";
-import { inTauri, keychainStatus, playSfxCue } from "../tauri/bridge";
+import {
+  buildDesignVoiceRequest,
+  buildPronunciationRequest,
+  designVoiceErrorCopy,
+  designVoiceOutcomeCopy,
+  pronunciationErrorCopy,
+  pronunciationOutcomeCopy,
+  voiceLabDisabledReason,
+  voiceLabGateCopy,
+} from "../core/voiceLab";
+import { ROSTER } from "../core/agents";
+import {
+  createPronunciation,
+  designVoice,
+  inTauri,
+  keychainStatus,
+  playSfxCue,
+} from "../tauri/bridge";
 import Frame from "./Frame";
 
 /**
@@ -143,6 +160,9 @@ export default function AudioIoPanel({
 
           {/* SFX CUES — read-only catalog + honest per-cue test triggers ---- */}
           <SfxCueTrigger />
+
+          {/* VOICE LAB — design a voice + add a pronunciation (key + tier gated) */}
+          <VoiceLab />
 
           <div className="verify-foot dim-note">
             All three audio-input features ship <b>OFF / neutral</b>. Live
@@ -289,6 +309,270 @@ function SfxCueTrigger() {
             ". They generate once via ElevenLabs, then play from cache. " +
             "Cues require the key + cloud SFX on — else nothing plays."}
       </div>
+    </div>
+  );
+}
+
+/**
+ * VOICE LAB (Phase-2) — two HONEST ElevenLabs provisioning controls from the HUD:
+ *
+ *   - DESIGN A VOICE — design a voice for an agent from a text DESCRIPTION
+ *     (the `design_voice` command). Only the text description leaves the device;
+ *     the returned voice id is stored daemon-side.
+ *   - ADD A PRONUNCIATION — mint a single alias rule (word -> say, the
+ *     `create_pronunciation` command). Text rules only; no audio leaves the device.
+ *
+ * Both ride the SAME token-injecting command seam every verb uses — they add NO
+ * authority and NO new tier.
+ *
+ * HONESTY CONTRACT (do not regress):
+ *   - The Voice Lab requires the ElevenLabs key + the cloud tier. The forms are
+ *     DISABLED (with copy that names exactly what's missing) until the gate is
+ *     open; with the tier off / no key / offline, NOTHING is created — never a
+ *     fabricated voice or dictionary.
+ *   - The daemon makes the real, gated call and returns an honest `Err` when the
+ *     gate is closed; this surface only reflects that outcome, never claims a
+ *     creation when it didn't happen.
+ *   - SECRET-FREE. It reads only two booleans (cloud-tier switch on, key present)
+ *     and sends the free-text request fields — never the key value, never the
+ *     returned voice/dictionary id.
+ *
+ * The gate inputs are probed ONCE on mount (config `voice.cloud_tier` + key
+ * presence); the pure request-shaping / gate / outcome logic lives in
+ * core/voiceLab.ts and is unit-tested headlessly.
+ */
+function VoiceLab() {
+  const shell = inTauri();
+  const [cloudTierOn, setCloudTierOn] = useState(false);
+  const [keyPresent, setKeyPresent] = useState(false);
+
+  // Probe the secret-free gate inputs once: the cloud-tier switch (from config)
+  // and whether an ElevenLabs key is on file (presence only — never the value).
+  // In a plain browser both stay false and the forms render disabled.
+  useEffect(() => {
+    if (!shell) return;
+    let live = true;
+    void (async () => {
+      try {
+        const { configGet } = await import("../tauri/configSettings");
+        const settings = await configGet();
+        const tier = settings.find((s) => s.key === "voice.cloud_tier");
+        if (live) setCloudTierOn(tier?.value === true);
+      } catch {
+        if (live) setCloudTierOn(false);
+      }
+    })();
+    void keychainStatus("elevenlabs_api_key")
+      .then((present) => {
+        if (live) setKeyPresent(present);
+      })
+      .catch(() => {
+        if (live) setKeyPresent(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [shell]);
+
+  const reason = voiceLabDisabledReason(shell, { cloudTierOn, keyPresent });
+  const gateOpen = reason === null;
+
+  return (
+    <div className="audioio-voicelab" aria-label="Voice Lab">
+      <div className="verify-row">
+        <span className="verify-head">VOICE LAB</span>
+        <span
+          className={`verify-pill audioio-${gateOpen ? "good" : "idle"}`}
+          title={
+            "Design an ElevenLabs voice for an agent, or add a pronunciation rule. " +
+            "Both require the ElevenLabs key + cloud TTS ([voice].cloud_tier) ON; " +
+            "with either off (or offline) nothing is created — never a fabricated " +
+            "voice or dictionary. Only the text you enter leaves the device; no key " +
+            "value or returned id crosses this surface."
+          }
+        >
+          <span className={`dot ${gateOpen ? "good" : "idle"}`} />
+          {gateOpen ? "READY" : "OFF"}
+        </span>
+        <span className="verify-meaning">{voiceLabGateCopy(reason)}</span>
+      </div>
+
+      <DesignVoiceForm gateOpen={gateOpen} reason={reason} />
+      <AddPronunciationForm gateOpen={gateOpen} reason={reason} />
+
+      <div className="audioio-sub dim-note">
+        Designing a voice or adding a pronunciation calls ElevenLabs once and
+        stores the result on this device. Requires the key + cloud tier — else
+        nothing is created.
+      </div>
+    </div>
+  );
+}
+
+/** DESIGN A VOICE — pick an agent + describe the voice, then Design. The shaping +
+ *  validation floors live in core/voiceLab.ts (mirroring the daemon `decide`); a
+ *  thin request never leaves the form. The outcome is the daemon's own honest line,
+ *  falling back to the contract copy — never a fabricated "designed" state. */
+function DesignVoiceForm({
+  gateOpen,
+  reason,
+}: {
+  gateOpen: boolean;
+  reason: ReturnType<typeof voiceLabDisabledReason>;
+}) {
+  const [agent, setAgent] = useState(ROSTER[0]?.name ?? "");
+  const [description, setDescription] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+
+  const submit = useCallback(async () => {
+    if (busy) return;
+    const shaped = buildDesignVoiceRequest(agent, description, "");
+    if (!shaped.ok) {
+      setNote(designVoiceErrorCopy(shaped.error));
+      return;
+    }
+    setBusy(true);
+    setNote("");
+    try {
+      const r = await designVoice(shaped.request.agent, shaped.request.description);
+      // Prefer the daemon's own secret-free line; fall back to the contract copy.
+      setNote(r.detail || designVoiceOutcomeCopy(r.outcome, shaped.request.agent));
+    } catch {
+      setNote(designVoiceOutcomeCopy("failed", shaped.request.agent));
+    } finally {
+      setBusy(false);
+    }
+  }, [agent, description, busy]);
+
+  return (
+    <div className="audioio-vl-form" aria-label="Design a voice">
+      <div className="audioio-vl-title">Design a voice</div>
+      <div className="audioio-vl-fields">
+        <label className="audioio-vl-label">
+          Agent
+          <select
+            className="audioio-vl-select"
+            value={agent}
+            onChange={(e) => setAgent(e.target.value)}
+            disabled={!gateOpen || busy}
+          >
+            {ROSTER.map((a) => (
+              <option key={a.name} value={a.name}>
+                {a.name} — {a.role}
+              </option>
+            ))}
+          </select>
+        </label>
+        <label className="audioio-vl-label">
+          Describe the voice
+          <textarea
+            className="audioio-vl-textarea"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            disabled={!gateOpen || busy}
+            rows={2}
+            placeholder="e.g. a calm, warm British concierge voice, mid-30s, measured pace"
+            title={gateOpen ? undefined : voiceLabGateCopy(reason)}
+          />
+        </label>
+        <button
+          type="button"
+          className="icon-btn audioio-vl-submit"
+          onClick={() => void submit()}
+          disabled={!gateOpen || busy}
+          title={gateOpen ? "Design this voice (calls ElevenLabs once)" : voiceLabGateCopy(reason)}
+        >
+          {busy ? "Designing…" : "Design"}
+        </button>
+      </div>
+      {note && (
+        <div className="audioio-sub dim-note" role="status">
+          {note}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** ADD A PRONUNCIATION — a word + how to say it, then Add. Shaping/validation in
+ *  core/voiceLab.ts; the daemon mints ONE alias rule. The outcome is honest — never
+ *  a fabricated dictionary. */
+function AddPronunciationForm({
+  gateOpen,
+  reason,
+}: {
+  gateOpen: boolean;
+  reason: ReturnType<typeof voiceLabDisabledReason>;
+}) {
+  const [word, setWord] = useState("");
+  const [say, setSay] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+
+  const submit = useCallback(async () => {
+    if (busy) return;
+    const shaped = buildPronunciationRequest(word, say, "");
+    if (!shaped.ok) {
+      setNote(pronunciationErrorCopy(shaped.error));
+      return;
+    }
+    setBusy(true);
+    setNote("");
+    try {
+      const r = await createPronunciation(shaped.request.word, shaped.request.say);
+      setNote(
+        r.detail ||
+          pronunciationOutcomeCopy(r.outcome, shaped.request.word, shaped.request.say),
+      );
+    } catch {
+      setNote(pronunciationOutcomeCopy("failed", shaped.request.word, shaped.request.say));
+    } finally {
+      setBusy(false);
+    }
+  }, [word, say, busy]);
+
+  return (
+    <div className="audioio-vl-form" aria-label="Add a pronunciation">
+      <div className="audioio-vl-title">Add a pronunciation</div>
+      <div className="audioio-vl-fields">
+        <label className="audioio-vl-label">
+          Word
+          <input
+            className="audioio-vl-input"
+            value={word}
+            onChange={(e) => setWord(e.target.value)}
+            disabled={!gateOpen || busy}
+            placeholder="e.g. JARVIS"
+            title={gateOpen ? undefined : voiceLabGateCopy(reason)}
+          />
+        </label>
+        <label className="audioio-vl-label">
+          Say it like
+          <input
+            className="audioio-vl-input"
+            value={say}
+            onChange={(e) => setSay(e.target.value)}
+            disabled={!gateOpen || busy}
+            placeholder="e.g. jar viss"
+            title={gateOpen ? undefined : voiceLabGateCopy(reason)}
+          />
+        </label>
+        <button
+          type="button"
+          className="icon-btn audioio-vl-submit"
+          onClick={() => void submit()}
+          disabled={!gateOpen || busy}
+          title={gateOpen ? "Add this pronunciation (calls ElevenLabs once)" : voiceLabGateCopy(reason)}
+        >
+          {busy ? "Adding…" : "Add"}
+        </button>
+      </div>
+      {note && (
+        <div className="audioio-sub dim-note" role="status">
+          {note}
+        </div>
+      )}
     </div>
   );
 }

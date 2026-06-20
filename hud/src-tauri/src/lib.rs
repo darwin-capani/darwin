@@ -896,6 +896,8 @@ pub fn run() {
             heal::heal_apply,
             command::send_command,
             command::play_sfx_cue,
+            command::design_voice,
+            command::create_pronunciation,
             config_settings::config_get,
             config_settings::config_set,
             config_settings::daemon_restart,

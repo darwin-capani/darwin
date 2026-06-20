@@ -278,7 +278,6 @@ pub struct ActivePronunciation {
 impl ActivePronunciation {
     /// Record the active locator from a confirmed `create_pronunciation` (replaces any
     /// prior one — a re-create supersedes the old dictionary).
-    #[allow(dead_code)] // written by trigger_create_pronunciation + exercised in tests
     pub fn set(&mut self, dictionary_id: &str, version_id: &str) {
         self.dictionary_id = dictionary_id.to_string();
         self.version_id = version_id.to_string();
@@ -316,7 +315,6 @@ pub fn load_pronunciation(root: &Path) -> ActivePronunciation {
 
 /// Persist the active-pronunciation store (non-secret ids) with restrictive perms,
 /// mirroring [`save_clones`]. Best-effort 0700 dir / 0600 file.
-#[allow(dead_code)] // written by trigger_create_pronunciation + exercised in tests
 pub fn save_pronunciation(root: &Path, active: &ActivePronunciation) -> std::io::Result<()> {
     let path = pronunciation_store_path(root);
     if let Some(parent) = path.parent() {

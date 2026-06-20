@@ -1181,7 +1181,6 @@ impl InferenceClient {
     ///
     /// SECURITY: `el_key` rides ONLY the request body for the server's `xi-api-key`
     /// header — never logged/argv/telemetry. The returned `voice_id` is non-secret.
-    #[allow(dead_code)] // credential+runtime-gated seam; reached via trigger_design_voice
     pub async fn design_voice(
         &mut self,
         description: &str,
@@ -1211,7 +1210,6 @@ impl InferenceClient {
     ///
     /// SECURITY: `el_key` rides ONLY the request body for the server's `xi-api-key`
     /// header — never logged/argv/telemetry. Both returned ids are non-secret.
-    #[allow(dead_code)] // credential+runtime-gated seam; reached via trigger_create_pronunciation
     pub async fn create_pronunciation(
         &mut self,
         name: &str,

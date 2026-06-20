@@ -44,6 +44,11 @@ const MAX_TEXT_CHARS: usize = 4 * 1024;
 const SOCKET_TIMEOUT: Duration = Duration::from_secs(120);
 /// Cap on the reply we read back (a prose reply, never bulk data).
 const MAX_REPLY_BYTES: usize = 64 * 1024;
+/// The EL voice-design prompt floor — matches daemon
+/// `command.rs::MIN_VOICE_DESCRIPTION_CHARS`. A `design_voice` description below
+/// this is rejected HERE (defense-in-depth; the daemon also rejects it) so a
+/// too-thin request never rides the wire.
+const MIN_VOICE_DESCRIPTION_CHARS: usize = 20;
 
 /// The bounded command set the backend will relay — the SAME structural
 /// allowlist as daemon/src/command.rs. An unknown `cmd` from JS is rejected here
@@ -69,6 +74,18 @@ const ALLOWED_COMMANDS: &[&str] = &[
     // and NO new tier. Relayed through the SAME token-injecting socket as every
     // other verb (defense-in-depth: an unknown cue name is rejected daemon-side).
     "play_cue",
+    // Phase-2 Voice Lab — the two ElevenLabs provisioning verbs.
+    //   `design_voice` designs a voice for an agent from a TEXT description and
+    //     carries {agent, description, name?}. Only the text description leaves the
+    //     device; the returned voice id is stored daemon-side.
+    //   `create_pronunciation` mints ONE alias pronunciation rule (word -> say) and
+    //     carries {word, say, name?}. Text rules only; no audio leaves the device.
+    // The daemon gates BOTH on its already-shipped key + non-Local-tier gate and
+    // returns an HONEST `Err` (never a fabricated voice/dictionary) when the gate is
+    // closed. These add NO new authority and NO new tier — they ride the SAME
+    // token-injecting socket as every other verb (defense-in-depth: a too-thin /
+    // empty request is rejected daemon-side).
+    "design_voice", "create_pronunciation",
 ];
 
 /// The typed request the React layer hands `send_command`. Every field is
@@ -92,6 +109,24 @@ pub struct CommandRequest {
     /// catalog atom (confirm/alert/error/…); never a key, prompt, or path.
     #[serde(default)]
     pub cue: Option<String>,
+    /// Phase-2 Voice Lab — the voice DESCRIPTION (`design_voice` only). Free text,
+    /// clamped + length-checked in [`build_request`] (the EL design floor is
+    /// `MIN_VOICE_DESCRIPTION_CHARS`). Never a key, never an id.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// Phase-2 Voice Lab — the optional display/dictionary NAME (`design_voice` +
+    /// `create_pronunciation`). A short label only; omitted when blank (the daemon
+    /// defaults it).
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Phase-2 Voice Lab — the string to replace (`create_pronunciation` only). The
+    /// word/phrase the rule rewrites; non-empty, clamped in [`build_request`].
+    #[serde(default)]
+    pub word: Option<String>,
+    /// Phase-2 Voice Lab — the alias to say in its place (`create_pronunciation`
+    /// only). The replacement pronunciation text; non-empty, clamped.
+    #[serde(default)]
+    pub say: Option<String>,
 }
 
 /// The reply surfaced to the UI. `ok` mirrors the daemon's `{ok}`; `reply` is the
@@ -220,6 +255,48 @@ pub fn build_request(req: &CommandRequest, token: &str) -> Result<Value, String>
                 return Err("play_cue requires a cue name".to_string());
             }
             obj.insert("cue".to_string(), json!(cue.to_ascii_lowercase()));
+        }
+        "design_voice" => {
+            // {agent, description, name?}. Mirror the daemon `decide` floors so a
+            // thin request never spends a cloud op: a non-empty agent, a description
+            // at/above the EL design floor, and an OPTIONAL display name (omitted
+            // when blank — the daemon defaults it to the agent name). Only the text
+            // description leaves the device; no key/id ever rides this verb.
+            let agent = req.agent.as_deref().map(str::trim).unwrap_or("");
+            if agent.is_empty() {
+                return Err("design_voice requires an agent".to_string());
+            }
+            let description = req.description.as_deref().map(clamp_text).unwrap_or_default();
+            let description = description.trim();
+            if description.chars().count() < MIN_VOICE_DESCRIPTION_CHARS {
+                return Err("design_voice requires a longer voice description".to_string());
+            }
+            obj.insert("agent".to_string(), json!(agent));
+            obj.insert("description".to_string(), json!(description));
+            if let Some(name) = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                obj.insert("name".to_string(), json!(name));
+            }
+        }
+        "create_pronunciation" => {
+            // {word, say, name?}. Mirror the daemon `decide` floors: a non-empty word
+            // (the string to replace) AND a non-empty say (the alias pronunciation),
+            // plus an OPTIONAL dictionary name (omitted when blank — the daemon
+            // defaults it). Text rules only; no audio/key/id ever rides this verb.
+            let word = req.word.as_deref().map(clamp_text).unwrap_or_default();
+            let word = word.trim();
+            if word.is_empty() {
+                return Err("create_pronunciation requires a word to replace".to_string());
+            }
+            let say = req.say.as_deref().map(clamp_text).unwrap_or_default();
+            let say = say.trim();
+            if say.is_empty() {
+                return Err("create_pronunciation requires an alias pronunciation".to_string());
+            }
+            obj.insert("word".to_string(), json!(word));
+            obj.insert("say".to_string(), json!(say));
+            if let Some(name) = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+                obj.insert("name".to_string(), json!(name));
+            }
         }
         // brief / roster / state / pending carry no extra fields. The task #12
         // emergency-stop verbs `panic` / `unlock` are also bare (the daemon calls
@@ -474,6 +551,115 @@ pub async fn play_sfx_cue(cue: String) -> Result<PlayCueReply, String> {
     Ok(cue_outcome(&reply))
 }
 
+/* ------------------------------------------------------ Voice Lab (Phase-2) */
+
+/// The honest Voice-Lab outcome the HUD maps to prose. Mirrors the daemon
+/// trigger vocabulary collapsed to a small set: a genuine creation (`created`), a
+/// closed-gate / offline / no-key no-op (`unavailable`), or a generic failure
+/// (`failed`). It NEVER claims a creation when the daemon reported an honest `Err`.
+/// `detail` is the daemon's own secret-free line (never a voice/dictionary id).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct VoiceLabReply {
+    pub outcome: String,
+    pub detail: String,
+}
+
+/// Map a daemon `CommandReply` (the `design_voice` / `create_pronunciation` relay
+/// reply) into the bounded [`VoiceLabReply`] vocabulary. PURE — unit-tested.
+///
+/// HONESTY: an `ok:false` reply NEVER becomes "created". The daemon trigger
+/// returns prose, so we classify on the secret-free reply/error text: any `ok:true`
+/// success → `created`; a gate-closed / offline / no-key rejection (the trigger's
+/// "needs the cloud tier" / "working offline" / "without an ElevenLabs key" copy) →
+/// `unavailable` (an honest no-op, nothing created); anything else → `failed`. No id
+/// or secret is ever forwarded — only the contracted `{outcome, detail}`.
+pub fn voice_lab_outcome(reply: &CommandReply) -> VoiceLabReply {
+    // The command channel returns ok:true for any DISPATCHED verb and carries the
+    // trigger's honest outcome PROSE in `reply` — a closed gate / failure is reported
+    // in that text, NOT via ok:false (the same shape as the SFX cue path). So we
+    // classify on the secret-free line and call it "created" ONLY when the prose
+    // carries no failure / gate marker: an honest no-op or failure can NEVER read as
+    // "created", even though the dispatch itself returned ok:true.
+    let line = if reply.ok {
+        reply.reply.as_deref().unwrap_or("")
+    } else {
+        reply.error.as_deref().unwrap_or("command_failed")
+    };
+    let lower = line.to_ascii_lowercase();
+    let detail = if line.is_empty() { "Done.".to_string() } else { line.to_string() };
+
+    // A closed-gate no-op: cloud tier off / offline / no key. The daemon's own copy
+    // names these; mirror its markers so an honest no-op never reads as "created".
+    let outcome = if lower.contains("needs the cloud tier")
+        || lower.contains("working offline")
+        || lower.contains("without an elevenlabs key")
+        || lower.contains("add one in settings")
+    {
+        "unavailable"
+    } else if !reply.ok
+        || lower.contains("couldn't")
+        || lower.contains("could not")
+        || lower.contains("can't")
+        || lower.contains("didn't go through")
+        || lower.contains("nothing was created")
+    {
+        // Any honest failure marker -> failed, even on an ok:true dispatch.
+        "failed"
+    } else {
+        // A genuine creation: dispatched ok with clean success prose.
+        "created"
+    };
+    VoiceLabReply { outcome: outcome.to_string(), detail }
+}
+
+/// DESIGN a voice for `agent` from a text `description` (+ an optional display
+/// `name`). Relays a bounded `design_voice` request through the SAME
+/// token-injecting command socket as [`send_command`] — it adds NO new authority
+/// and NO new tier. The daemon gates it on its already-shipped key + non-Local-tier
+/// gate and returns an honest `Err` (never a fabricated voice) when the gate is
+/// closed; this command faithfully maps that into the [`VoiceLabReply`] vocabulary.
+/// Only the text description leaves the UI; no key value or id ever crosses here.
+#[tauri::command]
+pub async fn design_voice(
+    agent: String,
+    description: String,
+    name: Option<String>,
+) -> Result<VoiceLabReply, String> {
+    let request = CommandRequest {
+        cmd: "design_voice".to_string(),
+        agent: Some(agent),
+        description: Some(description),
+        name,
+        ..Default::default()
+    };
+    let reply = send_command(request).await?;
+    Ok(voice_lab_outcome(&reply))
+}
+
+/// CREATE a single-alias pronunciation rule (`word` -> `say`, under an optional
+/// dictionary `name`). Relays a bounded `create_pronunciation` request through the
+/// SAME token-injecting command socket as [`send_command`] — NO new authority, NO
+/// new tier. The daemon gates it on its already-shipped key + non-Local-tier gate
+/// and returns an honest `Err` (never a fabricated dictionary) when the gate is
+/// closed; this command maps that into the [`VoiceLabReply`] vocabulary. Text rules
+/// only; no audio, key value, or id ever crosses here.
+#[tauri::command]
+pub async fn create_pronunciation(
+    word: String,
+    say: String,
+    name: Option<String>,
+) -> Result<VoiceLabReply, String> {
+    let request = CommandRequest {
+        cmd: "create_pronunciation".to_string(),
+        word: Some(word),
+        say: Some(say),
+        name,
+        ..Default::default()
+    };
+    let reply = send_command(request).await?;
+    Ok(voice_lab_outcome(&reply))
+}
+
 /* --------------------------------------------------------------------- tests */
 
 #[cfg(test)]
@@ -503,6 +689,20 @@ mod tests {
             req("unlock"),
             // Phase-2 SFX cue — carries the cue name.
             { let mut r = req("play_cue"); r.cue = Some("confirm".into()); r },
+            // Phase-2 Voice Lab — design_voice carries agent + a long-enough
+            // description; create_pronunciation carries word + say.
+            {
+                let mut r = req("design_voice");
+                r.agent = Some("friday".into());
+                r.description = Some("a calm, warm British concierge voice".into());
+                r
+            },
+            {
+                let mut r = req("create_pronunciation");
+                r.word = Some("JARVIS".into());
+                r.say = Some("jar viss".into());
+                r
+            },
         ];
         for r in ok {
             let v = build_request(&r, "TOK").expect("known verb builds");
@@ -533,6 +733,132 @@ mod tests {
         let mut blank_cue = req("play_cue");
         blank_cue.cue = Some("   ".into());
         assert!(build_request(&blank_cue, "T").is_err()); // whitespace cue
+
+        // Voice Lab — design_voice needs an agent AND a long-enough description.
+        assert!(build_request(&req("design_voice"), "T").is_err()); // no agent
+        let mut no_desc = req("design_voice");
+        no_desc.agent = Some("friday".into());
+        assert!(build_request(&no_desc, "T").is_err()); // no description
+        let mut short_desc = req("design_voice");
+        short_desc.agent = Some("friday".into());
+        short_desc.description = Some("too short".into()); // < the EL floor
+        assert!(build_request(&short_desc, "T").is_err());
+        let mut blank_agent = req("design_voice");
+        blank_agent.agent = Some("   ".into());
+        blank_agent.description = Some("a calm, warm British concierge voice".into());
+        assert!(build_request(&blank_agent, "T").is_err()); // whitespace agent
+
+        // Voice Lab — create_pronunciation needs BOTH word and say.
+        assert!(build_request(&req("create_pronunciation"), "T").is_err()); // neither
+        let mut no_say = req("create_pronunciation");
+        no_say.word = Some("JARVIS".into());
+        assert!(build_request(&no_say, "T").is_err()); // no say
+        let mut no_word = req("create_pronunciation");
+        no_word.say = Some("jar viss".into());
+        assert!(build_request(&no_word, "T").is_err()); // no word
+        let mut blank_say = req("create_pronunciation");
+        blank_say.word = Some("JARVIS".into());
+        blank_say.say = Some("   ".into());
+        assert!(build_request(&blank_say, "T").is_err()); // whitespace say
+    }
+
+    #[test]
+    fn build_request_design_voice_carries_only_the_text_fields() {
+        let mut r = req("design_voice");
+        r.agent = Some("  friday  ".into());
+        r.description = Some("  a calm, warm British concierge voice  ".into());
+        r.name = Some("Concierge".into());
+        let v = build_request(&r, "TOK").unwrap();
+        assert_eq!(v["cmd"], "design_voice");
+        // Agent is trimmed; the description is trimmed; the name rides when present.
+        assert_eq!(v["agent"], "friday");
+        assert_eq!(v["description"], "a calm, warm British concierge voice");
+        assert_eq!(v["name"], "Concierge");
+        assert_eq!(v["token"], "TOK", "token injected by the backend");
+        // ONLY token + cmd + agent + description + name — no key/id/path field.
+        assert_eq!(v.as_object().unwrap().len(), 5);
+
+        // A blank name is OMITTED entirely (the daemon defaults it to the agent).
+        let mut no_name = req("design_voice");
+        no_name.agent = Some("friday".into());
+        no_name.description = Some("a calm, warm British concierge voice".into());
+        no_name.name = Some("   ".into());
+        let v = build_request(&no_name, "T").unwrap();
+        assert!(v.get("name").is_none(), "blank name omitted");
+        assert_eq!(v.as_object().unwrap().len(), 4); // token+cmd+agent+description
+    }
+
+    #[test]
+    fn build_request_create_pronunciation_carries_only_the_text_rule() {
+        let mut r = req("create_pronunciation");
+        r.word = Some("  JARVIS  ".into());
+        r.say = Some("  jar viss  ".into());
+        r.name = Some("My dictionary".into());
+        let v = build_request(&r, "TOK").unwrap();
+        assert_eq!(v["cmd"], "create_pronunciation");
+        assert_eq!(v["word"], "JARVIS");
+        assert_eq!(v["say"], "jar viss");
+        assert_eq!(v["name"], "My dictionary");
+        assert_eq!(v["token"], "TOK", "token injected by the backend");
+        // ONLY token + cmd + word + say + name — no key/id/audio field.
+        assert_eq!(v.as_object().unwrap().len(), 5);
+
+        // A blank name is OMITTED (the daemon defaults it to a fixed label).
+        let mut no_name = req("create_pronunciation");
+        no_name.word = Some("JARVIS".into());
+        no_name.say = Some("jar viss".into());
+        let v = build_request(&no_name, "T").unwrap();
+        assert!(v.get("name").is_none(), "blank name omitted");
+        assert_eq!(v.as_object().unwrap().len(), 4); // token+cmd+word+say
+    }
+
+    #[test]
+    fn voice_lab_outcome_maps_the_daemon_reply_honestly() {
+        // A successful creation → created (the agent now speaks with it).
+        let designed = parse_reply(r#"{"ok":true,"reply":"Designed and saved the Concierge voice for friday."}"#);
+        assert_eq!(voice_lab_outcome(&designed).outcome, "created");
+        let pron = parse_reply(r#"{"ok":true,"reply":"Created the pronunciation rule: say \"JARVIS\" as \"jar viss\"."}"#);
+        assert_eq!(voice_lab_outcome(&pron).outcome, "created");
+        // A gate-closed rejection NEVER reads as created — it is an honest no-op.
+        let offline = parse_reply(
+            r#"{"ok":false,"error":"Designing a voice needs the cloud tier, but you're working offline — nothing was created."}"#,
+        );
+        assert_eq!(voice_lab_outcome(&offline).outcome, "unavailable");
+        let no_key = parse_reply(
+            r#"{"ok":false,"error":"I can't design a voice without an ElevenLabs key — add one in Settings. No voice was created."}"#,
+        );
+        assert_eq!(voice_lab_outcome(&no_key).outcome, "unavailable");
+        // A generation/persist failure → failed, never a fabricated success.
+        let failed = parse_reply(
+            r#"{"ok":false,"error":"I couldn't design that voice just now — the cloud request didn't go through. Nothing was created."}"#,
+        );
+        assert_eq!(voice_lab_outcome(&failed).outcome, "failed");
+        // A protocol-level relay failure also reads as failed (never created).
+        let relay = parse_reply(r#"{"ok":false,"error":"unknown_command"}"#);
+        assert_eq!(voice_lab_outcome(&relay).outcome, "failed");
+        // FAIL-SAFE: the command channel returns ok:TRUE for any dispatched verb,
+        // carrying a gated/failure outcome in the PROSE. Such a reply must NOT read
+        // as "created" — we classify on the text, never the bare ok flag.
+        let ok_true_offline = parse_reply(
+            r#"{"ok":true,"reply":"Designing a voice needs the cloud tier, but you're working offline — nothing was created."}"#,
+        );
+        assert_eq!(
+            voice_lab_outcome(&ok_true_offline).outcome, "unavailable",
+            "ok:true with gated prose is an honest no-op, never created"
+        );
+        let ok_true_failed = parse_reply(
+            r#"{"ok":true,"reply":"I couldn't design that voice just now — the cloud request didn't go through. Nothing was created."}"#,
+        );
+        assert_eq!(
+            voice_lab_outcome(&ok_true_failed).outcome, "failed",
+            "ok:true with failure prose is failed, never created"
+        );
+        // The mapped detail never carries an id/secret-shaped marker.
+        for r in [&designed, &pron, &offline, &no_key, &failed, &relay, &ok_true_offline, &ok_true_failed] {
+            let mapped = voice_lab_outcome(r);
+            assert!(!mapped.detail.contains("sk-"));
+            assert!(!mapped.detail.contains(".wav"));
+        }
     }
 
     #[test]

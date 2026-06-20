@@ -443,6 +443,85 @@ export async function playSfxCue(cue: string): Promise<PlayCueReply> {
   }
 }
 
+/* ------------------------------------------------------- Voice Lab (Phase-2) */
+
+/** The honest outcome of a Voice-Lab attempt (mirrors the Rust `VoiceLabReply`).
+ *  `outcome` is the small contract vocabulary the UI maps to prose; it NEVER
+ *  claims a voice/dictionary was created when the daemon reported an honest `Err`.
+ *  `detail` is a short human line (never a secret, never a voice/dictionary id). */
+export interface VoiceLabReply {
+  /** "created" | "unavailable" | "failed" | "no_shell". */
+  outcome: "created" | "unavailable" | "failed" | "no_shell";
+  detail: string;
+}
+
+/**
+ * DESIGN an ElevenLabs voice for `agent` from a text `description` (+ an optional
+ * display `name`) via the `design_voice` backend command. This adds NO authority
+ * and NO new tier: the backend relays a bounded `design_voice` request through the
+ * SAME token-injecting command socket the deck uses, and the daemon's
+ * already-shipped gate (a key on file + a non-Local tier) makes the real, honest
+ * call. With the tier off / no key / offline the daemon returns an honest `Err`
+ * (`unavailable`) — never a fabricated voice.
+ *
+ * In a plain browser (no shell) there is nothing to design — return an honest
+ * `no_shell` outcome rather than throwing. Only the text description (+ the agent /
+ * name labels) leaves the UI here; no key value and no id ever cross this boundary.
+ */
+export async function designVoice(
+  agent: string,
+  description: string,
+  name?: string,
+): Promise<VoiceLabReply> {
+  if (!inTauri()) {
+    return {
+      outcome: "no_shell",
+      detail: "Designing a voice requires the JARVIS desktop app.",
+    };
+  }
+  try {
+    return await invoke<VoiceLabReply>("design_voice", { agent, description, name });
+  } catch (e) {
+    return {
+      outcome: "failed",
+      detail: typeof e === "string" ? e : "could not design the voice",
+    };
+  }
+}
+
+/**
+ * ADD a single-alias pronunciation rule (`word` -> `say`, under an optional
+ * dictionary `name`) via the `create_pronunciation` backend command. Same shape +
+ * honesty as {@link designVoice}: the backend relays a bounded
+ * `create_pronunciation` request through the SAME token-injecting socket; the
+ * daemon's already-shipped gate makes the real call and returns an honest `Err`
+ * (`unavailable`) when the tier is off / no key / offline — never a fabricated
+ * dictionary.
+ *
+ * In a plain browser (no shell) there is nothing to create — return an honest
+ * `no_shell` outcome. Text rules only; no audio, key value, or id ever crosses.
+ */
+export async function createPronunciation(
+  word: string,
+  say: string,
+  name?: string,
+): Promise<VoiceLabReply> {
+  if (!inTauri()) {
+    return {
+      outcome: "no_shell",
+      detail: "Adding a pronunciation requires the JARVIS desktop app.",
+    };
+  }
+  try {
+    return await invoke<VoiceLabReply>("create_pronunciation", { word, say, name });
+  } catch (e) {
+    return {
+      outcome: "failed",
+      detail: typeof e === "string" ? e : "could not add the pronunciation",
+    };
+  }
+}
+
 export async function toggleFullscreen(): Promise<void> {
   if (!inTauri()) {
     // Browser fallback for development.

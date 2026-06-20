@@ -6508,6 +6508,57 @@ svg.tri circle {
 }
 .audioio-cue-blurb { font-size: 0.72em; line-height: 1.3; flex: 1 1 200px; }
 
+/* VOICE LAB — design-a-voice + add-a-pronunciation forms. Like the SFX cues,
+   they add no authority: the controls are enabled only when the daemon gate is
+   open ([voice].cloud_tier + an ElevenLabs key); otherwise they render disabled
+   with honest copy. Secret-free — only the text the operator types is sent. */
+.audioio-voicelab { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.audioio-vl-form {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 0 0 0 2px;
+}
+.audioio-vl-title {
+  font-weight: 600;
+  font-size: 0.76em;
+  letter-spacing: 0.02em;
+  opacity: 0.85;
+}
+.audioio-vl-fields { display: flex; flex-direction: column; gap: 5px; }
+.audioio-vl-label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 0.72em;
+  letter-spacing: 0.02em;
+  opacity: 0.75;
+}
+.audioio-vl-input,
+.audioio-vl-select,
+.audioio-vl-textarea {
+  font: inherit;
+  font-size: 0.78em;
+  color: var(--fg, rgba(255, 255, 255, 0.92));
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  padding: 4px 6px;
+  width: 100%;
+  box-sizing: border-box;
+}
+.audioio-vl-textarea { resize: vertical; min-height: 2.6em; line-height: 1.35; }
+.audioio-vl-input:focus,
+.audioio-vl-select:focus,
+.audioio-vl-textarea:focus {
+  outline: none;
+  border-color: var(--learn-green, rgba(120, 220, 160, 0.7));
+}
+.audioio-vl-input:disabled,
+.audioio-vl-select:disabled,
+.audioio-vl-textarea:disabled { opacity: 0.45; cursor: not-allowed; }
+.audioio-vl-submit { align-self: flex-start; min-width: 72px; font-size: 0.74em; padding: 2px 10px; }
+
 /* ---------------------------------------------- ANSWER CROSS-CHECK panel */
 /* ANSWER // CROSS-CHECK — the last answer's two OPTIONAL answer-quality passes,
    siblings of SELF-CHECK: #21 tool-result plausibility cross-check (emitted as

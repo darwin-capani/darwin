@@ -71,6 +71,12 @@ pub const MAX_LINE_BYTES: usize = 8 * 1024;
 /// (yet under-[`MAX_LINE_BYTES`]) field from reaching the model.
 pub const MAX_TEXT_CHARS: usize = 4 * 1024;
 
+/// Minimum length of a `design_voice` DESCRIPTION. ElevenLabs' voice-design
+/// endpoint rejects a too-short prompt (its documented floor is ~20 characters),
+/// so a description below this is a [`Decision::BadRequest`] HERE — it never
+/// reaches the cloud op or spends a request on a request the server would reject.
+pub const MIN_VOICE_DESCRIPTION_CHARS: usize = 20;
+
 /// Rolling rate-limit: at most this many commands within [`RATE_WINDOW`]. The
 /// command channel is a human at a deck, not an automation firehose; this is the
 /// spam / accidental-loop guard (mirrors genproxy's PROXY_RATE shape).
@@ -99,6 +105,23 @@ struct RawCommand {
     cue: String,
     #[serde(default)]
     ts: Option<u64>,
+    /// `design_voice`: the voice DESCRIPTION (the EL design prompt). Free text,
+    /// clamped + length-checked in [`decide`] (the EL design minimum is ~20 chars).
+    #[serde(default)]
+    description: String,
+    /// `design_voice`: the optional display name; defaults to the agent name when
+    /// empty. `create_pronunciation`: the optional dictionary name (defaults to a
+    /// fixed label). A short label only — clamped in [`decide`].
+    #[serde(default)]
+    name: String,
+    /// `create_pronunciation`: the string to replace (`string_to_replace`). The
+    /// word/phrase the dictionary rewrites; non-empty, clamped in [`decide`].
+    #[serde(default)]
+    word: String,
+    /// `create_pronunciation`: the alias to say in its place. The replacement
+    /// pronunciation text; non-empty, clamped in [`decide`].
+    #[serde(default)]
+    say: String,
 }
 
 /// The BOUNDED command set — the structural allowlist. Parsing a line into one
@@ -152,6 +175,32 @@ pub enum Command {
     /// ([`crate::voice_tier::sfx_enabled`] + offline check) turns switch-off / no-key
     /// / offline into an honest silent no-op. There is no model/agent/tool path to it.
     PlayCue { cue: String },
+    /// DESIGN a voice for an agent from a text DESCRIPTION (the HUD's voice-design
+    /// control). A DEDICATED provisioning verb, NOT `ask` — it NEVER reaches the
+    /// model/tool loop. `decide` validates a non-empty `agent`, a `description`
+    /// of at least [`MIN_VOICE_DESCRIPTION_CHARS`] (the EL design floor), and a
+    /// `name` (defaulted to the agent name when empty); the daemon then calls
+    /// `trigger_design_voice` directly, whose own gate (key + cloud tier) turns
+    /// no-key / offline into an HONEST `Err` — never a fabricated voice. Only the
+    /// text description leaves the device. There is no model/agent/tool path to it.
+    DesignVoice {
+        agent: String,
+        description: String,
+        name: String,
+    },
+    /// CREATE a single-alias pronunciation-dictionary rule (the HUD's pronunciation
+    /// control). A DEDICATED provisioning verb, NOT `ask` — it NEVER reaches the
+    /// model/tool loop. `decide` validates a non-empty `word` (the string to
+    /// replace) and a non-empty `say` (the alias pronunciation) and builds ONE
+    /// alias rule; the daemon then calls `trigger_create_pronunciation` directly,
+    /// whose own gate (key + cloud tier) turns no-key / offline into an HONEST
+    /// `Err` — never a fabricated dictionary id. Text rules only; no audio leaves
+    /// the device. There is no model/agent/tool path to it.
+    CreatePronunciation {
+        word: String,
+        say: String,
+        name: String,
+    },
 }
 
 /// The pre-auth decision for one inbound line. PURE and exhaustively unit-tested:
@@ -259,6 +308,70 @@ fn decide(raw: &str) -> Decision {
             }
             Command::PlayCue { cue: cue.to_string() }
         }
+        // The HUD voice-design control. A provisioning verb that designs a voice
+        // for an agent from a TEXT description. Three checks, all here so a thin /
+        // empty request never spends a cloud op: (1) a non-empty agent (resolution
+        // to a real agent + its allowlist is downstream), (2) a description at or
+        // above the EL design floor (MIN_VOICE_DESCRIPTION_CHARS) — a too-short
+        // prompt is a BadRequest, never routed, (3) a display name, defaulted to
+        // the agent name when omitted. The trigger's key + cloud-tier gate makes
+        // no-key / offline an HONEST failure downstream; here we only admit a
+        // structurally-complete request. Only the text description leaves the host.
+        "design_voice" => {
+            let agent = clamp_text(req.agent.clone().unwrap_or_default());
+            let agent = agent.trim();
+            if agent.is_empty() {
+                return Decision::BadRequest { reason: "design_voice requires an agent" };
+            }
+            let description = clamp_text(req.description);
+            let description = description.trim();
+            if description.chars().count() < MIN_VOICE_DESCRIPTION_CHARS {
+                return Decision::BadRequest {
+                    reason: "design_voice requires a longer voice description",
+                };
+            }
+            // The display name defaults to the agent name when the field is empty.
+            let name = clamp_text(req.name);
+            let name = name.trim();
+            let name = if name.is_empty() { agent } else { name };
+            Command::DesignVoice {
+                agent: agent.to_string(),
+                description: description.to_string(),
+                name: name.to_string(),
+            }
+        }
+        // The HUD pronunciation control. A provisioning verb that mints a
+        // single-alias pronunciation rule (word -> say). Both the string to
+        // replace (`word`) and the alias pronunciation (`say`) must be non-empty —
+        // an empty either side is a BadRequest, never routed — and the dictionary
+        // name defaults to a fixed label when omitted. The trigger's key +
+        // cloud-tier gate makes no-key / offline an HONEST failure downstream; here
+        // we only admit a structurally-complete rule. Text rules only; no audio
+        // leaves the host.
+        "create_pronunciation" => {
+            let word = clamp_text(req.word);
+            let word = word.trim();
+            if word.is_empty() {
+                return Decision::BadRequest {
+                    reason: "create_pronunciation requires a word to replace",
+                };
+            }
+            let say = clamp_text(req.say);
+            let say = say.trim();
+            if say.is_empty() {
+                return Decision::BadRequest {
+                    reason: "create_pronunciation requires an alias pronunciation",
+                };
+            }
+            let name = clamp_text(req.name);
+            let name = name.trim();
+            let name = if name.is_empty() { "JARVIS pronunciation" } else { name };
+            Command::CreatePronunciation {
+                word: word.to_string(),
+                say: say.to_string(),
+                name: name.to_string(),
+            }
+        }
         // Anything else — including the empty string — is rejected here. There is
         // NO route for an unknown command.
         other => return Decision::UnknownCommand { cmd: other.to_string() },
@@ -324,6 +437,29 @@ pub trait CommandPipeline: Send + Sync {
     /// switch-off / no-key / offline as an HONEST silent no-op — the returned text
     /// is the honest outcome (played / cached / unavailable), never a faked play.
     fn play_cue(&self, cue: &str) -> impl std::future::Future<Output = String> + Send;
+    /// DESIGN a voice for `agent` from a text `description` + display `name` (all
+    /// already validated by [`decide`]). Delegates to the daemon's
+    /// `trigger_design_voice`, whose gate (key + cloud tier) makes no-key / offline
+    /// an HONEST failure — the returned text is the honest outcome (designed /
+    /// unavailable), NEVER a fabricated voice. Only the text description leaves the
+    /// device; the el_key + the returned voice id stay inside the trigger.
+    fn design_voice(
+        &self,
+        agent: &str,
+        description: &str,
+        name: &str,
+    ) -> impl std::future::Future<Output = String> + Send;
+    /// CREATE a single-alias pronunciation rule (`word` -> `say`) under dictionary
+    /// `name` (all already validated by [`decide`]). Delegates to the daemon's
+    /// `trigger_create_pronunciation`, whose gate (key + cloud tier) makes no-key /
+    /// offline an HONEST failure — the returned text is the honest outcome (created
+    /// / unavailable), NEVER a fabricated dictionary id. Text rules only.
+    fn create_pronunciation(
+        &self,
+        word: &str,
+        say: &str,
+        name: &str,
+    ) -> impl std::future::Future<Output = String> + Send;
 }
 
 /// The seam to the confirmation gate + forge marker — the SECURITY-critical
@@ -614,6 +750,29 @@ where
             telemetry::emit("system", "command.routed", json!({"cmd": "play_cue", "cue": cue}));
             json!({"ok": true, "reply": pipeline.play_cue(&cue).await})
         }
+        Command::DesignVoice { agent, description, name } => {
+            // The HUD voice-design control. agent/description/name are already
+            // validated (non-empty agent, description >= the EL floor, defaulted
+            // name) by decide. Route into the daemon's trigger_design_voice via the
+            // pipeline — its gate (key + cloud tier) makes no-key / offline an
+            // HONEST failure; we surface whatever it returns (designed / unavailable
+            // / failed), never faking a voice. Telemetry records the AGENT slot only
+            // — NEVER the (free-text, possibly identifying) description, the el_key,
+            // or the returned voice id.
+            telemetry::emit("system", "command.routed", json!({"cmd": "design_voice", "agent": agent}));
+            json!({"ok": true, "reply": pipeline.design_voice(&agent, &description, &name).await})
+        }
+        Command::CreatePronunciation { word, say, name } => {
+            // The HUD pronunciation control. word/say are already validated
+            // non-empty (name defaulted) by decide. Route into the daemon's
+            // trigger_create_pronunciation via the pipeline — its gate (key + cloud
+            // tier) makes no-key / offline an HONEST failure; we surface whatever it
+            // returns (created / unavailable / failed), never faking a dictionary
+            // id. Telemetry records the cmd only — NEVER the free-text rule, the
+            // el_key, or the returned ids.
+            telemetry::emit("system", "command.routed", json!({"cmd": "create_pronunciation"}));
+            json!({"ok": true, "reply": pipeline.create_pronunciation(&word, &say, &name).await})
+        }
     }
 }
 
@@ -832,6 +991,66 @@ impl CommandPipeline for LivePipeline {
             Err(msg) => msg,
         }
     }
+
+    async fn design_voice(&self, agent: &str, description: &str, name: &str) -> String {
+        // Delegate to the daemon's `design_voice_for_command`, the Send-safe wrapper
+        // around `trigger_design_voice`. That path performs the SAME cloud-tier +
+        // Keychain-key gate as the spoken voice-design path, designs the voice, and
+        // persists the returned id into the cloned-voice store, OR returns an HONEST
+        // unavailable/failed message. Only the text description leaves the device;
+        // the el_key + the returned voice id are read ONLY inside the trigger.
+        match crate::design_voice_for_command(
+            self.cfg.clone(),
+            description.to_string(),
+            name.to_string(),
+            agent.to_string(),
+            self.root.clone(),
+            self.inference_sock.clone(),
+        )
+        .await
+        {
+            // Designed + stored: a short honest ack. We do NOT echo the voice id (a
+            // non-secret, but not the user's business here); the agent now speaks
+            // with it. The display name is the user-facing handle.
+            Ok(_voice_id) => format!("Designed and saved the {name} voice for {agent}."),
+            // no-key / offline / generation / persist failure: the honest line from
+            // the trigger, never a faked voice.
+            Err(msg) => msg,
+        }
+    }
+
+    async fn create_pronunciation(&self, word: &str, say: &str, name: &str) -> String {
+        // Build the SINGLE alias rule (word -> say) and delegate to the daemon's
+        // `create_pronunciation_for_command`, the Send-safe wrapper around
+        // `trigger_create_pronunciation`. That path performs the SAME cloud-tier +
+        // Keychain-key gate as the spoken pronunciation path, mints the dictionary,
+        // and persists the non-secret locator, OR returns an HONEST unavailable/
+        // failed message. Text rules only — no audio leaves the device; the el_key
+        // + the returned ids are read ONLY inside the trigger.
+        let rule = crate::inference::PronunciationRule {
+            string_to_replace: word.to_string(),
+            rule_type: "alias".to_string(),
+            alias: Some(say.to_string()),
+            phoneme: None,
+            alphabet: None,
+        };
+        match crate::create_pronunciation_for_command(
+            self.cfg.clone(),
+            name.to_string(),
+            vec![rule],
+            self.root.clone(),
+            self.inference_sock.clone(),
+        )
+        .await
+        {
+            // Created + stored: a short honest ack naming the rule. We do NOT echo
+            // the dictionary/version ids (non-secret, but not the user's business).
+            Ok(_ids) => format!("Created the pronunciation rule: say \"{word}\" as \"{say}\"."),
+            // no-key / offline / generation / persist failure: the honest line from
+            // the trigger, never a faked dictionary.
+            Err(msg) => msg,
+        }
+    }
 }
 
 /// Clear the forge pending marker for `ts` — and NOTHING else. This is the
@@ -929,6 +1148,8 @@ mod tests {
             (json!({"token": "t", "cmd": "dismiss_forge", "ts": 42}), true),
             (json!({"token": "t", "cmd": "policy", "text": "always allow the gmail_send action"}), true),
             (json!({"token": "t", "cmd": "play_cue", "cue": "confirm"}), true),
+            (json!({"token": "t", "cmd": "design_voice", "agent": "edith", "description": "a calm warm british woman, mid-thirties"}), true),
+            (json!({"token": "t", "cmd": "create_pronunciation", "word": "JARVIS", "say": "jarviss"}), true),
         ];
         for (line, _ok) in cases {
             assert!(
@@ -962,6 +1183,17 @@ mod tests {
             json!({"token": "t", "cmd": "policy"}),
             json!({"token": "t", "cmd": "play_cue", "cue": "   "}),
             json!({"token": "t", "cmd": "play_cue"}),
+            // design_voice: a missing/empty agent, and a description below the EL
+            // design floor (MIN_VOICE_DESCRIPTION_CHARS), are each a BadRequest.
+            json!({"token": "t", "cmd": "design_voice", "description": "a long enough description here"}),
+            json!({"token": "t", "cmd": "design_voice", "agent": "   ", "description": "a long enough description here"}),
+            json!({"token": "t", "cmd": "design_voice", "agent": "edith", "description": "too short"}),
+            json!({"token": "t", "cmd": "design_voice", "agent": "edith"}),
+            // create_pronunciation: an empty word or an empty say is a BadRequest.
+            json!({"token": "t", "cmd": "create_pronunciation", "say": "jarviss"}),
+            json!({"token": "t", "cmd": "create_pronunciation", "word": "  ", "say": "jarviss"}),
+            json!({"token": "t", "cmd": "create_pronunciation", "word": "JARVIS"}),
+            json!({"token": "t", "cmd": "create_pronunciation", "word": "JARVIS", "say": "  "}),
         ];
         for line in bad {
             assert!(
@@ -1010,6 +1242,87 @@ mod tests {
             matches!(decide(&line), Decision::UnknownCommand { .. }),
             "an unknown cmd remains UnknownCommand"
         );
+    }
+
+    /// SECURITY/shape: `design_voice` validates a non-empty agent + a description
+    /// at or above the EL design floor, clamps + trims the fields, and DEFAULTS the
+    /// display name to the agent name when omitted. A too-short description never
+    /// routes (it would be a wasted, server-rejected cloud op).
+    #[test]
+    fn design_voice_validates_shape_and_defaults_the_name() {
+        // A complete request parses to DesignVoice with the fields carried verbatim.
+        let line = json!({
+            "token": "t", "cmd": "design_voice", "agent": "edith",
+            "description": "a calm warm british woman, mid-thirties", "name": "Edith Voice"
+        })
+        .to_string();
+        match decide(&line) {
+            Decision::Ok { command: Command::DesignVoice { agent, description, name }, .. } => {
+                assert_eq!(agent, "edith");
+                assert_eq!(description, "a calm warm british woman, mid-thirties");
+                assert_eq!(name, "Edith Voice");
+            }
+            other => panic!("complete design_voice must be Ok(DesignVoice), got {other:?}"),
+        }
+        // No name -> defaults to the agent name.
+        let line = json!({
+            "token": "t", "cmd": "design_voice", "agent": "fury",
+            "description": "a gruff commanding older man, authoritative"
+        })
+        .to_string();
+        match decide(&line) {
+            Decision::Ok { command: Command::DesignVoice { agent, name, .. }, .. } => {
+                assert_eq!(name, agent, "the name defaults to the agent name");
+            }
+            other => panic!("expected Ok(DesignVoice), got {other:?}"),
+        }
+        // A description shorter than the floor is a BadRequest (never routed).
+        let short = "a".repeat(MIN_VOICE_DESCRIPTION_CHARS - 1);
+        let line = json!({"token": "t", "cmd": "design_voice", "agent": "edith", "description": short}).to_string();
+        assert!(
+            matches!(decide(&line), Decision::BadRequest { .. }),
+            "a sub-floor description must be BadRequest"
+        );
+        // Exactly at the floor is accepted.
+        let exact = "a".repeat(MIN_VOICE_DESCRIPTION_CHARS);
+        let line = json!({"token": "t", "cmd": "design_voice", "agent": "edith", "description": exact}).to_string();
+        assert!(matches!(decide(&line), Decision::Ok { .. }), "a floor-length description is accepted");
+    }
+
+    /// SECURITY/shape: `create_pronunciation` requires a non-empty word AND a
+    /// non-empty say, trims them, carries them verbatim into the parsed command,
+    /// and defaults the dictionary name when omitted. An empty either side never
+    /// routes.
+    #[test]
+    fn create_pronunciation_validates_a_single_alias_rule() {
+        // word + say (no name) -> CreatePronunciation with a defaulted name.
+        let line = json!({"token": "t", "cmd": "create_pronunciation", "word": "  JARVIS  ", "say": "  jarviss  "}).to_string();
+        match decide(&line) {
+            Decision::Ok { command: Command::CreatePronunciation { word, say, name }, .. } => {
+                assert_eq!(word, "JARVIS", "word is trimmed + carried verbatim");
+                assert_eq!(say, "jarviss", "say is trimmed + carried verbatim");
+                assert!(!name.is_empty(), "the dictionary name is defaulted, never empty");
+            }
+            other => panic!("complete create_pronunciation must be Ok, got {other:?}"),
+        }
+        // An explicit name is honored.
+        let line = json!({"token": "t", "cmd": "create_pronunciation", "word": "nginx", "say": "engine x", "name": "Ops terms"}).to_string();
+        match decide(&line) {
+            Decision::Ok { command: Command::CreatePronunciation { name, .. }, .. } => {
+                assert_eq!(name, "Ops terms");
+            }
+            other => panic!("expected Ok(CreatePronunciation), got {other:?}"),
+        }
+        // Empty word or empty say is a BadRequest (never routed).
+        for line in [
+            json!({"token": "t", "cmd": "create_pronunciation", "word": "", "say": "x"}),
+            json!({"token": "t", "cmd": "create_pronunciation", "word": "x", "say": ""}),
+        ] {
+            assert!(
+                matches!(decide(&line.to_string()), Decision::BadRequest { .. }),
+                "empty word/say must be BadRequest: {line}"
+            );
+        }
     }
 
     /// A non-JSON line is Malformed; an oversized line is Oversized (before parse).
@@ -1061,6 +1374,10 @@ mod tests {
         last_agent: StdMutex<Option<String>>,
         play_cue_calls: AtomicU32,
         last_cue: StdMutex<Option<String>>,
+        design_voice_calls: AtomicU32,
+        last_design: StdMutex<Option<(String, String, String)>>,
+        create_pron_calls: AtomicU32,
+        last_pron: StdMutex<Option<(String, String, String)>>,
     }
     impl CommandPipeline for MockPipeline {
         async fn ask(&self, text: &str, agent: Option<&str>) -> String {
@@ -1076,6 +1393,18 @@ mod tests {
             self.play_cue_calls.fetch_add(1, Ordering::SeqCst);
             *self.last_cue.lock().unwrap() = Some(cue.to_string());
             format!("cue:{cue}")
+        }
+        async fn design_voice(&self, agent: &str, description: &str, name: &str) -> String {
+            self.design_voice_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_design.lock().unwrap() =
+                Some((agent.to_string(), description.to_string(), name.to_string()));
+            format!("design:{agent}:{name}")
+        }
+        async fn create_pronunciation(&self, word: &str, say: &str, name: &str) -> String {
+            self.create_pron_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_pron.lock().unwrap() =
+                Some((word.to_string(), say.to_string(), name.to_string()));
+            format!("pron:{word}:{say}")
         }
     }
 
@@ -1262,6 +1591,83 @@ mod tests {
         let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
         assert_eq!(r["error"], "bad_request", "unknown cue is a bad_request");
         assert_eq!(pipeline.play_cue_calls.load(Ordering::SeqCst), 0, "unknown cue never routes");
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "and never reaches the model");
+    }
+
+    /// The `design_voice` verb routes to the pipeline's dedicated `design_voice`
+    /// arm with the validated agent/description/name — NOT to `ask` (so it NEVER
+    /// reaches the model tool loop). It is the HUD voice-design control: a
+    /// dedicated, authenticated, rate-passed provisioning verb with no model path.
+    #[tokio::test]
+    async fn design_voice_verb_routes_to_the_design_arm_not_the_model() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let desc = "a calm warm british woman, mid-thirties";
+        let line = json!({"token": valid_token(), "cmd": "design_voice", "agent": "edith", "description": desc, "name": "Edith Voice"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "design:edith:Edith Voice");
+        assert_eq!(pipeline.design_voice_calls.load(Ordering::SeqCst), 1, "reached the design arm");
+        assert_eq!(
+            *pipeline.last_design.lock().unwrap(),
+            Some(("edith".into(), desc.into(), "Edith Voice".into())),
+            "the validated fields are carried verbatim"
+        );
+        // It did NOT route through the model pipeline (ask) — no model path to a voice.
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "design_voice never reaches the model");
+    }
+
+    /// A too-short `design_voice` description is rejected as a bad_request through
+    /// the handler and the design arm is NEVER reached — the EL design floor holds
+    /// end-to-end, even with a valid token, so no wasted cloud op is spent.
+    #[tokio::test]
+    async fn short_design_description_is_rejected_through_the_handler() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "design_voice", "agent": "edith", "description": "too short"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["error"], "bad_request", "a sub-floor description is a bad_request");
+        assert_eq!(pipeline.design_voice_calls.load(Ordering::SeqCst), 0, "never routes");
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "and never reaches the model");
+    }
+
+    /// The `create_pronunciation` verb routes to the pipeline's dedicated
+    /// `create_pronunciation` arm with the validated word/say/name — NOT to `ask`
+    /// (so it NEVER reaches the model tool loop). It is the HUD pronunciation
+    /// control: a dedicated, authenticated, rate-passed provisioning verb.
+    #[tokio::test]
+    async fn create_pronunciation_verb_routes_to_its_arm_not_the_model() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "create_pronunciation", "word": "JARVIS", "say": "jarviss"}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "pron:JARVIS:jarviss");
+        assert_eq!(pipeline.create_pron_calls.load(Ordering::SeqCst), 1, "reached the pronunciation arm");
+        // word + say are carried verbatim; the name is defaulted (non-empty).
+        let last = pipeline.last_pron.lock().unwrap().clone().unwrap();
+        assert_eq!(last.0, "JARVIS");
+        assert_eq!(last.1, "jarviss");
+        assert!(!last.2.is_empty(), "the dictionary name is defaulted");
+        // It did NOT route through the model pipeline (ask) — no model path here.
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "create_pronunciation never reaches the model");
+    }
+
+    /// An empty-`say` `create_pronunciation` is rejected as a bad_request through
+    /// the handler and the arm is NEVER reached — the non-empty rule check holds
+    /// end-to-end, even with a valid token.
+    #[tokio::test]
+    async fn empty_pronunciation_rule_is_rejected_through_the_handler() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "create_pronunciation", "word": "JARVIS", "say": ""}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim).await;
+        assert_eq!(r["error"], "bad_request", "an empty alias is a bad_request");
+        assert_eq!(pipeline.create_pron_calls.load(Ordering::SeqCst), 0, "never routes");
         assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "and never reaches the model");
     }
 
@@ -1502,6 +1908,10 @@ mod tests {
             async fn roster(&self) -> String { unreachable!() }
             async fn state(&self) -> String { unreachable!() }
             async fn play_cue(&self, _cue: &str) -> String { unreachable!() }
+            async fn design_voice(&self, _a: &str, _d: &str, _n: &str) -> String { unreachable!() }
+            async fn create_pronunciation(&self, _w: &str, _s: &str, _n: &str) -> String {
+                unreachable!()
+            }
         }
         let pipeline = Arc::new(ParkingPipeline);
         let dispatcher = Arc::new(ProbeDispatcher::default());
