@@ -427,6 +427,34 @@ ELEVENLABS_PRONUNCIATION_URL = (
 # EL applies pronunciation dictionaries to a TTS turn in order and caps the count.
 ELEVENLABS_PRONUNCIATION_MAX_LOCATORS = 3
 
+# MUSIC (prompt-to-music / compose): POST /v1/music ({"prompt": <=4100 chars,
+# "music_length_ms": 3000..600000}) -> generated audio. Composes a NON-speech music
+# track from a text prompt. Like SFX/TTS, the key rides ONLY the xi-api-key header
+# (never URL/query/log) and we request PCM (pcm_24000) so the bytes wrap into the
+# SAME pipeline WAV via _pcm16_to_float32 -> _write_wav. There is NO on-device music
+# generator, so this is a PURE cloud capability: gated on the key + the daemon's
+# [voice].cloud_music switch (+ non-Local tier), and INERT (honest 'unavailable',
+# never faked) without a key.
+#
+# CHANNEL LAYOUT (flawlessness point): the pipeline's _pcm16_to_float32 + _write_wav
+# are MONO. EL's `output_format` query param fully determines the returned layout;
+# every `pcm_*` format (pcm_24000 included) is INTERLEAVED-FREE single-channel PCM16
+# — identical to the SFX/TTS surfaces that already decode cleanly through the mono
+# path. By PINNING output_format=pcm_24000 (a mono format) we GUARANTEE mono bytes
+# at the wire, so there is no stereo interleave to misread as mono. Defense in depth:
+# the seam ALSO verifies the byte count is an even number of int16 samples (a stereo
+# stream would still be even, but a pinned mono format never yields stereo) and the
+# decode path is the exact 16-bit mono one used everywhere else. We never request an
+# mp3/stereo format, so the "interleaved stereo read as mono" hazard cannot arise.
+# Endpoint confirmed against the 2026 ElevenLabs docs:
+# https://elevenlabs.io/docs/api-reference/music/compose
+ELEVENLABS_MUSIC_URL = "https://api.elevenlabs.io/v1/music"
+ELEVENLABS_MUSIC_OUTPUT_FORMAT = "pcm_24000"
+ELEVENLABS_MUSIC_LENGTH_MIN_MS = 3000
+ELEVENLABS_MUSIC_LENGTH_MAX_MS = 600000
+ELEVENLABS_MUSIC_LENGTH_DEFAULT_MS = 30000
+ELEVENLABS_MUSIC_PROMPT_MAX = 4100
+
 
 def _is_non_english_lang(lang):
     """True when `lang` names a language that is NOT English (so the EL TTS leg
@@ -749,6 +777,91 @@ def _elevenlabs_sfx(prompt, api_key, duration_s=None, prompt_influence=None,
     req.add_header("Accept", "audio/pcm")
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
         return resp.read()
+
+
+def _clamp_music_length_ms(length_ms):
+    """Clamp `length_ms` into EL's [3000, 600000] ms window, returning an int.
+    A None/bad-type/non-finite value reads as the DEFAULT (30000ms) rather than an
+    error, so a malformed length can never reach the wire. PURE; no network."""
+    if not isinstance(length_ms, (int, float)) or isinstance(length_ms, bool):
+        return ELEVENLABS_MUSIC_LENGTH_DEFAULT_MS
+    f = float(length_ms)
+    if f != f or f in (float("inf"), float("-inf")):
+        return ELEVENLABS_MUSIC_LENGTH_DEFAULT_MS
+    clamped = max(ELEVENLABS_MUSIC_LENGTH_MIN_MS, min(ELEVENLABS_MUSIC_LENGTH_MAX_MS, int(f)))
+    return clamped
+
+
+def _build_music_payload(prompt, length_ms=None):
+    """Build the ElevenLabs music (compose) request JSON (a dict) for `prompt`.
+
+    `music_length_ms` is ALWAYS present and clamped into EL's [3000, 600000] ms
+    window (a None/invalid length folds to the 30000ms default). An empty / blank /
+    non-string prompt, or one longer than EL's 4100-char cap, is REJECTED with a
+    ValueError BEFORE any payload is shaped (so a degenerate prompt never reaches the
+    wire). PURE; no network — split out so the payload shaping is unit-testable
+    without HTTP."""
+    if not (isinstance(prompt, str) and prompt.strip()):
+        raise ValueError("ElevenLabs music requires a non-empty prompt")
+    if len(prompt) > ELEVENLABS_MUSIC_PROMPT_MAX:
+        raise ValueError(
+            "ElevenLabs music prompt exceeds %d chars" % ELEVENLABS_MUSIC_PROMPT_MAX
+        )
+    return {
+        "prompt": prompt,
+        "music_length_ms": _clamp_music_length_ms(length_ms),
+    }
+
+
+def _elevenlabs_music(prompt, api_key, length_ms=ELEVENLABS_MUSIC_LENGTH_DEFAULT_MS,
+                      timeout_s=ELEVENLABS_TIMEOUT_S):
+    """THE music network seam (the ONLY place compose-music touches the EL network).
+
+    POST `prompt` to /v1/music and return raw PCM16 MONO @24kHz bytes
+    (output_format=pcm_24000); the caller wraps them into the pipeline WAV. The
+    `api_key` rides ONLY the `xi-api-key` request header — never the URL/query,
+    never a log line. Raises on any HTTP/transport error; the caller
+    (`compose_music`) catches EVERYTHING and returns no audio, so a failure never
+    fabricates a track and never crashes a turn.
+
+    CHANNEL LAYOUT (flawlessness point): we PIN output_format=pcm_24000, a MONO
+    PCM16 format, so the bytes decode through the IDENTICAL _pcm16_to_float32 mono
+    path as TTS/SFX — there is no stereo interleave to misread as mono. As defense
+    in depth we ALSO assert the byte count is a whole number of int16 samples (even
+    length); a truncated/odd response raises rather than silently producing skewed
+    audio. We NEVER request an mp3/stereo format, so the interleaved-stereo hazard
+    cannot arise.
+
+    Mock seam: tests monkeypatch `server._elevenlabs_music` to return canned bytes
+    (or raise) WITHOUT touching the network. Stdlib-only (urllib).
+
+    CREDENTIAL+RUNTIME GATED: reached ONLY from the compose_music op, which the
+    daemon enters only after its [voice].cloud_music + key gate."""
+    import urllib.request
+
+    if not api_key:
+        # Defense in depth: never send a keyless cloud request.
+        raise ValueError("ElevenLabs music requires an API key (none supplied)")
+    if not (isinstance(prompt, str) and prompt.strip()):
+        raise ValueError("ElevenLabs music requires a non-empty prompt")
+
+    # _build_music_payload re-validates the prompt and clamps the length; pinning a
+    # MONO output_format here is what guarantees the mono channel layout downstream.
+    url = f"{ELEVENLABS_MUSIC_URL}?output_format={ELEVENLABS_MUSIC_OUTPUT_FORMAT}"
+    payload = json.dumps(_build_music_payload(prompt, length_ms)).encode("utf-8")
+    req = urllib.request.Request(url, data=payload, method="POST")
+    # The key rides ONLY this header. Never a URL/query param, never logged.
+    req.add_header(_ELEVENLABS_HEADER, api_key)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "audio/pcm")
+    with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+        pcm = resp.read()
+    # Defense in depth: pcm_24000 is mono 16-bit, so a valid body is an even number
+    # of bytes (one int16 per sample). An odd length means a truncated/garbled
+    # stream — raise rather than feed skewed bytes into the mono decoder.
+    if pcm and (len(pcm) % 2) != 0:
+        raise ValueError("ElevenLabs music returned a truncated PCM16 stream")
+    return pcm
 
 
 def _multipart_body(fields, file_field, file_name, file_bytes, content_type="audio/wav"):
@@ -4299,6 +4412,36 @@ class InferenceEngine:
             )
             return None
 
+    def compose_music(self, prompt, el_key, length_ms=None):
+        """Compose a NON-speech MUSIC track from `prompt` via ElevenLabs music
+        (compose) and return a pipeline WAV path, or None on any failure.
+
+        There is NO on-device music generator, so a failure (or no key) yields None
+        and the caller treats it as 'unavailable' — never a fabricated/placeholder
+        track, never a crash. `length_ms` (None -> EL's 30s default) is clamped to
+        EL's [3000, 600000] ms window in the seam. The PCM bytes are MONO @24kHz
+        (pcm_24000), so they flow through the IDENTICAL _pcm16_to_float32 ->
+        _write_wav path as TTS/SFX (fades, atomic write, pipeline WAV) with no
+        stereo-interleave hazard. The key rides only the seam header — never logged
+        here. Blocking; runs on a worker thread."""
+        try:
+            length = ELEVENLABS_MUSIC_LENGTH_DEFAULT_MS if length_ms is None else length_ms
+            pcm = _elevenlabs_music(prompt, el_key, length)
+            if not pcm:
+                log.warning("ElevenLabs music returned no audio; no track produced")
+                return None
+            audio = _pcm16_to_float32(pcm)
+            return self._write_wav(audio, ELEVENLABS_SAMPLE_RATE)
+        except Exception as exc:
+            # ANY error (network, HTTP, auth, timeout, missing key/prompt, decode)
+            # -> no track. Log only the redacted exception CLASS — never the message
+            # (which could echo a key-bearing URL fragment).
+            log.warning(
+                "ElevenLabs music failed (%s); no track produced",
+                _redact_elevenlabs(type(exc).__name__),
+            )
+            return None
+
     def isolate_audio(self, audio_path, el_key):
         """Strip background noise from the audio at `audio_path` via ElevenLabs
         audio isolation (voice isolator) and return a CLEANED pipeline WAV path, or
@@ -5260,6 +5403,40 @@ class InferenceServer:
                     "id": rid,
                     "ok": False,
                     "error": "sound effects unavailable (cloud SFX tier off or no key)",
+                    "latency_ms": latency_ms(),
+                }
+
+            if op == "compose_music":
+                # CLOUD-ONLY music track (ElevenLabs music/compose). The daemon emits
+                # this only after its [voice].cloud_music + key gate. text = the music
+                # prompt; el_key = the xi-api-key (request-body only, NEVER logged);
+                # optional length_ms shapes the duration (clamped to EL's
+                # [3000, 600000] ms window). The returned PCM is MONO (pcm_24000), so
+                # it decodes through the same mono pipeline path as TTS/SFX — no stereo
+                # interleave hazard. There is NO on-device music generator, so on any
+                # failure (or no key) -> ok:false (honest 'unavailable', never a
+                # fabricated/placeholder track).
+                prompt = req.get("text")
+                if not prompt or not isinstance(prompt, str):
+                    raise ValueError("'text' (music prompt) is required for op=compose_music")
+                el_key = req.get("el_key")
+                if el_key is not None and not isinstance(el_key, str):
+                    raise ValueError("'el_key' must be a string")
+                length_ms = req.get("length_ms")
+                if length_ms is not None and (
+                    not isinstance(length_ms, int) or isinstance(length_ms, bool)
+                ):
+                    raise ValueError("'length_ms' must be an integer")
+                path = await asyncio.to_thread(
+                    self.engine.compose_music, prompt, el_key, length_ms
+                )
+                if path:
+                    return {"id": rid, "ok": True, "path": path, "latency_ms": latency_ms()}
+                # Honest unavailable: there is no on-device music fallback to substitute.
+                return {
+                    "id": rid,
+                    "ok": False,
+                    "error": "music unavailable (cloud music tier off or no key)",
                     "latency_ms": latency_ms(),
                 }
 
