@@ -373,6 +373,16 @@ diarize = true                 # #31 MULTI-SPEAKER DIARIZATION, SHIPS ON (full-p
 # through its explicit gate/command; it NEVER changes the default speech path. When
 # active the SFX TEXT PROMPT leaves the device (text only). Set false to disable cues.
 cloud_sfx = true               # SFX cue master switch, SHIPS ON (full-power default) — INERT WITHOUT A KEY: needs the EL key + a non-Local tier; otherwise a silent no-op (no on-device SFX generator). Reached only through its explicit gate; never changes the default speech path. When active the SFX text prompt leaves the device. Set false to disable cues.
+# cloud_music — the MUSIC GENERATION tier (the inference server's compose_music op:
+# a short text prompt -> a generated FULL-LENGTH music track). SHIPS ON (full-power
+# default), gated EXACTLY like cloud_sfx: reached only when cloud_music = true AND an
+# `elevenlabs_api_key` is present in the Keychain AND the tier is non-Local. There is
+# NO on-device music generator, so without a key (or offline) it is honestly
+# UNAVAILABLE — no track is produced, stated honestly, never faked. An ADDED generation
+# layer reached only through its explicit gate/command; it NEVER changes the default
+# speech path. When active the music TEXT PROMPT leaves the device (text only). Set
+# false to disable music generation.
+cloud_music = true             # music-generation master switch, SHIPS ON (full-power default) — INERT WITHOUT A KEY: needs the EL key + a non-Local tier; otherwise honestly unavailable (no on-device music generator). Reached only through its explicit gate; never changes the default speech path. When active the music text prompt leaves the device and it generates a full track. Set false to disable music generation.
 # stream_tts — LOW-LATENCY STREAMING TTS. OPT-IN (ships OFF) so DEFAULT BEHAVIOR IS
 # UNCHANGED — today's blocking synthesis stays the default. When true AND the resolved
 # backend is ElevenLabs, `speak` requests the streaming endpoint for faster first

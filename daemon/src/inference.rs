@@ -221,6 +221,13 @@ struct Request<'a> {
     /// the server's default. Carried only when the caller pins one.
     #[serde(skip_serializing_if = "Option::is_none")]
     prompt_influence: Option<f32>,
+    /// compose_music only: OPTIONAL track length in MILLISECONDS (the server clamps to
+    /// its 3000..600000 window and DEFAULTS to 30000 when absent). Carried only when the
+    /// caller pins one; absent => the server's default duration. Carried only on the
+    /// compose_music path so an old server (no music op) sees a clean shape it rejects
+    /// as unknown (which the daemon reads as "music unavailable").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    length_ms: Option<u32>,
     /// speak only (ADDITIVE): the active ElevenLabs pronunciation-dictionary locators
     /// ([{pronunciation_dictionary_id, version_id?}]) the daemon minted via
     /// op=create_pronunciation. NON-secret ids only. Carried ONLY when a non-empty list
@@ -300,6 +307,7 @@ impl<'a> Request<'a> {
             rules: None,
             duration_s: None,
             prompt_influence: None,
+            length_ms: None,
             pronunciation_locators: None,
             stream: None,
         }
@@ -1165,6 +1173,39 @@ impl InferenceClient {
         resp.path
             .map(PathBuf::from)
             .ok_or_else(|| anyhow!("sound_effect response missing path"))
+    }
+
+    /// COMPOSE MUSIC (Phase-2): emit op=compose_music with the text `prompt` + the
+    /// resolved ElevenLabs key; the server generates a FULL-LENGTH music track WAV
+    /// (EL music-generation) and returns its path under state/tmp/ for the daemon to
+    /// play. `length_ms` is an OPTIONAL length hint in MILLISECONDS (the server clamps
+    /// to its 3000..600000 window and DEFAULTS to 30000 when absent), threaded onto the
+    /// wire ONLY when the caller pins one.
+    ///
+    /// HONESTY: there is NO on-device music generator — this is reached ONLY through the
+    /// `[voice].cloud_music` + key gate (see [`crate::voice_tier::music_enabled`]). On any
+    /// failure (no key / network / quota) the server returns ok:false and this returns
+    /// Err, so the caller surfaces an honest "unavailable" — never a fabricated track. The
+    /// music text PROMPT leaves the device (text only — no on-device audio is uploaded).
+    ///
+    /// SECURITY: `el_key` rides ONLY the request body for the server's `xi-api-key`
+    /// header — never logged/argv/telemetry. Mirrors `sound_effect`.
+    #[allow(dead_code)] // credential+runtime-gated seam; reached via trigger_compose_music
+    pub async fn compose_music(
+        &mut self,
+        prompt: &str,
+        el_key: &str,
+        length_ms: Option<u32>,
+    ) -> Result<PathBuf> {
+        let mut req = Request::new(self.fresh_id(), "compose_music");
+        req.text = Some(prompt);
+        req.el_key = Some(el_key);
+        // Thread length_ms ONLY when the caller pins one; absent => the server's default.
+        req.length_ms = length_ms;
+        let resp = self.request(&req).await?;
+        resp.path
+            .map(PathBuf::from)
+            .ok_or_else(|| anyhow!("compose_music response missing path"))
     }
 
     /// DESIGN VOICE (Phase-2): mint an ElevenLabs voice from a text DESCRIPTION (no

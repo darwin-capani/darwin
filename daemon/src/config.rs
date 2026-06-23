@@ -355,7 +355,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // on key system events (confirm -> "success", deny -> "notify"), riding the same
     // cloud_sfx gate (no key => silent no-op); it never affects the action's outcome
     // or timing. Listed so it never reads as a typo.
-    ("voice", &["cloud_tier", "cloud_stt", "model", "voices", "adaptive_prosody", "whisper", "whisper_auto", "diarize", "cloud_sfx", "stream_tts", "pronunciation_dictionary_id", "pronunciation_dictionary_version", "event_cues"]),
+    ("voice", &["cloud_tier", "cloud_stt", "model", "voices", "adaptive_prosody", "whisper", "whisper_auto", "diarize", "cloud_sfx", "cloud_music", "stream_tts", "pronunciation_dictionary_id", "pronunciation_dictionary_version", "event_cues"]),
     // [wake] — CUSTOM WAKE-WORD (#32, wake.rs). `enabled` SHIPS ON (full-power
     // default): since `phrase` defaults to "jarvis", behavior is identical to today
     // unless the phrase is changed. The always-listening loop that consults the
@@ -950,6 +950,16 @@ pub struct VoiceConfig {
     /// changes the default speech path. When active the SFX text prompt leaves the
     /// device (text only). Mirrors cloud_tier's credential+runtime gating.
     pub cloud_sfx: bool,
+    /// MUSIC GENERATION TIER. SHIPS ON (full-power default) — INERT WITHOUT A KEY:
+    /// gates the inference server's `compose_music` op (a text prompt -> a generated
+    /// full-length music track WAV), reached only when an `elevenlabs_api_key` is in
+    /// the Keychain AND the tier is non-Local; otherwise NO track is produced (honest
+    /// unavailable — there is no on-device music generator, stated honestly, never
+    /// faked). An ADDED generation layer reached only through its explicit
+    /// gate/command — it NEVER changes the default speech path. When active the music
+    /// text prompt leaves the device (text only). Mirrors cloud_sfx's
+    /// credential+runtime gating.
+    pub cloud_music: bool,
     /// LOW-LATENCY STREAMING TTS. OPT-IN (ships OFF) — default behavior is unchanged
     /// (today's blocking synthesis). When true AND the resolved backend is ElevenLabs,
     /// `speak` requests the streaming endpoint for first-audio latency; the inference
@@ -1023,6 +1033,14 @@ impl Default for VoiceConfig {
             // cue tier reached only through its explicit gate; never changes the
             // default speech path. When active the SFX text prompt leaves the device.
             cloud_sfx: true,
+            // SHIPS ON (full-power default) — INERT WITHOUT A KEY, exactly like
+            // cloud_sfx: the compose_music op is reached only when cloud_music=true
+            // AND elevenlabs_api_key is in the Keychain AND the tier is non-Local;
+            // otherwise NO track (honest unavailable — no on-device music generator).
+            // An ADDED generation tier reached only through its explicit gate; never
+            // changes the default speech path. When active the music text prompt
+            // leaves the device (text only) and it generates a full track.
+            cloud_music: true,
             // OPT-IN (ships OFF) so DEFAULT BEHAVIOR IS UNCHANGED: streaming TTS is
             // requested only when stream_tts=true AND the backend is ElevenLabs; the
             // server falls back to blocking on any streaming error. Inert on Kokoro.
@@ -4022,6 +4040,10 @@ mod tests {
             "the sound-effect cue tier SHIPS ON (full-power default; INERT WITHOUT A KEY — silent no-op without the EL key, no on-device SFX generator)"
         );
         assert!(
+            cfg.voice.cloud_music,
+            "the music-generation tier SHIPS ON (full-power default; INERT WITHOUT A KEY — honest unavailable without the EL key, no on-device music generator)"
+        );
+        assert!(
             !cfg.voice.stream_tts,
             "low-latency streaming TTS is OPT-IN (ships OFF) — default behavior is unchanged (today's blocking synthesis)"
         );
@@ -4047,6 +4069,7 @@ mod tests {
             cloud_stt = false
             diarize = false
             cloud_sfx = false
+            cloud_music = false
             stream_tts = true
             event_cues = true
             pronunciation_dictionary_id = "EL_PD_ID"
@@ -4063,6 +4086,7 @@ mod tests {
         assert!(!cfg.voice.cloud_stt, "cloud_stt must round-trip as a known key");
         assert!(!cfg.voice.diarize, "diarize must round-trip as a known key");
         assert!(!cfg.voice.cloud_sfx, "cloud_sfx must round-trip as a known key (operator can turn the SFX cue tier off)");
+        assert!(!cfg.voice.cloud_music, "cloud_music must round-trip as a known key (operator can turn the music-generation tier off)");
         assert!(cfg.voice.stream_tts, "stream_tts must round-trip as a known key (operator can opt in to streaming TTS)");
         assert!(cfg.voice.event_cues, "event_cues must round-trip as a known key (operator can opt in to event cues)");
         assert_eq!(

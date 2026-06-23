@@ -122,6 +122,15 @@ struct RawCommand {
     /// pronunciation text; non-empty, clamped in [`decide`].
     #[serde(default)]
     say: String,
+    /// `compose_music`: the music PROMPT (what to compose). Free text, clamped +
+    /// non-empty-checked in [`decide`]. Only the text prompt leaves the device.
+    #[serde(default)]
+    prompt: String,
+    /// `compose_music`: the OPTIONAL track length in MILLISECONDS. Absent => the
+    /// server's default (the server clamps to its 3000..600000 window). Carried only
+    /// when the caller pins one; threaded onto the wire only when `Some`.
+    #[serde(default)]
+    length_ms: Option<u32>,
 }
 
 /// The BOUNDED command set — the structural allowlist. Parsing a line into one
@@ -200,6 +209,19 @@ pub enum Command {
         word: String,
         say: String,
         name: String,
+    },
+    /// COMPOSE a music track from a text PROMPT (the HUD's music-generation control,
+    /// Jerome's "Leisure + DJ" surface). A DEDICATED benign verb, NOT `ask` — it NEVER
+    /// reaches the model/tool loop. `decide` validates a NON-EMPTY prompt (clamped +
+    /// trimmed; an empty prompt is a [`Decision::BadRequest`], never routed) and carries
+    /// the OPTIONAL `length_ms` verbatim; the daemon then calls `trigger_compose_music`
+    /// directly, whose own gate ([`crate::voice_tier::music_enabled`] + offline check)
+    /// turns switch-off / no-key / offline into an HONEST `Err` — never a fabricated
+    /// track. Only the text prompt leaves the device. There is no model/agent/tool path
+    /// to it.
+    ComposeMusic {
+        prompt: String,
+        length_ms: Option<u32>,
     },
 }
 
@@ -372,6 +394,25 @@ fn decide(raw: &str) -> Decision {
                 name: name.to_string(),
             }
         }
+        // The HUD music-generation control (Jerome's "Leisure + DJ" surface). A benign
+        // verb that composes a track from a TEXT prompt. The prompt is validated here:
+        // clamped + trimmed, and a NON-EMPTY check — an empty prompt is a BadRequest,
+        // never routed, so a thin request never spends a cloud op. The OPTIONAL
+        // length_ms is carried verbatim (the server clamps it). The trigger's key +
+        // cloud-tier gate makes no-key / offline an HONEST failure downstream; here we
+        // only admit a structurally-complete request. Only the text prompt leaves the
+        // host.
+        "compose_music" => {
+            let prompt = clamp_text(req.prompt);
+            let prompt = prompt.trim();
+            if prompt.is_empty() {
+                return Decision::BadRequest { reason: "compose_music requires a non-empty prompt" };
+            }
+            Command::ComposeMusic {
+                prompt: prompt.to_string(),
+                length_ms: req.length_ms,
+            }
+        }
         // Anything else — including the empty string — is rejected here. There is
         // NO route for an unknown command.
         other => return Decision::UnknownCommand { cmd: other.to_string() },
@@ -459,6 +500,18 @@ pub trait CommandPipeline: Send + Sync {
         word: &str,
         say: &str,
         name: &str,
+    ) -> impl std::future::Future<Output = String> + Send;
+    /// COMPOSE a music track from a text `prompt` with an OPTIONAL `length_ms` (both
+    /// already validated by [`decide`]: a non-empty prompt). Delegates to the daemon's
+    /// `trigger_compose_music`, whose gate ([`crate::voice_tier::music_enabled`] +
+    /// offline check) makes switch-off / no-key / offline an HONEST failure — the
+    /// returned text is the honest outcome (composed / unavailable), NEVER a fabricated
+    /// track. Only the text prompt leaves the device; the el_key stays inside the
+    /// trigger.
+    fn compose_music(
+        &self,
+        prompt: &str,
+        length_ms: Option<u32>,
     ) -> impl std::future::Future<Output = String> + Send;
 }
 
@@ -807,6 +860,17 @@ where
             telemetry::emit("system", "command.routed", json!({"cmd": "create_pronunciation"}));
             json!({"ok": true, "reply": pipeline.create_pronunciation(&word, &say, &name).await})
         }
+        Command::ComposeMusic { prompt, length_ms } => {
+            // The HUD music-generation control (Jerome's surface). The prompt is
+            // already validated non-empty by decide. Route into the daemon's
+            // trigger_compose_music via the pipeline — its gate (music_enabled +
+            // offline) makes switch-off / no-key / offline an HONEST failure; we
+            // surface whatever it returns (composed / unavailable / failed), never
+            // faking a track. Telemetry records the cmd only — NEVER the free-text
+            // prompt or the el_key.
+            telemetry::emit("system", "command.routed", json!({"cmd": "compose_music"}));
+            json!({"ok": true, "reply": pipeline.compose_music(&prompt, length_ms).await})
+        }
     }
 }
 
@@ -1108,6 +1172,31 @@ impl CommandPipeline for LivePipeline {
             Err(msg) => msg,
         }
     }
+
+    async fn compose_music(&self, prompt: &str, length_ms: Option<u32>) -> String {
+        // Delegate to the daemon's `compose_music_for_command`, the Send-safe wrapper
+        // around `trigger_compose_music`. That path performs the SAME cloud-tier +
+        // Keychain-key gate as the other EL ops, composes the track, OR returns an
+        // HONEST unavailable/failed message. Only the text prompt leaves the device;
+        // the el_key is read ONLY inside the trigger.
+        match crate::compose_music_for_command(
+            self.cfg.clone(),
+            prompt.to_string(),
+            length_ms,
+            self.root.clone(),
+            self.inference_sock.clone(),
+        )
+        .await
+        {
+            // Composed: a short honest ack. We do NOT echo the WAV path (an internal
+            // track path is not the user's business); the HUD already knows it asked
+            // to compose.
+            Ok(_path) => "Composed your track — it's ready.".to_string(),
+            // switch-off / no-key / offline / generation failure: the honest line from
+            // trigger_compose_music, never a faked track.
+            Err(msg) => msg,
+        }
+    }
 }
 
 /// Clear the forge pending marker for `ts` — and NOTHING else. This is the
@@ -1207,6 +1296,7 @@ mod tests {
             (json!({"token": "t", "cmd": "play_cue", "cue": "confirm"}), true),
             (json!({"token": "t", "cmd": "design_voice", "agent": "edith", "description": "a calm warm british woman, mid-thirties"}), true),
             (json!({"token": "t", "cmd": "create_pronunciation", "word": "JARVIS", "say": "jarviss"}), true),
+            (json!({"token": "t", "cmd": "compose_music", "prompt": "a calm lo-fi study beat"}), true),
         ];
         for (line, _ok) in cases {
             assert!(
@@ -1251,6 +1341,10 @@ mod tests {
             json!({"token": "t", "cmd": "create_pronunciation", "word": "  ", "say": "jarviss"}),
             json!({"token": "t", "cmd": "create_pronunciation", "word": "JARVIS"}),
             json!({"token": "t", "cmd": "create_pronunciation", "word": "JARVIS", "say": "  "}),
+            // compose_music: a missing/empty/whitespace prompt is a BadRequest.
+            json!({"token": "t", "cmd": "compose_music"}),
+            json!({"token": "t", "cmd": "compose_music", "prompt": ""}),
+            json!({"token": "t", "cmd": "compose_music", "prompt": "   "}),
         ];
         for line in bad {
             assert!(
@@ -1435,6 +1529,8 @@ mod tests {
         last_design: StdMutex<Option<(String, String, String)>>,
         create_pron_calls: AtomicU32,
         last_pron: StdMutex<Option<(String, String, String)>>,
+        compose_music_calls: AtomicU32,
+        last_music: StdMutex<Option<(String, Option<u32>)>>,
     }
     impl CommandPipeline for MockPipeline {
         async fn ask(&self, text: &str, agent: Option<&str>) -> String {
@@ -1462,6 +1558,11 @@ mod tests {
             *self.last_pron.lock().unwrap() =
                 Some((word.to_string(), say.to_string(), name.to_string()));
             format!("pron:{word}:{say}")
+        }
+        async fn compose_music(&self, prompt: &str, length_ms: Option<u32>) -> String {
+            self.compose_music_calls.fetch_add(1, Ordering::SeqCst);
+            *self.last_music.lock().unwrap() = Some((prompt.to_string(), length_ms));
+            format!("music:{prompt}")
         }
     }
 
@@ -1816,6 +1917,92 @@ mod tests {
         assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "and never reaches the model");
     }
 
+    /// SECURITY/shape: `compose_music` validates a NON-EMPTY prompt, clamps + trims it,
+    /// and carries the OPTIONAL length_ms verbatim. An empty/whitespace prompt is a
+    /// BadRequest (never routed); the cmd itself stays a known verb (an unknown cmd is
+    /// still UnknownCommand — the allowlist boundary is unchanged by adding it).
+    #[test]
+    fn compose_music_validates_a_non_empty_prompt() {
+        // A complete request (with a pinned length) parses to ComposeMusic verbatim.
+        let line = json!({
+            "token": "t", "cmd": "compose_music",
+            "prompt": "  a calm lo-fi study beat  ", "length_ms": 45000
+        }).to_string();
+        match decide(&line) {
+            Decision::Ok { command: Command::ComposeMusic { prompt, length_ms }, .. } => {
+                assert_eq!(prompt, "a calm lo-fi study beat", "trimmed prompt carried verbatim");
+                assert_eq!(length_ms, Some(45000), "the optional length is carried verbatim");
+            }
+            other => panic!("complete compose_music must be Ok(ComposeMusic), got {other:?}"),
+        }
+        // No length_ms => None (the server defaults), still Ok.
+        let line = json!({"token": "t", "cmd": "compose_music", "prompt": "upbeat synthwave"}).to_string();
+        match decide(&line) {
+            Decision::Ok { command: Command::ComposeMusic { length_ms, .. }, .. } => {
+                assert_eq!(length_ms, None, "an absent length defaults at the server");
+            }
+            other => panic!("expected Ok(ComposeMusic), got {other:?}"),
+        }
+        // An empty/whitespace prompt is a BadRequest — NOT routed.
+        for bad in ["", "   "] {
+            let line = json!({"token": "t", "cmd": "compose_music", "prompt": bad}).to_string();
+            assert!(
+                matches!(decide(&line), Decision::BadRequest { .. }),
+                "empty prompt {bad:?} must be BadRequest (never routed)"
+            );
+        }
+        // A missing prompt field is likewise a BadRequest.
+        let line = json!({"token": "t", "cmd": "compose_music"}).to_string();
+        assert!(matches!(decide(&line), Decision::BadRequest { .. }), "missing prompt is BadRequest");
+        // An entirely unknown cmd is STILL UnknownCommand (allowlist boundary intact).
+        let line = json!({"token": "t", "cmd": "make_song", "prompt": "x"}).to_string();
+        assert!(
+            matches!(decide(&line), Decision::UnknownCommand { .. }),
+            "an unknown cmd remains UnknownCommand"
+        );
+    }
+
+    /// The `compose_music` verb routes to the pipeline's dedicated `compose_music` arm
+    /// with the validated prompt + optional length — NOT to `ask` (so it NEVER reaches
+    /// the model tool loop). It is the HUD music-generation control (Jerome's surface):
+    /// a dedicated, authenticated, rate-passed benign verb with no model path.
+    #[tokio::test]
+    async fn compose_music_verb_routes_to_its_arm_not_the_model() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({
+            "token": valid_token(), "cmd": "compose_music",
+            "prompt": "a calm lo-fi study beat", "length_ms": 60000
+        }).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["reply"], "music:a calm lo-fi study beat");
+        assert_eq!(pipeline.compose_music_calls.load(Ordering::SeqCst), 1, "reached the music arm");
+        assert_eq!(
+            *pipeline.last_music.lock().unwrap(),
+            Some(("a calm lo-fi study beat".into(), Some(60000))),
+            "the validated prompt + length are carried verbatim"
+        );
+        // It did NOT route through the model pipeline (ask) — no model path to a track.
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "compose_music never reaches the model");
+    }
+
+    /// An empty-prompt `compose_music` is rejected as a bad_request through the handler
+    /// and the music arm is NEVER reached — the non-empty prompt check holds end-to-end,
+    /// even with a valid token, so no wasted cloud op is spent.
+    #[tokio::test]
+    async fn empty_music_prompt_is_rejected_through_the_handler() {
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+        let lim = fresh_limiter();
+        let line = json!({"token": valid_token(), "cmd": "compose_music", "prompt": "   "}).to_string();
+        let r = handle_line(&line, &pipeline, &dispatcher, &lim, false).await;
+        assert_eq!(r["error"], "bad_request", "an empty prompt is a bad_request");
+        assert_eq!(pipeline.compose_music_calls.load(Ordering::SeqCst), 0, "never routes");
+        assert_eq!(pipeline.ask_calls.load(Ordering::SeqCst), 0, "and never reaches the model");
+    }
+
     /// Task #12: the `panic` verb routes to the dispatcher's lockdown engage —
     /// NOT the model pipeline (`ask`). It is the HUD PANIC button: a bare,
     /// authenticated, rate-passed verb with no model path.
@@ -2057,6 +2244,7 @@ mod tests {
             async fn create_pronunciation(&self, _w: &str, _s: &str, _n: &str) -> String {
                 unreachable!()
             }
+            async fn compose_music(&self, _p: &str, _l: Option<u32>) -> String { unreachable!() }
         }
         let pipeline = Arc::new(ParkingPipeline);
         let dispatcher = Arc::new(ProbeDispatcher::default());

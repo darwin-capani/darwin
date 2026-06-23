@@ -3309,6 +3309,65 @@ async fn trigger_sound_effect(
     }
 }
 
+/// COMPOSE MUSIC trigger (Phase-2). Mirrors [`trigger_sound_effect`] exactly: gate ->
+/// read the key from the Keychain -> emit op=compose_music -> return the track WAV path.
+/// Reached only through its EXPLICIT gate ([`voice_tier::music_enabled`] =
+/// `[voice].cloud_music` + key present) AND, like cloud_tier, only when the operator is
+/// NOT offline (a `Local` tier keeps everything on-device). Music generation has NO
+/// on-device fallback, so when the gate is off / there is no key / the operator is
+/// offline this returns an HONEST `Err` ("unavailable") — never a fabricated track. The
+/// music text PROMPT leaves the device (text only). `length_ms` is an OPTIONAL length
+/// hint the server clamps/defaults.
+///
+/// SECURITY: the resolved key is read here ONLY to thread into the request body
+/// (server -> xi-api-key header); it is never logged/argv/telemetry. Mirrors
+/// `trigger_sound_effect`'s key handling exactly.
+#[allow(dead_code)] // Phase-2 command seam; wired to the compose_music command/intent surface
+async fn trigger_compose_music(
+    cfg: &Config,
+    prompt: &str,
+    length_ms: Option<u32>,
+    _root: &Path,
+    infer: &mut InferenceClient,
+) -> Result<std::path::PathBuf, String> {
+    // Cheap pre-check: never touch the Keychain when offline or the switch is off.
+    let active = model_tier::active_tier(cfg, model_tier::current_override());
+    if active == model_tier::Tier::Local {
+        return Err("Composing music needs the cloud tier, but you're working offline — \
+                    nothing was created."
+            .to_string());
+    }
+    if !cfg.voice.cloud_music {
+        return Err("The music-generation tier is off. Turn on [voice].cloud_music to use it."
+            .to_string());
+    }
+    // Resolve the key ONLY now that the switch is on + non-offline.
+    let key = crate::integrations::resolve_secret(voice_tier::ELEVENLABS_ACCOUNT).await;
+    let Some(key) = key else {
+        // music_enabled(cfg, key_present=false) == false: honest unavailable, no
+        // on-device music generator to fall back to.
+        debug_assert!(!voice_tier::music_enabled(cfg, false));
+        telemetry::emit("system", "music.no_key", json!({}));
+        return Err("I can't compose music without an ElevenLabs key — add one in Settings. \
+                    There's no on-device music generator."
+            .to_string());
+    };
+    debug_assert!(voice_tier::music_enabled(cfg, true), "gate must be open here");
+    match infer.compose_music(prompt, &key, length_ms).await {
+        Ok(path) => {
+            telemetry::emit("system", "music.generated", json!({}));
+            Ok(path)
+        }
+        Err(e) => {
+            warn!(error = %e, "compose-music: compose_music op failed");
+            telemetry::emit("system", "music.failed", json!({}));
+            Err("I couldn't compose that track just now — the cloud request didn't go \
+                 through. Nothing was created."
+                .to_string())
+        }
+    }
+}
+
 /// NAMED CUE trigger (Phase-2). The agent-intent/HUD-facing surface for playing a
 /// BUILT-IN cue by NAME (see [`sfx_cue::CATALOG`]: confirm/alert/error/success/
 /// notify/wake). This sits ON TOP of the sound-effect seam and does NOT duplicate
@@ -3414,6 +3473,42 @@ pub(crate) async fn play_cue_for_command(
     match tokio::task::spawn_blocking(move || join.join()).await {
         Ok(Ok(result)) => result,
         _ => Err("I couldn't play that cue just now — nothing was produced.".to_string()),
+    }
+}
+
+/// `Send`-safe wrapper around [`trigger_compose_music`] for the command channel's
+/// `compose_music` verb — the SAME isolation pattern as [`play_cue_for_command`].
+/// The compose future drives the inference seam (whose trait object is not `Send`),
+/// so it cannot be awaited directly inside the `Send`-required command-channel task;
+/// we run the (genuinely non-`Send`) composition to completion on a dedicated thread
+/// with its own current-thread runtime and hand back ONLY the `Send`
+/// `Result<PathBuf, String>` (the track path, or the honest failure prose). The
+/// trigger's own gate is unchanged: switch-off / no-key / offline is still the honest
+/// `Err` produced INSIDE `trigger_compose_music`; this wrapper fabricates nothing.
+/// `el_key` is read ONLY inside the trigger (never on this thread's stack as a value we
+/// log or return). The wrapper opens its OWN per-call inference client on
+/// `inference_sock`, the same lazy-connect pattern the other background tasks use.
+pub(crate) async fn compose_music_for_command(
+    cfg: Config,
+    prompt: String,
+    length_ms: Option<u32>,
+    root: PathBuf,
+    inference_sock: PathBuf,
+) -> Result<std::path::PathBuf, String> {
+    let join = std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(rt) => rt,
+            Err(e) => return Err(format!("Couldn't start the music runtime: {e}")),
+        };
+        rt.block_on(async move {
+            let mut infer = InferenceClient::new(inference_sock);
+            trigger_compose_music(&cfg, &prompt, length_ms, &root, &mut infer).await
+        })
+    });
+    // A panic on the compose thread becomes an honest failure, never a faked track.
+    match tokio::task::spawn_blocking(move || join.join()).await {
+        Ok(Ok(result)) => result,
+        _ => Err("I couldn't compose that track just now — nothing was created.".to_string()),
     }
 }
 
