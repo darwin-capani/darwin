@@ -522,6 +522,53 @@ export async function createPronunciation(
   }
 }
 
+/* ------------------------------------------------------ Compose music (Phase-3) */
+
+/** The honest outcome of a Compose-music attempt (mirrors the Rust `MusicReply`).
+ *  `outcome` is the small contract vocabulary the UI maps to prose; it NEVER
+ *  claims a track was composed when the daemon reported an honest no-op / failure.
+ *  `detail` is a short human line (never a secret, never the produced audio path). */
+export interface MusicReply {
+  /** "created" | "unavailable" | "failed" | "no_shell". */
+  outcome: "created" | "unavailable" | "failed" | "no_shell";
+  detail: string;
+}
+
+/**
+ * COMPOSE a full music track from a text `prompt` (+ an OPTIONAL `lengthMs`) via
+ * the `compose_music` backend command. This adds NO authority and NO new tier:
+ * the backend relays a bounded `compose_music` request through the SAME
+ * token-injecting command socket the deck uses, and the daemon's already-shipped
+ * gate (`[voice].cloud_music` + an ElevenLabs key on file + a non-Local tier)
+ * makes the real, honest call. With the switch off / no key / offline the daemon
+ * returns an honest "unavailable" / "didn't go through, nothing was created" prose
+ * (`unavailable` / `failed`) — never a fabricated track.
+ *
+ * In a plain browser (no shell) there is nothing to compose — return an honest
+ * `no_shell` outcome rather than throwing. Only the text prompt (+ the optional
+ * length) leaves the UI here; no key value and no audio path ever cross this
+ * boundary.
+ */
+export async function composeMusic(
+  prompt: string,
+  lengthMs?: number,
+): Promise<MusicReply> {
+  if (!inTauri()) {
+    return {
+      outcome: "no_shell",
+      detail: "Composing music requires the JARVIS desktop app.",
+    };
+  }
+  try {
+    return await invoke<MusicReply>("compose_music", { prompt, lengthMs });
+  } catch (e) {
+    return {
+      outcome: "failed",
+      detail: typeof e === "string" ? e : "could not compose the track",
+    };
+  }
+}
+
 export async function toggleFullscreen(): Promise<void> {
   if (!inTauri()) {
     // Browser fallback for development.

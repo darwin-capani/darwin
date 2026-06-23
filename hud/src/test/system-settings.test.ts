@@ -102,6 +102,7 @@ const BACKEND_WHITELIST_IDS: string[] = [
   "voice.cloud_tier",
   "voice.cloud_stt",
   "voice.cloud_sfx",
+  "voice.cloud_music",
   "voice.stream_tts",
   "voice.event_cues",
   "voice.pronunciation_dictionary_id",
@@ -280,6 +281,21 @@ describe("new ElevenLabs [voice] daemon keys are surfaced in the HUD catalog", (
     expect(hint).toContain("no on-device sfx generator");
   });
 
+  it("cloud_music is an honest toggle in the Voice & Speech group", () => {
+    const e = entryById("voice.cloud_music");
+    expect(e?.control).toBe("toggle");
+    expect(e?.group).toBe("Voice & Speech");
+    expect(e?.label).toBe("Cloud music (ElevenLabs)");
+    const hint = e!.hint.toLowerCase();
+    // Honest: ships on, inert without a key, generates a full track from a prompt,
+    // the audio is a cloud generation (no on-device fallback).
+    expect(hint).toContain("ships on");
+    expect(hint).toContain("inert without a key");
+    expect(hint).toContain("track");
+    expect(hint).toContain("no on-device music generator");
+    expect(hint).toContain("cloud generation");
+  });
+
   it("stream_tts is an honest opt-in toggle in the Voice & Speech group", () => {
     const e = entryById("voice.stream_tts");
     expect(e?.control).toBe("toggle");
@@ -333,6 +349,7 @@ describe("new ElevenLabs [voice] daemon keys are surfaced in the HUD catalog", (
       "voice.cloud_tier",
       "voice.cloud_stt",
       "voice.cloud_sfx",
+      "voice.cloud_music",
       "voice.stream_tts",
       "voice.event_cues",
       "voice.pronunciation_dictionary_id",
@@ -343,7 +360,7 @@ describe("new ElevenLabs [voice] daemon keys are surfaced in the HUD catalog", (
   });
 
   it("the new toggles/text fields are never marked dangerous (no confirm gate)", () => {
-    for (const id of ["voice.cloud_sfx", "voice.stream_tts", "voice.event_cues"]) {
+    for (const id of ["voice.cloud_sfx", "voice.cloud_music", "voice.stream_tts", "voice.event_cues"]) {
       const e = entryById(id)!;
       expect(e.danger).toBeFalsy();
       expect(isDangerousChange(e, true)).toBe(false);

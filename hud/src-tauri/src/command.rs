@@ -49,6 +49,12 @@ const MAX_REPLY_BYTES: usize = 64 * 1024;
 /// this is rejected HERE (defense-in-depth; the daemon also rejects it) so a
 /// too-thin request never rides the wire.
 const MIN_VOICE_DESCRIPTION_CHARS: usize = 20;
+/// The bounded track-length band (milliseconds) for `compose_music`. An OPTIONAL
+/// length outside this band is CLAMPED here (not rejected) so a request never
+/// rides an absurd duration; an absent length is omitted (the daemon defaults it).
+/// Mirrors the HUD core's seconds band (3..=600s).
+const MIN_LENGTH_MS: u32 = 3_000;
+const MAX_LENGTH_MS: u32 = 600_000;
 
 /// The bounded command set the backend will relay — the SAME structural
 /// allowlist as daemon/src/command.rs. An unknown `cmd` from JS is rejected here
@@ -86,6 +92,16 @@ const ALLOWED_COMMANDS: &[&str] = &[
     // token-injecting socket as every other verb (defense-in-depth: a too-thin /
     // empty request is rejected daemon-side).
     "design_voice", "create_pronunciation",
+    // Phase-3 Compose music — generate a FULL music track from a text PROMPT (the
+    // daemon `compose_music` verb). Carries {prompt, length_ms?}: only the text
+    // prompt (+ an optional bounded track length) leaves the device; the generated
+    // track is a cloud generation handled daemon-side. The daemon gates it on its
+    // already-shipped `[voice].cloud_music` + an ElevenLabs key + a non-Local tier
+    // and returns honest "unavailable" / "didn't go through, nothing was created"
+    // prose (never a fabricated track) when the gate is closed. It adds NO new
+    // authority and NO new tier — it rides the SAME token-injecting socket as every
+    // other verb (defense-in-depth: an empty prompt is rejected daemon-side).
+    "compose_music",
 ];
 
 /// The typed request the React layer hands `send_command`. Every field is
@@ -127,6 +143,15 @@ pub struct CommandRequest {
     /// only). The replacement pronunciation text; non-empty, clamped.
     #[serde(default)]
     pub say: Option<String>,
+    /// Phase-3 Compose music — the track PROMPT (`compose_music` only). Free text,
+    /// clamped + non-empty-checked in [`build_request`]. Never a key, never a path.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// Phase-3 Compose music — the OPTIONAL track length in milliseconds
+    /// (`compose_music` only). Clamped to a sensible band in [`build_request`];
+    /// omitted from the wire when absent (the daemon defaults it).
+    #[serde(default)]
+    pub length_ms: Option<u32>,
 }
 
 /// The reply surfaced to the UI. `ok` mirrors the daemon's `{ok}`; `reply` is the
@@ -296,6 +321,22 @@ pub fn build_request(req: &CommandRequest, token: &str) -> Result<Value, String>
             obj.insert("say".to_string(), json!(say));
             if let Some(name) = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
                 obj.insert("name".to_string(), json!(name));
+            }
+        }
+        "compose_music" => {
+            // {prompt, length_ms?}. Mirror the daemon floor: a non-empty prompt is
+            // required (a blank request never spends a cloud op). The OPTIONAL
+            // length is CLAMPED into the bounded band and omitted when absent (the
+            // daemon defaults it). Only the text prompt (+ the optional length)
+            // leaves the device; no key/path ever rides this verb.
+            let prompt = req.prompt.as_deref().map(clamp_text).unwrap_or_default();
+            let prompt = prompt.trim();
+            if prompt.is_empty() {
+                return Err("compose_music requires a non-empty prompt".to_string());
+            }
+            obj.insert("prompt".to_string(), json!(prompt));
+            if let Some(ms) = req.length_ms {
+                obj.insert("length_ms".to_string(), json!(ms.clamp(MIN_LENGTH_MS, MAX_LENGTH_MS)));
             }
         }
         // brief / roster / state / pending carry no extra fields. The task #12
@@ -660,6 +701,87 @@ pub async fn create_pronunciation(
     Ok(voice_lab_outcome(&reply))
 }
 
+/* ----------------------------------------------------- Compose music (Phase-3) */
+
+/// The honest Compose-music outcome the HUD maps to prose. Mirrors the daemon
+/// trigger vocabulary collapsed to a small set: a genuine creation (`created`), a
+/// closed-gate / offline / no-key no-op (`unavailable`), or a generic failure
+/// (`failed`). It NEVER claims a track when the daemon reported an honest no-op /
+/// failure. `detail` is the daemon's own secret-free line (never the audio path).
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct MusicReply {
+    pub outcome: String,
+    pub detail: String,
+}
+
+/// Map a daemon `CommandReply` (the `compose_music` relay reply) into the bounded
+/// [`MusicReply`] vocabulary. PURE — unit-tested.
+///
+/// HONESTY (FAIL-SAFE, exactly like [`voice_lab_outcome`]): the command channel
+/// returns `ok:true` for any DISPATCHED verb and carries the trigger's honest
+/// outcome PROSE in `reply` — a closed gate / failure is reported in that TEXT, NOT
+/// via `ok:false`. So we classify on the secret-free line and call it "created"
+/// ONLY when the prose carries no gate / failure marker: an honest no-op or failure
+/// can NEVER read as "created", even though the dispatch itself returned ok:true. A
+/// gate-closed / offline / no-key rejection → `unavailable`; anything else honestly
+/// failed → `failed`. No path or secret is ever forwarded — only the contracted
+/// `{outcome, detail}`.
+pub fn music_outcome(reply: &CommandReply) -> MusicReply {
+    let line = if reply.ok {
+        reply.reply.as_deref().unwrap_or("")
+    } else {
+        reply.error.as_deref().unwrap_or("command_failed")
+    };
+    let lower = line.to_ascii_lowercase();
+    let detail = if line.is_empty() { "Done.".to_string() } else { line.to_string() };
+
+    // A closed-gate no-op: cloud music off / offline / no key. The daemon's own copy
+    // names these; mirror its markers so an honest no-op never reads as "created".
+    let outcome = if lower.contains("needs the cloud tier")
+        || lower.contains("needs cloud music")
+        || lower.contains("working offline")
+        || lower.contains("without an elevenlabs key")
+        || lower.contains("add one in settings")
+        || lower.contains("unavailable")
+    {
+        "unavailable"
+    } else if !reply.ok
+        || lower.contains("couldn't")
+        || lower.contains("could not")
+        || lower.contains("can't")
+        || lower.contains("didn't go through")
+        || lower.contains("nothing was created")
+    {
+        // Any honest failure marker -> failed, even on an ok:true dispatch.
+        "failed"
+    } else {
+        // A genuine creation: dispatched ok with clean success prose.
+        "created"
+    };
+    MusicReply { outcome: outcome.to_string(), detail }
+}
+
+/// COMPOSE a full music track from a text `prompt` (+ an OPTIONAL `length_ms`).
+/// Relays a bounded `compose_music` request through the SAME token-injecting
+/// command socket as [`send_command`] — it adds NO new authority and NO new tier.
+/// The daemon gates it on its already-shipped `[voice].cloud_music` + an ElevenLabs
+/// key + a non-Local tier and returns an honest "unavailable" / "didn't go through,
+/// nothing was created" prose (never a fabricated track) when the gate is closed;
+/// this command faithfully maps that into the [`MusicReply`] vocabulary. Only the
+/// text prompt (+ the optional length) leaves the UI; no key value or path ever
+/// crosses here.
+#[tauri::command]
+pub async fn compose_music(prompt: String, length_ms: Option<u32>) -> Result<MusicReply, String> {
+    let request = CommandRequest {
+        cmd: "compose_music".to_string(),
+        prompt: Some(prompt),
+        length_ms,
+        ..Default::default()
+    };
+    let reply = send_command(request).await?;
+    Ok(music_outcome(&reply))
+}
+
 /* --------------------------------------------------------------------- tests */
 
 #[cfg(test)]
@@ -701,6 +823,12 @@ mod tests {
                 let mut r = req("create_pronunciation");
                 r.word = Some("JARVIS".into());
                 r.say = Some("jar viss".into());
+                r
+            },
+            // Phase-3 Compose music — carries a non-empty prompt (length optional).
+            {
+                let mut r = req("compose_music");
+                r.prompt = Some("an 8-bit happy birthday".into());
                 r
             },
         ];
@@ -760,6 +888,12 @@ mod tests {
         blank_say.word = Some("JARVIS".into());
         blank_say.say = Some("   ".into());
         assert!(build_request(&blank_say, "T").is_err()); // whitespace say
+
+        // Compose music — needs a non-empty prompt (the length is optional).
+        assert!(build_request(&req("compose_music"), "T").is_err()); // no prompt
+        let mut blank_prompt = req("compose_music");
+        blank_prompt.prompt = Some("   ".into());
+        assert!(build_request(&blank_prompt, "T").is_err()); // whitespace prompt
     }
 
     #[test]
@@ -858,6 +992,89 @@ mod tests {
             let mapped = voice_lab_outcome(r);
             assert!(!mapped.detail.contains("sk-"));
             assert!(!mapped.detail.contains(".wav"));
+        }
+    }
+
+    #[test]
+    fn build_request_compose_music_carries_only_the_prompt_and_clamped_length() {
+        // Prompt trimmed; a given length rides as a clamped length_ms; no key/path.
+        let mut r = req("compose_music");
+        r.prompt = Some("  an 8-bit happy birthday  ".into());
+        r.length_ms = Some(30_000);
+        let v = build_request(&r, "TOK").unwrap();
+        assert_eq!(v["cmd"], "compose_music");
+        assert_eq!(v["prompt"], "an 8-bit happy birthday");
+        assert_eq!(v["length_ms"], 30_000);
+        assert_eq!(v["token"], "TOK", "token injected by the backend");
+        // ONLY token + cmd + prompt + length_ms ride the wire — no key/path field.
+        assert_eq!(v.as_object().unwrap().len(), 4);
+
+        // A blank length is OMITTED entirely (the daemon defaults it).
+        let mut no_len = req("compose_music");
+        no_len.prompt = Some("lo-fi beat".into());
+        let v = build_request(&no_len, "T").unwrap();
+        assert!(v.get("length_ms").is_none(), "absent length omitted");
+        assert_eq!(v.as_object().unwrap().len(), 3); // token+cmd+prompt
+
+        // An out-of-band length is CLAMPED, never rejected: too short -> floor,
+        // too long -> ceiling.
+        let mut short = req("compose_music");
+        short.prompt = Some("x".into());
+        short.length_ms = Some(1);
+        assert_eq!(build_request(&short, "T").unwrap()["length_ms"], MIN_LENGTH_MS);
+        let mut long = req("compose_music");
+        long.prompt = Some("x".into());
+        long.length_ms = Some(u32::MAX);
+        assert_eq!(build_request(&long, "T").unwrap()["length_ms"], MAX_LENGTH_MS);
+    }
+
+    #[test]
+    fn music_outcome_maps_the_daemon_reply_honestly() {
+        // A successful composition → created (a real track was generated).
+        let composed = parse_reply(r#"{"ok":true,"reply":"Composed a 30s track from \"an 8-bit happy birthday\"."}"#);
+        assert_eq!(music_outcome(&composed).outcome, "created");
+        // A gate-closed / offline / no-key rejection NEVER reads as created.
+        let offline = parse_reply(
+            r#"{"ok":false,"error":"Composing music needs the cloud tier, but you're working offline — nothing was created."}"#,
+        );
+        assert_eq!(music_outcome(&offline).outcome, "unavailable");
+        let no_key = parse_reply(
+            r#"{"ok":false,"error":"I can't compose music without an ElevenLabs key — add one in Settings. Nothing was created."}"#,
+        );
+        assert_eq!(music_outcome(&no_key).outcome, "unavailable");
+        let unavail = parse_reply(r#"{"ok":false,"error":"Music generation is unavailable right now."}"#);
+        assert_eq!(music_outcome(&unavail).outcome, "unavailable");
+        // A generation failure → failed, never a fabricated success.
+        let failed = parse_reply(
+            r#"{"ok":false,"error":"I couldn't compose that track just now — the cloud request didn't go through. Nothing was created."}"#,
+        );
+        assert_eq!(music_outcome(&failed).outcome, "failed");
+        // A protocol-level relay failure also reads as failed (never created).
+        let relay = parse_reply(r#"{"ok":false,"error":"unknown_command"}"#);
+        assert_eq!(music_outcome(&relay).outcome, "failed");
+        // FAIL-SAFE: the command channel returns ok:TRUE for any dispatched verb,
+        // carrying a gated/failure outcome in the PROSE. Such a reply must NOT read
+        // as "created" — we classify on the text, never the bare ok flag.
+        let ok_true_offline = parse_reply(
+            r#"{"ok":true,"reply":"Composing music needs the cloud tier, but you're working offline — nothing was created."}"#,
+        );
+        assert_eq!(
+            music_outcome(&ok_true_offline).outcome, "unavailable",
+            "ok:true with gated prose is an honest no-op, never created"
+        );
+        let ok_true_failed = parse_reply(
+            r#"{"ok":true,"reply":"I couldn't compose that track just now — the cloud request didn't go through. Nothing was created."}"#,
+        );
+        assert_eq!(
+            music_outcome(&ok_true_failed).outcome, "failed",
+            "ok:true with failure prose is failed, never created"
+        );
+        // The mapped detail never carries a path/secret-shaped marker.
+        for r in [&composed, &offline, &no_key, &unavail, &failed, &relay, &ok_true_offline, &ok_true_failed] {
+            let mapped = music_outcome(r);
+            assert!(!mapped.detail.contains("sk-"));
+            assert!(!mapped.detail.contains(".wav"));
+            assert!(!mapped.detail.contains(".mp3"));
         }
     }
 

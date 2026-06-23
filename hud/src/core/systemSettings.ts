@@ -399,6 +399,16 @@ export const CATALOG: CatalogEntry[] = [
       "An added cue layer reached only through its explicit gate; it never changes the default speech path. When active the SFX text prompt leaves the device.",
   },
   {
+    id: "voice.cloud_music",
+    group: "Voice & Speech",
+    label: "Cloud music (ElevenLabs)",
+    control: "toggle",
+    hint:
+      "Gates the ElevenLabs MUSIC-generation tier (a text prompt -> a generated full track). " +
+      "Ships ON but INERT WITHOUT A KEY — needs the EL key + a non-Local tier; there is no on-device music generator, so without a key (or offline) it is honestly unavailable (never faked). " +
+      "An added music layer reached only through its explicit gate; it never changes the default speech path. When active the music text prompt leaves the device and it generates a full track (a cloud generation).",
+  },
+  {
     id: "voice.stream_tts",
     group: "Voice & Speech",
     label: "Streaming cloud TTS",

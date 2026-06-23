@@ -154,6 +154,7 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "voice", key: "whisper_auto", kind: Kind::Bool },
     Setting { section: "voice", key: "diarize", kind: Kind::Bool },
     Setting { section: "voice", key: "cloud_sfx", kind: Kind::Bool },
+    Setting { section: "voice", key: "cloud_music", kind: Kind::Bool },
     Setting { section: "voice", key: "stream_tts", kind: Kind::Bool },
     Setting { section: "voice", key: "event_cues", kind: Kind::Bool },
     Setting { section: "voice", key: "pronunciation_dictionary_id", kind: Kind::Str },

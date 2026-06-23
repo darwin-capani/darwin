@@ -26,8 +26,19 @@ import {
   voiceLabDisabledReason,
   voiceLabGateCopy,
 } from "../core/voiceLab";
+import {
+  DEFAULT_LENGTH_SECONDS,
+  MAX_LENGTH_SECONDS,
+  MIN_LENGTH_SECONDS,
+  buildComposeMusicRequest,
+  composeMusicErrorCopy,
+  composeMusicOutcomeCopy,
+  musicDisabledReason,
+  musicGateCopy,
+} from "../core/music";
 import { ROSTER } from "../core/agents";
 import {
+  composeMusic,
   createPronunciation,
   designVoice,
   inTauri,
@@ -163,6 +174,9 @@ export default function AudioIoPanel({
 
           {/* VOICE LAB — design a voice + add a pronunciation (key + tier gated) */}
           <VoiceLab />
+
+          {/* COMPOSE MUSIC — generate a full track from a prompt (key + music gated) */}
+          <ComposeMusic />
 
           <div className="verify-foot dim-note">
             All three audio-input features ship <b>OFF / neutral</b>. Live
@@ -491,6 +505,167 @@ function DesignVoiceForm({
           {note}
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * COMPOSE MUSIC (Phase-3) — an HONEST way to generate a FULL music track from a
+ * text prompt via ElevenLabs, from the HUD. It sends the `compose_music` command
+ * through the existing token-injecting command seam.
+ *
+ * HONESTY CONTRACT (do not regress):
+ *   - Composing music requires the ElevenLabs key + cloud music ON. The form is
+ *     DISABLED (with copy that names exactly what's missing) until the gate is
+ *     open; with the switch off / no key / offline, NOTHING is created — never a
+ *     fabricated track.
+ *   - The control adds NO authority and NO new tier. The daemon makes the real,
+ *     gated call (`[voice].cloud_music` + an EL key + a non-Local tier) and
+ *     returns honest "unavailable" / "didn't go through, nothing was created"
+ *     prose when closed; this surface only reflects that outcome, never claims a
+ *     track was made on a no-op.
+ *   - SECRET-FREE. It reads only two booleans (switch on, key present) and sends
+ *     the PROMPT (+ an optional length) — never the key value, never the audio path.
+ *
+ * The gate inputs are probed ONCE on mount (config `voice.cloud_music` + key
+ * presence); the pure request-shaping / gate / outcome logic lives in
+ * core/music.ts and is unit-tested headlessly.
+ */
+function ComposeMusic() {
+  const shell = inTauri();
+  const [cloudMusicOn, setCloudMusicOn] = useState(false);
+  const [keyPresent, setKeyPresent] = useState(false);
+  const [prompt, setPrompt] = useState("");
+  const [length, setLength] = useState(String(DEFAULT_LENGTH_SECONDS));
+  const [busy, setBusy] = useState(false);
+  const [note, setNote] = useState("");
+
+  // Probe the secret-free gate inputs once: the cloud-music switch (from config)
+  // and whether an ElevenLabs key is on file (presence only — never the value).
+  // In a plain browser both stay false and the form renders disabled.
+  useEffect(() => {
+    if (!shell) return;
+    let live = true;
+    void (async () => {
+      try {
+        const { configGet } = await import("../tauri/configSettings");
+        const settings = await configGet();
+        const music = settings.find((s) => s.key === "voice.cloud_music");
+        if (live) setCloudMusicOn(music?.value === true);
+      } catch {
+        if (live) setCloudMusicOn(false);
+      }
+    })();
+    void keychainStatus("elevenlabs_api_key")
+      .then((present) => {
+        if (live) setKeyPresent(present);
+      })
+      .catch(() => {
+        if (live) setKeyPresent(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [shell]);
+
+  const reason = musicDisabledReason(shell, { cloudMusicOn, keyPresent });
+  const gateOpen = reason === null;
+
+  const submit = useCallback(async () => {
+    if (busy) return;
+    const shaped = buildComposeMusicRequest(prompt, length);
+    if (!shaped.ok) {
+      setNote(composeMusicErrorCopy(shaped.error));
+      return;
+    }
+    setBusy(true);
+    setNote("");
+    try {
+      const r = await composeMusic(shaped.request.prompt, shaped.request.lengthMs);
+      // Prefer the daemon's own secret-free line; fall back to the contract copy.
+      setNote(r.detail || composeMusicOutcomeCopy(r.outcome, shaped.request.prompt));
+    } catch {
+      setNote(composeMusicOutcomeCopy("failed", shaped.request.prompt));
+    } finally {
+      setBusy(false);
+    }
+  }, [prompt, length, busy]);
+
+  return (
+    <div className="audioio-music" aria-label="Compose music">
+      <div className="verify-row">
+        <span className="verify-head">COMPOSE MUSIC</span>
+        <span
+          className={`verify-pill audioio-${gateOpen ? "good" : "idle"}`}
+          title={
+            "Generate a full music track from a text prompt via ElevenLabs. It " +
+            "requires the ElevenLabs key + cloud music ([voice].cloud_music) ON; " +
+            "with either off (or offline) nothing is created — never a fabricated " +
+            "track. Only the prompt you enter leaves the device; no key value or " +
+            "audio path crosses this surface."
+          }
+        >
+          <span className={`dot ${gateOpen ? "good" : "idle"}`} />
+          {gateOpen ? "READY" : "OFF"}
+        </span>
+        <span className="verify-meaning">{musicGateCopy(reason)}</span>
+      </div>
+
+      <div className="audioio-vl-form" aria-label="Compose a track">
+        <div className="audioio-vl-fields">
+          <label className="audioio-vl-label">
+            Prompt
+            <textarea
+              className="audioio-vl-textarea"
+              value={prompt}
+              onChange={(e) => setPrompt(e.target.value)}
+              disabled={!gateOpen || busy}
+              rows={2}
+              placeholder="e.g. an 8-bit happy birthday"
+              title={gateOpen ? undefined : musicGateCopy(reason)}
+            />
+          </label>
+          <label className="audioio-vl-label">
+            Length (seconds, optional)
+            <input
+              className="audioio-vl-input"
+              type="number"
+              inputMode="numeric"
+              min={MIN_LENGTH_SECONDS}
+              max={MAX_LENGTH_SECONDS}
+              value={length}
+              onChange={(e) => setLength(e.target.value)}
+              disabled={!gateOpen || busy}
+              placeholder={`${DEFAULT_LENGTH_SECONDS} (blank = default)`}
+              title={
+                gateOpen
+                  ? `Optional track length, ${MIN_LENGTH_SECONDS}–${MAX_LENGTH_SECONDS}s (blank = daemon default)`
+                  : musicGateCopy(reason)
+              }
+            />
+          </label>
+          <button
+            type="button"
+            className="icon-btn audioio-vl-submit"
+            onClick={() => void submit()}
+            disabled={!gateOpen || busy}
+            title={gateOpen ? "Compose this track (calls ElevenLabs once)" : musicGateCopy(reason)}
+          >
+            {busy ? "Composing…" : "Compose"}
+          </button>
+        </div>
+        {note && (
+          <div className="audioio-sub dim-note" role="status">
+            {note}
+          </div>
+        )}
+      </div>
+
+      <div className="audioio-sub dim-note">
+        Composing music calls ElevenLabs once and generates a full track from your
+        prompt (a cloud generation). Requires the key + cloud music — else nothing
+        is created.
+      </div>
     </div>
   );
 }
