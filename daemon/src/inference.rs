@@ -862,6 +862,13 @@ impl InferenceClient {
         }
     }
 
+    /// The inference socket this client connects to. Lets a caller that holds only
+    /// a borrowed client (e.g. the router) spawn a Send-safe per-call client on the
+    /// SAME socket for a background generation — see `compose_music_for_command`.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
     /// On-device / cloud STT. The server transcribes the WAV at `wav` and returns
     /// the text. `backend` is the STT backend the daemon already resolved
     /// ([`voice_tier::resolve_stt_backend`]): on-device whisper (the default +

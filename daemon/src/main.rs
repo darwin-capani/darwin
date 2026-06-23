@@ -3356,6 +3356,12 @@ async fn trigger_compose_music(
     match infer.compose_music(prompt, &key, length_ms).await {
         Ok(path) => {
             telemetry::emit("system", "music.generated", json!({}));
+            // PART 1: actually PLAY the composed track so the user HEARS it.
+            // Fire-and-forget on the SEPARATE music sink (not the speech Session):
+            // a 30 s–10 min track plays in the background and never mutes the mic
+            // or hijacks the speaking turn. Returns immediately; the caller's reply
+            // is the honest ack. A playback failure is swallowed inside playback.
+            crate::playback::play_track_path(&path);
             Ok(path)
         }
         Err(e) => {

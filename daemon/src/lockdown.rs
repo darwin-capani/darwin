@@ -256,6 +256,10 @@ pub async fn panic() -> &'static str {
     set_flag(true);
     // 2. Drop any armed confirmation — a parked outward action must not survive.
     crate::confirm::clear();
+    // 2b. Silence any composed track playing in the background. The emergency stop
+    //     cuts ALL audible output; a 30 s–10 min music track is no exception. This
+    //     touches only the separate music sink — the speech path is unaffected.
+    crate::playback::stop_track();
     // 3. Persist so a restart re-enters lockdown.
     write_marker();
     // 4. Audit (secret-free, fire-and-forget on the success path).

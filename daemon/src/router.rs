@@ -587,6 +587,54 @@ pub async fn route(
         }
     }
 
+    // COMPOSE-MUSIC VOICE COMMAND (Phase-2 flagship "JARVIS, compose an 8-bit happy
+    // birthday"). CONSERVATIVELY anchored (classify_music_intent requires an explicit
+    // music-CREATION verb + a musical anchor, so "play some jazz" and "what's the
+    // time" never trip it). MIRRORS the chart arm's shape: gated, handled BEFORE
+    // normal model routing so a creation utterance never falls through to the model.
+    // GATED by [voice].cloud_music (the music-generation tier switch) — when OFF this
+    // arm is skipped entirely and the utterance routes normally (we never claim to
+    // compose with the tier off). When ON but there's NO ElevenLabs key (or we're
+    // offline), the spawned trigger_compose_music honestly NO-OPS — nothing is
+    // fabricated and no track plays; the "composing now" ack is then mildly optimistic
+    // but never a lie about a produced track. The composition runs FIRE-AND-FORGET on
+    // a Send-safe per-call client (compose_music_for_command's dedicated thread +
+    // current-thread runtime), and Part-1 plays the finished WAV on the SEPARATE music
+    // sink — so this route returns the Jerome-voiced ack IMMEDIATELY without blocking
+    // on the 30 s–10 min generation. The el_key is read ONLY inside the trigger.
+    if cfg.voice.cloud_music {
+        if let Some(prompt) = classify_music_intent(text) {
+            // JEROME — "Leisure + DJ": the agent that owns music/entertainment.
+            let jerome = agents.get("jerome").unwrap_or_else(|| agents.orchestrator());
+            emit_agent_active(jerome);
+            telemetry::emit("system", "music.intent", json!({}));
+            // Fire-and-forget the (genuinely non-Send) generation on its own thread,
+            // reusing the command channel's Send-safe wrapper. Part 1 plays the track
+            // when it finishes; failures stay inside the trigger (honest no-op).
+            let cfg_owned = cfg.clone();
+            let root_owned = root.to_path_buf();
+            let sock = infer.socket_path().to_path_buf();
+            tokio::spawn(async move {
+                let _ = crate::compose_music_for_command(
+                    cfg_owned,
+                    prompt,
+                    None,
+                    root_owned,
+                    sock,
+                )
+                .await;
+            });
+            return Ok(RouteOutcome {
+                routed_to: "local",
+                response: "Composing your track now, sir — I'll have it ready in a moment."
+                    .to_string(),
+                agent: jerome.name.clone(),
+                namespace: jerome.namespace.clone(),
+                spoken: None,
+            });
+        }
+    }
+
     // LIFE-LOG DIGEST VOICE COMMAND (#20): "what did I do this week" / "show my
     // life log" / "what did I do today". CONSERVATIVELY anchored
     // (classify_lifelog_intent requires an explicit own-activity cue, so an
@@ -2020,6 +2068,132 @@ async fn handle_macro_command(
         MacroCommand::Replay { .. } => {
             "Replay is handled live, sir — say it again and I'll run it.".to_string()
         }
+    }
+}
+
+/// COMPOSE-MUSIC VOICE INTENT (Phase-2 flagship "compose an 8-bit happy
+/// birthday"). Returns the extracted song PROMPT when the utterance is an
+/// explicit request to CREATE music, else None.
+///
+/// CONSERVATIVELY ANCHORED so it never trips on ordinary speech. A match needs
+/// BOTH a music-CREATION verb AND a musical anchor:
+///   * `compose` is inherently musical → it alone anchors (the flagship
+///     "compose an 8-bit happy birthday" carries no "song" noun).
+///   * the broader verbs `make` / `write` / `generate` / `produce` and the
+///     phrasings `play me` / `make me` REQUIRE an explicit music OBJECT noun
+///     (song / track / tune / beat / jingle / melody / riff) so "make me a
+///     sandwich" and "write me an email" are NOT music.
+/// "play some jazz" (no creation verb) and "what's the time" therefore return
+/// None — only an explicit creation request routes to Jerome.
+///
+/// The returned String is the cleaned PROMPT: the verb/object/filler stripped
+/// from the front and an "about/of" tail unwrapped, so "compose a song about
+/// the rain" → "the rain" and "compose an 8-bit happy birthday" → "an 8-bit
+/// happy birthday". An empty residue (e.g. a bare "compose a song") falls back
+/// to a generic prompt so the op still has something to compose. Pure +
+/// unit-tested.
+pub fn classify_music_intent(text: &str) -> Option<String> {
+    let lower = text.to_lowercase();
+    let lower = lower.trim();
+
+    const OBJECTS: &[&str] = &["song", "track", "tune", "beat", "jingle", "melody", "riff"];
+    let has_object = OBJECTS.iter().any(|o| lower.contains(o));
+
+    // The creation verb must appear as a leading/standalone word, not buried in a
+    // longer token. `compose` anchors on its own (inherently musical); the broader
+    // verbs need a music object noun present so non-music "make/write/generate"
+    // requests are excluded.
+    let has_word = |w: &str| {
+        lower == w
+            || lower.starts_with(&format!("{w} "))
+            || lower.contains(&format!(" {w} "))
+    };
+
+    let compose_verb = has_word("compose");
+    let broad_verb = ["make", "write", "generate", "produce"]
+        .iter()
+        .any(|v| has_word(v));
+    // "play me a tune" / "play me a beat" is a creation-ish ask ONLY with an object;
+    // a bare "play some jazz" (no object noun, no creation verb) must NOT match.
+    let play_me = lower.contains("play me");
+
+    let is_music = compose_verb || ((broad_verb || play_me) && has_object);
+    if !is_music {
+        return None;
+    }
+
+    Some(extract_music_prompt(lower))
+}
+
+/// Strip the creation verb / object / leading filler from a matched music
+/// utterance and unwrap an "about/of" tail, yielding the song PROMPT. A bare
+/// request with nothing left to describe falls back to a generic prompt so the
+/// op always has a non-empty thing to compose. Pure helper for
+/// [`classify_music_intent`].
+fn extract_music_prompt(lower: &str) -> String {
+    let mut s = lower.to_string();
+
+    // Drop a leading polite/address preamble so "jarvis, compose ..." reduces to
+    // the request before we strip the verb.
+    for prefix in ["jarvis", "hey jarvis", "ok jarvis", "please"] {
+        let p = format!("{prefix},");
+        if let Some(rest) = s.strip_prefix(&p) {
+            s = rest.trim().to_string();
+        }
+        if let Some(rest) = s.strip_prefix(&format!("{prefix} ")) {
+            s = rest.trim().to_string();
+        }
+    }
+
+    // Strip the leading creation verb (+ a "me" indirect object).
+    for verb in ["compose", "make", "write", "generate", "produce", "play"] {
+        for lead in [format!("{verb} me "), format!("{verb} ")] {
+            if let Some(rest) = s.strip_prefix(&lead) {
+                s = rest.trim().to_string();
+                break;
+            }
+        }
+    }
+
+    // Drop a leading article.
+    for art in ["a ", "an ", "the ", "some "] {
+        if let Some(rest) = s.strip_prefix(art) {
+            s = rest.trim().to_string();
+            break;
+        }
+    }
+
+    // Strip a leading music object noun (+ trailing article), so
+    // "song about the rain" -> "about the rain".
+    const OBJECTS: &[&str] = &["song", "track", "tune", "beat", "jingle", "melody", "riff"];
+    for obj in OBJECTS {
+        for lead in [format!("{obj} "), obj.to_string()] {
+            if s == *obj {
+                s = String::new();
+                break;
+            }
+            if let Some(rest) = s.strip_prefix(&lead) {
+                s = rest.trim().to_string();
+                break;
+            }
+        }
+    }
+
+    // Unwrap an "about/of" tail: "... about the rain" -> "the rain".
+    for joiner in ["about ", "of ", "for ", "that goes "] {
+        if let Some(idx) = s.find(joiner) {
+            s = s[idx + joiner.len()..].trim().to_string();
+            break;
+        }
+    }
+
+    let s = s.trim().trim_end_matches(['.', '!', '?']).trim();
+    if s.is_empty() {
+        // A bare "compose a song" — nothing described; give the op a usable prompt
+        // rather than an empty one.
+        "a short, pleasant instrumental piece".to_string()
+    } else {
+        s.to_string()
     }
 }
 
@@ -7579,6 +7753,57 @@ mod tests {
         let out = crate::report::dispatch(&mem, ns, intent, &on).await.unwrap();
         assert_eq!(out.verb, "report_empty", "no saved cited run -> honest empty");
         assert!(out.markdown.to_lowercase().contains("no sources to report on"), "{}", out.markdown);
+    }
+
+    #[test]
+    fn classify_music_intent_extracts_the_prompt_on_creation_requests() {
+        use super::classify_music_intent as c;
+        // The flagship: "compose" anchors alone (no "song" noun). The verb +
+        // leading article are stripped, leaving the cleaned prompt.
+        assert_eq!(
+            c("JARVIS, compose an 8-bit happy birthday").as_deref(),
+            Some("8-bit happy birthday")
+        );
+        assert_eq!(c("compose an 8-bit happy birthday").as_deref(), Some("8-bit happy birthday"));
+        // "about/of" tails unwrap to the descriptor.
+        assert_eq!(c("compose a song about the rain").as_deref(), Some("the rain"));
+        assert_eq!(c("write me a tune about my dog").as_deref(), Some("my dog"));
+        assert_eq!(c("generate a beat of pure 90s house").as_deref(), Some("pure 90s house"));
+        // Broad verbs WITH a music object noun match.
+        assert!(c("make me a jingle for my coffee shop").is_some());
+        assert_eq!(c("make me a jingle for my coffee shop").as_deref(), Some("my coffee shop"));
+        assert!(c("produce a melody that goes da da dum").is_some());
+        // "play me a <object>" is a creation ask.
+        assert!(c("play me a track in the style of lo-fi").is_some());
+        // A bare creation request with nothing described falls back to a non-empty
+        // generic prompt (never an empty string the op can't compose).
+        let bare = c("compose a song").expect("bare compose still matches");
+        assert!(!bare.is_empty(), "bare compose must yield a non-empty prompt");
+    }
+
+    #[test]
+    fn classify_music_intent_rejects_non_music_speech() {
+        use super::classify_music_intent as c;
+        // No creation verb -> not music (the critical anti-over-trigger case).
+        assert!(c("play some jazz").is_none());
+        assert!(c("play the latest taylor swift").is_none());
+        assert!(c("turn up the music").is_none());
+        assert!(c("what's the time").is_none());
+        assert!(c("what's the cpu usage").is_none());
+        assert!(c("how's the weather today").is_none());
+        // Broad creation verbs WITHOUT a music object are NOT music.
+        assert!(c("make me a sandwich").is_none());
+        assert!(c("write me an email to my boss").is_none());
+        assert!(c("generate a report on the JWST").is_none());
+        assert!(c("produce the quarterly numbers").is_none());
+        // "play me ..." without a music object noun is not music.
+        assert!(c("play me the news").is_none());
+        // Casual mention of a song without a creation verb is not music.
+        assert!(c("i love that song").is_none());
+        assert!(c("what song is this").is_none());
+        // Empty / whitespace.
+        assert!(c("").is_none());
+        assert!(c("   ").is_none());
     }
 
     #[test]

@@ -86,6 +86,18 @@ enum PlayCmd {
     /// it. Queued clips from sessions created so far are already marked stale via
     /// DISCARD_BELOW (see [`cancel_all`]), so they are discarded, not played.
     Stop,
+    /// MUSIC (compose_music): play one whole WAV (bytes) to completion on a
+    /// SEPARATE, persistent music sink — NOT the per-reply speech sink. A new
+    /// track replaces the previous one (the music sink is stopped + rebuilt), so
+    /// only one composed track sounds at a time. Fire-and-forget: there is no ack
+    /// (the caller never blocks), and a decode/device failure is logged silently.
+    /// Because it rides its own sink, a 30 s–10 min track never enters the speech
+    /// Session's generation/drain machinery, never mutes the mic, and never
+    /// hijacks the speaking turn.
+    MusicPlay { bytes: Vec<u8> },
+    /// Stop any composed track NOW (a fresh track, a panic, or a lockdown). No
+    /// drain, no ack — the music sink is dropped if present.
+    MusicStop,
 }
 
 static PLAYBACK: OnceLock<Option<mpsc::UnboundedSender<PlayCmd>>> = OnceLock::new();
@@ -126,10 +138,69 @@ pub fn cancel_all() {
     }
 }
 
+/// FIRE-AND-FORGET music playback (compose_music): play one composed WAV to
+/// completion on a SEPARATE, persistent music sink on the dedicated playback
+/// thread — never the per-reply speech `Session`. Returns IMMEDIATELY (it only
+/// queues a `MusicPlay`); the caller never blocks, so a 30 s–10 min track plays
+/// in the background while the command/HUD reply is the immediate ack. Because
+/// the track rides its own sink — not the speech sink — it never enters the
+/// speech Session's generation/drain machinery, never mutes the mic, and never
+/// hijacks the speaking turn. A new track REPLACES the previous one (the music
+/// sink is stopped + rebuilt on the thread). Any failure (no device, undecodable
+/// WAV) is handled silently on the thread so a playback hiccup never crashes a
+/// turn. No-ops silently if the playback thread could not be spawned.
+pub fn play_track(bytes: Vec<u8>) {
+    if let Some(tx) = sender() {
+        let _ = tx.send(PlayCmd::MusicPlay { bytes });
+    }
+}
+
+/// FIRE-AND-FORGET music playback from a generated WAV file on disk (the
+/// `trigger_compose_music` output path). Reads the file, then hands the bytes to
+/// [`play_track`]. Returns IMMEDIATELY; the only blocking work is the small WAV
+/// read (composed tracks are local files just written by the inference server).
+/// An unreadable/empty path is a silent no-op (logged) — a playback failure must
+/// never crash the turn that produced the track.
+pub fn play_track_path(path: &std::path::Path) {
+    match resolve_track_bytes(path) {
+        Ok(bytes) => play_track(bytes),
+        Err(e) => warn!(error = %e, path = %path.display(), "music: could not read composed track"),
+    }
+}
+
+/// Read a composed track's bytes from disk. Split out (pure, no audio device) so
+/// the path-resolution half of [`play_track_path`] is unit-testable; the live
+/// rodio decode/playback is device-gated and exercised only at runtime.
+fn resolve_track_bytes(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    let bytes = std::fs::read(path)?;
+    if bytes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "composed track file is empty",
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Stop any composed track NOW, leaving the speech path untouched. Wired into
+/// the emergency-stop path (panic / lockdown) and called before a replacement
+/// track. Safe to call when nothing is playing. Callable from any thread.
+pub fn stop_track() {
+    if let Some(tx) = sender() {
+        let _ = tx.send(PlayCmd::MusicStop);
+    }
+}
+
 /// The playback thread: owns the !Send OutputStream and the per-reply Sink.
 fn run(mut rx: mpsc::UnboundedReceiver<PlayCmd>) {
     let mut output: Option<(OutputStream, OutputStreamHandle)> = None;
     let mut sink: Option<Sink> = None;
+    // The composed-music sink: entirely separate from the per-reply speech `sink`
+    // above, so a long track plays alongside (never inside) the speaking turn. It
+    // shares the one OutputStream (the expensive resource), but its own Sink means
+    // a track is stopped/replaced without touching speech playback. It is detached
+    // (`play()` + `detach()` below) so the thread never blocks draining it.
+    let mut music: Option<Sink> = None;
     // The channel sender lives in a static, so this loop runs until exit.
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
@@ -172,6 +243,65 @@ fn run(mut rx: mpsc::UnboundedReceiver<PlayCmd>) {
                     s.stop();
                 }
             }
+            PlayCmd::MusicPlay { bytes } => {
+                // Replace any track in flight, then play the new one to completion
+                // on its own sink. Errors are logged + swallowed (a music hiccup
+                // never crashes a turn). This NEVER touches the speech `sink`.
+                if let Some(prev) = music.take() {
+                    prev.stop();
+                }
+                music = start_music(&mut output, bytes);
+            }
+            PlayCmd::MusicStop => {
+                // Panic / lockdown / pre-replace: cut the composed track now.
+                if let Some(m) = music.take() {
+                    m.stop();
+                }
+            }
+        }
+    }
+}
+
+/// Build a fresh music sink and queue the whole composed WAV on it. Returns the
+/// detached sink (so the thread keeps a STOP handle without ever blocking to
+/// drain it), or None after logging on any device/decode failure. Reuses the one
+/// shared OutputStream — only a second Sink is created.
+fn start_music(
+    output: &mut Option<(OutputStream, OutputStreamHandle)>,
+    bytes: Vec<u8>,
+) -> Option<Sink> {
+    if output.is_none() {
+        match OutputStream::try_default() {
+            Ok(pair) => *output = Some(pair),
+            Err(e) => {
+                warn!(error = %e, "rodio: no default output device for music");
+                return None;
+            }
+        }
+    }
+    let handle = &output.as_ref().expect("output set above").1;
+    let sink = match Sink::try_new(handle) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "rodio: failed to create music sink");
+            // The stream may be dead (device changed); drop it so the next use
+            // rebuilds from scratch.
+            *output = None;
+            return None;
+        }
+    };
+    match Decoder::new(Cursor::new(bytes)) {
+        Ok(source) => {
+            sink.append(source);
+            // Detach: the sink plays to completion on the audio thread without the
+            // playback thread blocking on it, yet we keep the handle so a panic /
+            // lockdown / replacement can stop it.
+            sink.play();
+            Some(sink)
+        }
+        Err(e) => {
+            warn!(error = %e, "rodio: failed to decode composed-music wav");
+            None
         }
     }
 }
@@ -497,6 +627,46 @@ mod tests {
             !super::is_stale(next.generation),
             "the fresh post-barge reply must NOT be marked stale"
         );
+    }
+
+    /// WAV-path resolution for the music path (the pure half of play_track_path):
+    /// a real file's bytes are read; a missing path and an empty file are honest
+    /// errors. The live rodio decode + playback that follows is DEVICE-GATED and
+    /// exercised only at runtime (no audio device is opened here).
+    #[test]
+    fn resolve_track_bytes_reads_a_real_file_and_rejects_bad_paths() {
+        use std::io::Write;
+        // A real, non-empty file resolves to its exact bytes.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("jarvis-music-test-{}.wav", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            f.write_all(b"RIFFxxxxWAVE").unwrap();
+        }
+        let bytes = super::resolve_track_bytes(&path).expect("a real file resolves");
+        assert_eq!(bytes, b"RIFFxxxxWAVE");
+
+        // An empty file is an honest error (nothing to play), not empty bytes.
+        let empty = dir.join(format!("jarvis-music-empty-{}.wav", std::process::id()));
+        std::fs::File::create(&empty).unwrap();
+        assert!(super::resolve_track_bytes(&empty).is_err(), "empty file -> error");
+
+        // A missing path is an honest error.
+        let missing = dir.join("jarvis-music-does-not-exist-zzz.wav");
+        assert!(super::resolve_track_bytes(&missing).is_err(), "missing path -> error");
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&empty);
+    }
+
+    /// The music stop path is wired and callable from any thread without an audio
+    /// device — it only queues a MusicStop (or no-ops if the thread is unspawned).
+    /// This guards the panic/lockdown stop wiring without opening a device.
+    #[test]
+    fn stop_track_is_callable_without_a_device() {
+        // Must not panic; whether the thread exists or not, this is a safe no-op /
+        // enqueue. (No assertion on audio — there is no device in CI.)
+        super::stop_track();
     }
 
     /// Pure math — no audio device, no playback thread.
