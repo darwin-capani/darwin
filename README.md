@@ -44,6 +44,24 @@ cd jarvis
 
 **Requirements:** Apple Silicon Mac (M1 or later), macOS, Homebrew Python 3.11 (`/opt/homebrew/bin/python3.11` — MLX has no wheels for 3.14), a Rust toolchain (`rustup`), and Node 20+ for the HUD. The 4B default model wants **≥ 16 GB unified memory** (8 GB works but is tight). Cloud fallback and premium voice need an `ANTHROPIC_API_KEY` (and optionally an ElevenLabs key) — entered once in the HUD and stored in the macOS Keychain, never on disk.
 
+### Enable image generation (optional — FLUX is a gated model)
+
+Image generation uses [`black-forest-labs/FLUX.1-schnell`](https://huggingface.co/black-forest-labs/FLUX.1-schnell), a **gated** Hugging Face model — it cannot download anonymously, so the installer **skips it with a warning** and image generation stays **inert** until you authorize it. **Everything else installs and runs normally;** only image generation needs this.
+
+To enable it:
+
+1. Accept the licence (free, one click) at <https://huggingface.co/black-forest-labs/FLUX.1-schnell>.
+2. Authenticate with Hugging Face — either log in with a token, or export one before re-running:
+   ```bash
+   "$HOME/Library/Application Support/JARVIS/.venv/bin/hf" auth login   # paste an HF token
+   # …or:
+   export HF_TOKEN=hf_xxxxxxxx
+   ```
+3. Re-run the installer — it resumes from cache and pulls FLUX with your token:
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/darwin-capani/jarvis/main/install.sh | bash -s -- -y
+   ```
+
 ### Uninstall — one command, two confirmations
 
 ```bash

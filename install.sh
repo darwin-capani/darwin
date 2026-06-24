@@ -559,7 +559,18 @@ print_next_steps_directives() {
         "or store them in the macOS Keychain. Local inference works fully offline" \
         "with no key at all; enabling a gate != active without the key."
 
-    ui_panel "4" "VOICE WAKE WORD  +  GATES THAT STAY ENFORCED" \
+    ui_panel "4" "IMAGE GENERATION  (FLUX — gated model)" \
+        "Image generation uses ${UI_BRIGHT}FLUX.1-schnell${UI_RESET}, a ${UI_BRIGHT}GATED${UI_RESET} Hugging Face model" \
+        "that cannot download anonymously — so it stays ${UI_BRIGHT}inert${UI_RESET} until you authorize it." \
+        "To enable image generation:" \
+        "  1. accept the licence (free) at" \
+        "     ${UI_ICE}https://huggingface.co/black-forest-labs/FLUX.1-schnell${UI_RESET}" \
+        "  2. authenticate:  ${UI_CYAN}\"$JARVIS_HOME/.venv/bin/hf\" auth login${UI_RESET}" \
+        "     (or  ${UI_CYAN}export HF_TOKEN=hf_...${UI_RESET}  before re-running)" \
+        "  3. re-run the installer — it resumes from cache and pulls FLUX with your token." \
+        "Everything else works without this; only image generation needs it."
+
+    ui_panel "5" "VOICE WAKE WORD  +  GATES THAT STAY ENFORCED" \
         "Say \"${UI_BRIGHT}JARVIS${UI_RESET}\" to wake it once the daemon is up." \
         "The installer ships the ${UI_BRIGHT}master switch ON${UI_RESET} (consequential actions ARMED)," \
         "but every consequential action STILL requires a ${UI_BRIGHT}fresh per-action confirm${UI_RESET} +" \
@@ -568,12 +579,12 @@ print_next_steps_directives() {
         "PROPOSE-ONLY${UI_RESET} (drafts a validated patch you apply via scripts/apply_heal.sh," \
         "and inert until ANTHROPIC_API_KEY is set). Lockdown/panic forces everything off."
 
-    ui_panel "5" "BOOT-TO-JARVIS" \
+    ui_panel "6" "BOOT-TO-JARVIS" \
         "For a deployment Mac, enable auto-login so the gui-domain agents start at" \
         "power-on (see ${UI_ICE}scripts/install_boot.sh${UI_RESET} checklist)." \
         "${UI_YELLOW}Do not install these agents on a dev machine.${UI_RESET}"
 
-    ui_panel "6" "REMOVE JARVIS COMPLETELY" \
+    ui_panel "7" "REMOVE JARVIS COMPLETELY" \
         "Run" \
         "  ${UI_CYAN}\"$JARVIS_HOME/uninstall.sh\"${UI_RESET}" \
         "(two typed confirmations; --dry-run to preview)."
