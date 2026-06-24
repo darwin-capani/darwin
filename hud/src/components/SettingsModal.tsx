@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Frame from "./Frame";
 import SystemSettingsPanel from "./SystemSettingsPanel";
+import SystemAccessPanel from "./SystemAccessPanel";
 import {
   BEARER_CREDENTIALS,
   Credential,
@@ -183,7 +184,7 @@ export default function SettingsModal({
   /** Which tab to open on. Defaults to "credentials" (today's behavior). The
    *  onboarding wizard routes to a specific tab by passing this — it never adds
    *  a new surface, it just deep-opens an existing one. */
-  initialTab?: "credentials" | "system";
+  initialTab?: "credentials" | "system" | "access";
   /** Re-open the first-run onboarding tour (a deliberate user action). Optional
    *  so the existing tests render without it; when absent the control is hidden. */
   onReopenOnboarding?: () => void;
@@ -193,7 +194,7 @@ export default function SettingsModal({
   // Which top-level Settings surface is showing. "credentials" is the existing
   // keys/gates/policy view; "system" is the dedicated SYSTEM SETTINGS panel that
   // edits config/jarvis.toml (batched, applied on a daemon restart).
-  const [tab, setTab] = useState<"credentials" | "system">(initialTab);
+  const [tab, setTab] = useState<"credentials" | "system" | "access">(initialTab);
   // The configured MCP servers that declare a token (mcp.status carries only the
   // usesToken bool — never a secret), so a server's token can be stored under its
   // mcp_<server>_token Keychain account through the SAME guarded path.
@@ -211,7 +212,13 @@ export default function SettingsModal({
     <div className="modal-backdrop" onClick={onClose}>
       <div className="modal settings-modal" onClick={(e) => e.stopPropagation()}>
         <Frame
-          title={tab === "system" ? "SETTINGS // SYSTEM CONFIG" : "SETTINGS // CREDENTIALS"}
+          title={
+            tab === "system"
+              ? "SETTINGS // SYSTEM CONFIG"
+              : tab === "access"
+                ? "SETTINGS // SYSTEM ACCESS"
+                : "SETTINGS // CREDENTIALS"
+          }
           tag="com.jarvis.daemon"
         >
           <div className="settings-tabs" role="tablist" aria-label="Settings sections">
@@ -233,11 +240,29 @@ export default function SettingsModal({
             >
               System Settings
             </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "access"}
+              className={`settings-tab${tab === "access" ? " active" : ""}`}
+              onClick={() => setTab("access")}
+            >
+              System Access
+            </button>
           </div>
 
           {tab === "system" ? (
             <div className="body" role="tabpanel" aria-label="System Settings">
               <SystemSettingsPanel voiceId={voiceId} />
+              <div className="field-row" style={{ justifyContent: "flex-end" }}>
+                <button className="icon-btn" onClick={onClose}>
+                  Close
+                </button>
+              </div>
+            </div>
+          ) : tab === "access" ? (
+            <div className="body" role="tabpanel" aria-label="System Access">
+              <SystemAccessPanel />
               <div className="field-row" style={{ justifyContent: "flex-end" }}>
                 <button className="icon-btn" onClick={onClose}>
                   Close

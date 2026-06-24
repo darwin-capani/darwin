@@ -592,3 +592,63 @@ export function bindFullscreenKey(): () => void {
   window.addEventListener("keydown", onKey);
   return () => window.removeEventListener("keydown", onKey);
 }
+
+/* ---------------------------------------------------- SYSTEM ACCESS (macOS TCC) */
+
+/** Outcome of opening a macOS System Settings privacy pane. `opened` is true
+ *  only when System Settings was actually launched; `detail` is a short, honest
+ *  human line (never a faked "granted"). */
+export interface PaneOpenResult {
+  opened: boolean;
+  label: string;
+  detail: string;
+}
+
+/**
+ * Open ONE macOS Privacy pane by an allowlisted KEY (from core/permissions.ts).
+ * The backend maps the key to a fixed System Settings anchor and opens it — the
+ * frontend never passes a URL, so an arbitrary URL can never be opened. Degrades
+ * honestly in the browser (no shell to open System Settings).
+ */
+export async function openPrivacyPane(pane: string): Promise<PaneOpenResult> {
+  if (!inTauri()) {
+    return {
+      opened: false,
+      label: pane,
+      detail: "Opening System Settings needs the JARVIS desktop app.",
+    };
+  }
+  try {
+    return await invoke<PaneOpenResult>("open_privacy_pane", { pane });
+  } catch (e) {
+    return {
+      opened: false,
+      label: pane,
+      detail: typeof e === "string" ? e : "could not open System Settings",
+    };
+  }
+}
+
+/**
+ * The "re-request all permissions" action: opens System Settings → Privacy &
+ * Security (every category listed). Takes no argument, so there is no injection
+ * surface at all. Honest browser fallback.
+ */
+export async function requestAllPermissions(): Promise<PaneOpenResult> {
+  if (!inTauri()) {
+    return {
+      opened: false,
+      label: "Privacy & Security",
+      detail: "Opening System Settings needs the JARVIS desktop app.",
+    };
+  }
+  try {
+    return await invoke<PaneOpenResult>("request_all_permissions", {});
+  } catch (e) {
+    return {
+      opened: false,
+      label: "Privacy & Security",
+      detail: typeof e === "string" ? e : "could not open System Settings",
+    };
+  }
+}
