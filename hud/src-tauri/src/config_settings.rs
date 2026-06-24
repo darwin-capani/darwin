@@ -157,6 +157,11 @@ pub const SETTINGS: &[Setting] = &[
     Setting { section: "voice", key: "cloud_music", kind: Kind::Bool },
     Setting { section: "voice", key: "stream_tts", kind: Kind::Bool },
     Setting { section: "voice", key: "event_cues", kind: Kind::Bool },
+    // WHO opens the mic: "device" = the daemon opens it via cpal (default,
+    // unchanged); "app" = the JARVIS HUD app captures the mic (clean "JARVIS"
+    // prompt) and streams the audio to the daemon. Switch to "app" to grant the
+    // mic through a real prompt, then restart the daemon.
+    Setting { section: "voice", key: "mic_source", kind: Kind::Enum(&["device", "app"]) },
     Setting { section: "voice", key: "pronunciation_dictionary_id", kind: Kind::Str },
     Setting { section: "voice", key: "pronunciation_dictionary_version", kind: Kind::Str },
     Setting { section: "speech", key: "engine", kind: Kind::Enum(&["kokoro", "csm", "orpheus"]) },

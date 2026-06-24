@@ -428,6 +428,20 @@ export const CATALOG: CatalogEntry[] = [
       "Requires cloud_sfx + an EL key (rides the same gate); without that it is a silent no-op. Delivery only — never a gate.",
   },
   {
+    id: "voice.mic_source",
+    group: "Voice & Speech",
+    label: "Microphone owner",
+    control: "select",
+    optionLabels: {
+      device: "Background service (default)",
+      app: "JARVIS app — clean prompt",
+    },
+    hint:
+      "WHO opens the microphone. \"Background service\" (default) keeps today's behavior — the daemon opens the mic itself. " +
+      "\"JARVIS app\" makes the app capture the mic, so macOS shows a clean \"JARVIS\" permission prompt, and the app streams the audio to the service over a local socket. " +
+      "After switching to \"JARVIS app\", RESTART the daemon; the app then asks for the microphone the next time it launches.",
+  },
+  {
     id: "voice.pronunciation_dictionary_id",
     group: "Voice & Speech",
     label: "Pronunciation dictionary id",

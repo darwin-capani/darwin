@@ -15,6 +15,7 @@ mod command;
 mod config_settings;
 mod credentials;
 mod heal;
+mod mic_stream;
 mod permissions;
 mod setup;
 mod tcc;
@@ -874,6 +875,25 @@ pub fn run() {
         // Explicit, idempotent takeover state shared by the enter/exit commands
         // and the reset-on-exit safety net. Ships INACTIVE (Default).
         .manage(Takeover::default())
+        // In-process microphone capture state (mic_stream.rs). Ships idle; the
+        // start_mic_stream command (and the setup auto-start below) only opens
+        // the mic AFTER a successful connect to the daemon's app-audio socket,
+        // so this no-ops cleanly when the daemon isn't in app-mode.
+        .manage(mic_stream::MicState::default())
+        // AUTO-START the mic→daemon stream once on launch. It is a clean no-op
+        // when the daemon isn't listening on its app-audio socket (the connect
+        // fails before the mic is ever opened, so no prompt fires), so this is
+        // safe to fire unconditionally. Run it off the main thread so a slow
+        // socket connect / device query never blocks app startup.
+        .setup(|app| {
+            let handle = app.handle().clone();
+            std::thread::spawn(move || {
+                use tauri::Manager;
+                let state = handle.state::<mic_stream::MicState>();
+                let _ = mic_stream::start_mic_stream(state);
+            });
+            Ok(())
+        })
         // RESET-ON-EXIT safety net (window side): when the main window is
         // destroyed, restore the default macOS presentation options so a window
         // close can never leave the Dock/menu bar hidden.
@@ -901,6 +921,8 @@ pub fn run() {
             command::design_voice,
             command::create_pronunciation,
             command::compose_music,
+            mic_stream::start_mic_stream,
+            mic_stream::stop_mic_stream,
             config_settings::config_get,
             config_settings::config_set,
             config_settings::daemon_restart,

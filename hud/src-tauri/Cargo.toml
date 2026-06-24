@@ -30,6 +30,12 @@ security-framework = "3"
 # Async fs + child-process for the gated self-heal apply command (heal.rs).
 # Tauri already pulls tokio in transitively; we declare it to `use` it directly.
 tokio = { version = "1", features = ["process", "fs", "io-util"] }
+# IN-PROCESS microphone capture (mic_stream.rs). Capturing the mic in THIS app
+# bundle (which carries NSMicrophoneUsageDescription + the audio-input
+# entitlement) makes macOS show a clean "JARVIS" mic prompt; the raw f32 PCM is
+# then streamed over a Unix socket to the daemon's app-audio ingest. Same 0.15
+# line the daemon already depends on — no new crate version.
+cpal = "0.15"
 # Pin: time 0.3.48 adds impls that conflict (E0119) with blanket `From` impls
 # in cookie 0.18.1 and tauri-utils 2.9.2. Drop this once those crates ship fixes.
 time = "=0.3.47"

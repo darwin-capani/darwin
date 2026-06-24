@@ -355,7 +355,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // on key system events (confirm -> "success", deny -> "notify"), riding the same
     // cloud_sfx gate (no key => silent no-op); it never affects the action's outcome
     // or timing. Listed so it never reads as a typo.
-    ("voice", &["cloud_tier", "cloud_stt", "model", "voices", "adaptive_prosody", "whisper", "whisper_auto", "diarize", "cloud_sfx", "cloud_music", "stream_tts", "pronunciation_dictionary_id", "pronunciation_dictionary_version", "event_cues"]),
+    ("voice", &["cloud_tier", "cloud_stt", "model", "voices", "adaptive_prosody", "whisper", "whisper_auto", "diarize", "cloud_sfx", "cloud_music", "stream_tts", "pronunciation_dictionary_id", "pronunciation_dictionary_version", "event_cues", "mic_source"]),
     // [wake] — CUSTOM WAKE-WORD (#32, wake.rs). `enabled` SHIPS ON (full-power
     // default): since `phrase` defaults to "jarvis", behavior is identical to today
     // unless the phrase is changed. The always-listening loop that consults the
@@ -891,6 +891,14 @@ impl Default for SpeechConfig {
 ///     so turning the tier on with no mapping still works (every agent just keeps
 ///     its on-device voice until the operator maps it). VOICE-ONLY: this is a TTS
 ///     voice layer; JARVIS owns its own brain/router/turn-taking.
+///   - `mic_source` (default "device"): where capture frames come FROM. "device"
+///     (the default) is today's cpal path, byte-for-byte unchanged. "app" routes
+///     the mic IN over a confined Unix socket (`state/ipc/audio_in.sock`, 0700 dir
+///     / 0600 socket) from the HUD: the daemon reads a token-authenticated
+///     handshake (the SAME per-boot command token, `apps::verify_command_token`),
+///     then ingests length-prefixed f32 frames into the SAME VAD/barge/lockdown/
+///     meter pipeline — only the SOURCE of frames changes. Any other value is
+///     treated as "device".
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct VoiceConfig {
@@ -988,6 +996,18 @@ pub struct VoiceConfig {
     /// non-Local tier); without that it is a silent no-op. Default off => ZERO
     /// behavior change.
     pub event_cues: bool,
+    /// MICROPHONE SOURCE. DEFAULT "device" (today's behavior, byte-for-byte): the
+    /// daemon opens the local input device with cpal and captures it. Set "app" to
+    /// route microphone audio IN over a confined Unix socket from the HUD app
+    /// instead of the daemon opening the mic itself — the daemon binds
+    /// `state/ipc/audio_in.sock` (0700 dir, 0600 socket), reads a token-authenticated
+    /// handshake (the SAME per-boot command token, verified with
+    /// `apps::verify_command_token`), then ingests length-prefixed f32 frames into
+    /// the SAME capture-processing pipeline (VAD / barge / lockdown / meter all
+    /// identical — only the SOURCE of frames changes). Any value other than "app"
+    /// is treated as "device" (the safe default). The socket path is local-only and
+    /// token-gated; an invalid token closes the connection with no audio ingested.
+    pub mic_source: String,
 }
 
 impl Default for VoiceConfig {
@@ -1059,6 +1079,12 @@ impl Default for VoiceConfig {
             // that rides the cloud_sfx gate (no key => silent no-op) and can never
             // affect the action's outcome or timing.
             event_cues: false,
+            // DEFAULT "device" (today's behavior, byte-for-byte): the daemon opens
+            // the local input device with cpal. "app" instead routes the mic in over
+            // state/ipc/audio_in.sock from the HUD (token-authenticated handshake +
+            // length-prefixed f32 frames into the SAME capture pipeline). Any other
+            // value is treated as "device" (the safe default).
+            mic_source: "device".to_string(),
         }
     }
 }
@@ -4061,6 +4087,10 @@ mod tests {
         );
         assert_eq!(cfg.voice.model, "eleven_flash_v2_5", "default EL model");
         assert!(cfg.voice.voices.is_empty(), "no per-agent EL voice mapped by default");
+        assert_eq!(
+            cfg.voice.mic_source, "device",
+            "mic_source DEFAULTS to \"device\" (today's cpal capture, byte-for-byte) — \"app\" is opt-in"
+        );
 
         // All keys parse as known and round-trip (including the [voice.voices] map).
         let raw = r#"
@@ -4072,6 +4102,7 @@ mod tests {
             cloud_music = false
             stream_tts = true
             event_cues = true
+            mic_source = "app"
             pronunciation_dictionary_id = "EL_PD_ID"
             pronunciation_dictionary_version = "EL_PD_VER"
             model = "eleven_multilingual_v2"
@@ -4089,6 +4120,7 @@ mod tests {
         assert!(!cfg.voice.cloud_music, "cloud_music must round-trip as a known key (operator can turn the music-generation tier off)");
         assert!(cfg.voice.stream_tts, "stream_tts must round-trip as a known key (operator can opt in to streaming TTS)");
         assert!(cfg.voice.event_cues, "event_cues must round-trip as a known key (operator can opt in to event cues)");
+        assert_eq!(cfg.voice.mic_source, "app", "mic_source must round-trip as a known key (operator can route the mic in from the HUD app)");
         assert_eq!(
             cfg.voice.pronunciation_dictionary_id, "EL_PD_ID",
             "pronunciation_dictionary_id must round-trip as a known key"

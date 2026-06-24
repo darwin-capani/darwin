@@ -421,7 +421,7 @@ fn jarvis_root() -> Result<PathBuf, String> {
 /// the stack for the round-trip, and is NEVER logged, returned to JS, or put in
 /// any error string. A missing file means the daemon is not running (or has not
 /// finished its handoff) — a structured, secret-free error.
-fn read_token(root: &Path) -> Result<String, String> {
+pub(crate) fn read_token(root: &Path) -> Result<String, String> {
     let path = root.join("state").join("ipc").join("command.token");
     let token = std::fs::read_to_string(&path)
         .map_err(|_| "command channel unavailable (is jarvisd running?)".to_string())?;

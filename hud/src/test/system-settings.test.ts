@@ -105,6 +105,7 @@ const BACKEND_WHITELIST_IDS: string[] = [
   "voice.cloud_music",
   "voice.stream_tts",
   "voice.event_cues",
+  "voice.mic_source",
   "voice.pronunciation_dictionary_id",
   "voice.pronunciation_dictionary_version",
   "voice.adaptive_prosody",

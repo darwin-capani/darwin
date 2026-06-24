@@ -48,31 +48,71 @@ pub fn spawn_capture(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>
 }
 
 fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> Result<()> {
-    let host = cpal::default_host();
-    let device = host
-        .default_input_device()
-        .ok_or_else(|| anyhow!("no default input device"))?;
-    let supported = device
-        .default_input_config()
-        .context("querying default input config")?;
-    let sample_rate = supported.sample_rate().0;
-    let channels = supported.channels() as usize;
-    let stream_config: cpal::StreamConfig = supported.into();
-
-    // The cpal callback runs on a realtime audio thread and must not block or
-    // allocate heavily: ship raw frames over a std channel and do VAD + WAV
-    // writing here instead.
+    // The processing loop below reads `raw_rx` — a stream of interleaved-f32
+    // chunks — and is IDENTICAL regardless of where those chunks come from. Only
+    // the SOURCE branches on [voice].mic_source:
+    //
+    //   * "device" (the default): open the local input device with cpal and let
+    //     the realtime callback push frames into raw_tx — today's behavior,
+    //     byte-for-byte. The cpal Stream is !Send and must outlive the loop, so it
+    //     is held in `_cpal_stream` (a guard dropped only when the loop returns).
+    //   * "app": instead of opening the mic, bind+accept the audio_in.sock, verify
+    //     the token handshake, take (sample_rate, channels) from the header, and
+    //     spawn a reader thread that decodes length-prefixed f32 frames into the
+    //     SAME raw_tx. The cpal device is never touched.
+    //
+    // Either way we end up with the same (raw_rx, sample_rate, channels) and fall
+    // through to the UNCHANGED processing loop.
     let (raw_tx, raw_rx) = std_mpsc::channel::<Vec<f32>>();
-    let stream = device.build_input_stream(
-        &stream_config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            let _ = raw_tx.send(data.to_vec());
-        },
-        |err| warn!(error = %err, "cpal stream error"),
-        None,
-    )?;
-    stream.play().context("starting input stream")?;
-    info!(sample_rate, channels, "audio capture running");
+
+    // Kept alive for the whole loop: in device mode it's the cpal Stream guard; in
+    // app mode it stays None (the reader thread owns the socket). Dropping it stops
+    // the device.
+    let _cpal_stream: Option<cpal::Stream>;
+    let sample_rate: u32;
+    let channels: usize;
+
+    if mic_source_is_app(&cfg.voice.mic_source) {
+        // APP MODE: route the mic in over state/ipc/audio_in.sock from the HUD.
+        // The daemon binds the socket (0700 dir / 0600 socket), accepts ONE HUD
+        // connection, verifies the token in the JSON handshake line, and reads the
+        // (sample_rate, channels) the HUD declares. A reader thread then decodes
+        // length-prefixed f32 frames and pushes each Vec<f32> into raw_tx — the
+        // SAME channel the cpal callback feeds. A bind/handshake/token failure is
+        // logged and returns Err cleanly (the loop never panics or wedges).
+        let header = accept_app_audio(&root, raw_tx)?;
+        sample_rate = header.sample_rate;
+        channels = (header.channels as usize).max(1);
+        _cpal_stream = None;
+        info!(sample_rate, channels, "audio capture running (app source)");
+    } else {
+        // DEVICE MODE (default): today's cpal path, byte-for-byte unchanged.
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device"))?;
+        let supported = device
+            .default_input_config()
+            .context("querying default input config")?;
+        sample_rate = supported.sample_rate().0;
+        channels = supported.channels() as usize;
+        let stream_config: cpal::StreamConfig = supported.into();
+
+        // The cpal callback runs on a realtime audio thread and must not block or
+        // allocate heavily: ship raw frames over a std channel and do VAD + WAV
+        // writing here instead.
+        let stream = device.build_input_stream(
+            &stream_config,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                let _ = raw_tx.send(data.to_vec());
+            },
+            |err| warn!(error = %err, "cpal stream error"),
+            None,
+        )?;
+        stream.play().context("starting input stream")?;
+        info!(sample_rate, channels, "audio capture running");
+        _cpal_stream = Some(stream);
+    }
 
     let tmp_dir = root.join("state").join("tmp");
     let mut vad = Vad::new(&cfg, sample_rate);
@@ -281,6 +321,257 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
         }
     }
     Ok(())
+}
+
+// ===========================================================================
+// APP-MODE MIC INGEST — route the mic in over state/ipc/audio_in.sock.
+//
+// The HUD app captures the microphone and streams it to the daemon over a
+// confined, token-authenticated Unix socket, instead of the daemon opening the
+// device with cpal. The WIRE CONTRACT (both sides match byte-for-byte):
+//
+//   * Unix stream socket at  <root>/state/ipc/audio_in.sock  (the daemon binds
+//     it; the ipc dir is 0700, the socket 0600).
+//   * HANDSHAKE: the HUD sends EXACTLY ONE line of UTF-8 JSON terminated by '\n':
+//        {"token":"<command.token>","sample_rate":<u32>,"channels":<u16>}
+//     The daemon verifies `token` with `apps::verify_command_token` (the SAME
+//     per-boot HMAC capability token the command channel uses). An invalid token
+//     closes the connection with NO audio ingested.
+//   * FRAMES: after the handshake, the HUD streams repeated binary frames, each:
+//        [4 bytes: u32 little-endian = N, the number of f32 samples]
+//        [N * 4 bytes: the samples as f32 little-endian]
+//     The daemon decodes each into a Vec<f32> and pushes it down the SAME channel
+//     the cpal callback feeds. On EOF / read error the reader stops ingest.
+//
+// This runs on the capture thread (a plain std::thread, NOT a tokio task), so it
+// uses blocking std::os::unix::net sockets — no async runtime is involved.
+// ===========================================================================
+
+/// Hard cap on the JSON handshake line. The handshake is a tiny fixed object
+/// (token + two integers); anything larger is a probe or mistake and is rejected
+/// BEFORE parse so a hostile client can't feed the JSON parser an unbounded line.
+const MAX_HANDSHAKE_BYTES: usize = 8 * 1024;
+/// Hard cap on a single frame's sample count (the u32 length prefix). At 48 kHz
+/// stereo this is ~10 s of audio per frame — far above any real capture buffer —
+/// so a corrupt/hostile prefix can never make the daemon attempt a multi-gigabyte
+/// allocation. A frame above this closes the connection.
+const MAX_FRAME_SAMPLES: u32 = 1_000_000;
+
+/// The parsed, token-VERIFIED app-audio handshake header. Produced ONLY after
+/// `apps::verify_command_token` accepts the presented token, so reaching this
+/// struct already means the connection is authenticated.
+#[derive(Debug, Clone, Copy)]
+struct AppAudioHeader {
+    sample_rate: u32,
+    channels: u16,
+}
+
+/// The on-the-wire handshake line shape. We read only what we need; the token is
+/// verified (and never stored past the check / logged), the rate/channels are
+/// taken as the capture format.
+#[derive(serde::Deserialize)]
+struct AppAudioHandshake {
+    #[serde(default)]
+    token: String,
+    #[serde(default)]
+    sample_rate: u32,
+    #[serde(default)]
+    channels: u16,
+}
+
+/// The app-audio socket path: `<root>/state/ipc/audio_in.sock`, alongside the
+/// command socket (same confined 0700 ipc dir).
+fn audio_in_sock_path(root: &std::path::Path) -> PathBuf {
+    root.join("state").join("ipc").join("audio_in.sock")
+}
+
+/// Bind the app-audio socket: remove a stale one, create the 0700 parent dir,
+/// bind, chmod 0600. Mirrors the command channel's bind (defense-in-depth on top
+/// of the token gate).
+fn bind_audio_socket(path: &std::path::Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::remove_file(path) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %path.display(), error = %e, "could not remove stale audio_in socket");
+        }
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    Ok(listener)
+}
+
+/// Read + verify the handshake line from an accepted connection. Reads ONE
+/// '\n'-terminated line (bounded by [`MAX_HANDSHAKE_BYTES`]), parses it, and
+/// verifies the token with `apps::verify_command_token`. Returns the header ONLY
+/// on a valid token; an oversized/malformed line or a bad token is an `Err` (the
+/// caller closes the connection — no audio). The token value is never logged.
+fn read_app_handshake<R: std::io::BufRead>(reader: &mut R) -> Result<AppAudioHeader> {
+    use std::io::BufRead as _;
+    let mut line = Vec::new();
+    // Bounded read: take at most MAX_HANDSHAKE_BYTES+1 so an unterminated flood
+    // can't grow the buffer without bound, then require a terminating newline.
+    let n = std::io::Read::take(&mut *reader, MAX_HANDSHAKE_BYTES as u64 + 1)
+        .read_until(b'\n', &mut line)
+        .context("reading app-audio handshake")?;
+    if n == 0 {
+        return Err(anyhow!("app-audio connection closed before handshake"));
+    }
+    if line.len() > MAX_HANDSHAKE_BYTES {
+        return Err(anyhow!("app-audio handshake line oversized"));
+    }
+    let hs: AppAudioHandshake =
+        serde_json::from_slice(&line).context("parsing app-audio handshake JSON")?;
+    if !crate::apps::verify_command_token(&hs.token) {
+        // No token value is logged — only that verification failed.
+        return Err(anyhow!("app-audio handshake token failed verification"));
+    }
+    Ok(AppAudioHeader {
+        sample_rate: hs.sample_rate,
+        channels: hs.channels,
+    })
+}
+
+/// Bind the app-audio socket, accept ONE HUD connection, verify the handshake,
+/// and spawn a reader thread that decodes length-prefixed f32 frames into
+/// `raw_tx`. Returns the verified header (sample_rate/channels) so the caller can
+/// run the processing loop. A bind/handshake/token failure is an `Err` (logged by
+/// the caller) — the loop never panics or wedges.
+///
+/// The accept BLOCKS until the HUD connects (the capture thread has nothing to do
+/// until there is an audio source), mirroring how device mode blocks until cpal
+/// delivers the first frame.
+fn accept_app_audio(
+    root: &std::path::Path,
+    raw_tx: std_mpsc::Sender<Vec<f32>>,
+) -> Result<AppAudioHeader> {
+    let sock = audio_in_sock_path(root);
+    let listener = bind_audio_socket(&sock)
+        .with_context(|| format!("binding app-audio socket {}", sock.display()))?;
+    info!(path = %sock.display(), "app-audio ingest listening");
+
+    // Accept the HUD connection. We serve a single audio source at a time (one
+    // mic), so we take the first connection and read it to EOF.
+    let (stream, _peer) = listener.accept().context("accepting app-audio connection")?;
+    // Bound the HANDSHAKE: a same-user client that connects then stalls before
+    // sending its token must not pin the capture thread in read_until forever.
+    // Cleared right after the handshake so continuous frame reads block normally.
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let mut reader = std::io::BufReader::new(stream);
+    let header = read_app_handshake(&mut reader)?;
+    let _ = reader.get_ref().set_read_timeout(None);
+
+    // Reader thread: owns the connection + a clone-free move of raw_tx, decodes
+    // frames, pushes each Vec<f32> into the SAME channel the cpal callback feeds.
+    // Ends on EOF / read error / a frame over the cap (logged, then stops ingest).
+    std::thread::Builder::new()
+        .name("audio-app-ingest".to_string())
+        .spawn(move || {
+            if let Err(e) = read_app_frames(&mut reader, &raw_tx) {
+                info!(error = %e, "app-audio ingest ended");
+            }
+        })
+        .context("spawning app-audio reader thread")?;
+
+    Ok(header)
+}
+
+/// Read length-prefixed f32 frames from an authenticated connection until EOF /
+/// error, pushing each decoded `Vec<f32>` into `raw_tx`. Each frame is a 4-byte
+/// LE `u32` sample count `N` (bounded by [`MAX_FRAME_SAMPLES`]) followed by
+/// `N * 4` LE-f32 bytes. A clean EOF (the HUD closed) returns `Ok(())`; a partial
+/// frame / oversized prefix is an `Err`. Stops the moment the receiver is gone
+/// (the processing loop returned).
+fn read_app_frames<R: std::io::Read>(
+    reader: &mut R,
+    raw_tx: &std_mpsc::Sender<Vec<f32>>,
+) -> Result<()> {
+    loop {
+        let mut len_buf = [0u8; 4];
+        // A clean EOF exactly at a frame boundary is the normal end of stream.
+        match read_full_or_eof(reader, &mut len_buf)? {
+            ReadFrame::Eof => return Ok(()),
+            ReadFrame::Got => {}
+        }
+        let n = u32::from_le_bytes(len_buf);
+        if n > MAX_FRAME_SAMPLES {
+            return Err(anyhow!("app-audio frame sample count {n} exceeds cap"));
+        }
+        let mut payload = vec![0u8; n as usize * 4];
+        reader
+            .read_exact(&mut payload)
+            .context("reading app-audio frame payload")?;
+        let frame = decode_frame(&payload);
+        // The receiver is gone once the processing loop returns — stop cleanly.
+        if raw_tx.send(frame).is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// Outcome of an at-a-frame-boundary read: a clean EOF vs. a full buffer.
+enum ReadFrame {
+    Eof,
+    Got,
+}
+
+/// Fill `buf` fully, but report a CLEAN EOF (no bytes read at all) as
+/// [`ReadFrame::Eof`] rather than an error — that is the normal end of stream at
+/// a frame boundary. A partial read (some bytes then EOF) IS an error (a
+/// truncated length prefix).
+fn read_full_or_eof<R: std::io::Read>(reader: &mut R, buf: &mut [u8]) -> Result<ReadFrame> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..]) {
+            Ok(0) => {
+                if filled == 0 {
+                    return Ok(ReadFrame::Eof);
+                }
+                return Err(anyhow!("app-audio stream ended mid length-prefix"));
+            }
+            Ok(k) => filled += k,
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(anyhow::Error::new(e).context("reading app-audio length prefix")),
+        }
+    }
+    Ok(ReadFrame::Got)
+}
+
+/// Decode the PAYLOAD of one frame — `4 * k` little-endian bytes — into `k`
+/// `f32` samples. PURE: it folds little-endian byte quads into f32s. Trailing
+/// bytes that don't complete a 4-byte sample are dropped (a well-formed frame has
+/// exactly `4 * N` payload bytes, so this only guards a malformed tail). Inverse
+/// of [`encode_frame`] over the sample region.
+fn decode_frame(payload: &[u8]) -> Vec<f32> {
+    payload
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
+}
+
+/// Encode `samples` into a full length-prefixed frame: a 4-byte LE `u32` count
+/// followed by the samples as LE f32. Inverse of the wire read in
+/// [`read_app_frames`] (and of [`decode_frame`] over the payload). Used by the
+/// roundtrip unit tests; mirrors what the HUD writes.
+#[cfg(test)]
+fn encode_frame(samples: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + samples.len() * 4);
+    out.extend_from_slice(&(samples.len() as u32).to_le_bytes());
+    for &s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    out
+}
+
+/// True when the configured `[voice].mic_source` selects the APP socket ingest.
+/// Any value other than the exact "app" (including the default "device" and any
+/// typo) is the safe device default — the cpal path is never disabled by a
+/// mistyped value.
+fn mic_source_is_app(mic_source: &str) -> bool {
+    mic_source == "app"
 }
 
 fn write_wav(path: &std::path::Path, sample_rate: u32, samples: &[f32]) -> Result<()> {
@@ -913,5 +1204,123 @@ mod gate_tests {
             !mic_capture_suppressed(false),
             "unlocked (shipped default) => capture proceeds byte-for-byte today"
         );
+    }
+}
+
+#[cfg(test)]
+mod app_ingest_tests {
+    use super::{
+        decode_frame, encode_frame, mic_source_is_app, read_app_frames, read_full_or_eof,
+        ReadFrame, MAX_FRAME_SAMPLES,
+    };
+    use std::sync::mpsc as std_mpsc;
+
+    /// PURE roundtrip: encode samples into a length-prefixed frame, strip the
+    /// 4-byte prefix, and decode the payload back to the EXACT same f32s. This is
+    /// the wire-contract invariant the HUD relies on (LE u32 count + LE f32s).
+    #[test]
+    fn frame_payload_roundtrips_through_decode() {
+        let samples = vec![0.0f32, 1.0, -1.0, 0.5, -0.25, f32::MIN_POSITIVE, 123.456];
+        let frame = encode_frame(&samples);
+        // The prefix is the LE sample count.
+        let n = u32::from_le_bytes([frame[0], frame[1], frame[2], frame[3]]);
+        assert_eq!(n as usize, samples.len(), "prefix encodes the sample count");
+        assert_eq!(frame.len(), 4 + samples.len() * 4, "frame is prefix + 4 bytes/sample");
+        // The payload decodes back bit-for-bit.
+        let decoded = decode_frame(&frame[4..]);
+        assert_eq!(decoded, samples, "decode_frame inverts encode_frame's payload");
+    }
+
+    /// An empty frame (N = 0) is a valid frame: prefix only, empty payload.
+    #[test]
+    fn empty_frame_roundtrips() {
+        let frame = encode_frame(&[]);
+        assert_eq!(frame, vec![0u8, 0, 0, 0], "N=0 prefix, no payload");
+        assert!(decode_frame(&frame[4..]).is_empty());
+    }
+
+    /// decode_frame drops a malformed trailing partial sample (a guard — a
+    /// well-formed payload is always a multiple of 4 bytes).
+    #[test]
+    fn decode_drops_a_partial_trailing_sample() {
+        // 5 bytes = one full f32 (1.0) plus one stray byte.
+        let mut payload = 1.0f32.to_le_bytes().to_vec();
+        payload.push(0xAB);
+        let decoded = decode_frame(&payload);
+        assert_eq!(decoded, vec![1.0f32], "the stray trailing byte is dropped");
+    }
+
+    /// read_full_or_eof reports a CLEAN boundary EOF (no bytes) as Eof, a full
+    /// read as Got, and a PARTIAL read (truncated prefix) as an error.
+    #[test]
+    fn read_full_or_eof_distinguishes_clean_eof_from_truncation() {
+        // Clean EOF: empty reader, asking for 4 bytes.
+        let mut empty: &[u8] = &[];
+        let mut buf = [0u8; 4];
+        assert!(matches!(read_full_or_eof(&mut empty, &mut buf), Ok(ReadFrame::Eof)));
+
+        // Full read: exactly 4 bytes available.
+        let mut full: &[u8] = &[1, 2, 3, 4];
+        assert!(matches!(read_full_or_eof(&mut full, &mut buf), Ok(ReadFrame::Got)));
+        assert_eq!(buf, [1, 2, 3, 4]);
+
+        // Truncated: 2 bytes then EOF while a 4-byte prefix is expected => error.
+        let mut partial: &[u8] = &[9, 9];
+        assert!(read_full_or_eof(&mut partial, &mut buf).is_err());
+    }
+
+    /// read_app_frames decodes a back-to-back stream of frames into raw_tx and
+    /// returns Ok on a clean EOF at a frame boundary.
+    #[test]
+    fn read_app_frames_decodes_a_stream_to_eof() {
+        let f1 = vec![0.1f32, 0.2, 0.3];
+        let f2 = vec![-0.5f32, 0.5];
+        let mut wire = encode_frame(&f1);
+        wire.extend(encode_frame(&f2));
+        let mut cursor: &[u8] = &wire;
+        let (tx, rx) = std_mpsc::channel::<Vec<f32>>();
+        let res = read_app_frames(&mut cursor, &tx);
+        drop(tx);
+        assert!(res.is_ok(), "a clean EOF at a frame boundary is Ok");
+        let got: Vec<Vec<f32>> = rx.iter().collect();
+        assert_eq!(got, vec![f1, f2], "both frames decoded in order into raw_tx");
+    }
+
+    /// A frame whose length prefix exceeds the cap is rejected as an error and
+    /// nothing is pushed — the daemon never attempts the huge allocation.
+    #[test]
+    fn read_app_frames_rejects_an_oversized_prefix() {
+        let mut wire = (MAX_FRAME_SAMPLES + 1).to_le_bytes().to_vec();
+        // No payload needed: the prefix check fires before any payload read.
+        wire.extend_from_slice(&[0u8; 4]);
+        let mut cursor: &[u8] = &wire;
+        let (tx, rx) = std_mpsc::channel::<Vec<f32>>();
+        let res = read_app_frames(&mut cursor, &tx);
+        drop(tx);
+        assert!(res.is_err(), "an over-cap prefix is an error, not an allocation");
+        assert!(rx.iter().next().is_none(), "nothing is ingested from a rejected frame");
+    }
+
+    /// A truncated payload (prefix promises more samples than the stream has) is
+    /// an error — not a silent short frame.
+    #[test]
+    fn read_app_frames_errors_on_a_truncated_payload() {
+        let mut wire = 4u32.to_le_bytes().to_vec(); // promises 4 samples = 16 bytes
+        wire.extend_from_slice(&[0u8; 8]); // only 8 bytes of payload present
+        let mut cursor: &[u8] = &wire;
+        let (tx, _rx) = std_mpsc::channel::<Vec<f32>>();
+        assert!(read_app_frames(&mut cursor, &tx).is_err());
+    }
+
+    /// mic_source_is_app selects the socket ingest ONLY for the exact "app"; the
+    /// default "device", any typo, and the empty string all stay on cpal — a
+    /// mistyped value never disables the device path.
+    #[test]
+    fn mic_source_app_is_exact_match_only() {
+        assert!(mic_source_is_app("app"), "\"app\" selects the socket ingest");
+        assert!(!mic_source_is_app("device"), "the default stays on cpal");
+        assert!(!mic_source_is_app("App"), "case-sensitive: a typo stays on cpal");
+        assert!(!mic_source_is_app(""), "empty stays on cpal (safe default)");
+        assert!(!mic_source_is_app("socket"), "an unknown value stays on cpal");
     }
 }
