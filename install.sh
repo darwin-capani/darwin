@@ -655,7 +655,45 @@ fi
 # Idempotent: a present cargo is detected + reused, never reinstalled.
 if [ -x "$CARGO" ] || command -v cargo >/dev/null 2>&1; then
     [ -x "$CARGO" ] || CARGO="$(command -v cargo)"
-    ui_ok "Rust toolchain: $("$CARGO" --version 2>/dev/null || echo cargo)"
+    # Source the cargo env so a freshly-installed toolchain is on PATH before probing.
+    [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
+    # VERIFY cargo actually RUNS — not just that the file exists. A rustup proxy
+    # with NO default toolchain configured (`rustup default stable` never ran)
+    # EXISTS but ERRORS ("rustup could not choose a version of cargo to run"). We
+    # must NOT mask that (the old `|| echo cargo` did) — otherwise it sails through
+    # preflight and dies at the BUILD stage.
+    if "$CARGO" --version >/dev/null 2>&1; then
+        ui_ok "Rust toolchain: $("$CARGO" --version)"
+    elif [ "$MODE" = "check" ]; then
+        ui_warn "cargo is present but has NO usable toolchain (rustup has no default set)."
+        if [ "$DO_PROVISION" -eq 1 ]; then
+            plan "rustup default stable   # set the default Rust toolchain so cargo can build"
+        else
+            ui_note "--no-provision: run  rustup default stable  (then re-run)."
+            PREFLIGHT_FATAL=1
+        fi
+    elif [ "$DO_PROVISION" -eq 0 ]; then
+        ui_warn "cargo is present but has NO usable toolchain (rustup has no default set)."
+        ui_note "--no-provision: run  rustup default stable  (then re-run)."
+        ui_err "cargo cannot build the daemon without a default toolchain."
+        PREFLIGHT_FATAL=1
+    else
+        # AUTO-REPAIR (the common case: rustup installed without a default): set
+        # stable as the default toolchain + re-verify — fixing the exact "could not
+        # choose a version of cargo to run" BUILD failure HERE at preflight.
+        ui_info "cargo has no default toolchain — configuring it (rustup default stable)."
+        _rustup="$HOME/.cargo/bin/rustup"
+        [ -x "$_rustup" ] || _rustup="$(command -v rustup 2>/dev/null || echo rustup)"
+        _rd_rc=0
+        run_quiet "rustup default stable" -- "$_rustup" default stable || _rd_rc=$?
+        if [ "$_rd_rc" -eq 0 ] && "$CARGO" --version >/dev/null 2>&1; then
+            ui_ok "Rust ready: $("$CARGO" --version)"
+        else
+            ui_err "cargo still has no usable toolchain after 'rustup default stable'."
+            ui_note "Run manually:  rustup default stable   (then re-run)."
+            PREFLIGHT_FATAL=1
+        fi
+    fi
 elif [ "$MODE" = "check" ]; then
     ui_warn "Rust toolchain (cargo) not found."
     if [ "$DO_PROVISION" -eq 1 ]; then
