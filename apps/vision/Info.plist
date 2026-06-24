@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  EMBEDDED Info.plist for the JARVIS vision micro-app (a bare SwiftPM executable,
+  NOT an .app bundle). It is linked into the binary's __TEXT,__info_plist section
+  (see Package.swift linkerSettings), so macOS reads it for:
+
+    * The TCC PROMPT NAME. The vision binary is the process that actually captures
+      the Camera (AVCaptureSession) and the Screen (ScreenCaptureKit). Without a
+      bundle, the macOS permission prompt + the System Settings entry would show
+      the bare executable name ("vision"). With CFBundleDisplayName below, both
+      read "J.A.R.V.I.S." — the same name the HUD app shows — so screen/camera
+      consent is attributed to JARVIS, not an anonymous helper.
+
+    * The usage-description strings macOS requires before showing the Camera /
+      Microphone prompts (Screen Recording has no usage string — it is a pure TCC
+      pane). SoundAnalysis on live audio touches the mic, hence the mic string.
+
+  HONESTY: this only changes the NAME shown and supplies the required reason
+  strings — it grants nothing. The user still approves each prompt; capture stays
+  on-device, off until asked, never recorded or uploaded.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key>
+  <string>J.A.R.V.I.S.</string>
+  <key>CFBundleName</key>
+  <string>J.A.R.V.I.S.</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.jarvis.vision</string>
+
+  <key>NSCameraUsageDescription</key>
+  <string>JARVIS uses the camera only when you explicitly ask it to watch the camera (on-device vision). It stays off until you ask; frames are processed on-device and are not recorded or uploaded.</string>
+
+  <key>NSMicrophoneUsageDescription</key>
+  <string>JARVIS analyzes short audio on-device to recognize sounds when you ask. Audio is processed on-device; nothing is recorded or uploaded.</string>
+</dict>
+</plist>

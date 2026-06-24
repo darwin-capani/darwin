@@ -47,7 +47,20 @@ let package = Package(
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("ImageIO"),
-                .linkedFramework("Foundation")
+                .linkedFramework("Foundation"),
+                // EMBED Info.plist into the binary's __TEXT,__info_plist section so
+                // macOS reads CFBundleDisplayName="J.A.R.V.I.S." for this binary's
+                // Camera/Screen TCC prompts (it is the real capturer) plus the
+                // Camera/Mic usage strings. SwiftPM resolves this linker path
+                // relative to the PACKAGE ROOT, so it works with both `swift build`
+                // run from apps/vision and the installer's `--package-path apps/vision`
+                // (verified: the __info_plist section is present either way).
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Info.plist",
+                ])
             ]
         ),
         // XCTest target. Tests drive the PURE logic (shared types, Op
