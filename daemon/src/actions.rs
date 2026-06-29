@@ -454,7 +454,7 @@ fn leading_scheme(url: &str) -> Option<&str> {
 
 /// Host of an http(s) URL: the authority minus userinfo and port.
 fn url_host(url: &str) -> &str {
-    let after_scheme = url.splitn(2, "://").nth(1).unwrap_or("");
+    let after_scheme = url.split_once("://").map(|x| x.1).unwrap_or("");
     let authority = after_scheme
         .split(&['/', '?', '#'][..])
         .next()
@@ -537,7 +537,7 @@ fn google_search_url(query: &str) -> String {
 /// allowed so a continuation can still surface a homepage.
 pub fn url_is_data_bearing(url: &str) -> bool {
     // Drop scheme; what's left is `authority[/path][?query][#frag]`.
-    let after_scheme = url.splitn(2, "://").nth(1).unwrap_or(url);
+    let after_scheme = url.split_once("://").map(|x| x.1).unwrap_or(url);
     // A query string anywhere is data-bearing.
     let (before_query, query) = match after_scheme.split_once('?') {
         Some((b, q)) => (b, q),

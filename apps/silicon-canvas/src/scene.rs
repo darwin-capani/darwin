@@ -398,8 +398,10 @@ pub struct Zone {
 /// the array is uploadable straight to the GPU flag buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
+#[derive(Default)]
 pub enum HighlightFlag {
     /// Normal: drawn at full intensity, no emphasis.
+    #[default]
     Normal = 0,
     /// On the selected net: drawn in `--holo-bright` (SPEC §4).
     Highlighted = 1,
@@ -409,11 +411,6 @@ pub enum HighlightFlag {
     TraceFront = 3,
 }
 
-impl Default for HighlightFlag {
-    fn default() -> Self {
-        HighlightFlag::Normal
-    }
-}
 
 // ===========================================================================
 // The Scene: struct-of-arrays.
@@ -469,16 +466,13 @@ pub struct Scene {
 /// schematic so `Scene::default()` is valid before any import.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum SceneKind {
+    #[default]
     Schematic,
     Pcb,
 }
 
-impl Default for SceneKind {
-    fn default() -> Self {
-        SceneKind::Schematic
-    }
-}
 
 impl From<DocumentKind> for SceneKind {
     fn from(d: DocumentKind) -> Self {

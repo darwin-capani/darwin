@@ -83,6 +83,7 @@ struct Issue {
 
 /// The slim view of a just-created PR / comment we echo back.
 #[derive(Debug, Clone, Deserialize)]
+#[derive(Default)]
 struct Created {
     #[serde(default)]
     number: u64,
@@ -394,14 +395,6 @@ impl<T: HttpTransport> GithubClient<T> {
 // instead of failing the whole call after the side effect already happened.
 // ---------------------------------------------------------------------------
 
-impl Default for Created {
-    fn default() -> Self {
-        Self {
-            number: 0,
-            html_url: String::new(),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers (pure — unit-testable without a transport)

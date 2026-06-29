@@ -565,7 +565,7 @@ pub fn chunk_text(content: &str, chunk_chars: usize, overlap: usize) -> Vec<Chun
     let stride = chunk_chars.saturating_sub(overlap).max(1);
     // (char_index, byte_offset) for every character — lets us map a window's
     // start char to its byte position for the citation offset.
-    let indices: Vec<(usize, char)> = content.char_indices().map(|(b, c)| (b, c)).collect();
+    let indices: Vec<(usize, char)> = content.char_indices().collect();
     let n = indices.len();
     let mut chunks = Vec::new();
     let mut start = 0usize;
@@ -1402,7 +1402,7 @@ mod tests {
         }
         // On-disk bytes are ciphertext: the chunk text is not in the clear, and the
         // SQLite magic header is absent (it's a SQLCipher file).
-        let raw = fs::read(&t.db_path()).unwrap();
+        let raw = fs::read(t.db_path()).unwrap();
         assert!(
             !raw.windows(b"doc-canary".len()).any(|w| w == b"doc-canary"),
             "chunk text must not appear in plaintext on disk"
@@ -1715,7 +1715,7 @@ mod tests {
         write!(s, "xref\n0 {}\n", objs.len() + 1).unwrap();
         s.push_str("0000000000 65535 f \n");
         for off in &offsets {
-            write!(s, "{off:010} 00000 n \n").unwrap();
+            writeln!(s, "{off:010} 00000 n ").unwrap();
         }
         write!(
             s,

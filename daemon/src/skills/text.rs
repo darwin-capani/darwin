@@ -904,7 +904,7 @@ fn strip_inline_md(line: &str) -> String {
         s = s.replace(marker, "");
     }
     // Single '*' and '_' emphasis markers.
-    s = s.replace('*', "").replace('_', "");
+    s = s.replace(['*', '_'], "");
     s
 }
 
@@ -997,7 +997,7 @@ fn sort_lines(args: &Value) -> Result<String> {
     let unique = opt_bool(args, "unique");
     let mut lines: Vec<&str> = text.lines().collect();
     if ci {
-        lines.sort_by(|a, b| a.to_ascii_lowercase().cmp(&b.to_ascii_lowercase()));
+        lines.sort_by_key(|a| a.to_ascii_lowercase());
     } else {
         lines.sort();
     }

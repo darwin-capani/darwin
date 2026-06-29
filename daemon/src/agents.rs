@@ -1459,7 +1459,7 @@ impl AgentRegistry {
                 }
                 Some((_, bs)) => {
                     // Track the highest runner-up (for the strict-tie check).
-                    if second.map_or(true, |sec| s > sec) {
+                    if second.is_none_or(|sec| s > sec) {
                         second = Some(s);
                     }
                     let _ = bs;

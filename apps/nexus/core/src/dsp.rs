@@ -615,6 +615,14 @@ pub fn compressor_gain(p: &CompressorParams, level_db: f32) -> f32 {
 }
 
 #[cfg(test)]
+impl crate::types::ChannelDsp {
+    /// Test helper: a fully-enabled default chain (all stages on).
+    fn default_enabled() -> Self {
+        Self { enabled: true, ..Self::default() }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::matrix::{MatrixState, MatrixSnapshot};
@@ -1087,13 +1095,5 @@ mod tests {
         assert!(slow > fast, "longer TC must give larger coeff");
         // Default sample rate const is what we expect.
         assert_eq!(DEFAULT_SAMPLE_RATE, 48_000);
-    }
-}
-
-#[cfg(test)]
-impl crate::types::ChannelDsp {
-    /// Test helper: a fully-enabled default chain (all stages on).
-    fn default_enabled() -> Self {
-        Self { enabled: true, ..Self::default() }
     }
 }

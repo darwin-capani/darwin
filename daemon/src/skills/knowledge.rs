@@ -661,13 +661,13 @@ fn power_of_ten(exp: i32) -> String {
         if exp >= 0 {
             // 1 followed by `exp` zeros.
             let mut s = String::from("1");
-            s.extend(std::iter::repeat('0').take(exp as usize));
+            s.extend(std::iter::repeat_n('0', exp as usize));
             s
         } else {
             // 0.000…1 with |exp| decimal places.
             let zeros = (-exp - 1) as usize;
             let mut s = String::from("0.");
-            s.extend(std::iter::repeat('0').take(zeros));
+            s.extend(std::iter::repeat_n('0', zeros));
             s.push('1');
             s
         }

@@ -3986,7 +3986,7 @@ mod verify {
     pub fn current_outcome() -> VerifyOutcome {
         #[cfg(test)]
         {
-            if let Some(slot) = OUTCOME_OVERRIDE.with(|c| c.borrow().clone()) {
+            if let Some(slot) = OUTCOME_OVERRIDE.with(|c| *c.borrow()) {
                 return slot.unwrap_or(VerifyOutcome::Off);
             }
         }
@@ -4370,7 +4370,7 @@ pub use verify::{current_outcome, verify_telemetry, TurnVerifyGuard, VerifyOutco
 // reached via the `verify::` path inside this module (production caller + tests)
 // rather than re-exported at the public API surface.
 #[cfg(test)]
-pub use verify::{clear_outcome, set_outcome, should_verify, VerifyResult};
+pub use verify::clear_outcome;
 
 /// TOOL-RESULT VERIFICATION (#21) — a GATED, BOUNDED, ON-by-default plausibility
 /// cross-check of a TOOL RESULT before the OS (a) surfaces it to the user AS FACT
@@ -15859,7 +15859,7 @@ mod tests {
 
         // ALLOWED on jarvis (orchestrator wildcard), steve, and oracle.
         assert!(
-            agent_may_use(&vec!["*".to_string()], "forge_app"),
+            agent_may_use(&["*".to_string()], "forge_app"),
             "the orchestrator wildcard (jarvis) must admit forge_app"
         );
         assert!(
@@ -15905,7 +15905,7 @@ mod tests {
             "forge_app",
             &json!({"goal": "an app that reverses a string"}),
             &mem,
-            &vec!["*".to_string()],
+            &["*".to_string()],
         )
         .await;
         assert!(!is_error, "the off-state guidance is friendly, not an error: {outcome}");

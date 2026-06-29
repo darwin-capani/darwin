@@ -1477,7 +1477,7 @@ mod tests {
                 }
                 // Emit a plausible-looking node head to drive the interpreter
                 // deeper than the lexer (so field readers run on garbage args).
-                4 | 5 | 6 => {
+                4..=6 => {
                     s.push('(');
                     s.push_str(HEADS[rng.below(HEADS.len() as u32) as usize]);
                     s.push(' ');

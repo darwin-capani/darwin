@@ -236,9 +236,9 @@ fn entry_key(facet: Facet, subject: &str) -> String {
 /// follow the prefix.
 fn parse_entry_key(key: &str) -> Option<(Facet, String)> {
     let rest = key.strip_prefix(MODEL_PREFIX)?;
-    let mut parts = rest.splitn(2, '.');
-    let facet_tok = parts.next()?;
-    let subject = parts.next()?;
+    let (facet_tok, subject) = rest.split_once('.')?;
+    
+    
     if subject.is_empty() || subject.contains('.') {
         return None;
     }
@@ -388,7 +388,7 @@ pub async fn correct(
     let trimmed = new_observation.trim();
     if trimmed.is_empty() {
         // Delete = forget this one entry.
-        return Ok(memory.delete_fact(&key).await?);
+        return memory.delete_fact(&key).await;
     }
     let observation = bound_observation(trimmed);
     let value = encode_value(1, &["user:correction".to_string()], &observation);
@@ -543,9 +543,9 @@ fn facet_of_fact_key(key: &str) -> Option<Facet> {
 fn fact_subject(key: &str) -> Option<String> {
     let k = key.trim().to_lowercase();
     let rest = k.strip_prefix("user.").unwrap_or(&k);
-    let mut parts = rest.splitn(2, '.');
-    let _facet = parts.next()?;
-    let subject = parts.next()?;
+    let (_facet, subject) = rest.split_once('.')?;
+    
+    
     slugify(subject)
 }
 

@@ -649,9 +649,7 @@ pub async fn route(
     if let Some(intent) = crate::lifelog::classify_lifelog_intent(text) {
         let prime = agents.orchestrator();
         emit_agent_active(prime);
-        let period = match intent {
-            crate::lifelog::LifeLogIntent::Digest(p) => p,
-        };
+        let crate::lifelog::LifeLogIntent::Digest(period) = intent;
         // The spoken reply comes from the unchanged dispatch; the enriched card is
         // built from the SAME agent-scoped, bounded digest read so the HUD can render
         // content. No logic change to lifelog.rs — this reuses its public surface.

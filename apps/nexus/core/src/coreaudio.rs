@@ -271,6 +271,7 @@ impl AggregateDevice {
 /// The realtime IOProc handle: the installed `AudioDeviceIOProc` id + the device
 /// it runs on + the boxed [`RtContext`] the callback reads. DEVICE-GATED. On
 /// teardown the proc is stopped, removed, and the context freed.
+#[derive(Default)]
 pub struct IoProc {
     /// The HAL device the proc is installed on.
     #[cfg(feature = "coreaudio")]
@@ -292,23 +293,6 @@ pub struct IoProc {
     _private: (),
 }
 
-impl Default for IoProc {
-    fn default() -> Self {
-        #[cfg(feature = "coreaudio")]
-        {
-            Self {
-                device_id: 0,
-                proc_id: None,
-                ctx: std::ptr::null_mut(),
-                started: false,
-            }
-        }
-        #[cfg(not(feature = "coreaudio"))]
-        {
-            Self { _private: () }
-        }
-    }
-}
 
 impl std::fmt::Debug for IoProc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

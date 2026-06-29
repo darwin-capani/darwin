@@ -341,7 +341,7 @@ fn ring_handoff_threaded_is_race_free() {
                 );
                 last_rev = snap.revision;
                 reads += 1;
-                if reads % 4096 == 0 {
+                if reads.is_multiple_of(4096) {
                     max_seen.store(last_rev, Ordering::Relaxed);
                 }
                 if done.load(Ordering::Acquire) {
