@@ -15,7 +15,12 @@
  */
 import { Canvas, useFrame } from "@react-three/fiber";
 import { memo, useMemo, useRef } from "react";
-import { BlendFunction, BloomEffect } from "postprocessing";
+import {
+  BlendFunction,
+  BloomEffect,
+  ChromaticAberrationEffect,
+  NoiseEffect,
+} from "postprocessing";
 import { EffectComposer } from "@react-three/postprocessing";
 import * as THREE from "three";
 import { audioStore } from "../core/audioStore";
@@ -42,9 +47,10 @@ export interface CoreSceneProps {
 const BLOOM_INTENSITY = 0.72;
 // Whole-assembly proportion: a compact centerpiece, not a viewport-filling
 // planet. Applied in the per-frame scale write (the JSX scale prop would be
-// overwritten by the pulse). Trimmed 0.58 -> 0.42 so the orb reads as a small
-// focused centerpiece (user directive: make the orb AND its particles smaller).
-const CORE_BASE_SCALE = 0.42;
+// overwritten by the pulse). Trimmed 0.58 -> 0.42 -> 0.36 so the orb's bloom is
+// cleanly framed by the tactical ring with the corner readouts outside it (no
+// overlap), and stays a small focused centerpiece.
+const CORE_BASE_SCALE = 0.36;
 
 /* ---------------------------------------------------------------- shaders */
 
@@ -152,27 +158,88 @@ function makeParticles(count: number): THREE.BufferGeometry {
   return geo;
 }
 
+/* --------------------------------------------------------- reticle layers */
+
+// Reduced-motion: a single module-scope MediaQueryList (zero per-frame
+// allocation) so the loop can freeze ALL continuous motion when the OS asks
+// for it. matchMedia().matches is a cheap property read; the list updates
+// itself when the system preference changes, so no listener is needed.
+const REDUCED_MOTION_MQ =
+  typeof window !== "undefined" && typeof window.matchMedia === "function"
+    ? window.matchMedia("(prefers-reduced-motion: reduce)")
+    : null;
+const reducedMotion = () => REDUCED_MOTION_MQ?.matches === true;
+
+// Audio-reactive SPECTRUM RING: `count` radial ticks just outside the particle
+// shell. Two vertices per tick (inner fixed, outer pushed out per frame by the
+// synthesized spectrum) drawn as LineSegments — one draw call, positions
+// updated in place (no re-alloc, no teleport: same anti-flash discipline as the
+// particle buffer). The base ring sits at SPECTRUM_R; bars grow outward.
+const SPECTRUM_BARS = 72;
+const SPECTRUM_R = 1.74;
+// Shorter bars (was 0.55) so the spectrum reads as a tight energy ring hugging
+// the orb rather than long spikes that collide with the overlay gauges/ticks.
+const SPECTRUM_MAX = 0.32;
+function makeSpectrum(count: number): THREE.BufferGeometry {
+  const geo = new THREE.BufferGeometry();
+  const pos = new Float32Array(count * 2 * 3);
+  for (let i = 0; i < count; i++) {
+    const a = (i / count) * Math.PI * 2;
+    const cx = Math.cos(a) * SPECTRUM_R;
+    const cy = Math.sin(a) * SPECTRUM_R;
+    pos[i * 6] = cx;
+    pos[i * 6 + 1] = cy;
+    pos[i * 6 + 3] = cx; // outer starts coincident; useFrame pushes it out
+    pos[i * 6 + 4] = cy;
+  }
+  geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+  return geo;
+}
+
 interface LiveVisual extends CoreVisualTarget {
   scale: number;
   bloom: number;
   particleCount: number;
   /** Smoothed audio amplitude (ampFollow output) — drives the gentle swell. */
   ampEnv: number;
+  /** Motion clock: advances by dt ONLY when motion is allowed, so a
+   *  reduced-motion user gets a frozen frame instead of the wall clock. */
+  simTime: number;
+  /** Damped pointer-parallax tilt (radians) added to the core's rest tilt. */
+  tiltX: number;
+  tiltZ: number;
 }
+
+// Grain strength when motion is allowed; silenced under reduced-motion since
+// procedural noise animates per frame.
+const NOISE_OPACITY = 0.05;
 
 function CoreAssembly({
   coreState,
   agentHue,
   governor,
   bloomEffect,
+  noiseEffect,
 }: {
   coreState: CoreState;
   agentHue: number | null;
   governor: PerfGovernor;
   bloomEffect: BloomEffect;
+  noiseEffect: NoiseEffect;
 }) {
   const group = useRef<THREE.Group>(null);
   const ring = useRef<THREE.Mesh>(null);
+  // Mk II audio spectrum ring. (The reticle/range framing now lives in the
+  // sharper SVG overlay — CoreHud — so the redundant canvas rings were removed
+  // to declutter the concentric stack.)
+  const spectrum = useRef<THREE.LineSegments>(null);
+  // Reactor depth layers: a counter-rotating octahedral cage + 2 orbital rings.
+  const shell2 = useRef<THREE.LineSegments>(null);
+  const orbit1 = useRef<THREE.Group>(null);
+  const orbit2 = useRef<THREE.Group>(null);
+  // Previous discrete state, to fire the one-shot "iris" flourish on a change.
+  const prevState = useRef<CoreState>(coreState);
+  const iris = useRef(0);
   // Pixel ratio is set ONCE via the Canvas dpr prop (FIXED_DPR) — do not call
   // gl.setPixelRatio here; a second writer desyncs the composer's buffers
   // from the canvas size and the mismatch reads as flicker.
@@ -230,6 +297,59 @@ function CoreAssembly({
     [],
   );
 
+  // Spectrum ring: positions updated in place every frame (no re-alloc).
+  const spectrumGeo = useMemo(() => makeSpectrum(SPECTRUM_BARS), []);
+  const spectrumMat = useMemo(
+    () =>
+      new THREE.LineBasicMaterial({
+        color: new THREE.Color("#7DF3FF"),
+        transparent: true,
+        opacity: 0.6,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      }),
+    [],
+  );
+  // Second wireframe shell (octahedral cage) + orbital-ring material + satellite
+  // node material — the reactor/gyroscope depth layers around the orb.
+  const shell2Geo = useMemo(
+    () => new THREE.WireframeGeometry(new THREE.OctahedronGeometry(1.5, 0)),
+    [],
+  );
+  const shell2Mat = useMemo(
+    () =>
+      new THREE.LineBasicMaterial({
+        color: new THREE.Color("#36C6E3"),
+        transparent: true,
+        opacity: 0.2,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      }),
+    [],
+  );
+  const orbitMat = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color("#7DF3FF"),
+        transparent: true,
+        opacity: 0.3,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      }),
+    [],
+  );
+  const satMat = useMemo(
+    () =>
+      new THREE.MeshBasicMaterial({
+        color: new THREE.Color("#CFFAFF"),
+        transparent: true,
+        opacity: 0.95,
+        blending: THREE.AdditiveBlending,
+        depthWrite: false,
+      }),
+    [],
+  );
+
   // Pooled per-frame state — zero allocations in the loop.
   const live = useRef<LiveVisual>({
     hue: 190,
@@ -243,6 +363,9 @@ function CoreAssembly({
     bloom: BLOOM_INTENSITY,
     particleCount: PERF_TIERS[0].particles,
     ampEnv: 0,
+    simTime: 0,
+    tiltX: 0,
+    tiltZ: 0,
   });
   const tmpColor = useRef(new THREE.Color());
   const stateRef = useRef(coreState);
@@ -255,11 +378,25 @@ function CoreAssembly({
 
   useFrame((state, delta) => {
     const dt = Math.min(delta, 0.1);
+    const rm = reducedMotion();
     const coreState = stateRef.current;
     const rms = audioStore.lastRms; // refs, not React — no re-render path
-    const t = state.clock.elapsedTime;
     const v = live.current;
+    // Motion clock: frozen under reduced-motion so every t-driven oscillation
+    // (drift, breath, shimmer, parallax) settles to a still frame. Color and
+    // intensity still damp — those are state, not motion.
+    v.simTime += rm ? 0 : dt;
+    const t = v.simTime;
     const target = coreVisualTarget(coreState, rms, agentHueRef.current);
+
+    // One-shot IRIS flourish: a discrete state change snaps the targeting
+    // reticle (brief opacity+scale kick that decays away). Never fires on the
+    // 15Hz audio frames — only on the discrete coreState transition.
+    if (coreState !== prevState.current) {
+      iris.current = rm ? 0 : 1;
+      prevState.current = coreState;
+    }
+    iris.current = damp(iris.current, 0, 4, dt);
 
     // Smooth crossfades — lerp hue/intensity, never hard cuts.
     if (import.meta.env.DEV) {
@@ -295,9 +432,19 @@ function CoreAssembly({
     const pulse = 1 + Math.sin(t * Math.PI * 2 * v.pulseHz) * v.pulseDepth * 0.5;
     v.scale = Math.min(1.05, Math.max(0.96, damp(v.scale, pulse, 5, dt)));
 
+    // Pointer parallax: the whole assembly tilts a few degrees toward the
+    // cursor for depth, damped so it glides (never snaps). Zeroed under
+    // reduced-motion. state.pointer is R3F's normalized -1..1 canvas cursor.
+    const targetTiltX = rm ? 0 : -state.pointer.y * 0.2;
+    const targetTiltZ = rm ? 0 : state.pointer.x * 0.12;
+    v.tiltX = damp(v.tiltX, targetTiltX, 4, dt);
+    v.tiltZ = damp(v.tiltZ, targetTiltZ, 4, dt);
+
     if (group.current) {
-      group.current.rotation.y += v.spin * dt;
-      group.current.rotation.x = Math.sin(t * 0.07) * 0.18;
+      // Spin gated by reduced-motion (was ungated) so the orb truly freezes.
+      group.current.rotation.y += v.spin * (rm ? 0 : dt);
+      group.current.rotation.x = Math.sin(t * 0.07) * 0.18 + v.tiltX;
+      group.current.rotation.z = v.tiltZ;
       group.current.scale.setScalar(v.scale * CORE_BASE_SCALE);
     }
     if (ring.current) {
@@ -307,6 +454,27 @@ function CoreAssembly({
       (ring.current.material as THREE.MeshBasicMaterial).opacity =
         0.05 + amp * 0.12 * Math.min(1, v.intensity);
     }
+
+    // --- Reactor depth layers: the octahedral cage counter-rotates (net slow,
+    // opposite the orb) and the two inclined orbital rings spin at their own
+    // rates, carrying their satellite nodes around. All gated by reduced-motion;
+    // hue/brightness track the core like every other element. ---
+    const dtm = rm ? 0 : dt;
+    const intB = Math.min(1, v.intensity);
+    if (shell2.current) {
+      shell2.current.rotation.y -= v.spin * dtm * 1.7;
+      shell2.current.rotation.x += dtm * 0.06;
+      tmpColor.current.setHSL(v.hue / 360, 0.75, 0.58);
+      shell2Mat.color.copy(tmpColor.current);
+      shell2Mat.opacity = 0.12 + intB * 0.22;
+    }
+    if (orbit1.current) orbit1.current.rotation.y += dtm * 0.6;
+    if (orbit2.current) orbit2.current.rotation.y -= dtm * 0.46;
+    tmpColor.current.setHSL(v.hue / 360, 0.95, 0.72);
+    orbitMat.color.copy(tmpColor.current);
+    orbitMat.opacity = 0.18 + intB * 0.28;
+    tmpColor.current.setHSL(v.hue / 360, 0.55, 0.92);
+    satMat.color.copy(tmpColor.current);
 
     tmpColor.current.setHSL(v.hue / 360, 0.85, 0.62);
     wireMat.color.copy(tmpColor.current);
@@ -321,33 +489,97 @@ function CoreAssembly({
     particleMat.uniforms.uFlow.value = Math.min(0.8, amp);
     particleMat.uniforms.uOpacity.value = 0.34 + Math.min(1, v.intensity) * 0.32;
 
+    const intC = Math.min(1, v.intensity);
+
+    // --- Spectrum ring: outer vertex of each radial tick is pushed out by an
+    // idle shimmer plus an audio-driven peak (a traveling wave so it scintillates
+    // like an equalizer). Positions rewritten in place every frame — same
+    // no-realloc discipline as the particle buffer. ---
+    if (spectrum.current) {
+      spectrum.current.rotation.z += (rm ? 0 : dt) * 0.02;
+      const sp = spectrumGeo.attributes.position.array as Float32Array;
+      // Audio term gated by reduced-motion: with flow=0 the bars collapse to the
+      // (frozen-t) shimmer baseline and the ring holds a still frame, so a
+      // reduced-motion user never sees the equalizer pulse with their voice.
+      const flow = rm ? 0 : Math.min(1, amp * 1.25);
+      const gain = Math.min(1.25, 0.55 + v.intensity);
+      for (let i = 0; i < SPECTRUM_BARS; i++) {
+        const a = (i / SPECTRUM_BARS) * Math.PI * 2;
+        const shimmer = 0.12 + 0.07 * Math.sin(i * 0.7 + t * 1.3);
+        const peak = flow * (0.35 + 0.65 * Math.abs(Math.sin(i * 2.1 + t * 4.0)));
+        const r = SPECTRUM_R + (shimmer + peak) * SPECTRUM_MAX * gain;
+        sp[i * 6 + 3] = Math.cos(a) * r;
+        sp[i * 6 + 4] = Math.sin(a) * r;
+      }
+      spectrumGeo.attributes.position.needsUpdate = true;
+      tmpColor.current.setHSL(v.hue / 360, 0.95, 0.74);
+      spectrumMat.color.copy(tmpColor.current);
+      // iris one-shot now flares the spectrum on a state change (the reticle it
+      // used to drive is gone).
+      spectrumMat.opacity = 0.34 + intC * 0.36 + iris.current * 0.3;
+    }
+
     // Adaptive degradation — crossfaded, never a hard cut:
     // bloom intensity lerps toward the tier target (composer stays mounted),
     // particle count damps toward the tier budget via setDrawRange.
     const tier = PERF_TIERS[governor.sample(dt * 1000)];
     v.bloom = damp(v.bloom, tier.bloom ? BLOOM_INTENSITY : 0, 2, dt);
     bloomEffect.intensity = v.bloom;
+    // Film grain is animated noise — mute it entirely under reduced-motion, and
+    // shed it with bloom on the low perf tier so a struggling GPU drops it too.
+    noiseEffect.blendMode.opacity.value = rm || !tier.bloom ? 0 : NOISE_OPACITY;
     v.particleCount = damp(v.particleCount, tier.particles, 2, dt);
     particleGeo.setDrawRange(0, Math.round(v.particleCount));
   });
 
   return (
-    <group ref={group}>
-      <lineSegments geometry={wireGeo} material={wireMat} />
-      <mesh material={sphereMat}>
-        <sphereGeometry args={[0.82, 48, 48]} />
-      </mesh>
-      <mesh ref={ring} rotation={[Math.PI / 2, 0, 0]}>
-        <torusGeometry args={[1, 0.006, 8, 96]} />
-        <meshBasicMaterial
-          color="#7DF3FF"
-          transparent
-          opacity={0.1}
-          blending={THREE.AdditiveBlending}
-          depthWrite={false}
-        />
-      </mesh>
-      <points geometry={particleGeo} material={particleMat} />
+    // Lift the whole core a touch above the viewport center so it sits in the
+    // OPEN upper zone (clear of the bottom intel panel) — the overlay/aura are
+    // shifted up to match in CSS.
+    <group position={[0, 0.22, 0]}>
+      {/* The orb: spins on Y, tilts with breath + pointer parallax, breathes. */}
+      <group ref={group}>
+        <lineSegments geometry={wireGeo} material={wireMat} />
+        {/* counter-rotating octahedral cage */}
+        <lineSegments ref={shell2} geometry={shell2Geo} material={shell2Mat} />
+        <mesh material={sphereMat}>
+          <sphereGeometry args={[0.82, 48, 48]} />
+        </mesh>
+        <mesh ref={ring} rotation={[Math.PI / 2, 0, 0]}>
+          <torusGeometry args={[1, 0.006, 8, 96]} />
+          <meshBasicMaterial
+            color="#7DF3FF"
+            transparent
+            opacity={0.1}
+            blending={THREE.AdditiveBlending}
+            depthWrite={false}
+          />
+        </mesh>
+        {/* two inclined orbital rings, each carrying a satellite node */}
+        <group ref={orbit1} rotation={[1.15, 0, 0.4]}>
+          <mesh material={orbitMat}>
+            <torusGeometry args={[1.5, 0.004, 6, 96]} />
+          </mesh>
+          <mesh material={satMat} position={[1.5, 0, 0]}>
+            <sphereGeometry args={[0.032, 10, 10]} />
+          </mesh>
+        </group>
+        <group ref={orbit2} rotation={[-0.7, 0.6, -0.35]}>
+          <mesh material={orbitMat}>
+            <torusGeometry args={[1.74, 0.004, 6, 96]} />
+          </mesh>
+          <mesh material={satMat} position={[1.74, 0, 0]}>
+            <sphereGeometry args={[0.026, 10, 10]} />
+          </mesh>
+        </group>
+        <points geometry={particleGeo} material={particleMat} />
+      </group>
+      {/* Spectrum: steady, camera-facing energy ring (in-plane spin only) that
+          frames the breathing orb. Scaled to match the orb but never pulsed, so
+          the ring holds while the core breathes. */}
+      <group scale={CORE_BASE_SCALE}>
+        <lineSegments ref={spectrum} geometry={spectrumGeo} material={spectrumMat} />
+      </group>
     </group>
   );
 }
@@ -396,6 +628,28 @@ function CoreScene({ coreState, agentHue }: CoreSceneProps) {
     return effect;
   }, []);
 
+  // Holographic fringe: a SMALL, radially-modulated chromatic aberration so the
+  // bloomed core edges split into faint cyan/magenta — the "projected hologram"
+  // tell. Radial modulation keeps the center crisp and only fringes the edges.
+  // Static (no time term) so it adds no motion and no flicker surface.
+  const chromaticAberration = useMemo(
+    () =>
+      new ChromaticAberrationEffect({
+        offset: new THREE.Vector2(0.0007, 0.0007),
+        radialModulation: true,
+        modulationOffset: 0.3,
+      }),
+    [],
+  );
+  // Fine film grain over the whole frame — breaks up the flat void into a lit
+  // surface. Opacity is driven per-frame in CoreAssembly (0 under reduced-motion
+  // or the low perf tier).
+  const noiseEffect = useMemo(() => {
+    const effect = new NoiseEffect({ blendFunction: BlendFunction.SCREEN, premultiply: true });
+    effect.blendMode.opacity.value = NOISE_OPACITY;
+    return effect;
+  }, []);
+
   return (
     <Canvas gl={GL_PROPS} camera={CAMERA_PROPS} dpr={FIXED_DPR} style={CANVAS_STYLE}>
       {/* Opaque scene background (pairs with alpha:false above). */}
@@ -405,11 +659,22 @@ function CoreScene({ coreState, agentHue }: CoreSceneProps) {
         agentHue={agentHue}
         governor={governor}
         bloomEffect={bloomEffect}
+        noiseEffect={noiseEffect}
       />
       {/* multisampling=0: MSAA framebuffer blits are a WKWebView flicker
-          class; bloom's mipmap blur supplies the smoothing instead. */}
+          class; bloom's mipmap blur supplies the smoothing instead.
+          ORDER MATTERS: chromatic aberration is a CONVOLUTION effect, which can
+          never share an EffectPass with its neighbours, so it goes LAST — that
+          lets bloom + grain (both non-convolution) merge into ONE pass, leaving
+          exactly TWO passes total ([bloom+grain], then [chromatic aberration]).
+          Putting it in the middle would split this into THREE passes and add a
+          render-target ping-pong per frame (the WKWebView composer cost we
+          minimize). Both added passes are STATIC (CA) or opacity-gated (grain),
+          so the opaque-canvas anti-flash contract still holds. */}
       <EffectComposer multisampling={0}>
         <primitive object={bloomEffect} />
+        <primitive object={noiseEffect} />
+        <primitive object={chromaticAberration} />
       </EffectComposer>
     </Canvas>
   );
