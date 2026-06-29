@@ -39,6 +39,9 @@ import StatusBar from "./components/StatusBar";
 import SuggestionsPanel from "./components/SuggestionsPanel";
 import UpdateDialog from "./components/UpdateDialog";
 import BriefFocusPanel from "./components/BriefFocusPanel";
+import BootReveal from "./components/BootReveal";
+import ConduitField from "./components/ConduitField";
+import CoreHud from "./components/CoreHud";
 import UnifiedSearchPanel from "./components/UnifiedSearchPanel";
 import VerifyPanel from "./components/VerifyPanel";
 import AnswerCrossCheckPanel from "./components/AnswerCrossCheckPanel";
@@ -76,6 +79,31 @@ export default function App() {
   const [settingsTab, setSettingsTab] = useState<"credentials" | "system" | null>(null);
   const settingsOpen = settingsTab !== null;
   const [deckOpen, setDeckOpen] = useState(false);
+
+  // CINEMATIC BOOT / WAKE REVEAL — the one-shot power-on overlay. Plays the
+  // FIRST time the telemetry link connects (JARVIS "waking"), never on later
+  // reconnect flaps (a ref latches it). Purely cosmetic: it gates nothing and
+  // self-dismisses on a timer or any key/click.
+  const [bootPlaying, setBootPlaying] = useState(false);
+  const bootPlayed = useRef(false);
+  useEffect(() => {
+    if (!bootPlayed.current && state.connected) {
+      bootPlayed.current = true;
+      setBootPlaying(true);
+    }
+  }, [state.connected]);
+  // REVEALED — flips true when the boot/wake sequence ends, cueing the readout
+  // panels to materialize in (the regions "deal in" once, behind/after the boot
+  // overlay). Stays false when boot never plays (e.g. dev with no daemon), where
+  // the panels are simply visible with no entrance.
+  const [revealed, setRevealed] = useState(false);
+  // STABLE callback identities: BootReveal arms its timers in a [onReveal,onDone]
+  // -keyed effect, so fresh closures each render (telemetry churns App ~15Hz)
+  // would clear+re-arm them forever. useCallback pins them. revealPanels fires
+  // ~0.6s before the overlay unmounts so the panels deal in UNDER the fade (no
+  // empty-HUD gap); dismissBoot then unmounts the overlay.
+  const revealPanels = useCallback(() => setRevealed(true), []);
+  const dismissBoot = useCallback(() => setBootPlaying(false), []);
 
   // LAUNCH AUTO-UPDATE — the version string for the "Update available" dialog,
   // or null when no dialog is showing. Set ONLY by the launch auto-check below,
@@ -234,6 +262,54 @@ export default function App() {
   // F11 fullscreen.
   useEffect(() => bindFullscreenKey(), []);
 
+  // DEPTH PARALLAX — publish the normalized cursor position (-1..1 from center)
+  // as CSS vars on the root; background layers translate by it at different
+  // depths (CSS), so the backdrop, conduits and core overlay separate in 3D as
+  // the cursor moves. rAF-throttled, passive, and zero React churn (writes CSS
+  // vars, never state). The R3F core does its own pointer tilt; panels stay put
+  // (they're interactive). Motion is gated off in CSS under reduced-motion.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let raf = 0;
+    const onMove = (ev: PointerEvent) => {
+      cancelAnimationFrame(raf);
+      raf = requestAnimationFrame(() => {
+        const x = (ev.clientX / window.innerWidth - 0.5) * 2;
+        const y = (ev.clientY / window.innerHeight - 0.5) * 2;
+        const root = document.documentElement.style;
+        root.setProperty("--par-x", x.toFixed(3));
+        root.setProperty("--par-y", y.toFixed(3));
+      });
+    };
+    window.addEventListener("pointermove", onMove, { passive: true });
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      cancelAnimationFrame(raf);
+    };
+  }, []);
+
+  // VOICE-REACTIVE LIGHT FIELD — a rAF loop reads the live mic/voice amplitude
+  // from the audioStore (a ref, never React state) and publishes a smoothed
+  // 0..1 `--voice` CSS var with an asymmetric attack/release ease, so the
+  // ambient edge-bloom swells with speech and settles softly. Writes only a CSS
+  // var → zero React re-renders (same anti-flash discipline as the core loop).
+  // The visual is gated off in CSS under reduced-motion.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let raf = 0;
+    let v = 0;
+    const tick = () => {
+      const rms = audioStore.lastRms || 0;
+      const target = Math.min(1, rms * 6);
+      // gentle attack, slower release — tracks the loudness contour, not spikes
+      v += (target - v) * (target > v ? 0.3 : 0.06);
+      document.documentElement.style.setProperty("--voice", v.toFixed(3));
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
   // ABOUT MENU — open the custom About panel when the user picks
   // "About J.A.R.V.I.S." from the native macOS menu. The Rust shell emits
   // `menu://about` with the bundle version as payload; we stash it and open the
@@ -371,7 +447,24 @@ export default function App() {
           agentHue={state.activeAgent ? state.activeAgent.hue : null}
         />
       </div>
+      {/* Ambient cyan aura breathing behind the core — painted on the DOM
+          backdrop (not the opaque WebGL canvas) so the core reads as seated in
+          light without touching the canvas anti-flash invariants. */}
+      {/* Holographic projection floor: a perspective ground-grid receding to a
+          horizon beneath the core, so it reads as projected in volumetric space.
+          z:1 (deep background). */}
+      <div className="holo-floor" aria-hidden="true" />
+      <div className="core-aura" aria-hidden="true" />
       <div className="hud-vignette" />
+      {/* Voice-reactive light field: ambient edge-bloom whose intensity follows
+          the --voice amplitude var. z:2, pointer-events:none. */}
+      <div className="voice-field" aria-hidden="true" />
+      {/* Neural conduits: energy flowing from the core out to the panel columns.
+          z:2, painted before the tactical overlay so the gauges sit on top. */}
+      <ConduitField coreState={state.coreState} />
+      {/* Tactical overlay framing the orb: live arc gauges + radar sweep +
+          range rings + corner readouts. z:2, above the vignette, below panels. */}
+      <CoreHud gauges={state.gauges} coreState={state.coreState} />
 
       {/* Always mounted; fade via CSS class so reconnect flaps cannot
           strobe the overlay (show transition is delayed ~500ms). */}
@@ -398,7 +491,9 @@ export default function App() {
         onDismiss={() => dispatch({ type: "alert.dismiss" })}
       />
 
-      <div className="panel-layer">
+      <div
+        className={`panel-layer${bootPlaying && !revealed ? " pre-reveal" : ""}`}
+      >
         <StatusBar
           connected={state.connected}
           coreState={state.coreState}
@@ -509,6 +604,10 @@ export default function App() {
 
       <Toasts toasts={state.toasts} />
       <CommandDeck open={deckOpen} onClose={() => setDeckOpen(false)} />
+
+      {/* CINEMATIC BOOT / WAKE REVEAL — mounts once on first connect, above
+          everything (z 9999), and unmounts itself when the sequence ends. */}
+      {bootPlaying && <BootReveal onReveal={revealPanels} onDone={dismissBoot} />}
 
       {/* FIRST-RUN ONBOARDING — shown once (real persisted flag); routes to the
           existing, already-gated Settings surfaces and never bypasses them. */}

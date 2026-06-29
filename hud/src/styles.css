@@ -49,6 +49,39 @@
   --mono: "SF Mono", "JetBrains Mono", ui-monospace, Menlo, monospace;
   --sans: "SF Pro Display", -apple-system, system-ui, sans-serif;
   --text: "SF Pro Text", -apple-system, system-ui, sans-serif;
+
+  /* ---- Mk II motion + depth system (build directive: state-of-the-art) ----
+     Shared timing/easing tokens so every micro-interaction shares one rhythm
+     (rule: motion-consistency). Durations stay in the 140-420ms band the UX
+     guideline calls for; the spring-feel ease-out curve is used for entrances,
+     the symmetric curve for state toggles. */
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-soft: cubic-bezier(0.65, 0, 0.35, 1);
+  --dur-fast: 140ms;
+  --dur: 220ms;
+  --dur-slow: 420ms;
+
+  /* Elevation scale (rule: elevation-consistent) so shadows are never ad-hoc:
+     --elev-1 seats the resting readout panels (.frame); --elev-3 floats the
+     command-deck modal above them (.cmd-deck-frame). */
+  --elev-1: 0 2px 10px rgba(1, 4, 9, 0.45);
+  --elev-3: 0 22px 60px rgba(1, 4, 9, 0.66);
+
+  /* The cyan light-streak the panel-title hover sweep rides (.frame-title::after). */
+  --sweep: linear-gradient(
+    100deg,
+    transparent 0%,
+    rgba(125, 243, 255, 0) 35%,
+    rgba(125, 243, 255, 0.5) 50%,
+    rgba(125, 243, 255, 0) 65%,
+    transparent 100%
+  );
+
+  /* Keyboard focus ring — a double-stop halo (void gap + bright cyan + glow) so
+     focus is unmistakable on the dark glass without fighting the FUI strokes
+     (rule: focus-states, color-contrast). Used by the global :focus-visible. */
+  --focus-ring: 0 0 0 2px var(--bg-void), 0 0 0 3px var(--cyan-bright),
+    0 0 12px rgba(26, 214, 255, 0.7);
 }
 
 * {
@@ -230,7 +263,9 @@ body,
 
 .center-col > .global-scan {
   pointer-events: auto;
-  max-height: 56%;
+  /* capped low so even a FULLY-POPULATED intel feed (opaque glass, z:3) can't
+     rise into the lifted core ring (z:2) below it */
+  max-height: 25%;
 }
 
 /* ------------------------------------------------- angular frame chrome */
@@ -241,6 +276,31 @@ body,
   flex-direction: column;
   min-height: 0;
   filter: drop-shadow(0 0 7px rgba(26, 214, 255, 0.14));
+  /* Mk II: settle the panel onto a depth shadow and animate the hover lift.
+     transform/filter only (GPU-composited, zero reflow) so the lift can never
+     shift the scrolling columns it lives in. */
+  transform: translateZ(0);
+  transition:
+    filter var(--dur) var(--ease-out),
+    transform var(--dur) var(--ease-out);
+}
+
+/* Hover "alive" state: the panel rises a hair and its cyan glow strengthens,
+   the corner brackets brighten, and a single light-streak sweeps the title bar
+   once. Pointer-only (hover: hover) so touch/keyboard never trigger it; fully
+   neutralized under prefers-reduced-motion (see the a11y section). */
+@media (hover: hover) {
+  .frame:hover {
+    transform: translateY(-2px);
+    filter: drop-shadow(0 4px 16px rgba(26, 214, 255, 0.26));
+  }
+  .frame:hover .bk {
+    opacity: 1;
+    box-shadow: 0 0 8px var(--cyan);
+  }
+  .frame:hover .frame-title::after {
+    transform: translateX(220%);
+  }
 }
 
 /* 1px cyan stroke that follows the cut corners: gradient layer clipped to
@@ -321,6 +381,9 @@ body,
   border: 0 solid var(--cyan-bright);
   opacity: 0.85;
   pointer-events: none;
+  transition:
+    opacity var(--dur) var(--ease-out),
+    box-shadow var(--dur) var(--ease-out);
 }
 .frame .bk.tl { left: -2px; top: -2px; border-left-width: 2px; border-top-width: 2px; }
 .frame .bk.tr { right: -2px; top: -2px; border-right-width: 2px; border-top-width: 2px; }
@@ -358,6 +421,19 @@ body,
   width: 3px;
   background: linear-gradient(180deg, #effeff, var(--cyan));
   box-shadow: 0 0 12px var(--cyan), 0 0 4px var(--cyan-bright);
+}
+
+/* Light-streak that sweeps across the title bar once on panel hover. Parked
+   off the left edge; the .frame:hover rule slides it across. Clipped by the
+   title bar's own clip-path, so the streak rides the beveled silhouette. */
+.frame-title::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: var(--sweep);
+  transform: translateX(-120%);
+  transition: transform var(--dur-slow) var(--ease-out);
 }
 
 .frame-title .t {
@@ -7504,4 +7580,892 @@ svg.tri circle {
 .icon-btn.onboarding-finish {
   border-color: var(--cyan-bright);
   color: var(--cyan-bright);
+}
+
+/* ===================================================================
+   MK II — ACCESSIBILITY LAYER + GLASS DEPTH (state-of-the-art pass)
+   Appended as one block so the upgrade is reviewable in isolation and
+   never destabilizes the tuned rules above. Three concerns:
+     1. keyboard focus rings (was: only a handful of ad-hoc :focus)
+     2. prefers-reduced-motion (was: ABSENT across 17 keyframes)
+     3. shared glass elevation + a quiet ambient core aura
+   =================================================================== */
+
+/* ---- 1. Keyboard focus visibility (rule: focus-states, keyboard-nav) ----
+   Every natively-focusable control and anything made focusable with tabindex
+   gets the same unmistakable double-stop halo. :focus-visible (not :focus) so
+   a mouse press never paints the ring — only keyboard/AT traversal does. The
+   void-gap stop keeps the ring legible even atop a cyan-stroked element. */
+a:focus-visible,
+button:focus-visible,
+input:focus-visible,
+select:focus-visible,
+textarea:focus-visible,
+[tabindex]:focus-visible,
+[role="button"]:focus-visible,
+[role="tab"]:focus-visible,
+[role="option"]:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+  border-radius: 3px;
+  position: relative;
+  z-index: 1;
+}
+
+/* ---- 2. Reduced motion (rule: reduced-motion) ----
+   A user who asks the OS for less motion gets a still HUD: the breathing core,
+   particle drift, dial spins, sweeps, pulses and entrance animations all
+   collapse to their resting frame, and every transition becomes effectively
+   instant. Instant is the CORRECT behavior here — the anti-flash transitions
+   exist to spare involuntary strobing for typical users; a reduced-motion user
+   has explicitly opted into hard cuts. (The R3F core honors this separately in
+   CoreScene via the same media query.) */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    transition-delay: 0ms !important;
+    scroll-behavior: auto !important;
+  }
+  .frame:hover {
+    transform: none;
+  }
+  .frame-title::after {
+    display: none;
+  }
+}
+
+/* ---- 3. Shared glass depth + ambient core aura ----
+   Lift each readout panel onto the elevation ladder so the glass reads as a
+   pane floating over the void rather than a flat fill. The shadow MUST live on
+   .frame (which has no clip-path) — a box-shadow on the clipped .frame-clip /
+   .frame-inner is eaten by their own octagon clip-path and paints nothing.
+   Additive to .frame's existing cyan drop-shadow glow and the inner sheen on
+   .frame-inner (both kept); this is the OUTER depth cast. */
+.frame {
+  box-shadow: var(--elev-1);
+}
+
+/* A soft cyan aura breathing behind the 3D core, painted on the DOM backdrop
+   (never the WebGL canvas — keeps the opaque-canvas anti-flash invariant). It
+   sits under the panels (z below .panel-layer) and only tints the void center
+   so the core feels seated in light. */
+.core-aura {
+  position: absolute;
+  left: 50%;
+  top: 43%;
+  width: 56vmin;
+  height: 56vmin;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 1;
+  background: radial-gradient(
+    circle at center,
+    rgba(26, 214, 255, 0.1),
+    rgba(26, 214, 255, 0.04) 42%,
+    transparent 68%
+  );
+  filter: blur(8px);
+  animation: coreAura 9s var(--ease-soft) infinite;
+}
+@keyframes coreAura {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  50% {
+    opacity: 0.85;
+    transform: translate(-50%, -50%) scale(1.08);
+  }
+}
+
+/* ===================================================================
+   MK II — CINEMATIC BOOT / WAKE REVEAL
+   A one-shot power-on overlay (component: BootReveal). Opaque void that
+   choreographs in, then fades itself out to reveal the HUD. The whole
+   overlay runs `bootOut` near the end so the unmount lands on a frame
+   that is already transparent (no hard pop).
+   =================================================================== */
+.boot-reveal {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: grid;
+  place-items: center;
+  background: var(--bg-void);
+  overflow: hidden;
+  cursor: pointer;
+  animation: bootOut 0.5s var(--ease-soft) 3s forwards;
+}
+@keyframes bootOut {
+  to {
+    opacity: 0;
+    visibility: hidden;
+  }
+}
+
+/* faint grid that fades up under the stamp */
+.boot-reveal .boot-grid {
+  position: absolute;
+  inset: 0;
+  background-image: radial-gradient(rgba(26, 214, 255, 0.12) 1px, transparent 1.4px);
+  background-size: 30px 30px;
+  opacity: 0;
+  animation: bootGrid 1.6s var(--ease-out) 0.5s forwards;
+}
+@keyframes bootGrid {
+  to {
+    opacity: 0.5;
+  }
+}
+
+/* a single bright line sweeping top -> bottom once (the "scan") */
+.boot-reveal .boot-scan {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 2px;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    var(--cyan-bright) 50%,
+    transparent
+  );
+  box-shadow: 0 0 22px 4px rgba(125, 243, 255, 0.5);
+  opacity: 0.9;
+  animation: bootScan 1.1s var(--ease-soft) 0.15s forwards;
+}
+@keyframes bootScan {
+  0% {
+    transform: translateY(0);
+    opacity: 0;
+  }
+  12% {
+    opacity: 0.9;
+  }
+  100% {
+    transform: translateY(100vh);
+    opacity: 0;
+  }
+}
+
+/* four corner brackets snapping into place */
+.boot-reveal .boot-corner {
+  position: absolute;
+  width: 54px;
+  height: 54px;
+  border: 0 solid var(--cyan);
+  opacity: 0;
+  box-shadow: 0 0 12px rgba(26, 214, 255, 0.5);
+  animation: bootCorner 0.7s var(--ease-out) 0.6s forwards;
+}
+.boot-reveal .boot-corner.tl {
+  left: 38px;
+  top: 38px;
+  border-left-width: 2px;
+  border-top-width: 2px;
+}
+.boot-reveal .boot-corner.tr {
+  right: 38px;
+  top: 38px;
+  border-right-width: 2px;
+  border-top-width: 2px;
+}
+.boot-reveal .boot-corner.bl {
+  left: 38px;
+  bottom: 38px;
+  border-left-width: 2px;
+  border-bottom-width: 2px;
+}
+.boot-reveal .boot-corner.br {
+  right: 38px;
+  bottom: 38px;
+  border-right-width: 2px;
+  border-bottom-width: 2px;
+}
+@keyframes bootCorner {
+  0% {
+    opacity: 0;
+    transform: scale(1.4);
+  }
+  100% {
+    opacity: 0.85;
+    transform: scale(1);
+  }
+}
+
+.boot-reveal .boot-center {
+  position: relative;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  gap: 10px;
+}
+
+/* two concentric reticle rings drawing/spinning in behind the stamp */
+.boot-reveal .boot-ring {
+  position: absolute;
+  width: 280px;
+  height: 280px;
+  border: 1px solid rgba(26, 214, 255, 0.5);
+  border-radius: 50%;
+  border-top-color: var(--cyan-bright);
+  border-right-color: transparent;
+  opacity: 0;
+  animation: bootRing 1.4s var(--ease-out) 0.4s forwards;
+}
+.boot-reveal .boot-ring-2 {
+  width: 360px;
+  height: 360px;
+  border-style: dashed;
+  border-color: rgba(125, 243, 255, 0.32);
+  animation-duration: 1.8s;
+  animation-direction: reverse;
+}
+@keyframes bootRing {
+  0% {
+    opacity: 0;
+    transform: scale(0.6) rotate(-140deg);
+  }
+  60% {
+    opacity: 0.8;
+  }
+  100% {
+    opacity: 0.55;
+    transform: scale(1) rotate(0deg);
+  }
+}
+
+/* the identity stamp */
+.boot-reveal .boot-mark {
+  font-family: var(--mono);
+  font-size: clamp(28px, 5vw, 64px);
+  font-weight: 700;
+  letter-spacing: 0.5em;
+  text-indent: 0.5em;
+  color: var(--ice);
+  text-shadow: 0 0 24px rgba(26, 214, 255, 0.8), 0 0 6px var(--cyan-bright);
+  opacity: 0;
+  animation: bootMark 1s var(--ease-out) 0.55s forwards;
+}
+@keyframes bootMark {
+  0% {
+    opacity: 0;
+    letter-spacing: 1.1em;
+    filter: blur(8px);
+    transform: scale(0.96);
+  }
+  100% {
+    opacity: 1;
+    letter-spacing: 0.5em;
+    filter: blur(0);
+    transform: scale(1);
+  }
+}
+
+.boot-reveal .boot-sub {
+  font-family: var(--mono);
+  font-size: clamp(8px, 1vw, 11px);
+  letter-spacing: 0.42em;
+  text-indent: 0.42em;
+  /* --ice-dim (#9cc3d4) clears WCAG AA (~8:1 on the void); the 0.55-alpha
+     --cyan-dim only reached 3.99:1 on this normal-size text. */
+  color: var(--ice-dim);
+  opacity: 0;
+  animation: bootFade 0.7s var(--ease-out) 1s forwards;
+}
+
+/* subsystem checklist — each line ticks in (staggered via an inline delay) with
+   its "ONLINE" status, between the mark resolving and the final all-clear. */
+.boot-reveal .boot-checklist {
+  list-style: none;
+  margin: 18px 0 4px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: clamp(240px, 32vw, 380px);
+  font-family: var(--mono);
+  font-size: clamp(9px, 0.95vw, 11px);
+  letter-spacing: 0.12em;
+}
+.boot-reveal .boot-checklist li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  opacity: 0;
+  animation: bootCheck 0.45s var(--ease-out) forwards;
+}
+.boot-reveal .bc-name {
+  color: var(--ice-dim);
+  white-space: nowrap;
+}
+.boot-reveal .bc-dots {
+  flex: 1;
+  height: 0;
+  border-bottom: 1px dotted rgba(125, 243, 255, 0.25);
+}
+.boot-reveal .bc-ok {
+  color: var(--learn-green);
+  text-shadow: 0 0 8px rgba(92, 224, 168, 0.6);
+}
+@keyframes bootCheck {
+  from {
+    opacity: 0;
+    transform: translateX(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+.boot-reveal .boot-status {
+  margin-top: 10px;
+  font-family: var(--mono);
+  font-size: clamp(10px, 1.1vw, 13px);
+  letter-spacing: 0.3em;
+  text-indent: 0.3em;
+  color: var(--learn-green);
+  text-shadow: 0 0 14px rgba(92, 224, 168, 0.7);
+  opacity: 0;
+  /* lands at 2.85s with a ~150ms hold before bootOut starts at 3s, so the
+     climax line reaches full strength and is never faded out mid-appearance */
+  animation: bootFade 0.45s var(--ease-out) 2.4s forwards;
+}
+@keyframes bootFade {
+  to {
+    opacity: 1;
+  }
+}
+
+/* Reduced motion: no choreography — the stamp, checklist + status are simply
+   present, then the React timer (~1.1s) unmounts the overlay in a single cut.
+   A hard cut is the correct, opted-into behavior under reduced-motion. */
+@media (prefers-reduced-motion: reduce) {
+  .boot-reveal,
+  .boot-reveal * {
+    animation: none !important;
+  }
+  .boot-reveal .boot-grid {
+    opacity: 0.4;
+  }
+  .boot-reveal .boot-mark,
+  .boot-reveal .boot-sub,
+  .boot-reveal .boot-status,
+  .boot-reveal .boot-corner,
+  .boot-reveal .boot-ring,
+  .boot-reveal .boot-checklist li {
+    opacity: 1;
+  }
+}
+
+/* ===================================================================
+   MK II — COMMAND DECK GLOW-UP
+   Spotlight/Raycast-grade entrance + depth for the existing command
+   surface. Additive only — the component markup/behavior is untouched;
+   this just deepens the scrim, floats the panel on the elevation ladder,
+   and gives it a spring entrance + a focus-lit input.
+   =================================================================== */
+.command-deck {
+  /* deeper, dimmer scrim with a centered focus so the deck pops forward */
+  background: radial-gradient(
+    ellipse at center,
+    rgba(2, 6, 12, 0.55),
+    rgba(1, 3, 7, 0.82) 100%
+  );
+  backdrop-filter: blur(7px) saturate(1.1);
+  -webkit-backdrop-filter: blur(7px) saturate(1.1);
+  animation: deckScrim var(--dur) var(--ease-out);
+}
+@keyframes deckScrim {
+  from {
+    opacity: 0;
+  }
+}
+
+.cmd-deck-frame {
+  /* float it on the top of the elevation ladder + a cyan rim glow, and let it
+     spring in from slightly small/low (transform-origin centered). */
+  filter: drop-shadow(var(--elev-3)) drop-shadow(0 0 28px rgba(26, 214, 255, 0.2));
+  animation: deckIn var(--dur-slow) var(--ease-out);
+}
+@keyframes deckIn {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.965);
+  }
+}
+
+/* The takeover desktop mounts CommandDeck inline (not as a centered modal); its
+   override neutralizes position/background but not animation, so the new
+   entrance would make the inline panel fade + spring on mount. Cancel it there. */
+.takeover-col-center .command-deck,
+.takeover-col-center .cmd-deck-frame {
+  animation: none;
+}
+
+/* Input becomes the obvious focus target: a brighter rest border and a full
+   focus-glow ring (Spotlight feel) layered over the global focus-visible. */
+.cmd-text {
+  transition:
+    border-color var(--dur-fast) var(--ease-out),
+    box-shadow var(--dur-fast) var(--ease-out),
+    background var(--dur-fast) var(--ease-out);
+}
+.cmd-text:focus {
+  border-color: var(--cyan-bright);
+  background: rgba(26, 214, 255, 0.07);
+  box-shadow:
+    inset 0 0 0 1px rgba(125, 243, 255, 0.25),
+    0 0 18px rgba(26, 214, 255, 0.28);
+}
+
+/* Launcher / action buttons: brighten + lift a hair on hover (pointer only). */
+@media (hover: hover) {
+  /* The deck is a <Frame>, so it also matches the generic .frame:hover lift,
+     whose single small drop-shadow would REPLACE the deck's elev-3 + rim glow
+     (filter is not additive). Re-assert the deck filter at higher specificity
+     so hovering the panel keeps its depth instead of shrinking it. */
+  .frame.cmd-deck-frame:hover {
+    transform: translateY(-2px);
+    filter: drop-shadow(var(--elev-3)) drop-shadow(0 0 32px rgba(26, 214, 255, 0.26));
+  }
+  .cmd-btn {
+    transition:
+      border-color var(--dur-fast) var(--ease-out),
+      background var(--dur-fast) var(--ease-out),
+      transform var(--dur-fast) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out);
+  }
+  .cmd-btn:hover:not(:disabled) {
+    transform: translateY(-1px);
+    box-shadow: 0 3px 12px rgba(26, 214, 255, 0.22);
+  }
+  /* constellation roster chips lift + glow on hover so the grid feels live */
+  .cmd-const-grid > * {
+    transition:
+      transform var(--dur-fast) var(--ease-out),
+      box-shadow var(--dur-fast) var(--ease-out),
+      border-color var(--dur-fast) var(--ease-out);
+  }
+  .cmd-const-grid > *:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 0 14px rgba(26, 214, 255, 0.2);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .command-deck,
+  .cmd-deck-frame {
+    animation: none !important;
+  }
+  .cmd-btn:hover:not(:disabled),
+  .cmd-const-grid > *:hover {
+    transform: none;
+  }
+}
+
+/* ===================================================================
+   MK II — TACTICAL CORE HUD (component: CoreHud)
+   A pointer-events:none overlay framing the 3D orb: range rings + degree
+   ticks, a rotating radar sweep, two live arc gauges (CPU cyan / memory
+   violet), and four corner readout clusters. z:2 sits above the opaque
+   canvas + vignette but below the panels (z:3); mounted AFTER the vignette
+   in App so it paints over it. Arc lengths carry a transition so a new
+   telemetry sample eases in; the radar is a pure CSS spin.
+   =================================================================== */
+.core-hud {
+  position: absolute;
+  left: 50%;
+  top: 43%;
+  /* Sized to fit the OPEN center on any viewport: capped by height (clear zone
+     between the latency strip and the bottom intel panel), by width (stay clear
+     of the side columns), and an absolute max. Prevents the ring colliding with
+     the panels on short/narrow windows. Framed against the now-smaller orb so
+     the corner readouts sit just OUTSIDE the bloom. */
+  width: min(500px, 42vh, 42vw);
+  height: min(500px, 42vh, 42vw);
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 2;
+}
+.core-hud-svg {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.ch-rings circle {
+  fill: none;
+  stroke: rgba(26, 214, 255, 0.1);
+  stroke-width: 1;
+}
+.ch-ticks line {
+  stroke: rgba(26, 214, 255, 0.32);
+  stroke-width: 1;
+}
+.ch-ticks line.major {
+  stroke: var(--cyan);
+  stroke-width: 1.5;
+}
+
+.ch-gauge-track {
+  fill: none;
+  stroke: rgba(26, 214, 255, 0.1);
+  stroke-width: 3;
+  stroke-linecap: round;
+}
+.ch-gauge-val {
+  fill: none;
+  stroke-width: 3.5;
+  stroke-linecap: round;
+  filter: drop-shadow(0 0 5px currentColor);
+  transition: stroke-dasharray 0.6s var(--ease-out);
+}
+.ch-cpu {
+  stroke: var(--cyan-bright);
+  color: var(--cyan-bright);
+}
+.ch-mem {
+  stroke: var(--cloud-violet);
+  color: var(--cloud-violet);
+}
+
+/* radar sweep — a conic wedge masked to an annulus, slowly rotating */
+.core-radar {
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  width: 94%;
+  height: 94%;
+  transform: translate(-50%, -50%);
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    rgba(26, 214, 255, 0) 0deg,
+    rgba(26, 214, 255, 0) 296deg,
+    rgba(26, 214, 255, 0.16) 348deg,
+    rgba(125, 243, 255, 0.45) 360deg
+  );
+  -webkit-mask-image: radial-gradient(circle at center, transparent 30%, #000 42%, #000 92%, transparent 100%);
+  mask-image: radial-gradient(circle at center, transparent 30%, #000 42%, #000 92%, transparent 100%);
+  animation: coreRadar 7s linear infinite;
+}
+@keyframes coreRadar {
+  to {
+    transform: translate(-50%, -50%) rotate(360deg);
+  }
+}
+
+/* Readout clusters flank the UPPER orb, two per side. They must stay in the
+   center column's clear upper zone: the GlobalScanPanel (z:3, opaque glass)
+   anchors to the LOWER-center and the left/right columns fill their edges, so
+   the only space the panels never cover is up here around the orb's top half.
+   (An earlier bottom-corner placement was occluded by a populated intel feed.) */
+.ch-readout {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  font-family: var(--mono);
+  text-shadow: 0 0 10px rgba(2, 6, 12, 0.9);
+}
+/* Symmetric FOUR-CORNER instrument layout. The orb is circular, so the square
+   box's CORNERS are empty (corner distance 1.41r > bloom radius) — corner
+   readouts are inherently clear of the bloom, and the top/bottom corners clear
+   the latency strip / GlobalScan respectively. CPU + MEMORY top, UPTIME +
+   CORE STATE bottom. */
+.ch-readout.tl {
+  left: -3%;
+  top: 0;
+  align-items: flex-start;
+}
+.ch-readout.tr {
+  right: -3%;
+  top: 0;
+  align-items: flex-end;
+  text-align: right;
+}
+.ch-readout.bl {
+  left: -3%;
+  bottom: 0;
+  align-items: flex-start;
+}
+.ch-readout.br {
+  right: -3%;
+  bottom: 0;
+  align-items: flex-end;
+  text-align: right;
+}
+.ch-k {
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  color: var(--ice-dim);
+}
+.ch-v {
+  font-size: 19px;
+  font-weight: 700;
+  letter-spacing: 0.03em;
+  color: var(--ice);
+  line-height: 1.05;
+}
+.ch-cpu-c {
+  color: var(--cyan-bright);
+}
+.ch-mem-c {
+  color: var(--cloud-violet);
+}
+.ch-state {
+  font-size: 13px;
+  color: var(--cyan-bright);
+}
+.ch-sub {
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  color: var(--ice-dim);
+}
+
+/* KPI sparklines: a rolling line+area trend under the CPU/MEM readouts, turning
+   the gauges into a live monitoring graph. Updates only on new telemetry (no
+   continuous animation), so it's inherently reduced-motion-friendly. */
+.ch-spark {
+  display: block;
+  width: 96px;
+  height: 20px;
+  margin-top: 4px;
+  overflow: visible;
+}
+.ch-spark .sp-area {
+  opacity: 0.16;
+}
+.ch-spark .sp-line {
+  fill: none;
+  stroke-width: 1.4;
+  vector-effect: non-scaling-stroke;
+  filter: drop-shadow(0 0 3px currentColor);
+}
+.ch-cpu-spark .sp-area {
+  fill: var(--cyan);
+}
+.ch-cpu-spark .sp-line {
+  stroke: var(--cyan-bright);
+  color: var(--cyan-bright);
+}
+.ch-mem-spark .sp-area {
+  fill: var(--cloud-violet);
+}
+.ch-mem-spark .sp-line {
+  stroke: var(--cloud-violet);
+  color: var(--cloud-violet);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .core-radar {
+    animation: none;
+  }
+}
+
+/* ===================================================================
+   MK II — NEURAL CONDUITS (component: ConduitField)
+   Energy channels from the core out to the panel columns, each carrying
+   a travelling pulse (pure CSS stroke-dashoffset on a pathLength=100 path,
+   so every conduit's pulse travels at the same normalized rate regardless
+   of its real length). z:2, pointer-events:none. Activity speeds + brightens
+   the flow; cloud compute tints it violet; reduced-motion stills it.
+   =================================================================== */
+.conduits {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 2;
+  pointer-events: none;
+  overflow: visible;
+}
+.conduit-base {
+  fill: none;
+  stroke: rgba(26, 214, 255, 0.11);
+  stroke-width: 1;
+}
+.conduit-flow {
+  fill: none;
+  stroke: var(--cyan-bright);
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-dasharray: 9 91; /* a visible streak per normalized path length (seamless) */
+  opacity: 0.5;
+  filter: drop-shadow(0 0 5px var(--cyan));
+  animation: conduitFlow 3.4s linear infinite;
+}
+@keyframes conduitFlow {
+  from {
+    stroke-dashoffset: 100;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.conduits.active .conduit-flow {
+  opacity: 0.85;
+  stroke-width: 2;
+  animation-duration: 1.5s;
+}
+.conduits.cloud .conduit-flow {
+  stroke: var(--cloud-violet);
+  filter: drop-shadow(0 0 5px var(--cloud-violet));
+}
+.conduits.cloud .conduit-base {
+  stroke: rgba(157, 125, 255, 0.08);
+}
+@media (prefers-reduced-motion: reduce) {
+  .conduit-flow {
+    animation: none;
+    opacity: 0;
+  }
+}
+
+/* ===================================================================
+   MK II — DEPTH PARALLAX
+   App publishes the cursor as --par-x / --par-y (-1..1 from center). The
+   background layers translate by it at different rates so they separate in
+   depth behind the static (interactive) panels: the backdrop drifts OPPOSITE
+   the cursor (far), the conduits + tactical overlay drift WITH it (near); the
+   R3F core adds its own pointer tilt. Eased so it glides, never snaps.
+   =================================================================== */
+.hud-backdrop {
+  transform: translate3d(calc(var(--par-x, 0) * -16px), calc(var(--par-y, 0) * -16px), 0);
+  transition: transform 0.5s var(--ease-out);
+}
+.conduits {
+  transform: translate3d(calc(var(--par-x, 0) * 7px), calc(var(--par-y, 0) * 7px), 0);
+  transition: transform 0.4s var(--ease-out);
+}
+.core-hud {
+  transform: translate(-50%, -50%)
+    translate3d(calc(var(--par-x, 0) * 9px), calc(var(--par-y, 0) * 9px), 0);
+  transition: transform 0.4s var(--ease-out);
+}
+@media (prefers-reduced-motion: reduce) {
+  .hud-backdrop,
+  .conduits {
+    transform: none;
+  }
+  .core-hud {
+    transform: translate(-50%, -50%);
+  }
+}
+
+/* ===================================================================
+   MK II — HOLOGRAPHIC PROJECTION FLOOR
+   A perspective ground-grid receding to a horizon beneath the core, so the
+   centerpiece reads as projected into volumetric space. Slowly scrolls toward
+   the viewer; masked to fade out at the horizon + sides. z:1 (deep bg).
+   =================================================================== */
+.holo-floor {
+  position: absolute;
+  left: 50%;
+  bottom: -4%;
+  width: 160vw;
+  height: 62vh;
+  transform: translateX(-50%) perspective(440px) rotateX(75deg);
+  transform-origin: center bottom;
+  z-index: 1;
+  pointer-events: none;
+  background-image:
+    linear-gradient(rgba(26, 214, 255, 0.16) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(26, 214, 255, 0.16) 1px, transparent 1px);
+  background-size: 64px 64px;
+  -webkit-mask-image: radial-gradient(ellipse 60% 100% at 50% 100%, #000 8%, transparent 74%);
+  mask-image: radial-gradient(ellipse 60% 100% at 50% 100%, #000 8%, transparent 74%);
+  opacity: 0.5;
+  animation: holoFloor 8s linear infinite;
+}
+@keyframes holoFloor {
+  to {
+    background-position: 0 64px;
+  }
+}
+
+/* ===================================================================
+   MK II — VOICE-REACTIVE LIGHT FIELD
+   A cyan glow blooming from the core across the HUD, its strength following the
+   smoothed --voice amplitude (set per-frame from the audioStore) — the core
+   "lighting the room" as JARVIS speaks/listens. z:2, pointer-events:none.
+   =================================================================== */
+.voice-field {
+  position: absolute;
+  inset: 0;
+  z-index: 2;
+  pointer-events: none;
+  background: radial-gradient(
+    circle at 50% 44%,
+    rgba(125, 243, 255, 0.16) 0%,
+    rgba(26, 214, 255, 0.08) 28%,
+    transparent 52%
+  );
+  opacity: calc(var(--voice, 0) * 0.85);
+  transition: opacity 0.1s linear;
+}
+
+/* ===================================================================
+   MK II — PANEL MATERIALIZATION
+   The readout regions are hidden behind the boot overlay while it plays, then
+   "deal in" once (staggered fade + slide + bright flash) when the sequence
+   ends. from-only keyframe → resting state is normal-visible, so if boot never
+   runs (dev / no daemon) the panels just show with no entrance.
+   =================================================================== */
+/* TRANSITION-based reveal (not a keyframe): the panels' RESTING state is fully
+   visible, so they can never get stuck hidden if the transition is throttled or
+   never runs (a paused keyframe with both-fill would freeze at opacity:0). They
+   are hidden ONLY while .pre-reveal is applied (during boot, behind the
+   overlay); when it's removed they ease in, staggered per region. */
+.panel-layer > * {
+  transition:
+    opacity 0.5s var(--ease-out),
+    transform 0.5s var(--ease-out);
+}
+.panel-layer > *:nth-child(1) {
+  transition-delay: 0.02s;
+}
+.panel-layer > *:nth-child(2) {
+  transition-delay: 0.1s;
+}
+.panel-layer > *:nth-child(3) {
+  transition-delay: 0.18s;
+}
+.panel-layer > *:nth-child(4) {
+  transition-delay: 0.26s;
+}
+.panel-layer > *:nth-child(5) {
+  transition-delay: 0.34s;
+}
+.panel-layer > *:nth-child(6) {
+  transition-delay: 0.42s;
+}
+.panel-layer.pre-reveal > * {
+  opacity: 0;
+  transform: translateY(10px);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .holo-floor {
+    animation: none;
+  }
+  .voice-field {
+    opacity: 0;
+  }
+  .panel-layer > * {
+    transition: none;
+  }
+  .panel-layer.pre-reveal > * {
+    transform: none;
+  }
 }
