@@ -424,7 +424,7 @@ fn error_signature(line: &str) -> Option<String> {
         return None;
     }
     // Everything after the first ": " (the message), else after the target.
-    let msg = line.splitn(2, ": ").nth(1).unwrap_or(line).trim();
+    let msg = line.split_once(": ").map(|x| x.1).unwrap_or(line).trim();
     // Trim a volatile detail tail introduced by " error=" / " err=".
     let cut = msg
         .find(" error=")

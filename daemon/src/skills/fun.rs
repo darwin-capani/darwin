@@ -399,7 +399,7 @@ fn wordle_feedback(args: &Value) -> Result<String> {
 
     // Two-pass scoring. Pass 1: greens, consuming the matched answer letters from
     // a tally. Pass 2: yellows only while an unmatched copy remains; else gray.
-    let mut marks = vec!['-'; 5];
+    let mut marks = ['-'; 5];
     let mut counts = [0u8; 26];
     for (i, &ac) in a.iter().enumerate() {
         if g[i] == ac {

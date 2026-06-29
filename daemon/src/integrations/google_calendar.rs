@@ -54,6 +54,7 @@ const DEFAULT_CALENDAR: &str = "primary";
 
 /// One event, as returned by `events.list`, `events.get` and `events.insert`.
 #[derive(Debug, Clone, Deserialize)]
+#[derive(Default)]
 struct Event {
     #[serde(default)]
     id: String,
@@ -348,17 +349,6 @@ impl GoogleCalendarClient<super::ReqwestTransport> {
 // instead of failing the whole call after the event was already created.
 // ---------------------------------------------------------------------------
 
-impl Default for Event {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            summary: String::new(),
-            start: EventTime::default(),
-            end: EventTime::default(),
-            html_link: String::new(),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers (pure — unit-testable without a transport)

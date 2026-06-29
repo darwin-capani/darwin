@@ -448,7 +448,7 @@ pub fn rank<P: EmbeddingProvider>(
         let sig = dedup_signature(&hit.fact);
         // An all-stopword / empty value has an empty signature; treat each such
         // fact as distinct (do not collapse unrelated empties together).
-        let is_dup = !sig.is_empty() && seen.iter().any(|s| *s == sig);
+        let is_dup = !sig.is_empty() && seen.contains(&sig);
         if is_dup {
             continue;
         }
@@ -821,7 +821,7 @@ mod tests {
         let hits = rank("ignored by this provider", &facts, 2, &IndexProvider);
         // Highest index scores highest -> the last fact ranks first.
         assert_eq!(hits[0].index, facts.len() - 1);
-        assert_eq!(method_status(&IndexProvider).to_lowercase().contains("embedding"), true);
+        assert!(method_status(&IndexProvider).to_lowercase().contains("embedding"));
     }
 
     // ---- proactive surface helper (read-only, no speak) --------------------

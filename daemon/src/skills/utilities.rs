@@ -186,7 +186,7 @@ fn decode_b64(s: &str) -> Result<Vec<u8>> {
     if s.is_empty() {
         return Ok(Vec::new());
     }
-    if !s.is_ascii() || s.len() % 4 != 0 {
+    if !s.is_ascii() || !s.len().is_multiple_of(4) {
         return Err(anyhow!(
             "base64_decode: input length must be a multiple of 4 and ASCII"
         ));

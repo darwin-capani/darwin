@@ -1502,7 +1502,7 @@ mod tests {
     /// Pull a query-parameter value out of a built consent URL (the flow
     /// percent-encodes values; for our ASCII state/port that's an identity, but
     /// we decode to be exact). Test-only helper.
-    fn url_param<'u>(url: &'u str, key: &str) -> Option<String> {
+    fn url_param(url: &str, key: &str) -> Option<String> {
         let query = url.split_once('?').map(|(_, q)| q).unwrap_or("");
         parse_query(query)
             .into_iter()

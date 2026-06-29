@@ -84,8 +84,10 @@ pub fn classify_intent(utterance: &str) -> Option<CloneIntent> {
 /// confirmation gate so a clone (audio leaving the device) can never fire from a
 /// single utterance, automatically, or from a misheard fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default)]
 pub enum CloneState {
     /// No clone proposed.
+    #[default]
     Idle,
     /// A clone was proposed and is AWAITING an explicit spoken confirmation. Carries
     /// the resolved owner sample path (already confined) and the agent slot the
@@ -93,11 +95,6 @@ pub enum CloneState {
     Pending { sample: PathBuf, agent: String },
 }
 
-impl Default for CloneState {
-    fn default() -> Self {
-        CloneState::Idle
-    }
-}
 
 /// Whether an utterance is an explicit affirmative confirming a pending clone.
 /// CONSERVATIVE and NEGATION-FAIL-SAFE: only clear yes-phrasings confirm (so an

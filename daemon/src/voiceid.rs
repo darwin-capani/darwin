@@ -502,13 +502,13 @@ pub fn vault_path(root: &Path) -> PathBuf {
 /// `key` applied via SQLCipher `PRAGMA key`, and ensure its single-row schema.
 fn open_vault(path: &Path, key: &crate::crypto::SecretKey) -> std::io::Result<rusqlite::Connection> {
     let conn = rusqlite::Connection::open(path)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     crate::crypto::apply_key(&conn, key)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        .map_err(std::io::Error::other)?;
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS owner(id INTEGER PRIMARY KEY CHECK(id=1), profile_json TEXT NOT NULL);",
     )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    .map_err(std::io::Error::other)?;
     Ok(conn)
 }
 
@@ -551,7 +551,7 @@ pub fn save_profile_encrypted(
          ON CONFLICT(id) DO UPDATE SET profile_json = excluded.profile_json",
         rusqlite::params![json],
     )
-    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    .map_err(std::io::Error::other)?;
     drop(conn);
     set_mode(&path, 0o600);
     Ok(())

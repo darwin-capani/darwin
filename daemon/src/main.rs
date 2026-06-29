@@ -550,11 +550,10 @@ fn sweep_stale_utterances(root: &Path) {
         // remaining sentences can leave some behind, so reclaim them on restart.
         let stale = (name.starts_with("utterance-") || name.starts_with("tts-"))
             && name.ends_with(".wav");
-        if stale {
-            if std::fs::remove_file(entry.path()).is_ok() {
+        if stale
+            && std::fs::remove_file(entry.path()).is_ok() {
                 swept += 1;
             }
-        }
     }
     if swept > 0 {
         info!(swept, "removed stale utterance WAVs from state/tmp");

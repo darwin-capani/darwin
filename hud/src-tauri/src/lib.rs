@@ -736,7 +736,7 @@ async fn enter_takeover(
             for m in applied.iter().rev() {
                 let _ = drive_step(&window, *m, false);
             }
-            let _ = reset_presentation_to_default();
+            reset_presentation_to_default();
             return Err(format!("enter_takeover failed at {:?}: {e}", step.mutation));
         }
         applied.push(step.mutation);
@@ -857,7 +857,7 @@ pub fn run() {
         // Custom macOS menu: the "About J.A.R.V.I.S." item opens our custom About
         // panel (emits ABOUT_MENU_EVENT to the webview) instead of the system
         // about panel; everything else is the standard predefined menu.
-        .menu(|handle| build_app_menu(handle))
+        .menu(build_app_menu)
         // When About is picked, emit the app version to the webview, which mounts
         // the custom About panel. No other menu id is consequential here.
         .on_menu_event(|handle, event| {

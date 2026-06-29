@@ -1313,7 +1313,7 @@ profile = \"default\"      # SHIPS NEUTRAL.
 
         // End-to-end: a key under a comment-tagged header round-trips.
         let text = "[screen_context]   # #42 the privacy-sensitive read\ninterval_secs = 30   # cadence\n";
-        let u = apply_changes(&text, &[Change {
+        let u = apply_changes(text, &[Change {
             id: "screen_context.interval_secs".into(),
             value: SettingValue::Int(45),
         }]).expect("apply under comment-tagged header");

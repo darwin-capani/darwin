@@ -76,6 +76,7 @@ const MULTIPART_BOUNDARY: &str = "jarvis-drive-boundary";
 /// (`mimeType`/`modifiedTime`); serde maps them onto the snake_case fields.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+#[derive(Default)]
 struct DriveFile {
     #[serde(default)]
     id: String,
@@ -337,16 +338,6 @@ impl DriveClient<super::ReqwestTransport> {
 // gracefully instead of failing the whole call after the file was created.
 // ---------------------------------------------------------------------------
 
-impl Default for DriveFile {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            name: String::new(),
-            mime_type: String::new(),
-            modified_time: String::new(),
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Helpers (pure — unit-testable without a transport)

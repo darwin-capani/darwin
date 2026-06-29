@@ -551,15 +551,15 @@ fn is_prime_u64(n: u64) -> bool {
     if n < 2 {
         return false;
     }
-    if n % 2 == 0 {
+    if n.is_multiple_of(2) {
         return n == 2;
     }
-    if n % 3 == 0 {
+    if n.is_multiple_of(3) {
         return n == 3;
     }
     let mut i: u64 = 5;
     while i.saturating_mul(i) <= n {
-        if n % i == 0 || n % (i + 2) == 0 {
+        if n.is_multiple_of(i) || n.is_multiple_of(i + 2) {
             return false;
         }
         i += 6;
@@ -589,9 +589,9 @@ fn factorize(args: &Value) -> Result<String> {
     let mut factors: Vec<(u64, u32)> = Vec::new();
     let mut d: u64 = 2;
     while d.saturating_mul(d) <= m {
-        if m % d == 0 {
+        if m.is_multiple_of(d) {
             let mut exp = 0;
-            while m % d == 0 {
+            while m.is_multiple_of(d) {
                 m /= d;
                 exp += 1;
             }
