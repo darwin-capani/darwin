@@ -27,6 +27,7 @@ mod code;
 mod command;
 mod config;
 mod confirm;
+mod connector;
 mod crypto;
 // MULTI-SPEAKER DIARIZATION (#31): the PURE mapper that CONSUMES the speaker labels the
 // ElevenLabs Scribe STT backend reports into a per-speaker diarized transcript, and the
@@ -1482,6 +1483,9 @@ async fn main() -> Result<()> {
     // Install the global trace store so the read-only `oracle_ask` query tool can
     // reach the corpus without threading it through the whole tool-dispatch chain.
     optimize::set_global_trace_store(trace_store.clone());
+    // Install the config path so the CONSEQUENTIAL `connector_add` tool can append
+    // a vetted [[mcp.servers]] block to jarvis.toml (same OnceLock pattern).
+    connector::set_config_path(root.join("config").join("jarvis.toml"));
 
     // The EVAL scorecard's live, in-memory rolling state (eval.rs): bounded
     // windows of MEASURED per-turn latencies + cloud token usage. Held for the

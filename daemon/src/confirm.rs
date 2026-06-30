@@ -198,6 +198,12 @@ pub const CONSEQUENTIAL_TOOLS: &[&str] = &[
     // batches, never loops. The actuation itself is device-gated (Accessibility
     // TCC consent + a real display) and built-not-run.
     "ui_actuate",
+    // Adding an MCP connector = a persistent mutation of the machine's tool
+    // surface (a vetted [[mcp.servers]] entry written to jarvis.toml). It ALWAYS
+    // parks for a spoken yes on the exact spec; it never auto-applies. It handles
+    // NO secret (the token goes to the Keychain out-of-band) and the connector is
+    // added INERT (agents=[], every tool gated).
+    "connector_add",
 ];
 
 /// Whether a tool name is consequential (side-effecting) and therefore must be
@@ -918,12 +924,15 @@ mod tests {
         // DANGEROUS tool — it physically actuates the UI — so it MUST be gated PER
         // ACTION (it always parks; one confirm = one actuation; it never auto-runs).
         assert!(is_consequential_tool("ui_actuate"), "ui_actuate must be gated per-action (it parks, never auto-runs)");
-        // Exactly the 18 gate-routed tools, no dupes.
-        assert_eq!(CONSEQUENTIAL_TOOLS.len(), 18, "expected 18 consequential tools");
+        // connector_add adds an MCP connector (a persistent config mutation) — it
+        // MUST be gated (it always parks for a spoken yes; it never auto-applies).
+        assert!(is_consequential_tool("connector_add"), "connector_add must be gated (it parks, never auto-applies)");
+        // Exactly the 19 gate-routed tools, no dupes.
+        assert_eq!(CONSEQUENTIAL_TOOLS.len(), 19, "expected 19 consequential tools");
         let mut sorted = CONSEQUENTIAL_TOOLS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 18, "no duplicate consequential tool names");
+        assert_eq!(sorted.len(), 19, "no duplicate consequential tool names");
     }
 
     #[test]
