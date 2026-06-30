@@ -627,6 +627,22 @@ fn tool_defs() -> &'static Value {
                 }
             },
             {
+                "name": "connector_add",
+                "description": "Add an MCP connector (a new tool server) to JARVIS. CONSEQUENTIAL: this writes a vetted [[mcp.servers]] entry to the user's config and ALWAYS asks for a spoken confirmation first (it never auto-applies). It NEVER handles secrets — do NOT pass any token/key/password; if the connector needs one, set uses_token=true and the user stores it in the Keychain out-of-band. The connector is added INERT (no agent may use it, every tool gated) and connects on the next restart after the user grants agents. For http, give an https:// url; for stdio, give an absolute command path. Use when the user asks to add/install/connect an MCP server or tool connector by name.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Server id: lowercase letters/digits with single _ or - separators, e.g. 'github' or 'local-fs'"},
+                        "transport": {"type": "string", "description": "'http' (remote MCP over https) or 'stdio' (local subprocess)"},
+                        "url": {"type": "string", "description": "http only: the https:// endpoint URL"},
+                        "command": {"type": "string", "description": "stdio only: the absolute path to the interpreter/binary to spawn"},
+                        "args": {"type": "array", "items": {"type": "string"}, "description": "stdio only: arguments after the command"},
+                        "uses_token": {"type": "boolean", "description": "true if the server authenticates with a token (stored by the user in the Keychain; never passed here)"}
+                    },
+                    "required": ["name", "transport"]
+                }
+            },
+            {
                 "name": "open_path",
                 "description": "Open a specific file or folder in its default application. Only paths under the user's home folder or /Applications are permitted. Call this after search_files when the user wants the found file opened.",
                 "input_schema": {
@@ -7759,6 +7775,14 @@ async fn dispatch_tool(
             }
             None => Err(anyhow!("map_trace needs a 'trace' string argument")),
         },
+        // CONNECTOR ADD — CONSEQUENTIAL (in CONSEQUENTIAL_TOOLS, so execute_tool
+        // PARKS it for a spoken yes). gate(confirm): DryRun returns the preview the
+        // user confirms; Execute appends a vetted, INERT [[mcp.servers]] block. It
+        // takes NO secret (deny_unknown_fields rejects a sneaked token).
+        "connector_add" => match serde_json::from_value::<crate::connector::ConnectorRequest>(input.clone()) {
+            Ok(req) => crate::connector::add_connector(req).await,
+            Err(e) => Err(anyhow!("invalid connector_add arguments: {e}")),
+        },
         other => Err(anyhow!("unknown tool '{other}'")),
     };
     match result {
@@ -12144,6 +12168,7 @@ mod tests {
                 "oracle_ask",
                 "egress_snapshot",
                 "map_trace",
+                "connector_add",
                 "open_path",
                 "open_url",
                 "web_search",
