@@ -126,6 +126,66 @@ pub fn skills() -> Vec<SkillDef> {
             &["roll dice", "roll a d20", "2d6", "dice roll", "throw the dice"],
             dice_roll,
         ),
+        SkillDef::new(
+            "rot13",
+            Category::Utilities,
+            "Apply the ROT13 letter substitution (a<->n, etc.) to text; non-letters pass through. Self-inverse. Use to lightly obfuscate or reveal a spoiler.",
+            &["rot13", "rot-13", "obfuscate text", "spoiler cipher"],
+            rot13,
+        )
+        .with_eval_vectors(&[("{\"text\":\"Hello\"}", "Uryyb"), ("{\"text\":\"Uryyb\"}", "Hello")]),
+        SkillDef::new(
+            "caesar_cipher",
+            Category::Utilities,
+            "Shift the letters of 'text' by integer 'shift' (mod 26, wrapping); non-letters pass through. Use for a classic Caesar cipher — a negative shift decodes.",
+            &["caesar cipher", "shift cipher", "rotate letters", "encrypt with a shift"],
+            caesar_cipher,
+        )
+        .with_eval_vectors(&[("{\"text\":\"abc\",\"shift\":1}", "bcd"), ("{\"text\":\"xyz\",\"shift\":3}", "abc")]),
+        SkillDef::new(
+            "luhn_check",
+            Category::Utilities,
+            "Validate a number string against the Luhn checksum (credit cards, IMEIs); spaces/dashes ignored. Returns 'valid' or 'invalid'. Use to sanity-check a card/ID check digit.",
+            &["luhn", "luhn check", "validate credit card", "card checksum"],
+            luhn_check,
+        )
+        .with_eval_vectors(&[("{\"number\":\"79927398713\"}", "valid"), ("{\"number\":\"79927398710\"}", "invalid")]),
+        SkillDef::new(
+            "rgb_to_hex",
+            Category::Utilities,
+            "Convert an RGB color (integers 'r','g','b', each 0..=255) to a #rrggbb hex string. Use to turn channel values into a CSS hex color.",
+            &["rgb to hex", "color to hex", "hex color", "rgb hex"],
+            rgb_to_hex,
+        )
+        .with_eval_vectors(&[("{\"r\":255,\"g\":0,\"b\":128}", "#ff0080"), ("{\"r\":0,\"g\":0,\"b\":0}", "#000000")]),
+        SkillDef::new(
+            "hex_to_rgb",
+            Category::Utilities,
+            "Convert a #rrggbb hex color (the leading # is optional) to an rgb(r, g, b) string. Use to read a hex color as channel values.",
+            &["hex to rgb", "hex color to rgb", "parse hex color", "rgb from hex"],
+            hex_to_rgb,
+        )
+        .with_eval_vectors(&[("{\"hex\":\"#ff0080\"}", "rgb(255, 0, 128)"), ("{\"hex\":\"00ff00\"}", "rgb(0, 255, 0)")]),
+        SkillDef::new(
+            "binary_encode",
+            Category::Utilities,
+            "Encode 'text' as space-separated 8-bit binary, one octet per UTF-8 byte. Use to show the raw bits of a string.",
+            &["text to binary", "binary encode", "to bits", "ascii to binary"],
+            binary_encode,
+        )
+        .with_eval_vectors(&[("{\"text\":\"A\"}", "01000001"), ("{\"text\":\"Hi\"}", "01001000 01101001")]),
+        SkillDef::new(
+            "sql_guard",
+            Category::Utilities,
+            "Classify whether a SQL query is strictly READ-ONLY (a single SELECT/WITH/EXPLAIN with no write/DDL keywords, no extra statements, no comments). Returns 'read-only: OK' or 'REJECTED: <reason>'. The fail-closed safety core for any read-only query tool — conservative by design (it rejects a query that merely MENTIONS a write keyword).",
+            &["is this sql read only", "sql guard", "validate sql", "read only query check"],
+            sql_guard,
+        )
+        .with_eval_vectors(&[
+            ("{\"sql\":\"SELECT * FROM traces\"}", "read-only: OK"),
+            ("{\"sql\":\"UPDATE traces SET x=1\"}", "REJECTED: must start with SELECT, WITH, or EXPLAIN (got 'UPDATE')"),
+            ("{\"sql\":\"SELECT 1; DROP TABLE t\"}", "REJECTED: multiple statements are not allowed"),
+        ]),
     ]
 }
 
@@ -630,6 +690,180 @@ fn dice_roll(args: &Value) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
+// Ciphers / encoders (pure, deterministic) — Library batch
+// ---------------------------------------------------------------------------
+
+/// `rot13 {text}` -> ROT13 of the ASCII letters; everything else passes through.
+/// Self-inverse. Pure.
+fn rot13(args: &Value) -> Result<String> {
+    let text = require_str(args, "text", "rot13")?;
+    Ok(text
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' => (((c as u8 - b'A' + 13) % 26) + b'A') as char,
+            'a'..='z' => (((c as u8 - b'a' + 13) % 26) + b'a') as char,
+            _ => c,
+        })
+        .collect())
+}
+
+/// `caesar_cipher {text, shift}` -> letters shifted by `shift` (mod 26, wrapping;
+/// a negative shift decodes); non-letters pass through. Pure.
+fn caesar_cipher(args: &Value) -> Result<String> {
+    let text = require_str(args, "text", "caesar_cipher")?;
+    let shift = args
+        .get("shift")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| anyhow!("caesar_cipher needs an integer 'shift'"))?;
+    let s = shift.rem_euclid(26) as u8;
+    Ok(text
+        .chars()
+        .map(|c| match c {
+            'A'..='Z' => (((c as u8 - b'A' + s) % 26) + b'A') as char,
+            'a'..='z' => (((c as u8 - b'a' + s) % 26) + b'a') as char,
+            _ => c,
+        })
+        .collect())
+}
+
+/// `luhn_check {number}` -> "valid" or "invalid" per the Luhn checksum. Spaces and
+/// dashes are ignored; any other non-digit is a friendly error. Pure.
+fn luhn_check(args: &Value) -> Result<String> {
+    let number = require_str(args, "number", "luhn_check")?;
+    let mut digits: Vec<u32> = Vec::new();
+    for c in number.chars() {
+        if c.is_whitespace() || c == '-' {
+            continue;
+        }
+        digits.push(
+            c.to_digit(10)
+                .ok_or_else(|| anyhow!("luhn_check: '{c}' is not a digit"))?,
+        );
+    }
+    if digits.is_empty() {
+        return Err(anyhow!("luhn_check: no digits in the input"));
+    }
+    let mut sum = 0u32;
+    let mut double = false;
+    for &d in digits.iter().rev() {
+        let v = if double {
+            let x = d * 2;
+            if x > 9 {
+                x - 9
+            } else {
+                x
+            }
+        } else {
+            d
+        };
+        sum += v;
+        double = !double;
+    }
+    Ok(if sum % 10 == 0 {
+        "valid".to_string()
+    } else {
+        "invalid".to_string()
+    })
+}
+
+/// `rgb_to_hex {r,g,b}` -> a #rrggbb hex string (each channel an integer 0..=255).
+/// Pure.
+fn rgb_to_hex(args: &Value) -> Result<String> {
+    let chan = |k: &str| -> Result<u64> {
+        args.get(k)
+            .and_then(Value::as_u64)
+            .filter(|v| *v <= 255)
+            .ok_or_else(|| anyhow!("rgb_to_hex needs integer 'r','g','b', each 0..=255"))
+    };
+    Ok(format!(
+        "#{:02x}{:02x}{:02x}",
+        chan("r")?,
+        chan("g")?,
+        chan("b")?
+    ))
+}
+
+/// `hex_to_rgb {hex}` -> an rgb(r, g, b) string from a #rrggbb hex color (the
+/// leading # is optional). Pure.
+fn hex_to_rgb(args: &Value) -> Result<String> {
+    let raw = require_str(args, "hex", "hex_to_rgb")?;
+    let hex = raw.trim().trim_start_matches('#');
+    if hex.len() != 6 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(anyhow!("hex_to_rgb needs a 6-digit hex color like #ff0080"));
+    }
+    let parse = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).expect("validated hex pair");
+    Ok(format!("rgb({}, {}, {})", parse(0), parse(2), parse(4)))
+}
+
+/// `binary_encode {text}` -> space-separated 8-bit binary, one octet per UTF-8
+/// byte. Pure.
+fn binary_encode(args: &Value) -> Result<String> {
+    let text = require_str(args, "text", "binary_encode")?;
+    if text.is_empty() {
+        return Err(anyhow!("binary_encode: empty input"));
+    }
+    Ok(text
+        .bytes()
+        .map(|b| format!("{b:08b}"))
+        .collect::<Vec<_>>()
+        .join(" "))
+}
+
+// ---------------------------------------------------------------------------
+// sql_guard — read-only SQL safety classifier (the core a query tool gates on)
+// ---------------------------------------------------------------------------
+
+/// `sql_guard {sql}` -> "read-only: OK" or "REJECTED: <reason>". A FAIL-CLOSED
+/// classifier: a query is read-only only if it is a single SELECT/WITH/EXPLAIN
+/// statement with no comments, no extra statements, and no write/DDL keyword
+/// token anywhere. Conservative by design — it rejects a query that merely
+/// MENTIONS a write keyword (e.g. in a string literal), because for a safety gate
+/// a false reject is fine and a false accept is not. Pure + total (only a missing
+/// 'sql' arg is an error; every query yields a verdict, never a panic).
+fn sql_guard(args: &Value) -> Result<String> {
+    let sql = require_str(args, "sql", "sql_guard")?;
+    Ok(classify_sql(sql))
+}
+
+/// Pure verdict function behind [`sql_guard`], factored out so it is exhaustively
+/// unit-tested without the arg-plumbing.
+fn classify_sql(sql: &str) -> String {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    if trimmed.is_empty() {
+        return "REJECTED: empty query".to_string();
+    }
+    if trimmed.contains("--") || trimmed.contains("/*") {
+        return "REJECTED: comments are not allowed".to_string();
+    }
+    // A ';' that survived the trailing-trim means more than one statement.
+    if trimmed.contains(';') {
+        return "REJECTED: multiple statements are not allowed".to_string();
+    }
+    let upper = trimmed.to_ascii_uppercase();
+    let first = upper.split_whitespace().next().unwrap_or("");
+    if !matches!(first, "SELECT" | "WITH" | "EXPLAIN") {
+        return format!("REJECTED: must start with SELECT, WITH, or EXPLAIN (got '{first}')");
+    }
+    // Write/DDL keywords are forbidden as whole tokens ANYWHERE (a writable CTE,
+    // a stacked write, etc.). Tokenize on non-identifier chars so substrings of a
+    // larger identifier (e.g. `updated_at`) do not trip it.
+    const DENY: &[&str] = &[
+        "INSERT", "UPDATE", "DELETE", "DROP", "ALTER", "CREATE", "REPLACE", "TRUNCATE", "ATTACH",
+        "DETACH", "PRAGMA", "VACUUM", "REINDEX", "GRANT", "REVOKE", "MERGE", "UPSERT",
+    ];
+    let tokens: std::collections::HashSet<&str> = upper
+        .split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .filter(|t| !t.is_empty())
+        .collect();
+    for &kw in DENY {
+        if tokens.contains(kw) {
+            return format!("REJECTED: contains the write/DDL keyword '{kw}'");
+        }
+    }
+    "read-only: OK".to_string()
+}
+
+// ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
 
@@ -933,6 +1167,56 @@ mod tests {
         assert!(dice_roll(&json!({"seed": 1, "count": 0})).is_err(), "count 0 rejected");
         assert!(dice_roll(&json!({"seed": 1, "sides": 1})).is_err(), "1-sided rejected");
         assert!(dice_roll(&json!({"seed": 1, "count": 101})).is_err(), "too many dice");
+    }
+
+    // ---- library batch: ciphers / encoders --------------------------------
+
+    #[test]
+    fn library_batch_matches_known_vectors() {
+        assert_eq!(rot13(&json!({"text": "Hello"})).unwrap(), "Uryyb");
+        assert_eq!(rot13(&json!({"text": "Uryyb"})).unwrap(), "Hello");
+        assert_eq!(caesar_cipher(&json!({"text": "abc", "shift": 1})).unwrap(), "bcd");
+        assert_eq!(caesar_cipher(&json!({"text": "bcd", "shift": -1})).unwrap(), "abc");
+        assert_eq!(luhn_check(&json!({"number": "79927398713"})).unwrap(), "valid");
+        assert_eq!(luhn_check(&json!({"number": "79927398710"})).unwrap(), "invalid");
+        assert_eq!(rgb_to_hex(&json!({"r": 255, "g": 0, "b": 128})).unwrap(), "#ff0080");
+        assert_eq!(hex_to_rgb(&json!({"hex": "#ff0080"})).unwrap(), "rgb(255, 0, 128)");
+        assert_eq!(binary_encode(&json!({"text": "Hi"})).unwrap(), "01001000 01101001");
+        // Argument validation — friendly errors, never panics.
+        assert!(rot13(&json!({})).is_err());
+        assert!(caesar_cipher(&json!({"text": "x"})).is_err(), "missing shift");
+        assert!(rgb_to_hex(&json!({"r": 256, "g": 0, "b": 0})).is_err(), "channel out of range");
+        assert!(hex_to_rgb(&json!({"hex": "xyz"})).is_err(), "bad hex");
+    }
+
+    // ---- sql_guard --------------------------------------------------------
+
+    #[test]
+    fn sql_guard_accepts_read_only_and_rejects_the_rest() {
+        let ok = |q: &str| sql_guard(&json!({ "sql": q })).unwrap();
+        // Accepts a single SELECT/WITH/EXPLAIN.
+        assert_eq!(ok("SELECT * FROM traces"), "read-only: OK");
+        assert_eq!(ok("  select id, ts from traces where outcome = 'failed'  "), "read-only: OK");
+        assert_eq!(ok("WITH r AS (SELECT 1) SELECT * FROM r"), "read-only: OK");
+        assert_eq!(ok("EXPLAIN SELECT 1"), "read-only: OK");
+        // A trailing semicolon is tolerated (single statement).
+        assert_eq!(ok("SELECT 1;"), "read-only: OK");
+        // An identifier that merely CONTAINS a keyword substring is fine.
+        assert_eq!(ok("SELECT updated_at, created_at FROM traces"), "read-only: OK");
+        // Rejects non-SELECT leads.
+        assert_eq!(
+            ok("UPDATE traces SET x=1"),
+            "REJECTED: must start with SELECT, WITH, or EXPLAIN (got 'UPDATE')"
+        );
+        // Rejects a write keyword anywhere (writable CTE / smuggled write).
+        assert!(ok("WITH x AS (DELETE FROM t RETURNING *) SELECT * FROM x").starts_with("REJECTED: contains"));
+        // Rejects stacked statements and comments (fail-closed).
+        assert_eq!(ok("SELECT 1; DROP TABLE t"), "REJECTED: multiple statements are not allowed");
+        assert_eq!(ok("SELECT 1 -- ; DROP TABLE t"), "REJECTED: comments are not allowed");
+        assert_eq!(ok("SELECT 1 /* hidden */"), "REJECTED: comments are not allowed");
+        assert_eq!(ok("   "), "REJECTED: empty query");
+        // Only a missing arg is a hard error.
+        assert!(sql_guard(&json!({})).is_err());
     }
 
     // ---- catalog ----------------------------------------------------------
