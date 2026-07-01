@@ -4073,8 +4073,7 @@ mod answers {
 }
 
 pub use answers::{
-    current_sources, record_source, record_turn_tool, take_turn_tool, AnswerSource,
-    TurnSourcesGuard, TurnToolGuard,
+    current_sources, record_source, take_turn_tool, AnswerSource, TurnSourcesGuard, TurnToolGuard,
 };
 #[cfg(test)]
 pub use answers::clear_sources;
