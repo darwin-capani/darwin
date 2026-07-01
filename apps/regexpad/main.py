@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import signal
 import socket
 import sys
 
@@ -10,6 +11,23 @@ TOKEN = os.environ.get("JARVIS_APP_TOKEN", "")
 SOCKET_PATH = os.environ.get("JARVIS_APP_SOCKET", "")
 
 _MATCH_CAP = 50
+# ReDoS defense: a user-supplied pattern can catastrophically backtrack (e.g.
+# "(a+)+b" on "aaaa…"), which Python's re cannot be asked to bound and which
+# raises nothing — it just spins, hanging the app (and the daemon reading it).
+# Bound the inputs AND hard-cap wall-clock via SIGALRM (CPython does check
+# signals during a match, so this reliably interrupts a runaway pattern).
+_MAX_PATTERN = 2000
+_MAX_TEXT = 100_000
+_MATCH_TIMEOUT_S = 1.0
+_HAS_ALARM = hasattr(signal, "setitimer") and hasattr(signal, "SIGALRM")
+
+
+class _MatchTimeout(Exception):
+    pass
+
+
+def _on_timeout(_signum, _frame):
+    raise _MatchTimeout()
 
 
 def send(conn, obj):
@@ -25,10 +43,14 @@ def compute(payload):
     pattern = payload.get("pattern", "")
     if not isinstance(pattern, str):
         return {"error": "pattern must be a string"}
+    if len(pattern) > _MAX_PATTERN:
+        return {"error": f"pattern too long (max {_MAX_PATTERN} chars)"}
 
     text = payload.get("text", "")
     if not isinstance(text, str):
         return {"error": "text must be a string"}
+    if len(text) > _MAX_TEXT:
+        return {"error": f"text too long (max {_MAX_TEXT} chars)"}
 
     ignorecase = bool(payload.get("ignmatchcase", False))
     flags = re.IGNORECASE if ignorecase else 0
@@ -42,6 +64,12 @@ def compute(payload):
 
     matches = []
     count = 0
+    # Hard wall-clock cap around the match so a catastrophically-backtracking
+    # pattern is interrupted (SIGALRM) instead of hanging the app + the daemon.
+    prev = None
+    if _HAS_ALARM:
+        prev = signal.signal(signal.SIGALRM, _on_timeout)
+        signal.setitimer(signal.ITIMER_REAL, _MATCH_TIMEOUT_S)
     try:
         for m in rx.finditer(text):
             count += 1
@@ -53,8 +81,14 @@ def compute(payload):
                     "end": m.end(),
                     "groups": groups,
                 })
+    except _MatchTimeout:
+        return {"error": "match timed out — pattern too slow (possible catastrophic backtracking)"}
     except Exception as e:  # noqa: BLE001 — pathological patterns must not crash
         return {"error": f"match failed: {e}"}
+    finally:
+        if _HAS_ALARM:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, prev if prev is not None else signal.SIG_DFL)
 
     return {
         "count": count,

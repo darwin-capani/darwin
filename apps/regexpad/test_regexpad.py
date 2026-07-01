@@ -74,6 +74,23 @@ def test_hostile_and_empty_inputs_never_raise():
     assert isinstance(r2, dict) and "error" not in r2, r2
 
 
+def test_catastrophic_pattern_times_out_not_hangs():
+    # ReDoS guard: "(a+)+b" on "aaaa…" backtracks exponentially. compute() must
+    # return an error within the wall-clock cap, NOT hang the app/daemon.
+    import time
+    t0 = time.time()
+    r = compute({"pattern": "(a+)+b", "text": "a" * 40})
+    elapsed = time.time() - t0
+    assert isinstance(r, dict), r
+    assert "error" in r, r
+    assert elapsed < 3.0, f"must not hang; took {elapsed:.2f}s"
+
+
+def test_oversized_inputs_return_error():
+    assert "error" in compute({"pattern": "a" * 3000, "text": "x"})
+    assert "error" in compute({"pattern": "x", "text": "a" * 200_000})
+
+
 def main():
     tests = [
         test_basic_matches_and_count,
@@ -84,6 +101,8 @@ def main():
         test_cap_at_50_but_count_full,
         test_optional_group_none_preserved,
         test_hostile_and_empty_inputs_never_raise,
+        test_catastrophic_pattern_times_out_not_hangs,
+        test_oversized_inputs_return_error,
     ]
     for t in tests:
         t()
