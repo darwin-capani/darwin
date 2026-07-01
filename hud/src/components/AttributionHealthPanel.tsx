@@ -34,6 +34,10 @@ export default function AttributionHealthPanel({
               <span className="attr-ok-n">{health.reliable}</span>
               <span className="attr-stat-label"> RELIABLE</span>
             </span>
+            <span className="attr-stat">
+              <span className="attr-mixed-n">{health.mixed}</span>
+              <span className="attr-stat-label"> MIXED</span>
+            </span>
             <span className={`attr-stat ${health.failing > 0 ? "warn" : ""}`}>
               <span className="attr-fail-n">{health.failing}</span>
               <span className="attr-stat-label"> FAILING</span>

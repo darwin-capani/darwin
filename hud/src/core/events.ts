@@ -2929,6 +2929,9 @@ export interface AttributionFlag {
 export interface AttributionHealth {
   turns: number;
   reliable: number;
+  /** Well-sampled capabilities in the mediocre [50%,80%) band — reported so the
+   *  snapshot accounts for every judged capability, not just reliable + failing. */
+  mixed: number;
   failing: number;
   flags: AttributionFlag[];
   /** Eval-verified skills that are also live-proven — ready-to-promote. */
@@ -2966,6 +2969,7 @@ export function parseAttributionHealth(data: Record<string, unknown>): Attributi
   return {
     turns: num(data, "turns") ?? 0,
     reliable: num(data, "reliable") ?? 0,
+    mixed: num(data, "mixed") ?? 0,
     failing: num(data, "failing") ?? 0,
     flags: coerceFlagList(data["flags"]),
     promote: coerceFlagList(data["promote"]),
