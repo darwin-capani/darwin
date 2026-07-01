@@ -1856,6 +1856,10 @@ async fn main() -> Result<()> {
     // and tcc.anomaly (new grant / denied->allowed escalation) for the HUD. It
     // never mutates TCC; only its own baseline store is written.
     tokio::spawn(tcc::sentinel_task(tcc_baseline));
+    // Ambient capability-health surfacing: a slow, READ-ONLY periodic pass over
+    // the trace corpus that emits attribution.health (which agents/skills are
+    // failing) for the HUD. PROPOSE-ONLY — it flags, it never disables/reroutes.
+    tokio::spawn(attribution::health_task());
     // Resolve the Anthropic API key eagerly (env var, then macOS Keychain) so
     // daemon.started reports whether the cloud path is available. Only the
     // bool ever leaves this call — the key itself stays out of logs and
