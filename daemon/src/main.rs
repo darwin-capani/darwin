@@ -2803,6 +2803,11 @@ async fn run_pipeline(
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
+                // The capability this turn routed to (the tool loop's LAST-WINS
+                // capture; skill_invoke resolves to the skill name). Read + cleared
+                // once per turn, so it never leaks into the next turn's trace. ""
+                // when the turn used no tool/skill.
+                let tool_or_skill = anthropic::take_turn_tool().unwrap_or_default();
                 match optimize::record_trace(
                     cfg,
                     trace_store,
@@ -2810,7 +2815,7 @@ async fn run_pipeline(
                     &class.intent,
                     &outcome.agent,
                     mode,
-                    "", // tool/skill is not carried on RouteOutcome; honestly empty
+                    &tool_or_skill,
                     optimize::Outcome::Success,
                     total_ms,
                     ts,
