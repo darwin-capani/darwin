@@ -1051,7 +1051,12 @@ async fn run_pipeline(
     // Stamp the attempt right before any cloud call so failed attempts count
     // toward the limit too (each one is a paid cloud call).
     if let Err(e) = memory.upsert_fact(META_HEAL_LAST_ATTEMPT, &ts.to_string()).await {
-        warn!(error = %e, "heal: failed to stamp the attempt time; continuing");
+        // FAIL-SAFE (mirrors forge_gap): if the attempt stamp cannot be persisted
+        // we CANNOT enforce the one-draft-per-6h rate limit, so we must NOT make
+        // the paid cloud draft call — broken bookkeeping must never unleash
+        // unmetered drafting (the conservative rule above). Skip this episode.
+        warn!(error = %e, "heal: failed to stamp the attempt time; skipping to avoid unmetered drafting");
+        return;
     }
 
     let daemon_dir = root.join("daemon");

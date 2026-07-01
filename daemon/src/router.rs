@@ -605,7 +605,16 @@ pub async fn route(
     if cfg.voice.cloud_music {
         if let Some(prompt) = classify_music_intent(text) {
             // JEROME — "Leisure + DJ": the agent that owns music/entertainment.
-            let jerome = agents.get("jerome").unwrap_or_else(|| agents.orchestrator());
+            // Fall back to the orchestrator if the roster lacks it, but WARN so a
+            // missing specialist is visible (a silent fallback would route music
+            // to the wrong namespace/voice without any signal to the operator).
+            let jerome = match agents.get("jerome") {
+                Some(a) => a,
+                None => {
+                    warn!("router: agents.toml has no 'jerome' (music specialist); routing music via the orchestrator");
+                    agents.orchestrator()
+                }
+            };
             emit_agent_active(jerome);
             telemetry::emit("system", "music.intent", json!({}));
             // Fire-and-forget the (genuinely non-Send) generation on its own thread,
