@@ -71,7 +71,11 @@ fn parse_lsof(output: &str) -> Vec<Conn> {
         if fields.len() < 2 {
             continue;
         }
-        let Some(conn_field) = fields.iter().find(|f| f.contains("->")) else {
+        // Search from the END: the `local->remote` endpoint lives in the trailing
+        // NAME field, so scanning in reverse avoids mis-matching a COMMAND name
+        // that happens to contain "->" (which `.find` from the front would hit
+        // first, fabricating a wrong remote). Mirrors the state-field scan below.
+        let Some(conn_field) = fields.iter().rev().find(|f| f.contains("->")) else {
             continue;
         };
         let remote = conn_field.split("->").nth(1).unwrap_or("").to_string();
@@ -166,5 +170,18 @@ launchd       1  root    7u  IPv4  0x4      0t0  TCP *:8080 (LISTEN)";
     fn parse_skips_junk_lines() {
         assert!(parse_lsof("").is_empty());
         assert!(parse_lsof("garbage\nno arrow here\n").is_empty());
+    }
+
+    #[test]
+    fn parse_ignores_arrow_in_command_name() {
+        // A process whose COMMAND contains "->" must NOT be mistaken for the
+        // connection field: the real remote lives in the trailing NAME field, so
+        // scanning from the end picks the right one (regression for a mis-attribution).
+        let line = "weird->cmd 999 user 5u IPv4 0x9 0t0 TCP 10.0.0.1:5000->198.51.100.9:443 (ESTABLISHED)";
+        let conns = parse_lsof(line);
+        assert_eq!(conns.len(), 1);
+        assert_eq!(conns[0].command, "weird->cmd");
+        assert_eq!(conns[0].remote, "198.51.100.9:443", "remote must come from the NAME field, not the command");
+        assert_eq!(conns[0].state, "ESTABLISHED");
     }
 }
