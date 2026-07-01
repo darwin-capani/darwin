@@ -2056,6 +2056,22 @@ fn is_parked_consequential(name: &str, input: &Value) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)] // mirrors the loop's full working set
+/// The capability identifier a turn is attributed to in the optimizer trace: the
+/// SKILL name for a `skill_invoke` (so per-skill attribution works instead of
+/// collapsing every skill to "skill_invoke"), otherwise the tool name itself.
+/// Pure.
+fn capability_label(tool_name: &str, input: &Value) -> String {
+    if tool_name == "skill_invoke" {
+        if let Some(skill) = input.get("name").and_then(Value::as_str) {
+            let s = skill.trim();
+            if !s.is_empty() {
+                return s.to_string();
+            }
+        }
+    }
+    tool_name.to_string()
+}
+
 async fn tool_loop(
     model: &str,
     max_tokens: u32,
@@ -2165,6 +2181,11 @@ async fn tool_loop(
             )
             .await;
             if !is_error {
+                // ATTRIBUTION: record the capability this turn used (LAST-WINS)
+                // for the optimizer trace's single tool_or_skill column. Covers a
+                // parked consequential tool too (is_error==false), since the turn
+                // still routed to it. skill_invoke resolves to the SKILL name.
+                answers::record_turn_tool(&capability_label(&name, &block["input"]));
                 // First successful execution of this signature: record it for
                 // the dedup ledger AND the budget-kill acknowledgment. An
                 // is_error result is NOT recorded — a genuinely failed call may
@@ -2671,6 +2692,9 @@ async fn local_tool_loop(
             let (out, is_error) =
                 execute_tool(&call.name, &call.input, memory, allowed, namespace, true).await;
             if !is_error {
+                // ATTRIBUTION: same capability capture as the cloud tool loop, so
+                // an offline turn's tool/skill is recorded in the trace too.
+                answers::record_turn_tool(&capability_label(&call.name, &call.input));
                 seen.insert(signature, out.clone());
             }
             // A parked consequential preview (is_error == false) OR a gate refusal
@@ -3879,6 +3903,84 @@ mod answers {
             .clear();
     }
 
+    /// The single capability (tool or skill name) that best represents THIS turn:
+    /// the LAST tool/skill the tool loop executed. A turn may use several tools;
+    /// the terminal one is the honest single-column representative for the
+    /// optimizer trace (`traces.tool_or_skill`), which is one column, not a
+    /// per-step list. Set by the tool loop via `record_turn_tool`; the recorder
+    /// reads + CLEARS it via `take_turn_tool` at turn end (so it never leaks
+    /// across turns — unlike sources, this is read AFTER the turn handler returns,
+    /// so it is deliberately NOT cleared by TurnSourcesGuard).
+    static TURN_TOOL: Mutex<Option<String>> = Mutex::new(None);
+
+    // Test-only thread-local override so a test drives the accumulator on its OWN
+    // thread without racing the process-global slot the real tool-loop tests
+    // write. Mirrors `SOURCES_OVERRIDE`. (A comment, not a doc comment — rustdoc
+    // cannot attach docs to a macro invocation.)
+    #[cfg(test)]
+    thread_local! {
+        static TOOL_OVERRIDE: std::cell::RefCell<Option<Option<String>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Record the capability (tool/skill name) that ran this turn (LAST-WINS).
+    /// Empty is ignored. Poison-tolerant.
+    pub fn record_turn_tool(label: &str) {
+        let label = label.trim();
+        if label.is_empty() {
+            return;
+        }
+        #[cfg(test)]
+        {
+            let handled = TOOL_OVERRIDE.with(|c| {
+                if let Some(slot) = c.borrow_mut().as_mut() {
+                    *slot = Some(label.to_string());
+                    true
+                } else {
+                    false
+                }
+            });
+            if handled {
+                return;
+            }
+        }
+        *TURN_TOOL.lock().unwrap_or_else(|p| p.into_inner()) = Some(label.to_string());
+    }
+
+    /// Read AND clear the turn's representative capability (None when the turn
+    /// used no tool/skill). Clearing on read is the no-cross-turn-leak contract:
+    /// the recorder calls this exactly once per turn. Poison-tolerant.
+    pub fn take_turn_tool() -> Option<String> {
+        #[cfg(test)]
+        {
+            let active = TOOL_OVERRIDE.with(|c| c.borrow().is_some());
+            if active {
+                return TOOL_OVERRIDE.with(|c| c.borrow_mut().as_mut().and_then(|s| s.take()));
+            }
+        }
+        TURN_TOOL.lock().unwrap_or_else(|p| p.into_inner()).take()
+    }
+
+    /// `#[cfg(test)]`-only RAII override that isolates `record_turn_tool` /
+    /// `take_turn_tool` to the current thread. Mirrors `SourcesOverride`.
+    #[cfg(test)]
+    pub(crate) struct ToolOverride;
+
+    #[cfg(test)]
+    impl ToolOverride {
+        pub(crate) fn fresh() -> Self {
+            TOOL_OVERRIDE.with(|c| *c.borrow_mut() = Some(None));
+            Self
+        }
+    }
+
+    #[cfg(test)]
+    impl Drop for ToolOverride {
+        fn drop(&mut self) {
+            TOOL_OVERRIDE.with(|c| *c.borrow_mut() = None);
+        }
+    }
+
     /// RAII guard that CLEARS the per-turn answer-sources accumulator when the
     /// turn handler returns by ANY path — the exact analogue of `TurnGateGuard`
     /// (voice-id) and `TurnLangGuard` (response voice). Installed once near the
@@ -3918,7 +4020,8 @@ mod answers {
 }
 
 pub use answers::{
-    current_sources, record_source, AnswerSource, TurnSourcesGuard,
+    current_sources, record_source, record_turn_tool, take_turn_tool, AnswerSource,
+    TurnSourcesGuard,
 };
 #[cfg(test)]
 pub use answers::clear_sources;
@@ -10912,7 +11015,7 @@ mod tests {
         budget_exhausted_reply,
         build_messages, build_system_blocks, cite_annotation, citation_for_tool, clear_sources,
         cloud_summary_candidates, confidence_tail, current_sources, dispatch_tool,
-        answer_annotation_telemetry, answers,
+        answer_annotation_telemetry, answers, capability_label,
         execute_mcp_tool, execute_tool,
         extract_text, facts_block, forge_gate, grounded_world_live, is_parked_consequential,
         keychain_query_args, outward_get_egress_refusal, parse_confidence, personalization_block,
@@ -10933,6 +11036,33 @@ mod tests {
         KEYCHAIN_TIMEOUT, SECURITY_BIN, SPOKEN_MAX_TOKENS, TOOL_LOOP_BUDGET, TOOL_LOOP_MAX_CALLS,
     };
     use super::tool_signature;
+
+    // ATTRIBUTION CAPTURE (task: light up traces.tool_or_skill) — the pure
+    // capability-label resolver + the per-turn last-wins accumulator.
+    #[test]
+    fn capability_label_resolves_skill_name_else_tool() {
+        assert_eq!(capability_label("open_app", &json!({"name": "x"})), "open_app");
+        assert_eq!(
+            capability_label("skill_invoke", &json!({"name": "base64_encode"})),
+            "base64_encode"
+        );
+        // Missing / blank skill name falls back to the meta-tool name (never empty).
+        assert_eq!(capability_label("skill_invoke", &json!({})), "skill_invoke");
+        assert_eq!(capability_label("skill_invoke", &json!({"name": "  "})), "skill_invoke");
+    }
+
+    #[test]
+    fn turn_tool_records_last_wins_and_take_clears() {
+        let _guard = answers::ToolOverride::fresh();
+        assert_eq!(answers::take_turn_tool(), None);
+        answers::record_turn_tool("search_files");
+        answers::record_turn_tool("open_path"); // last wins
+        answers::record_turn_tool("   "); // empty ignored
+        assert_eq!(answers::take_turn_tool(), Some("open_path".to_string()));
+        // Cleared on read — a turn that used no tool sees None (no cross-turn leak).
+        assert_eq!(answers::take_turn_tool(), None);
+    }
+
     // OFFLINE BOUNDED TOOL-LOOP (task #3) symbols — the curated safe subset, the
     // subset/agent intersection, the deterministic tool-call parser, the bounded
     // loop core over an injectable local brain, and the round clamp.
