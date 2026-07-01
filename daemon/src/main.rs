@@ -2836,9 +2836,18 @@ async fn run_pipeline(
                             agent: outcome.agent.clone(),
                         });
                     }
-                    Ok(None) => {} // disabled mid-flight: no trace, leave prior as-is
+                    // Disabled mid-turn (a config reload between the outer check
+                    // and record_trace): clear prior so a re-enable next turn does
+                    // not mislabel this now-stale trace_id as "corrected".
+                    Ok(None) => *prior_turn = None,
                     Err(e) => warn!(error = %e, "optimize: failed to record turn trace"),
                 }
+            } else {
+                // This turn was NOT recorded (optimize disabled, or a transient
+                // screen-read): drop prior_turn so the NEXT recorded turn never
+                // runs its correction check against a now-stale prior trace (the
+                // correction chain must only link immediately-consecutive traces).
+                *prior_turn = None;
             }
 
             // EVAL latency: record this turn's MEASURED pipeline timing + the
