@@ -212,8 +212,11 @@ struct CapFlag {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Health {
     turns: usize,
-    /// Distinct well-sampled capabilities that are reliable / failing.
+    /// Distinct well-sampled capabilities that are reliable / mixed / failing.
+    /// All three are reported so the snapshot accounts for every judged capability
+    /// (a mediocre "mixed" one is never silently dropped from the picture).
     reliable: usize,
+    mixed: usize,
     failing: usize,
     /// The failing ones, detailed (the propose-only "needs attention" list).
     flags: Vec<CapFlag>,
@@ -230,6 +233,7 @@ struct Health {
 /// so the flag + promote policy is unit-tested.
 fn health(traces: &[Trace], eval_skills: &HashSet<String>) -> Health {
     let mut reliable = 0;
+    let mut mixed = 0;
     let mut failing = 0;
     let mut flags = Vec::new();
     let agents = tally(traces, agent_key);
@@ -250,12 +254,17 @@ fn health(traces: &[Trace], eval_skills: &HashSet<String>) -> Health {
                     turns: s.graded(),
                     rate_pct: (r * 100.0).round() as u32,
                 });
+            } else {
+                // [FAILING_RATE, RELIABLE_RATE): mediocre but not failing — counted
+                // so reliable + mixed + failing accounts for every judged capability.
+                mixed += 1;
             }
         }
     }
     Health {
         turns: traces.len(),
         reliable,
+        mixed,
         failing,
         flags,
         promote: promotion_candidates(traces, eval_skills),
@@ -359,6 +368,7 @@ pub async fn health_tick() {
         json!({
             "turns": h.turns,
             "reliable": h.reliable,
+            "mixed": h.mixed,
             "failing": h.failing,
             "flags": to_json(&h.flags),
             "promote": to_json(&h.promote),
@@ -503,6 +513,13 @@ mod tests {
         // jarvis (agent): 2 failed only -> below MIN_SAMPLE -> NOT judged.
         traces.push(t("jarvis", "shell_run", Outcome::Failed));
         traces.push(t("jarvis", "shell_run", Outcome::Failed));
+        // vega (agent): 3 success + 2 failed -> 60% -> MIXED (well-sampled, neither).
+        for _ in 0..3 {
+            traces.push(t("vega", "web_search", Outcome::Success));
+        }
+        for _ in 0..2 {
+            traces.push(t("vega", "web_search", Outcome::Failed));
+        }
 
         let h = health(&traces, &HashSet::new());
         assert_eq!(h.turns, traces.len());
@@ -510,6 +527,8 @@ mod tests {
         assert_eq!(h.reliable, 2, "pepper + gcal_create");
         // karen (agent) + gmail_send (tool) both failing -> 2 failing.
         assert_eq!(h.failing, 2);
+        // vega (agent) + web_search (tool) both 60% -> 2 mixed (accounted, not dropped).
+        assert_eq!(h.mixed, 2, "vega + web_search");
         // The low-sample jarvis/shell_run is neither reliable nor failing nor flagged.
         assert!(h.flags.iter().all(|f| f.name != "jarvis" && f.name != "shell_run"));
         // A failing flag carries an honest rate + count.
@@ -526,7 +545,7 @@ mod tests {
         let h = health(&[], &HashSet::new());
         assert_eq!(
             h,
-            Health { turns: 0, reliable: 0, failing: 0, flags: vec![], promote: vec![] }
+            Health { turns: 0, reliable: 0, mixed: 0, failing: 0, flags: vec![], promote: vec![] }
         );
     }
 

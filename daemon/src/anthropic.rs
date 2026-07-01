@@ -3969,6 +3969,40 @@ mod answers {
         TURN_TOOL.lock().unwrap_or_else(|p| p.into_inner()).take()
     }
 
+    /// Clear the per-turn capability accumulator. Used by `TurnToolGuard` so the
+    /// slot resets on EVERY return path from the turn handler — belt-and-braces
+    /// over the recorder's `take_turn_tool`: a transient / optimize-disabled /
+    /// early-returning turn that ran a tool must never leak it into the NEXT
+    /// turn's trace. Poison-tolerant.
+    pub fn clear_turn_tool() {
+        #[cfg(test)]
+        {
+            let active = TOOL_OVERRIDE.with(|c| c.borrow().is_some());
+            if active {
+                TOOL_OVERRIDE.with(|c| {
+                    if let Some(slot) = c.borrow_mut().as_mut() {
+                        *slot = None;
+                    }
+                });
+                return;
+            }
+        }
+        *TURN_TOOL.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    }
+
+    /// RAII guard that CLEARS the per-turn capability accumulator when the turn
+    /// handler returns by ANY path — the analogue of `TurnSourcesGuard`. The
+    /// recorder reads `TURN_TOOL` (via `take_turn_tool`) BEFORE this guard drops
+    /// (both live inside `run_pipeline`), so a normal turn's attribution is
+    /// recorded first; this then guarantees a transient / optimize-disabled /
+    /// early-return turn can never leak its tool into the next turn's trace.
+    pub struct TurnToolGuard;
+    impl Drop for TurnToolGuard {
+        fn drop(&mut self) {
+            clear_turn_tool();
+        }
+    }
+
     /// `#[cfg(test)]`-only RAII override that isolates `record_turn_tool` /
     /// `take_turn_tool` to the current thread. Mirrors `SourcesOverride`.
     #[cfg(test)]
@@ -4029,7 +4063,7 @@ mod answers {
 
 pub use answers::{
     current_sources, record_source, record_turn_tool, take_turn_tool, AnswerSource,
-    TurnSourcesGuard,
+    TurnSourcesGuard, TurnToolGuard,
 };
 #[cfg(test)]
 pub use answers::clear_sources;
@@ -11071,6 +11105,18 @@ mod tests {
         answers::record_turn_tool("   "); // empty ignored
         assert_eq!(answers::take_turn_tool(), Some("open_path".to_string()));
         // Cleared on read — a turn that used no tool sees None (no cross-turn leak).
+        assert_eq!(answers::take_turn_tool(), None);
+    }
+
+    #[test]
+    fn turn_tool_guard_clears_on_drop_so_a_skipped_recorder_never_leaks() {
+        let _override = answers::ToolOverride::fresh();
+        // A tool ran, but the recorder is skipped (transient / optimize-disabled).
+        answers::record_turn_tool("open_path");
+        {
+            let _g = answers::TurnToolGuard; // drops here -> clears the accumulator
+        }
+        // The next turn sees None — the stale tool did NOT leak across the turn.
         assert_eq!(answers::take_turn_tool(), None);
     }
 

@@ -2139,6 +2139,12 @@ async fn run_pipeline(
     // NEXT turn (the no-cross-turn-leak contract) — the exact analogue of
     // TurnGateGuard / TurnLangGuard. Inert when [answers] is disabled.
     let _sources_guard = anthropic::TurnSourcesGuard;
+    // ATTRIBUTION no-cross-turn-leak: clear the per-turn tool/skill accumulator on
+    // EVERY return path. The optimizer recorder reads it (take_turn_tool) earlier
+    // in this function, so a normal turn is attributed first; this guard then
+    // guarantees a transient / optimize-disabled / early-return turn never leaks
+    // its tool into the next turn's trace.
+    let _tool_guard = anthropic::TurnToolGuard;
 
     // Per-turn SELF-VERIFICATION outcome ([answers].verify, ships ON): the cloud
     // path records THIS turn's verify outcome (off | verified-clean | revised |

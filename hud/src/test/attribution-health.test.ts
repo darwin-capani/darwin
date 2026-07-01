@@ -32,6 +32,7 @@ function connected(at = 0): HudState {
 const payload: Record<string, unknown> = {
   turns: 42,
   reliable: 3,
+  mixed: 2,
   failing: 1,
   flags: [{ kind: "agent", name: "karen", turns: 6, rate: 17 }],
   promote: [{ kind: "skill", name: "base64_encode", turns: 10, rate: 95 }],
@@ -44,6 +45,7 @@ describe("parseAttributionHealth (defensive)", () => {
     expect(h).toEqual({
       turns: 42,
       reliable: 3,
+      mixed: 2,
       failing: 1,
       flags: [{ kind: "agent", name: "karen", turns: 6, rate: 17 }],
       promote: [{ kind: "skill", name: "base64_encode", turns: 10, rate: 95 }],
@@ -52,7 +54,7 @@ describe("parseAttributionHealth (defensive)", () => {
 
   it("defaults to an all-zero snapshot when fields are absent", () => {
     const h = parseAttributionHealth({});
-    expect(h).toEqual({ turns: 0, reliable: 0, failing: 0, flags: [], promote: [] });
+    expect(h).toEqual({ turns: 0, reliable: 0, mixed: 0, failing: 0, flags: [], promote: [] });
   });
 
   it("drops flags with no name and caps the list", () => {
@@ -99,6 +101,7 @@ describe("AttributionHealthPanel (review-only)", () => {
     const html = render(parseAttributionHealth(payload));
     expect(html).toContain("REVIEW ONLY");
     expect(html).toContain("RELIABLE");
+    expect(html).toContain("MIXED");
     expect(html).toContain("FAILING");
     expect(html).toContain("NEEDS ATTENTION");
     expect(html).toContain("karen");
@@ -110,7 +113,7 @@ describe("AttributionHealthPanel (review-only)", () => {
   });
 
   it("shows an all-healthy note when nothing is failing, and no promote section when empty", () => {
-    const html = render({ turns: 30, reliable: 5, failing: 0, flags: [], promote: [] });
+    const html = render({ turns: 30, reliable: 5, mixed: 0, failing: 0, flags: [], promote: [] });
     expect(html).toContain("No well-sampled capability is failing");
     expect(html).not.toContain("NEEDS ATTENTION");
     expect(html).not.toContain("READY TO PROMOTE");

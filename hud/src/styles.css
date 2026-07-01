@@ -8935,6 +8935,11 @@ body,
   font-weight: 700;
   color: var(--cyan-bright);
 }
+.attr-mixed-n {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--cyan-dim);
+}
 .attr-stat.warn .attr-fail-n {
   color: var(--warn-amber);
 }
