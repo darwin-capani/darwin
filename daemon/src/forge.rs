@@ -1104,7 +1104,19 @@ pub async fn forge_app(root: &Path, cfg: &Config, memory: &Memory, goal: &str) -
     let stamped = pending.lock().ok().and_then(|slot| *slot);
     if let Some(ts) = stamped {
         if let Err(e) = memory.upsert_fact(META_FORGE_PENDING, &ts.to_string()).await {
-            tracing::warn!(error = %e, "forge: proposal written but meta.forge_pending stamp failed");
+            // FAIL-SAFE (one-pending-proposal cap): the cap is enforced by the
+            // durable meta.forge_pending marker (forge_gap_task blocks a new draft
+            // while it exists). If it cannot be written we CANNOT enforce the cap,
+            // so we must not leave an un-capped pending proposal on disk — else a
+            // SECOND unreviewed proposal could be drafted once the attempt window
+            // reopens. Roll the just-written proposal back (invariant:
+            // proposal-on-disk <=> marker-set) and report Aborted. Losing one
+            // proposal is strictly safer than bypassing the cap.
+            tracing::warn!(error = %e, "forge: pending stamp failed; rolling back the proposal to preserve the one-pending cap");
+            if let ForgeOutcome::Proposed { dir } = &outcome {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            return ForgeOutcome::Aborted { stage: "pending_stamp" };
         }
     }
     outcome

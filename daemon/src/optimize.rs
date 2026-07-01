@@ -1457,6 +1457,14 @@ impl TraceStore {
         if trimmed.is_empty() {
             return Err(anyhow!("oracle_ask: empty query"));
         }
+        // Defense-in-depth: reject a multi-statement query outright so the
+        // first-keyword check is a genuine gate, not one the caller can sidestep
+        // with "SELECT 1; DELETE ..." (rusqlite compiles only the first statement
+        // and query_only blocks the write, but the keyword check must mean what it
+        // says). Any ';' remaining after the trailing-';' trim is embedded.
+        if trimmed.contains(';') {
+            return Err(anyhow!("oracle_ask: only a single read-only statement is allowed"));
+        }
         let first = trimmed
             .split_whitespace()
             .next()
@@ -1771,6 +1779,10 @@ mod tests {
         assert!(store.readonly_query("DELETE FROM traces").await.is_err());
         assert!(store.readonly_query("UPDATE traces SET intent='x'").await.is_err());
         assert!(store.readonly_query("DROP TABLE traces").await.is_err());
+        // A multi-statement query is rejected outright (the keyword gate is a real
+        // defense layer, not one a smuggled second statement can slip past).
+        assert!(store.readonly_query("SELECT 1; DELETE FROM traces").await.is_err());
+        assert!(store.readonly_query("SELECT 1;DROP TABLE traces").await.is_err());
 
         // The corpus is intact (no rejected write touched it) and the connection
         // is usable again afterward (query_only was reset).
