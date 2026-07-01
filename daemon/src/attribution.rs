@@ -21,8 +21,10 @@
 //! proven skills are documented follow-ons; this v1 analyzes what already exists.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
 use anyhow::{anyhow, Result};
+use serde_json::json;
 
 use crate::optimize::{Outcome, Trace};
 
@@ -33,6 +35,16 @@ const MAX_TRACES: usize = 5000;
 const MIN_SAMPLE: usize = 5;
 /// Rows rendered per section before an "and N more" elision.
 const MAX_ROWS_SHOWN: usize = 12;
+/// Rate at or above which a well-sampled capability is "reliable".
+const RELIABLE_RATE: f64 = 0.8;
+/// Rate below which a well-sampled capability is "failing" (the propose-only flag).
+const FAILING_RATE: f64 = 0.5;
+
+/// Ambient health cadence (runtime-only; never run in tests). A generous startup
+/// delay keeps it out of the first exchanges; a slow tick since the trace corpus
+/// only grows as the user interacts.
+const HEALTH_STARTUP_DELAY: Duration = Duration::from_secs(45);
+const HEALTH_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Outcome tallies for one agent or one tool/skill.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -79,6 +91,19 @@ impl Stat {
             _ => "failing",
         }
     }
+}
+
+/// The agent that handled a trace, or None when unattributed. Shared by the
+/// on-demand report and the ambient health pass.
+fn agent_key(t: &Trace) -> Option<String> {
+    let a = t.agent.trim();
+    (!a.is_empty()).then(|| a.to_string())
+}
+
+/// The tool/skill a trace invoked, or None when the turn used neither.
+fn tool_key(t: &Trace) -> Option<String> {
+    let k = t.tool_or_skill.trim();
+    (!k.is_empty()).then(|| k.to_string())
 }
 
 /// Group traces by a key (agent, or tool/skill), tallying outcomes. Rows with no
@@ -132,14 +157,8 @@ fn analyze(traces: &[Trace]) -> String {
                 Use JARVIS for a while and this fills in."
             .to_string();
     }
-    let agents = tally(traces, |t| {
-        let a = t.agent.trim();
-        (!a.is_empty()).then(|| a.to_string())
-    });
-    let tools = tally(traces, |t| {
-        let k = t.tool_or_skill.trim();
-        (!k.is_empty()).then(|| k.to_string())
-    });
+    let agents = tally(traces, agent_key);
+    let tools = tally(traces, tool_key);
 
     let mut out = format!("Capability attribution over the last {} turns.\n", traces.len());
     if traces.len() < MIN_SAMPLE * 2 {
@@ -165,6 +184,111 @@ pub async fn report() -> Result<String> {
         .ok_or_else(|| anyhow!("capability_report: the trace store is not available"))?;
     let traces = store.recent(MAX_TRACES).await?;
     Ok(analyze(&traces))
+}
+
+// ---------------------------------------------------------------------------
+// Ambient health surfacing (PROPOSE-ONLY) — a periodic pass that flags the
+// FAILING capabilities so the user notices "skill X keeps failing" without
+// asking. It emits telemetry ONLY (attribution.health); it never disables,
+// promotes, or reroutes anything (that stays a human decision / a documented
+// follow-on). The pure `health` core is unit-tested; the loop is runtime-only.
+// ---------------------------------------------------------------------------
+
+/// One well-sampled capability that is currently FAILING (the propose-only flag).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CapFlag {
+    /// "agent" or "tool".
+    kind: &'static str,
+    name: String,
+    turns: usize,
+    /// Success rate as a whole-number percent.
+    rate_pct: u32,
+}
+
+/// A snapshot of capability health across the corpus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Health {
+    turns: usize,
+    /// Distinct well-sampled capabilities that are reliable / failing.
+    reliable: usize,
+    failing: usize,
+    /// The failing ones, detailed (the propose-only "needs attention" list).
+    flags: Vec<CapFlag>,
+}
+
+/// Compute capability health across agents + tools. Only WELL-SAMPLED
+/// capabilities (>= MIN_SAMPLE graded turns) are classified — the same
+/// sample-size honesty as the report. Pure, so the flag policy is unit-tested.
+fn health(traces: &[Trace]) -> Health {
+    let mut reliable = 0;
+    let mut failing = 0;
+    let mut flags = Vec::new();
+    let agents = tally(traces, agent_key);
+    let tools = tally(traces, tool_key);
+    for (kind, rows) in [("agent", &agents), ("tool", &tools)] {
+        for (name, s) in rows {
+            if s.graded() < MIN_SAMPLE {
+                continue; // never judged on a thin sample
+            }
+            let Some(r) = s.rate() else { continue };
+            if r >= RELIABLE_RATE {
+                reliable += 1;
+            } else if r < FAILING_RATE {
+                failing += 1;
+                flags.push(CapFlag {
+                    kind,
+                    name: name.clone(),
+                    turns: s.graded(),
+                    rate_pct: (r * 100.0).round() as u32,
+                });
+            }
+        }
+    }
+    Health {
+        turns: traces.len(),
+        reliable,
+        failing,
+        flags,
+    }
+}
+
+/// One health tick: read the recent corpus (read-only) and emit an
+/// `attribution.health` telemetry snapshot for the HUD. PROPOSE-ONLY: it changes
+/// nothing. No store / read error is fatal — it simply skips this tick.
+pub async fn health_tick() {
+    let Some(store) = crate::optimize::global_trace_store() else {
+        return;
+    };
+    let traces = match store.recent(MAX_TRACES).await {
+        Ok(t) => t,
+        Err(_) => return,
+    };
+    let h = health(&traces);
+    let flags: Vec<_> = h
+        .flags
+        .iter()
+        .map(|f| json!({"kind": f.kind, "name": f.name, "turns": f.turns, "rate": f.rate_pct}))
+        .collect();
+    crate::telemetry::emit(
+        "system",
+        "attribution.health",
+        json!({
+            "turns": h.turns,
+            "reliable": h.reliable,
+            "failing": h.failing,
+            "flags": flags,
+        }),
+    );
+}
+
+/// The ambient capability-health loop (runtime-only; never run in tests). Mirrors
+/// the other slow housekeeping loops: a startup delay, then a periodic tick.
+pub async fn health_task() {
+    tokio::time::sleep(HEALTH_STARTUP_DELAY).await;
+    loop {
+        health_tick().await;
+        tokio::time::sleep(HEALTH_INTERVAL).await;
+    }
 }
 
 #[cfg(test)]
@@ -276,5 +400,43 @@ mod tests {
         let out = analyze(&[]);
         assert!(out.contains("No traces recorded yet"));
         assert!(!out.contains("%"), "must not print a fabricated rate");
+    }
+
+    #[test]
+    fn health_flags_only_well_sampled_failing_capabilities() {
+        let mut traces = Vec::new();
+        // pepper (agent): 5 success + 1 failed -> 83% -> reliable.
+        for _ in 0..5 {
+            traces.push(t("pepper", "gcal_create", Outcome::Success));
+        }
+        traces.push(t("pepper", "gcal_create", Outcome::Failed));
+        // karen (agent): 1 success + 5 failed -> 17% -> FAILING (well-sampled).
+        traces.push(t("karen", "gmail_send", Outcome::Success));
+        for _ in 0..5 {
+            traces.push(t("karen", "gmail_send", Outcome::Failed));
+        }
+        // jarvis (agent): 2 failed only -> below MIN_SAMPLE -> NOT judged.
+        traces.push(t("jarvis", "shell_run", Outcome::Failed));
+        traces.push(t("jarvis", "shell_run", Outcome::Failed));
+
+        let h = health(&traces);
+        assert_eq!(h.turns, traces.len());
+        // gcal_create (tool) is also reliable; pepper (agent) reliable -> 2 reliable.
+        assert_eq!(h.reliable, 2, "pepper + gcal_create");
+        // karen (agent) + gmail_send (tool) both failing -> 2 failing.
+        assert_eq!(h.failing, 2);
+        // The low-sample jarvis/shell_run is neither reliable nor failing nor flagged.
+        assert!(h.flags.iter().all(|f| f.name != "jarvis" && f.name != "shell_run"));
+        // A failing flag carries an honest rate + count.
+        let karen = h.flags.iter().find(|f| f.name == "karen").expect("karen flagged");
+        assert_eq!(karen.kind, "agent");
+        assert_eq!(karen.turns, 6);
+        assert_eq!(karen.rate_pct, 17);
+    }
+
+    #[test]
+    fn health_of_empty_corpus_is_all_zero_no_flags() {
+        let h = health(&[]);
+        assert_eq!(h, Health { turns: 0, reliable: 0, failing: 0, flags: vec![] });
     }
 }

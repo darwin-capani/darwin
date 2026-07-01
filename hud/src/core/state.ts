@@ -42,6 +42,7 @@ import {
   LockdownStatus,
   CapabilityAtlas,
   TccSentinel,
+  AttributionHealth,
   McpStatus,
   WebhookSurface,
   PluginSurface,
@@ -132,6 +133,7 @@ import {
   parseTccSnapshot,
   parseTccAnomalies,
   TCC_ANOMALY_CAP,
+  parseAttributionHealth,
   parseMcpStatus,
   parseWebhookEvent,
   applyWebhookEvent,
@@ -627,6 +629,10 @@ export interface HudState {
   /** Accumulated TCC anomaly alerts (tcc.anomaly): new grants / denied→allowed
    *  escalations, newest-first, deduped + capped. REVIEW-ONLY. */
   tccAnomalies: string[];
+  /** The ambient capability-health snapshot (attribution.health): how many of
+   *  JARVIS's own agents/skills are reliable vs failing, with the failing ones
+   *  flagged. Null until the sentinel emits. PROPOSE-ONLY (flags, never acts). */
+  attributionHealth: AttributionHealth | null;
   /** The AT-REST ENCRYPTION surface (security.status): the honest posture of the
    *  opt-in, ships-OFF whole-file SQLCipher encryption — the [security].encrypt_memory
    *  config intent, the GROUND-TRUTH `active` flag (the master key actually resolved
@@ -1185,6 +1191,7 @@ export function initialState(): HudState {
     capabilityAtlas: null,
     tccSentinel: null,
     tccAnomalies: [],
+    attributionHealth: null,
     security: null,
     webhooks: webhookSurfaceInitial(),
     plugins: null,
@@ -2158,6 +2165,14 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
         .filter((x, i, a) => a.indexOf(x) === i)
         .slice(0, TCC_ANOMALY_CAP);
       return { ...s, tccAnomalies: merged };
+    }
+
+    case "attribution.health": {
+      // Ambient capability-health snapshot (secret-free: counts + failing-flag
+      // names). parseAttributionHealth NEVER returns null (a malformed payload
+      // yields an honest all-zero snapshot). The latest snapshot REPLACES the
+      // prior (it is the current health, not an accumulating log). PROPOSE-ONLY.
+      return { ...s, attributionHealth: parseAttributionHealth(env.data) };
     }
 
     case "webhook.received": {

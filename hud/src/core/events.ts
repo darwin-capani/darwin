@@ -2908,6 +2908,65 @@ export function parseTccAnomalies(data: Record<string, unknown>): string[] {
     .slice(0, TCC_ANOMALY_CAP);
 }
 
+// ---------------------------------------------------------------------------
+// CAPABILITY ATTRIBUTION HEALTH (attribution.health) — the PROPOSE-ONLY ambient
+// signal of which of JARVIS's own agents/skills are reliable vs failing, from
+// the trace corpus (daemon/src/attribution.rs). Counts + failing-capability
+// flags only — no secret, no raw utterance. Parsers never throw.
+// ---------------------------------------------------------------------------
+
+/** One well-sampled capability the sentinel flagged as FAILING. */
+export interface AttributionFlag {
+  /** "agent" | "tool" (or a future kind — surfaced verbatim). */
+  kind: string;
+  name: string;
+  turns: number;
+  /** Success rate as a whole-number percent. */
+  rate: number;
+}
+
+/** attribution.health — the ambient capability-health snapshot. */
+export interface AttributionHealth {
+  turns: number;
+  reliable: number;
+  failing: number;
+  flags: AttributionFlag[];
+}
+
+/** Max failing-capability flags retained/rendered. */
+export const ATTRIBUTION_FLAG_CAP = 12;
+
+/** Coerce one failing-capability flag, or null if it has no usable name. */
+function coerceAttributionFlag(o: Record<string, unknown>): AttributionFlag | null {
+  const name = str(o, "name");
+  if (name === null || name.length === 0) return null;
+  return {
+    kind: str(o, "kind") ?? "capability",
+    name,
+    turns: num(o, "turns") ?? 0,
+    rate: num(o, "rate") ?? 0,
+  };
+}
+
+/** Coerce an attribution.health payload. NEVER returns null — a malformed
+ *  payload yields an honest all-zero snapshot, never a stale one. */
+export function parseAttributionHealth(data: Record<string, unknown>): AttributionHealth {
+  const rawFlags = data["flags"];
+  const flags = Array.isArray(rawFlags)
+    ? rawFlags
+        .filter(isPlainObject)
+        .map(coerceAttributionFlag)
+        .filter((f): f is AttributionFlag => f !== null)
+        .slice(0, ATTRIBUTION_FLAG_CAP)
+    : [];
+  return {
+    turns: num(data, "turns") ?? 0,
+    reliable: num(data, "reliable") ?? 0,
+    failing: num(data, "failing") ?? 0,
+    flags,
+  };
+}
+
 function coerceMcpTool(o: Record<string, unknown>): McpToolStatus | null {
   const name = str(o, "name");
   if (name === null || name.length === 0) return null;

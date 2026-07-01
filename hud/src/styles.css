@@ -8913,3 +8913,71 @@ body,
 .tcc-anomaly.warn {
   color: var(--warn-amber);
 }
+
+/* CAPABILITY // HEALTH — propose-only agent/skill performance flags. */
+.attr-body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.attr-summary {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.attr-ok-n {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--learn-green, #5ce0a8);
+}
+.attr-fail-n {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--cyan-bright);
+}
+.attr-stat.warn .attr-fail-n {
+  color: var(--warn-amber);
+}
+.attr-stat-label {
+  font-size: 9px;
+  letter-spacing: 0.14em;
+  color: var(--cyan-dim);
+}
+.attr-turns {
+  margin-left: auto;
+  font-size: 9px;
+  letter-spacing: 0.1em;
+  color: var(--cyan-dim);
+}
+.attr-flags {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+.attr-flags-title {
+  font-size: 8px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+  color: var(--warn-amber);
+}
+.attr-flag {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 10px;
+}
+.attr-flag-name {
+  color: var(--warn-amber);
+  font-weight: 600;
+}
+.attr-flag-kind {
+  font-size: 8px;
+  letter-spacing: 0.1em;
+  color: var(--cyan-dim);
+  text-transform: uppercase;
+}
+.attr-flag-stat {
+  margin-left: auto;
+  color: var(--cyan-dim);
+  white-space: nowrap;
+}
