@@ -69,6 +69,12 @@ mod integrations;
 // wired behind the flag at the audio.rs segment site; only the pure core is proven
 // headlessly (hermetic tests in interpret.rs).
 mod interpret;
+// MICRO-APP INTROSPECTION (introspect.rs): a DEFENSIVE, READ-ONLY sentinel over
+// jarvisd's OWN sandboxed children — SBPL profile-drift detection (fingerprint
+// vs on-disk) + per-app RSS/CPU anomaly classification via sysinfo. No ES, no
+// task_for_pid, no ptrace, no entitlement (it watches same-UID children it
+// spawned). It relays through the telemetry bus; it observes, it never acts.
+mod introspect;
 mod knowledge_graph;
 // LIFE-LOG DIGEST (#20): a periodic (daily/weekly) browsable summary built ONLY
 // from the agent-scoped, redacted EPISODIC store — bounded, never-fabricating
@@ -1857,10 +1863,17 @@ async fn main() -> Result<()> {
     // and tcc.anomaly (new grant / denied->allowed escalation) for the HUD. It
     // never mutates TCC; only its own baseline store is written.
     tokio::spawn(tcc::sentinel_task(tcc_baseline));
-    // Ambient capability-health surfacing: a slow, READ-ONLY periodic pass over
-    // the trace corpus that emits attribution.health (which agents/skills are
-    // failing) for the HUD. PROPOSE-ONLY — it flags, it never disables/reroutes.
-    tokio::spawn(attribution::health_task());
+    // Ambient micro-app introspection: a slow, READ-ONLY sentinel over jarvisd's
+    // OWN sandboxed children — SBPL profile-drift (fingerprint vs on-disk) and
+    // per-app RSS/CPU anomaly classification via sysinfo (same-UID, no
+    // entitlement). It emits introspect.snapshot/profile_drift/anomaly for the
+    // HUD/posture; it observes, it never signals/kills/injects/writes. Ships ON
+    // ([introspect].enabled) and stays inert (nothing to observe) until an app
+    // runs. record_profile/record_child in apps.rs feed it regardless of the
+    // flag; only this sampling loop is gated.
+    if cfg.introspect.enabled {
+        tokio::spawn(introspect::sentinel_task(app_registry.clone()));
+    }
     // Resolve the Anthropic API key eagerly (env var, then macOS Keychain) so
     // daemon.started reports whether the cloud path is available. Only the
     // bool ever leaves this call — the key itself stays out of logs and

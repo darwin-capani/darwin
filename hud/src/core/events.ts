@@ -2913,6 +2913,82 @@ export function parseTccAnomalies(data: Record<string, unknown>): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// MICRO-APP INTROSPECTION (introspect.snapshot / introspect.profile_drift /
+// introspect.anomaly / introspect.module_violation) — the ambient READ-ONLY
+// sentinel over jarvisd's OWN sandboxed children (daemon/src/introspect.rs):
+// SBPL profile-drift, RSS/CPU anomalies, and cooperative dyld module attestation.
+// SECRET-FREE: app names + counts + module paths only, never a token or file
+// contents. Parsers never throw; the status never returns null.
+// ---------------------------------------------------------------------------
+
+/** introspect.snapshot — the per-tick tally of the sandboxed-child sentinel. */
+export interface IntrospectStatus {
+  apps: number;
+  drift: number;
+  anomalies: number;
+}
+
+/** Coerce an introspect.snapshot payload. NEVER null — a malformed payload
+ *  yields an honest all-zero snapshot, never a stale one. */
+export function parseIntrospectSnapshot(data: Record<string, unknown>): IntrospectStatus {
+  return {
+    apps: num(data, "apps") ?? 0,
+    drift: num(data, "drift") ?? 0,
+    anomalies: num(data, "anomalies") ?? 0,
+  };
+}
+
+/** Max introspect finding lines retained/rendered. */
+export const INTROSPECT_ALERT_CAP = 20;
+
+/** Format an introspect.profile_drift payload into a finding line, or null if it
+ *  has no app name (the structural anchor). */
+export function introspectDriftLine(data: Record<string, unknown>): string | null {
+  const app = str(data, "app");
+  if (app === null || app.length === 0) return null;
+  return bool(data, "missing")
+    ? `PROFILE MISSING: ${app} — its seatbelt profile file is gone`
+    : `PROFILE DRIFT: ${app} — on-disk seatbelt profile changed since launch`;
+}
+
+/** Format an introspect.anomaly payload into a finding line, or null if unusable. */
+export function introspectAnomalyLine(data: Record<string, unknown>): string | null {
+  const app = str(data, "app");
+  const kind = str(data, "kind");
+  if (app === null || app.length === 0 || kind === null || kind.length === 0) return null;
+  const detail = str(data, "detail") ?? "";
+  return `ANOMALY [${kind}]: ${app}${detail ? ` — ${detail}` : ""}`;
+}
+
+/** Format an introspect.module_violation payload into a finding line, or null. */
+export function introspectModuleViolationLine(data: Record<string, unknown>): string | null {
+  const app = str(data, "app");
+  const path = str(data, "path");
+  if (app === null || app.length === 0 || path === null || path.length === 0) return null;
+  return `MODULE: ${app} loaded unexpected ${path}`;
+}
+
+/** Format an introspect.security_event payload (kernel security event about a
+ *  tracked app — W^X violation / task-port acquisition / signal) into a finding
+ *  line, or null. `high` events are tagged SECURITY so the panel highlights them. */
+export function introspectSecurityLine(data: Record<string, unknown>): string | null {
+  const app = str(data, "app");
+  const kind = str(data, "kind");
+  if (app === null || app.length === 0 || kind === null || kind.length === 0) return null;
+  const detail = str(data, "detail") ?? "";
+  const tag = bool(data, "high") ? "SECURITY" : "notice";
+  return `${tag} [${kind}]: ${app}${detail ? ` — ${detail}` : ""}`;
+}
+
+/** Accumulate a finding newest-first, deduped, capped. A persistent finding
+ *  re-fires every tick but dedupe collapses it to one line. */
+export function mergeIntrospectAlert(line: string, prev: string[]): string[] {
+  return [line, ...prev]
+    .filter((x, i, a) => a.indexOf(x) === i)
+    .slice(0, INTROSPECT_ALERT_CAP);
+}
+
+// ---------------------------------------------------------------------------
 // CAPABILITY ATTRIBUTION HEALTH (attribution.health) — the PROPOSE-ONLY ambient
 // signal of which of JARVIS's own agents/skills are reliable vs failing, from
 // the trace corpus (daemon/src/attribution.rs). Counts + failing-capability

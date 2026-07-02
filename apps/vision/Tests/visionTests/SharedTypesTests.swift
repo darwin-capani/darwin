@@ -320,6 +320,33 @@ final class VisionEventWireTests: XCTestCase {
         XCTAssertNil(data["screen_authorized"])  // nil -> omitted
     }
 
+    func testModulesEnvelopeShapeIsTypedModulesWithNoTopic() throws {
+        let ev = VisionEvent.modules([
+            DyldModule(path: "/usr/lib/libSystem.B.dylib", uuid: "AAAA"),
+            DyldModule(path: "/app/vision", uuid: nil),
+        ])
+        // Additive contract: type is "modules" (not items/status), NOT topic-routed.
+        XCTAssertEqual(ev.relayType, .modules)
+        let obj = try XCTUnwrap(decodeLine(try XCTUnwrap(ev.line(token: "T"))))
+        XCTAssertEqual(obj["type"] as? String, "modules")
+        let data = try XCTUnwrap(obj["data"] as? [String: Any])
+        XCTAssertNil(data["topic"], "a modules report is not topic-routed")
+        let mods = try XCTUnwrap(data["modules"] as? [[String: Any]])
+        XCTAssertEqual(mods.count, 2)
+        XCTAssertEqual(mods[0]["path"] as? String, "/usr/lib/libSystem.B.dylib")
+        XCTAssertEqual(mods[0]["uuid"] as? String, "AAAA")
+        XCTAssertEqual(mods[1]["path"] as? String, "/app/vision")
+        XCTAssertNil(mods[1]["uuid"], "a nil uuid is omitted, not serialized as null")
+    }
+
+    func testCollectLoadedModulesReturnsThisProcessImages() throws {
+        // Runs in-process (the test binary) — must enumerate real images with UUIDs.
+        let mods = DyldReport.collectLoadedModules()
+        XCTAssertFalse(mods.isEmpty, "the test process has loaded images")
+        XCTAssertTrue(mods.allSatisfy { !$0.path.isEmpty })
+        XCTAssertTrue(mods.contains { $0.uuid != nil }, "at least one image has a parsed LC_UUID")
+    }
+
     func testEveryTopicMatchesManifestDeclaredTopics() throws {
         // The relay drops any topic not declared in manifest.toml. These MUST
         // equal the manifest's telemetry_topics exactly (vision.screen for the OCR

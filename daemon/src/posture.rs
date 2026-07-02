@@ -123,6 +123,14 @@ where
         ReadOutput::Unavailable(why) => format!("Software updates: couldn't read ({why})"),
     });
 
+    // Micro-app introspection (introspect.rs): a secret-free, read-only tally of
+    // the sandboxed-child sentinel (profile-drift / resource-anomalies / module-
+    // violations). None until the sentinel has ticked — then this line joins the
+    // posture the same way FileVault/Firewall/SIP do. It reports; it never acts.
+    if let Some(line) = crate::introspect::posture_line() {
+        lines.push(line);
+    }
+
     format!(
         "Security posture (read-only — I report it; turning anything on is yours to do in System Settings): {}",
         lines.join("; ")
