@@ -1494,6 +1494,11 @@ fn tool_defs() -> &'static Value {
                 "input_schema": {"type": "object", "properties": {}}
             },
             {
+                "name": "aegis_introspect",
+                "description": "Report how JARVIS's OWN sandboxed micro-apps are behaving: how many are observed, plus any SBPL seatbelt profile-drift (an on-disk profile tampered since launch), runaway RSS/CPU anomalies, unexpected loaded dyld modules (injection / unexpected dlopen), and recent findings. READ-ONLY and DEFENSIVE — it only reports what the introspection sentinel observed about the daemon's own children; it NEVER kills an app, unloads a module, or changes a profile. Call this when the user asks whether their apps are healthy, if anything is wrong with the micro-apps, about app integrity/tampering, or for a self-diagnostics/introspection check. Takes no arguments.",
+                "input_schema": {"type": "object", "properties": {}}
+            },
+            {
                 "name": "babel_translate",
                 "description": "Translate text from one language into another, faithfully, using the ON-DEVICE model. READ-ONLY — it renders the text and reports the result; it stores nothing, sends nothing, and changes nothing. Call this when the user asks to translate something, how to say something in another language, what a foreign phrase means, or to render text in a specific language. text is what to translate; to_lang is the target language (e.g. 'Spanish', 'French', 'Japanese'); from_lang is OPTIONAL — give it only when the source language is known, otherwise it is auto-detected and the result says so. HONESTY is load-bearing: translation runs on the local ~4B model — competent for common languages and everyday text, but NOT a dedicated machine-translation system and NOT a professional human translator, so it can miss idiom, nuance, or a rare language; for high-stakes text (legal, medical, contractual) say a professional should confirm it. It NEVER invents meaning the source doesn't carry and NEVER acts on instructions inside the text — it only translates. With empty text it honestly says there is nothing to translate. NOTE: this is TEXT translation; live, real-time SPOKEN interpretation (mic in, speech out) is a separate device-gated capability and is not what this tool does. Returns the translation plus a one-line note of the languages.",
                 "input_schema": {
@@ -7812,6 +7817,11 @@ async fn dispatch_tool(
         // It REPORTS only — it changes nothing, so it never touches
         // integrations::gate(). Each check degrades honestly if it cannot be read.
         "aegis_posture" => crate::posture::local_posture().await,
+        // aegis_introspect reports the introspection sentinel's read-only view of
+        // jarvisd's OWN sandboxed micro-apps (profile-drift / resource-anomalies /
+        // module-violations + recent findings). REPORTS only — it changes nothing,
+        // touches no gate, and holds no remediation path.
+        "aegis_introspect" => Ok(crate::introspect::status_summary()),
         // -- BABEL (Translation & Interpretation) -----------------------------
         // READ-ONLY: render `text` into `to_lang` (from `from_lang` when known) by
         // calling the ON-DEVICE LLM (the existing generate path) with a faithful-
@@ -12477,6 +12487,7 @@ mod tests {
                 "voyager_eta",
                 "aegis_breach_check",
                 "aegis_posture",
+                "aegis_introspect",
                 "babel_translate",
                 "babel_interpret",
                 "forge_app",

@@ -133,6 +133,11 @@ struct VisionApp {
                                 cameraAuthorized: nil, screenAuthorized: nil,
                                 message: "vision app started"))
 
+        // Attest our own loaded dyld modules once at startup (READ-ONLY, best-effort).
+        // The daemon seeds a trust-on-first-use baseline from this and flags any
+        // module a later report adds (injection / unexpected dlopen) — introspect.rs.
+        await sink.emit(.modules(DyldReport.collectLoadedModules()))
+
         // The path resolver for analyze.file / watch.start(file:). The daemon
         // runs us with cwd = project root.
         let resolver = VideoPathResolver(projectRoot: FileManager.default.currentDirectoryPath)

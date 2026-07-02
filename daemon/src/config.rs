@@ -26,6 +26,15 @@ pub struct Config {
     /// loosen a gate, enable a consequential action, or raise autonomy.
     pub focus: FocusConfig,
     pub apps: AppsConfig,
+    /// [introspect] — MICRO-APP INTROSPECTION (introspect.rs). `enabled` SHIPS ON
+    /// (full-power default). READ-ONLY DEFENSE: a slow sentinel over jarvisd's OWN
+    /// sandboxed children that flags SBPL profile-drift (on-disk tamper) and RSS/
+    /// CPU anomalies via sysinfo (same-UID, no entitlement, no ES/ptrace). It
+    /// emits telemetry for the HUD/posture and takes NO action — reacting to a
+    /// finding would be consequential and rides the existing gates. Inert until an
+    /// app runs; with it false the sentinel loop is not spawned (the cheap
+    /// record_profile/record_child hooks in apps.rs still populate their maps).
+    pub introspect: IntrospectConfig,
     pub integrations: IntegrationsConfig,
     pub standing: StandingConfig,
     /// [drafts] — AUTO-DRAFT (#25, drafts.rs). `enabled` SHIPS ON (full-power
@@ -212,6 +221,11 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // which non-consequential proactive intel surfaces, never loosens a gate.
     ("focus", &["profile"]),
     ("apps", &["autostart"]),
+    // [introspect] — the READ-ONLY micro-app introspection sentinel
+    // (introspect.rs): SBPL profile-drift + per-app RSS/CPU anomaly surfacing.
+    // `enabled` SHIPS ON (full-power default); it only observes jarvisd's own
+    // children (same-UID, no entitlement) and never acts.
+    ("introspect", &["enabled"]),
     // [integrations] — `allow_consequential` is THE master gate for outward/
     // side-effecting actions. SHIPS ON (full-power default) — INERT-SAFE: a
     // CONFIRMED consequential action still clears confirm + voice-id + policy +
@@ -2221,6 +2235,25 @@ pub struct AppsConfig {
     pub autostart: Vec<String>,
 }
 
+/// [introspect] — the READ-ONLY micro-app introspection sentinel (introspect.rs).
+/// `enabled` SHIPS ON: like `[audit]`, it is pure accountability/observability —
+/// it watches jarvisd's own sandboxed children (SBPL profile-drift + RSS/CPU
+/// anomalies) and never acts, so enabling it loosens nothing. With it false the
+/// sentinel loop is simply not spawned.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct IntrospectConfig {
+    /// Master switch for the sentinel loop. SHIPS ON (read-only observability).
+    pub enabled: bool,
+}
+
+impl Default for IntrospectConfig {
+    fn default() -> Self {
+        // On by default — it only observes jarvisd's own children and reports.
+        Self { enabled: true }
+    }
+}
+
 /// [integrations] — the shared Chart-2 integration substrate (integrations.rs).
 /// `allow_consequential` is THE master gate for outward/side-effecting actions
 /// (post a message, create an event). It SHIPS ON (true) — the headline of the
@@ -2852,6 +2885,7 @@ impl Config {
             proactive: section(&table, "proactive", &mut issues),
             focus: section(&table, "focus", &mut issues),
             apps: section(&table, "apps", &mut issues),
+            introspect: section(&table, "introspect", &mut issues),
             integrations: section(&table, "integrations", &mut issues),
             standing: section(&table, "standing", &mut issues),
             drafts: section(&table, "drafts", &mut issues),
