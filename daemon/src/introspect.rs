@@ -327,6 +327,11 @@ pub fn reset_module_baseline(name: &str) {
 
 /// A semantic security event about one of jarvisd's tracked apps. Produced by the
 /// (deferred, device-gated) ES NOTIFY client — or, today, by tests.
+// ES SEAM: intentionally has no LIVE caller yet — the ES NOTIFY front-end that
+// produces these is deferred (needs the restricted entitlement + FDA + notarized
+// root host). The classifier + ingestion below are exercised by tests and ready
+// for that front-end. allow(dead_code) so the binary build stays warning-clean.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SecurityEvent {
     /// `mprotect(..., PROT_EXEC)` — a page was made executable (a W^X flip toward X).
@@ -342,6 +347,7 @@ pub enum SecurityEvent {
 
 /// A classified security finding — informational only (surfaced to the HUD/posture
 /// and the findings ring; never acted on here).
+#[allow(dead_code)] // ES seam (see SecurityEvent) — tested; awaits the live ES front-end.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SecurityFinding {
     pub app: String,
@@ -355,6 +361,7 @@ pub struct SecurityFinding {
 /// manifest declared `jit=true` (so an executable/JIT mapping is EXPECTED, not a
 /// violation). Returns a finding when noteworthy, else `None` (benign/expected).
 /// PURE.
+#[allow(dead_code)] // ES seam (see SecurityEvent) — tested; awaits the live ES front-end.
 pub fn classify_security_event(
     app: &str,
     jit_declared: bool,
@@ -408,6 +415,7 @@ pub fn classify_security_event(
 /// SEAM the deferred ES NOTIFY client plugs into; it is exercised by tests today.
 /// READ-ONLY — it reports; it never blocks/kills/responds (an ES observer must be
 /// NOTIFY-only, never AUTH).
+#[allow(dead_code)] // ES seam (see SecurityEvent) — tested; awaits the live ES front-end.
 pub fn ingest_security_event(app: &str, jit_declared: bool, ev: &SecurityEvent) {
     if let Some(f) = classify_security_event(app, jit_declared, ev) {
         record_finding(format!("{}: {}", f.kind, f.detail));
@@ -434,6 +442,7 @@ pub const EV_PROFILE_DRIFT: &str = "introspect.profile_drift";
 pub const EV_ANOMALY: &str = "introspect.anomaly";
 pub const EV_MODATTEST: &str = "introspect.modattest";
 pub const EV_MODULE_VIOLATION: &str = "introspect.module_violation";
+#[allow(dead_code)] // ES seam — only emitted by the deferred live ES front-end (tested).
 pub const EV_SECURITY: &str = "introspect.security_event";
 
 pub fn ev_snapshot(apps: usize, drift: usize, anomalies: usize) -> (&'static str, serde_json::Value) {
@@ -474,6 +483,7 @@ pub fn ev_modattest(
     )
 }
 
+#[allow(dead_code)] // ES seam — only called by the deferred live ES front-end (tested).
 pub fn ev_security(app: &str, kind: &str, high: bool, detail: &str) -> (&'static str, serde_json::Value) {
     (EV_SECURITY, json!({"app": app, "kind": kind, "high": high, "detail": detail}))
 }
