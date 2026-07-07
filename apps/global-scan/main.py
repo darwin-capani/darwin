@@ -623,9 +623,10 @@ def main() -> int:
     # a later report adds (injection / unexpected dlopen) — see introspect.rs.
     if _dyld_report is not None:
         try:
-            link.send("modules", _dyld_report.modules_payload())
-            # Watch for a LATER dlopen; the poll loop re-reports when it fires.
+            # Register the watch FIRST so a dlopen in the gap between the snapshot
+            # and registration isn't missed; the poll loop re-reports when it fires.
             _dyld_report.watch()
+            link.send("modules", _dyld_report.modules_payload())
         except Exception:  # pragma: no cover - never break the app over telemetry
             pass
 

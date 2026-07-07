@@ -1996,10 +1996,12 @@ async fn relay_line(
                     );
                     telemetry::emit("system", event, payload);
                     for module in &att.unexpected {
-                        crate::introspect::record_finding(format!(
+                        // Finding ring is user/cloud-facing -> redact the home
+                        // prefix; the telemetry envelope below keeps the full path.
+                        crate::introspect::record_finding(crate::introspect::redact_home(&format!(
                             "module: {name} loaded unexpected {}",
                             module.path
-                        ));
+                        )));
                         let (event, payload) =
                             crate::introspect::ev_module_violation(name, &module.path, &module.uuid);
                         telemetry::emit("system", event, payload);

@@ -359,11 +359,13 @@ final class VisionEventWireTests: XCTestCase {
             if dlopen(lib, RTLD_NOW) != nil { break }
         }
         let after = DyldReport.collectLoadedModules().count
-        // If the dlopen actually added images, the watch flag must have fired.
-        if after > before {
-            XCTAssertTrue(DyldReport.consumeChanged(), "a runtime dlopen must set the changed flag")
-            XCTAssertFalse(DyldReport.consumeChanged(), "consumeChanged clears the flag")
+        // Only meaningful if a candidate dlopen actually added a new image on this
+        // runner — otherwise skip, so the test can't pass without exercising the watch.
+        guard after > before else {
+            throw XCTSkip("no candidate dlopen added new dyld images on this runner")
         }
+        XCTAssertTrue(DyldReport.consumeChanged(), "a runtime dlopen must set the changed flag")
+        XCTAssertFalse(DyldReport.consumeChanged(), "consumeChanged clears the flag")
     }
 
     func testEveryTopicMatchesManifestDeclaredTopics() throws {
