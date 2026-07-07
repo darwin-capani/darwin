@@ -3,9 +3,9 @@
 //! jarvisd already OWNS the processes it wants to watch: `apps.rs` spawns each
 //! micro-app as a same-UID child under `sandbox-exec` and holds its `Child`. So
 //! this subsystem needs NONE of the heavy macOS observation machinery — no
-//! Endpoint Security (which needs root + the restricted
-//! `com.apple.developer.endpoint-security.client` entitlement + Full Disk Access
-//! + a notarized host), no `task_for_pid`/Mach ports (which need
+//! Endpoint Security (which needs root, the restricted
+//! `com.apple.developer.endpoint-security.client` entitlement, Full Disk Access,
+//! and a notarized host), no `task_for_pid`/Mach ports (which need
 //! `com.apple.security.cs.debugger` and, on hardened/Apple-signed targets, would
 //! not even yield a port), and no `ptrace` (an adversarial, exclusive, target-
 //! stopping facility on macOS). It observes its own children the cheap way:

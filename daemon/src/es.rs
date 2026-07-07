@@ -41,6 +41,10 @@ type EsCallback = extern "C" fn(*const FlatEvent);
 // the archive and adds its OUT_DIR to the search path; declaring the links here
 // keeps rustc's ordering + the whole-archive modifier exact. Linking needs no
 // entitlement — es_new_client's entitlement check is a RUNTIME gate.
+// clippy::duplicated_attributes is a false positive here — it sees `kind = "dylib"`
+// on two DIFFERENT #[link] attributes (EndpointSecurity vs bsm) as a duplicate;
+// both links are needed and its "remove one" suggestion would break linking.
+#[allow(clippy::duplicated_attributes)]
 #[link(name = "jarvis_es_shim", kind = "static", modifiers = "+whole-archive")]
 #[link(name = "EndpointSecurity", kind = "dylib")]
 #[link(name = "bsm", kind = "dylib")]
