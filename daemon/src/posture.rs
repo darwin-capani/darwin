@@ -105,8 +105,8 @@ protection on or changing a permission is yours to do in System Settings.\n\n\
     )
 }
 
-/// One combined defensive readout: machine posture (FileVault/firewall/SIP/updates)
-/// + macOS app-privacy grants (TCC) + the micro-app introspection sentinel. Each
+/// One combined defensive readout: machine posture (FileVault/firewall/SIP/updates),
+/// macOS app-privacy grants (TCC), and the micro-app introspection sentinel. Each
 /// sub-read degrades honestly to a "couldn't read" line rather than failing the
 /// whole report. READ-ONLY — it reports; it changes nothing and holds no
 /// remediation path (turning a protection on is the user's own action).
