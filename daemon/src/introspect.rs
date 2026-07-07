@@ -322,6 +322,12 @@ static MODULE_VIOLATIONS: AtomicUsize = AtomicUsize::new(0);
 /// "dedup vs the seeded set, not vs confirmed" discipline used elsewhere). The
 /// session violation counter is advanced by the unexpected count.
 pub fn attest_or_seed(name: &str, observed: &[Module]) -> Option<ModuleAttestation> {
+    // An empty report carries no information: never SEED a baseline from it (an
+    // empty first baseline would flag every real module as "unexpected" on the
+    // next report) and never attest against it. Wait for a non-empty report.
+    if observed.is_empty() {
+        return None;
+    }
     let mut map = module_baselines().lock().ok()?;
     match map.get(name) {
         None => {
@@ -458,7 +464,9 @@ pub fn classify_security_event(
 #[allow(dead_code)] // ES seam (see SecurityEvent) — tested; awaits the live ES front-end.
 pub fn ingest_security_event(app: &str, jit_declared: bool, ev: &SecurityEvent) {
     if let Some(f) = classify_security_event(app, jit_declared, ev) {
-        record_finding(format!("{}: {}", f.kind, f.detail));
+        // Finding ring is user/cloud-facing -> redact the home prefix (username);
+        // the telemetry envelope keeps the full detail for local forensics.
+        record_finding(redact_home(&format!("{}: {}", f.kind, f.detail)));
         let (event, payload) = ev_security(&f.app, f.kind, f.high, &f.detail);
         crate::telemetry::emit("system", event, payload);
     }
@@ -565,18 +573,27 @@ pub fn record_child(name: &str, pid: Option<u32>) -> PidGuard {
     }
     PidGuard {
         name: name.to_string(),
+        pid,
     }
 }
 
 /// Clears an app's recorded pid when dropped (RAII, mirrors `kill_on_drop`).
 pub struct PidGuard {
     name: String,
+    /// The pid THIS guard recorded (None if `record_child` got no pid).
+    pid: Option<u32>,
 }
 
 impl Drop for PidGuard {
     fn drop(&mut self) {
+        // Remove the entry only if it still holds the exact pid this guard
+        // recorded — so a guard that recorded nothing (None), or a stale guard,
+        // can never clear a newer launch's pid out from under the sentinel.
+        let Some(pid) = self.pid else { return };
         if let Ok(mut m) = child_pids().lock() {
-            m.remove(&self.name);
+            if m.get(&self.name) == Some(&pid) {
+                m.remove(&self.name);
+            }
         }
     }
 }
@@ -699,6 +716,17 @@ const MAX_FINDINGS: usize = 20;
 fn findings() -> &'static Mutex<VecDeque<String>> {
     static M: OnceLock<Mutex<VecDeque<String>>> = OnceLock::new();
     M.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// Redact the user's home-directory prefix (which embeds the username) to `~` in
+/// a string. The findings ring feeds the user/cloud-facing `status_summary`
+/// query, so paths that reach it are kept PII-free — while the LOCAL telemetry
+/// envelopes keep the full path for on-device forensics.
+pub(crate) fn redact_home(s: &str) -> String {
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => s.replace(&home, "~"),
+        _ => s.to_string(),
+    }
 }
 
 /// Retain one already-safe (SECRET-FREE) finding line for the status query.
@@ -1022,6 +1050,34 @@ mod tests {
     }
 
     #[test]
+    fn pid_guard_only_clears_the_exact_pid_it_recorded() {
+        // A guard that recorded NOTHING (None) must not clear an existing entry.
+        child_pids().lock().unwrap().insert("pg-app".to_string(), 111);
+        {
+            let _none_guard = record_child("pg-app", None);
+        }
+        assert_eq!(snapshot_pids().get("pg-app"), Some(&111), "None guard must not clear");
+        // A stale guard (recorded 111) must not clear a NEWER pid (222) that a
+        // later launch inserted — it only removes its own pid.
+        let stale = record_child("pg-app", Some(111));
+        child_pids().lock().unwrap().insert("pg-app".to_string(), 222);
+        drop(stale);
+        assert_eq!(snapshot_pids().get("pg-app"), Some(&222), "stale guard must not clear newer pid");
+        child_pids().lock().unwrap().remove("pg-app");
+    }
+
+    #[test]
+    fn redact_home_replaces_the_home_prefix_only() {
+        if let Ok(home) = std::env::var("HOME") {
+            let r = redact_home(&format!("module: x loaded unexpected {home}/Library/evil.dylib"));
+            assert!(!r.contains(&home), "home prefix (username) must be redacted: {r}");
+            assert!(r.contains("~/Library/evil.dylib"));
+        }
+        // A path with no home prefix is passed through unchanged (forensics intact).
+        assert_eq!(redact_home("/usr/lib/libSystem.B.dylib"), "/usr/lib/libSystem.B.dylib");
+    }
+
+    #[test]
     fn record_profile_stores_fingerprint() {
         let profile = "(version 1)\n(deny default)\n";
         record_profile("fp-test-app", profile);
@@ -1094,6 +1150,23 @@ mod tests {
         let baseline: BTreeSet<String> = [m("/a", Some("1"))].iter().map(Module::key).collect();
         let att = attest_modules(&baseline, &[m("/a", Some("HACKED"))]);
         assert_eq!(att.unexpected, vec![m("/a", Some("HACKED"))]);
+    }
+
+    #[test]
+    fn attest_or_seed_ignores_an_empty_report_and_never_poisons_the_baseline() {
+        let app = "attest-empty-app";
+        // An empty report never seeds and never attests -> always None. This is
+        // the guard: an empty FIRST report used to seed an empty baseline, which
+        // then flagged every real module on the next report as an injection.
+        assert!(attest_or_seed(app, &[]).is_none());
+        // The first NON-empty report seeds (returns None), not flags-everything.
+        let real = vec![m("/usr/lib/libSystem.B.dylib", Some("AAAA"))];
+        assert!(attest_or_seed(app, &real).is_none());
+        // A later empty report is still ignored — never a false attestation.
+        assert!(attest_or_seed(app, &[]).is_none());
+        // The real baseline stands: re-reporting it flags nothing.
+        let att = attest_or_seed(app, &real).expect("attests against the seeded baseline");
+        assert!(att.unexpected.is_empty());
     }
 
     #[test]

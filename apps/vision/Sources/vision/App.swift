@@ -133,14 +133,15 @@ struct VisionApp {
                                 cameraAuthorized: nil, screenAuthorized: nil,
                                 message: "vision app started"))
 
+        // Register the dyld watcher FIRST, then snapshot — so a dlopen in the gap
+        // between the snapshot and registration isn't missed (Vision / ScreenCapture
+        // Kit / CoreML load lazily when capture STARTS, after the report below).
+        DyldReport.watch()
         // Attest our own loaded dyld modules once at startup (READ-ONLY, best-effort).
         // The daemon seeds a trust-on-first-use baseline from this and flags any
         // module a later report adds (injection / unexpected dlopen) — introspect.rs.
+        // The op loop below re-attests when the watch flag fires (after each host op).
         await sink.emit(.modules(DyldReport.collectLoadedModules()))
-        // Watch for LATER dlopens too: Vision / ScreenCaptureKit / CoreML load
-        // lazily when capture STARTS, after the report above. The op loop below
-        // re-attests when the flag fires (checked after each host op).
-        DyldReport.watch()
 
         // The path resolver for analyze.file / watch.start(file:). The daemon
         // runs us with cwd = project root.
