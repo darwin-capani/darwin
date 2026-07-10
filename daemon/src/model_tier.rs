@@ -154,9 +154,10 @@ pub enum ModelChoice {
 /// `None` (config default) on restart (documented above).
 static OVERRIDE: Mutex<Option<Tier>> = Mutex::new(None);
 
-/// Test-only thread-local override mirroring voiceid's `GATE_OVERRIDE`: a test
-/// forces an override on its OWN thread without touching the process-global slot
-/// other parallel tests rely on. Compiled out of release.
+// Test-only thread-local override mirroring voiceid's `GATE_OVERRIDE`: a test
+// forces an override on its OWN thread without touching the process-global slot
+// other parallel tests rely on. Compiled out of release. (Plain comment: rustdoc
+// can't attach a doc comment to a macro invocation — it would warn.)
 #[cfg(test)]
 thread_local! {
     static OVERRIDE_TL: std::cell::Cell<Option<Option<Tier>>> = const { std::cell::Cell::new(None) };

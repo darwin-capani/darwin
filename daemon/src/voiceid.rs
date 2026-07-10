@@ -764,10 +764,11 @@ impl OwnerGate {
 /// deep gate call sites, cleared at turn end.
 static TURN_GATE: Mutex<Option<OwnerGate>> = Mutex::new(None);
 
-/// Test-only thread-local override, mirroring `integrations`'s
-/// `CONSEQUENTIAL_OVERRIDE`: a test forces a gate on its OWN thread without
-/// touching the process-global slot other tests may rely on. Compiled out in
-/// release.
+// Test-only thread-local override, mirroring `integrations`'s
+// `CONSEQUENTIAL_OVERRIDE`: a test forces a gate on its OWN thread without
+// touching the process-global slot other tests may rely on. Compiled out in
+// release. (Plain comment: rustdoc can't attach a doc comment to a macro
+// invocation — it would warn.)
 #[cfg(test)]
 thread_local! {
     static GATE_OVERRIDE: std::cell::Cell<Option<OwnerGate>> = const { std::cell::Cell::new(None) };

@@ -671,9 +671,9 @@ fn power_of_ten(exp: i32) -> String {
             s.push('1');
             s
         }
-    } else if exp >= 0 {
-        format!("1e{exp}")
     } else {
+        // Outside the spell-out range, use scientific notation. `exp` already
+        // carries its sign (e.g. `1e10`, `1e-8`), so both directions render the same.
         format!("1e{exp}")
     }
 }
