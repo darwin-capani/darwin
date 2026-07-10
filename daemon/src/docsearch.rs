@@ -480,14 +480,24 @@ fn flate_stream_within_budget(content: &[u8], budget: u64, spent: &mut u64) -> b
 /// pdf-extract (which also wraps lopdf) cannot inflate what it cannot parse, so it
 /// will error safely on the same input.
 ///
-/// RESIDUAL (documented, accepted as defense-in-depth): a bomb ARMORED behind a
-/// non-Flate filter chain (e.g. `ASCII85Decode`/`LZWDecode` -> `FlateDecode`) has
-/// non-zlib `content` here, so its inner inflation is not measured and a *crafted
-/// filter-chained* bomb can still reach pdf-extract's uncapped inflate. The complete,
-/// filter-agnostic fix is a memory-jailed extraction subprocess (RLIMIT_AS) —
-/// deferred, because re-exec'ing the daemon per file fights the in-process test
-/// model. This guard closes the common naive single-FlateDecode bomb (the reported
-/// vector) with reliable boundaries.
+/// RESIDUALS (documented; a complete fix needs process-level isolation, see below):
+///   1. FILTER-CHAIN ARMOR — a bomb behind a non-Flate chain (`ASCII85Decode` /
+///      `LZWDecode` -> `FlateDecode`) has non-zlib `content` here, so its inner
+///      inflation is not measured and a *crafted* filter-chained bomb can still
+///      reach pdf-extract's uncapped inflate.
+///   2. STRUCTURAL-STREAM (parse-time) BOMBS — a bomb inside a cross-reference
+///      stream (XRefStm) or object stream (ObjStm) is decompressed by the PARSER
+///      itself (both this `load_mem` AND pdf-extract's own load must decode those to
+///      read the file). lopdf 0.38 exposes no decompression-size limit on load, so
+///      such a bomb OOMs during parse — and NO in-process guard can prevent it,
+///      because pdf-extract re-parses the same bytes unbounded regardless of what we
+///      check first (a Rust alloc-abort does not unwind, so `catch_unwind` can't
+///      contain it either).
+/// The ONLY complete, filter- and structure-agnostic fix is a memory-jailed
+/// extraction subprocess (RLIMIT_AS on a child) — deferred as an architectural
+/// follow-up (a per-file re-exec fights the in-process test model). This guard
+/// closes the common single-FlateDecode CONTENT-stream bomb (the reported vector)
+/// with reliable boundaries; the two residuals above are honestly out of its reach.
 fn pdf_decompression_within_budget(bytes: &[u8], budget: u64) -> bool {
     let Ok(doc) = lopdf::Document::load_mem(bytes) else {
         return true; // unparseable -> pdf-extract will error safely, not OOM
