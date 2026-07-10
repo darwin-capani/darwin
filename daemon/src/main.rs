@@ -1899,6 +1899,17 @@ async fn main() -> Result<()> {
         #[cfg(feature = "endpoint-security")]
         es::start_and_report();
     }
+    // Ambient CAPABILITY-HEALTH loop: a slow, READ-ONLY periodic pass over the
+    // optimizer's own trace corpus that emits the PROPOSE-ONLY `attribution.health`
+    // snapshot (how many agents/skills are reliable / mixed / failing, plus promote
+    // candidates) for the HUD's AttributionHealthPanel. It changes nothing — it only
+    // reads and reports. Gated on the optimizer being ON (its trace store is the
+    // source); `health_tick` also self-gates, emitting nothing when the store is
+    // absent. This is the daemon half of an otherwise-complete HUD feature (the
+    // panel/parser/reducer + tests already exist) that was built but never spawned.
+    if cfg.optimize.enabled {
+        tokio::spawn(attribution::health_task());
+    }
     // Resolve the Anthropic API key eagerly (env var, then macOS Keychain) so
     // daemon.started reports whether the cloud path is available. Only the
     // bool ever leaves this call — the key itself stays out of logs and
