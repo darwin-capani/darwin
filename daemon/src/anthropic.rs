@@ -3749,15 +3749,6 @@ mod response_voice {
     /// the main.rs response-speak site, cleared at turn end by [`TurnLangGuard`].
     static RESPONSE_VOICE_LANG: Mutex<Option<String>> = Mutex::new(None);
 
-    /// Test-only thread-local override, mirroring `voiceid`'s `GATE_OVERRIDE`: a test
-    /// forces a value on its OWN thread without racing the process-global slot other
-    /// tests share. Compiled out in release.
-    #[cfg(test)]
-    thread_local! {
-        static LANG_OVERRIDE: std::cell::RefCell<Option<Option<String>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-
     /// Record the language THIS turn's response text should be voiced in (the Babel
     /// `to_lang`). An empty/whitespace value reads as no hint. Poison-tolerant.
     pub fn set_response_voice_lang(lang: Option<&str>) {
@@ -3775,12 +3766,6 @@ mod response_voice {
     /// is the read consulted by the main.rs response-speak site, which threads it into
     /// `speech::speak_in_lang` (None => today's `speak`). Poison-tolerant.
     pub fn current_response_voice_lang() -> Option<String> {
-        #[cfg(test)]
-        {
-            if let Some(v) = LANG_OVERRIDE.with(|c| c.borrow().clone()) {
-                return v;
-            }
-        }
         RESPONSE_VOICE_LANG.lock().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
@@ -3796,28 +3781,6 @@ mod response_voice {
         }
     }
 
-    /// `#[cfg(test)]`-only RAII override forcing `current_response_voice_lang()` to a
-    /// value on the current thread, restoring the prior state on drop. Mirrors
-    /// `voiceid::GateOverride`.
-    #[cfg(test)]
-    pub(crate) struct LangOverride {
-        prev: Option<Option<String>>,
-    }
-
-    #[cfg(test)]
-    impl LangOverride {
-        pub(crate) fn force(lang: Option<&str>) -> Self {
-            let prev = LANG_OVERRIDE.with(|c| c.replace(Some(lang.map(str::to_string))));
-            Self { prev }
-        }
-    }
-
-    #[cfg(test)]
-    impl Drop for LangOverride {
-        fn drop(&mut self) {
-            LANG_OVERRIDE.with(|c| *c.borrow_mut() = self.prev.take());
-        }
-    }
 }
 
 // Production needs only set (babel_interpret arm), current (main.rs response-speak
@@ -3887,9 +3850,9 @@ mod answers {
 
     // Test-only thread-local override so a test can drive the accumulator on its
     // OWN thread without racing the process-global slot other tests share —
-    // mirrors `voiceid::GATE_OVERRIDE` / `response_voice::LANG_OVERRIDE`. A plain
-    // comment (not a doc comment) because rustdoc can't attach docs to a macro
-    // invocation (it would warn under the test build).
+    // mirrors `voiceid::GATE_OVERRIDE`. A plain comment (not a doc comment) because
+    // rustdoc can't attach docs to a macro invocation (it would warn under the test
+    // build).
     #[cfg(test)]
     thread_local! {
         static SOURCES_OVERRIDE: std::cell::RefCell<Option<Vec<AnswerSource>>> =
