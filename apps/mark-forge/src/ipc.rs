@@ -30,7 +30,7 @@
 //! daemon's socket), opens NO window, touches NO GPU, plays NO audio. The engine
 //! is pure CPU/f64; the HUD renders.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
@@ -768,8 +768,18 @@ fn params_refusal(patch: &ParamsPatch) -> Option<String> {
 /// window, touches NO GPU, plays NO audio.
 pub fn run(env: AppEnv) -> Result<()> {
     let stream = UnixStream::connect(&env.socket_path)?;
+    serve(stream, &env)
+}
+
+/// Serve the JSONL op loop over an already-connected `stream`: publish the online
+/// log + the initial (empty) scene, then read BOUNDED lines and dispatch each via
+/// [`handle_line`] until a clean `stop`, EOF, or socket error. Split out of [`run`]
+/// (which only does the `connect`) so the socket loop — including the bounded
+/// reader's oversized-frame drop + resync path — is testable over a
+/// [`UnixStream::pair`], which `run`'s connect-to-a-path shape otherwise precludes.
+fn serve(stream: UnixStream, env: &AppEnv) -> Result<()> {
     let mut writer = stream.try_clone()?;
-    let reader = BufReader::new(stream);
+    let mut reader = BufReader::new(stream);
 
     let mut state = AppState::new();
 
@@ -777,19 +787,109 @@ pub fn run(env: AppEnv) -> Result<()> {
     // Publish the initial (empty) scene so the HUD panel can mount.
     emit(&mut writer, &env.token, Telemetry::Scene(scene_topology(&state.world)));
 
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(_) => break, // socket closed / read error → exit cleanly
-        };
-        // One bad line never tears the app down (mirrors silicon-canvas /
-        // global-scan): handle_line classifies + dispatches + writes back, and
-        // returns LoopAction::Stop only on a clean `stop` verb.
-        if let LoopAction::Stop = handle_line(&mut state, &env.token, &line, &mut writer) {
-            break;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match read_bounded_line(&mut reader, &mut buf) {
+            LineRead::Eof => break, // socket closed / read error → exit cleanly
+            LineRead::Oversized => {
+                // A peer streamed past the per-line cap with no newline: the frame
+                // was DROPPED and the reader resynced to the next `\n`, so the heap
+                // never grew unbounded (the read-loop analogue of MAX_BODIES /
+                // MAX_STEPS_PER_CALL). Log it like any dropped line and keep
+                // serving — one bad frame never tears the app down.
+                log_line(
+                    &mut writer,
+                    &env.token,
+                    &format!(
+                        "dropped oversized line (>= {MAX_LINE_BYTES} bytes, no newline); resynced to next frame"
+                    ),
+                );
+            }
+            LineRead::Line(line) => {
+                // One bad line never tears the app down (mirrors silicon-canvas /
+                // global-scan): handle_line classifies + dispatches + writes back,
+                // and returns LoopAction::Stop only on a clean `stop` verb.
+                if let LoopAction::Stop = handle_line(&mut state, &env.token, &line, &mut writer) {
+                    break;
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// Hard cap on a single inbound JSONL line. A well-formed op line is a few hundred
+/// bytes; 1 MiB is orders of magnitude past any real frame yet finite. A peer that
+/// streams past this WITHOUT a newline has its oversized frame DROPPED (and the
+/// reader resynced to the next `\n`) rather than allowed to grow the inbound
+/// `String` without bound → allocation `abort()`. This is the read-loop analogue
+/// of the op-level [`MAX_BODIES`] / [`MAX_DT`] / `world::MAX_STEPS_PER_CALL` bounds
+/// — bound everything the peer controls; never a panic, never an abort.
+const MAX_LINE_BYTES: u64 = 1024 * 1024;
+
+/// The outcome of one bounded read from the inbound socket.
+enum LineRead {
+    /// A complete line within the byte cap (trailing `\n` stripped). Decoded with
+    /// `from_utf8_lossy`, so a non-UTF-8 byte becomes U+FFFD and is classified +
+    /// dropped downstream as a malformed line — never a hard read error that tears
+    /// the loop down (the trap `reader.lines()`'s `read_line` would raise).
+    Line(String),
+    /// The peer streamed >= [`MAX_LINE_BYTES`] with no newline: the oversized frame
+    /// was drained to the next `\n` (or EOF) and DROPPED. The loop keeps serving.
+    Oversized,
+    /// Clean EOF or an unrecoverable socket error — the loop should exit.
+    Eof,
+}
+
+/// Read ONE line from `reader`, bounded to [`MAX_LINE_BYTES`]. Reads up to the cap
+/// looking for a `\n`; a complete line — or a final unterminated line at EOF —
+/// under the cap is returned as [`LineRead::Line`] (trailing `\n` stripped, decoded
+/// lossily so an invalid byte can never raise a read error). A frame that reaches
+/// the cap with no newline is [`LineRead::Oversized`]: the rest of that frame is
+/// drained to the next `\n` so the FOLLOWING line resyncs cleanly. `buf` is a
+/// caller-owned scratch buffer reused across calls (cleared on entry).
+fn read_bounded_line<R: BufRead>(reader: &mut R, buf: &mut Vec<u8>) -> LineRead {
+    buf.clear();
+    let n = match (&mut *reader).take(MAX_LINE_BYTES).read_until(b'\n', buf) {
+        Ok(n) => n,
+        Err(_) => return LineRead::Eof, // socket read error → exit cleanly
+    };
+    if n == 0 {
+        return LineRead::Eof; // clean EOF
+    }
+    if buf.last() == Some(&b'\n') {
+        buf.pop(); // strip the trailing newline (handle_line trims anyway)
+        return LineRead::Line(String::from_utf8_lossy(buf).into_owned());
+    }
+    // No trailing newline. A short final line before EOF is legitimate; a frame
+    // that consumed the WHOLE cap without a newline is oversized → drop + resync.
+    if (n as u64) < MAX_LINE_BYTES {
+        return LineRead::Line(String::from_utf8_lossy(buf).into_owned());
+    }
+    resync_to_newline(reader);
+    LineRead::Oversized
+}
+
+/// Drain and discard bytes from `reader` up to and including the next `\n` (or
+/// EOF), so a dropped oversized frame leaves no partial line to corrupt the next
+/// parse. Bounded memory: scans the [`BufReader`]'s fixed internal buffer chunk by
+/// chunk via `fill_buf`/`consume` and never allocates a growing buffer of its own.
+fn resync_to_newline<R: BufRead>(reader: &mut R) {
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(c) => c,
+            Err(_) => return, // socket error → the next read reports EOF
+        };
+        if chunk.is_empty() {
+            return; // EOF before any newline
+        }
+        if let Some(pos) = chunk.iter().position(|&b| b == b'\n') {
+            reader.consume(pos + 1); // consume through the newline; resynced
+            return;
+        }
+        let len = chunk.len();
+        reader.consume(len); // discard this whole chunk, keep scanning
+    }
 }
 
 /// What the socket loop does after one inbound line.
@@ -1557,5 +1657,91 @@ mod tests {
         assert_eq!(a, LoopAction::Continue);
         assert_eq!(state.world.gravity, Vec3::new(0.0, -3.0, 0.0), "a sane gravity is accepted");
         assert!(gravity_refusal(0.0, -9.81, 0.0).is_none());
+    }
+
+    // ----- the socket loop bounds an oversized newline-free frame ----------
+
+    #[test]
+    fn serve_bounds_oversized_line_and_keeps_serving() {
+        // The bounded reader must never grow the inbound String without limit: a
+        // peer that streams > MAX_LINE_BYTES with NO newline has that frame DROPPED
+        // and the reader resynced to the next `\n`, so the FOLLOWING stop frame is
+        // still processed and serve() returns cleanly. Drives the REAL serve() loop
+        // over a socketpair (run() connects to a path; serve() is the testable loop
+        // shell), the first end-to-end socket coverage of the read loop.
+        use std::io::{Read, Write};
+        use std::thread;
+
+        let (mut host, app) = UnixStream::pair().expect("socketpair");
+        let env = AppEnv {
+            socket_path: PathBuf::from("/tmp/mark-forge-test-unused.sock"),
+            token: "tok-oversize".to_string(),
+            name: "mark-forge".to_string(),
+        };
+        let handle = thread::spawn(move || serve(app, &env));
+
+        // A frame far larger than the cap with NO newline, then a `\n` to end the
+        // oversized frame, then a clean stop. If the reader grew unbounded this
+        // would OOM; if it failed to resync it would never see the stop and hang.
+        let oversized = vec![b'x'; MAX_LINE_BYTES as usize + 4096];
+        host.write_all(&oversized).unwrap();
+        host.write_all(b"\n").unwrap();
+        host.write_all(b"{\"type\":\"stop\"}\n").unwrap();
+        host.flush().unwrap();
+
+        let result = handle.join().expect("serve thread panicked");
+        assert!(result.is_ok(), "serve returned an error: {result:?}");
+
+        // serve closed its stream on return, so read_to_string ends at EOF. The
+        // output carries the oversized-drop log AND the stopping log — the loop
+        // survived the oversized frame and processed the next one.
+        let mut out = String::new();
+        host.read_to_string(&mut out).unwrap();
+        assert!(
+            out.contains("dropped oversized line"),
+            "the oversized frame is logged as dropped: {out}"
+        );
+        assert!(
+            out.contains("stopping"),
+            "the stop frame after the oversized frame is still processed: {out}"
+        );
+    }
+
+    // ----- the socket loop survives an invalid-UTF-8 line ------------------
+
+    #[test]
+    fn serve_drops_invalid_utf8_line_and_processes_the_next() {
+        // `reader.lines()`'s `read_line` raises Err(InvalidData) on a non-UTF-8
+        // byte; the old `Err(_) => break` would have EXITED the app on it. The
+        // bounded reader decodes lossily, so the bad line is classified + dropped
+        // and the loop keeps serving — the following stop frame still processes.
+        use std::io::{Read, Write};
+        use std::thread;
+
+        let (mut host, app) = UnixStream::pair().expect("socketpair");
+        let env = AppEnv {
+            socket_path: PathBuf::from("/tmp/mark-forge-test-unused.sock"),
+            token: "tok-badutf8".to_string(),
+            name: "mark-forge".to_string(),
+        };
+        let handle = thread::spawn(move || serve(app, &env));
+
+        host.write_all(&[0xFF, 0xFE, b'\n']).unwrap();
+        host.write_all(b"{\"type\":\"stop\"}\n").unwrap();
+        host.flush().unwrap();
+
+        let result = handle.join().expect("serve thread panicked");
+        assert!(result.is_ok(), "serve must not error on a non-UTF-8 line: {result:?}");
+
+        let mut out = String::new();
+        host.read_to_string(&mut out).unwrap();
+        assert!(
+            out.contains("dropped line"),
+            "the invalid-UTF-8 line is logged as dropped: {out}"
+        );
+        assert!(
+            out.contains("stopping"),
+            "the stop after the bad line still processes: {out}"
+        );
     }
 }
