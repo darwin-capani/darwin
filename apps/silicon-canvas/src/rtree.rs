@@ -168,8 +168,15 @@ impl Index {
             );
         }
         for (i, v) in scene.vias.iter().enumerate() {
-            // A via spans layers; index it on every layer in its span so a
-            // hit-test on any of those layers finds it.
+            // A via occupies every copper layer between its two faces. The parser
+            // interns copper in physical stackup order (dense, contiguous ids;
+            // see `parser::seed_copper_layers`), so the inclusive LayerId range
+            // `[from, to]` is exactly that copper span and holds no non-copper id.
+            // A blind/buried via is therefore indexed only on the layers it truly
+            // reaches — never on copper past its span. (Before stackup-ordered
+            // interning, first-appearance ids could place a blind via onto a layer
+            // it never reaches, e.g. `B.Cu` sitting numerically between `F.Cu` and
+            // an inner layer.)
             let bb = disc_bbox(v.position, v.diameter);
             let (lo, hi) = layer_span(v.layer_from, v.layer_to);
             for raw in lo..=hi {
@@ -529,6 +536,58 @@ mod tests {
         }
         // Outside the span: nothing.
         assert!(idx.hit_test(Point::new(1.0, 1.0), &[LayerId::new(5)]).is_none());
+    }
+
+    // A board whose GEOMETRY appears F.Cu, then B.Cu, then In1.Cu — the canonical
+    // Bug-1 divergence: first-appearance interning would number them F.Cu=0,
+    // B.Cu=1, In1.Cu=2, so a blind via F.Cu -> In1.Cu would span ids 0..=2 and be
+    // wrongly indexed onto B.Cu (id 1). The parser's stackup pre-seed instead
+    // numbers copper physically (F.Cu=0, In1.Cu=1, B.Cu=2), so the via spans only
+    // 0..=1 and never lands on B.Cu.
+    const STACKUP_PCB: &str = r#"
+(kicad_pcb (version 20221018) (generator pcbnew)
+  (layers
+    (0 "F.Cu" signal)
+    (1 "In1.Cu" signal)
+    (31 "B.Cu" signal))
+  (net 0 "")
+  (net 1 "N1")
+  (segment (start 0 0) (end 3 0) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 0 0) (end 3 0) (width 0.25) (layer "B.Cu") (net 1))
+  (segment (start 0 0) (end 3 0) (width 0.25) (layer "In1.Cu") (net 1))
+  (via (at 10 0) (size 0.6) (drill 0.3) (layers "F.Cu" "In1.Cu") (net 1)))
+"#;
+
+    #[test]
+    fn blind_via_indexed_only_on_its_physical_span() {
+        use crate::parser::parse_document;
+        use std::path::Path;
+
+        let scene = parse_document(Path::new("board.kicad_pcb"), STACKUP_PCB).unwrap();
+        let idx = Index::build(&scene);
+        let id = |name: &str| {
+            LayerId::new(scene.layer_names.iter().position(|n| n == name).unwrap() as u16)
+        };
+        let (f, in1, b) = (id("F.Cu"), id("In1.Cu"), id("B.Cu"));
+        // Physical stackup: In1.Cu sits strictly between F.Cu and B.Cu.
+        assert!(f.raw() < in1.raw() && in1.raw() < b.raw());
+
+        let at_via = Point::new(10.0, 0.0);
+        // The blind via reaches F.Cu and In1.Cu → hittable on both.
+        for layer in [f, in1] {
+            let hit = idx.hit_test(at_via, &[layer]);
+            assert_eq!(
+                hit.map(|e| e.kind),
+                Some(EntityKind::Via),
+                "via must be hittable on {}",
+                scene.layer_names[layer.index()]
+            );
+        }
+        // ...but NOT on B.Cu, which the blind via never physically reaches.
+        assert!(
+            idx.hit_test(at_via, &[b]).is_none(),
+            "blind via must not appear on B.Cu it never reaches"
+        );
     }
 
     #[test]

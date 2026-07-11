@@ -566,13 +566,29 @@ fn is_net_label(kind: crate::scene::LabelKind) -> bool {
 // PCB builder: per-layer copper endpoint match + via stitching.
 // ===========================================================================
 
+/// A via's `(layer_from, layer_to)` normalized to an inclusive `(lo, hi)` raw
+/// [`LayerId`] range, tolerating either ordering. Because the parser interns
+/// copper in physical stackup order (`parser::seed_copper_layers`), this range
+/// is exactly the copper the via stitches — mirrors `rtree::layer_span`.
+#[inline]
+fn via_layer_span(from: LayerId, to: LayerId) -> (u16, u16) {
+    let (a, b) = (from.raw(), to.raw());
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 fn build_pcb(scene: &Scene) -> Graph {
     let mut b = Builder::new();
     // Per-(layer, cell) endpoint groups for same-layer copper contact.
     let mut layer_cell: HashMap<(u16, QuantKey), Vec<u32>> = HashMap::new();
-    // Position cell (layer-agnostic) for via stitching: every node touching a
-    // via's xy position, across layers, merges through the via.
-    let mut stitch_cell: HashMap<QuantKey, Vec<u32>> = HashMap::new();
+    // Position cell for via stitching: every node touching a via's xy position,
+    // tagged with the copper layer it sits on (`(node, layer.raw())`). A via then
+    // stitches only the nodes whose layer falls within its TRUE span, so a
+    // blind/buried via never merges copper it cannot physically reach.
+    let mut stitch_cell: HashMap<QuantKey, Vec<(u32, u16)>> = HashMap::new();
 
     // Same-layer copper contact: connect nodes sharing a quantized endpoint on
     // the same layer.
@@ -594,9 +610,10 @@ fn build_pcb(scene: &Scene) -> Graph {
         let node = b.node(EntityRef::track((i as u32).into()), t.layer);
         touch_layer(&mut b, &mut layer_cell, t.layer, t.a, node);
         touch_layer(&mut b, &mut layer_cell, t.layer, t.b, node);
-        // Also register endpoints for via stitching at those positions.
-        stitch_cell.entry(t.a.quantize()).or_default().push(node);
-        stitch_cell.entry(t.b.quantize()).or_default().push(node);
+        // Also register endpoints (tagged with the track's layer) for via
+        // stitching at those positions.
+        stitch_cell.entry(t.a.quantize()).or_default().push((node, t.layer.raw()));
+        stitch_cell.entry(t.b.quantize()).or_default().push((node, t.layer.raw()));
     }
 
     // Pads: connect at their position on their layer, and register for stitching
@@ -604,20 +621,28 @@ fn build_pcb(scene: &Scene) -> Graph {
     for (i, p) in scene.pads.iter().enumerate() {
         let node = b.node(EntityRef::pad((i as u32).into()), p.layer);
         touch_layer(&mut b, &mut layer_cell, p.layer, p.position, node);
-        stitch_cell.entry(p.position.quantize()).or_default().push(node);
+        stitch_cell.entry(p.position.quantize()).or_default().push((node, p.layer.raw()));
     }
 
-    // Vias: a node at their position; stitch together everything registered at
-    // that position (tracks on either layer, pads), since a via is a layer
-    // transition (SPEC §1 via stitching).
+    // Vias: a node at their position; stitch together the copper registered at
+    // that position that lies WITHIN the via's layer span (SPEC §1 via stitching).
+    // LayerIds are physical stackup indices (the parser seeds copper in stackup
+    // order), so the inclusive `[lo, hi]` id range is exactly the copper the via
+    // passes through: a through via (full stack) merges everything at the point,
+    // while a blind/buried via leaves copper outside its span in its own net.
     for (i, v) in scene.vias.iter().enumerate() {
         let node = b.node(EntityRef::via((i as u32).into()), v.layer_from);
+        let (lo, hi) = via_layer_span(v.layer_from, v.layer_to);
         let key = v.position.quantize();
         let group = stitch_cell.entry(key).or_default();
-        for &other in group.iter() {
-            b.connect(node, other);
+        for &(other, layer) in group.iter() {
+            if (lo..=hi).contains(&layer) {
+                b.connect(node, other);
+            }
         }
-        group.push(node);
+        // Register the via on its top face so a later via at the same point can
+        // stitch to it (two coincident vias are degenerate; one face suffices).
+        group.push((node, v.layer_from.raw()));
     }
 
     // Zones: connect a zone to copper sharing one of its outline vertices on the
@@ -883,6 +908,57 @@ mod tests {
             .find(|s| s.entity == EntityRef::track(1u32.into()))
             .unwrap();
         assert!(t1.crosses_layer, "reaching the back-layer track crosses a layer");
+    }
+
+    #[test]
+    fn blind_via_does_not_stitch_copper_outside_its_span() {
+        // Physical stackup ids (as the parser hands them out): F.Cu=0, In1.Cu=1,
+        // In4.Cu=4. An In1.Cu track and an In4.Cu track meet at (10,0); a blind via
+        // spanning only F.Cu..In1.Cu sits there. The via reaches the In1.Cu track
+        // (bottom of its span) but NOT the In4.Cu track — the In4.Cu copper must
+        // stay in its own net (the layer-agnostic stitch would wrongly merge it).
+        let mut s = Scene::new(SceneKind::Pcb);
+        let f = LayerId::new(0);
+        let in1 = LayerId::new(1);
+        let in4 = LayerId::new(4);
+        s.tracks.push(Track {
+            a: Point::new(5.0, 0.0),
+            b: Point::new(10.0, 0.0),
+            width: 0.25,
+            layer: in1,
+            net_id: NetId::NONE,
+        }); // track 0, In1.Cu — within the via span
+        s.tracks.push(Track {
+            a: Point::new(10.0, 0.0),
+            b: Point::new(15.0, 0.0),
+            width: 0.25,
+            layer: in4,
+            net_id: NetId::NONE,
+        }); // track 1, In4.Cu — outside the via span
+        s.vias.push(Via {
+            position: Point::new(10.0, 0.0),
+            diameter: 0.6,
+            drill: 0.3,
+            layer_from: f,
+            layer_to: in1,
+            net_id: NetId::NONE,
+        }); // via 0, blind F.Cu -> In1.Cu
+        s.init_flags();
+        let g = Graph::build(&s);
+
+        let n_in1 = g.node_net(EntityRef::track(0u32.into()));
+        let n_in4 = g.node_net(EntityRef::track(1u32.into()));
+        let n_via = g.node_net(EntityRef::via(0u32.into()));
+        // The via stitches the In1.Cu track it reaches.
+        assert!(n_via.is_some());
+        assert_eq!(n_via, n_in1, "via must stitch the In1.Cu track within its span");
+        // The In4.Cu track the via never reaches stays in a distinct net.
+        assert_ne!(
+            n_in4, n_in1,
+            "blind via must NOT merge the In4.Cu track outside its span"
+        );
+        // Two nets total: {In1.Cu track + via} and {In4.Cu track}.
+        assert_eq!(g.net_count(), 2);
     }
 
     #[test]
