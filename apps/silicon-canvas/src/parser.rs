@@ -767,6 +767,58 @@ impl LayerTable {
     }
 }
 
+/// True for a KiCad copper layer name — `F.Cu`, `B.Cu`, or an inner `In<k>.Cu`.
+/// Only copper layers hold a stackup position and can be spanned by a via;
+/// technical layers (`*.Mask`, `*.SilkS`, `*.Paste`, `Edge.Cuts`, …) never end
+/// in `.Cu`.
+fn is_copper_layer(name: &str) -> bool {
+    name.ends_with(".Cu")
+}
+
+/// Pre-seed `layers` with the board's copper stack in physical (top→bottom)
+/// order from the top-level `(layers (ORDINAL "name" type ...) ...)` block.
+///
+/// KiCad defines a layer's `ORDINAL` as its position in the stack ordering
+/// (F.Cu = 0, inner copper ascending, B.Cu last), so interning the copper layers
+/// by ascending ordinal hands them dense [`LayerId`]s `0..n` that are contiguous
+/// and physically ordered. That is the invariant the two via consumers depend
+/// on: an inclusive LayerId range then equals a real copper span, so the R-tree
+/// indexes a via on exactly the copper it reaches ([`crate::rtree`]) and the
+/// graph stitches only copper within the via's span ([`crate::graph`]). Without
+/// it, first-appearance interning could place a blind via's inner layer numerically
+/// adjacent to `B.Cu` and mis-hit / mis-merge copper the via never touches.
+///
+/// Non-copper layers are left for first-appearance interning and land after the
+/// copper block. A board with no parseable `(layers ...)` block is a no-op —
+/// layers then fall back to first-appearance interning as before.
+fn seed_copper_layers(root: &Value, layers: &mut LayerTable) {
+    let Some(block) = root.get("layers") else {
+        return;
+    };
+    let Some(items) = block.list() else {
+        return;
+    };
+    // Collect (ordinal, name) per copper layer; items[0] is the `layers` head.
+    let mut copper: Vec<(i64, &str)> = Vec::new();
+    for item in items.iter().skip(1) {
+        let Some(fields) = item.list() else {
+            continue;
+        };
+        let ordinal = fields.first().and_then(Value::as_f64);
+        let name = fields.get(1).and_then(Value::as_str);
+        if let (Some(ordinal), Some(name)) = (ordinal, name) {
+            if is_copper_layer(name) {
+                copper.push((ordinal as i64, name));
+            }
+        }
+    }
+    // Ascending ORDINAL is top→bottom stackup order (F.Cu first … B.Cu last).
+    copper.sort_by_key(|&(ordinal, _)| ordinal);
+    for (_, name) in copper {
+        layers.intern(name);
+    }
+}
+
 /// A net-name interner for `.kicad_pcb`, which DOES carry an explicit
 /// `(net <n> "<name>")` table. Maps the file's net ordinal to our dense
 /// [`NetId`], preserving index 0 == "" (KiCad's net 0 is the no-net).
@@ -814,6 +866,13 @@ pub fn parse_pcb(path: &Path, root: &Value) -> Result<Scene> {
     let mut scene = Scene::new(SceneKind::Pcb);
     let mut layers = LayerTable::new();
     let mut nets = PcbNetTable::new();
+
+    // Pre-seed the layer table from the board's top-level `(layers ...)` stackup
+    // so numeric LayerId adjacency reflects PHYSICAL copper adjacency, not the
+    // order layers first appear in the geometry. This is the invariant the R-tree
+    // via-span index (`rtree`) and the graph via stitcher (`graph`) both rely on
+    // to reason about which copper a via actually reaches.
+    seed_copper_layers(root, &mut layers);
 
     // Net table: (net 0 "") (net 1 "GND") ...
     for n in root.get_all("net") {
@@ -1309,6 +1368,47 @@ mod tests {
         assert_ne!(via.layer_from, via.layer_to);
         assert_eq!(scene.layer_names[via.layer_from.index()], "F.Cu");
         assert_eq!(scene.layer_names[via.layer_to.index()], "B.Cu");
+    }
+
+    // A board whose `(layers ...)` stackup declares F.Cu, In1.Cu, B.Cu, but whose
+    // GEOMETRY first touches F.Cu, then B.Cu, then In1.Cu — the canonical Bug-1
+    // divergence. Without the stackup pre-seed, first-appearance interning would
+    // number copper F.Cu=0, B.Cu=1, In1.Cu=2, misordering the stack; the pre-seed
+    // must intern copper in stack order so In1.Cu lands physically between F.Cu
+    // and B.Cu. `B.SilkS` is declared but never referenced, so it must NOT be
+    // interned (pre-seed is copper-only).
+    const STACKUP_PCB: &str = r#"
+(kicad_pcb (version 20221018) (generator pcbnew)
+  (layers
+    (0 "F.Cu" signal)
+    (1 "In1.Cu" signal)
+    (31 "B.Cu" signal)
+    (36 "B.SilkS" user))
+  (net 0 "")
+  (net 1 "N1")
+  (segment (start 0 0) (end 3 0) (width 0.25) (layer "F.Cu") (net 1))
+  (segment (start 0 0) (end 3 0) (width 0.25) (layer "B.Cu") (net 1))
+  (segment (start 0 0) (end 3 0) (width 0.25) (layer "In1.Cu") (net 1))
+  (via (at 10 0) (size 0.6) (drill 0.3) (layers "F.Cu" "In1.Cu") (net 1)))
+"#;
+
+    #[test]
+    fn pcb_seeds_copper_in_stackup_order_not_appearance_order() {
+        let scene = parse_document(Path::new("board.kicad_pcb"), STACKUP_PCB).unwrap();
+        // Copper interned in physical stack order despite the geometry touching
+        // B.Cu first: F.Cu, In1.Cu, B.Cu take ids 0, 1, 2.
+        assert_eq!(scene.layer_names.first().map(String::as_str), Some("F.Cu"));
+        assert_eq!(scene.layer_names.get(1).map(String::as_str), Some("In1.Cu"));
+        assert_eq!(scene.layer_names.get(2).map(String::as_str), Some("B.Cu"));
+        // Unreferenced non-copper layers are not interned.
+        assert!(!scene.layer_names.iter().any(|l| l == "B.SilkS"));
+        // The blind via spans F.Cu -> In1.Cu (adjacent ids 0,1), never reaching
+        // B.Cu (id 2) — the property both the R-tree and graph fixes rely on.
+        let via = &scene.vias[0];
+        assert_eq!(via.layer_from.raw(), 0);
+        assert_eq!(via.layer_to.raw(), 1);
+        let b = scene.layer_names.iter().position(|n| n == "B.Cu").unwrap();
+        assert!(via.layer_to.index() < b, "In1.Cu must sit below B.Cu in the stack");
     }
 
     // ---- error / robustness cases (panic-freedom contract) ----------------
