@@ -26,6 +26,7 @@ import LifeLogPanel from "./components/LifeLogPanel";
 import MarkForgePanel, { MARK_FORGE_APP_NAME } from "./components/MarkForgePanel";
 import McpPanel from "./components/McpPanel";
 import CapabilityAtlasPanel from "./components/CapabilityAtlasPanel";
+import PresencePanel from "./components/PresencePanel";
 import CapabilityStatusPanel from "./components/CapabilityStatusPanel";
 import TccSentinelPanel from "./components/TccSentinelPanel";
 import IntrospectPanel from "./components/IntrospectPanel";
@@ -546,6 +547,7 @@ export default function App() {
             onDismiss={dismissSuggestion}
           />
           <BriefFocusPanel digest={state.proactiveDigest} focus={state.focusProfile} />
+          <PresencePanel presence={state.presence} />
           <VisionPanel
             feed={state.appFeeds[VISION_APP]}
             running={state.runningApps.has(VISION_APP)}

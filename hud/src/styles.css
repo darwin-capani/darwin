@@ -9366,3 +9366,16 @@ body,
   letter-spacing: 0.08em;
 }
 .panel-error-retry:hover { border-color: #8a5a5a; color: #e0b0b0; }
+
+/* Presence / attention (presence.state): fused Away / Present / Focused. */
+.presence-body { display: flex; flex-direction: column; gap: 4px; }
+.presence-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.presence-pill {
+  font-size: 0.66em; letter-spacing: 0.06em; padding: 1px 6px;
+  border-radius: 3px; border: 1px solid currentColor; white-space: nowrap;
+}
+.presence-pill.present { color: var(--learn-green); }
+.presence-pill.focused { color: var(--warn-amber); }
+.presence-pill.away { color: var(--fg-dim, rgba(255,255,255,0.4)); }
+.presence-signal.on { color: var(--learn-green); }
+.presence-signal.off { opacity: 0.4; text-decoration: line-through; }

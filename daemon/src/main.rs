@@ -131,6 +131,7 @@ mod optimize;
 mod playback;
 mod plugin_sdk;
 mod policy;
+mod presence;
 mod posture;
 mod power;
 mod proactive;
@@ -952,7 +953,23 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
         // stamp; calendar + important-unread mail from the throttled Google reads
         // (absent/degraded silently when Google is not connected — never
         // fabricated); market stays None (no live source exists yet).
-        let present = recently_present(&memory).await;
+        let secs_since_input = secs_since_last_interaction(&memory).await;
+        let present = secs_since_input.is_some_and(|s| s <= ANTICIPATE_PRESENCE_WINDOW_SECS);
+        // FUSED PRESENCE / ATTENTION (presence.rs): combine input recency with the
+        // (optional, not-yet-sourced) speech + vision signals into Away / Present /
+        // Focused. Focused (in silent flow) SUPPRESSES spoken proactivity below —
+        // permission-neutral, it can only quiet EDITH, never enable anything. The
+        // HUD gets presence.state either way.
+        let presence_inputs = presence::PresenceInputs {
+            secs_since_input,
+            ..Default::default()
+        };
+        let attention = presence::fuse(&presence_inputs, &presence::PresenceThresholds::default());
+        telemetry::emit(
+            "agent.edith",
+            "presence.state",
+            presence::state_payload(attention, &presence_inputs),
+        );
         let now_rfc3339 = chrono::Utc::now().to_rfc3339();
         let signals = signals::collect_signals(
             &mut collector,
@@ -1033,7 +1050,12 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
         // EDITH never voices a proactive brief — the HUD card already surfaced
         // above, but no unprompted speech fires. With lockdown OFF this is
         // byte-for-byte the prior `should_speak()`.
-        if decision.should_speak_now() {
+        if decision.should_speak_now() && attention.suppresses_spoken_proactivity() {
+            // FUSED-PRESENCE OVERLAY (F5): the user is Away (empty room) or Focused
+            // (silent flow). The HUD card already surfaced above; skip the VOICING
+            // so EDITH does not interrupt. Permission-neutral: this only quiets.
+            info!(?attention, "anticipation: suppressing spoken brief (attention state); card only");
+        } else if decision.should_speak_now() {
             // Spoken path: STRICTLY the existing speech pipeline, and never
             // while already speaking — so EDITH cannot talk over a live reply
             // and the SPEAKING/MUTE_TAIL/barge invariants hold. If speech is in
@@ -1058,21 +1080,28 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
 /// warn-and-continue — an unreadable stamp reads as "not present" (fail-safe:
 /// EDITH stays silent rather than surface to a maybe-empty room).
 async fn recently_present(memory: &Memory) -> bool {
+    secs_since_last_interaction(memory)
+        .await
+        .is_some_and(|s| s <= ANTICIPATE_PRESENCE_WINDOW_SECS)
+}
+
+/// Seconds since the last user interaction (meta.last_interaction), or `None`
+/// when the stamp is unreadable/absent. Read-only; the shared source for both
+/// `recently_present` and the fused presence/attention state (presence.rs).
+async fn secs_since_last_interaction(memory: &Memory) -> Option<u64> {
     let last = match memory.get_fact("meta.last_interaction").await {
         Ok(v) => v,
         Err(e) => {
             warn!(error = %e, "anticipation: cannot read presence stamp; treating as absent");
-            return false;
+            return None;
         }
     };
-    let Some(secs) = proactive::parse_unix_secs(last.as_deref()) else {
-        return false;
-    };
+    let secs = proactive::parse_unix_secs(last.as_deref())?;
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    now.saturating_sub(secs) <= ANTICIPATE_PRESENCE_WINDOW_SECS
+    Some(now.saturating_sub(secs))
 }
 
 /// Standing-missions cadence. Runtime-only — NOT exercised by any test (the PURE
