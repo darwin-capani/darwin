@@ -186,6 +186,12 @@ mod reflect;
 // folds already-cited material, honest-empty when none). Hermetic tests in report.rs.
 mod report;
 mod research;
+// SESSION REWIND (F12): REVIEW-ONLY time travel — "what happened at 2pm" /
+// "rewind the last hour" reconstructs a bounded, redacted timeline from the
+// RECORDED stores (episodes + audit; never raw transcripts, which retain what
+// the episodic privacy gate deliberately excludes) and narrates it. It never
+// re-executes anything. Hermetically tested in rewind.rs.
+mod rewind;
 mod router;
 mod screen_context;
 mod secret_scan;

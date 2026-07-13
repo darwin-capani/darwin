@@ -9506,3 +9506,27 @@ body,
 .secondlook-note { font-size: 0.72em; overflow-wrap: anywhere; }
 .secondlook-note::before { content: "▸ "; color: var(--warn-amber); }
 .secondlook-foot { margin-top: 4px; }
+
+/* Session rewind (session.rewind): review-only timeline of an asked window —
+   recorded turns + gated-action verdicts, oldest first. Nothing re-executes. */
+.rewind-body { display: flex; flex-direction: column; gap: 5px; }
+.rewind-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.rewind-pill {
+  font-size: 0.62em; letter-spacing: 0.06em; padding: 1px 6px;
+  border-radius: 3px; border: 1px solid currentColor; white-space: nowrap;
+  color: var(--learn-green);
+}
+.rewind-counts { font-size: 0.66em; }
+.rewind-items { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.rewind-item { font-size: 0.72em; display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.rewind-ts { font-variant-numeric: tabular-nums; }
+.rewind-kind {
+  font-size: 0.78em; letter-spacing: 0.06em; padding: 0 4px;
+  border-radius: 2px; border: 1px solid currentColor; white-space: nowrap;
+}
+.rewind-kind.turn { color: var(--fg-dim, rgba(255, 255, 255, 0.5)); }
+.rewind-kind.action { color: var(--warn-amber); }
+.rewind-text { overflow-wrap: anywhere; }
+.rewind-detail { flex-basis: 100%; padding-left: 46px; font-size: 0.9em; }
+.rewind-empty { font-size: 0.72em; }
+.rewind-foot { margin-top: 4px; }

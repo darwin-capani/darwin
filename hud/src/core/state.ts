@@ -35,6 +35,7 @@ import {
   EvalReport,
   KnowledgeGraphResult,
   LifeLogDigest,
+  SessionRewind,
   LiveGateEvent,
   ConsensusAdvisory,
   LocalToolsStatus,
@@ -138,6 +139,7 @@ import {
   parseJournalSnapshot,
   parseKnowledgeGraphResult,
   parseLifeLogDigest,
+  parseSessionRewind,
   parseLockdownStatus,
   parseNotebookActivity,
   parseUnifiedSearchResult,
@@ -867,6 +869,11 @@ export interface HudState {
    *  empty:true (the honest "nothing logged"), never a fabricated event. SECRET-
    *  FREE — every field is the episodic store's already-redacted, bounded output. */
   lifelog: LifeLogDigest | null;
+  /** The last SESSION REWIND (session.rewind): a review-only reconstruction of
+   *  an asked time window — recorded turns interleaved with gated actions,
+   *  pre-redacted daemon-side. Null until the first rewind command. Nothing
+   *  here re-executes anything. */
+  sessionRewind: SessionRewind | null;
   /** The CONSEQUENTIAL-GATE AUDIT surface (audit.snapshot): the daemon's
    *  hash-chained, tamper-EVIDENT log of every consequential decision — recent
    *  entries (newest-first, SECRET-FREE: agent/tool/REDACTED target/decision/
@@ -1320,6 +1327,7 @@ export function initialState(): HudState {
     researchProvenance: [],
     notebook: null,
     lifelog: null,
+    sessionRewind: null,
     audit: null,
     liveGate: [],
     consensusAdvisory: null,
@@ -2798,6 +2806,17 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       const digest = parseLifeLogDigest(env.data);
       if (digest === null) return s;
       return { ...s, lifelog: digest };
+    }
+
+    case "session.rewind": {
+      // A SESSION REWIND ran (daemon rewind.rs via the router arm): the
+      // review-only timeline of the asked window. parseSessionRewind returns
+      // null when the payload carries no window label — dropped (same
+      // reference), never rendered with a fabricated window. A fresh rewind
+      // REPLACES the prior one (the panel shows the last thing asked for).
+      const rewind = parseSessionRewind(env.data);
+      if (rewind === null) return s;
+      return { ...s, sessionRewind: rewind };
     }
 
     case "chart.data": {
