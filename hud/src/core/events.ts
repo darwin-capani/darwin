@@ -5744,6 +5744,74 @@ export function parsePdfJailAvailable(data: Record<string, unknown>): boolean {
 }
 
 /* ------------------------------------------------------------------------ *
+ * CAPABILITY MAP — the live honest "armed by default, gated per action"       *
+ * readout (daemon capability.rs -> `system / capability.map`, audit-snapshot  *
+ * cadence). One row per notable subsystem: ready / armed-but-needs-a-          *
+ * dependency / off, plus `verified` = did the daemon actually probe the        *
+ * dependency (cloud key, sandbox-exec) or only STATE the requirement (an       *
+ * unread Keychain secret, a TCC consent knowable only at first use). The map   *
+ * never claims certainty it does not have. SECRET-FREE: `dependency` is a       *
+ * human phrase, never a key/path/host. Distinct from `capabilityAtlas` (the    *
+ * micro-app capability inventory).                                            *
+ * ------------------------------------------------------------------------ */
+
+/** The honest status of one subsystem. Any unknown value coerces to "off" (the
+ *  conservative reading — never over-claim readiness). */
+export type CapStatus = "ready" | "armed_needs_dependency" | "off";
+
+/** One subsystem row of the capability map (capability.rs `Capability`). */
+export interface Capability {
+  key: string;
+  label: string;
+  armed: boolean;
+  status: CapStatus;
+  /** What is needed when status is armed_needs_dependency; "" otherwise. */
+  dependency: string;
+  /** Did the daemon LIVE-CHECK the dependency (true) or only state it (false)? */
+  verified: boolean;
+}
+
+/** The whole capability map (capability.rs `capability_map`). */
+export interface CapabilityMap {
+  capabilities: Capability[];
+}
+
+/** Coerce one untrusted capability object, or null if it has no `key` (a row
+ *  with no subsystem to name is not a capability). `status` is validated against
+ *  the three known values and defaults to "off" — the conservative reading, so a
+ *  malformed frame never renders a subsystem as ready. Never throws. */
+function coerceSubsystemCapability(o: Record<string, unknown>): Capability | null {
+  const key = str(o, "key");
+  if (key === null || key.length === 0) return null;
+  const raw = str(o, "status");
+  const status: CapStatus =
+    raw === "ready" || raw === "armed_needs_dependency" || raw === "off" ? raw : "off";
+  return {
+    key,
+    label: str(o, "label") ?? key,
+    armed: bool(o, "armed") === true,
+    status,
+    dependency: str(o, "dependency") ?? "",
+    verified: bool(o, "verified") === true,
+  };
+}
+
+/** Parse a `capability.map` payload into a CapabilityMap. Rows are coerced
+ *  item-by-item (malformed entries dropped). NEVER returns null and never throws;
+ *  an absent/garbled payload yields an empty map (the panel shows nothing rather
+ *  than a fabricated readiness claim). */
+export function parseCapabilityMap(data: Record<string, unknown>): CapabilityMap {
+  const raw = data["capabilities"];
+  const capabilities = Array.isArray(raw)
+    ? raw
+        .filter(isPlainObject)
+        .map(coerceSubsystemCapability)
+        .filter((c): c is Capability => c !== null)
+    : [];
+  return { capabilities };
+}
+
+/* ------------------------------------------------------------------------ *
  * UNIFIED SEARCH — one query fanned out across every AVAILABLE source             *
  * (daemon/src/unified_search.rs + anthropic.rs::unified_search_tool).             *
  *                                                                                *

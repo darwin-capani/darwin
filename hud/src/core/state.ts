@@ -52,6 +52,7 @@ import {
   NotebookActivity,
   OptimizerProposal,
   PolicySnapshot,
+  CapabilityMap,
   SecurityStatus,
   SkillsCatalog,
   SttTierStatus,
@@ -124,6 +125,7 @@ import {
   parseDocIndexStatus,
   parseDocSearchResult,
   parsePdfJailAvailable,
+  parseCapabilityMap,
   parseKnowledgeGraphResult,
   parseLifeLogDigest,
   parseLockdownStatus,
@@ -730,6 +732,12 @@ export interface HudState {
    *  fallback is never silent. Null until the first status frame arrives (an
    *  older daemon never sends one), in which case the panel claims nothing. */
   pdfJailAvailable: boolean | null;
+  /** The live honest capability map (capability.map, audit-snapshot cadence): one
+   *  row per notable subsystem — ready / armed-but-needs-a-dependency / off — with
+   *  `verified` distinguishing a probed dependency from a merely-stated one. Null
+   *  until the first frame (an older daemon never sends one), so the panel claims
+   *  nothing rather than fabricating readiness. */
+  capabilityMap: CapabilityMap | null;
   /** The last UNIFIED-SEARCH result (unified.searched): one query fanned out
    *  across every AVAILABLE source, merged into ONE ranked list where each hit is
    *  ATTRIBUTED to its source + carries a real CITATION, plus the HONEST coverage
@@ -1233,6 +1241,7 @@ export function initialState(): HudState {
     docIndex: null,
     docSearch: null,
     pdfJailAvailable: null,
+    capabilityMap: null,
     unifiedSearch: null,
     knowledgeGraph: null,
     answerAnnotation: null,
@@ -2460,6 +2469,15 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // daemon says the helper is missing" and "the payload was malformed". The
       // DocSearchPanel shows the amber PDF JAIL MISSING pill on `false`.
       return { ...s, pdfJailAvailable: parsePdfJailAvailable(env.data) };
+    }
+
+    case "capability.map": {
+      // The live honest capability map (main.rs::audit_snapshot_task ->
+      // capability::emit_map): one row per notable subsystem with its honest
+      // ready/armed-inert/off status. parseCapabilityMap NEVER returns null and
+      // coerces an unknown status to "off" (never over-claims readiness), so a
+      // malformed frame degrades to an empty/conservative map, not a lie.
+      return { ...s, capabilityMap: parseCapabilityMap(env.data) };
     }
 
     case "unified.searched": {
