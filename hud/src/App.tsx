@@ -26,6 +26,7 @@ import LifeLogPanel from "./components/LifeLogPanel";
 import MarkForgePanel, { MARK_FORGE_APP_NAME } from "./components/MarkForgePanel";
 import McpPanel from "./components/McpPanel";
 import CapabilityAtlasPanel from "./components/CapabilityAtlasPanel";
+import CapabilityStatusPanel from "./components/CapabilityStatusPanel";
 import TccSentinelPanel from "./components/TccSentinelPanel";
 import IntrospectPanel from "./components/IntrospectPanel";
 import AttributionHealthPanel from "./components/AttributionHealthPanel";
@@ -566,6 +567,7 @@ export default function App() {
             running={state.runningApps.has(MARK_FORGE_APP_NAME)}
           />
           <McpPanel mcp={state.mcp} />
+          <CapabilityStatusPanel map={state.capabilityMap} />
           <CapabilityAtlasPanel atlas={state.capabilityAtlas} />
           <AppDeckPanel runningApps={state.runningApps} appFeeds={state.appFeeds} />
           <AttributionHealthPanel health={state.attributionHealth} />

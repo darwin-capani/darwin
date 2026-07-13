@@ -16,6 +16,7 @@ mod attribution;
 mod audio;
 mod audit;
 mod brief;
+mod capability;
 mod cartographer;
 // DATA -> CHART (#41): a daemon ChartSpec {kind, series:[{label, points:[(x,y)]}],
 // x_axis, y_axis, title} emitted as a `chart.data` telemetry envelope from a data
@@ -846,10 +847,16 @@ const AUDIT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(15);
 /// payload so the panel shows the OFF state. A read failure skips that tick rather
 /// than emitting a fabricated/partial snapshot. Warn-and-continue throughout: a
 /// snapshot tick must never wedge or panic the daemon.
-async fn audit_snapshot_task() {
+async fn audit_snapshot_task(cfg: Arc<Config>) {
     tokio::time::sleep(AUDIT_SNAPSHOT_STARTUP_DELAY).await;
     loop {
         audit::emit_snapshot().await;
+        // The HUD's CapabilityPanel shows the honest "armed by default, gated per
+        // action" posture as a live map: for every notable subsystem, whether it
+        // is ready / armed-but-needs-a-dependency / off, and whether the daemon
+        // actually probed that dependency. READ-ONLY + SECRET-FREE, on the same
+        // cadence as its snapshot siblings below.
+        capability::emit_map(&cfg).await;
         // The HUD's AuditPanel shows the POLICY editor alongside the audit timeline
         // (App.tsx passes `policy={state.policy}`), and `state.policy` is fed ONLY by
         // `policy.snapshot`. Emit it on the same cadence so the editor reflects the
@@ -1891,7 +1898,7 @@ async fn main() -> Result<()> {
     // READ-ONLY accountability — it never records/prunes/mutates the log (the gate
     // chokepoints do that); when [audit].enabled is false it emits the honest
     // OFF payload so the panel shows the disabled state, never a stale one.
-    tokio::spawn(audit_snapshot_task());
+    tokio::spawn(audit_snapshot_task(cfg.clone()));
     // Ambient TCC sentinel: a slow, READ-ONLY periodic scan of macOS app privacy
     // grants that seeds a baseline on first run, then emits tcc.snapshot (status)
     // and tcc.anomaly (new grant / denied->allowed escalation) for the HUD. It
