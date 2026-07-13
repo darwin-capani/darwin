@@ -7616,6 +7616,88 @@ export function lifeLogPeriodLabel(period: LifeLogPeriod): string {
 }
 
 /* ------------------------------------------------------------------------ *
+ * SESSION REWIND (session.rewind) — REVIEW-ONLY time travel (daemon          *
+ * rewind.rs): "what happened at 2pm" reconstructs a bounded timeline of the  *
+ * asked window from the RECORDED stores — episodes (redacted at write, the   *
+ * privacy-gated turn record) interleaved with the audit log's redacted       *
+ * consequential-action entries. It never re-executes anything. SECRET-FREE:  *
+ * every string is pre-redacted + bounded daemon-side (and capped again       *
+ * here); chain hashes never ride. Items past the daemon's cap arrive as an   *
+ * `items_omitted` DISCLOSURE — a capped list is never presented as complete. *
+ * ------------------------------------------------------------------------ */
+
+/** One timeline item: a recorded turn or a gated action. An unknown kind
+ *  coerces to "turn" (the neutral reading — never fabricates an action). */
+export interface RewindItem {
+  ts: string;
+  kind: "turn" | "action";
+  text: string;
+  detail: string;
+}
+
+/** A reconstructed window. */
+export interface SessionRewind {
+  label: string;
+  from: string;
+  to: string;
+  empty: boolean;
+  turnCount: number;
+  actionCount: number;
+  /** True when a daemon store read saturated its cap — the counts are then a
+   *  FLOOR ("at least N"), shown as such, never presented as exact. */
+  countsFloor: boolean;
+  itemsOmitted: number;
+  items: RewindItem[];
+}
+
+/** Defensive caps mirroring the daemon's bounds — the wire is never trusted. */
+export const REWIND_ITEMS_CAP = 20;
+const REWIND_STR_CAP = 240;
+
+function boundRewindStr(v: string | null): string {
+  return v === null ? "" : v.trim().slice(0, REWIND_STR_CAP);
+}
+
+/** Coerce one timeline row; a row without text is meaningless and dropped. */
+function coerceRewindItem(o: Record<string, unknown>): RewindItem | null {
+  const text = str(o, "text");
+  if (text === null || text.trim() === "") return null;
+  return {
+    ts: boundRewindStr(str(o, "ts")),
+    kind: str(o, "kind") === "action" ? "action" : "turn",
+    text: boundRewindStr(text),
+    detail: boundRewindStr(str(o, "detail")),
+  };
+}
+
+/** Parse a `session.rewind` payload, or null when it carries no window label
+ *  (a rewind of nothing is dropped, never rendered with a fabricated window).
+ *  Counts clamp to >= 0; rows are capped and degrade individually. */
+export function parseSessionRewind(data: Record<string, unknown>): SessionRewind | null {
+  const label = str(data, "label");
+  if (label === null || label.trim() === "") return null;
+  const raw = data["items"];
+  const items = Array.isArray(raw)
+    ? raw
+        .slice(0, REWIND_ITEMS_CAP)
+        .filter(isPlainObject)
+        .map(coerceRewindItem)
+        .filter((i): i is RewindItem => i !== null)
+    : [];
+  return {
+    label: boundRewindStr(label),
+    from: boundRewindStr(str(data, "from")),
+    to: boundRewindStr(str(data, "to")),
+    empty: bool(data, "empty") === true,
+    turnCount: nonNegInt(data, "turn_count"),
+    actionCount: nonNegInt(data, "action_count"),
+    countsFloor: bool(data, "counts_floor") === true,
+    itemsOmitted: nonNegInt(data, "items_omitted"),
+    items,
+  };
+}
+
+/* ------------------------------------------------------------------------ *
  * ACTION SURFACE (#25 auto-draft / #26 durable missions / #27 macros) —      *
  * the read-only HUD view of the three OFF-default, gated, wired-live action  *
  * features. The daemon emits all of these via telemetry::emit("system", …)   *

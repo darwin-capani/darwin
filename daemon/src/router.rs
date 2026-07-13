@@ -719,6 +719,55 @@ pub async fn route(
         });
     }
 
+    // SESSION REWIND (F12): "what happened at 2pm" / "rewind the last hour" /
+    // "walk me through this morning". REVIEW-ONLY time travel: reconstructs a
+    // bounded timeline of the window from the RECORDED stores — episodes (the
+    // redacted, gated turn record; deliberately NOT raw transcripts, which keep
+    // what the episodic privacy gate excludes) and the audit log's redacted
+    // consequential-action entries — narrates a digest, and emits the timeline
+    // for the HUD step-through. It NEVER re-executes anything (that is macro
+    // replay's job, and it re-gates). Runs AFTER the lifelog arm so lifelog
+    // keeps its own-activity phrasing ("what did I do", "my day"); the rewind
+    // classifier requires an explicit gate + time qualifier and never matches
+    // macro-replay verbs. Reads degrade to an honest empty, never an error.
+    if let Some(window) =
+        crate::rewind::classify_rewind_intent(text, chrono::Local::now().fixed_offset())
+    {
+        let prime = agents.orchestrator();
+        emit_agent_active(prime);
+        // Both reads are WINDOW-SCOPED (a depth-only read would silently miss
+        // an old window's rows and narrate a false absence) and share one cap;
+        // a saturated read flips counts_floor so the counts are disclosed as
+        // "at least N", never presented as exact.
+        const REWIND_READ_CAP: usize = 200;
+        // Episodes over the shared/orchestrator scope (the lifelog precedent).
+        let episodes = memory
+            .episodes_around(&prime.namespace, &window.from_utc, &window.to_utc, REWIND_READ_CAP)
+            .await
+            .unwrap_or_default();
+        // Audit entries via the windowed read — both sides UTC RFC3339, so the
+        // lexical compare is exact. A missing/failed log degrades to no
+        // actions, never an error.
+        let actions: Vec<crate::audit::AuditEntry> = match crate::audit::global() {
+            Some((_enabled, log)) => log
+                .between(&window.from_utc, &window.to_utc, REWIND_READ_CAP)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let counts_floor =
+            episodes.len() >= REWIND_READ_CAP || actions.len() >= REWIND_READ_CAP;
+        let rewind = crate::rewind::build_timeline(&window, &episodes, &actions, counts_floor);
+        telemetry::emit("system", "session.rewind", crate::rewind::payload(&rewind));
+        return Ok(RouteOutcome {
+            routed_to: "local",
+            response: crate::rewind::render_spoken(&rewind),
+            agent: prime.name.clone(),
+            namespace: prime.namespace.clone(),
+            spoken: None,
+        });
+    }
+
     // Roll-call (item 3, the reel centerpiece): "introduce the team" / "roll
     // call" / "assemble" -> each agent speaks its one-line self-introduction in
     // ITS OWN voice, in order, emitting agent.active per agent so the HUD
