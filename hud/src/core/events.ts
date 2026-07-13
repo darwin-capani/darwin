@@ -5744,6 +5744,48 @@ export function parsePdfJailAvailable(data: Record<string, unknown>): boolean {
 }
 
 /* ------------------------------------------------------------------------ *
+ * PRESENCE / ATTENTION — the fused attention state (daemon presence.rs ->      *
+ * `agent.edith / presence.state`, anticipation cadence). Away / Present /      *
+ * Focused, plus which raw signals actually fed the fusion. When Focused (in    *
+ * silent flow) or Away, EDITH suppresses SPOKEN proactivity (a silent HUD card *
+ * still surfaces) — permission-neutral, it only quiets. `signals` shows which  *
+ * inputs are live (input recency now; speech/vision are wired but not yet fed).*
+ * ------------------------------------------------------------------------ */
+
+/** The fused attention state. Any unknown value coerces to "present" (the
+ *  neutral reading — never fabricates "away", which would wrongly imply an empty
+ *  room, nor "focused", which would wrongly imply flow). */
+export type PresenceState = "away" | "present" | "focused";
+
+export interface Presence {
+  state: PresenceState;
+  atMachine: boolean;
+  focusDnd: boolean;
+  /** Which raw signals were available this tick (honesty about the fusion). */
+  signals: { input: boolean; speech: boolean; vision: boolean };
+}
+
+/** Parse a `presence.state` payload. NEVER returns null / never throws; an
+ *  absent or garbled `state` coerces to "present" (the neutral state — it never
+ *  invents "away"/"focused", which carry behavioral meaning). */
+export function parsePresence(data: Record<string, unknown>): Presence {
+  const raw = str(data, "state");
+  const state: PresenceState =
+    raw === "away" || raw === "present" || raw === "focused" ? raw : "present";
+  const sig = isPlainObject(data["signals"]) ? (data["signals"] as Record<string, unknown>) : {};
+  return {
+    state,
+    atMachine: bool(data, "at_machine") === true,
+    focusDnd: bool(data, "focus_dnd") === true,
+    signals: {
+      input: bool(sig, "input") === true,
+      speech: bool(sig, "speech") === true,
+      vision: bool(sig, "vision") === true,
+    },
+  };
+}
+
+/* ------------------------------------------------------------------------ *
  * CAPABILITY MAP — the live honest "armed by default, gated per action"       *
  * readout (daemon capability.rs -> `system / capability.map`, audit-snapshot  *
  * cadence). One row per notable subsystem: ready / armed-but-needs-a-          *
