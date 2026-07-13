@@ -53,6 +53,7 @@ import {
   OptimizerProposal,
   PolicySnapshot,
   CapabilityMap,
+  Presence,
   SecurityStatus,
   SkillsCatalog,
   SttTierStatus,
@@ -126,6 +127,7 @@ import {
   parseDocSearchResult,
   parsePdfJailAvailable,
   parseCapabilityMap,
+  parsePresence,
   parseKnowledgeGraphResult,
   parseLifeLogDigest,
   parseLockdownStatus,
@@ -738,6 +740,9 @@ export interface HudState {
    *  until the first frame (an older daemon never sends one), so the panel claims
    *  nothing rather than fabricating readiness. */
   capabilityMap: CapabilityMap | null;
+  /** The fused attention state (presence.state): Away/Present/Focused. Null until
+   *  the first frame. Focused/Away means EDITH is holding spoken proactivity. */
+  presence: Presence | null;
   /** The last UNIFIED-SEARCH result (unified.searched): one query fanned out
    *  across every AVAILABLE source, merged into ONE ranked list where each hit is
    *  ATTRIBUTED to its source + carries a real CITATION, plus the HONEST coverage
@@ -1242,6 +1247,7 @@ export function initialState(): HudState {
     docSearch: null,
     pdfJailAvailable: null,
     capabilityMap: null,
+    presence: null,
     unifiedSearch: null,
     knowledgeGraph: null,
     answerAnnotation: null,
@@ -2478,6 +2484,13 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // coerces an unknown status to "off" (never over-claims readiness), so a
       // malformed frame degrades to an empty/conservative map, not a lie.
       return { ...s, capabilityMap: parseCapabilityMap(env.data) };
+    }
+
+    case "presence.state": {
+      // Fused attention (main.rs anticipation_task -> presence::state_payload).
+      // parsePresence never returns null and coerces an unknown state to the
+      // neutral "present" (never fabricates away/focused).
+      return { ...s, presence: parsePresence(env.data) };
     }
 
     case "unified.searched": {
