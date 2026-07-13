@@ -487,6 +487,35 @@ impl AuditLog {
         Ok(entries)
     }
 
+    /// Entries within the inclusive `[from, to]` RFC3339 window (both sides
+    /// UTC; RFC3339 compares lexicographically), NEWEST first, capped at
+    /// `limit`. Read-only — the session-rewind timeline's windowed read: a
+    /// depth-only `recent(n)` would silently miss a window's entries whenever
+    /// enough newer entries accrued after it, then narrate a false absence.
+    pub async fn between(&self, from: &str, to: &str, limit: usize) -> Result<Vec<AuditEntry>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT seq, ts, agent, tool, target_redacted, decision, outcome, prev_hash, entry_hash
+             FROM audit WHERE ts >= ?1 AND ts <= ?2 ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let entries = stmt
+            .query_map(params![from, to, limit as i64], |row| {
+                Ok(AuditEntry {
+                    seq: row.get(0)?,
+                    ts: row.get(1)?,
+                    agent: row.get(2)?,
+                    tool: row.get(3)?,
+                    target_redacted: row.get(4)?,
+                    decision: row.get(5)?,
+                    outcome: row.get(6)?,
+                    prev_hash: row.get(7)?,
+                    entry_hash: row.get(8)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(entries)
+    }
+
     /// Total entries currently retained (for the HUD + tests).
     pub async fn len(&self) -> Result<usize> {
         let conn = self.conn.lock().await;
