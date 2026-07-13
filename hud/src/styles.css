@@ -5648,6 +5648,26 @@ svg.tri circle {
    guard — the same ok/degraded palette as the NEURAL/BM25 pill beside it. */
 .docsearch-pill.jailed { color: var(--learn-green); }
 .docsearch-pill.unjailed { color: var(--warn-amber); }
+
+/* Capability map (capability.map): the live "armed by default, gated per action"
+   readout. Same ok/degraded/off palette as the docsearch pills. */
+.capmap-body { display: flex; flex-direction: column; gap: 4px; }
+.capmap-row { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.capmap-label { flex: 1 1 auto; min-width: 0; }
+.capmap-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+  white-space: nowrap;
+}
+.capmap-pill.ready { color: var(--learn-green); }
+.capmap-pill.needs-dep { color: var(--warn-amber); }
+.capmap-pill.off { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
+.capmap-dep { flex-basis: 100%; padding-left: 2px; }
+.capmap-unverified { opacity: 0.6; font-style: italic; }
+.capmap-foot { margin-top: 8px; }
 .docsearch-counts { display: flex; gap: 14px; flex-wrap: wrap; }
 .docsearch-count { display: flex; flex-direction: column; gap: 1px; }
 .docsearch-count-val {
