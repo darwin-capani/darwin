@@ -44,7 +44,7 @@ tokio = { version = "1", features = ["process", "fs", "io-util"] }
 cpal = "0.15"
 # Pin: time 0.3.48 adds impls that conflict (E0119) with blanket `From` impls
 # in cookie 0.18.1 and tauri-utils 2.9.2. Drop this once those crates ship fixes.
-time = "=0.3.47"
+time = "=0.3.53"
 
 # macOS kiosk presentation-options for the DEVICE-GATED takeover (hide Dock /
 # menu bar). These are NOT new heavy deps: tao (Tauri's windowing layer) already
