@@ -1,13 +1,14 @@
 //! Gapless TTS playback on a dedicated rodio thread.
 //!
-//! Design note (per the shared contract): rodio's `OutputStream` is `!Send`,
-//! so it can live neither in a tokio task nor directly in a `static`. The
-//! `OnceLock` instead holds the sender of a command channel; a dedicated
-//! playback thread spawned on first use owns one lazily-created, persistent
-//! `OutputStream` for the daemon's life (opening the CoreAudio device is the
-//! expensive part — reopening per reply would reintroduce startup gaps).
+//! Design note (per the shared contract): rodio's device sink
+//! (`MixerDeviceSink`) is `!Send`, so it can live neither in a tokio task nor
+//! directly in a `static`. The `OnceLock` instead holds the sender of a
+//! command channel; a dedicated playback thread spawned on first use owns one
+//! lazily-created, persistent device sink for the daemon's life (opening the
+//! CoreAudio device is the expensive part — reopening per reply would
+//! reintroduce startup gaps).
 //!
-//! Per spoken reply the thread keeps one `Sink`; clips arrive as full WAV
+//! Per spoken reply the thread keeps one `Player`; clips arrive as full WAV
 //! bytes and are appended via `rodio::Decoder` over a `Cursor`, so sentences
 //! play back-to-back with no process spawns and no gaps. Every command is
 //! acknowledged over a oneshot so the async side never blocks the runtime
@@ -19,7 +20,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use rodio::source::Zero;
-use rodio::{Decoder, OutputStream, OutputStreamHandle, Sink};
+use rodio::stream::{DeviceSinkBuilder, MixerDeviceSink};
+use rodio::{ChannelCount, Decoder, Player, SampleRate};
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
@@ -191,16 +193,16 @@ pub fn stop_track() {
     }
 }
 
-/// The playback thread: owns the !Send OutputStream and the per-reply Sink.
+/// The playback thread: owns the !Send device sink and the per-reply Player.
 fn run(mut rx: mpsc::UnboundedReceiver<PlayCmd>) {
-    let mut output: Option<(OutputStream, OutputStreamHandle)> = None;
-    let mut sink: Option<Sink> = None;
-    // The composed-music sink: entirely separate from the per-reply speech `sink`
+    let mut output: Option<MixerDeviceSink> = None;
+    let mut sink: Option<Player> = None;
+    // The composed-music player: entirely separate from the per-reply speech `sink`
     // above, so a long track plays alongside (never inside) the speaking turn. It
-    // shares the one OutputStream (the expensive resource), but its own Sink means
+    // shares the one device sink (the expensive resource), but its own Player means
     // a track is stopped/replaced without touching speech playback. It is detached
     // (`play()` + `detach()` below) so the thread never blocks draining it.
-    let mut music: Option<Sink> = None;
+    let mut music: Option<Player> = None;
     // The channel sender lives in a static, so this loop runs until exit.
     while let Some(cmd) = rx.blocking_recv() {
         match cmd {
@@ -265,31 +267,24 @@ fn run(mut rx: mpsc::UnboundedReceiver<PlayCmd>) {
 /// Build a fresh music sink and queue the whole composed WAV on it. Returns the
 /// detached sink (so the thread keeps a STOP handle without ever blocking to
 /// drain it), or None after logging on any device/decode failure. Reuses the one
-/// shared OutputStream — only a second Sink is created.
+/// shared device sink — only a second Player is created.
 fn start_music(
-    output: &mut Option<(OutputStream, OutputStreamHandle)>,
+    output: &mut Option<MixerDeviceSink>,
     bytes: Vec<u8>,
-) -> Option<Sink> {
+) -> Option<Player> {
     if output.is_none() {
-        match OutputStream::try_default() {
-            Ok(pair) => *output = Some(pair),
+        match DeviceSinkBuilder::open_default_sink() {
+            Ok(dev) => *output = Some(dev),
             Err(e) => {
                 warn!(error = %e, "rodio: no default output device for music");
                 return None;
             }
         }
     }
-    let handle = &output.as_ref().expect("output set above").1;
-    let sink = match Sink::try_new(handle) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!(error = %e, "rodio: failed to create music sink");
-            // The stream may be dead (device changed); drop it so the next use
-            // rebuilds from scratch.
-            *output = None;
-            return None;
-        }
-    };
+    let device = output.as_ref().expect("output set above");
+    // `connect_new` is infallible in rodio 0.22; the fallible step is opening
+    // the device sink above.
+    let sink = Player::connect_new(device.mixer());
     match Decoder::new(Cursor::new(bytes)) {
         Ok(source) => {
             sink.append(source);
@@ -309,12 +304,12 @@ fn start_music(
 /// Lazily open the output device and the per-reply sink. Returns None (after
 /// logging) when the audio device is unavailable.
 fn ensure_sink<'a>(
-    output: &mut Option<(OutputStream, OutputStreamHandle)>,
-    sink: &'a mut Option<Sink>,
-) -> Option<&'a Sink> {
+    output: &mut Option<MixerDeviceSink>,
+    sink: &'a mut Option<Player>,
+) -> Option<&'a Player> {
     if output.is_none() {
-        match OutputStream::try_default() {
-            Ok(pair) => *output = Some(pair),
+        match DeviceSinkBuilder::open_default_sink() {
+            Ok(dev) => *output = Some(dev),
             Err(e) => {
                 warn!(error = %e, "rodio: no default output device");
                 return None;
@@ -322,24 +317,17 @@ fn ensure_sink<'a>(
         }
     }
     if sink.is_none() {
-        let handle = &output.as_ref().expect("output set above").1;
-        match Sink::try_new(handle) {
-            Ok(s) => *sink = Some(s),
-            Err(e) => {
-                warn!(error = %e, "rodio: failed to create sink");
-                // The stream may be dead (device unplugged/changed); drop it
-                // so the next append rebuilds from scratch.
-                *output = None;
-                return None;
-            }
-        }
+        let device = output.as_ref().expect("output set above");
+        // `connect_new` is infallible in rodio 0.22; the fallible resource is
+        // the device sink opened above.
+        *sink = Some(Player::connect_new(device.mixer()));
     }
     sink.as_ref()
 }
 
 fn append_clip(
-    output: &mut Option<(OutputStream, OutputStreamHandle)>,
-    sink: &mut Option<Sink>,
+    output: &mut Option<MixerDeviceSink>,
+    sink: &mut Option<Player>,
     bytes: Vec<u8>,
 ) -> bool {
     let Some(sink) = ensure_sink(output, sink) else {
@@ -358,16 +346,18 @@ fn append_clip(
 }
 
 fn append_silence(
-    output: &mut Option<(OutputStream, OutputStreamHandle)>,
-    sink: &mut Option<Sink>,
+    output: &mut Option<MixerDeviceSink>,
+    sink: &mut Option<Player>,
     duration: Duration,
 ) -> bool {
     let Some(sink) = ensure_sink(output, sink) else {
         return false;
     };
-    sink.append(Zero::<f32>::new_samples(
-        1,
-        SILENCE_SAMPLE_RATE,
+    // rodio 0.22: `Zero` is no longer generic and takes NonZero channel/rate
+    // newtypes. Both operands here are compile-time-nonzero constants.
+    sink.append(Zero::new_samples(
+        ChannelCount::new(1).expect("mono channel count is nonzero"),
+        SampleRate::new(SILENCE_SAMPLE_RATE).expect("silence sample rate is nonzero"),
         silence_samples(duration),
     ));
     true

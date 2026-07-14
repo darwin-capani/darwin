@@ -35,7 +35,7 @@ cc = "1"
 [dependencies]
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
-cpal = "0.15"
+cpal = "0.17"
 # Direct handles on crates already in the tree (via zip + pdf-extract) — no new
 # downloads, pinned to the existing lock versions. Used ONLY by docsearch's PDF
 # decompression-bomb guard: `lopdf` parses the PDF STRUCTURE (correct /Length stream
@@ -75,9 +75,11 @@ libc = "0.2"
 pdf-extract = "0.12"
 quick-xml = "0.41"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-# 0.20 shares cpal 0.15 with the capture path (one CoreAudio backend, no
-# duplicate cpal in the tree); only the wav decoder (hound) is needed.
-rodio = { version = "0.20", default-features = false, features = ["wav"] }
+# 0.22 shares cpal 0.17 with the capture path (one CoreAudio backend, no
+# duplicate cpal in the tree). `playback` re-enables the cpal-backed
+# OutputStream (0.21 gated it behind that feature); `wav` is the symphonia
+# WAV decoder that replaced hound in 0.22.
+rodio = { version = "0.22", default-features = false, features = ["wav", "playback"] }
 # SQLCipher (transparent, whole-file AES-256 page encryption via PRAGMA key) for
 # the at-rest encrypted-memory feature (#11). `bundled-sqlcipher` vendors a SQLite
 # amalgamation built WITH SQLCipher's crypto provider — the documented dep
@@ -93,7 +95,7 @@ sha2 = "0.11"
 sysinfo = "0.32"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.24"
-toml = "0.8"
+toml = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
