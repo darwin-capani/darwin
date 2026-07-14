@@ -77,7 +77,7 @@ quick-xml = "0.41"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # 0.20 shares cpal 0.15 with the capture path (one CoreAudio backend, no
 # duplicate cpal in the tree); only the wav decoder (hound) is needed.
-rodio = { version = "0.20", default-features = false, features = ["wav"] }
+rodio = { version = "0.22", default-features = false, features = ["wav"] }
 # SQLCipher (transparent, whole-file AES-256 page encryption via PRAGMA key) for
 # the at-rest encrypted-memory feature (#11). `bundled-sqlcipher` vendors a SQLite
 # amalgamation built WITH SQLCipher's crypto provider — the documented dep
