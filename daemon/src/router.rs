@@ -729,7 +729,9 @@ pub async fn route(
     // replay's job, and it re-gates). Runs AFTER the lifelog arm so lifelog
     // keeps its own-activity phrasing ("what did I do", "my day"); the rewind
     // classifier requires an explicit gate + time qualifier and never matches
-    // macro-replay verbs. Reads degrade to an honest empty, never an error.
+    // macro-replay verbs. Reads stay fail-open (an empty window is never an
+    // error) — but a FAILED read is DISCLOSED, never narrated as a clean
+    // "nothing happened" (that would fabricate absence).
     if let Some(window) =
         crate::rewind::classify_rewind_intent(text, chrono::Local::now().fixed_offset())
     {
@@ -740,28 +742,52 @@ pub async fn route(
         // a saturated read flips counts_floor so the counts are disclosed as
         // "at least N", never presented as exact.
         const REWIND_READ_CAP: usize = 200;
+        let mut reads_failed = false;
         // Episodes over the shared/orchestrator scope (the lifelog precedent).
-        let episodes = memory
+        let episodes = match memory
             .episodes_around(&prime.namespace, &window.from_utc, &window.to_utc, REWIND_READ_CAP)
             .await
-            .unwrap_or_default();
+        {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "rewind: episode read failed; disclosing a partial record");
+                reads_failed = true;
+                Vec::new()
+            }
+        };
         // Audit entries via the windowed read — both sides UTC RFC3339, so the
-        // lexical compare is exact. A missing/failed log degrades to no
-        // actions, never an error.
+        // lexical compare is exact. A MISSING log (audit off) is honestly "no
+        // actions"; a FAILED read on a present log is disclosed.
         let actions: Vec<crate::audit::AuditEntry> = match crate::audit::global() {
-            Some((_enabled, log)) => log
-                .between(&window.from_utc, &window.to_utc, REWIND_READ_CAP)
-                .await
-                .unwrap_or_default(),
+            Some((_enabled, log)) => {
+                match log.between(&window.from_utc, &window.to_utc, REWIND_READ_CAP).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = %e, "rewind: audit read failed; disclosing a partial record");
+                        reads_failed = true;
+                        Vec::new()
+                    }
+                }
+            }
             None => Vec::new(),
         };
         let counts_floor =
             episodes.len() >= REWIND_READ_CAP || actions.len() >= REWIND_READ_CAP;
         let rewind = crate::rewind::build_timeline(&window, &episodes, &actions, counts_floor);
-        telemetry::emit("system", "session.rewind", crate::rewind::payload(&rewind));
+        let mut payload = crate::rewind::payload(&rewind);
+        if reads_failed {
+            payload["reads_failed"] = serde_json::json!(true);
+        }
+        telemetry::emit("system", "session.rewind", payload);
+        let mut response = crate::rewind::render_spoken(&rewind);
+        if reads_failed {
+            response.push_str(
+                " One caveat, sir — part of the record was unreadable just now, so this view may be incomplete.",
+            );
+        }
         return Ok(RouteOutcome {
             routed_to: "local",
-            response: crate::rewind::render_spoken(&rewind),
+            response,
             agent: prime.name.clone(),
             namespace: prime.namespace.clone(),
             spoken: None,
@@ -2517,9 +2543,11 @@ fn recent_replies(history: &[(String, String)], n: usize) -> Vec<String> {
 /// open-on-single-strong-match), system.query (real sysinfo stats),
 /// conversation (context only), memory.store/recall. `args` is the
 /// classifier's pass-through args object (Null on old servers). `agent` is the
-/// active agent: memory.store writes under its namespace ("<namespace>.note")
-/// and memory.recall reads its namespaced view (own namespace + shared facts),
-/// so each agent's notes stay isolated (constellation namespacing, item 4).
+/// active agent: memory.store writes under its namespace
+/// ("<namespace>.note.<content-hash>", one key per distinct note — never a
+/// clobbering fixed key) and memory.recall reads its namespaced view (own
+/// namespace + shared facts), so each agent's notes stay isolated
+/// (constellation namespacing, item 4).
 async fn handle_local(
     intent: &str,
     args: &serde_json::Value,
@@ -2549,9 +2577,21 @@ async fn handle_local(
         }
         "system.query" => actions::system_status_data().await,
         "memory.store" => {
-            // Namespaced note key, e.g. "agent.pepper.note". upsert_user_fact
-            // keeps the meta.* guard in front of every model/agent-driven write.
-            let key = format!("{}.note", agent.namespace);
+            // Namespaced, CONTENT-KEYED note (e.g. "agent.pepper.note.3fa9…"):
+            // one key per distinct note text, so storing a second note never
+            // silently CLOBBERS the first (the old fixed "<ns>.note" key kept
+            // only the latest note), while re-storing identical text stays a
+            // no-growth upsert. Recall is prefix-scoped (agent_scoped_facts
+            // LIKE '<ns>.%'), so suffixed keys surface unchanged.
+            // upsert_user_fact keeps the meta.* guard in front of every
+            // model/agent-driven write.
+            let suffix = {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                text.hash(&mut h);
+                h.finish()
+            };
+            let key = format!("{}.note.{suffix:016x}", agent.namespace);
             match memory.upsert_user_fact(&key, text).await {
                 Ok(()) => format!("Stored fact: {text}"),
                 Err(e) => {
@@ -7817,6 +7857,32 @@ mod tests {
             pursued_subqueries: 1,
             truncated: false,
         }
+    }
+
+    #[tokio::test]
+    async fn memory_store_keeps_every_distinct_note_never_clobbering_the_last() {
+        // Regression (full-OS sweep): memory.store used the FIXED key
+        // "<ns>.note", so a second note silently overwrote the first. Notes are
+        // now content-keyed; identical text stays a no-growth upsert.
+        let db = TempDb::new("note-clobber");
+        let mem = Memory::open(&db.0).unwrap();
+        let reg = AgentRegistry::canonical();
+        let agent = reg.orchestrator();
+        let apps = crate::apps::AppRegistry::discover(std::path::Path::new("/nonexistent"));
+        let apps = std::sync::Arc::new(apps);
+
+        for text in ["the wifi password is hidden", "buy oat milk", "buy oat milk"] {
+            super::handle_local("memory.store", &serde_json::Value::Null, text, &mem, &apps, agent).await;
+        }
+        let facts = mem.agent_scoped_facts(&agent.namespace, 50).await.unwrap();
+        let notes: Vec<&str> = facts
+            .iter()
+            .filter(|(k, _)| k.starts_with(&format!("{}.note.", agent.namespace)))
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(notes.len(), 2, "two distinct notes kept, duplicate deduped: {notes:?}");
+        assert!(notes.contains(&"the wifi password is hidden"));
+        assert!(notes.contains(&"buy oat milk"));
     }
 
     #[tokio::test]
