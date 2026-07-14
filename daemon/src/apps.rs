@@ -1055,6 +1055,11 @@ pub struct AppInfo {
     pub name: String,
     pub description: String,
     pub running: bool,
+    /// Whether the manifest's entry file actually EXISTS right now. Spec-only
+    /// apps (manifest + SPEC.md, no code yet) and unbuilt compiled apps
+    /// register (deliberate: visible in the deck, build-state independent) but
+    /// are honestly labeled not-runnable instead of failing at spawn time.
+    pub entry_present: bool,
 }
 
 impl AppRegistry {
@@ -1163,6 +1168,11 @@ impl AppRegistry {
                 name: e.manifest.name().to_string(),
                 description: e.manifest.app.description.clone(),
                 running: e.running,
+                // Live probe (one stat per app per list): a spec-only or
+                // unbuilt entry reads not-runnable; building it flips this
+                // honestly without a restart.
+                entry_present: abs(&self.project_root, Path::new(&e.manifest.app.entry))
+                    .is_file(),
             })
             .collect();
         out.sort_by(|a, b| a.name.cmp(&b.name));
@@ -1367,6 +1377,25 @@ pub async fn start(registry: &Arc<AppRegistry>, name: &str) -> Result<()> {
         if entry.running {
             info!(app = name, "micro-app already running");
             return Ok(());
+        }
+        // HONEST-LABELING GUARD: a spec-only app (manifest + SPEC.md, no code)
+        // or an unbuilt compiled app registers deliberately (visible in the
+        // deck) but must refuse to START with a clear reason — not flip
+        // `running`, spawn, and die in the lifecycle with a confusing exec
+        // error. Skipped under the test interpreter override, where the entry
+        // is a stand-in played in-process and need not exist on disk.
+        #[cfg(test)]
+        let probe_entry = registry.interpreter_override.is_none();
+        #[cfg(not(test))]
+        let probe_entry = true;
+        if probe_entry {
+            let entry_abs = abs(&registry.project_root, Path::new(&entry.manifest.app.entry));
+            if !entry_abs.is_file() {
+                return Err(anyhow!(
+                    "micro-app {name:?} isn't runnable yet — its entry {:?} does not exist (spec-only, or not built)",
+                    entry.manifest.app.entry
+                ));
+            }
         }
         // Rotate the nonce + mint a fresh token for this launch.
         entry.nonce = fresh_nonce();
@@ -3574,6 +3603,49 @@ mod tests {
     /// WHOLE. (With the accumulator local to the future, as it was before, the
     /// prefix would be consumed-then-dropped and the resumed read would return
     /// only the tail — the exact desync this guards.)
+    #[tokio::test]
+    async fn a_spec_only_app_registers_but_is_labeled_not_runnable_and_refuses_to_start() {
+        // Regression (full-OS sweep): a manifest whose entry doesn't exist (a
+        // spec-only app, or an unbuilt compiled one) used to register as fully
+        // runnable, then flip `running` + spawn + die with a confusing exec
+        // error. It must register (visible in the deck), report entry_present
+        // false, and refuse to start with a clear reason.
+        let root = PathBuf::from(format!(
+            "/private/tmp/jrv-specapp-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() % 1_000_000
+        ));
+        let app_dir = root.join("apps/spec-app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        // manifest + SPEC.md, but NO main.py at the declared entry.
+        std::fs::write(
+            app_dir.join("manifest.toml"),
+            r#"
+            [app]
+            name = "spec-app"
+            version = "0.1.0"
+            description = "spec-only, no code yet"
+            entry = "apps/spec-app/main.py"
+            runtime = "python"
+            [permissions]
+            audio = false
+            gpu = false
+            net_hosts = []
+            fs_read = []
+            fs_write = []
+            "#,
+        )
+        .unwrap();
+
+        let registry = AppRegistry::discover(&root);
+        let info = registry.list().await;
+        let spec = info.iter().find(|a| a.name == "spec-app").expect("registers despite no entry");
+        assert!(!spec.entry_present, "labeled not-runnable (entry absent)");
+        let err = start(&registry, "spec-app").await.expect_err("start refuses a spec-only app");
+        assert!(err.to_string().contains("isn't runnable yet"), "honest refusal: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[tokio::test]
     async fn read_line_bounded_is_cancellation_safe_across_a_dropped_read() {
         let (mut client, server) = UnixStream::pair().expect("unix socketpair");
