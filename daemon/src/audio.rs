@@ -94,7 +94,7 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
         let supported = device
             .default_input_config()
             .context("querying default input config")?;
-        sample_rate = supported.sample_rate().0;
+        sample_rate = supported.sample_rate();
         channels = supported.channels() as usize;
         let stream_config: cpal::StreamConfig = supported.into();
 
