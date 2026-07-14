@@ -2211,7 +2211,14 @@ async fn main() -> Result<()> {
             json!({
                 "apps": installed
                     .iter()
-                    .map(|a| json!({"name": a.name, "description": a.description, "running": a.running}))
+                    .map(|a| json!({
+                        "name": a.name,
+                        "description": a.description,
+                        "running": a.running,
+                        // HONEST LABEL: false for spec-only / unbuilt entries so
+                        // the deck never offers a Start that can only fail.
+                        "runnable": a.entry_present,
+                    }))
                     .collect::<Vec<_>>(),
             }),
         );
