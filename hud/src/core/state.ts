@@ -62,6 +62,7 @@ import {
   CapabilityMap,
   DistillStatus,
   SyncStatus,
+  HandoffStatus,
   SceneStatus,
   OvernightStatus,
   Presence,
@@ -147,6 +148,7 @@ import {
   parseCapabilityMap,
   parseDistillStatus,
   parseSyncStatus,
+  parseHandoffStatus,
   parseSceneStatus,
   parseOvernightStatus,
   parsePresence,
@@ -808,6 +810,11 @@ export interface HudState {
    *  syncable-fact count, key present, pending conflicts. Null until the first
    *  frame. E2E-encrypted; deletions don't propagate. */
   federatedSync: SyncStatus | null;
+  /** The continuity-handoff pipeline's honest state (handoff.status): off/armed-
+   *  needs-pairing/paired, whether an inbound session capsule is staged, and the
+   *  two pinned truths — carries NO credentials, and restoring context PARKS
+   *  (authority never transfers). Null until the first frame. REVIEW-ONLY. */
+  handoff: HandoffStatus | null;
   /** The acoustic-scene sensor's honest state (scene.status, F6): off/armed-
    *  needs-model/listening, the sound-event vocabulary, transient events. Null
    *  until the first frame. NEVER retains audio. */
@@ -1434,6 +1441,7 @@ export function initialState(): HudState {
     pdfJailAvailable: null,
     distill: null,
     federatedSync: null,
+    handoff: null,
     scene: null,
     overnight: null,
     capabilityMap: null,
@@ -2776,6 +2784,13 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // sync::emit_status). parseSyncStatus NEVER returns null and pins the
       // honest transport-inert / deletes-don't-propagate facts.
       return { ...s, federatedSync: parseSyncStatus(env.data) };
+    }
+
+    case "handoff.status": {
+      // The continuity-handoff pipeline status (main.rs audit_snapshot_task ->
+      // handoff::emit_status). parseHandoffStatus NEVER returns null and pins the
+      // honest transport-inert / no-credentials / restore-parks facts.
+      return { ...s, handoff: parseHandoffStatus(env.data) };
     }
 
     case "scene.status": {
