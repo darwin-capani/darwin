@@ -314,6 +314,36 @@ enabled = true
 interval_secs      = 300    # seconds between scans (the listening surface moves slowly)
 startup_delay_secs = 40     # wait after boot before the first scan
 
+[interception]
+# Traffic-Interception Integrity Check — "is anything MITMing me?" (interception.rs).
+# A slow, READ-ONLY read of THIS machine's OWN local config, each surface read via
+# a FIXED-ARG bounded subprocess (never a shell string), so the parsers are
+# CI-tested on canned output. It SENDS NO PACKETS and never touches another host:
+#   * `scutil --proxy`  — an unexpected system/PAC HTTP(S)/SOCKS proxy
+#   * `/etc/hosts`      — non-default entries that redirect a domain to a routable
+#                         IP (loud) or pin one to loopback (a block); the default
+#                         localhost/broadcasthost lines are expected, never flagged
+#   * non-Apple trusted ROOT CAs — `security dump-trust-settings -d` (the ADMIN
+#                         trust-settings domain — honest SKIP without privileges) +
+#                         the System-keychain certs (`security find-certificate -a`);
+#                         a rogue trusted root silently breaks ALL your TLS, so it is
+#                         surfaced LOUDLY
+#   * `scutil --dns`    — the configured resolvers (a LOOPBACK resolver means
+#                         something on-box is handling every lookup)
+#   * `profiles show`   — installed configuration/MDM profiles (user-domain
+#                         readable; system-domain -> honest SKIP)
+# Each finding is explained in PLAIN SPEECH; it emits the `security.interception`
+# telemetry frame + folds a summary into the posture readout. STRICTLY READ-ONLY:
+# no writes, no config changes, no remediation (not even a gated one) — removing a
+# proxy or a root CA is the user's own action in System Settings / Keychain Access.
+# Honest SKIP when a read needs a privilege the no-sudo daemon lacks — NEVER a
+# fabricated "clean". SHIPS ON (full-power default); with it false the check loop
+# is not spawned.
+enabled = true
+# Check cadence (defaults shown; absent = these values).
+interval_secs      = 300    # seconds between checks (local interception config moves slowly)
+startup_delay_secs = 50     # wait after boot before the first check
+
 [integrations]
 # Shared substrate for the Chart-2 integrations (GitHub, Slack, Google
 # Drive/Calendar). allow_consequential is THE master gate for outward/
