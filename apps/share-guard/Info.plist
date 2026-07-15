@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  EMBEDDED Info.plist for the DARWIN share-guard micro-app (a bare SwiftPM
+  executable, NOT an .app bundle). It is linked into the binary's
+  __TEXT,__info_plist section (see Package.swift linkerSettings), so macOS reads
+  CFBundleDisplayName="D.A.R.W.I.N." and the bundle identifier for this binary —
+  the same name the HUD app shows.
+
+  Share Guard opens NO TCC-gated device: it never captures the camera, screen, or
+  microphone. It scrubs a SUPPLIED text/image payload and writes a redacted copy
+  inside its own sandbox dir. So there are deliberately NO usage-description
+  strings here — this plist only supplies the display name + bundle id and grants
+  nothing.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDisplayName</key>
+  <string>D.A.R.W.I.N.</string>
+  <key>CFBundleName</key>
+  <string>D.A.R.W.I.N.</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.darwin.share-guard</string>
+</dict>
+</plist>
