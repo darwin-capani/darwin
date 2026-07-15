@@ -8115,6 +8115,97 @@ export function parseSessionRewind(data: Record<string, unknown>): SessionRewind
 }
 
 /* ------------------------------------------------------------------------ *
+ * CAUSA // DECISION TRACE (causa.trace) — the causal decision-trace          *
+ * explainer (daemon explain.rs): "why did you do that" / "why <Agent>"       *
+ * narrates the ordered decision steps of a recent turn — intent, selector    *
+ * mode, the agent it routed to, local-vs-cloud route, the owner gate, the    *
+ * capability it used, the outcome. REVIEW-ONLY: nothing here re-executes.     *
+ * SECRET-FREE: the utterance + outcome are pre-redacted daemon-side (and      *
+ * bounded again here); the step tokens are decision labels. An HONEST-EMPTY   *
+ * frame (`empty:true`, no steps) rides when the asked turn wasn't recorded —  *
+ * the daemon NEVER fabricates a rationale, so the panel shows the honest      *
+ * "no trace" state rather than an invented one.                              *
+ * ------------------------------------------------------------------------ */
+
+/** One decision step: which pipeline stage, what was chosen, why, and any
+ *  recorded alternatives (usually none — the daemon does not persist rejected
+ *  candidates, and never invents them). */
+export interface CausaStep {
+  stage: string;
+  chosen: string;
+  why: string;
+  alternatives: string[];
+}
+
+/** A reconstructed causal decision trace of one turn. */
+export interface CausaTrace {
+  /** What was asked: the last turn, or a named agent's last turn. */
+  query: "last" | "agent";
+  /** The agent named in a "why <Agent>" ask ("" for a plain "why did you..."). */
+  agentQuery: string;
+  /** True when no trace matched the ask — the honest empty (no steps). */
+  empty: boolean;
+  turnRef: number;
+  ts: string;
+  /** The agent that handled the explained turn. */
+  agent: string;
+  /** The redacted, bounded utterance of the explained turn. */
+  utterance: string;
+  steps: CausaStep[];
+}
+
+/** Defensive caps mirroring the daemon's bounds — the wire is never trusted. */
+export const CAUSA_STEPS_CAP = 12;
+const CAUSA_ALTS_CAP = 6;
+const CAUSA_STR_CAP = 240;
+
+function boundCausaStr(v: string | null): string {
+  return v === null ? "" : v.trim().slice(0, CAUSA_STR_CAP);
+}
+
+/** Coerce one decision step; a step without a stage is meaningless and dropped. */
+function coerceCausaStep(o: Record<string, unknown>): CausaStep | null {
+  const stage = str(o, "stage");
+  if (stage === null || stage.trim() === "") return null;
+  const alts = (strArr(o, "alternatives") ?? [])
+    .slice(0, CAUSA_ALTS_CAP)
+    .map((a) => a.trim().slice(0, CAUSA_STR_CAP));
+  return {
+    stage: boundCausaStr(stage),
+    chosen: boundCausaStr(str(o, "chosen")),
+    why: boundCausaStr(str(o, "why")),
+    alternatives: alts,
+  };
+}
+
+/** Parse a `causa.trace` payload, or null when it carries no valid `query`
+ *  (a frame with no ask is dropped, never rendered). Both the honest-empty
+ *  frame (`empty:true`, no steps) and a populated trace parse; steps are
+ *  capped and degrade individually. */
+export function parseCausaTrace(data: Record<string, unknown>): CausaTrace | null {
+  const query = str(data, "query");
+  if (query !== "last" && query !== "agent") return null;
+  const raw = data["steps"];
+  const steps = Array.isArray(raw)
+    ? raw
+        .slice(0, CAUSA_STEPS_CAP)
+        .filter(isPlainObject)
+        .map(coerceCausaStep)
+        .filter((s): s is CausaStep => s !== null)
+    : [];
+  return {
+    query,
+    agentQuery: boundCausaStr(str(data, "agent_query")),
+    empty: bool(data, "empty") === true,
+    turnRef: nonNegInt(data, "turn_ref"),
+    ts: boundCausaStr(str(data, "ts")),
+    agent: boundCausaStr(str(data, "agent")),
+    utterance: boundCausaStr(str(data, "utterance")),
+    steps,
+  };
+}
+
+/* ------------------------------------------------------------------------ *
  * ACTION SURFACE (#25 auto-draft / #26 durable missions / #27 macros) —      *
  * the read-only HUD view of the three OFF-default, gated, wired-live action  *
  * features. The daemon emits all of these via telemetry::emit("system", …)   *
