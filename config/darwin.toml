@@ -65,6 +65,8 @@ enabled = true          # master gate. SHIPS ON (full-power default). "chart thi
 [boundary]               # CUSTOMS // EGRESS (boundary.rs). A PRE-FLIGHT egress boundary gate: before a CLOUD turn goes out, CUSTOMS builds a READ-ONLY manifest of exactly the personal context about to be sent (facts / history / world rows / persona / system prompt), classifies each by sensitivity + size, and emits it as a `boundary.manifest` frame. INSPECTS + (reduce-only) TRIMS; it never mutates, never sends, and never touches the LOCAL inference path (which egresses nothing off the box).
 enabled = true          # master gate for the pre-flight manifest. SHIPS ON (full-power default) as a NEUTRAL READ-ONLY preview of cloud egress. Off => the cloud turn is byte-for-byte today's (no manifest computed/emitted). Set false to disable.
 default_trim = "none"   # the default REDUCE-ONLY trim on every cloud turn. SHIPS "none" (the IDENTITY — send everything, today's behavior). "no_facts" withholds the remembered FACTS; "no_memory" withholds FACTS + conversation HISTORY. A trim can ONLY withhold whole categories, never add one; an unknown value degrades to "none". A per-turn voice command can override this for a single turn.
+[vault]                  # VAULT MODE ("go dark", vault.rs) — a one-word forcing switch that keeps a turn LOCAL-ONLY for sensitive work. Where CUSTOMS ([boundary]) trims the cloud egress, Vault removes the cloud turn ALTOGETHER: the router refuses to escalate to the Anthropic fallback (the turn stays on the local MLX brain, or honestly says it can't do this offline) and CUSTOMS is forced to its maximal reduce-only trim. RESTRICT-ONLY: vault can only remove cloud + tighten the trim, never add either. Toggled at runtime by a `vault` op or a spoken "go dark" / "vault mode on|off".
+enabled = false         # boot default for vault mode. SHIPS OFF — vault CHANGES behavior (it removes cloud access), so it is opt-in and never engages silently. Runtime toggles flip the live mode; this only sets the state at startup. Set true to boot dark.
 [egress]                 # EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs) — the longitudinal follow-on to the read-only Egress Sentinel. Samples the SAME lsof outbound snapshot, keeps a BOUNDED baseline, and runs two PURE classifiers: first-seen talker + regular-interval beacon cadence (the C2-callback signature). READ-ONLY. Any "block" is PROPOSE-ONLY: a pf rule rendered as TEXT you apply yourself with sudo — the loop NEVER mutates the firewall. UID-scoped: unprivileged lsof sees only same-UID processes (stated in every alert frame). Alerts RIDE EDITH's quiet-hours (from [proactive]) + cooldown + debounce so they never spam.
 enabled = true              # master gate. SHIPS ON (full-power default) — pure read-only observability, like [introspect]/[audit]. With it false the sampling loop is simply not spawned. Set false to disable.
 startup_delay_secs = 45     # wait this long after boot before the first sample (let the host settle)
@@ -107,6 +109,11 @@ phrase = "darwin"       # the wake phrase (case/punct/whitespace-insensitive + s
 
 [shell]                  # #43 SANDBOXED SHELL / TERMINAL — the HIGHEST-RISK capability (arbitrary command execution).
 enabled = true          # master gate. SHIPS ON (full-power default). Even ON it NEVER auto-runs: shell_run is in CONSEQUENTIAL_TOOLS + NEVER_AUTO_APPROVE_TOOLS (parks per-action even under an "Always" policy), clears a destructive denylist pre-exec, and execs only under allow_consequential + confirm + voice-id + !lockdown in a deny-default sandbox-exec profile. INERT WITHOUT DEVICE SUPPORT: exec needs /usr/bin/sandbox-exec + /bin/sh. Set false to disable.
+
+[realm]                  # SCRATCH REALMS (realm.rs) — a disposable, confined build+test sandbox that VERIFIES a code_propose_diff proposal BEFORE a human applies it.
+enabled = true          # master gate. SHIPS ON (full-power default) — INERT WITHOUT DEPS: a Realm needs an allowlisted [code].roots repo (the tree it COW-copies) AND [shell].enabled (it reuses the sandboxed-exec seam). The realm is a network-denied COW copy under state/realms/<ts>/; the daemon READS your tree to copy it but NEVER writes the real tree (apply-to-real stays the separate human-gated apply_code_diff.sh). A `passed` verdict means the build/test REALLY ran and exited zero; the sandbox unavailable / a non-applying diff => an honest UNVERIFIED, never a faked pass. Set false to disable.
+verify_command = ""     # the build/test command run INSIDE the realm (e.g. "cargo test --offline"). SHIPS EMPTY — the realm is network-denied, so name a command that builds/tests OFFLINE (pre-fetched deps). Empty => an honest UNVERIFIED verdict (nothing to run), never a faked pass.
+timeout_secs = 300      # wall-clock cap (seconds) for the realm build/test. Compiling from source in a fresh realm is slow, so this is generous (5 min): a too-short bound makes every real build time out to UNVERIFIED, defeating the point. The setup steps (COW copy + git apply) have their own separate bound.
 
 [ui_automation]          # #44 GATED UI AUTOMATION (the CAPSTONE) — the SINGLE MOST DANGEROUS capability (physically actuating the macOS UI).
 enabled = true          # master gate. SHIPS ON (full-power default). Even ON it NEVER auto-runs: ui_actuate is in CONSEQUENTIAL_TOOLS + NEVER_AUTO_APPROVE_TOOLS (parks PER ACTION — one confirm = one actuation; a second re-parks — even under "Always"), fires only under allow_consequential + confirm + voice-id + !lockdown, never batched. INERT WITHOUT TCC: the CGEvent/AX post needs Accessibility consent (runtime, not SBPL-grantable) + a real display. Set false to disable.
@@ -460,6 +467,26 @@ threshold = 0.86             # cosine ACCEPT on the acoustic embedding (max over
 min_enroll_samples = 3       # how many owner utterances the explicit "enroll my voice" flow captures before the local profile is saved.
 gate_scope = "consequential" # "consequential" (default): gate only outward/consequential actions + the confirmation replay. "all": ALSO block non-consequential commands from an unrecognized speaker (a stricter posture). Unknown values fall back to "consequential" (never silently to "all").
 
+[threshold]
+# VOICE-SCOPED GUEST MODE (daemon/src/threshold.rs): when voice-id reports an
+# UNRECOGNIZED speaker (or the owner toggles guest mode on), DARWIN applies a
+# restrict-only GUEST scope for the turn — a strictly READ-ONLY tool allowlist (no
+# consequential/outward tools, no writes), recall confined to the SHARED tier
+# (never the owner's private agent.* facts — it REUSES voiceid/memory's existing
+# namespace-isolation guard via a reserved sentinel namespace), and a quieter focus
+# profile. A guest scope is DERIVED from the owner scope and is provably NO BROADER
+# than it on every axis: it can only ever REMOVE tools, confine recall, and quiet.
+#
+# HONESTY: voice-id is a bar-RAISER, not a high-assurance biometric (it is
+# replay-/impersonation-spoofable). Guest mode is therefore a COURTESY boundary
+# LAYERED ON TOP of — NEVER a replacement for — the real backstops: the
+# [integrations] allow_consequential master switch, the per-action spoken confirm
+# gate, the voice-id owner gate, and the per-action [policy] layer. Those are
+# UNCHANGED whether or not guest mode is on; a guest turn is gated AT LEAST as
+# strictly as an owner turn, never more loosely.
+enabled = true               # master switch, SHIPS ON (armed by default): an unrecognized speaker is auto-scoped to guest. ARMED-but-INERT — the "unrecognized" signal only exists when [voice_id] is ENFORCING (enabled + a profile enrolled), so with voice-id off (the shipped default) this scopes NOTHING until the owner enrolls a voice OR explicitly toggles guest mode. false => guest scope never applies (owner behavior byte-for-byte).
+guest_profile = "deep_focus" # the (quiet) focus profile a guest turn uses. Ships "deep_focus" (only a genuinely CRITICAL signal surfaces — a stranger doesn't get the owner's proactive intel). Parsed via focus::FocusProfile::from_config_str, which is restrict-only for ANY string, so even a typo can only ever quiet, never broaden. Other sensible values: "sleep", "work", or any custom name.
+
 [episodic]
 # The EPISODIC STORE (daemon/src/episodic.rs): DARWIN's durable, redacted,
 # agent-scoped, BOUNDED memory of completed interactions, plus the recall over it
@@ -732,6 +759,22 @@ enabled = true                 # layer master switch, SHIPS ON but INERT (store 
 # the encrypted DBs are UNRECOVERABLE.
 [security]
 encrypt_memory = false         # SHIPS OFF (enabling changes the on-disk format + migrates). true = encrypt the sensitive stores at rest.
+
+# [enclave] — ENCLAVE CUSTODY (enclave.rs): ADDITIVE, hardware-bound custody of the at-rest
+# DB master key OVER the existing macOS Keychain path. WHERE an Apple Secure Enclave + the SE
+# entitlement (a code-signed host) are present, the master key is wrapped by a NON-EXPORTABLE,
+# hardware-bound Secure-Enclave key (kSecAttrTokenIDSecureEnclave) — the wrapping key never
+# leaves the chip and cannot be exfiltrated even by root. Where absent (the shipped, unentitled
+# posture), custody FALLS BACK to the unchanged OS-protected Keychain path.
+#   - enabled = true (the default): ARMED, but INERT until the SE hardware + entitlement are
+#     present — reported honestly (a self-check SKIP + an enclave.status frame with active=false),
+#     NEVER a fabricated "enclave-protected" claim.
+#   - enabled = false: custody is exactly today's Keychain path.
+# HONESTY: this is custody-hardening ONLY. It never changes which key at-rest encryption resolves
+# ([security].encrypt_memory), and it never touches per-agent credential isolation. With
+# encryption OFF there is no master key to bind, so enclave is a no-op regardless of this switch.
+[enclave]
+enabled = true                 # ARMED by default; inert (honest Keychain fallback) without a Secure Enclave + SE entitlement.
 
 [voice.voices]
 # Per-agent ElevenLabs voice ids: agent name -> EL voice id. An UNMAPPED agent

@@ -123,6 +123,20 @@ pub struct Config {
     /// falls through to the model.
     pub mirror: MirrorConfig,
     pub voice_id: VoiceIdConfig,
+    /// [threshold] — VOICE-SCOPED GUEST MODE (threshold.rs). `enabled` SHIPS ON
+    /// (armed by default): an UNRECOGNIZED speaker (per voice-id) is auto-scoped to
+    /// a restrict-only GUEST scope — a strictly READ-ONLY tool allowlist, recall
+    /// confined to the SHARED tier (never the owner's private `agent.*` facts), and
+    /// a quieter focus profile. Guest scope can ONLY narrow the owner scope; it
+    /// LAYERS ON TOP of — and never replaces — the master switch + per-action
+    /// confirm + voice-id + policy gates, which are unchanged whether or not guest
+    /// mode is on. ARMED-but-INERT: the "unrecognized" signal only exists when
+    /// voice-id is ENFORCING (enrolled), so with voice-id off (the shipped default)
+    /// this scopes nothing until the owner enrolls a voice or explicitly toggles
+    /// guest mode. HONESTY: voice-id is a bar-raiser, not a high-assurance biometric
+    /// (replay-spoofable), so guest mode is a COURTESY boundary, not a security
+    /// backstop.
+    pub threshold: ThresholdConfig,
     pub episodic: EpisodicConfig,
     pub notebooks: NotebookConfig,
     pub lifelog: LifeLogConfig,
@@ -180,6 +194,16 @@ pub struct Config {
     pub triage: TriageConfig,
     pub policy: PolicyConfig,
     pub security: SecurityConfig,
+    /// [enclave] — ENCLAVE CUSTODY (enclave.rs): ADDITIVE, hardware-bound custody of
+    /// the at-rest DB master key. `enabled` SHIPS ON (armed by default) — but INERT
+    /// WITHOUT its dependency: minting a non-exportable Secure-Enclave-bound key
+    /// needs an Apple Secure Enclave AND the SE entitlement on a code-signed host.
+    /// Where present, the master key is wrapped by an SE key OVER the existing
+    /// Keychain custody; otherwise custody honestly falls back to the unchanged
+    /// OS-protected Keychain path (reported as a self-check SKIP, never a fabricated
+    /// "enclave-protected"). It never changes the resolved key or per-agent
+    /// credential isolation — custody-hardening only.
+    pub enclave: EnclaveConfig,
     /// [distill] — SELF-DISTILLATION (F17, distill.rs): an on-device LoRA
     /// pipeline that learns a personal adapter from the user's OWN graded
     /// interactions. SHIPS OFF (like [security]) because training MUTATES
@@ -253,6 +277,13 @@ pub struct Config {
     /// enabling only adds an honest inventory + an opt-in trim — never a new
     /// egress.
     pub boundary: BoundaryConfig,
+    /// [vault] — VAULT MODE ("go dark", vault.rs). `enabled` SHIPS OFF (vault
+    /// removes cloud access, so it is opt-in and never engages silently). With it
+    /// active the router forces LOCAL-ONLY routing (no Anthropic-fallback
+    /// escalation) and CUSTOMS is forced to its maximal reduce-only trim. It is a
+    /// RESTRICT-ONLY tightening — vault can only remove cloud + strengthen the trim,
+    /// never add either — toggled at runtime by a `vault` op or a spoken "go dark".
+    pub vault: VaultConfig,
     /// [egress] — EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs), the
     /// longitudinal follow-on to the read-only Egress Sentinel. `enabled` SHIPS ON
     /// (full-power default) — like `[introspect]`/`[audit]` it is pure, READ-ONLY
@@ -276,6 +307,16 @@ pub struct Config {
     /// act. With it false the "what would you do if ..." cue falls through to normal
     /// routing (it is just another question).
     pub precog: PrecogConfig,
+    /// [realm] — SCRATCH REALMS (realm.rs): a disposable, confined build+test
+    /// sandbox that VERIFIES a `code_propose_diff` proposal BEFORE a human applies
+    /// it. `enabled` SHIPS ON (full-power default) but is INERT WITHOUT DEPS — it
+    /// can only run with an allowlisted `[code].roots` repo (the tree it COW-copies)
+    /// AND `[shell].enabled` (it reuses the sandboxed-exec seam). The realm is a
+    /// network-denied COW copy under `state/realms/<ts>/`; the daemon READS the
+    /// user's tree for the copy but NEVER writes it (apply-to-real stays the separate
+    /// human-gated `apply_code_diff.sh`). It reports honest UNVERIFIED — never a
+    /// faked pass — when the sandbox/tooling is unavailable or no verify command is set.
+    pub realm: RealmConfig,
 }
 
 /// Every section and key the config knows, for unknown-key diagnostics
@@ -480,6 +521,13 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // "consequential"|"all"
     // (unknown -> "consequential"); listed here so it never reads as a typo.
     ("voice_id", &["enabled", "threshold", "min_enroll_samples", "gate_scope"]),
+    // [threshold] — voice-scoped GUEST mode (threshold.rs). `enabled` is the master
+    // switch and SHIPS ON (armed by default): an unrecognized speaker is auto-scoped
+    // to a restrict-only, read-only, shared-recall-only, quieter GUEST scope. It can
+    // ONLY narrow the owner scope and LAYERS ON TOP of the unchanged master switch +
+    // confirm + voice-id + policy gates. `guest_profile` ("deep_focus" default) is
+    // the quiet focus lens a guest turn uses (restrict-only for any value).
+    ("threshold", &["enabled", "guest_profile"]),
     // [episodic] — the episodic store (episodic.rs). UNLIKE self_heal/forge/
     // optimize/voice_id, `enabled` SHIPS ON (true): it is the SAME always-on,
     // bounded, local posture as the transcripts table / lifelong-learning fact
@@ -757,6 +805,13 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // covered; lose the Keychain item => the DBs are unrecoverable. Listed here so
     // the key never reads as a typo.
     ("security", &["encrypt_memory"]),
+    // [enclave] — ENCLAVE CUSTODY (enclave.rs). `enabled` SHIPS ON (armed by
+    // default) but is INERT WITHOUT the Secure Enclave + SE entitlement: it wraps
+    // the at-rest master key with a non-exportable hardware-bound SE key WHERE
+    // present, else custody honestly falls back to the unchanged OS-protected
+    // Keychain path (a self-check SKIP, never a fabricated enclave claim). Listed
+    // here so the key never reads as a typo.
+    ("enclave", &["enabled"]),
     ("distill", &["enabled", "python", "base_model", "iters"]),
     ("sync", &["enabled", "peer_endpoint"]),
     ("scene", &["enabled", "confidence_floor"]),
@@ -817,6 +872,9 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // ("none" | "no_facts" | "no_memory"); an unknown value degrades to "none".
     // Listed so neither key reads as a typo.
     ("boundary", &["enabled", "default_trim"]),
+    // [vault] — VAULT MODE ("go dark", vault.rs). `enabled` SHIPS OFF (vault removes
+    // cloud access, so it is opt-in). Listed so the key never reads as a typo.
+    ("vault", &["enabled"]),
     // [egress] — EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs). `enabled`
     // SHIPS ON (read-only observability). The remaining keys tune the bounded
     // baseline retention and the beacon-cadence + alert-suppression thresholds;
@@ -844,6 +902,14 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // construction: it describes what a real run WOULD do (and that it would PARK),
     // never acts. Listed so the key never reads as a typo.
     ("precog", &["enabled"]),
+    // [realm] — SCRATCH REALMS (realm.rs): a disposable, confined build+test sandbox
+    // that VERIFIES a code_propose_diff proposal in a network-denied COW copy of the
+    // codebase BEFORE a human applies it. `enabled` SHIPS ON (full-power default) —
+    // INERT WITHOUT DEPS: it needs an allowlisted [code].roots repo + [shell].enabled.
+    // `verify_command` SHIPS EMPTY (the operator names their project's build/test
+    // command; empty => an honest UNVERIFIED, never a faked pass). Listed here so
+    // neither key reads as a typo.
+    ("realm", &["enabled", "verify_command", "timeout_secs"]),
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1633,6 +1699,36 @@ impl Default for BoundaryConfig {
     }
 }
 
+/// [vault] — VAULT MODE ("go dark", vault.rs), a one-word forcing switch that keeps
+/// a turn LOCAL-ONLY for sensitive work. Where CUSTOMS ([boundary]) inventories +
+/// trims the cloud egress, Vault removes the cloud turn ALTOGETHER: with it active
+/// the router refuses to escalate to the Anthropic fallback (the turn stays on the
+/// local MLX brain, or honestly says it can't do this offline) and CUSTOMS is forced
+/// to its strongest reduce-only trim.
+///
+/// `enabled` SHIPS OFF: vault CHANGES BEHAVIOR (it removes cloud access), so it is
+/// opt-in and never engages silently. It is toggled at runtime — a `vault` router op
+/// or a spoken "go dark" / "vault mode on|off" — and this key is only the boot
+/// default. RESTRICT-ONLY: vault can only ever REMOVE cloud + tighten the egress
+/// trim, never add either — a turn under vault egresses nothing the non-vault turn
+/// wouldn't, and with it off the cloud decision is byte-for-byte today's.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VaultConfig {
+    /// The boot default for vault mode. SHIPS OFF (vault removes cloud access, so it
+    /// is opt-in). Runtime toggles ("go dark" / the `vault` op) flip the live mode;
+    /// this only sets the state at startup.
+    pub enabled: bool,
+}
+
+impl Default for VaultConfig {
+    /// Ships OFF — vault changes behavior (local-only + maximal egress trim), so it
+    /// never engages until the operator opts in (config default or a runtime toggle).
+    fn default() -> Self {
+        Self { enabled: false }
+    }
+}
+
 /// [egress] — EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs), the
 /// longitudinal follow-on to the read-only Egress Sentinel. `enabled` SHIPS ON:
 /// like `[introspect]`/`[audit]` it is pure READ-ONLY observability — it samples
@@ -2181,6 +2277,60 @@ impl Default for ShellConfig {
     }
 }
 
+/// [realm] — SCRATCH REALMS (realm.rs): a disposable, confined build+test sandbox
+/// that VERIFIES a `code_propose_diff` proposal in a throwaway, network-denied copy
+/// of the user's codebase BEFORE a human applies it — closing the honesty gap the
+/// propose path admits (a proposed diff's compile/test correctness is NOT guaranteed).
+///
+///   - `enabled` (SHIPS ON, full-power default): master switch. INERT WITHOUT DEPS —
+///     a Realm can only run with an allowlisted `[code].roots` repo (the tree it
+///     COW-copies) AND `[shell].enabled` (it reuses the sandboxed-exec seam). With
+///     any of the three unmet the feature is inert (see [`crate::realm::realm_permitted`]).
+///   - `verify_command` (SHIPS EMPTY): the build/test command run INSIDE the realm
+///     (e.g. `"cargo test --offline"`). EMPTY => the Realm reports an honest
+///     UNVERIFIED (there is nothing to run) rather than faking a pass — the operator
+///     must set the command their project builds/tests with. The realm is network-
+///     denied, so a build must not need the network (pre-fetched deps / `--offline`).
+///
+/// HONESTY: the realm is a COPY-ON-WRITE copy under `state/realms/<ts>/` — the daemon
+/// READS the user's tree to copy it but NEVER writes the real tree; the proposed diff
+/// is applied INTO the realm ONLY. Apply-to-real stays the SEPARATE, human-reviewed
+/// `scripts/apply_code_diff.sh` (unchanged). The build/test runs under the DENY-DEFAULT,
+/// network-denied `sandbox-exec` profile (write-confined to the realm). A `Passed`
+/// verdict means the build/test REALLY ran and exited zero — it is never a claim; when
+/// the sandbox/tooling is unavailable or the diff does not apply, the Realm reports an
+/// honest UNVERIFIED, NEVER a faked pass. The exec is DEVICE-gated (needs
+/// `/usr/bin/sandbox-exec` + `/bin/cp` + git) and is NOT claimed proven by the hermetic
+/// tests (which use a mock runner).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RealmConfig {
+    pub enabled: bool,
+    pub verify_command: String,
+    /// Wall-clock cap (seconds) for the realm build/test. Compiling from source in a
+    /// fresh network-denied realm is far slower than a quick shell command, so this
+    /// is generous — a too-short bound makes every real build time out to UNVERIFIED,
+    /// defeating the point of the realm (which is a REAL pass/fail verdict).
+    pub timeout_secs: u64,
+}
+
+impl Default for RealmConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS ON (full-power default) — INERT WITHOUT DEPS: a Realm needs an
+            // allowlisted [code].roots repo AND [shell].enabled to do anything.
+            enabled: true,
+            // SHIPS EMPTY — the operator must name the command their project
+            // builds/tests with (network-denied, so `--offline` / pre-fetched deps).
+            // Empty => an honest UNVERIFIED verdict, never a faked pass.
+            verify_command: String::new(),
+            // 5 minutes: enough for a real from-source compile+test, so a genuine
+            // verdict is reachable instead of always timing out to UNVERIFIED.
+            timeout_secs: 300,
+        }
+    }
+}
+
 /// [ui_automation] — GATED UI AUTOMATION (#44, the CAPSTONE), the SINGLE MOST
 /// DANGEROUS capability: actually ACTUATING the macOS UI (a synthetic click /
 /// type / key combo). It SHIPS ON (full-power default) and is maximally gated by
@@ -2534,6 +2684,47 @@ impl Default for VoiceIdConfig {
             threshold: 0.86,
             min_enroll_samples: 3,
             gate_scope: "consequential".to_string(),
+        }
+    }
+}
+
+/// [threshold] — VOICE-SCOPED GUEST MODE (threshold.rs). A restrict-only GUEST
+/// scope applied when voice-id reports an UNRECOGNIZED speaker (or the owner
+/// toggles guest mode): a strictly READ-ONLY tool allowlist, recall confined to
+/// the SHARED tier (never the owner's private `agent.*` facts, reusing the existing
+/// namespace-isolation guard), and a quieter focus profile.
+///
+/// The guest scope can ONLY narrow the owner scope (restrict-only, proven in
+/// threshold.rs). It LAYERS ON TOP of — never replaces — the master switch +
+/// per-action confirm + voice-id + policy gates, which are UNCHANGED whether or not
+/// guest mode is on. HONESTY: voice-id is a bar-raiser, not a high-assurance
+/// biometric (replay-spoofable), so guest mode is a COURTESY boundary, not a
+/// security backstop.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ThresholdConfig {
+    /// Master switch, SHIPS ON (armed by default): an unrecognized speaker is
+    /// auto-scoped to guest. ARMED-but-INERT — the "unrecognized" signal only
+    /// exists when voice-id is ENFORCING (enrolled), so with voice-id off (the
+    /// shipped default) this scopes nothing until a voice is enrolled OR guest mode
+    /// is explicitly toggled. False => guest scope never applies (owner behavior
+    /// byte-for-byte).
+    pub enabled: bool,
+    /// The (quiet) focus profile a guest turn uses. Ships "deep_focus" (only a
+    /// genuinely CRITICAL signal surfaces). Parsed via
+    /// `focus::FocusProfile::from_config_str`, which is restrict-only for ANY string
+    /// — so even a typo can only ever quiet, never broaden.
+    pub guest_profile: String,
+}
+
+impl Default for ThresholdConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS ARMED (full-power default), but INERT until voice-id is enrolled
+            // — see the doc above.
+            enabled: true,
+            // A genuinely quiet guest lens: only Critical surfaces, no digest.
+            guest_profile: "deep_focus".to_string(),
         }
     }
 }
@@ -3022,6 +3213,40 @@ pub struct SecurityConfig {
     /// Master switch for at-rest encryption. SHIPS OFF (false) and is pinned:
     /// with it false the stores are exactly today's plaintext SQLite.
     pub encrypt_memory: bool,
+}
+
+/// [enclave] — ENCLAVE CUSTODY (enclave.rs): ADDITIVE, hardware-bound custody of
+/// the at-rest DB master key OVER the existing macOS Keychain path (crypto.rs).
+///
+///   - `enabled` (SHIPS ON, armed by default): the master switch. When ON AND a
+///     Secure Enclave + the SE entitlement are genuinely reachable, the at-rest
+///     master key is wrapped by a non-exportable, hardware-bound Secure-Enclave key
+///     (`kSecAttrTokenIDSecureEnclave`) — the wrapping key never leaves the chip and
+///     cannot be exfiltrated even by root. When OFF, or when the SE is not reachable
+///     (the shipped unentitled posture), custody FALLS BACK to the unchanged
+///     OS-protected Keychain path.
+///
+/// ARMED-BUT-INERT (be honest): this ships ON but does nothing until its hardware +
+/// entitlement dependency is present — reported as a self-check SKIP + an
+/// `enclave.status` frame with `active=false`, NEVER a fabricated "enclave-protected"
+/// claim. It is custody-hardening ONLY: it never changes which `SecretKey` startup
+/// resolves/installs, and never touches per-agent credential isolation (the
+/// integrations allowlist).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EnclaveConfig {
+    /// Master switch for Secure-Enclave-bound custody. SHIPS ON (armed) but inert
+    /// without the SE hardware + entitlement; with it false custody is exactly
+    /// today's Keychain path.
+    pub enabled: bool,
+}
+
+impl Default for EnclaveConfig {
+    fn default() -> Self {
+        // Armed by default; inert (honest Keychain fallback) without the Secure
+        // Enclave + entitlement dependency.
+        Self { enabled: true }
+    }
 }
 
 
@@ -3644,6 +3869,7 @@ impl Config {
             calibrate: section(&table, "calibrate", &mut issues),
             mirror: section(&table, "mirror", &mut issues),
             voice_id: section(&table, "voice_id", &mut issues),
+            threshold: section(&table, "threshold", &mut issues),
             episodic: section(&table, "episodic", &mut issues),
             notebooks: section(&table, "notebooks", &mut issues),
             lifelog: section(&table, "lifelog", &mut issues),
@@ -3662,6 +3888,7 @@ impl Config {
             triage: section(&table, "triage", &mut issues),
             policy: section(&table, "policy", &mut issues),
             security: section(&table, "security", &mut issues),
+            enclave: section(&table, "enclave", &mut issues),
             distill: section(&table, "distill", &mut issues),
             sync: section(&table, "sync", &mut issues),
             scene: section(&table, "scene", &mut issues),
@@ -3672,8 +3899,10 @@ impl Config {
             report: section(&table, "report", &mut issues),
             chart: section(&table, "chart", &mut issues),
             boundary: section(&table, "boundary", &mut issues),
+            vault: section(&table, "vault", &mut issues),
             egress: section(&table, "egress", &mut issues),
             precog: section(&table, "precog", &mut issues),
+            realm: section(&table, "realm", &mut issues),
         };
 
         // SELECTABLE QUANTIZATION (#39) value validation: an unknown [inference]

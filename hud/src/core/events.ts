@@ -3851,6 +3851,58 @@ export function lockdownInitial(): LockdownStatus {
 }
 
 /* ------------------------------------------------------------------------ *
+ * VAULT MODE ("go dark") — daemon/src/vault.rs + router.rs + boundary.rs.         *
+ * A one-word forcing switch that keeps a turn LOCAL-ONLY: with it active the      *
+ * router refuses to escalate to the Anthropic cloud fallback (the turn stays on   *
+ * the local MLX brain, or honestly says it can't do this offline) and CUSTOMS is  *
+ * forced to its MAXIMAL reduce-only trim. RESTRICT-ONLY — vault can only ever      *
+ * REMOVE cloud + tighten the egress trim, never add either. The daemon emits a     *
+ * SECRET-FREE `system / vault.status` frame ({active, read_only, restrict_only})   *
+ * at startup and on every toggle (retained, so a late-connecting HUD learns the    *
+ * current mode). The parser carries that contract forward: booleans only, so even  *
+ * a malformed payload cannot smuggle a field into the indicator.                   *
+ * ------------------------------------------------------------------------ */
+
+/** The VAULT MODE posture (vault.status). SECRET-FREE — a single boolean. `active`
+ *  is the ground truth (the daemon's `vault::active()`): true = go-dark engaged
+ *  (LOCAL-ONLY, no cloud escalation, CUSTOMS at maximal reduction). */
+export interface VaultStatus {
+  active: boolean;
+}
+
+/** Parse a vault.status payload. NEVER returns null — a vault frame always yields a
+ *  snapshot so the indicator renders the current honest posture, not a stale one.
+ *  `active` defaults to FALSE (the shipped-OFF default) when absent/non-bool.
+ *  Surfaces ONLY the one boolean; any extra field on the wire is ignored. Never
+ *  throws on junk. */
+export function parseVaultStatus(data: Record<string, unknown>): VaultStatus {
+  return {
+    active: bool(data, "active") ?? false,
+  };
+}
+
+/** The at-a-glance tone for the vault indicator: "warn" (VAULT — go-dark is
+ *  engaged; a deliberate, protective posture, not an alarm) or "ok" (the shipped
+ *  default, cloud routing exactly as configured). Distinct from lockdown's "bad":
+ *  vault is a chosen tightening, not an emergency stop. */
+export function vaultTone(v: VaultStatus): "warn" | "ok" {
+  return v.active ? "warn" : "ok";
+}
+
+/** The indicator label: VAULT when engaged (go dark), else OPEN (cloud routing
+ *  available exactly as configured). */
+export function vaultLabel(v: VaultStatus): string {
+  return v.active ? "VAULT" : "OPEN";
+}
+
+/** The shipped-OFF default snapshot — not active. The HUD's honest starting posture
+ *  before any vault.status arrives is `null`, but a caller needing a concrete
+ *  default (e.g. a test) can use this. */
+export function vaultInitial(): VaultStatus {
+  return { active: false };
+}
+
+/* ------------------------------------------------------------------------ *
  * VOICE-ID — daemon/src/voiceid.rs + main.rs::handle_voice_id.                   *
  * On-device speaker verification. The daemon emits a SECRET-FREE                 *
  * `system / voiceid.verify` event each turn ({verified, score, enabled,         *

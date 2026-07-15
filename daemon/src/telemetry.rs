@@ -37,6 +37,10 @@ fn sticky_key(event: &str, data: &Value) -> Option<String> {
         "app.registry" | "lockdown.status" | "config.invalid" | "agents.invalid" => {
             Some(event.to_string())
         }
+        // VAULT MODE (vault.rs): "go dark" is a rare, event-driven MODE change (not a
+        // 15s cadence), so retain the latest frame — a HUD that connects after a
+        // toggle must still learn the current vault state to render its indicator.
+        "vault.status" => Some(event.to_string()),
         // Per-app diagnostic: one retained frame per offending app.
         "app.manifest_invalid" => Some(format!(
             "app.manifest_invalid:{}",

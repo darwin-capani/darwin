@@ -5583,6 +5583,32 @@ svg.tri circle {
 }
 .status-item.lockdown-chip.ok { color: var(--ice-dim); }
 
+/* ------------------------------------------------------- VAULT MODE ("go dark") */
+/* The at-a-glance VAULT indicator chip (daemon/src/vault.rs vault.status). VAULT is
+   a DELIBERATE, protective posture (amber/warn) — distinct from lockdown's red
+   ALARM: go-dark is a chosen tightening (local-only + maximal CUSTOMS trim), not an
+   emergency stop. OPEN (the shipped default) is calm/dim. */
+.vault-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35em;
+  white-space: nowrap;
+  letter-spacing: 0.1em;
+}
+.vault-chip .vault-dot {
+  width: 0.5em;
+  height: 0.5em;
+  border-radius: 50%;
+  background: currentColor;
+  box-shadow: 0 0 4px currentColor;
+}
+.vault-chip.warn {
+  color: var(--warn-amber);
+  font-weight: 700;
+}
+.vault-chip.ok { color: var(--ice-dim); }
+.vault-chip.inactive .vault-dot { box-shadow: none; opacity: 0.55; }
+
 .panic-btn {
   margin: 0 0.4rem;
   padding: 0.18rem 0.6rem;

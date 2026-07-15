@@ -78,6 +78,13 @@ mod egress;
 // "block" is PROPOSE-ONLY: a pf rule rendered as TEXT the user applies with
 // sudo — the module never mutates the firewall. ON by default ([egress].enabled).
 mod egress_beacon;
+// ENCLAVE CUSTODY (enclave.rs): ADDITIVE, hardware-bound custody of the at-rest DB
+// master key. WHERE a Secure Enclave + the SE entitlement are present, the master
+// key is wrapped by a non-exportable SE-bound key OVER the existing Keychain path;
+// otherwise (the shipped, unentitled posture) custody honestly falls back to the
+// unchanged OS-protected Keychain — never a fabricated enclave claim. ARMED by
+// default ([enclave].enabled), inert without its hardware/entitlement dependency.
+mod enclave;
 mod episodic;
 // LIVE ENDPOINT SECURITY NOTIFY client (feature `endpoint-security`, DEVICE-GATED).
 // OFF by default — the normal build never compiles it. When on, it feeds kernel
@@ -206,6 +213,17 @@ mod prosody;
 // wired in the binary — the detect/surface path itself IS live.
 #[cfg_attr(not(test), allow(dead_code))]
 mod proactive_intel;
+// SCRATCH REALMS (realm.rs): a disposable, confined build+test sandbox that VERIFIES
+// a proposed code change (from code::code_propose_diff) BEFORE a human applies it. It
+// COW-copies an allowlisted [code].roots repo into a network-denied state/realms/<ts>/,
+// applies the proposed diff INTO the realm ONLY (never the user's tree), runs the
+// build/test there via the EXISTING device-gated shell::run_sandboxed seam, captures the
+// REAL pass/fail, attaches it to the proposal card, then tears the realm down. PURE
+// orchestration (path construction, confinement, verdict mapping) + a device-gated
+// runner (built, never invoked under cargo test). ARMED by default, INERT without a
+// [code].roots repo + [shell].enabled. Honest-UNVERIFIED (never a faked pass) when the
+// sandbox is unavailable. Hermetically tested in realm.rs.
+mod realm;
 mod recall;
 mod reflect;
 // REPORT GENERATION (#40): a PURE build_report(title, sources:[SourcedClaim], cfg)
@@ -253,6 +271,13 @@ mod speech;
 mod standing;
 mod tcc;
 mod telemetry;
+// THRESHOLD (threshold.rs): a voice-scoped GUEST / restricted-speaker mode. When
+// voice-id reports an UNRECOGNIZED speaker (or the owner toggles guest mode), it
+// projects a restrict-only GUEST scope — a read-only tool allowlist, shared-only
+// recall (never the owner's private facts), and a quieter focus profile — that can
+// ONLY narrow the owner scope. A COURTESY layer on top of the unchanged master
+// switch + confirm + voice-id + policy gates, never a replacement for them.
+mod threshold;
 // FORENSIC TRIAGE SNAPSHOT (aegis): a one-shot READ-ONLY "capture everything" that
 // freezes a REDACTED, timestamped evidence bundle under state/forensics/<ts>/ and
 // folds its manifest SHA-256 into the audit chain + the Keychain external anchor.
@@ -267,6 +292,7 @@ mod triage;
 mod ui_automation;
 mod unified_search;
 mod user_model;
+mod vault;
 mod voiceid;
 // VOICE CLONING (build 2/2): the CONSENT-GATED, authorization-bound capability that
 // uploads an owner-authorized sample to ElevenLabs and stores the returned voice id.
@@ -1824,6 +1850,15 @@ async fn main() -> Result<()> {
     // manifest is a READ-ONLY inventory, and the LOCAL inference path never reaches
     // it (it egresses nothing).
     boundary::init(cfg.boundary.enabled, &cfg.boundary.default_trim);
+    // VAULT MODE ("go dark", vault.rs): install the [vault].enabled config default
+    // ONCE (SHIPS OFF — it changes behavior) so the router reads one process-global
+    // to force LOCAL-ONLY routing, and boundary::gate_and_trim reads it to force
+    // CUSTOMS to the maximal reduce. RESTRICT-ONLY — vault can only remove cloud +
+    // tighten the egress trim, never add either; with it OFF the cloud decision is
+    // byte-for-byte today's. Emit the startup vault.status so a HUD that connects
+    // after boot sees the honest current mode (the frame is retained by telemetry).
+    vault::init(cfg.vault.enabled);
+    telemetry::emit("system", "vault.status", vault::status_frame(vault::active()));
     // MCP CLIENT (docs/SANDBOX.md): connect every configured external tool server
     // ONCE at startup, then install the connected manager as the process-global so
     // the cloud tool loop can offer + route its tools WITHOUT threading a manager
@@ -1869,6 +1904,28 @@ async fn main() -> Result<()> {
     let came_up_locked = lockdown::init(&state_dir);
 
     let master_key = resolve_encryption_key(cfg.security.encrypt_memory, &state_dir).await;
+
+    // ENCLAVE CUSTODY (enclave.rs, ADDITIVE over the Keychain path). Purely a
+    // custody-hardening decision made AFTER the master key is resolved/installed —
+    // it never changes which key was resolved nor its Keychain custody. WHERE a
+    // Secure Enclave + the SE entitlement are present, the resolved master key is
+    // wrapped by a non-exportable, hardware-bound SE key; otherwise (the shipped
+    // unentitled posture) this is an HONEST no-op that reports the Keychain
+    // fallback. The result only feeds the `enclave.status` telemetry frame below —
+    // it does not gate or alter any store open. Per-agent credential isolation (the
+    // integrations allowlist) is untouched: enclave concerns only the master key.
+    let enclave_custody = enclave::resolve_custody(cfg.enclave.enabled, master_key.as_ref());
+    {
+        // Honest PASS/SKIP custody line in the startup log (never the key). PASS =
+        // the master key is SE-wrapped; SKIP = the inert Keychain fallback with its
+        // reason. Informational only — NOT a structural startup gate.
+        let check = enclave::selfcheck(&enclave_custody);
+        info!(
+            status = check.status.label(),
+            detail = %check.detail,
+            "enclave: master-key custody self-check"
+        );
+    }
 
     let memory = Arc::new(open_memory(&state_dir.join("darwin.db"), master_key.as_ref())?);
 
@@ -2053,6 +2110,12 @@ async fn main() -> Result<()> {
             "cipher": "SQLCipher AES-256 (transparent, whole-file, page-level)"
         }),
     );
+    // ENCLAVE CUSTODY status (enclave.rs; secret-free — NEVER the key). Drives the
+    // HUD's "hardware-bound custody" indicator with the GROUND-TRUTH `active` (the
+    // SE wrap actually engaged this run), the honest availability reason when inert,
+    // and the public SE key label — never any key material. On the shipped
+    // unentitled build this reads "keychain-fallback / inert" honestly.
+    telemetry::emit("system", "enclave.status", enclave::status_frame(&enclave_custody));
     // SKILLS MARKETPLACE status (secret-free): the hand-written in-tree skill
     // catalog the HUD Skills panel browses — every skill's name, category,
     // one-line "when to use", and the consequential / source-gated markers, plus

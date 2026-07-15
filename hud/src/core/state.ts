@@ -44,6 +44,7 @@ import {
   LocalWarmStatus,
   InferencePerfStatus,
   LockdownStatus,
+  VaultStatus,
   CapabilityAtlas,
   TccSentinel,
   IntrospectStatus,
@@ -155,6 +156,7 @@ import {
   parseCausaTrace,
   parseMirrorFrame,
   parseLockdownStatus,
+  parseVaultStatus,
   parseNotebookActivity,
   parseUnifiedSearchResult,
   parseEpisodicRecorded,
@@ -728,6 +730,13 @@ export interface HudState {
    *  carries `locked`, which the reducer/App folds in so the indicator flips
    *  immediately on a button press, ahead of the next telemetry frame. */
   lockdown: LockdownStatus | null;
+  /** The VAULT MODE ("go dark") posture (vault.status, daemon/src/vault.rs): the
+   *  process-global switch that forces a turn LOCAL-ONLY (no cloud escalation) and
+   *  CUSTOMS to its maximal reduce-only trim. Null until the daemon emits the
+   *  startup snapshot (SHIPS OFF, {active:false}); `active` drives the VAULT / OPEN
+   *  indicator. RESTRICT-ONLY and SECRET-FREE — a single boolean; toggling it only
+   *  ever tightens (removes cloud + strengthens the trim), never adds egress. */
+  vault: VaultStatus | null;
   /** The skills marketplace catalog (skills.catalog): the hand-written in-tree
    *  skill library the Skills panel browses by category, with per-category counts,
    *  the real shipped total, and the live [skills] master-switch state. Null until
@@ -1377,6 +1386,7 @@ export function initialState(): HudState {
     webhooks: webhookSurfaceInitial(),
     plugins: null,
     lockdown: null,
+    vault: null,
     skills: null,
     evalReport: null,
     optimizerProposal: null,
@@ -2621,6 +2631,17 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // LOCKED DOWN / NORMAL indicator; `restoredFromMarker` true means this start
       // RE-ENTERED lockdown from the persisted marker (the stop survived a restart).
       return { ...s, lockdown: parseLockdownStatus(env.data) };
+    }
+
+    case "vault.status": {
+      // VAULT MODE ("go dark", daemon/src/vault.rs): the go-dark posture snapshot,
+      // emitted at startup and on every toggle (retained by the daemon, so a HUD
+      // that connects after a toggle still learns the current mode). parseVaultStatus
+      // NEVER returns null (a malformed payload yields the honest {active:false}
+      // fail-safe, not a stale one) and carries a single boolean. `active` drives the
+      // VAULT / OPEN indicator; when active the turn is LOCAL-ONLY with CUSTOMS at
+      // maximal reduction. Replaced in place each toggle.
+      return { ...s, vault: parseVaultStatus(env.data) };
     }
 
     case "skills.catalog": {
