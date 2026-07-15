@@ -35,6 +35,18 @@ pub struct Config {
     /// app runs; with it false the sentinel loop is not spawned (the cheap
     /// record_profile/record_child hooks in apps.rs still populate their maps).
     pub introspect: IntrospectConfig,
+    /// [persistence] — PERSISTENCE SENTINEL ("Autoruns for the Mac", persistence.rs).
+    /// `enabled` SHIPS ON (full-power default). READ-ONLY DEFENSE: a slow sentinel
+    /// that inventories the host's autostart/persistence surfaces (LaunchAgents,
+    /// LaunchDaemons, login items, cron, third-party kexts) + each backing binary's
+    /// signing/notarization + the Gatekeeper switch via FIXED-ARG bounded
+    /// subprocesses, keeps a baseline, and flags what is NEW / REMOVED / newly
+    /// UNSIGNED. DARWIN's own two launch items are labeled self, never alarmed on. It
+    /// emits `security.persistence` for the HUD/posture and takes NO action —
+    /// remediating a finding would be consequential and is out of scope. Honest SKIP
+    /// when a read needs a privilege the no-sudo daemon lacks (login items ->
+    /// Automation TCC). With it false the sentinel loop is not spawned.
+    pub persistence: PersistenceConfig,
     pub integrations: IntegrationsConfig,
     pub standing: StandingConfig,
     /// [drafts] — AUTO-DRAFT (#25, drafts.rs). `enabled` SHIPS ON (full-power
@@ -272,6 +284,15 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // `enabled` SHIPS ON (full-power default); it only observes darwind's own
     // children (same-UID, no entitlement) and never acts.
     ("introspect", &["enabled", "interval_secs", "startup_delay_secs", "cpu_alert_percent", "rss_growth_ratio"]),
+    // [persistence] — the READ-ONLY Persistence Sentinel (persistence.rs): an
+    // "Autoruns for the Mac" inventory of autostart surfaces (LaunchAgents /
+    // LaunchDaemons / login items / cron / third-party kexts) + per-binary
+    // signing/notarization + Gatekeeper, with a baseline diff (new/removed/
+    // unsigned). `enabled` SHIPS ON (full-power default); it only reads + reports,
+    // never remediates. `assess_signing` gates the codesign/spctl per-binary reads
+    // (ASSESSMENT only, never executions); `max_assess` caps how many binaries are
+    // assessed per scan.
+    ("persistence", &["enabled", "interval_secs", "startup_delay_secs", "assess_signing", "max_assess"]),
     // [integrations] — `allow_consequential` is THE master gate for outward/
     // side-effecting actions. SHIPS ON (full-power default) — INERT-SAFE: a
     // CONFIRMED consequential action still clears confirm + voice-id + policy +
@@ -2448,6 +2469,40 @@ impl Default for IntrospectConfig {
     }
 }
 
+/// [persistence] — the PERSISTENCE SENTINEL (persistence.rs): a READ-ONLY
+/// "Autoruns for the Mac" inventory of the host's autostart surfaces + per-binary
+/// signing/notarization + Gatekeeper, with a pure baseline diff. It only observes
+/// and reports (secret-free counts + anomalies); it never remediates.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PersistenceConfig {
+    /// Master switch for the sentinel loop. SHIPS ON (read-only observability).
+    pub enabled: bool,
+    /// Seconds between sentinel scans (the autostart surface moves slowly).
+    pub interval_secs: u64,
+    /// Seconds to wait after boot before the first scan (let the box settle).
+    pub startup_delay_secs: u64,
+    /// Whether to run the per-binary `codesign`/`spctl` ASSESSMENT reads. SHIPS ON.
+    pub assess_signing: bool,
+    /// Cap on how many binaries are signing-assessed per scan (bounds the work).
+    pub max_assess: usize,
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        // On by default — it only reads the host's autostart surfaces and reports.
+        // The cadence matches the TCC sentinel (a slow scan; the surface moves on
+        // the order of installs). Signing assessment is on but bounded.
+        Self {
+            enabled: true,
+            interval_secs: 300,
+            startup_delay_secs: 45,
+            assess_signing: true,
+            max_assess: 64,
+        }
+    }
+}
+
 /// [integrations] — the shared Chart-2 integration substrate (integrations.rs).
 /// `allow_consequential` is THE master gate for outward/side-effecting actions
 /// (post a message, create an event). It SHIPS ON (true) — the headline of the
@@ -3155,6 +3210,7 @@ impl Config {
             focus: section(&table, "focus", &mut issues),
             apps: section(&table, "apps", &mut issues),
             introspect: section(&table, "introspect", &mut issues),
+            persistence: section(&table, "persistence", &mut issues),
             integrations: section(&table, "integrations", &mut issues),
             standing: section(&table, "standing", &mut issues),
             drafts: section(&table, "drafts", &mut issues),

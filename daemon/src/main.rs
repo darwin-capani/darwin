@@ -153,6 +153,11 @@ mod notebook;
 // optimize_task calls optimize::run_optimizer (propose-only, never mutates the
 // live config). Exercised in full by optimize.rs's own hermetic tests.
 mod optimize;
+// Persistence Sentinel ("Autoruns for the Mac", persistence.rs): a READ-ONLY
+// inventory of the host's autostart/persistence surfaces + per-binary
+// signing/notarization + Gatekeeper, with a pure baseline diff. It reports; it
+// never remediates.
+mod persistence;
 mod playback;
 mod plugin_sdk;
 mod policy;
@@ -533,6 +538,18 @@ fn open_tcc_baseline(path: &Path, key: Option<&crypto::SecretKey>) -> Result<tcc
     match key {
         Some(k) => tcc::TccBaseline::open_encrypted(path, k),
         None => tcc::TccBaseline::open(path),
+    }
+}
+
+/// Open the Persistence-sentinel baseline store honoring the resolved encryption
+/// state (same plaintext/SQLCipher seam as the TCC baseline).
+fn open_persistence_baseline(
+    path: &Path,
+    key: Option<&crypto::SecretKey>,
+) -> Result<persistence::PersistenceBaseline> {
+    match key {
+        Some(k) => persistence::PersistenceBaseline::open_encrypted(path, k),
+        None => persistence::PersistenceBaseline::open(path),
     }
 }
 
@@ -1745,6 +1762,16 @@ async fn main() -> Result<()> {
         &state_dir.join("tcc_baseline.db"),
         master_key.as_ref(),
     )?);
+    // The Persistence sentinel's durable baseline (same plaintext/encrypted seam).
+    // Opened only when the sentinel is armed (built inside its spawn gate below).
+    let persistence_baseline = if cfg.persistence.enabled {
+        Some(Arc::new(open_persistence_baseline(
+            &state_dir.join("persistence_baseline.db"),
+            master_key.as_ref(),
+        )?))
+    } else {
+        None
+    };
 
     // The EVAL scorecard's live, in-memory rolling state (eval.rs): bounded
     // windows of MEASURED per-turn latencies + cloud token usage. Held for the
@@ -2122,6 +2149,25 @@ async fn main() -> Result<()> {
     // and tcc.anomaly (new grant / denied->allowed escalation) for the HUD. It
     // never mutates TCC; only its own baseline store is written.
     tokio::spawn(tcc::sentinel_task(tcc_baseline));
+    // Ambient PERSISTENCE sentinel ("Autoruns for the Mac"): a slow, READ-ONLY
+    // scan of the host's autostart/persistence surfaces (LaunchAgents /
+    // LaunchDaemons / login items / cron / third-party kexts) + each backing
+    // binary's signing/notarization (codesign/spctl ASSESSMENT reads, never
+    // executions) + the Gatekeeper switch. It seeds a baseline on first run, then
+    // emits security.persistence (counts + any new/removed/unsigned anomalies) and
+    // folds a summary into the posture readout. DARWIN's own two launch items are
+    // labeled self, never alarmed on. It never mutates any OS surface; only its own
+    // baseline store is written. Ships ON ([persistence].enabled); with it false
+    // the loop is not spawned.
+    if let Some(persistence_baseline) = persistence_baseline {
+        tokio::spawn(persistence::sentinel_task(
+            persistence_baseline,
+            cfg.persistence.startup_delay_secs,
+            cfg.persistence.interval_secs,
+            cfg.persistence.assess_signing,
+            cfg.persistence.max_assess,
+        ));
+    }
     // Ambient micro-app introspection: a slow, READ-ONLY sentinel over darwind's
     // OWN sandboxed children — SBPL profile-drift (fingerprint vs on-disk) and
     // per-app RSS/CPU anomaly classification via sysinfo (same-UID, no

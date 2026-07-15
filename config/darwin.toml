@@ -233,6 +233,35 @@ startup_delay_secs = 30     # wait after boot before the first tick (let apps se
 cpu_alert_percent  = 95.0   # sustained CPU% above which an app is flagged
 rss_growth_ratio   = 3.0    # RSS growth multiple over baseline that counts as a runaway
 
+[persistence]
+# Persistence Sentinel — "Autoruns for the Mac" (persistence.rs). A slow,
+# READ-ONLY inventory of the host's autostart / persistence surfaces, each read
+# via a FIXED-ARG bounded subprocess (never a shell string), so the parsers are
+# CI-tested on canned output:
+#   * ~/Library/LaunchAgents, /Library/LaunchAgents, /Library/LaunchDaemons
+#     plist listings (Label / Program / RunAtLoad / ProgramArguments)
+#   * user-domain `launchctl list` (third-party jobs; com.apple.* filtered)
+#   * `crontab -l`
+#   * login items via System Events (Automation-TCC gated -> honest SKIP without
+#     the grant, NEVER a fabricated empty list)
+#   * loaded third-party kexts (`kmutil showloaded`; com.apple.* filtered)
+#   * Gatekeeper status (`spctl --status`)
+#   * per-autostart-binary signing/notarization (`codesign -dv`, `spctl --assess`
+#     — ASSESSMENT reads only, never executions)
+# It keeps a baseline and reports DELTAS (a NEW / REMOVED / newly-UNSIGNED
+# autostart item) via the `security.persistence` telemetry frame + a summary in
+# the posture readout. DARWIN's own two launch items (com.darwin.daemon /
+# com.darwin.inference) are LABELED as self and are NEVER alarmed on. STRICTLY
+# READ-ONLY: no writes to user data, no kills, no unloads, no remediation.
+# SHIPS ON (full-power default); with it false the sentinel loop is not spawned.
+enabled = true
+# Sentinel cadence (defaults shown; absent = these values).
+interval_secs      = 300    # seconds between scans (the autostart surface moves slowly)
+startup_delay_secs = 45     # wait after boot before the first scan
+# Signing assessment (codesign/spctl per backing binary — ASSESSMENT reads only).
+assess_signing     = true   # run the per-binary signing/notarization reads
+max_assess         = 64     # cap on binaries assessed per scan (bounds the work)
+
 [integrations]
 # Shared substrate for the Chart-2 integrations (GitHub, Slack, Google
 # Drive/Calendar). allow_consequential is THE master gate for outward/
