@@ -9174,19 +9174,29 @@ async fn code_propose_diff_tool(request: &str) -> String {
              root to let me propose changes. While it is off I propose nothing and touch no code."
                 .to_string()
         }
-        crate::code::CodeOutcome::Proposed { dir, apply_cmd, hits, .. } => {
+        crate::code::CodeOutcome::Proposed { dir, apply_cmd, hits, diff } => {
             let ts = proposal_ts(&dir);
             telemetry::emit(
                 "system",
                 "code.proposed",
                 json!({"ts": ts, "grounded_hits": hits.len()}),
             );
-            format!(
+            let mut reply = format!(
                 "I drafted a reviewable change and wrote it to the proposal store — I have NOT \
                  touched your code. Review the diff, then run `{apply_cmd}` to apply it (it \
                  re-validates the diff and writes only under your allowlisted codebase root). \
                  Nothing is applied until you run that."
-            )
+            );
+            // SCRATCH REALM: if [realm] is armed (and a [code].roots repo + [shell]
+            // sandbox are available), VERIFY the proposal in a disposable, network-
+            // denied COW copy — build/test it there, attach the REAL verdict to the
+            // proposal card, and fold an honest line into the reply. Never touches the
+            // user's real tree; honest UNVERIFIED (never a faked pass) if it can't run.
+            if let Some(verdict) = verify_proposal_in_realm(&dir, &diff, ts).await {
+                reply.push(' ');
+                reply.push_str(&crate::realm::verdict_reply_line(&verdict));
+            }
+            reply
         }
         crate::code::CodeOutcome::NoDiff { reason } => {
             telemetry::emit("system", "code.rejected", json!({"reason": reason}));
@@ -9218,6 +9228,71 @@ fn load_shell_config() -> crate::config::ShellConfig {
     };
     let (cfg, _issues) = crate::config::Config::load(&root.join("config").join("darwin.toml"));
     cfg.shell
+}
+
+// -- SCRATCH REALMS (crate::realm) -----------------------------------------------
+
+/// Load the live [realm] config from the on-disk darwin.toml (one source of truth,
+/// like load_shell_config). When no root is resolved, returns the default.
+fn load_realm_config() -> crate::config::RealmConfig {
+    let Some(root) = ROOT.get() else {
+        return crate::config::RealmConfig::default();
+    };
+    let (cfg, _issues) = crate::config::Config::load(&root.join("config").join("darwin.toml"));
+    cfg.realm
+}
+
+/// VERIFY a just-written proposal in a Scratch Realm and attach the verdict to the
+/// proposal card. Returns `Some(verdict)` when the Realm ran (or honestly reported
+/// UNVERIFIED); `None` when the feature is inert (armed-off, no [code].roots repo,
+/// or the [shell] sandbox off / lockdown) so the caller simply omits a verdict line.
+///
+/// It NEVER touches the user's real tree: the device-gated runner COW-copies the
+/// allowlisted repo into a confined, network-denied `state/realms/<ts>/`, applies
+/// the diff THERE, and builds/tests it under the sandboxed-exec seam. The verdict is
+/// written as `realm_verdict.md` alongside the proposal and emitted (secret-free) as
+/// a `realm.verdict` telemetry frame.
+async fn verify_proposal_in_realm(
+    dir: &std::path::Path,
+    diff: &str,
+    ts: u64,
+) -> Option<crate::realm::RealmVerdict> {
+    let realm_cfg = load_realm_config();
+    let code_cfg = load_code_config();
+    let shell_cfg = load_shell_config();
+    // LOCKDOWN overlay: when locked, force the feature off (mirrors code/shell).
+    let locked = crate::lockdown::is_locked_down();
+    let enabled = realm_cfg.enabled && !locked;
+    let shell_enabled = shell_cfg.enabled && !locked;
+    if !crate::realm::realm_permitted(enabled, &code_cfg.roots, shell_enabled) {
+        telemetry::emit("system", "realm.blocked", json!({"reason": "inert", "ts": ts}));
+        return None;
+    }
+    // The repo to COW-copy is the first allowlisted [code].roots root (canonicalized
+    // so the copy + the SBPL confinement resolve to the same tree).
+    let code_root = std::path::PathBuf::from(&code_cfg.roots[0]);
+    let code_root = std::fs::canonicalize(&code_root).unwrap_or(code_root);
+    let runner = crate::realm::SandboxedRealmRunner {
+        home: dirs_home(),
+        daemon_state: daemon_state_dir(),
+    };
+    let verdict = crate::realm::verify_proposal(
+        &runner,
+        &daemon_state_dir(),
+        &code_root,
+        ts,
+        diff,
+        &realm_cfg.verify_command,
+    )
+    .await;
+    // Attach the verdict to the proposal card (an artifact under the proposal store)
+    // + emit the secret-free telemetry frame.
+    let annotation = crate::realm::verdict_annotation(&verdict);
+    if let Err(e) = std::fs::write(dir.join("realm_verdict.md"), &annotation) {
+        warn!(error = %e, "realm: could not write the verdict artifact to the proposal card");
+    }
+    telemetry::emit("system", "realm.verdict", crate::realm::verdict_telemetry(ts, &verdict));
+    Some(verdict)
 }
 
 // -- GATED UI AUTOMATION / ACTUATION (crate::ui_automation, #44) -----------------
