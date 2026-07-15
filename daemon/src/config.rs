@@ -58,6 +58,15 @@ pub struct Config {
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
     pub optimize: OptimizeConfig,
+    /// [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
+    /// `enabled` SHIPS ON (full-power default): it is READ-ONLY aggregate analytics
+    /// (a reliability curve + ECE gap over the recent confidence/outcome window),
+    /// emitting the secret-free `calibrate.report` telemetry — the same always-on,
+    /// no-autonomy posture as [episodic] / the eval scorecard. `influence_routing`
+    /// SHIPS OFF: it gates the REDUCE-ONLY clarify-band hook, which can only ever
+    /// make DARWIN ask MORE clarifying questions in a measurably-overconfident bucket,
+    /// never act more boldly — off by default so the first landing is pure analytics.
+    pub calibrate: CalibrateConfig,
     pub voice_id: VoiceIdConfig,
     pub episodic: EpisodicConfig,
     pub notebooks: NotebookConfig,
@@ -317,6 +326,17 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // phase ALWAYS proposes (mode KEEPS "propose") — there is no auto-apply-to-live
     // path, exactly like self-heal's mode.
     ("optimize", &["enabled", "mode"]),
+    // [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
+    // `enabled` SHIPS ON (read-only aggregate analytics: a reliability curve + ECE
+    // gap over the recent confidence/outcome window, emitted as secret-free
+    // `calibrate.report`). `influence_routing` SHIPS OFF and gates the REDUCE-ONLY
+    // clarify-band hook (it can only ever make DARWIN ask MORE, never act bolder).
+    // The remaining keys tune the curve resolution + the sample-size honesty floor +
+    // the overconfidence dead-band + the widen cap; listed so none reads as a typo.
+    (
+        "calibrate",
+        &["enabled", "influence_routing", "n_bins", "min_sample", "overconfidence_margin", "max_widen"],
+    ),
     // [voice_id] — on-device speaker verification (voiceid.rs). `enabled` is the
     // master switch and SHIPS OFF (deliberate: voice-id is a fail-closed GATE, not a
     // feature; enrollment is always explicit). With it false (or with no enrolled
@@ -1453,6 +1473,66 @@ impl Default for OptimizeConfig {
             // review+apply, adopted only if it beats baseline on held-out traces.
             // There is no auto-apply-to-live path; NEVER ship "auto" as the default.
             mode: "propose".to_string(),
+        }
+    }
+}
+
+/// [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
+/// A READ-ONLY fold over the recent (confidence, outcome) window into a reliability
+/// curve + a scalar over/under-confidence gap (ECE-style), with a MIN_SAMPLE floor
+/// so a thin bucket is reported "insufficient data" rather than judged. It emits the
+/// aggregate, secret-free `calibrate.report` telemetry and changes NOTHING on its
+/// own.
+///
+///   - `enabled` (SHIPS ON, full-power default): master gate for the report pass.
+///     Analytics only — no PII (a sample is a float + an outcome enum), no autonomy.
+///     Off => no report is emitted (the pure math is unaffected).
+///   - `influence_routing` (SHIPS OFF): gates the REDUCE-ONLY clarify-band hook
+///     ([`crate::calibrate::adjusted_clarify_threshold`]). When on, the router MAY
+///     RAISE its clarify/low-confidence threshold in a bucket PLUMBLINE measured as
+///     overconfident — asking MORE clarifying questions there. The hook is
+///     mathematically incapable of LOWERING the threshold, so it can only ever make
+///     DARWIN more cautious, never bolder. Off by default: routing is byte-for-byte
+///     today's and PLUMBLINE is pure analytics.
+///   - `n_bins` (deciles): reliability resolution. `min_sample`: the per-bucket
+///     honesty floor. `overconfidence_margin`: how far actual must lag the claim
+///     before a bucket counts as overconfident (dead-band against noise).
+///     `max_widen`: the cap on how far the reduce-only hook may raise the threshold.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CalibrateConfig {
+    pub enabled: bool,
+    pub influence_routing: bool,
+    pub n_bins: usize,
+    pub min_sample: usize,
+    pub overconfidence_margin: f64,
+    pub max_widen: f64,
+}
+
+impl Default for CalibrateConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS ON — READ-ONLY aggregate analytics (a reliability curve + ECE
+            // gap over the recent confidence/outcome window), the same always-on,
+            // no-autonomy posture as the eval scorecard / [episodic].
+            enabled: true,
+            // SHIPS OFF — the reduce-only clarify-band hook is inert by default so
+            // the first landing is pure analytics and routing is unchanged. Even
+            // when on, it can ONLY widen the clarify band (ask more), never narrow
+            // it (act bolder).
+            influence_routing: false,
+            // Deciles — fine enough to see a miscalibration bend, coarse enough that
+            // a bucket can reach the floor on a real corpus.
+            n_bins: crate::calibrate::DEFAULT_BINS,
+            // Per-bucket honesty floor: below this many graded turns a bucket is
+            // "insufficient data" and excluded from the ECE / gap.
+            min_sample: crate::calibrate::DEFAULT_MIN_SAMPLE,
+            // A bucket is only "overconfident" if actual success lags the claim by
+            // MORE than this — a dead-band so ordinary sampling noise never widens.
+            overconfidence_margin: 0.1,
+            // Cap on the reduce-only widen (the hook never raises the threshold by
+            // more than this, and the result is always capped at 1.0).
+            max_widen: 0.15,
         }
     }
 }
@@ -3014,6 +3094,7 @@ impl Config {
             mcp: section(&table, "mcp", &mut issues),
             skills: section(&table, "skills", &mut issues),
             optimize: section(&table, "optimize", &mut issues),
+            calibrate: section(&table, "calibrate", &mut issues),
             voice_id: section(&table, "voice_id", &mut issues),
             episodic: section(&table, "episodic", &mut issues),
             notebooks: section(&table, "notebooks", &mut issues),

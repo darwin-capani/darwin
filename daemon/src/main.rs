@@ -16,6 +16,11 @@ mod attribution;
 mod audio;
 mod audit;
 mod brief;
+// PLUMBLINE (calibrate.rs): the confidence-calibration self-report — a PURE fold of
+// the recent (confidence, outcome) window into a reliability curve + an ECE gap,
+// emitting the secret-free calibrate.report telemetry. Fully tested in calibrate.rs;
+// the reduce-only clarify-band hook it exposes ships OFF ([calibrate].influence_routing).
+mod calibrate;
 mod capability;
 mod cartographer;
 // DATA -> CHART (#41): a daemon ChartSpec {kind, series:[{label, points:[(x,y)]}],
@@ -2079,6 +2084,12 @@ async fn main() -> Result<()> {
         trace_store.clone(),
         eval_state.clone(),
     ));
+    // PLUMBLINE report pass (calibrate.rs): folds the live (confidence, outcome)
+    // window into a reliability curve + an ECE over/under-confidence gap and emits
+    // the secret-free `calibrate.report` telemetry. READ-ONLY analytics — it never
+    // touches routing (the reduce-only clarify-band hook is a separate, config-gated
+    // read the router performs, OFF by default); inert when [calibrate].enabled is off.
+    tokio::spawn(calibrate::calibrate_report_task(cfg.clone()));
     // Periodic AUDIT snapshot pass: reads the installed global audit log and emits
     // the secret-free `audit.snapshot` telemetry for the HUD AuditPanel timeline.
     // READ-ONLY accountability — it never records/prunes/mutates the log (the gate
@@ -3087,6 +3098,12 @@ async fn run_pipeline(
                             ),
                             Err(e) => warn!(error = %e, "optimize: failed to label prior trace corrected"),
                         }
+                        // PLUMBLINE: mirror the correction into the calibration
+                        // window so the prior turn's confidence is scored against
+                        // its true (corrected) outcome, not the provisional Success.
+                        if cfg.calibrate.enabled {
+                            calibrate::relabel(prior.trace_id, optimize::Outcome::CorrectedNextTurn);
+                        }
                     }
                 }
                 // Record this turn (default outcome Success; a future turn may
@@ -3117,6 +3134,14 @@ async fn run_pipeline(
                 .await
                 {
                     Ok(Some(id)) => {
+                        // PLUMBLINE: pair THIS turn's classifier confidence with its
+                        // trace id in the calibration window (provisional Success; a
+                        // next-turn correction re-labels it above). Same posture as
+                        // the optimizer trace: recorded only while enabled, and the
+                        // sample is secret-free (a float + an outcome).
+                        if cfg.calibrate.enabled {
+                            calibrate::record(id, class.confidence);
+                        }
                         *prior_turn = Some(optimize::PriorTurn {
                             trace_id: id,
                             intent: class.intent.clone(),
