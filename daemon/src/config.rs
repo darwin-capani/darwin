@@ -58,6 +58,21 @@ pub struct Config {
     /// the relevant Settings pane stays behind the standard per-action confirm gate.
     /// With it false the auditor loop is not spawned.
     pub exposure: ExposureConfig,
+    /// [interception] — TRAFFIC-INTERCEPTION INTEGRITY CHECK (interception.rs), a
+    /// defensive "is anything MITMing me?" check. `enabled` SHIPS ON (full-power
+    /// default). READ-ONLY DEFENSE: a slow check that reads THIS machine's OWN local
+    /// config via FIXED-ARG bounded subprocesses (it sends no packets and never
+    /// touches another host) — a system/PAC proxy (`scutil --proxy`), non-default
+    /// `/etc/hosts` entries, non-Apple trusted ROOT CAs (`security
+    /// dump-trust-settings -d` + the System keychain), the DNS resolvers (`scutil
+    /// --dns`), and installed configuration/MDM profiles (`profiles show`). It
+    /// explains each finding in plain speech (a rogue trusted root — which silently
+    /// breaks ALL TLS — is surfaced loudly), emits `security.interception`, and
+    /// folds a summary into the posture readout. It takes NO action — removing a
+    /// proxy or a root CA is the user's own action in System Settings / Keychain
+    /// Access. Honest SKIP when a read needs a privilege the no-sudo daemon lacks.
+    /// With it false the check loop is not spawned.
+    pub interception: InterceptionConfig,
     pub integrations: IntegrationsConfig,
     pub standing: StandingConfig,
     /// [drafts] — AUTO-DRAFT (#25, drafts.rs). `enabled` SHIPS ON (full-power
@@ -345,6 +360,13 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // packets sent). SHIPS ON. It reports (security.exposure + a posture summary);
     // the only remediation is the gated open_settings_pane actuator.
     ("exposure", &["enabled", "interval_secs", "startup_delay_secs"]),
+    // [interception] — the TRAFFIC-INTERCEPTION INTEGRITY CHECK (interception.rs),
+    // a READ-ONLY "is anything MITMing me?" read of THIS machine's OWN local config
+    // (scutil --proxy / --dns, /etc/hosts, security dump-trust-settings -d + the
+    // System keychain, profiles show). No packets sent. SHIPS ON. It reports
+    // (security.interception + a posture summary) and closes nothing; honest SKIP
+    // when a read needs a privilege the no-sudo daemon lacks.
+    ("interception", &["enabled", "interval_secs", "startup_delay_secs"]),
     // [integrations] — `allow_consequential` is THE master gate for outward/
     // side-effecting actions. SHIPS ON (full-power default) — INERT-SAFE: a
     // CONFIRMED consequential action still clears confirm + voice-id + policy +
@@ -2749,6 +2771,34 @@ impl Default for ExposureConfig {
     }
 }
 
+/// [interception] — the TRAFFIC-INTERCEPTION INTEGRITY CHECK (interception.rs): a
+/// READ-ONLY "is anything MITMing me?" read of THIS machine's OWN local config — a
+/// system/PAC proxy, non-default `/etc/hosts` entries, non-Apple trusted ROOT CAs,
+/// the DNS resolvers, and installed configuration/MDM profiles. It sends no packets
+/// and never touches another host. It only observes and reports (plain-speech
+/// findings + secret-free counts); it closes/removes nothing. Honest SKIP when a
+/// read needs a privilege the no-sudo daemon lacks.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct InterceptionConfig {
+    /// Master switch for the check loop. SHIPS ON (read-only observability).
+    pub enabled: bool,
+    /// Seconds between checks (local interception config moves on the order of
+    /// installs, not seconds).
+    pub interval_secs: u64,
+    /// Seconds to wait after boot before the first check (let the box settle).
+    pub startup_delay_secs: u64,
+}
+
+impl Default for InterceptionConfig {
+    fn default() -> Self {
+        // On by default — it only reads local config and reports. The cadence
+        // matches the other defensive sentinels (a slow scan); the startup delay is
+        // a touch later so the sentinels don't all fire at once.
+        Self { enabled: true, interval_secs: 300, startup_delay_secs: 50 }
+    }
+}
+
 /// [integrations] — the shared Chart-2 integration substrate (integrations.rs).
 /// `allow_consequential` is THE master gate for outward/side-effecting actions
 /// (post a message, create an event). It SHIPS ON (true) — the headline of the
@@ -3492,6 +3542,7 @@ impl Config {
             introspect: section(&table, "introspect", &mut issues),
             persistence: section(&table, "persistence", &mut issues),
             exposure: section(&table, "exposure", &mut issues),
+            interception: section(&table, "interception", &mut issues),
             integrations: section(&table, "integrations", &mut issues),
             standing: section(&table, "standing", &mut issues),
             drafts: section(&table, "drafts", &mut issues),
@@ -5254,6 +5305,37 @@ mod tests {
         assert!(
             issues.iter().any(|i| i.contains("introspect.interval_sec")),
             "a typo'd [introspect] key must be reported: {issues:?}"
+        );
+    }
+
+    /// Contract lockstep: [interception] ships enabled=TRUE (full-power default) —
+    /// the READ-ONLY "is anything MITMing me?" check is armed. Keys parse cleanly; a
+    /// typo is diagnosed; an absent section keeps the shipped defaults.
+    #[test]
+    fn interception_full_section_parses_and_a_typo_is_caught() {
+        let raw = r#"
+            [interception]
+            enabled = false
+            interval_secs = 120
+            startup_delay_secs = 5
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        assert!(issues.is_empty(), "clean [interception] must parse: {issues:?}");
+        assert!(!cfg.interception.enabled, "the operator can turn the check off");
+        assert_eq!(cfg.interception.interval_secs, 120);
+        assert_eq!(cfg.interception.startup_delay_secs, 5);
+
+        // An absent section keeps the shipped ON defaults (read-only observability).
+        let (def, _) = Config::parse("");
+        assert!(def.interception.enabled, "traffic-interception check SHIPS ON (full-power default)");
+        assert_eq!(def.interception.interval_secs, 300);
+        assert_eq!(def.interception.startup_delay_secs, 50);
+
+        // A typo'd key is reported, not silently swallowed.
+        let (_c, issues) = Config::parse("[interception]\ninterval_sec = 30\n");
+        assert!(
+            issues.iter().any(|i| i.contains("interception.interval_sec")),
+            "a typo'd [interception] key must be reported: {issues:?}"
         );
     }
 

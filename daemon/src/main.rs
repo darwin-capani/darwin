@@ -97,6 +97,15 @@ mod genproxy;
 mod heal;
 mod inference;
 mod integrations;
+// TRAFFIC-INTERCEPTION INTEGRITY CHECK (interception.rs): a DEFENSIVE, READ-ONLY
+// "is anything MITMing me?" check over THIS machine's OWN local config — a
+// configured proxy/PAC (scutil --proxy), non-default /etc/hosts entries,
+// non-Apple trusted ROOT CAs (security dump-trust-settings -d + the System
+// keychain), the DNS resolvers (scutil --dns), and installed configuration/MDM
+// profiles. It sends no packets and touches no other host; it emits
+// security.interception and folds a summary into the posture readout. Honest SKIP
+// when a read needs a privilege the no-sudo daemon lacks; it observes, never acts.
+mod interception;
 // CONTINUOUS LIVE INTERPRETATION (#30): the PURE per-segment interpret pipeline
 // (interpret_segment: transcript -> on-device-LLM translate -> rendered translation +
 // optional speak request) using an injectable translator; offline/unavailable degrades
@@ -2200,6 +2209,23 @@ async fn main() -> Result<()> {
         tokio::spawn(exposure::sentinel_task(
             cfg.exposure.startup_delay_secs,
             cfg.exposure.interval_secs,
+        ));
+    }
+    // Ambient TRAFFIC-INTERCEPTION INTEGRITY CHECK ("is anything MITMing me?"): a
+    // slow, READ-ONLY read of THIS machine's OWN local config — a system/PAC proxy
+    // (scutil --proxy), non-default /etc/hosts entries, non-Apple trusted ROOT CAs
+    // (security dump-trust-settings -d + the System keychain), the DNS resolvers
+    // (scutil --dns), and installed configuration/MDM profiles (profiles show). It
+    // sends no packets and never touches another host. It classifies each finding
+    // in plain speech (a rogue trusted root — which silently breaks ALL TLS — is
+    // surfaced loudly), emits `security.interception`, and folds a summary into the
+    // posture readout. Honest SKIP when a read needs a privilege the no-sudo daemon
+    // lacks (the admin trust-settings / system-domain profiles). It closes nothing.
+    // Ships ON ([interception].enabled); with it false the loop is not spawned.
+    if cfg.interception.enabled {
+        tokio::spawn(interception::sentinel_task(
+            cfg.interception.startup_delay_secs,
+            cfg.interception.interval_secs,
         ));
     }
     // Ambient micro-app introspection: a slow, READ-ONLY sentinel over darwind's

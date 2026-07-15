@@ -178,6 +178,16 @@ where
         lines.push(line);
     }
 
+    // Traffic-Interception Integrity Check (interception.rs): a secret-free,
+    // read-only "is anything MITMing me?" summary of THIS machine's OWN local
+    // config — a system/PAC proxy, non-default hosts entries, non-Apple trusted
+    // root CAs, on-box DNS resolvers, installed profiles. None until the check has
+    // run — then this line joins the posture the same way the others do. It reports
+    // (and sends no packets); it removes no proxy or root CA itself.
+    if let Some(line) = crate::interception::posture_line() {
+        lines.push(line);
+    }
+
     format!(
         "Security posture (read-only — I report it; turning anything on is yours to do in System Settings): {}",
         lines.join("; ")
