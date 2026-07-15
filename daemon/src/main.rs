@@ -189,6 +189,12 @@ mod notebook;
 // optimize_task calls optimize::run_optimizer (propose-only, never mutates the
 // live config). Exercised in full by optimize.rs's own hermetic tests.
 mod optimize;
+// Semantic Pasteboard (pasteboard.rs): an OPT-IN (ships OFF) poller of the macOS
+// clipboard that PII-redacts each new clip and stores it in a bounded, transient
+// in-RAM ring, plus a read-only recall-by-meaning surface (via recall.rs) and a
+// confirm-gated pasteboard_put. With [pasteboard].enabled=false nothing is polled
+// or stored.
+mod pasteboard;
 // Persistence Sentinel ("Autoruns for the Mac", persistence.rs): a READ-ONLY
 // inventory of the host's autostart/persistence surfaces + per-binary
 // signing/notarization + Gatekeeper, with a pure baseline diff. It reports; it
@@ -1842,6 +1848,24 @@ async fn main() -> Result<()> {
         // on-screen content).
         lumen::status_frame(cfg.lumen.narrate),
     );
+    // SEMANTIC PASTEBOARD (pasteboard.rs): install the [pasteboard] settings ONCE
+    // so the recall op + the poll loop read one process-global gate. SHIPS OFF
+    // (enabled=false) — with it off nothing is polled or stored and the poll loop
+    // below is never spawned. Only the bool + bounds are installed (no clip text).
+    pasteboard::install_settings(
+        cfg.pasteboard.enabled,
+        cfg.pasteboard.effective_retention(),
+        cfg.pasteboard.effective_poll_interval_secs(),
+    );
+    telemetry::emit(
+        "system",
+        "pasteboard.configured",
+        serde_json::json!({
+            "enabled": cfg.pasteboard.enabled,
+            "retention": cfg.pasteboard.effective_retention(),
+            "poll_interval_secs": cfg.pasteboard.effective_poll_interval_secs(),
+        }),
+    );
     // FURY's mission engine plans + dispatches with the heavy cloud model; wire
     // it from config ONCE so the fury_mission tool arm reads one process-global
     // (mirrors init_persona — no model threading through execute_tool).
@@ -2675,6 +2699,22 @@ async fn main() -> Result<()> {
                 );
             }
         }
+    }
+
+    // SEMANTIC PASTEBOARD (pasteboard.rs): if [pasteboard].enabled, spawn the
+    // OPT-IN clipboard poll loop. STRICTLY GATED — this block is skipped entirely
+    // when enabled=false (the shipped default), so nothing is ever polled or
+    // stored. The loop reads the pasteboard (device-gated), PII-redacts each new
+    // clip, stores it in the bounded in-RAM ring, and emits pasteboard.status.
+    if cfg.pasteboard.enabled {
+        let interval = cfg.pasteboard.effective_poll_interval_secs();
+        tokio::spawn(pasteboard::poll_loop(interval));
+        info!(poll_interval_secs = interval, "started semantic-pasteboard poll loop");
+        telemetry::emit(
+            "system",
+            "pasteboard.loop_started",
+            json!({"poll_interval_secs": interval}),
+        );
     }
 
     // One utterance at a time, driven to completion (audit fix: see the

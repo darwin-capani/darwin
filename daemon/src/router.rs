@@ -497,6 +497,68 @@ pub async fn route(
         });
     }
 
+    // SEMANTIC PASTEBOARD VOICE COMMANDS (pasteboard.rs): "what did I copy about
+    // the lease" / "recall my clipboard" (RECALL) and "forget my clipboard"
+    // (FORGET). CONSERVATIVELY anchored (classify_pasteboard_intent requires an
+    // explicit clipboard/"copied" reference plus a recall/forget cue, so an
+    // ordinary sentence — and crucially an imperative "copy X to my clipboard"
+    // (which is the confirm-gated pasteboard_put tool, NOT a recall) — never reaches
+    // here). Handled BEFORE normal routing so a pasteboard utterance never falls
+    // through to the model. READ-ONLY: RECALL ranks the BOUNDED, PII-REDACTED clip
+    // ring by MEANING via the recall.rs path (an off / empty ring is an HONEST
+    // "nothing copied yet", never fabricated); FORGET wipes the ring. SHIPS OFF
+    // ([pasteboard].enabled=false) — with it off nothing was ever captured, so
+    // recall/forget honestly report an empty history. Runs after the owner voice-id
+    // all-scope gate, so an unrecognized bystander cannot recall or wipe the owner's
+    // clipboard history.
+    if let Some(intent) = crate::pasteboard::classify_pasteboard_intent(text) {
+        let prime = agents.orchestrator();
+        emit_agent_active(prime);
+        let (verb, response) = if !cfg.pasteboard.enabled {
+            // OFF (the shipped default): nothing was ever captured. Honest, not a
+            // fabricated recall — and never a claim the feature is running.
+            (
+                "off",
+                "The semantic pasteboard is off, sir — I'm not capturing your clipboard. \
+                 Enable [pasteboard] and I'll start remembering what you copy, on-device."
+                    .to_string(),
+            )
+        } else {
+            match intent {
+                crate::pasteboard::PasteboardIntent::Recall { subject } => {
+                    // Rank the redacted clip ring by meaning; a named subject
+                    // narrows the query, a bare recall ranks against the whole
+                    // utterance. Honest-empty on an off / un-fed ring.
+                    let query = subject.as_deref().unwrap_or(text);
+                    ("recall", crate::pasteboard::global_render_recall(query, 10))
+                }
+                crate::pasteboard::PasteboardIntent::Forget => {
+                    let cleared = crate::pasteboard::global_clear();
+                    let ack = if cleared {
+                        "Done, sir — I've wiped your clipboard history.".to_string()
+                    } else {
+                        "There was no clipboard history to forget, sir.".to_string()
+                    };
+                    ("forget", ack)
+                }
+            }
+        };
+        // SECRET-FREE telemetry: the verb + the gate only — never the recalled
+        // (already-redacted) clip text.
+        telemetry::emit(
+            "system",
+            "pasteboard.command",
+            json!({ "verb": verb, "enabled": cfg.pasteboard.enabled }),
+        );
+        return Ok(RouteOutcome {
+            routed_to: "local",
+            response,
+            agent: prime.name.clone(),
+            namespace: prime.namespace.clone(),
+            spoken: None,
+        });
+    }
+
     // RESEARCH NOTEBOOK VOICE COMMAND (#19): "save this research" / "show my
     // research notebook on X" / "what have I researched" / "forget my research on
     // X". CONSERVATIVELY anchored (classify_notebook_intent requires an explicit

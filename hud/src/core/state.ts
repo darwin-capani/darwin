@@ -49,6 +49,7 @@ import {
   TccSentinel,
   IntrospectStatus,
   IntrospectCapability,
+  PasteboardStatus,
   PostureSnapshot,
   AttributionHealth,
   McpStatus,
@@ -167,6 +168,7 @@ import {
   parseTccAnomalies,
   TCC_ANOMALY_CAP,
   parseIntrospectSnapshot,
+  parsePasteboardStatus,
   introspectDriftLine,
   introspectAnomalyLine,
   introspectModuleViolationLine,
@@ -688,6 +690,10 @@ export interface HudState {
   /** Per-app DECLARED capability inventory (introspect.capabilities): the static
    *  "what can each app do" audit from manifests. Secret-free. REVIEW-ONLY. */
   introspectCapabilities: IntrospectCapability[];
+  /** The semantic-pasteboard status (pasteboard.status): the enabled gate, the
+   *  clip count + cap + poll cadence, and up to a few ALREADY-redacted, truncated
+   *  clip previews. Null until the first status frame. SHIPS OFF (opt-in). */
+  pasteboard: PasteboardStatus | null;
   /** The machine security posture (posture.snapshot, 30-min cadence): FileVault /
    *  firewall / SIP / pending-updates verdicts from the read-only status
    *  commands. Null until the first frame. REVIEW-ONLY — the daemon reports;
@@ -1393,6 +1399,7 @@ export function initialState(): HudState {
     introspect: null,
     introspectAlerts: [],
     introspectCapabilities: [],
+    pasteboard: null,
     posture: null,
     attributionHealth: null,
     security: null,
@@ -2445,6 +2452,15 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // Ambient sandboxed-child sentinel tally (secret-free counts). Never null —
       // a malformed payload yields an honest all-zero snapshot. REVIEW-ONLY.
       return { ...s, introspect: parseIntrospectSnapshot(env.data) };
+    }
+
+    case "pasteboard.status": {
+      // Semantic pasteboard (pasteboard.rs): enabled gate + clip count/cap/cadence
+      // + up to a few ALREADY-redacted, truncated clip previews. Never null — a
+      // malformed payload yields an honest OFF/empty snapshot; when off, previews
+      // are dropped so the panel never renders text for a pasteboard that is not
+      // running. SHIPS OFF (opt-in) and REDACTED at the source.
+      return { ...s, pasteboard: parsePasteboardStatus(env.data) };
     }
 
     case "introspect.profile_drift": {

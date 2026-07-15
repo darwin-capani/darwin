@@ -42,6 +42,7 @@ import AmbientMode from "./components/AmbientMode";
 import { isAtRest } from "./core/ambient";
 import TccSentinelPanel from "./components/TccSentinelPanel";
 import IntrospectPanel from "./components/IntrospectPanel";
+import PasteboardPanel from "./components/PasteboardPanel";
 import PostureDashboardPanel from "./components/PostureDashboardPanel";
 import AttributionHealthPanel from "./components/AttributionHealthPanel";
 import AppDeckPanel from "./components/AppDeckPanel";
@@ -664,6 +665,7 @@ export default function App() {
             alerts={state.introspectAlerts}
             capabilities={state.introspectCapabilities}
           />
+          <PasteboardPanel pasteboard={state.pasteboard} />
           <PostureDashboardPanel posture={state.posture} />
           <ConnectorMarketplacePanel mcp={state.mcp} />
           <ExtensibilityPanel webhooks={state.webhooks} plugins={state.plugins} />
