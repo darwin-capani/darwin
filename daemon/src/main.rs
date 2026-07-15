@@ -15,6 +15,7 @@ mod atlas;
 mod attribution;
 mod audio;
 mod audit;
+mod boundary;
 mod brief;
 mod capability;
 mod cartographer;
@@ -1633,6 +1634,15 @@ async fn main() -> Result<()> {
         cfg.answers.cross_check_model_pass,
         cfg.answers.debate,
     );
+    // CUSTOMS // EGRESS gate ([boundary].enabled ships ON as a neutral PREVIEW,
+    // default_trim ships "none" == the identity): wire it ONCE so the cloud path
+    // (complete_with_tools) reads one process-global to decide whether to build +
+    // emit the pre-flight egress manifest and which reduce-only trim to apply —
+    // mirrors init_answers, no Config threading through the cloud call. With
+    // default_trim = "none" the turn sends byte-for-byte what it sends today; the
+    // manifest is a READ-ONLY inventory, and the LOCAL inference path never reaches
+    // it (it egresses nothing).
+    boundary::init(cfg.boundary.enabled, &cfg.boundary.default_trim);
     // MCP CLIENT (docs/SANDBOX.md): connect every configured external tool server
     // ONCE at startup, then install the connected manager as the process-global so
     // the cloud tool loop can offer + route its tools WITHOUT threading a manager
