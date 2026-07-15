@@ -285,6 +285,7 @@ mod triage;
 mod ui_automation;
 mod unified_search;
 mod user_model;
+mod vault;
 mod voiceid;
 // VOICE CLONING (build 2/2): the CONSENT-GATED, authorization-bound capability that
 // uploads an owner-authorized sample to ElevenLabs and stores the returned voice id.
@@ -1842,6 +1843,15 @@ async fn main() -> Result<()> {
     // manifest is a READ-ONLY inventory, and the LOCAL inference path never reaches
     // it (it egresses nothing).
     boundary::init(cfg.boundary.enabled, &cfg.boundary.default_trim);
+    // VAULT MODE ("go dark", vault.rs): install the [vault].enabled config default
+    // ONCE (SHIPS OFF — it changes behavior) so the router reads one process-global
+    // to force LOCAL-ONLY routing, and boundary::gate_and_trim reads it to force
+    // CUSTOMS to the maximal reduce. RESTRICT-ONLY — vault can only remove cloud +
+    // tighten the egress trim, never add either; with it OFF the cloud decision is
+    // byte-for-byte today's. Emit the startup vault.status so a HUD that connects
+    // after boot sees the honest current mode (the frame is retained by telemetry).
+    vault::init(cfg.vault.enabled);
+    telemetry::emit("system", "vault.status", vault::status_frame(vault::active()));
     // MCP CLIENT (docs/SANDBOX.md): connect every configured external tool server
     // ONCE at startup, then install the connected manager as the process-global so
     // the cloud tool loop can offer + route its tools WITHOUT threading a manager

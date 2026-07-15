@@ -63,6 +63,7 @@ import SuggestionsPanel from "./components/SuggestionsPanel";
 import UpdateDialog from "./components/UpdateDialog";
 import BriefFocusPanel from "./components/BriefFocusPanel";
 import CustomsPanel from "./components/CustomsPanel";
+import VaultIndicator from "./components/VaultIndicator";
 import PrecogPanel from "./components/PrecogPanel";
 import BootReveal from "./components/BootReveal";
 import ConduitField from "./components/ConduitField";
@@ -620,6 +621,7 @@ export default function App() {
           />
           <BriefFocusPanel digest={state.proactiveDigest} focus={state.focusProfile} />
           <PrecogPanel plan={state.precogPlan} />
+          <VaultIndicator status={state.vault} />
           <CustomsPanel manifest={state.egressManifest} />
           <PresencePanel presence={state.presence} />
           <VisionPanel

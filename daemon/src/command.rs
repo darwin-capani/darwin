@@ -131,6 +131,11 @@ struct RawCommand {
     /// when the caller pins one; threaded onto the wire only when `Some`.
     #[serde(default)]
     length_ms: Option<u32>,
+    /// `vault`: the desired vault mode — `true` engages ("go dark"), `false` lifts.
+    /// REQUIRED for the `vault` verb (absent => a `BadRequest`, never a silent
+    /// default) so the HUD toggle is always explicit about which way it points.
+    #[serde(default)]
+    on: Option<bool>,
 }
 
 /// The BOUNDED command set — the structural allowlist. Parsing a line into one
@@ -189,6 +194,14 @@ pub enum Command {
     /// the ONLY way to `lockdown::unlock()` (gates return to their configured
     /// values; the marker is removed). NEVER model-routed.
     Unlock,
+    /// TOGGLE VAULT MODE ("go dark", vault.rs) — the HUD's vault switch. A DEDICATED
+    /// verb, NOT `ask` — it NEVER reaches the model/tool loop; the daemon flips the
+    /// process-global vault mode directly (`vault::set`). NOTHING CONSEQUENTIAL: it
+    /// only ever TIGHTENS (forces LOCAL-ONLY routing + the maximal CUSTOMS trim),
+    /// never adds cloud access or takes an outward action. `on` is REQUIRED (`decide`
+    /// rejects an absent flag) so the toggle is always explicit. There is no
+    /// model/agent/tool path to this verb.
+    Vault { on: bool },
     /// PLAY a named, built-in SFX cue (the HUD's SFX-cue Play button). A DEDICATED
     /// benign verb, NOT `ask` — it NEVER reaches the model/tool loop. The cue name
     /// is validated in [`decide`] against the fixed catalog
@@ -335,6 +348,14 @@ fn decide(raw: &str) -> Decision {
         // the model. They still pass the SAME token + rate gate every command does.
         "panic" => Command::Panic,
         "unlock" => Command::Unlock,
+        // VAULT MODE toggle (vault.rs) — the HUD's "go dark" switch. A DEDICATED
+        // verb; the daemon flips the process-global mode directly (never the model).
+        // `on` is REQUIRED: an absent/garbled flag is a BadRequest, never a silent
+        // default, so the toggle can never accidentally engage OR lift.
+        "vault" => match req.on {
+            Some(on) => Command::Vault { on },
+            None => return Decision::BadRequest { reason: "vault requires on:true|false" },
+        },
         // The HUD SFX-cue Play button. A benign verb that plays a NAMED built-in
         // cue. The name is validated TWICE-over: non-empty AND a member of the
         // fixed catalog (`sfx_cue::is_known_cue`). An empty or unknown cue is a
@@ -872,6 +893,17 @@ where
             telemetry::emit("system", "command.routed", json!({"cmd": "unlock"}));
             let reply = dispatcher.unlock().await;
             json!({"ok": true, "reply": reply, "locked": crate::lockdown::is_locked_down()})
+        }
+        Command::Vault { on } => {
+            // The HUD VAULT toggle ("go dark"): flip the process-global vault mode
+            // directly (vault::set) — never the model. NOTHING CONSEQUENTIAL: it only
+            // ever TIGHTENS (LOCAL-ONLY routing + the maximal CUSTOMS trim). Emit the
+            // secret-free vault.status frame so the HUD indicator flips immediately,
+            // and surface the honest spoken ack + the new state in the reply.
+            let now_on = crate::vault::set(on);
+            telemetry::emit("system", "vault.status", crate::vault::status_frame(now_on));
+            telemetry::emit("system", "command.routed", json!({"cmd": "vault", "on": now_on}));
+            json!({"ok": true, "reply": crate::vault::ack(now_on), "active": now_on})
         }
         Command::PlayCue { cue } => {
             // The HUD SFX-cue Play button. The cue name is already a validated

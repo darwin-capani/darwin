@@ -94,6 +94,16 @@ pub async fn route(
 ) -> Result<RouteOutcome> {
     let route_entry = Instant::now();
 
+    // VAULT MODE ("go dark", vault.rs) — SEAM 1 of 2. Fold an active vault into THIS
+    // turn's cloud reachability ONCE, at entry, so EVERY downstream cloud decision
+    // that consults `cloud_reachable` (the conversation brain, the roster answer,
+    // capability routing, agent selection) deterministically sees NO cloud this turn
+    // and stays on the local MLX brain. RESTRICT-ONLY: `vault::deny_cloud` can only
+    // turn a reachable cloud UNREACHABLE, never the reverse, so with the vault OFF
+    // this is byte-for-byte today's `cloud_reachable`. The actuating tool-loop gate
+    // (which does not consult reachability) is closed separately at SEAM 2 below.
+    let cloud_reachable = crate::vault::deny_cloud(cloud_reachable);
+
     // PANIC / LOCKDOWN (task #12) — THE emergency stop, honored BEFORE anything
     // else, even mid-confirmation / mid-anything. Any panic phrase ("panic",
     // "lockdown", "stop everything", "kill switch", "shut it all down") engages
@@ -341,6 +351,33 @@ pub async fn route(
         return Ok(RouteOutcome {
             routed_to: "local",
             response: ack,
+            agent: prime.name.clone(),
+            namespace: prime.namespace.clone(),
+            spoken: None,
+        });
+    }
+
+    // VAULT MODE VOICE COMMAND ("go dark", vault.rs): "go dark" / "vault mode on" /
+    // "vault mode off" / "come back online". CONSERVATIVELY anchored
+    // (vault::classify_vault_command matches only the imperative phrase set — an
+    // ordinary sentence that merely mentions "vault" never triggers, OFF taking
+    // precedence over ON) and handled BEFORE normal routing so a vault toggle never
+    // falls through to the model. This flips the process-global vault mode that the
+    // two cloud-decision seams above read; it changes NO safety gate (the
+    // consequential confirmation gate, the owner voice-id gate, lockdown, and
+    // per-action policy are all untouched) and is NOTHING CONSEQUENTIAL — it only
+    // TIGHTENS (removes cloud access + forces CUSTOMS to the maximal trim), never
+    // adds an outward action. Runs AFTER the owner voice-id all-scope gate, so an
+    // unrecognized bystander cannot flip it. On a hit we set the mode, emit the
+    // secret-free `vault.status` frame, and SPEAK an HONEST ack, then return.
+    if let Some(cmd) = crate::vault::classify_vault_command(text) {
+        let now_on = crate::vault::set(matches!(cmd, crate::vault::VaultCommand::On));
+        telemetry::emit("system", "vault.status", crate::vault::status_frame(now_on));
+        let prime = agents.orchestrator();
+        emit_agent_active(prime);
+        return Ok(RouteOutcome {
+            routed_to: "local",
+            response: crate::vault::ack(now_on).to_string(),
             agent: prime.name.clone(),
             namespace: prime.namespace.clone(),
             spoken: None,
@@ -1059,7 +1096,15 @@ pub async fn route(
     }
 
     let needs_deep_reasoning = class.complexity == "heavy";
-    let to_cloud = wants_cloud(class, cfg);
+    // VAULT MODE ("go dark") — SEAM 2 of 2. The actuating tool-loop gate does NOT
+    // consult `cloud_reachable` (it would otherwise try the cloud and degrade on the
+    // resolve_api_key error), so close it here at the decision itself: an active
+    // vault forces `to_cloud` false, so a heavy / low-confidence turn never reaches
+    // the cloud tool loop and instead stays on the local path (or honestly degrades
+    // offline). RESTRICT-ONLY via the same `vault::deny_cloud` gate as SEAM 1 — it
+    // can only turn a cloud decision OFF; with the vault off this is exactly
+    // `wants_cloud(class, cfg)`.
+    let to_cloud = crate::vault::deny_cloud(wants_cloud(class, cfg));
     // RC-6: a turn that is cloud-bound ONLY because the classifier was unsure
     // (low confidence on a conversation intent — the CLASSIFY_FALLBACK shape a
     // garbled echo produces) must NOT reach the actuating cloud tool loop. An
