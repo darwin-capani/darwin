@@ -9,11 +9,11 @@
 //! ([`now_secs`] is the only ambient time and lives at the live-loop edge), and
 //! the [`FiredState`] of what was last surfaced, and returns a [`Decision`]:
 //!   - `Nothing`            — no trigger crossed its threshold, or a guard
-//!                            suppressed it (debounce / cooldown / quiet hours);
+//!     suppressed it (debounce / cooldown / quiet hours);
 //!   - `Surface(Brief)`     — emit a HUD proactive card only (the SHIPPED
-//!                            default: `[proactive].speak = false`);
+//!     default: `[proactive].speak = false`);
 //!   - `Speak(Brief)`       — additionally voice it via the EXISTING speech
-//!                            path, ONLY when the operator has opted in.
+//!     path, ONLY when the operator has opted in.
 //!
 //! The [`Brief`] it composes is GROUNDED: every line traces to a field of the
 //! `Signals` snapshot. The evaluator never invents a fact, a number, a time, or

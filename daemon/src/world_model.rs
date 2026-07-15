@@ -22,11 +22,11 @@
 //! KEY SCHEME (stable, parseable, collision-resistant):
 //!   - entity attribute:  `user.world.entity.<type>.<id>.<attribute>` = value
 //!   - relationship:      `user.world.rel.<from_id>.<relation>.<to_id>` = value
-//! where `<type>` is one of the bounded [`EntityType`] kinds and `<id>` /
-//! `<from_id>` / `<to_id>` are SLUGS (lowercased, non-alphanumeric collapsed to
-//! `_`) so a name like "Project JARVIS" round-trips to a stable `project_jarvis`.
-//! The human-readable display name is itself stored as the `name` attribute, so
-//! nothing is lost to slugging.
+//!     where `<type>` is one of the bounded [`EntityType`] kinds and `<id>` /
+//!     `<from_id>` / `<to_id>` are SLUGS (lowercased, non-alphanumeric collapsed to
+//!     `_`) so a name like "Project JARVIS" round-trips to a stable `project_jarvis`.
+//!     The human-readable display name is itself stored as the `name` attribute, so
+//!     nothing is lost to slugging.
 //!
 //! BOUNDS. Every input is validated and clamped BEFORE it touches the store
 //! (slug/attribute/value length, entity-type whitelist) and the store is bounded
@@ -438,12 +438,16 @@ pub async fn snapshot(memory: &Memory) -> Result<WorldState> {
     Ok(structure_rows(rows))
 }
 
+/// A grouped entity under construction: its type, id, and the accumulated
+/// (attribute, value) pairs, before it is folded into an [`Entity`].
+type EntityGroup = (EntityType, String, Vec<(String, String)>);
+
 /// Pure: fold raw (key,value) world-tier rows into a structured [`WorldState`].
 /// Skips malformed/foreign rows. Sorted deterministically. Bounded to the read
 /// window. Exposed for direct unit testing without a store.
 pub fn structure_rows(rows: Vec<(String, String)>) -> WorldState {
     // Group entity attributes by (type, id).
-    let mut entities: Vec<(EntityType, String, Vec<(String, String)>)> = Vec::new();
+    let mut entities: Vec<EntityGroup> = Vec::new();
     let mut relationships: Vec<Relationship> = Vec::new();
 
     for (key, value) in rows.into_iter().take(WORLD_READ_WINDOW) {

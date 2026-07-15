@@ -877,8 +877,8 @@ mod tests {
     fn budget_constant_bounds_total_dispatches() {
         // The outer budget never exceeds the fan-out cap, so a mission's total
         // dispatches are finite even with a max-length plan.
-        assert!(MISSION_BUDGET <= MAX_SUBTASKS);
-        assert!(MISSION_BUDGET >= 1);
+        const { assert!(MISSION_BUDGET <= MAX_SUBTASKS) };
+        const { assert!(MISSION_BUDGET >= 1) };
     }
 
     // ---- offline -> friendly degrade (no planning, no dispatch) ------------

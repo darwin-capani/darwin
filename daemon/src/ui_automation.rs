@@ -608,14 +608,14 @@ pub fn accessibility_permission_granted() -> bool {
 /// vision-capture / apply-heal / shell-exec device-gated precedent, the REAL
 /// actuation only happens on-device behind the full gate ([`ui_automation_permitted`]
 /// + the master switch + the spoken per-action confirm replay + voice-id +
-/// `!lockdown`) AND the Accessibility TCC consent (a real display). The planner +
-/// the gate routing are proven hermetically; the actuation itself is device-gated
-/// (the synthetic CGEvent only lands when macOS has the runtime TCC grant and a live
-/// display — neither can exist under `cargo test`). This function NEVER runs unless
-/// the caller has already cleared every gate. It NEVER fabricates an actuation
-/// result — when consent is absent it returns [`ActuateError::AccessibilityNotGranted`],
-/// and on ANY post failure it returns [`ActuateError::PostFailed`] (an honest
-/// detail), never a fake success.
+///   `!lockdown`) AND the Accessibility TCC consent (a real display). The planner +
+///   the gate routing are proven hermetically; the actuation itself is device-gated
+///   (the synthetic CGEvent only lands when macOS has the runtime TCC grant and a live
+///   display — neither can exist under `cargo test`). This function NEVER runs unless
+///   the caller has already cleared every gate. It NEVER fabricates an actuation
+///   result — when consent is absent it returns [`ActuateError::AccessibilityNotGranted`],
+///   and on ANY post failure it returns [`ActuateError::PostFailed`] (an honest
+///   detail), never a fake success.
 ///
 /// Preconditions the caller MUST have established before calling this:
 ///   1. [`ui_automation_permitted`] is true (`[ui_automation].enabled`),
@@ -624,9 +624,9 @@ pub fn accessibility_permission_granted() -> bool {
 ///   3. the master switch is ON, the human CONFIRMED THIS ONE actuation (the
 ///      parked per-action replay), `!is_locked_down()`, and the voice-id owner
 ///      gate passed.
-/// This seam does not re-check the gate-routing layers — those are the gate
-/// routing's job; it does its OWN device check (Accessibility TCC) and is the
-/// final, narrowly-scoped, single-action actuator.
+///      This seam does not re-check the gate-routing layers — those are the gate
+///      routing's job; it does its OWN device check (Accessibility TCC) and is the
+///      final, narrowly-scoped, single-action actuator.
 #[allow(dead_code)] // device-gated seam: wired behind the gate, never run in tests
 pub async fn do_actuate(
     plan: &ActuationPlan,
@@ -811,7 +811,7 @@ impl CoreGraphics {
                         if cf_handle.is_null() {
                             return None;
                         }
-                        let p = dlsym(cf_handle, b"CFRelease\0".as_ptr() as *const c_char);
+                        let p = dlsym(cf_handle, c"CFRelease".as_ptr());
                         if p.is_null() {
                             return None;
                         }

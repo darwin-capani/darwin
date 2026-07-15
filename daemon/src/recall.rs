@@ -19,13 +19,13 @@
 //!     keyword-semantic, NOT vector-semantic. The HONEST FALLBACK whenever the
 //!     embedder is unavailable (inference server down, or an older server
 //!     without the embed op): recall keeps working, just lexically.
-//! This reverses the round-B limitation (then: lexical-only, "not neural,"
-//! because no embed endpoint existed). Now BOTH exist and the active one is
-//! chosen at runtime; [`method_status`] reports WHICH honestly so a user is
-//! never told recall is neural when it silently fell back to BM25. We never
-//! claim measured embedding QUALITY — only which mechanism produced the ranking.
-//! Neural recall NEEDS the inference server running; with it down, recall is
-//! lexical and says so.
+//!     This reverses the round-B limitation (then: lexical-only, "not neural,"
+//!     because no embed endpoint existed). Now BOTH exist and the active one is
+//!     chosen at runtime; [`method_status`] reports WHICH honestly so a user is
+//!     never told recall is neural when it silently fell back to BM25. We never
+//!     claim measured embedding QUALITY — only which mechanism produced the ranking.
+//!     Neural recall NEEDS the inference server running; with it down, recall is
+//!     lexical and says so.
 //!
 //! The embedding CALL itself is runtime/MLX-gated and is NOT exercised by any
 //! test (a test that hit MLX or the socket would be an automatic failure).
@@ -404,9 +404,9 @@ fn dedup_signature(fact: &Fact) -> Vec<String> {
 ///     fact is never surfaced as a "memory");
 ///   - `k == 0` or an empty store yields an empty result (the caller then says
 ///     "nothing on that yet" — it never fabricates).
-/// Dedup keeps the HIGHEST-scoring representative of each duplicate group (ties
-/// within a group keep the earliest index), so a relevant fact is never hidden
-/// behind a lower-scoring duplicate.
+///     Dedup keeps the HIGHEST-scoring representative of each duplicate group (ties
+///     within a group keep the earliest index), so a relevant fact is never hidden
+///     behind a lower-scoring duplicate.
 pub fn rank<P: EmbeddingProvider>(
     query: &str,
     facts: &[Fact],
@@ -515,7 +515,7 @@ pub type EmbedFuture<'a> =
 ///   - the embedder returns Err (inference server down / no embed op);
 ///   - it returns the wrong number of vectors;
 ///   - it returns empty/degenerate vectors.
-/// An empty store still returns zero hits under either backend (no fabrication).
+///     An empty store still returns zero hits under either backend (no fabrication).
 ///
 /// ISOLATION is unaffected: the caller passes only the facts visible to the
 /// active agent (agent_scoped_facts); this ranks exactly those, never more.

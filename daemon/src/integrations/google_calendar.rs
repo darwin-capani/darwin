@@ -110,8 +110,8 @@ struct EventsList {
 /// OAuth credentials from the Keychain and wires the real reqwest transport) or,
 /// in tests, [`GoogleCalendarClient::new`] (an explicit `GoogleAuth` over a mock
 /// + a `MockTransport` for the Calendar calls). The access token is never held on
-/// this struct — it is fetched per request from `auth.bearer()` and attached to
-/// the outbound `Authorization` header only.
+///   this struct — it is fetched per request from `auth.bearer()` and attached to
+///   the outbound `Authorization` header only.
 pub struct GoogleCalendarClient<T: HttpTransport> {
     /// The Calendar API transport (production: reqwest; tests: a MockTransport).
     transport: T,

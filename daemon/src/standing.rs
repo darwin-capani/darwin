@@ -165,12 +165,12 @@ impl Schedule {
     /// never a live loop.
     ///
     ///   - `Daily`    — due if the local time is at/after hour:minute AND it has
-    ///                  not already run today (last_run was before today's
-    ///                  fire-time boundary). Never twice in one day.
+    ///     not already run today (last_run was before today's
+    ///     fire-time boundary). Never twice in one day.
     ///   - `Interval` — due if `now - last_run >= secs` (always due the first time,
-    ///                  last_run == 0).
+    ///     last_run == 0).
     ///   - `OnSignal` — due if the named signal is present this tick (debounced by
-    ///                  the caller's last-run cooldown, see [`MIN_INTERVAL_SECS`]).
+    ///     the caller's last-run cooldown, see [`MIN_INTERVAL_SECS`]).
     pub fn is_due(
         &self,
         now: u64,

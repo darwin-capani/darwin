@@ -1404,9 +1404,9 @@ fn sandbox_wrapped_argv(
 ///   * write of each declared `fs_write` subpath,
 ///   * outbound TCP to each declared `net_hosts` host (+ DNS); EMPTY net_hosts =>
 ///     `(deny network*)` — no network at all.
-/// Everything else — the mic, GPU, the rest of the filesystem, the memory DB,
-/// secrets — stays denied by the opener. PURE (no IO), so the profile is fully
-/// unit-testable, mirroring apps.rs's `generate_sbpl`.
+///     Everything else — the mic, GPU, the rest of the filesystem, the memory DB,
+///     secrets — stays denied by the opener. PURE (no IO), so the profile is fully
+///     unit-testable, mirroring apps.rs's `generate_sbpl`.
 pub fn stdio_sandbox_profile(s: &McpServerConfig, project_root: &Path) -> String {
     let mut p = String::new();
     p.push_str("(version 1)\n");

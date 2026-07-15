@@ -437,7 +437,7 @@ fn facts_block(facts: &[(String, String)]) -> String {
 ///      text) — when supplied, its distinct content gives each agent its OWN
 ///      cached prefix (the cache key is the content), so an agent-switch reuses
 ///      that agent's cached prefix instead of recomputing it,
-/// then the DYNAMIC tail OUTSIDE the cached prefix:
+///      then the DYNAMIC tail OUTSIDE the cached prefix:
 ///   3. the per-agent FACTS block,
 ///   4. any extra dynamic sections (roster, anti-repeat avoid-list) the caller
 ///      appends via `dynamic_tail`.
@@ -450,10 +450,10 @@ fn facts_block(facts: &[(String, String)]) -> String {
 ///   - ONE on the per-agent persona block (when present) — so each agent caches
 ///     its OWN prefix (preamble + its persona) independently; an agent-switch
 ///     reuses that agent's entry instead of recomputing it.
-/// When only one stable block exists (e.g. PERSONA unset in tests, or the
-/// orchestrator whose `agent_persona` is None) exactly ONE breakpoint lands on
-/// it. Combined with the single tool-defs breakpoint on the tool-loop path the
-/// request spends at most three of the four allowed breakpoints.
+///     When only one stable block exists (e.g. PERSONA unset in tests, or the
+///     orchestrator whose `agent_persona` is None) exactly ONE breakpoint lands on
+///     it. Combined with the single tool-defs breakpoint on the tool-loop path the
+///     request spends at most three of the four allowed breakpoints.
 ///
 /// The cumulative prefix up to the PER-AGENT breakpoint is [tools (tool-loop
 /// path only) + preamble + persona]. On the TOOL-LOOP path the large tool-defs
@@ -2107,6 +2107,10 @@ fn capability_label(tool_name: &str, input: &Value) -> String {
     tool_name.to_string()
 }
 
+// Internal helper threading the whole model-call context (model, budgets,
+// system prompt, tools, session state) through the tool loop; every arg is
+// distinct and it is called from few sites, so a bundling struct adds no clarity.
+#[allow(clippy::too_many_arguments)]
 async fn tool_loop(
     model: &str,
     max_tokens: u32,
@@ -2437,12 +2441,12 @@ struct LocalToolCall {
 ///   * a ```tool ... ``` fenced block (the format we instruct), or any fenced
 ///     block whose body is the call JSON,
 ///   * a bare top-level JSON object carrying `name` (+ optional `input`),
-/// and accepts both `{"name","input"}` and a flat `{"name","<args>"}` shape (the
-/// 4B sometimes inlines args). Anything unparseable, or a `name` not a string,
-/// yields `None` — the loop then treats the reply as the final plain answer. The
-/// returned `name`'s membership in the offered safe subset is checked by the
-/// CALLER (and `execute_tool` re-checks the allowlist), so this stays a pure
-/// syntactic parse. Pure, so the parse is exhaustively unit-testable.
+///     and accepts both `{"name","input"}` and a flat `{"name","<args>"}` shape (the
+///     4B sometimes inlines args). Anything unparseable, or a `name` not a string,
+///     yields `None` — the loop then treats the reply as the final plain answer. The
+///     returned `name`'s membership in the offered safe subset is checked by the
+///     CALLER (and `execute_tool` re-checks the allowlist), so this stays a pure
+///     syntactic parse. Pure, so the parse is exhaustively unit-testable.
 fn parse_local_tool_call(reply: &str) -> Option<LocalToolCall> {
     // 1) Prefer a fenced block. Scan for ``` ... ``` and try its body as JSON.
     if let Some(body) = first_fenced_block(reply) {
@@ -4978,26 +4982,23 @@ mod crosscheck {
                     "content": plausibility_prompt(query, result),
                 }],
             });
-            match brain.respond(&body).await {
-                Ok(resp) => {
-                    let content = resp["content"].as_array().cloned().unwrap_or_default();
-                    let reply = super::extract_text(&content).unwrap_or_default();
-                    let (implausible, reason) = parse_plausibility(&reply);
-                    if implausible {
-                        return CrossCheckResult {
-                            outcome: CrossCheckOutcome::Flagged,
-                            flags: Vec::new(),
-                            model_reason: Some(if reason.is_empty() {
-                                "the model judged the result implausible for the query".to_string()
-                            } else {
-                                reason
-                            }),
-                            level: downgrade(level),
-                        };
-                    }
+            // FAIL-OPEN: a transport error never flips a clean result to flagged.
+            if let Ok(resp) = brain.respond(&body).await {
+                let content = resp["content"].as_array().cloned().unwrap_or_default();
+                let reply = super::extract_text(&content).unwrap_or_default();
+                let (implausible, reason) = parse_plausibility(&reply);
+                if implausible {
+                    return CrossCheckResult {
+                        outcome: CrossCheckOutcome::Flagged,
+                        flags: Vec::new(),
+                        model_reason: Some(if reason.is_empty() {
+                            "the model judged the result implausible for the query".to_string()
+                        } else {
+                            reason
+                        }),
+                        level: downgrade(level),
+                    };
                 }
-                // FAIL-OPEN: a transport error never flips a clean result to flagged.
-                Err(_) => {}
             }
         }
 
@@ -5443,9 +5444,9 @@ fn tool_carries_citation(name: &str) -> bool {
 ///   * episodic_recall → "past episodes" (real episode ids/summaries),
 ///   * web_search / open_url → the real URL from the input when present,
 ///   * karen_triage → "comms triage" (the read-only provider lists).
-/// An outcome that is an honest empty/miss (the tool's own "nothing found" /
-/// "nothing recorded" / "not connected" copy) yields `None` — there is no real
-/// source to cite, so the accumulator stays untouched. Pure + unit-testable.
+///     An outcome that is an honest empty/miss (the tool's own "nothing found" /
+///     "nothing recorded" / "not connected" copy) yields `None` — there is no real
+///     source to cite, so the accumulator stays untouched. Pure + unit-testable.
 fn citation_for_tool(name: &str, input: &Value, outcome: &str) -> Option<(String, String)> {
     // An honest empty/miss from any retrieval tool carries no real source.
     if is_empty_retrieval(outcome) {
@@ -5600,8 +5601,8 @@ pub fn parse_confidence(text: &str) -> Option<(Confidence, String)> {
 ///     answer;
 ///   * with NO sources (no retrieval) → the honest "(from my own knowledge)"
 ///     label — NEVER a fabricated citation.
-/// Returns the annotation string to APPEND (a leading newline-separated block),
-/// or empty when there is nothing to add (defensive). Pure + unit-testable.
+///     Returns the annotation string to APPEND (a leading newline-separated block),
+///     or empty when there is nothing to add (defensive). Pure + unit-testable.
 pub fn cite_annotation(sources: &[AnswerSource]) -> String {
     if sources.is_empty() {
         return "(from my own knowledge — no sources were consulted this turn)".to_string();
@@ -5674,11 +5675,11 @@ pub struct AnnotatedAnswer {
 ///   * `cite` on → append the HONEST cite line: the REAL recorded sources as
 ///     "Sources: …", or "(from my own knowledge)" when the turn used NO retrieval
 ///     — NEVER a fabricated citation.
-/// Order: confidence is parsed FIRST (off the raw model text), THEN the cite line
-/// is appended, so the cite line is never mistaken for the confidence line and the
-/// confidence marker never lands after the sources block. Pure w.r.t. its inputs
-/// (it reads the process-global accumulator + gate), so the whole behavior is
-/// unit-testable hermetically.
+///     Order: confidence is parsed FIRST (off the raw model text), THEN the cite line
+///     is appended, so the cite line is never mistaken for the confidence line and the
+///     confidence marker never lands after the sources block. Pure w.r.t. its inputs
+///     (it reads the process-global accumulator + gate), so the whole behavior is
+///     unit-testable hermetically.
 pub fn annotate_answer(response: &str) -> AnnotatedAnswer {
     let (cite_on, confidence_on) = answers_gate();
     annotate_with(response, cite_on, confidence_on, &current_sources())
@@ -8716,9 +8717,9 @@ pub async fn world_query_live(memory: &Memory, about: &str) -> String {
 ///     op) when that server is up — PREFERRED;
 ///   - lexical BM25 ([`crate::recall::LexicalProvider`]) as the honest fallback
 ///     when the embedder is unavailable.
-/// Nothing is stored or sent to the cloud; the only network is the LOCAL Unix
-/// socket to the on-device inference server (and only to embed — never to
-/// generate or reach the cloud).
+///     Nothing is stored or sent to the cloud; the only network is the LOCAL Unix
+///     socket to the on-device inference server (and only to embed — never to
+///     generate or reach the cloud).
 ///
 /// ISOLATION is load-bearing: scoping to `namespace` means recall surfaces only
 /// the active agent's OWN `agent.<name>.*` notes plus SHARED `user.*` facts —
@@ -9424,9 +9425,9 @@ fn load_heavy_model() -> String {
 ///     since/from-to) newest-first;
 ///   * a `query` -> a topical ranking RUNTIME-SELECTED between neural on-device
 ///     embeddings and lexical BM25 — the report NAMES whichever actually ran.
-/// Nothing is stored or sent (the only network is the LOCAL embed socket). When
-/// nothing is recorded or nothing matches, it honestly says so — it never
-/// fabricates an episode.
+///     Nothing is stored or sent (the only network is the LOCAL embed socket). When
+///     nothing is recorded or nothing matches, it honestly says so — it never
+///     fabricates an episode.
 async fn episodic_recall_tool(
     args: &EpisodicRecallArgs,
     memory: &Memory,
@@ -12015,7 +12016,7 @@ mod tests {
         assert_eq!(clamp_local_rounds(0), LOCAL_TOOL_LOOP_DEFAULT_ROUNDS);
         assert_eq!(clamp_local_rounds(2), 2);
         assert_eq!(clamp_local_rounds(9999), LOCAL_TOOL_LOOP_MAX_ROUNDS);
-        assert!(LOCAL_TOOL_LOOP_DEFAULT_ROUNDS <= LOCAL_TOOL_LOOP_MAX_ROUNDS);
+        const { assert!(LOCAL_TOOL_LOOP_DEFAULT_ROUNDS <= LOCAL_TOOL_LOOP_MAX_ROUNDS) };
     }
 
     // ---- the loop behavior (REAL loop + REAL execute_tool, mock brain) -------
@@ -15353,15 +15354,14 @@ mod tests {
         struct MockEmbedder;
         impl crate::recall::Embedder for MockEmbedder {
             fn embed<'a>(&'a self, texts: &'a [String]) -> crate::recall::EmbedFuture<'a> {
-                let n = texts.len();
                 Box::pin(async move {
                     // index 0 = query, points along axis 0.
                     let mut out = vec![vec![1.0, 0.0, 0.0]];
-                    for i in 1..n {
+                    for text in texts.iter().skip(1) {
                         // The fact whose searchable text mentions "car"/"subaru"
                         // gets a near-parallel vector; everything else is
                         // orthogonal (so only the relevant fact scores > 0).
-                        let t = texts[i].to_lowercase();
+                        let t = text.to_lowercase();
                         if t.contains("subaru") || t.contains("car") {
                             out.push(vec![0.98, 0.1, 0.0]);
                         } else {
@@ -16533,12 +16533,12 @@ mod tests {
 
     /// NO-DEPLOY FROM THE TOOL PATH (source-level proof): the forge_app tool arm
     /// + its run_forge_app helper must reach the forge pipeline through
-    /// forge::forge_draft (the PROPOSE-ONLY core) and must NEVER call any deploy
-    /// path. forge.rs itself proves the pipeline never writes into apps/ (see
-    /// forge::tests::no_auto_deploy_path_exists); here we pin the TOOL layer:
-    /// run_forge_app never constructs an apps/ path and never names an apply/
-    /// deploy/install side-effect — the only deploy route is the human
-    /// scripts/apply_forge.sh, which the SUMMARY merely *mentions*.
+    ///   forge::forge_draft (the PROPOSE-ONLY core) and must NEVER call any deploy
+    ///   path. forge.rs itself proves the pipeline never writes into apps/ (see
+    ///   forge::tests::no_auto_deploy_path_exists); here we pin the TOOL layer:
+    ///   run_forge_app never constructs an apps/ path and never names an apply/
+    ///   deploy/install side-effect — the only deploy route is the human
+    ///   scripts/apply_forge.sh, which the SUMMARY merely *mentions*.
     #[test]
     fn forge_app_tool_path_never_deploys() {
         let src = include_str!("anthropic.rs");

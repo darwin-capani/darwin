@@ -11,7 +11,8 @@
 //!   - `{"type":"start"|"refresh"|"stop"}` — host control verbs
 //!     ([`crate::ops::HostControl`]); `stop` exits cleanly.
 //!   - `{"op":"…", …}` — Silicon-Canvas ops ([`crate::ops::Op`], SPEC §6).
-//!   [`parse_command`] classifies each line by presence of `op` vs `type`.
+//!
+//! [`parse_command`] classifies each line by presence of `op` vs `type`.
 //!
 //! Outbound (app → host), stamped with the token on EVERY line via
 //! [`crate::ops::OutboundLine::telemetry`]; the host relays `type:"items"` lines

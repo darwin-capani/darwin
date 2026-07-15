@@ -327,8 +327,8 @@ pub async fn code_explain(
 ///   4. writes patch.diff + report.md + request.txt to state/code/proposals/<ts>/
 ///      ([`record_artifact`]) — the PROPOSAL STORE, NEVER the user's tree;
 ///   5. returns the diff + the manual apply command.
-/// The model's diff CORRECTNESS is runtime/model-gated — tests inject a mock brain
-/// returning a canned diff and assert the store write + NO tree mutation.
+///      The model's diff CORRECTNESS is runtime/model-gated — tests inject a mock brain
+///      returning a canned diff and assert the store write + NO tree mutation.
 pub async fn code_propose_diff(
     cfg: &crate::config::CodeConfig,
     code_root: &Path,

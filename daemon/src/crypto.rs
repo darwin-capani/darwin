@@ -11,12 +11,12 @@
 //! ENCRYPTED (transparent, whole-file SQLCipher AES-256, page-level) — the four
 //! sensitive SQLite stores, each opened today via `Connection::open(path)`:
 //!   * `memory.rs`    — the main Db: facts / transcripts / episodes / events
-//!                      (and the `user.world.*` world-model facts tier lives here).
+//!     (and the `user.world.*` world-model facts tier lives here).
 //!   * `docsearch.rs` — `state/docsearch.db`: indexed chunk text + vectors.
 //!   * `audit.rs`     — `state/audit.db`: the hash-chained consequential ledger.
 //!   * `optimize.rs`  — `state/optimize/optimize.db`: the trace corpus.
-//! Plus the NOT-a-DB sensitive store, wrapped SEPARATELY (SQLCipher's PRAGMA key
-//! does NOT cover it because it is a JSON file, not SQLite):
+//!     Plus the NOT-a-DB sensitive store, wrapped SEPARATELY (SQLCipher's PRAGMA key
+//!     does NOT cover it because it is a JSON file, not SQLite):
 //!   * `state/voiceid/owner.json` — the owner voice feature vector. [`VoiceVault`]
 //!     stores it inside its OWN encrypted SQLCipher SQLite blob.
 //!
@@ -57,8 +57,8 @@ pub const KEY_BYTES: usize = 32;
 ///     passphrase — we hold real key bytes, not a password);
 ///   * [`Self::keychain_value`] — the hex string written to / read from the
 ///     Keychain.
-/// `Debug` is implemented by hand to print a REDACTED placeholder, so a stray
-/// `{:?}` (or a struct that derives `Debug` and contains a key) can never leak it.
+///     `Debug` is implemented by hand to print a REDACTED placeholder, so a stray
+///     `{:?}` (or a struct that derives `Debug` and contains a key) can never leak it.
 #[derive(Clone, PartialEq, Eq)]
 pub struct SecretKey {
     bytes: [u8; KEY_BYTES],

@@ -331,7 +331,7 @@ fn fmt_num(v: f64) -> String {
 ///   - `tip`       : add `percent` tip to `value`    (reports tip + total)
 ///   - `discount`  : subtract `percent` off `value`
 ///   - `markup`    : add `percent` markup to `value`
-/// Pure + total; an unknown op or missing field is a friendly error.
+///     Pure + total; an unknown op or missing field is a friendly error.
 fn percentage(args: &Value) -> Result<String> {
     let op = args
         .get("op")

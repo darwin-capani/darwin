@@ -83,8 +83,8 @@ pub struct Config {
     /// "yes" (shell_run is in NEVER_AUTO_APPROVE_TOOLS — it parks per-action even
     /// under an Always policy), and only ever EXEC under the master switch + confirm
     /// + voice-id + !lockdown — under a DENY-DEFAULT sandbox-exec profile (no network,
-    /// write-confined to a scratch dir, the Keychain / ~/.claude / daemon state
-    /// denied). The exec itself is DEVICE-gated (needs /usr/bin/sandbox-exec + /bin/sh).
+    ///   write-confined to a scratch dir, the Keychain / ~/.claude / daemon state
+    ///   denied). The exec itself is DEVICE-gated (needs /usr/bin/sandbox-exec + /bin/sh).
     pub shell: ShellConfig,
     /// [ui_automation] — GATED UI AUTOMATION (#44, the CAPSTONE, ui_automation.rs):
     /// the SINGLE MOST DANGEROUS capability (physically actuating the macOS UI —
@@ -1577,8 +1577,8 @@ impl Default for LifeLogConfig {
 ///     nothing. Add absolute folder paths to make anything searchable. Every
 ///     candidate file is PATH-CONFINED (canonicalize
 ///     + assert it starts_with a canonicalized allowed root; symlink-escape / `..`
-///     / absolute-elsewhere are REJECTED), so the index can never reach a file
-///     outside an allowlisted root.
+///       / absolute-elsewhere are REJECTED), so the index can never reach a file
+///       outside an allowlisted root.
 ///   - `max_files` / `max_chunks` / `max_file_bytes` / `max_depth` /
 ///     `chunk_chars` / `chunk_overlap`: the BOUNDS — total files, total chunks,
 ///     per-file byte cap, recursion depth, chunk window size, and overlap. They
@@ -1751,8 +1751,8 @@ impl Default for ShellConfig {
 /// construction — see [`crate::ui_automation`] for the layers (the PURE
 /// single-action planner that can never batch, the consequential park PER ACTION
 /// + master/voice-id/lockdown gate routing) and the device-gated actuation seam
-/// (built, never invoked in a test, and itself behind an Accessibility-TCC consent
-/// check).
+///   (built, never invoked in a test, and itself behind an Accessibility-TCC consent
+///   check).
 ///
 ///   - `enabled` (SHIPS ON, full-power default): the master switch. Even ON the
 ///     tool NEVER auto-runs (see HONESTY below). INERT WITHOUT TCC: the actuation
@@ -2413,22 +2413,13 @@ impl Default for PolicyConfig {
 /// process/root attacker. Lose the Keychain item => the DBs are unrecoverable.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SecurityConfig {
     /// Master switch for at-rest encryption. SHIPS OFF (false) and is pinned:
     /// with it false the stores are exactly today's plaintext SQLite.
     pub encrypt_memory: bool,
 }
 
-impl Default for SecurityConfig {
-    fn default() -> Self {
-        // OFF by default — enabling changes the on-disk format (an irreversible
-        // migration), so it is a deliberate operator opt-in, NOT a full-power
-        // feature default.
-        Self {
-            encrypt_memory: false,
-        }
-    }
-}
 
 /// [distill] — self-distillation (F17). SHIPS OFF: training produces weights (an
 /// adapter), a consequential + device-heavy op, so it is a deliberate operator
@@ -2468,6 +2459,7 @@ impl Default for DistillConfig {
 /// endpoint is a non-secret address of the user's OWN device.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SyncConfig {
     /// Master switch. SHIPS OFF (false): with it off the pipeline is a no-op and
     /// the status honestly reports "off".
@@ -2477,12 +2469,6 @@ pub struct SyncConfig {
     pub peer_endpoint: String,
 }
 
-impl Default for SyncConfig {
-    fn default() -> Self {
-        // OFF by default — federated sync moves user data off-device; opt-in only.
-        Self { enabled: false, peer_endpoint: String::new() }
-    }
-}
 
 /// [scene] — ACOUSTIC SCENE AWARENESS (F6, scene.rs). Classify the ambient
 /// soundscape into named sound events. `enabled` is a privacy master switch:
@@ -2596,6 +2582,7 @@ impl Default for WebhooksConfig {
 /// surface (mirrors [`McpServerConfig`]).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct WebhookMapping {
     /// The external event name (the `X-Jarvis-Event` header / `event` field) this
     /// entry maps. An inbound event whose name matches no mapping is REJECTED.
@@ -2606,14 +2593,6 @@ pub struct WebhookMapping {
     pub intent: String,
 }
 
-impl Default for WebhookMapping {
-    fn default() -> Self {
-        Self {
-            event: String::new(),
-            intent: String::new(),
-        }
-    }
-}
 
 /// [plugin_sdk] — PLUGIN SDK (#36, plugin_sdk.rs): formalizes + VALIDATES the
 /// micro-app capability-module contract — the optional `[intents]`/`[tools]`
@@ -2856,39 +2835,33 @@ impl Default for McpConfig {
 /// (TLS-only; not SBPL-sandboxed — it runs elsewhere).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum McpTransportKind {
+    #[default]
     Stdio,
     Http,
 }
 
-impl Default for McpTransportKind {
-    fn default() -> Self {
-        McpTransportKind::Stdio
-    }
-}
 
 /// Default classification for a server's tools when the per-tool overrides do
 /// not name one. `consequential` (the default-of-the-default) is fail-safe: an
 /// undeclared tool is treated as side-effecting and parks behind the gate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum McpToolClass {
     ReadOnly,
+    #[default]
     Consequential,
 }
 
-impl Default for McpToolClass {
-    fn default() -> Self {
-        // Fail-safe: unknown -> consequential.
-        McpToolClass::Consequential
-    }
-}
 
 /// One configured MCP server. A server is INERT until `[mcp].enabled` is true AND
 /// it is listed here. `deny_unknown_fields`: a mistyped key is a parse error so a
 /// fat-fingered classification or allowlist can never silently widen the surface.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+#[derive(Default)]
 pub struct McpServerConfig {
     /// Server id. Must be the strict shape `[a-z0-9_-]+` with no leading/trailing
     /// or consecutive separator — validated at CONNECT time (not on parse): a name
@@ -2934,24 +2907,6 @@ pub struct McpServerConfig {
     pub net_hosts: Vec<String>,
 }
 
-impl Default for McpServerConfig {
-    fn default() -> Self {
-        Self {
-            name: String::new(),
-            transport: McpTransportKind::default(),
-            command: String::new(),
-            args: Vec::new(),
-            url: String::new(),
-            uses_token: false,
-            agents: Vec::new(),
-            default_class: McpToolClass::default(),
-            read_only_tools: Vec::new(),
-            fs_read: Vec::new(),
-            fs_write: Vec::new(),
-            net_hosts: Vec::new(),
-        }
-    }
-}
 
 impl Config {
     /// Load the config plus a list of human-readable issues (unknown keys,
@@ -3452,7 +3407,7 @@ mod tests {
     /// default) but is INERT WITHOUT TCC — the continuous loop still requires runtime
     /// macOS Screen-Recording consent, which the flag cannot grant. Prove the default
     /// + the empty-config parse are ON, the bounds are sane (cap >= 1, interval >= 1),
-    /// and the keys are known (no unknown-key diagnostic).
+    ///   and the keys are known (no unknown-key diagnostic).
     #[test]
     fn screen_context_ships_on_inert_without_tcc_with_sane_bounds_and_known_keys() {
         // The Default impl is ON (inert without TCC consent).

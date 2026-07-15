@@ -148,6 +148,9 @@ pub struct AuditEntry {
 /// distinct field tuples can collide into the same byte string (a field can't
 /// contain a NUL — redact + the fixed token sets guarantee it). This is the exact
 /// preimage `verify_chain` recomputes, so the two MUST stay byte-identical.
+// The args ARE the canonical content fields folded into the hash; a bundling
+// struct would just duplicate AuditEntry's shape and risk drifting from it.
+#[allow(clippy::too_many_arguments)]
 fn hash_entry(
     prev_hash: &str,
     seq: i64,
@@ -434,7 +437,7 @@ impl AuditLog {
     ///     i.e. a reorder or a mid-chain DELETE/INSERT),
     ///   * a wrong root anchor (the first entry's `prev_hash` != [`GENESIS_PREV`]),
     ///   * a non-contiguous seq (a deletion that left a gap WITHOUT re-rooting).
-    /// Read-only.
+    ///     Read-only.
     pub async fn verify_chain(&self) -> Result<ChainStatus> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(

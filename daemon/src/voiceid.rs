@@ -17,10 +17,10 @@
 //!   * THRESHOLD- and VOICE-dependent: the false-accept / false-reject rates are
 //!     a function of the chosen `threshold` and of how similar two real voices
 //!     are. They are DEVICE-gated — measurable only on the actual mic, never here.
-//! The hermetic tests in this module prove only the SYNTHETIC-SIGNAL SEPARATION
-//! (a deterministic "owner" tone-complex verifies; a clearly-different "intruder"
-//! is rejected), determinism, L2-normalization, and cosine correctness. They make
-//! NO accuracy claim about real voices, and the copy must never imply one.
+//!     The hermetic tests in this module prove only the SYNTHETIC-SIGNAL SEPARATION
+//!     (a deterministic "owner" tone-complex verifies; a clearly-different "intruder"
+//!     is rejected), determinism, L2-normalization, and cosine correctness. They make
+//!     NO accuracy claim about real voices, and the copy must never imply one.
 //!
 //! ### Where it sits in the safety stack — an ADDED layer, never a replacement
 //! Voice-ID is an ADDITIVE factor on top of the existing backstops, never a
@@ -28,12 +28,12 @@
 //!   * The armed-by-default `[integrations].allow_consequential` master switch (ON,
 //!     but a confirmed action still needs a fresh per-action confirm) and
 //!   * the cross-turn SPOKEN confirmation gate ([`crate::confirm`])
-//! remain the hard security backstop for outward actions. Voice-ID, when enabled
-//! AND a profile is enrolled, adds: an unrecognized speaker may not trigger a
-//! consequential/outward action, and may not confirm (replay) a parked action a
-//! bystander could otherwise approve. It FAILS CLOSED for consequential actions
-//! (no usable audio / embed error while enabled+enrolled => treat as UNVERIFIED,
-//! deny the consequential path) but never bricks ordinary replies.
+//!     remain the hard security backstop for outward actions. Voice-ID, when enabled
+//!     AND a profile is enrolled, adds: an unrecognized speaker may not trigger a
+//!     consequential/outward action, and may not confirm (replay) a parked action a
+//!     bystander could otherwise approve. It FAILS CLOSED for consequential actions
+//!     (no usable audio / embed error while enabled+enrolled => treat as UNVERIFIED,
+//!     deny the consequential path) but never bricks ordinary replies.
 //!
 //! ### Ships OFF + reversible
 //! `[voice_id].enabled` defaults FALSE. With voice-id OFF, OR with no enrolled

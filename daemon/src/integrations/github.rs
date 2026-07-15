@@ -347,6 +347,9 @@ impl<T: HttpTransport> GithubClient<T> {
     /// In [`ActionMode::DryRun`] this issues NO request — it returns a preview
     /// of the PR it would open. In [`ActionMode::Execute`] it POSTs the PR and
     /// returns its number and URL. Callers obtain `mode` from `gate(confirm)`.
+    // Distinct PR parameters passed positionally; a params struct would add
+    // ceremony without making the GitHub call any clearer.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open_pull_request(
         &self,
         owner: &str,

@@ -47,8 +47,8 @@
 //!     apps.rs runtime), so deployment lands it in exactly the micro-app box;
 //!   - DEPLOY is a separate HUMAN step (scripts/apply_forge.sh) that re-validates
 //!     and refuses anything outside state/forge/proposals/.
-//!   The cloud is reached ONLY through the ForgeBrain trait — unit tests mock
-//!   it; the only real cloud path is the #[ignore]'d forge_drill_real_cloud.
+//!     The cloud is reached ONLY through the ForgeBrain trait — unit tests mock
+//!     it; the only real cloud path is the #[ignore]'d forge_drill_real_cloud.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -339,7 +339,7 @@ fn is_confined_relpath(p: &str) -> bool {
 ///   - fs_write only to the app's OWN state dir ("state/apps/<name>");
 ///   - fs_read only to confined, in-project relative paths (no escapes);
 ///   - net_hosts capped, each a plausible hostname (no schemes, no slashes).
-/// Returns Ok(()) on a minimal manifest, Err(reason) on an over-broad one.
+///     Returns Ok(()) on a minimal manifest, Err(reason) on an over-broad one.
 fn validate_permissions(name: &str, p: &PermissionsSection) -> Result<()> {
     if p.audio {
         bail!("over-broad permission: a forged app may not request `audio` (microphone)");
@@ -570,6 +570,10 @@ fn render_rejection_report(ts: u64, model: &str, goal: &str, stage: &str, reason
 // ---------------------------------------------------------------------------
 
 /// How one forge attempt ended.
+// Constructed at most once per (infrequent) forge attempt and consumed
+// immediately; never stored in bulk, so the large `Proposed` variant costs
+// nothing in practice — boxing would only add indirection and churn.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
 enum AttemptResult {
     /// Validated: a minimal, born-sandboxed, building+passing app. Ready to

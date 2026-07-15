@@ -370,7 +370,7 @@ fn word_present(text: &str, word: &str) -> bool {
 ///   * fold the shell `$IFS` whitespace-injection idiom (`${IFS}`, `$IFS`) into a
 ///     space so `rm${IFS}-rf${IFS}/` becomes `rm -rf /`,
 ///   * turn tabs/newlines into spaces and collapse runs of spaces to one.
-/// Conservative: it only ever makes the text MORE likely to match the denylist.
+///     Conservative: it only ever makes the text MORE likely to match the denylist.
 fn normalize_for_classify(cmd: &str) -> String {
     let mut s = cmd.to_lowercase();
     // Fold the $IFS whitespace-injection idiom into a real space.
@@ -570,8 +570,8 @@ pub struct ShellRunResult {
 ///   2. the command classified [`ShellClass::Benign`] (NOT denylisted),
 ///   3. the master switch is ON, the human CONFIRMED (the parked replay),
 ///      `!is_locked_down()`, and the voice-id owner gate passed.
-/// This seam does not re-check those — they are the gate routing's job; it is the
-/// final, narrowly-scoped actuator.
+///      This seam does not re-check those — they are the gate routing's job; it is the
+///      final, narrowly-scoped actuator.
 pub async fn run_sandboxed(
     cmd: &str,
     profile: &str,

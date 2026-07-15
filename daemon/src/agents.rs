@@ -1046,8 +1046,8 @@ impl AgentRegistry {
     ///      specialist that owns those tools.
     ///   3. Keyword-driven: domain cues in the utterance pick a specialist.
     ///   4. Fallback: the orchestrator (jarvis).
-    /// The chosen agent must still hold the tool it will invoke; the router
-    /// enforces that and re-routes on a violation (isolation).
+    ///      The chosen agent must still hold the tool it will invoke; the router
+    ///      enforces that and re-routes on a violation (isolation).
     pub fn select(&self, intent: &str, text: &str, cloud_reachable: bool) -> &Agent {
         // 1. Cloud down -> the all-local survival profile, but only for the
         //    conversational/heavy cases that would otherwise need the cloud;

@@ -133,9 +133,9 @@ pub trait Extractor: Send + Sync {
 ///     "the X project") or containing an ALL-CAPS code word.
 ///   * TOPIC — a remaining capitalized multi-word noun phrase (the catch-all for
 ///     a salient capitalized concept).
-/// THREAD is reserved for conversational ingestion and is not mined from generic
-/// document prose (claiming it would be a guess), so the deterministic extractor
-/// never emits it — honest about what document text can ground.
+///     THREAD is reserved for conversational ingestion and is not mined from generic
+///     document prose (claiming it would be a guess), so the deterministic extractor
+///     never emits it — honest about what document text can ground.
 ///
 /// RELATIONSHIPS: any two DISTINCT entities found in the SAME chunk get a single
 /// `mentions` edge (from the earlier to the later by span). This is the weakest
@@ -611,9 +611,9 @@ pub struct BuildStats {
 ///      silently dropped wrong);
 ///   3. UPSERT each relationship (both endpoints were grounded in the same chunk)
 ///      via [`world_model::set_relationship`] (which enforces the relation cap).
-/// DEDUP is automatic: the slug is stable, so re-seeing an entity merges; the
-/// `source` attribute is only set when the entity is NEW (first grounding wins),
-/// so a re-run is idempotent and never churns provenance.
+///      DEDUP is automatic: the slug is stable, so re-seeing an entity merges; the
+///      `source` attribute is only set when the entity is NEW (first grounding wins),
+///      so a re-run is idempotent and never churns provenance.
 ///
 /// NEVER fabricates: it writes only what the extractor returned GROUNDED in a
 /// chunk. NEVER writes a private namespace: every key is `user.world.*` by
