@@ -152,6 +152,7 @@ quiet_end = 7       # quiet-hours band end (local hour, exclusive); quiet_start 
 
 [focus]                  # #24 FOCUS PROFILES (focus.rs). A PERMISSION-NEUTRAL lens over the proactive surfaces: it only narrows WHICH non-consequential intel surfaces (signal categories, brief verbosity, whether suggestions are quieted) and can ONLY make DARWIN quieter — never loosen the master switch / confirm gate / voice-id / lockdown / policy, never enable a consequential action, never raise autonomy.
 profile = "default"      # SHIPS NEUTRAL: "default" is the IDENTITY — today's proactive behavior byte-for-byte. Other values: "work" (silences news/routine/market, keeps calendar/mail/health), "sleep" (only CRITICAL surfaces, suggestions quieted), "deep_focus" (only critical, no digest, suggestions quieted), or any other string = a NAMED CUSTOM profile (itself restrict-only). An unknown value degrades to "default" (fail safe to today's behavior). Critical signals (imminent calendar / low disk) survive even deep_focus — the floor a profile can never silence.
+auto = false             # AUTO-FOCUS (focus.rs select_profile), SHIPS OFF (opt-in). When true, the LIVE anticipation tick RESELECTS the active profile each tick from ON-DEVICE signals — acoustic scene (scene.rs) + fused presence (presence.rs: Away/Present/Focused) + calendar (in a meeting?) + time-of-day — instead of holding `profile`: away/in-a-call/in-a-meeting -> deep_focus (quiet), night -> sleep, silent flow -> work, quiet room + present -> default (normal). PERMISSION-NEUTRAL by construction: the auto choice is applied through the SAME restrict-only apply_profile path, COMPOSED ON TOP of `profile`, so it can only ever NARROW further — never broaden past your configured profile, enable an action, raise autonomy, or loosen a gate. Opt-in because it changes what surfaces based on sensed room state. OFF = focus behaves exactly as today. (The acoustic-scene classifier ships inert — no bundled model — so live the scene input is Unknown and selection rides presence/calendar/time until scene.rs's capture tap is wired.)
 
 [self_heal]
 enabled = true    # master gate, SHIPS ON (full-power default) — INERT WITHOUT A CLOUD KEY: the heavy-model unified-diff draft requires ANTHROPIC_API_KEY; with no key the watchdog emits heal.blocked{reason:"no_api_key"} and patches NOTHING (needs the key to actually draft). When active: edge-triggered ERROR burst (or a single total-loss "audio capture stopped" line) -> collect last ~80 daemon.log lines + implicated src/<file>.rs paths -> heavy-model unified-diff draft -> staged copy of daemon/ under state/heal/staging-<ts>/ -> /usr/bin/patch -p1 + cargo check + cargo test (10min cap) -> propose per mode below. Rate-limited to one draft attempt per 6h (meta.heal_last_attempt); failures land in state/heal/rejected/<ts>/. Set false to disable.
@@ -205,12 +206,27 @@ min_sample = 20              # per-bucket honesty floor: below this many GRADED 
 overconfidence_margin = 0.1  # dead-band: a bucket counts as "overconfident" (and eligible for the reduce-only widen) only if actual success lags the claimed confidence by MORE than this, so ordinary sampling noise never widens the clarify band.
 max_widen = 0.15             # cap on the reduce-only hook's widen: it never raises the clarify threshold by more than this, and the result is always capped at 1.0.
 
+[mirror]
+# MIRROR (user_model.rs): belief-audit + contest over the SELF-MODEL. "why do you
+# think I prefer X" surfaces the STORED observation, provenance, and observed-count
+# of that belief — never a fabricated reason. "that's wrong about X" DROPS the belief
+# AND writes a `user.model.suppressed.*` tombstone that the reflection/consolidation
+# pass CONSULTS, so a contested belief is NEVER silently re-derived (the tombstone is
+# user-clearable). Emits the secret-free `mirror.belief` telemetry frame for the HUD.
+# READ-ONLY / REDUCE-ONLY: contesting only ever REMOVES a shared `user.model.*` belief
+# and suppresses it — it is structurally unable to touch a private `agent.*` note, and
+# does nothing consequential.
+enabled = true      # master gate, SHIPS ON (full-power default). Off => "why do you think…" / "that's wrong…" fall through to the model. Set false to disable.
+
 [standing]
 # Standing Missions (standing.rs): durable, scheduled, autonomous goals that run
 # on the standing-missions scheduler tick (a dedicated runtime loop, separate from
 # EDITH's anticipation tick) and reason over the shared World Model — the
 # self-heal/forge gated-autonomy pattern applied to "a recurring goal".
 enabled = true    # subsystem MASTER switch, SHIPS ON (full-power default). Even on: ESTABLISHING a standing mission is itself a cross-turn confirmation-gated action (standing_create is in CONSEQUENTIAL_TOOLS; DARWIN never silently spawns recurring autonomy), and every CONSEQUENTIAL step a running mission proposes (post/send/spend/control) STILL parks behind the confirmation gate + the [integrations] master switch — a standing mission can never auto-send/post/spend. Bounded: at most 8 active missions; each run is bounded by FURY's per-mission caps. Set false to disable.
+# TRIPWIRE (condition triggers): a standing mission may fire when a threshold on the verified signal snapshot is crossed ("free disk below 10%", "unread above 5", "calendar event within 15m") instead of on a clock. A tripwire may only READ + REASON — it holds no actuator, is INERT when this subsystem is off, and every consequential step the fired mission proposes STILL parks behind the confirm gate. Arming one routes through the SAME gated standing_create path. These two knobs tune the reactive path:
+condition_eval_secs = 60        # evaluation cadence: min seconds between condition-trigger evaluations against a fresh snapshot on the standing tick (the tick bounds the real max frequency).
+condition_debounce_secs = 3600  # anti-flap re-fire floor: min seconds between successive FIRES of the same tripwire after it clears. Combined with the built-in Schmitt hysteresis dead-band; clamped up to a 5-minute floor.
 
 [drafts]
 # AUTO-DRAFT (#25, drafts.rs): compose a REVIEWABLE pending draft (an email reply /
@@ -313,6 +329,36 @@ enabled = true
 # Auditor cadence (defaults shown; absent = these values).
 interval_secs      = 300    # seconds between scans (the listening surface moves slowly)
 startup_delay_secs = 40     # wait after boot before the first scan
+
+[interception]
+# Traffic-Interception Integrity Check — "is anything MITMing me?" (interception.rs).
+# A slow, READ-ONLY read of THIS machine's OWN local config, each surface read via
+# a FIXED-ARG bounded subprocess (never a shell string), so the parsers are
+# CI-tested on canned output. It SENDS NO PACKETS and never touches another host:
+#   * `scutil --proxy`  — an unexpected system/PAC HTTP(S)/SOCKS proxy
+#   * `/etc/hosts`      — non-default entries that redirect a domain to a routable
+#                         IP (loud) or pin one to loopback (a block); the default
+#                         localhost/broadcasthost lines are expected, never flagged
+#   * non-Apple trusted ROOT CAs — `security dump-trust-settings -d` (the ADMIN
+#                         trust-settings domain — honest SKIP without privileges) +
+#                         the System-keychain certs (`security find-certificate -a`);
+#                         a rogue trusted root silently breaks ALL your TLS, so it is
+#                         surfaced LOUDLY
+#   * `scutil --dns`    — the configured resolvers (a LOOPBACK resolver means
+#                         something on-box is handling every lookup)
+#   * `profiles show`   — installed configuration/MDM profiles (user-domain
+#                         readable; system-domain -> honest SKIP)
+# Each finding is explained in PLAIN SPEECH; it emits the `security.interception`
+# telemetry frame + folds a summary into the posture readout. STRICTLY READ-ONLY:
+# no writes, no config changes, no remediation (not even a gated one) — removing a
+# proxy or a root CA is the user's own action in System Settings / Keychain Access.
+# Honest SKIP when a read needs a privilege the no-sudo daemon lacks — NEVER a
+# fabricated "clean". SHIPS ON (full-power default); with it false the check loop
+# is not spawned.
+enabled = true
+# Check cadence (defaults shown; absent = these values).
+interval_secs      = 300    # seconds between checks (local interception config moves slowly)
+startup_delay_secs = 50     # wait after boot before the first check
 
 [integrations]
 # Shared substrate for the Chart-2 integrations (GitHub, Slack, Google

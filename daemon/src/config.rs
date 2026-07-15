@@ -58,6 +58,21 @@ pub struct Config {
     /// the relevant Settings pane stays behind the standard per-action confirm gate.
     /// With it false the auditor loop is not spawned.
     pub exposure: ExposureConfig,
+    /// [interception] — TRAFFIC-INTERCEPTION INTEGRITY CHECK (interception.rs), a
+    /// defensive "is anything MITMing me?" check. `enabled` SHIPS ON (full-power
+    /// default). READ-ONLY DEFENSE: a slow check that reads THIS machine's OWN local
+    /// config via FIXED-ARG bounded subprocesses (it sends no packets and never
+    /// touches another host) — a system/PAC proxy (`scutil --proxy`), non-default
+    /// `/etc/hosts` entries, non-Apple trusted ROOT CAs (`security
+    /// dump-trust-settings -d` + the System keychain), the DNS resolvers (`scutil
+    /// --dns`), and installed configuration/MDM profiles (`profiles show`). It
+    /// explains each finding in plain speech (a rogue trusted root — which silently
+    /// breaks ALL TLS — is surfaced loudly), emits `security.interception`, and
+    /// folds a summary into the posture readout. It takes NO action — removing a
+    /// proxy or a root CA is the user's own action in System Settings / Keychain
+    /// Access. Honest SKIP when a read needs a privilege the no-sudo daemon lacks.
+    /// With it false the check loop is not spawned.
+    pub interception: InterceptionConfig,
     pub integrations: IntegrationsConfig,
     pub standing: StandingConfig,
     /// [drafts] — AUTO-DRAFT (#25, drafts.rs). `enabled` SHIPS ON (full-power
@@ -97,6 +112,16 @@ pub struct Config {
     /// make DARWIN ask MORE clarifying questions in a measurably-overconfident bucket,
     /// never act more boldly — off by default so the first landing is pure analytics.
     pub calibrate: CalibrateConfig,
+    /// [mirror] — MIRROR, belief-audit + contest over the SELF-MODEL (user_model.rs).
+    /// `enabled` SHIPS ON (full-power default): it is a READ-ONLY / REDUCE-ONLY
+    /// surface — "why do you think I prefer X" surfaces the STORED observation,
+    /// provenance, and observed-count (never a fabricated reason); "that's wrong
+    /// about X" DROPS the belief and writes a suppression tombstone so the
+    /// consolidation pass never re-derives it. Contesting only ever REMOVES a shared
+    /// `user.model.*` belief and suppresses it — it is structurally unable to touch a
+    /// private `agent.*` note, and does nothing consequential. Off => the voice arm
+    /// falls through to the model.
+    pub mirror: MirrorConfig,
     pub voice_id: VoiceIdConfig,
     pub episodic: EpisodicConfig,
     pub notebooks: NotebookConfig,
@@ -324,7 +349,10 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // [focus] — FOCUS PROFILES (#24, focus.rs). `profile` ships "default" (the
     // identity — today's behavior). PERMISSION-NEUTRAL: a profile only quiets
     // which non-consequential proactive intel surfaces, never loosens a gate.
-    ("focus", &["profile"]),
+    // `auto` (AUTO-FOCUS) ships OFF: when on, the live tick reselects the profile
+    // each tick from on-device signals through the SAME restrict-only path (it can
+    // only narrow further, never broaden).
+    ("focus", &["profile", "auto"]),
     ("apps", &["autostart"]),
     // [introspect] — the READ-ONLY micro-app introspection sentinel
     // (introspect.rs): SBPL profile-drift + per-app RSS/CPU anomaly surfacing.
@@ -345,6 +373,13 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // packets sent). SHIPS ON. It reports (security.exposure + a posture summary);
     // the only remediation is the gated open_settings_pane actuator.
     ("exposure", &["enabled", "interval_secs", "startup_delay_secs"]),
+    // [interception] — the TRAFFIC-INTERCEPTION INTEGRITY CHECK (interception.rs),
+    // a READ-ONLY "is anything MITMing me?" read of THIS machine's OWN local config
+    // (scutil --proxy / --dns, /etc/hosts, security dump-trust-settings -d + the
+    // System keychain, profiles show). No packets sent. SHIPS ON. It reports
+    // (security.interception + a posture summary) and closes nothing; honest SKIP
+    // when a read needs a privilege the no-sudo daemon lacks.
+    ("interception", &["enabled", "interval_secs", "startup_delay_secs"]),
     // [integrations] — `allow_consequential` is THE master gate for outward/
     // side-effecting actions. SHIPS ON (full-power default) — INERT-SAFE: a
     // CONFIRMED consequential action still clears confirm + voice-id + policy +
@@ -353,10 +388,14 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("integrations", &["allow_consequential"]),
     // [standing] — Standing Missions (standing.rs). `enabled` is the subsystem
     // master switch and SHIPS ON (full-power default). Even on, establishing a
-    // mission is itself a confirmation-gated action, and every consequential step a
-    // run takes still parks behind the confirm gate + allow_consequential, bounded to
-    // <=8 active missions under FURY caps — so it can never auto-send/post/spend.
-    ("standing", &["enabled"]),
+    // mission (incl. ARMING a TRIPWIRE) is itself a confirmation-gated action, and
+    // every consequential step a run takes still parks behind the confirm gate +
+    // allow_consequential, bounded to <=8 active missions under FURY caps — so it can
+    // never auto-send/post/spend. The TRIPWIRE (condition-trigger) knobs
+    // `condition_eval_secs` (evaluation cadence) + `condition_debounce_secs`
+    // (anti-flap re-fire floor) tune the reactive path; listed so neither reads as a
+    // typo.
+    ("standing", &["enabled", "condition_eval_secs", "condition_debounce_secs"]),
     // [drafts] — AUTO-DRAFT (#25, drafts.rs). `enabled` SHIPS ON (full-power default).
     // A draft is always a reviewable suggestion — the module has no send path, so this
     // flag never enables an autonomous send. `retention` bounds the pending-draft
@@ -428,6 +467,12 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
         "calibrate",
         &["enabled", "influence_routing", "n_bins", "min_sample", "overconfidence_margin", "max_widen"],
     ),
+    // [mirror] — MIRROR, belief-audit + contest over the self-model (user_model.rs).
+    // `enabled` SHIPS ON (read-only / reduce-only self-model surface: explain a
+    // belief with its stored provenance, or contest it — dropping it + writing a
+    // suppression tombstone the consolidation pass consults so it is never
+    // re-derived). Listed so it never reads as a typo.
+    ("mirror", &["enabled"]),
     // [voice_id] — on-device speaker verification (voiceid.rs). `enabled` is the
     // master switch and SHIPS OFF (deliberate: voice-id is a fail-closed GATE, not a
     // feature; enrollment is always explicit). With it false (or with no enrolled
@@ -1762,6 +1807,32 @@ impl Default for ExplainConfig {
     }
 }
 
+/// [mirror] — MIRROR, belief-audit + contest over the SELF-MODEL (user_model.rs). A
+/// READ-ONLY / REDUCE-ONLY, ARMED-BY-DEFAULT surface. "why do you think I prefer X"
+/// surfaces the STORED observation, provenance, and observed-count of that belief
+/// (never a fabricated reason); "that's wrong about X" DROPS the belief AND writes a
+/// `user.model.suppressed.*` tombstone that the consolidation pass consults so the
+/// belief is NEVER silently re-derived (the tombstone is user-clearable). It emits
+/// the secret-free `mirror.belief` telemetry frame.
+///
+///   - `enabled` (SHIPS ON, full-power default): master gate for the explain +
+///     contest voice arm. Off => "why do you think…" / "that's wrong…" fall through
+///     to the model. Contest is REDUCE-ONLY (removes/suppresses a SHARED belief; it
+///     is structurally unable to touch a private `agent.*` note) — no autonomy.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MirrorConfig {
+    pub enabled: bool,
+}
+
+impl Default for MirrorConfig {
+    fn default() -> Self {
+        // SHIPS ON — a read-only / reduce-only self-model surface: it only ever
+        // EXPLAINS a stored belief or REMOVES + suppresses one at the user's word.
+        Self { enabled: true }
+    }
+}
+
 /// [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
 /// A READ-ONLY fold over the recent (confidence, outcome) window into a reliability
 /// curve + a scalar over/under-confidence gap (ECE-style), with a MIN_SAMPLE floor
@@ -2600,6 +2671,14 @@ impl Default for ProactiveConfig {
 /// named CUSTOM profile — which is itself restrict-only (it can only quiet, never
 /// broaden), so a typo can never accidentally LOOSEN anything. Parsed by
 /// `focus::FocusProfile::from_config_str`.
+///
+/// `auto` (AUTO-FOCUS, focus.rs `select_profile`) ships OFF: when on, the live
+/// anticipation tick reselects the active profile each tick from ON-DEVICE signals
+/// (acoustic scene + fused presence + calendar + time) and applies it through the
+/// SAME restrict-only `apply_profile` path (composed on top of `profile`), so it
+/// can only ever narrow further — never broaden past the configured profile,
+/// enable an action, or loosen a gate. Opt-in because it changes what surfaces
+/// based on sensed room state.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct FocusConfig {
@@ -2607,14 +2686,27 @@ pub struct FocusConfig {
     /// `focus::FocusProfile::from_config_str`; an unknown value is a named custom
     /// profile (restrict-only) and a blank degrades to "default".
     pub profile: String,
+    /// AUTO-FOCUS (focus.rs `select_profile`): when true, the LIVE anticipation
+    /// tick RESELECTS the active profile each tick from ON-DEVICE signals (acoustic
+    /// scene + fused presence + calendar + time-of-day) instead of holding the
+    /// static `profile`. Ships OFF: it changes what surfaces based on SENSED room
+    /// state, so it is opt-in like the other sensing sections. Auto is
+    /// permission-neutral BY CONSTRUCTION — the auto-selected profile is applied
+    /// through the SAME restrict-only `apply_profile` path (composed ON TOP of the
+    /// configured `profile`), so it can only ever NARROW further, never broaden past
+    /// the configured profile or enable/loosen anything. With it OFF, focus behaves
+    /// exactly as today (the configured `profile` is used byte-for-byte).
+    pub auto: bool,
 }
 
 impl Default for FocusConfig {
     /// Ships NEUTRAL: the "default" profile is the identity, reproducing today's
-    /// proactive behavior with no profile active.
+    /// proactive behavior with no profile active. Auto-Focus ships OFF (sensed-
+    /// state selection is opt-in).
     fn default() -> Self {
         FocusConfig {
             profile: "default".to_string(),
+            auto: false,
         }
     }
 }
@@ -2746,6 +2838,34 @@ impl Default for ExposureConfig {
         // On by default — it only reads the local socket table and reports. The
         // cadence matches the other defensive sentinels (a slow scan).
         Self { enabled: true, interval_secs: 300, startup_delay_secs: 40 }
+    }
+}
+
+/// [interception] — the TRAFFIC-INTERCEPTION INTEGRITY CHECK (interception.rs): a
+/// READ-ONLY "is anything MITMing me?" read of THIS machine's OWN local config — a
+/// system/PAC proxy, non-default `/etc/hosts` entries, non-Apple trusted ROOT CAs,
+/// the DNS resolvers, and installed configuration/MDM profiles. It sends no packets
+/// and never touches another host. It only observes and reports (plain-speech
+/// findings + secret-free counts); it closes/removes nothing. Honest SKIP when a
+/// read needs a privilege the no-sudo daemon lacks.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct InterceptionConfig {
+    /// Master switch for the check loop. SHIPS ON (read-only observability).
+    pub enabled: bool,
+    /// Seconds between checks (local interception config moves on the order of
+    /// installs, not seconds).
+    pub interval_secs: u64,
+    /// Seconds to wait after boot before the first check (let the box settle).
+    pub startup_delay_secs: u64,
+}
+
+impl Default for InterceptionConfig {
+    fn default() -> Self {
+        // On by default — it only reads local config and reports. The cadence
+        // matches the other defensive sentinels (a slow scan); the startup delay is
+        // a touch later so the sentinels don't all fire at once.
+        Self { enabled: true, interval_secs: 300, startup_delay_secs: 50 }
     }
 }
 
@@ -3123,16 +3243,35 @@ impl Default for PluginSdkConfig {
 #[serde(default)]
 pub struct StandingConfig {
     pub enabled: bool,
+    /// TRIPWIRE (condition-trigger) EVALUATION CADENCE, seconds: the minimum interval
+    /// between evaluations of condition triggers ([`crate::standing::Schedule::Condition`])
+    /// against a fresh signal snapshot on the standing scheduler tick. Default 60s.
+    /// The standing tick itself bounds the practical maximum frequency; lowering this
+    /// only makes tripwires no LESS responsive than the tick. A condition trigger may
+    /// only READ + REASON — evaluating it never actuates anything.
+    pub condition_eval_secs: u64,
+    /// TRIPWIRE DEBOUNCE / RATE-LIMIT, seconds: the minimum interval between successive
+    /// FIRES of the SAME condition trigger after it clears — so a flapping signal can
+    /// never spam. Combined with the built-in Schmitt hysteresis dead-band, this keeps
+    /// a jittery reading from re-firing. Clamped UP to a 5-minute floor
+    /// ([`crate::standing::MIN_CONDITION_DEBOUNCE_SECS`]). Default 3600s (1h).
+    pub condition_debounce_secs: u64,
 }
 
 impl Default for StandingConfig {
     fn default() -> Self {
-        // SHIPS ON (full-power default). Even on: establishing a mission is itself
-        // confirmation-gated (standing_create is in CONSEQUENTIAL_TOOLS), every
-        // consequential step a run takes still parks behind the confirm gate +
-        // allow_consequential, and it is bounded to <=8 active missions under FURY
-        // caps. A standing mission can never auto-send/post/spend.
-        Self { enabled: true }
+        // SHIPS ON (full-power default). Even on: establishing a mission (including
+        // ARMING a tripwire) is itself confirmation-gated (standing_create is in
+        // CONSEQUENTIAL_TOOLS), every consequential step a run takes still parks
+        // behind the confirm gate + allow_consequential, and it is bounded to <=8
+        // active missions under FURY caps. A standing mission can never
+        // auto-send/post/spend. The tripwire cadence/debounce default to a
+        // conservative 60s evaluation / 1h re-fire floor.
+        Self {
+            enabled: true,
+            condition_eval_secs: 60,
+            condition_debounce_secs: 3600,
+        }
     }
 }
 
@@ -3492,6 +3631,7 @@ impl Config {
             introspect: section(&table, "introspect", &mut issues),
             persistence: section(&table, "persistence", &mut issues),
             exposure: section(&table, "exposure", &mut issues),
+            interception: section(&table, "interception", &mut issues),
             integrations: section(&table, "integrations", &mut issues),
             standing: section(&table, "standing", &mut issues),
             drafts: section(&table, "drafts", &mut issues),
@@ -3502,6 +3642,7 @@ impl Config {
             optimize: section(&table, "optimize", &mut issues),
             explain: section(&table, "explain", &mut issues),
             calibrate: section(&table, "calibrate", &mut issues),
+            mirror: section(&table, "mirror", &mut issues),
             voice_id: section(&table, "voice_id", &mut issues),
             episodic: section(&table, "episodic", &mut issues),
             notebooks: section(&table, "notebooks", &mut issues),
@@ -3783,6 +3924,30 @@ mod tests {
         );
         assert!(cfg.power.adaptive);
         assert_eq!(cfg.power.low_battery_pct, 15);
+    }
+
+    /// AUTO-FOCUS: [focus].profile ships "default" (the identity) and [focus].auto
+    /// ships OFF (sensed-state selection is opt-in). Both keys are KNOWN (no
+    /// unknown-key diagnostic) and round-trip, and enabling auto takes.
+    #[test]
+    fn focus_defaults_neutral_auto_off_and_keys_known() {
+        let (cfg, issues) = Config::parse("");
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(cfg.focus.profile, "default", "[focus].profile ships the identity");
+        assert!(!cfg.focus.auto, "[focus].auto ships OFF (opt-in sensed-state selection)");
+
+        let raw = r#"
+            [focus]
+            profile = "work"
+            auto = true
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        assert!(
+            !issues.iter().any(|i| i.contains("focus")),
+            "[focus] keys must be KNOWN (no diagnostic): {issues:?}"
+        );
+        assert_eq!(cfg.focus.profile, "work");
+        assert!(cfg.focus.auto, "enabling auto must take");
     }
 
     /// Contract lockstep: [proactive] defaults are enabled=true,
@@ -4288,6 +4453,34 @@ mod tests {
         assert!(
             issues.iter().any(|i| i.contains("standing.enabledd")),
             "typo'd standing key must be reported: {issues:?}"
+        );
+    }
+
+    /// TRIPWIRE (condition-trigger) config: the evaluation cadence + anti-flap
+    /// re-fire debounce default conservatively, parse as known keys, and are
+    /// operator-overridable; a typo is diagnosed.
+    #[test]
+    fn standing_tripwire_keys_default_and_are_known() {
+        let (cfg, issues) = Config::parse("");
+        assert!(issues.is_empty());
+        assert_eq!(cfg.standing.condition_eval_secs, 60, "eval cadence defaults to 60s");
+        assert_eq!(cfg.standing.condition_debounce_secs, 3600, "re-fire debounce defaults to 1h");
+
+        let raw = r#"
+            [standing]
+            condition_eval_secs = 30
+            condition_debounce_secs = 1800
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        assert!(issues.is_empty(), "tripwire keys must be known: {issues:?}");
+        assert_eq!(cfg.standing.condition_eval_secs, 30);
+        assert_eq!(cfg.standing.condition_debounce_secs, 1800);
+
+        // A typo'd tripwire key is reported, not silently swallowed.
+        let (_cfg, issues) = Config::parse("[standing]\ncondition_evl_secs = 30\n");
+        assert!(
+            issues.iter().any(|i| i.contains("standing.condition_evl_secs")),
+            "typo'd tripwire key must be reported: {issues:?}"
         );
     }
 
@@ -5254,6 +5447,37 @@ mod tests {
         assert!(
             issues.iter().any(|i| i.contains("introspect.interval_sec")),
             "a typo'd [introspect] key must be reported: {issues:?}"
+        );
+    }
+
+    /// Contract lockstep: [interception] ships enabled=TRUE (full-power default) —
+    /// the READ-ONLY "is anything MITMing me?" check is armed. Keys parse cleanly; a
+    /// typo is diagnosed; an absent section keeps the shipped defaults.
+    #[test]
+    fn interception_full_section_parses_and_a_typo_is_caught() {
+        let raw = r#"
+            [interception]
+            enabled = false
+            interval_secs = 120
+            startup_delay_secs = 5
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        assert!(issues.is_empty(), "clean [interception] must parse: {issues:?}");
+        assert!(!cfg.interception.enabled, "the operator can turn the check off");
+        assert_eq!(cfg.interception.interval_secs, 120);
+        assert_eq!(cfg.interception.startup_delay_secs, 5);
+
+        // An absent section keeps the shipped ON defaults (read-only observability).
+        let (def, _) = Config::parse("");
+        assert!(def.interception.enabled, "traffic-interception check SHIPS ON (full-power default)");
+        assert_eq!(def.interception.interval_secs, 300);
+        assert_eq!(def.interception.startup_delay_secs, 50);
+
+        // A typo'd key is reported, not silently swallowed.
+        let (_c, issues) = Config::parse("[interception]\ninterval_sec = 30\n");
+        assert!(
+            issues.iter().any(|i| i.contains("interception.interval_sec")),
+            "a typo'd [interception] key must be reported: {issues:?}"
         );
     }
 

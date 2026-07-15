@@ -97,6 +97,15 @@ mod genproxy;
 mod heal;
 mod inference;
 mod integrations;
+// TRAFFIC-INTERCEPTION INTEGRITY CHECK (interception.rs): a DEFENSIVE, READ-ONLY
+// "is anything MITMing me?" check over THIS machine's OWN local config — a
+// configured proxy/PAC (scutil --proxy), non-default /etc/hosts entries,
+// non-Apple trusted ROOT CAs (security dump-trust-settings -d + the System
+// keychain), the DNS resolvers (scutil --dns), and installed configuration/MDM
+// profiles. It sends no packets and touches no other host; it emits
+// security.interception and folds a summary into the posture readout. Honest SKIP
+// when a read needs a privilege the no-sudo daemon lacks; it observes, never acts.
+mod interception;
 // CONTINUOUS LIVE INTERPRETATION (#30): the PURE per-segment interpret pipeline
 // (interpret_segment: transcript -> on-device-LLM translate -> rendered translation +
 // optional speak request) using an injectable translator; offline/unavailable degrades
@@ -1036,6 +1045,14 @@ const ANTICIPATE_INTERVAL: Duration = Duration::from_secs(60);
 /// room, so presence gates everything (anticipate::Signals.present).
 const ANTICIPATE_PRESENCE_WINDOW_SECS: u64 = 10 * 60;
 
+/// AUTO-FOCUS calendar window (focus::calendar_state). We have no per-event END
+/// time, so a bounded window around the start is the honest "in a meeting" proxy:
+/// a meeting counts as in-progress from IMMINENT minutes before it starts through
+/// LOOKBACK minutes after (a typical meeting length). Only consulted when
+/// `[focus].auto` is on.
+const AUTO_FOCUS_MEETING_IMMINENT_MIN: i64 = 5;
+const AUTO_FOCUS_MEETING_LOOKBACK_MIN: i64 = 60;
+
 /// EDITH's live anticipation loop (runtime-only; never run in tests). Each tick
 /// it builds a verified `Signals` snapshot from the cached telemetry reading and
 /// presence, runs the PURE [`anticipate::evaluate`] with the configured policy +
@@ -1067,18 +1084,31 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
     // autonomy field, so applying it cannot loosen the gate, enable an action, or
     // raise autonomy — it only filters categories, tightens brief verbosity, and
     // can quiet the suggestion feed.
-    let focus_profile = focus::FocusProfile::from_config_str(&cfg.focus.profile);
-    let tuned = focus::apply_profile(&focus_profile, &focus::BaseBehavior::default());
+    let configured_profile = focus::FocusProfile::from_config_str(&cfg.focus.profile);
+    let configured_tuned = focus::apply_profile(&configured_profile, &focus::BaseBehavior::default());
+    // AUTO-FOCUS (opt-in, `[focus].auto`, ships OFF): when on, the active profile
+    // is RESELECTED each tick from ON-DEVICE signals (acoustic scene + fused
+    // presence + calendar + time) and applied ON TOP of the configured profile
+    // through the SAME restrict-only `apply_profile` path — so it can only ever
+    // NARROW further, never broaden past the configured profile or the base, and
+    // (like the static profile) it never enables an action, raises autonomy, or
+    // touches a gate. Read ONCE at loop entry (same as the static profile). With
+    // it OFF the configured profile is used byte-for-byte as today.
+    let auto_focus = cfg.focus.auto;
     // Surface the active focus posture ONCE so the HUD can show which lens is
     // active and state the permission-neutral contract from the wire (the card
     // carries permission_neutral=true / raises_autonomy=false / loosens_gate=false
     // — not a HUD hardcode). PERMISSION-NEUTRAL by construction: TunedBehavior has
-    // no gate/permission/autonomy field to leak.
+    // no gate/permission/autonomy field to leak. In auto mode the per-tick selector
+    // re-emits `focus.active` whenever its choice changes.
     telemetry::emit(
         "agent.edith",
         "focus.active",
-        tuned.telemetry(focus_profile.clone()),
+        configured_tuned.telemetry(configured_profile.clone()),
     );
+    // The last auto choice we emitted a `focus.active` frame for, so we emit one
+    // ONLY when the auto selection actually changes (secret-free, bounded chatter).
+    let mut last_auto_choice: Option<focus::ProfileChoice> = None;
     let mut fired = FiredState::default();
     // Throttle caches for the external (network) signals, carried across ticks so
     // calendar/mail are refreshed on an interval rather than every 60s tick.
@@ -1131,6 +1161,48 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
         )
         .await;
 
+        // AUTO-FOCUS (opt-in): reselect the active profile from ON-DEVICE signals
+        // this tick and compose it ON TOP of the configured profile through the
+        // SAME restrict-only `apply_profile` path, so `tuned` can only NARROW
+        // further than the configured floor (never broaden, never enable/loosen).
+        // Signals are all on-device: the fused presence (`attention`), the calendar
+        // busy-state derived from the SAME upcoming-events the evaluator sees, the
+        // time-of-day over the operator's quiet band, and the acoustic scene —
+        // which ships inert (no bundled classifier / capture tap unwired), so it is
+        // honestly `Unknown` here and selection rides presence/calendar/time until
+        // scene.rs's tap is built. Emits `focus.active` only when the choice
+        // changes. When `[focus].auto` is OFF this whole block is skipped and the
+        // configured profile is used byte-for-byte as today.
+        let auto_tuned = if auto_focus {
+            let fsignals = focus::FocusSignals {
+                scene: focus::AcousticScene::Unknown,
+                presence: attention,
+                calendar: focus::calendar_state(
+                    &signals.events,
+                    AUTO_FOCUS_MEETING_IMMINENT_MIN,
+                    AUTO_FOCUS_MEETING_LOOKBACK_MIN,
+                ),
+                time: focus::TimeOfDay::from_local_hour(
+                    local_hour,
+                    policy.quiet_start,
+                    policy.quiet_end,
+                ),
+            };
+            let choice = focus::select_profile(fsignals);
+            let composed = focus::apply_profile(&choice.profile, &configured_tuned.as_base());
+            if last_auto_choice.as_ref() != Some(&choice) {
+                telemetry::emit("agent.edith", "focus.active", choice.telemetry(&composed));
+                info!(profile = ?choice.profile, reason = choice.reason, "auto-focus: selection changed");
+                last_auto_choice = Some(choice);
+            }
+            Some(composed)
+        } else {
+            None
+        };
+        // The behavior in force this tick: the per-tick auto selection when on,
+        // else the once-resolved configured profile (identical to today).
+        let tuned: &focus::TunedBehavior = auto_tuned.as_ref().unwrap_or(&configured_tuned);
+
         // PROACTIVE-INTELLIGENCE SUGGESTIONS (#13 habit detector + #14 predictive
         // suggester). Runs every tick, INDEPENDENT of the EDITH brief decision
         // below (a suggestion is a separate surface). GATED by [proactive].suggest
@@ -1168,7 +1240,7 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
         // non-empty digest is the multi-item glance, an empty one honestly says
         // nothing surfaced (never padded — so we only emit when non-empty).
         let brief_signals = signals::brief_signals_from_snapshot(&signals, &policy);
-        let smart_brief = brief::build_brief(&brief_signals, &tuned);
+        let smart_brief = brief::build_brief(&brief_signals, tuned);
         if !smart_brief.empty {
             telemetry::emit("agent.edith", "proactive.digest", smart_brief.telemetry());
         }
@@ -1324,6 +1396,15 @@ async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, soc
     // event loop's client (mirrors anticipation_task / reflect.rs).
     let mut infer = InferenceClient::new(sock);
     let registry = agents::AgentRegistry::canonical();
+    // TRIPWIRE (condition-trigger) state carried across ticks at the loop edge (like
+    // the anticipation loop's FiredState/CollectorState): the debounce/hysteresis
+    // ledger, the throttle cache for the network signals the snapshot needs, and the
+    // last-eval stamp for the condition-eval cadence. The pure tripwire scheduler
+    // (`standing::due_condition_missions`) threads the ledger; nothing here is
+    // persisted (a restart safely re-arms).
+    let mut tripwire_ledger = standing::TripwireLedger::default();
+    let mut collector = signals::CollectorState::new();
+    let mut last_condition_eval: u64 = 0;
 
     loop {
         tokio::time::sleep(STANDING_INTERVAL).await;
@@ -1335,10 +1416,14 @@ async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, soc
         // master_enabled=false, so NOTHING is ever due (no recurring autonomy
         // fires when locked). With lockdown OFF this is byte-for-byte the
         // configured `[standing].enabled`.
-        let enabled = {
+        let (enabled, condition_eval_secs, condition_debounce_secs) = {
             let (live, _issues) =
                 Config::load(&root.join("config").join("darwin.toml"));
-            live.standing.enabled && !lockdown::is_locked_down()
+            (
+                live.standing.enabled && !lockdown::is_locked_down(),
+                live.standing.condition_eval_secs,
+                live.standing.condition_debounce_secs,
+            )
         };
 
         let now = SystemTime::now()
@@ -1368,13 +1453,71 @@ async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, soc
             &signals_present,
             enabled,
         );
-        if due.is_empty() {
-            continue; // OFF, or nothing due this tick.
+
+        // TRIPWIRE (condition) triggers: fire on a threshold crossing of the verified
+        // signal snapshot rather than the clock. Only evaluated when the subsystem is
+        // enabled, at least one enabled condition mission exists, and the configured
+        // eval cadence has elapsed — so NO snapshot is built (no network read) when
+        // there are no tripwires. A firing tripwire launches the SAME bounded run as
+        // a time mission (RE-REASONED each fire), and its consequential steps still
+        // park. The pure scheduler `standing::due_condition_missions` applies the
+        // hysteresis/debounce via the ledger and honors the same master-switch guard.
+        let mut condition_due: Vec<&standing::StandingMission> = Vec::new();
+        let have_tripwires = missions
+            .iter()
+            .any(|m| m.enabled && m.schedule.is_condition());
+        if enabled
+            && have_tripwires
+            && now.saturating_sub(last_condition_eval) >= condition_eval_secs
+        {
+            last_condition_eval = now;
+            let present = secs_since_last_interaction(&memory)
+                .await
+                .is_some_and(|s| s <= ANTICIPATE_PRESENCE_WINDOW_SECS);
+            let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+            let signals = signals::collect_signals(
+                &mut collector,
+                telemetry::latest_snapshot(),
+                present,
+                now,
+                &now_rfc3339,
+                signals::DEFAULT_REFRESH_SECS,
+            )
+            .await;
+            condition_due = standing::due_condition_missions(
+                &missions,
+                &signals,
+                now,
+                &mut tripwire_ledger,
+                enabled,
+                condition_debounce_secs,
+            );
+        }
+
+        if due.is_empty() && condition_due.is_empty() {
+            continue; // OFF, or nothing due on either axis this tick.
         }
 
         let cloud_reachable = anthropic::resolve_api_key().await.is_some();
         let model = cfg.cloud.heavy_model.clone();
-        for mission in due {
+        // Run the time-due and tripwire-due missions through the SAME bounded engine.
+        // The two sets are disjoint (a Condition schedule is never clock-due), so no
+        // mission runs twice; the flag only decides whether to surface the extra
+        // `standing.tripwire` "why it fired" frame first.
+        let to_run = due
+            .into_iter()
+            .map(|m| (m, false))
+            .chain(condition_due.into_iter().map(|m| (m, true)));
+        for (mission, is_tripwire) in to_run {
+            // TRIPWIRE: surface WHY it fired (the condition that tripped) before the
+            // run, so the HUD can distinguish a reactive fire from a scheduled one.
+            if is_tripwire {
+                telemetry::emit(
+                    "agent.fury",
+                    "standing.tripwire",
+                    standing::tripwire_fired_telemetry(mission),
+                );
+            }
             // Run through the SAME cloud-backed planner/dispatcher fury_mission
             // uses — each sub-task runs as its OWNING specialist under that
             // specialist's allowlist + the consequential gate. No escalation.
@@ -2074,6 +2217,16 @@ async fn main() -> Result<()> {
     // Self-learning reflection: periodically consolidates facts from recent
     // transcripts (own InferenceClient; never blocks or panics the pipeline).
     tokio::spawn(reflect::reflection_task(sock_path.clone(), memory.clone()));
+    // MIRROR: emit the initial self-model belief SNAPSHOT so a HUD that connects at
+    // startup populates its MIRROR panel immediately (the snapshot frame is
+    // sticky-retained + replayed on connect). Best-effort + read-only; the reflection
+    // pass refreshes it each cycle and every explain/contest emits a fresh frame.
+    {
+        let mem = memory.clone();
+        tokio::spawn(async move {
+            crate::user_model::emit_belief_frame(&mem, "snapshot", "", false).await;
+        });
+    }
     // EDITH anticipation: the runtime-only proactive loop. The pure evaluator
     // (anticipate.rs) is what the tests cover; this live tick surfaces a HUD
     // card unprompted and, ONLY when [proactive].speak is on (ships ON) and the
@@ -2200,6 +2353,23 @@ async fn main() -> Result<()> {
         tokio::spawn(exposure::sentinel_task(
             cfg.exposure.startup_delay_secs,
             cfg.exposure.interval_secs,
+        ));
+    }
+    // Ambient TRAFFIC-INTERCEPTION INTEGRITY CHECK ("is anything MITMing me?"): a
+    // slow, READ-ONLY read of THIS machine's OWN local config — a system/PAC proxy
+    // (scutil --proxy), non-default /etc/hosts entries, non-Apple trusted ROOT CAs
+    // (security dump-trust-settings -d + the System keychain), the DNS resolvers
+    // (scutil --dns), and installed configuration/MDM profiles (profiles show). It
+    // sends no packets and never touches another host. It classifies each finding
+    // in plain speech (a rogue trusted root — which silently breaks ALL TLS — is
+    // surfaced loudly), emits `security.interception`, and folds a summary into the
+    // posture readout. Honest SKIP when a read needs a privilege the no-sudo daemon
+    // lacks (the admin trust-settings / system-domain profiles). It closes nothing.
+    // Ships ON ([interception].enabled); with it false the loop is not spawned.
+    if cfg.interception.enabled {
+        tokio::spawn(interception::sentinel_task(
+            cfg.interception.startup_delay_secs,
+            cfg.interception.interval_secs,
         ));
     }
     // Ambient micro-app introspection: a slow, READ-ONLY sentinel over darwind's
