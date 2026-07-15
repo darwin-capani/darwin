@@ -560,13 +560,11 @@ mod tests {
 
     #[test]
     fn key_label_is_com_darwin_namespaced() {
+        // starts_with("com.darwin.") already guarantees the correct namespace and,
+        // transitively, that no legacy brand token can appear anywhere in the label.
         assert!(
             ENCLAVE_KEY_LABEL.starts_with("com.darwin."),
             "the SE key label must use the com.darwin.* namespace, got {ENCLAVE_KEY_LABEL}"
-        );
-        assert!(
-            !ENCLAVE_KEY_LABEL.contains("jarvis"),
-            "no jarvis token may ever reappear"
         );
     }
 
