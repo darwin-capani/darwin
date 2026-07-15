@@ -445,6 +445,23 @@ impl AuditLog {
         Ok(head)
     }
 
+    /// The `entry_hash` stored at a specific `seq`, or `None` when no entry has that
+    /// seq (pruned away, or never existed). Read-only. Lets the external-anchor check
+    /// tell a legitimate append-only EXTENSION (the witnessed entry is still present
+    /// unchanged and the chain merely grew past it) from a genuine REWRITE (the entry
+    /// at the witnessed seq changed).
+    pub async fn hash_at_seq(&self, seq: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().await;
+        let h = conn
+            .query_row(
+                "SELECT entry_hash FROM audit WHERE seq = ?1",
+                params![seq],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(h)
+    }
+
     /// Read the live chain HEAD and WRITE it (as `"<seq>:<entry_hash>"`) to the
     /// EXTERNAL `anchor`, returning the witnessed `(seq, head)` — or `None` on an
     /// empty chain (nothing to witness, so no anchor is written). Call after a
@@ -479,19 +496,45 @@ impl AuditLog {
             // but the redact pass is the module's blanket discipline).
             return Ok(AnchorStatus::Malformed { raw_redacted: crate::optimize::redact(&raw) });
         };
-        let live = self.head().await?;
-        let is_match = match &live {
-            Some((l_seq, l_head)) => *l_seq == a_seq && *l_head == a_head,
-            None => false,
+        let Some((l_seq, l_head)) = self.head().await? else {
+            // An anchor exists but the live chain is EMPTY — the whole chain vanished
+            // from under the witness. Not legitimate growth: a genuine divergence.
+            return Ok(AnchorStatus::Mismatch { anchored_seq: a_seq, anchored_head: a_head, live: None });
         };
-        if is_match {
-            Ok(AnchorStatus::Match { seq: a_seq, head: a_head })
-        } else {
-            Ok(AnchorStatus::Mismatch {
+        // Exact corroboration.
+        if l_seq == a_seq && l_head == a_head {
+            return Ok(AnchorStatus::Match { seq: a_seq, head: a_head });
+        }
+        // Not exact. Distinguish a legitimate APPEND-ONLY extension from a REWRITE by
+        // asking whether the WITNESSED entry is still present, unchanged, at its seq.
+        // Without this the check false-alarms on EVERY boot after any new record —
+        // append-only growth advances the head — training operators to ignore it and
+        // nullifying the tamper detection the anchor exists to provide.
+        match self.hash_at_seq(a_seq).await? {
+            // Witnessed entry intact and the chain only grew past it: benign extension.
+            Some(h) if h == a_head && l_seq >= a_seq => {
+                Ok(AnchorStatus::Extended { anchored_seq: a_seq, anchored_head: a_head, live: (l_seq, l_head) })
+            }
+            // An entry EXISTS at the witnessed seq but its hash CHANGED: the chain was
+            // rewritten under the witness — the exact offline full-rewrite tamper the
+            // external anchor catches (and that verify_chain alone cannot). A rare
+            // local prune+re-root of a still-present witnessed entry also lands here
+            // (documented residual — a prune is uncommon at the generous retention cap).
+            Some(_) => Ok(AnchorStatus::Mismatch {
                 anchored_seq: a_seq,
                 anchored_head: a_head,
-                live,
-            })
+                live: Some((l_seq, l_head)),
+            }),
+            // No entry at the witnessed seq: below the live head it was legitimately
+            // pruned away (bounded retention) — benign; at/above it the chain shrank.
+            None if a_seq < l_seq => {
+                Ok(AnchorStatus::Extended { anchored_seq: a_seq, anchored_head: a_head, live: (l_seq, l_head) })
+            }
+            None => Ok(AnchorStatus::Mismatch {
+                anchored_seq: a_seq,
+                anchored_head: a_head,
+                live: Some((l_seq, l_head)),
+            }),
         }
     }
 
@@ -706,10 +749,19 @@ pub enum AnchorStatus {
     /// The live head equals the witnessed head at the same seq — the chain is
     /// externally corroborated up to that point.
     Match { seq: i64, head: String },
-    /// The live head differs from the witnessed head. Honestly AMBIGUOUS: an
-    /// offline full-chain rewrite (the tamper this catches that `verify_chain`
-    /// cannot), OR legitimate growth / pruning since the anchor was last written.
-    /// Both witnessed and live are carried so the caller can interpret.
+    /// The live head advanced PAST the witnessed head by legitimate APPEND-ONLY
+    /// growth (or bounded pruning) — the witnessed entry is still corroborated at its
+    /// seq, so this is NOT a tamper. Benign: the caller advances the witness to the
+    /// live head.
+    Extended {
+        anchored_seq: i64,
+        anchored_head: String,
+        live: (i64, String),
+    },
+    /// The live head differs from the witnessed head in a way that is NOT legitimate
+    /// growth: the entry at the witnessed seq CHANGED, or the chain shrank/vanished —
+    /// the offline full-chain rewrite the external anchor catches that `verify_chain`
+    /// cannot. Both witnessed and live are carried so the caller can interpret.
     Mismatch {
         anchored_seq: i64,
         anchored_head: String,
@@ -744,6 +796,14 @@ pub fn anchor_status_json(status: &AnchorStatus) -> serde_json::Value {
         AnchorStatus::NoAnchor => serde_json::json!({ "ok": true, "state": "no_anchor" }),
         AnchorStatus::Match { seq, head } => serde_json::json!({
             "ok": true, "state": "match", "seq": seq, "head": head,
+        }),
+        AnchorStatus::Extended { anchored_seq, anchored_head, live } => serde_json::json!({
+            "ok": true,
+            "state": "extended",
+            "anchored_seq": anchored_seq,
+            "anchored_head": anchored_head,
+            "live_seq": live.0,
+            "live_head": live.1,
         }),
         AnchorStatus::Mismatch { anchored_seq, anchored_head, live } => serde_json::json!({
             "ok": false,
@@ -1481,6 +1541,51 @@ mod tests {
                 assert!(live.is_some(), "the live head is reported alongside the witnessed one");
             }
             other => panic!("a full rewrite must mismatch the anchor, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn append_only_growth_is_extended_not_a_mismatch() {
+        // THE bug the review caught: after anchoring, ordinary new records advance the
+        // head every session, and the check must NOT cry tamper on legitimate
+        // append-only growth (else it false-alarms every boot → alarm fatigue).
+        let log = AuditLog::in_memory().unwrap();
+        log_some(&log).await; // seqs 1,2,3
+        let anchor = MemAnchor::default();
+        let (a_seq, a_head) = log.anchor_to(&anchor).await.unwrap().unwrap();
+        log_some(&log).await; // a new session grows the chain: seqs 4,5,6
+        match log.verify_against_anchor(&anchor).await.unwrap() {
+            AnchorStatus::Extended { anchored_seq, anchored_head, live } => {
+                assert_eq!(anchored_seq, a_seq);
+                assert_eq!(anchored_head, a_head, "witnessed entry still corroborated");
+                assert!(live.0 > a_seq, "the chain grew past the witness");
+            }
+            other => panic!("append-only growth must be Extended (benign), got {other:?}"),
+        }
+        // reanchor-on-start advances the witness forward on a benign Extended, so it
+        // does NOT stick — the next check is an exact match.
+        let (new_seq, _) = log.anchor_to(&anchor).await.unwrap().unwrap();
+        assert!(new_seq > a_seq);
+        assert!(log.verify_against_anchor(&anchor).await.unwrap().is_match());
+    }
+
+    #[tokio::test]
+    async fn a_changed_witnessed_entry_is_a_mismatch_even_when_the_chain_grew() {
+        // Growth is no cover for tampering: if the entry at the witnessed seq changed,
+        // it is a Mismatch even though the chain also grew past it.
+        let log = AuditLog::in_memory().unwrap();
+        log_some(&log).await; // 1,2,3
+        let anchor = MemAnchor::default();
+        let (a_seq, _) = log.anchor_to(&anchor).await.unwrap().unwrap();
+        {
+            let conn = log.conn.lock().await;
+            conn.execute("UPDATE audit SET entry_hash = 'deadbeef' WHERE seq = ?1", params![a_seq])
+                .unwrap();
+        }
+        log_some(&log).await; // still grows the head
+        match log.verify_against_anchor(&anchor).await.unwrap() {
+            AnchorStatus::Mismatch { anchored_seq, .. } => assert_eq!(anchored_seq, a_seq),
+            other => panic!("a changed witnessed entry must Mismatch, got {other:?}"),
         }
     }
 

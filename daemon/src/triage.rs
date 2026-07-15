@@ -417,7 +417,12 @@ async fn gather_processes() -> (Section, Section) {
             ReadOutput::Unavailable(_) => Signing::Unknown,
         };
         let line = format!("{path} | {}\n", verdict.label());
-        sign_body.push_str(&crate::introspect::redact_home(&line));
+        // Route through the SAME redaction as every other section — home-strip THEN
+        // token/PII redaction. signing.txt was previously home-stripped only, so a
+        // secret-shaped path component (or a non-$HOME user path) landed verbatim
+        // while the identical path in processes.txt was collapsed to [redacted] (the
+        // review caught the inconsistency + the module-header invariant it violated).
+        sign_body.push_str(&crate::optimize::redact(&crate::introspect::redact_home(&line)));
         assessed += 1;
     }
     let signing = Section {
