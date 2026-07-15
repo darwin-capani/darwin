@@ -501,8 +501,8 @@ pub fn verify_command_token(presented: &str) -> bool {
 ///     with `remote tcp` host-name filters for the listed hosts (plus DNS);
 ///     empty list => no network at all,
 ///   - mach lookups the loader needs (dyld, the system framework registry).
-/// Everything else — other filesystem, other network, the microphone, GPU,
-/// the window server, the memory DB, secrets — stays denied by the opener.
+///     Everything else — other filesystem, other network, the microphone, GPU,
+///     the window server, the memory DB, secrets — stays denied by the opener.
 pub fn generate_sbpl(
     manifest: &AppManifest,
     project_root: &Path,
@@ -1198,13 +1198,13 @@ impl AppRegistry {
     /// Re-reads the app's on-disk `manifest.toml`, then drives
     /// [`crate::plugin_sdk::register_plugin`] with the app's CURRENT launch token
     /// + nonce against the live session key — proving the manifest's contract
-    /// block ([intents]/[tools]) validates AND the presented token verifies under
-    /// the SAME HMAC machinery the per-app relay uses. Returns the handshake
-    /// outcome; the caller (main.rs autostart, gated by `[plugin_sdk].enabled`)
-    /// emits secret-free telemetry from it. A not-running / unknown app, or a
-    /// manifest that no longer reads, yields `Unauthorized`/`InvalidManifest` —
-    /// fail-closed. This is the LIVE wiring of the #36 handshake; the pure
-    /// `register_plugin` is what the hermetic tests prove.
+    ///   block ([intents]/[tools]) validates AND the presented token verifies under
+    ///   the SAME HMAC machinery the per-app relay uses. Returns the handshake
+    ///   outcome; the caller (main.rs autostart, gated by `[plugin_sdk].enabled`)
+    ///   emits secret-free telemetry from it. A not-running / unknown app, or a
+    ///   manifest that no longer reads, yields `Unauthorized`/`InvalidManifest` —
+    ///   fail-closed. This is the LIVE wiring of the #36 handshake; the pure
+    ///   `register_plugin` is what the hermetic tests prove.
     pub async fn register_on_launch(&self, name: &str) -> crate::plugin_sdk::HandshakeOutcome {
         let (manifest_path, token, nonce) = {
             let apps = self.apps.lock().await;
@@ -1959,15 +1959,12 @@ async fn serve_conn(
             // the same socket as the control verbs. A write failure means the
             // connection is gone; loop will pick up the close/exit next.
             op = next_op => {
-                match op {
-                    Some(op_line) => {
-                        if let Err(e) = send_op_line(write_half, &op_line).await {
-                            warn!(app = name, error = %e, "forwarding op to app failed");
-                        }
+                // The sender is dropped only when the registry is torn down;
+                // treat as nothing more to forward (do not exit the conn).
+                if let Some(op_line) = op {
+                    if let Err(e) = send_op_line(write_half, &op_line).await {
+                        warn!(app = name, error = %e, "forwarding op to app failed");
                     }
-                    // The sender is dropped only when the registry is torn down;
-                    // treat as nothing more to forward (do not exit the conn).
-                    None => {}
                 }
             }
             read = read_line_bounded(reader, &mut pending, &mut line, MAX_APP_LINE_BYTES) => {

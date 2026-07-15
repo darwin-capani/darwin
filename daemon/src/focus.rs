@@ -23,8 +23,8 @@
 //!       - verbosity may only step DOWN or hold (Full -> Brief -> Silent), never up;
 //!       - `suggestions_quieted` may only flip false -> true (quiet more), never
 //!         true -> false (un-quiet).
-//!     [`TunedBehavior::is_no_broader_than`] is the machine-checkable predicate
-//!     the property test asserts for EVERY profile against its base.
+//!         [`TunedBehavior::is_no_broader_than`] is the machine-checkable predicate
+//!         the property test asserts for EVERY profile against its base.
 //!
 //!   * The DEFAULT profile is the IDENTITY: `apply_profile(Default, base) == base`
 //!     for every base. With `[focus].profile = "default"` (the shipped default)
@@ -253,7 +253,7 @@ impl TunedBehavior {
         let verbosity_no_louder = self.verbosity.rank() >= base.verbosity.rank();
         // suggestions: base.quieted == true must stay true (can't un-quiet);
         // base.quieted == false may go either way (quieting more is fine).
-        let suggestions_no_louder = !(base.suggestions_quieted && !self.suggestions_quieted);
+        let suggestions_no_louder = !base.suggestions_quieted || self.suggestions_quieted;
         surfacing_subset && verbosity_no_louder && suggestions_no_louder
     }
 

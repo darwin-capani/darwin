@@ -8,6 +8,15 @@
 //! CoreAudio device is the expensive part — reopening per reply would
 //! reintroduce startup gaps).
 //!
+//! One persistent sink, REBUILT ON LOSS: if the macOS default output device
+//! changes mid-session (headphones unplugged, output switched), the cpal stream
+//! stays bound to the gone device and goes silent while its handle still looks
+//! valid — so `connect_new`/`append` keep "succeeding" and the afplay fallback
+//! never fires (permanent silence). cpal's stream error callback is the seam:
+//! on a FATAL device error it flags the sink dead, and the next device-touching
+//! command tears it down and reopens the CURRENT default device (see
+//! `open_device`, `is_fatal_stream_error`, and `should_rebuild`).
+//!
 //! Per spoken reply the thread keeps one `Player`; clips arrive as full WAV
 //! bytes and are appended via `rodio::Decoder` over a `Cursor`, so sentences
 //! play back-to-back with no process spawns and no gaps. Every command is
@@ -15,8 +24,8 @@
 //! and can fall back to afplay on any failure.
 
 use std::io::Cursor;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use rodio::source::Zero;
@@ -193,9 +202,90 @@ pub fn stop_track() {
     }
 }
 
+/// The one persistent device sink plus the liveness flag its cpal error
+/// callback writes. Lives only on the playback thread (`MixerDeviceSink` is
+/// `!Send`); the `Arc<AtomicBool>` is the sole part cpal touches from its own
+/// callback thread.
+struct DeviceOutput {
+    sink: MixerDeviceSink,
+    /// Flipped to `true` by the cpal error callback on a FATAL stream fault
+    /// (device removed / default output switched). Watched by [`device_is_dead`]
+    /// so the next device-touching command rebuilds the sink.
+    dead: Arc<AtomicBool>,
+}
+
+/// Whether a cpal stream error is FATAL — the device/stream is gone and the sink
+/// must be rebuilt — versus a transient glitch (a buffer under/overrun) the
+/// stream recovers from on its own. Rebuilding on every underrun would churn the
+/// device needlessly, so only a genuine device loss trips recovery. Pure, so the
+/// classification is unit-testable without an audio device.
+fn is_fatal_stream_error(err: &cpal::StreamError) -> bool {
+    matches!(
+        err,
+        cpal::StreamError::DeviceNotAvailable | cpal::StreamError::StreamInvalidated
+    )
+}
+
+/// Pure recovery predicate (unit-tested without an audio device): should the
+/// EXISTING device sink be torn down and rebuilt? True only when a device is
+/// currently open (`present`) AND its cpal error callback has fired
+/// (`device_dead`) — meaning the stream is bound to a gone device (default
+/// output changed / unplugged) and is silently dead though the handle still
+/// looks valid. A not-yet-opened device (`!present`) is opened lazily on first
+/// use, not "rebuilt", so this stays `false` for it.
+fn should_rebuild(present: bool, device_dead: bool) -> bool {
+    present && device_dead
+}
+
+/// Whether the live device sink has been flagged dead by its cpal error callback.
+fn device_is_dead(output: &Option<DeviceOutput>) -> bool {
+    output
+        .as_ref()
+        .is_some_and(|o| o.dead.load(Ordering::Relaxed))
+}
+
+/// Open the CURRENT default output device, installing a cpal error callback that
+/// flips a shared `dead` flag on a fatal stream fault. Returns the sink paired
+/// with the flag to watch, or `None` (after logging) when no output device is
+/// available. Mirrors rodio's `open_default_sink` (current default device +
+/// per-device config fallback) but with the error callback wired in — that
+/// callback is the ONLY signal that the persistent stream has silently died, so
+/// without it a mid-session device change would leave the daemon appending into
+/// a dead sink forever.
+fn open_device() -> Option<DeviceOutput> {
+    let dead = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&dead);
+    let builder = match DeviceSinkBuilder::from_default_device() {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(error = %e, "rodio: no default output device");
+            return None;
+        }
+    };
+    match builder
+        .with_error_callback(move |err: cpal::StreamError| {
+            if is_fatal_stream_error(&err) {
+                warn!(error = %err, "rodio: output device lost; flagging sink for rebuild");
+                flag.store(true, Ordering::Relaxed);
+            } else {
+                // A transient glitch (buffer under/overrun) — the stream keeps
+                // going; do NOT tear the device down over it.
+                warn!(error = %err, "rodio: non-fatal output stream error");
+            }
+        })
+        .open_sink_or_fallback()
+    {
+        Ok(sink) => Some(DeviceOutput { sink, dead }),
+        Err(e) => {
+            warn!(error = %e, "rodio: could not open the default output device");
+            None
+        }
+    }
+}
+
 /// The playback thread: owns the !Send device sink and the per-reply Player.
 fn run(mut rx: mpsc::UnboundedReceiver<PlayCmd>) {
-    let mut output: Option<MixerDeviceSink> = None;
+    let mut output: Option<DeviceOutput> = None;
     let mut sink: Option<Player> = None;
     // The composed-music player: entirely separate from the per-reply speech `sink`
     // above, so a long track plays alongside (never inside) the speaking turn. It
@@ -205,6 +295,23 @@ fn run(mut rx: mpsc::UnboundedReceiver<PlayCmd>) {
     let mut music: Option<Player> = None;
     // The channel sender lives in a static, so this loop runs until exit.
     while let Some(cmd) = rx.blocking_recv() {
+        // Recover from a mid-session device loss BEFORE any command that needs
+        // the device. If the live sink's cpal error callback fired (default
+        // output unplugged/switched), the stream is silently dead though the
+        // handle looks fine — drop the device AND both Players bound to its
+        // (now-defunct) mixer so the next ensure_sink/start_music rebuilds on the
+        // CURRENT default device. Teardown commands (Finish/Stop/MusicStop) don't
+        // need a live device, so they skip this.
+        let needs_device = matches!(
+            cmd,
+            PlayCmd::Append { .. } | PlayCmd::Silence { .. } | PlayCmd::MusicPlay { .. }
+        );
+        if needs_device && should_rebuild(output.is_some(), device_is_dead(&output)) {
+            warn!("rodio: output device lost; rebuilding the sink on the current default device");
+            output = None;
+            sink = None;
+            music = None;
+        }
         match cmd {
             PlayCmd::Append { generation, bytes, ack } => {
                 if is_stale(generation) {
@@ -268,23 +375,17 @@ fn run(mut rx: mpsc::UnboundedReceiver<PlayCmd>) {
 /// detached sink (so the thread keeps a STOP handle without ever blocking to
 /// drain it), or None after logging on any device/decode failure. Reuses the one
 /// shared device sink — only a second Player is created.
-fn start_music(
-    output: &mut Option<MixerDeviceSink>,
-    bytes: Vec<u8>,
-) -> Option<Player> {
+fn start_music(output: &mut Option<DeviceOutput>, bytes: Vec<u8>) -> Option<Player> {
     if output.is_none() {
-        match DeviceSinkBuilder::open_default_sink() {
-            Ok(dev) => *output = Some(dev),
-            Err(e) => {
-                warn!(error = %e, "rodio: no default output device for music");
-                return None;
-            }
+        match open_device() {
+            Some(dev) => *output = Some(dev),
+            None => return None, // open_device already logged the reason
         }
     }
     let device = output.as_ref().expect("output set above");
     // `connect_new` is infallible in rodio 0.22; the fallible step is opening
     // the device sink above.
-    let sink = Player::connect_new(device.mixer());
+    let sink = Player::connect_new(device.sink.mixer());
     match Decoder::new(Cursor::new(bytes)) {
         Ok(source) => {
             sink.append(source);
@@ -304,29 +405,26 @@ fn start_music(
 /// Lazily open the output device and the per-reply sink. Returns None (after
 /// logging) when the audio device is unavailable.
 fn ensure_sink<'a>(
-    output: &mut Option<MixerDeviceSink>,
+    output: &mut Option<DeviceOutput>,
     sink: &'a mut Option<Player>,
 ) -> Option<&'a Player> {
     if output.is_none() {
-        match DeviceSinkBuilder::open_default_sink() {
-            Ok(dev) => *output = Some(dev),
-            Err(e) => {
-                warn!(error = %e, "rodio: no default output device");
-                return None;
-            }
+        match open_device() {
+            Some(dev) => *output = Some(dev),
+            None => return None, // open_device already logged the reason
         }
     }
     if sink.is_none() {
         let device = output.as_ref().expect("output set above");
         // `connect_new` is infallible in rodio 0.22; the fallible resource is
         // the device sink opened above.
-        *sink = Some(Player::connect_new(device.mixer()));
+        *sink = Some(Player::connect_new(device.sink.mixer()));
     }
     sink.as_ref()
 }
 
 fn append_clip(
-    output: &mut Option<MixerDeviceSink>,
+    output: &mut Option<DeviceOutput>,
     sink: &mut Option<Player>,
     bytes: Vec<u8>,
 ) -> bool {
@@ -346,7 +444,7 @@ fn append_clip(
 }
 
 fn append_silence(
-    output: &mut Option<MixerDeviceSink>,
+    output: &mut Option<DeviceOutput>,
     sink: &mut Option<Player>,
     duration: Duration,
 ) -> bool {
@@ -667,5 +765,43 @@ mod tests {
             super::SILENCE_SAMPLE_RATE as usize / 4
         );
         assert_eq!(super::silence_samples(Duration::ZERO), 0);
+    }
+
+    /// Device-loss recovery decision (the fix for the silent-sink-on-device-change
+    /// bug), tested WITHOUT an audio device — the live rodio open/append is
+    /// device-gated, but the "when to rebuild" logic is pure and must be exact:
+    /// a healthy sink is reused, a dead one is rebuilt, and a not-yet-opened one
+    /// is opened lazily (not "rebuilt").
+    #[test]
+    fn should_rebuild_only_when_present_and_dead() {
+        // Healthy, open device: reuse it — never tear a working sink down.
+        assert!(!super::should_rebuild(true, false));
+        // Open device whose cpal error callback fired (default output
+        // unplugged/switched): the stream is silently dead, so rebuild it.
+        assert!(super::should_rebuild(true, true));
+        // No device yet: opened lazily on first use, this is not a "rebuild".
+        assert!(!super::should_rebuild(false, false));
+        // Defensive: a dead flag with no device present is still not a rebuild.
+        assert!(!super::should_rebuild(false, true));
+    }
+
+    /// The cpal error-callback classifier: only a genuine device/stream loss is
+    /// fatal (triggers a rebuild); a transient buffer glitch must NOT tear the
+    /// device down, or a momentary underrun under load would needlessly churn it.
+    #[test]
+    fn only_device_loss_errors_are_fatal() {
+        use cpal::StreamError;
+        assert!(super::is_fatal_stream_error(
+            &StreamError::DeviceNotAvailable
+        ));
+        assert!(super::is_fatal_stream_error(&StreamError::StreamInvalidated));
+        // A buffer under/overrun is a recoverable glitch, not a device loss.
+        assert!(!super::is_fatal_stream_error(&StreamError::BufferUnderrun));
+        // Backend-specific notices are not treated as a device loss on their own.
+        assert!(!super::is_fatal_stream_error(&StreamError::BackendSpecific {
+            err: cpal::BackendSpecificError {
+                description: "spurious".to_string(),
+            },
+        }));
     }
 }

@@ -180,9 +180,9 @@ impl VoiceGate {
     ///     from a no-voice-id appliance; we never silently stop remembering just
     ///     because the feature exists but is unconfigured); OR
     ///   * voice-id ON and enrolled AND this turn OWNER-VERIFIED -> record.
-    /// A voice-id-ON, enrolled, but UNVERIFIED turn (an unrecognized speaker) is
-    /// NOT recorded — that turn is not confidently the owner's, so it must not
-    /// seed the owner's durable episodic memory.
+    ///     A voice-id-ON, enrolled, but UNVERIFIED turn (an unrecognized speaker) is
+    ///     NOT recorded — that turn is not confidently the owner's, so it must not
+    ///     seed the owner's durable episodic memory.
     fn permits_recording(&self) -> bool {
         if self.enabled && self.enrolled {
             self.owner_verified

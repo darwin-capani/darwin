@@ -243,8 +243,8 @@ impl<T: HttpTransport, A: HttpTransport> XClient<T, A> {
     ///   * In [`ActionMode::Execute`] it issues exactly one `POST /2/tweets`
     ///     carrying `{"text": ...}` and returns a short confirmation with the new
     ///     tweet id.
-    /// Callers obtain `mode` from the foundation's `gate(confirm)`, so the shipped
-    /// default (gate OFF) always previews.
+    ///     Callers obtain `mode` from the foundation's `gate(confirm)`, so the shipped
+    ///     default (gate OFF) always previews.
     pub async fn post_tweet(&self, text: &str, mode: ActionMode) -> IntegrationResult<String> {
         // Enforce the length limit up front — counted in Unicode scalar values,
         // matching how X counts a standard tweet for this purpose — so a too-long

@@ -183,7 +183,7 @@ pub struct Report {
 ///   * HONEST-EMPTY: when NO claim carries a usable citation, the result is
 ///     `empty: true` with no sections and no citations — the caller renders a plain
 ///     "no sources to report on", never a fabricated body.
-/// Pure (no I/O) — the cite-discipline + assembly heart, unit-tested.
+///     Pure (no I/O) — the cite-discipline + assembly heart, unit-tested.
 pub fn build_report(title: &str, sources: &[SourcedClaim], _cfg: &ReportConfig) -> Report {
     // Group CITED claims by heading in first-seen order. A claim with no usable
     // citation is dropped here (never reaches a section, never a citation).

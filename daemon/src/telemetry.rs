@@ -151,6 +151,9 @@ pub async fn serve(port: u16) {
             // sends a tauri:// / loopback origin (or none for native clients). So we
             // refuse any Origin that isn't absent, tauri://, or loopback.
             use tokio_tungstenite::tungstenite::handshake::server::{Request, Response, ErrorResponse};
+            // The Err type (`ErrorResponse`) is fixed by tungstenite's accept_hdr
+            // callback contract — it cannot be boxed without breaking the signature.
+            #[allow(clippy::result_large_err)]
             let check = |req: &Request, resp: Response| -> Result<Response, ErrorResponse> {
                 let origin = req.headers().get("origin").and_then(|v| v.to_str().ok());
                 if origin_allowed(origin) {

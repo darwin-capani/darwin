@@ -343,7 +343,9 @@ impl Variable {
     /// assumption, never a panic.
     fn sample(&self, rng: &mut Rng) -> f64 {
         let (lo, hi) = (self.low, self.high);
-        if !(hi > lo) {
+        // Degenerate range (hi <= lo, or a NaN bound) collapses to lo — a fixed
+        // assumption, never a panic. partial_cmp keeps the NaN case explicit.
+        if !matches!(hi.partial_cmp(&lo), Some(std::cmp::Ordering::Greater)) {
             return lo;
         }
         match self.dist {

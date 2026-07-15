@@ -28,15 +28,15 @@
 //!      verdict + confidence 0..1.
 //!   7. SELECT — prefer the MINIMAL patch with the HIGHEST review confidence
 //!      among those that PASSED validation.
-//!   8a. mode="propose" (default) — write state/heal/proposals/<ts>/{patch.diff,
-//!       report.md, diagnosis.json, candidates.md, review.md}, stamp
-//!       meta.heal_pending=<ts>, emit heal.proposal{ts, files, validated:true,
-//!       confidence}. scripts/apply_heal.sh <ts> applies it on human request.
-//!   8b. mode="auto" (requires enabled=true; documented DANGEROUS) — apply the
-//!       same validated diff to the real daemon/, cargo build --release, emit
-//!       heal.applied, then EXIT cleanly for a supervised restart. UNCHANGED
-//!       from v1: there is still no NEW live-auto-apply path.
-//!   Any patch/validation failure of ALL candidates → state/heal/rejected/<ts>/
+//!      8a. mode="propose" (default) — write state/heal/proposals/<ts>/{patch.diff,
+//!      report.md, diagnosis.json, candidates.md, review.md}, stamp
+//!      meta.heal_pending=<ts>, emit heal.proposal{ts, files, validated:true,
+//!      confidence}. scripts/apply_heal.sh <ts> applies it on human request.
+//!      8b. mode="auto" (requires enabled=true; documented DANGEROUS) — apply the
+//!      same validated diff to the real daemon/, cargo build --release, emit
+//!      heal.applied, then EXIT cleanly for a supervised restart. UNCHANGED
+//!      from v1: there is still no NEW live-auto-apply path.
+//!      Any patch/validation failure of ALL candidates → state/heal/rejected/<ts>/
 //!   + heal.rejected{ts, stage}.
 //!
 //! SAFETY CONTRACT (non-negotiable): self-heal ships enabled=false /

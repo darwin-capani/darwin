@@ -2641,8 +2641,8 @@ mod tests {
     /// for an unbounded decode (the client `min`s the request against the cap).
     #[test]
     fn describe_image_decode_budget_is_capped() {
-        assert!(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS > 0);
-        assert!(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS <= DESCRIBE_IMAGE_MAX_TOKENS_CAP);
+        const { assert!(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS > 0) };
+        const { assert!(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS <= DESCRIBE_IMAGE_MAX_TOKENS_CAP) };
         assert_eq!(DESCRIBE_IMAGE_MAX_TOKENS_CAP, 1024, "cap pinned to the server's contract");
         // The clamp the client applies: an over-budget ask collapses to the cap.
         let asked = 99_999u32;
@@ -2735,11 +2735,11 @@ mod tests {
         assert_eq!(GENERATE_IMAGE_MIN_SIZE, 64, "min size pinned to the server's contract");
         assert_eq!(GENERATE_IMAGE_MAX_SIZE, 1536, "max size pinned to the server's contract");
         assert_eq!(GENERATE_IMAGE_DEFAULT_SIZE, 512, "default size pinned");
-        assert!(GENERATE_IMAGE_DEFAULT_SIZE >= GENERATE_IMAGE_MIN_SIZE);
-        assert!(GENERATE_IMAGE_DEFAULT_SIZE <= GENERATE_IMAGE_MAX_SIZE);
+        const { assert!(GENERATE_IMAGE_DEFAULT_SIZE >= GENERATE_IMAGE_MIN_SIZE) };
+        const { assert!(GENERATE_IMAGE_DEFAULT_SIZE <= GENERATE_IMAGE_MAX_SIZE) };
         assert_eq!(GENERATE_IMAGE_DEFAULT_STEPS, 4, "default steps pinned to the fast schnell budget");
         assert_eq!(GENERATE_IMAGE_MAX_STEPS_CAP, 50, "steps cap pinned to the server's contract");
-        assert!(GENERATE_IMAGE_DEFAULT_STEPS <= GENERATE_IMAGE_MAX_STEPS_CAP);
+        const { assert!(GENERATE_IMAGE_DEFAULT_STEPS <= GENERATE_IMAGE_MAX_STEPS_CAP) };
         // The clamps the client applies: an over/under-range ask collapses inward.
         assert_eq!(8.clamp(GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_MAX_SIZE), GENERATE_IMAGE_MIN_SIZE);
         assert_eq!(99_999u32.clamp(GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_MAX_SIZE), GENERATE_IMAGE_MAX_SIZE);

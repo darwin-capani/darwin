@@ -378,8 +378,8 @@ pub const DEFAULT_LOCAL_MODEL_GIB: f64 = 3.0;
 ///   1. an explicit override in `sizes` ([models].local_sizes, id -> GiB),
 ///   2. a coarse heuristic on the id (param count x a per-bit-width factor),
 ///   3. [`DEFAULT_LOCAL_MODEL_GIB`] when nothing matches.
-/// This is an ESTIMATE for keep-warm bookkeeping, NOT a measurement and NOT a
-/// guarantee; the real resident size is device/quant/runtime dependent. PURE.
+///      This is an ESTIMATE for keep-warm bookkeeping, NOT a measurement and NOT a
+///      guarantee; the real resident size is device/quant/runtime dependent. PURE.
 pub fn estimate_local_model_gib(
     model_id: &str,
     sizes: &std::collections::BTreeMap<String, f64>,
@@ -860,7 +860,7 @@ pub enum ModelSwapIntent {
 impl ModelSwapIntent {
     /// The override this intent installs: a tier (`Some`) for Heavy/Fast/Local, or
     /// `None` for Auto (which CLEARS the override back to the config default).
-    pub fn to_override(&self) -> Option<Tier> {
+    pub fn to_override(self) -> Option<Tier> {
         match self {
             ModelSwapIntent::Heavy => Some(Tier::Heavy),
             ModelSwapIntent::Fast => Some(Tier::Fast),

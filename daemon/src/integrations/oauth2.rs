@@ -287,11 +287,11 @@ impl std::fmt::Debug for GoogleAdsCall {
 
 /// Resolve the non-OAuth Google Ads call parameters (developer token + customer id
 /// + optional login-customer-id) from the Keychain. Returns the friendly
-/// "Google Ads isn't fully configured" error when the developer token OR the
-/// customer id is missing — the login-customer-id is genuinely optional and may be
-/// absent. The bearer is fetched separately (via [`ProviderAuth::bearer`]); this
-/// only covers the extra, non-OAuth pieces so a client can assemble a complete
-/// authorized request. No secret is logged.
+///   "Google Ads isn't fully configured" error when the developer token OR the
+///   customer id is missing — the login-customer-id is genuinely optional and may be
+///   absent. The bearer is fetched separately (via [`ProviderAuth::bearer`]); this
+///   only covers the extra, non-OAuth pieces so a client can assemble a complete
+///   authorized request. No secret is logged.
 pub async fn google_ads_call() -> IntegrationResult<GoogleAdsCall> {
     let developer_token = resolve_secret(GOOGLE_ADS_ACCOUNT_DEVELOPER_TOKEN)
         .await
@@ -1308,7 +1308,7 @@ mod tests {
         assert_eq!(X.name, "X");
         assert_eq!(X.auth_endpoint, "https://twitter.com/i/oauth2/authorize");
         assert_eq!(X.token_endpoint, "https://api.twitter.com/2/oauth2/token");
-        assert!(X.uses_pkce, "X uses PKCE");
+        const { assert!(X.uses_pkce, "X uses PKCE") };
         assert_eq!(X.token_auth, TokenAuth::BasicHeader, "X uses HTTP Basic at the token endpoint");
         assert_eq!(
             X.scopes,
@@ -1331,7 +1331,7 @@ mod tests {
             LINKEDIN.token_endpoint,
             "https://www.linkedin.com/oauth/v2/accessToken"
         );
-        assert!(!LINKEDIN.uses_pkce, "LinkedIn classic flow is client_secret-based");
+        const { assert!(!LINKEDIN.uses_pkce, "LinkedIn classic flow is client_secret-based") };
         assert_eq!(LINKEDIN.token_auth, TokenAuth::BodyParams);
         assert_eq!(LINKEDIN.scopes, &["openid", "profile", "w_member_social"]);
         assert_eq!(LINKEDIN.account_client_id, "linkedin_oauth_client_id");
@@ -1347,7 +1347,7 @@ mod tests {
             "https://accounts.google.com/o/oauth2/v2/auth"
         );
         assert_eq!(GOOGLE_ADS.token_endpoint, "https://oauth2.googleapis.com/token");
-        assert!(GOOGLE_ADS.uses_pkce, "Google Ads uses PKCE");
+        const { assert!(GOOGLE_ADS.uses_pkce, "Google Ads uses PKCE") };
         assert_eq!(
             GOOGLE_ADS.token_auth,
             TokenAuth::BodyParams,

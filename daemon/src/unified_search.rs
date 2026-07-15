@@ -27,10 +27,10 @@
 //!       - GMAIL      — recent-messages read (cited to that read for the query).
 //!       - CALENDAR   — upcoming-events read (cited to that read for the query).
 //!       - SLACK      — channel-list read (cited to that read; the live read is a
-//!                      channel LIST, so the citation is honest about being the
-//!                      channel-list read, not a non-existent message coordinate).
-//!     A DISCONNECTED cloud source is SKIPPED with a reason — never silently
-//!     dropped, never fabricated as if it had been searched.
+//!         channel LIST, so the citation is honest about being the
+//!         channel-list read, not a non-existent message coordinate).
+//!         A DISCONNECTED cloud source is SKIPPED with a reason — never silently
+//!         dropped, never fabricated as if it had been searched.
 //!
 //! HONESTY (load-bearing):
 //!   * SCOPING is preserved exactly as each underlying source already enforces
@@ -451,8 +451,8 @@ pub struct FanoutInputs {
 
 /// FOLD the per-source fan-out inputs into one ranked, attributed, cited result
 /// + an honest coverage summary. PURE + deterministic (no clock, no network, no
-/// embed call) so the entire merge/rank/coverage/citation contract is unit-
-/// testable with injected mock inputs.
+///   embed call) so the entire merge/rank/coverage/citation contract is unit-
+///   testable with injected mock inputs.
 ///
 /// For each source:
 ///   * an on-device source with `Some(items)` is SEARCHED; with `None` it is

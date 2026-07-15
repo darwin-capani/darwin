@@ -374,8 +374,8 @@ impl EvalState {
 /// Compute routing accuracy + correction rate from a recent trace window. Routing
 /// accuracy reuses [`optimize::baseline_held_out_score`] (the SAME held-out carve
 /// + scorer the optimizer judges candidates on); the correction rate counts
-/// CorrectedNextTurn over all usable (Success + CorrectedNextTurn) traces. Both
-/// are `None` when there is no data for them — `awaiting turns`, never fabricated.
+///   CorrectedNextTurn over all usable (Success + CorrectedNextTurn) traces. Both
+///   are `None` when there is no data for them — `awaiting turns`, never fabricated.
 pub fn accuracy_from_traces(traces: &[Trace]) -> AccuracyAggregate {
     let held = optimize::baseline_held_out_score(traces);
     let (routing_accuracy, held_out_n) = match held {

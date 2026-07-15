@@ -136,6 +136,9 @@ impl Trace {
     /// construction so a caller cannot accidentally hold a Trace carrying PII.
     /// `record_trace` uses this; tests may also build directly with an
     /// already-redacted string for known-answer assertions.
+    // The args are the raw interaction fields captured at construction; grouping
+    // them would just re-create Trace's own field set.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         raw_utterance: &str,
         intent: impl Into<String>,
@@ -602,8 +605,8 @@ pub struct PriorTurn {
 ///   3. The current turn routed to a DIFFERENT agent than the prior turn (the
 ///      route actually CHANGED — a re-ask that landed on the same agent corrected
 ///      nothing).
-/// Failing ANY of the three -> not a correction (the safe default is "no
-/// signal", which leaves the prior trace as Success).
+///      Failing ANY of the three -> not a correction (the safe default is "no
+///      signal", which leaves the prior trace as Success).
 pub fn is_correction(prior: &PriorTurn, current_intent: &str, current_agent: &str, current_utterance: &str) -> bool {
     // (2) same intent and (3) the route actually changed.
     if prior.intent != current_intent {
@@ -882,7 +885,7 @@ impl Score {
 ///
 ///   * Success(u, a)            => HIT iff replay_route(cfg, u) == a.
 ///   * CorrectedNextTurn(u, a)  => HIT iff replay_route(cfg, u) != a
-///                                 (avoiding the pick the user redirected away from).
+///     (avoiding the pick the user redirected away from).
 pub fn score_config(cfg: &RoutingConfig, traces: &[Trace]) -> Score {
     let mut s = Score {
         success_hits: 0,
@@ -1132,8 +1135,8 @@ const CUE_MAX_LEN: usize = 18;
 ///   * AT LEAST ONE VOWEL (a/e/i/o/u/y) — a cheap, wordlist-free entropy/word-
 ///     shape heuristic: every real English routing cue has a vowel, while random
 ///     consonant-run fragments do not. Rejects high-entropy secret fragments.
-/// A token failing ANY rule is ineligible and never reaches a candidate config
-/// or the proposal artifact.
+///     A token failing ANY rule is ineligible and never reaches a candidate config
+///     or the proposal artifact.
 ///
 /// `pub(crate)` so the Need-Sensed Forge gap detector ([`crate::forge_gap`])
 /// reuses the SAME privacy gate when sanitizing a synthesized forge goal — a
@@ -2356,7 +2359,7 @@ mod optimizer_tests {
             ));
         }
         // Newest-first overall.
-        v.sort_by(|a, b| b.ts.cmp(&a.ts));
+        v.sort_by_key(|b| std::cmp::Reverse(b.ts));
         v
     }
 
@@ -2428,7 +2431,7 @@ mod optimizer_tests {
         for i in 0..8u64 {
             v.push(trace("crypto workout plan", "hercules", Outcome::Success, 900 + i));
         }
-        v.sort_by(|a, b| b.ts.cmp(&a.ts)); // newest-first
+        v.sort_by_key(|b| std::cmp::Reverse(b.ts)); // newest-first
 
         // Sanity: the held-out split is indeed the hercules-success block.
         let (_train, held) = split_usable(&v);
@@ -2637,7 +2640,7 @@ mod optimizer_tests {
                 900 - i,
             ));
         }
-        v.sort_by(|a, b| b.ts.cmp(&a.ts)); // newest-first
+        v.sort_by_key(|b| std::cmp::Reverse(b.ts)); // newest-first
         v
     }
 

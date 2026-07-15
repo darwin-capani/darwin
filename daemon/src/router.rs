@@ -1804,8 +1804,8 @@ fn conversation_brain(
 /// model the local converse/generate op should answer with. Returns `Some(id)`
 /// ONLY when the operator configured a MULTI-RESIDENT warm-set ([models].local_warm
 /// + a budget that admits an extra) AND the AUTO-by-difficulty heuristic picks a
-/// NON-base model for this turn; otherwise `None` -> the server answers on the base
-/// single-resident model (today's behavior).
+///   NON-base model for this turn; otherwise `None` -> the server answers on the base
+///   single-resident model (today's behavior).
 ///
 /// This is the conservative, honest wiring: it never names a model that is not in
 /// the budget-bounded warm plan, it leaves the wire untouched (and so identical to
@@ -2261,8 +2261,8 @@ async fn handle_undo_command(cmd: crate::journal::UndoCommand, memory: &Memory) 
 ///     phrasings `play me` / `make me` REQUIRE an explicit music OBJECT noun
 ///     (song / track / tune / beat / jingle / melody / riff) so "make me a
 ///     sandwich" and "write me an email" are NOT music.
-/// "play some jazz" (no creation verb) and "what's the time" therefore return
-/// None — only an explicit creation request routes to Jerome.
+///     "play some jazz" (no creation verb) and "what's the time" therefore return
+///     None — only an explicit creation request routes to Jerome.
 ///
 /// The returned String is the cleaned PROMPT: the verb/object/filler stripped
 /// from the front and an "about/of" tail unwrapped, so "compose a song about
@@ -3716,11 +3716,11 @@ fn mentions_vision(lower: &str) -> bool {
 ///   - "stop watching" / "stop the watch"           -> watch.stop
 ///   - "analyze this video" / "analyze <file>.mp4"  -> analyze.file {path}
 ///   - "what's on my screen" / "read my screen" / "read this"
-///                                                  -> read.screen (OCR; TRANSIENT)
+///     -> read.screen (OCR; TRANSIENT)
 ///   - "where's the <X> button" / "find the <X> button" / "locate the <X>"
-///                                                  -> read.screen {query:<X>} (LOCATE, read-only)
+///     -> read.screen {query:<X>} (LOCATE, read-only)
 ///   - "what do you see" / "who is there" / "anyone there"
-///                                                  -> status (presence snapshot)
+///     -> status (presence snapshot)
 ///   - "set sensitivity to <0..1 | a percent>"      -> set.sensitivity {value}
 ///   - "open/launch/start vision"                   -> Launch
 pub fn vision_command(text: &str) -> Option<VisionCommand> {
@@ -3968,7 +3968,7 @@ fn op_scan_document(source: Option<&str>) -> String {
 ///   - "read this handwriting" / "read the whiteboard" / "what does this say"
 ///     (with a handwriting/whiteboard/note cue)            -> read.handwriting
 ///   - "scan this document" / "scan the page" / "scan this receipt"  -> scan.document
-/// The recognized text is SENSITIVE + TRANSIENT (`is_screen_read` covers these).
+///     The recognized text is SENSITIVE + TRANSIENT (`is_screen_read` covers these).
 fn handwriting_document_op(lower: &str) -> Option<String> {
     // SCAN a document/page/receipt with the camera (#29). The verb "scan" plus a
     // document-ish noun. Checked first so "scan this document" never falls into a
@@ -4045,8 +4045,8 @@ fn op_read_screen(query: Option<&str>) -> String {
 ///     "read the screen" / "read this" / "read what's on screen"  -> read.screen
 ///   - "where's the <X> button" / "where is the submit button" / "find the
 ///     <X> button" / "locate the <X>"                              -> read.screen{query:<X>}
-/// A where-is query carries the control phrase so the app's structuring can
-/// LOCATE (not click) the best-matching block.
+///     A where-is query carries the control phrase so the app's structuring can
+///     LOCATE (not click) the best-matching block.
 fn screen_read_op(lower: &str) -> Option<String> {
     // Where-is a control: "where is/where's the <X> button", "find the <X>
     // button", "locate the <X>". The query is the control phrase; the app

@@ -225,10 +225,10 @@ pub async fn serve(registry: Arc<AppRegistry>, generate_sock: PathBuf, inference
     }
 }
 
-/// One [`InferenceClient`] is shared across all proxy connections behind a
-/// single [`Mutex`], so concurrent micro-app generates serialize through the
-/// one connection to inference.sock — matching the inference server's own
-/// single-engine-lock model rather than fanning out unbounded connections.
+// One `InferenceClient` is shared across all proxy connections behind a
+// single `Mutex`, so concurrent micro-app generates serialize through the
+// one connection to inference.sock — matching the inference server's own
+// single-engine-lock model rather than fanning out unbounded connections.
 
 /// Bind the proxy socket: remove any stale one, create the `0700` parent dir,
 /// bind, then `chmod 0600` the socket. The dir is shared with the per-app

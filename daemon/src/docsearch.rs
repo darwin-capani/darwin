@@ -157,9 +157,9 @@ pub fn canonical_roots(roots: &[String]) -> Vec<PathBuf> {
 ///   * an absolute-elsewhere path canonicalizes to itself -> REJECTED;
 ///   * a file genuinely under a root canonicalizes to under the (canonicalized)
 ///     root -> ACCEPTED.
-/// A non-existent path cannot be canonicalized -> `None` (we never index a path we
-/// cannot prove resolves inside a root). The check is on the REAL path, never the
-/// lexical/symlink path, so it cannot be fooled by a crafted name.
+///     A non-existent path cannot be canonicalized -> `None` (we never index a path we
+///     cannot prove resolves inside a root). The check is on the REAL path, never the
+///     lexical/symlink path, so it cannot be fooled by a crafted name.
 pub fn confine(candidate: &Path, canonical_roots: &[PathBuf]) -> Option<PathBuf> {
     let real = std::fs::canonicalize(candidate).ok()?;
     if canonical_roots.iter().any(|root| real.starts_with(root)) {
@@ -750,9 +750,9 @@ fn pdf_text_jailed(helper: &Path, bytes: &[u8]) -> Result<String> {
 ///     scanned/image-only doc has no text layer — we never index it empty);
 ///   * `Ok(Err(e))` (extractor error: corrupt/encrypted/unreadable) -> `None`;
 ///   * `Err(panic)` (the parser panicked) -> `None`.
-/// Every `None` is logged with `path` + `reason` so a skip is HONEST + auditable.
-/// `AssertUnwindSafe` is sound here: `f` borrows only `&[u8]` and builds a fresh
-/// `String`; nothing observable is left in a broken state after a unwound panic.
+///     Every `None` is logged with `path` + `reason` so a skip is HONEST + auditable.
+///     `AssertUnwindSafe` is sound here: `f` borrows only `&[u8]` and builds a fresh
+///     `String`; nothing observable is left in a broken state after a unwound panic.
 fn extract_guarded<F>(path: &Path, label: &str, f: F) -> Option<String>
 where
     F: FnOnce() -> Result<String>,
@@ -795,12 +795,12 @@ where
 /// [`FileKind`], or `None` to HONEST-SKIP it. The single per-file extraction entry
 /// the indexer calls:
 ///   * `Text`  -> a mislabeled-binary NUL sniff then UTF-8-lossy decode (today's
-///               behavior, byte-for-byte — text-like handling UNCHANGED);
+///     behavior, byte-for-byte — text-like handling UNCHANGED);
 ///   * `Pdf`   -> [`pdf_text`] behind the panic-safe guard;
 ///   * `Office`-> [`office_text`] behind the panic-safe guard.
-/// `cap` bounds the extracted text length BEFORE chunking (the chunk store's
-/// `max_chunks` is the other ceiling). Pure w.r.t. disk/network: `bytes` were
-/// already read by the caller; nothing here reads a file or reaches the network.
+///     `cap` bounds the extracted text length BEFORE chunking (the chunk store's
+///     `max_chunks` is the other ceiling). Pure w.r.t. disk/network: `bytes` were
+///     already read by the caller; nothing here reads a file or reaches the network.
 fn extract_text(path: &Path, kind: FileKind, bytes: &[u8], cap: usize) -> Option<String> {
     let text = match kind {
         FileKind::Text => {
@@ -927,8 +927,8 @@ pub struct Discovered {
 ///   * accepts a FILE only when: it confines under a root, its extension is on the
 ///     allowlist, and its size is within `max_file_bytes` (a metadata stat, no read);
 ///   * stops at `max_files` total and `max_depth` recursion depth.
-/// Symlink loops cannot run away: a visited-set of real paths plus the depth bound
-/// terminate the walk. Errors on any single entry are skipped, never fatal.
+///     Symlink loops cannot run away: a visited-set of real paths plus the depth bound
+///     terminate the walk. Errors on any single entry are skipped, never fatal.
 pub fn walk(roots: &[String], bounds: &IndexBounds) -> Vec<Discovered> {
     let canon = canonical_roots(roots);
     let mut out: Vec<Discovered> = Vec::new();
@@ -1330,8 +1330,8 @@ impl DocIndex {
     ///      errs (server down / no embed op), stores the chunks WITHOUT vectors so
     ///      search falls back to BM25 — never failing the index;
     ///   5. enforces the `max_chunks` total bound.
-    /// Returns the resulting [`IndexStatus`]. NETWORK: never — embedding is the
-    /// on-device op; file contents + embeddings never leave the device.
+    ///      Returns the resulting [`IndexStatus`]. NETWORK: never — embedding is the
+    ///      on-device op; file contents + embeddings never leave the device.
     pub async fn reindex(
         &self,
         roots: &[String],

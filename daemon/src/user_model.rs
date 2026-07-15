@@ -455,7 +455,7 @@ fn has_preference_cue(lower: &str) -> bool {
 ///     episodic store already extracted) — a topic the user actually raised;
 ///   * a PREFERENCE signal when the (redacted) utterance carries an explicit
 ///     preference cue, subject = the utterance's salient entities.
-/// Pure + deterministic. Returns the signals tagged with `ep:<id>` provenance.
+///     Pure + deterministic. Returns the signals tagged with `ep:<id>` provenance.
 fn signals_from_episode(ep: &Episode) -> Vec<Signal> {
     let mut out = Vec::new();
     let prov = format!("ep:{}", ep.id);
@@ -573,7 +573,7 @@ pub struct Consolidation {
 ///   * `existing` (the current observed-counts, keyed by (facet, subject)) lets a
 ///     repeated observation COMPOUND onto the prior count rather than resetting —
 ///     so the model strengthens over time, bounded by the entry cap at write.
-/// Deterministic; exposed for direct unit testing.
+///     Deterministic; exposed for direct unit testing.
 pub fn consolidate_inputs(
     episodes: &[Episode],
     facts: &[(String, String)],
@@ -650,8 +650,8 @@ pub fn consolidate_inputs(
 ///      global entry cap for NEW entries (a reinforcement of an EXISTING entry
 ///      always succeeds) and MERGING provenance (newest-first, bounded) so a
 ///      reinforced entry's reasons accrete rather than being overwritten.
-/// Returns how many entries were written (upserted). NEVER fabricates: an empty /
-/// sub-threshold input set writes nothing.
+///      Returns how many entries were written (upserted). NEVER fabricates: an empty /
+///      sub-threshold input set writes nothing.
 ///
 /// ISOLATION: the caller passes episodes it read AGENT-SCOPED and facts from the
 /// (meta-filtered) user view; this function writes ONLY `user.model.*` keys, so it
@@ -768,8 +768,7 @@ pub fn summary(profile: &Profile) -> String {
     });
 
     let mut out = String::new();
-    let mut shown = 0usize;
-    for e in entries {
+    for (shown, e) in entries.into_iter().enumerate() {
         if shown >= SUMMARY_MAX_ENTRIES {
             break;
         }
@@ -778,7 +777,6 @@ pub fn summary(profile: &Profile) -> String {
             break;
         }
         out.push_str(&line);
-        shown += 1;
     }
     out
 }

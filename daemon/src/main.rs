@@ -1003,17 +1003,17 @@ const ANTICIPATE_PRESENCE_WINDOW_SECS: u64 = 10 * 60;
 /// the injected clock + the carried `FiredState`, and acts on the decision:
 ///   - `Nothing`  -> nothing.
 ///   - `Surface`  -> emit the `proactive.surface` HUD card (the behavior when
-///                   `[proactive].speak = false`; the shipped default is `true`,
-///                   which ALSO voices the brief via the echo-safe speech path).
+///     `[proactive].speak = false`; the shipped default is `true`,
+///     which ALSO voices the brief via the echo-safe speech path).
 ///   - `Speak`    -> emit the card AND voice the brief — but ONLY through the
-///                   EXISTING speech path (`speech::speak`), and ONLY when
-///                   `is_speaking()` is false, so the SPEAKING refcount /
-///                   MUTE_TAIL / barge logic all cover it and EDITH can never
-///                   open a parallel audio path or talk over a live reply.
-/// `FiredState` is carried across ticks here (the evaluator stays pure: it reads
-/// the state and the loop advances it via `FiredState::record` only when it
-/// actually acts). Warn-and-continue throughout: a tick must never wedge or
-/// panic the daemon.
+///     EXISTING speech path (`speech::speak`), and ONLY when
+///     `is_speaking()` is false, so the SPEAKING refcount /
+///     MUTE_TAIL / barge logic all cover it and EDITH can never
+///     open a parallel audio path or talk over a live reply.
+///     `FiredState` is carried across ticks here (the evaluator stays pure: it reads
+///     the state and the loop advances it via `FiredState::record` only when it
+///     actually acts). Warn-and-continue throughout: a tick must never wedge or
+///     panic the daemon.
 async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, sock: PathBuf) {
     use anticipate::{FiredState, Policy};
     use chrono::Timelike;
@@ -1186,19 +1186,10 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
     }
 }
 
-/// Whether the user interacted recently enough to be considered PRESENT for
-/// anticipation (meta.last_interaction within the presence window). Read-only;
-/// warn-and-continue — an unreadable stamp reads as "not present" (fail-safe:
-/// EDITH stays silent rather than surface to a maybe-empty room).
-async fn recently_present(memory: &Memory) -> bool {
-    secs_since_last_interaction(memory)
-        .await
-        .is_some_and(|s| s <= ANTICIPATE_PRESENCE_WINDOW_SECS)
-}
-
 /// Seconds since the last user interaction (meta.last_interaction), or `None`
-/// when the stamp is unreadable/absent. Read-only; the shared source for both
-/// `recently_present` and the fused presence/attention state (presence.rs).
+/// when the stamp is unreadable/absent. Read-only; the shared source for the
+/// anticipation presence check and the fused presence/attention state
+/// (presence.rs).
 async fn secs_since_last_interaction(memory: &Memory) -> Option<u64> {
     let last = match memory.get_fact("meta.last_interaction").await {
         Ok(v) => v,

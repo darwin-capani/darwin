@@ -109,8 +109,8 @@ pub fn health_from_snapshot(snap: &crate::telemetry::SystemSnapshot) -> HealthRe
 ///   - an all-day event (a bare `YYYY-MM-DD` `date`, no time) — we cannot give it
 ///     a precise lead time, so the evaluator does not surface it as "in N min";
 ///   - any string that does not parse as an RFC 3339 instant.
-/// A negative result (already started) is RETURNED as-is — the evaluator itself
-/// drops past events; this helper only converts time, it does not editorialize.
+///     A negative result (already started) is RETURNED as-is — the evaluator itself
+///     drops past events; this helper only converts time, it does not editorialize.
 pub fn lead_minutes_from_rfc3339(start: &str, now: u64) -> Option<i64> {
     let start = start.trim();
     if start.is_empty() {

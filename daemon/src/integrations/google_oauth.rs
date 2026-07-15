@@ -387,7 +387,7 @@ pub fn parse_redirect(request_line: &str, expected_state: &str) -> IntegrationRe
 
 /// Parse a URL query string into (key, value) pairs, percent-DECODING each. Pure
 /// + local so the handler needs no `url` dependency. Tolerates empty values and
-/// missing '='.
+///   missing '='.
 fn parse_query(query: &str) -> Vec<(String, String)> {
     query
         .split('&')

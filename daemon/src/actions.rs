@@ -5,8 +5,8 @@
 //!   tokio::process::Command, never an interpreted shell string.
 //! - NO delete/move/write of user files: actions open, search, and observe.
 //! - NO keystroke synthesis.
-//! Every command is bounded by a 5s timeout with kill_on_drop so a wedged
-//! `open`/`mdfind`/`osascript` can never hang the event loop.
+//!   Every command is bounded by a 5s timeout with kill_on_drop so a wedged
+//!   `open`/`mdfind`/`osascript` can never hang the event loop.
 //!
 //! All actions return Result<String>: Ok carries a human-readable outcome
 //! string suitable as converse data (including "soft" outcomes like an
@@ -581,7 +581,7 @@ pub async fn search_files_raw(query: &str, limit: usize) -> Result<Vec<FileHit>>
             })
         })
         .collect();
-    hits.sort_by(|a, b| b.modified.cmp(&a.modified)); // newest first
+    hits.sort_by_key(|b| std::cmp::Reverse(b.modified)); // newest first
     hits.truncate(limit);
     Ok(hits)
 }

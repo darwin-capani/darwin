@@ -15,10 +15,10 @@
 //!   3. THIS policy layer — a per-tool/-agent/-recipient rule the USER set:
 //!        * `Never`  — hard-block this action even with master ON + a fresh yes.
 //!        * `Always` — auto-approve (skip the per-turn park) ONLY when the master
-//!                     switch is ON and the voice-id gate allows; OFF => still
-//!                     DryRun. A deliberate, logged, master-gated loosening.
+//!          switch is ON and the voice-id gate allows; OFF => still
+//!          DryRun. A deliberate, logged, master-gated loosening.
 //!        * `Ask`    — the default and the existing behavior: park for a spoken
-//!                     human "yes" (the cross-turn confirmation gate).
+//!          human "yes" (the cross-turn confirmation gate).
 //!   4. The cross-turn confirmation gate (confirm.rs) — the spoken "yes".
 //!
 //! ## USER-SET ONLY — the load-bearing guarantee
