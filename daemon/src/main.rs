@@ -1045,6 +1045,14 @@ const ANTICIPATE_INTERVAL: Duration = Duration::from_secs(60);
 /// room, so presence gates everything (anticipate::Signals.present).
 const ANTICIPATE_PRESENCE_WINDOW_SECS: u64 = 10 * 60;
 
+/// AUTO-FOCUS calendar window (focus::calendar_state). We have no per-event END
+/// time, so a bounded window around the start is the honest "in a meeting" proxy:
+/// a meeting counts as in-progress from IMMINENT minutes before it starts through
+/// LOOKBACK minutes after (a typical meeting length). Only consulted when
+/// `[focus].auto` is on.
+const AUTO_FOCUS_MEETING_IMMINENT_MIN: i64 = 5;
+const AUTO_FOCUS_MEETING_LOOKBACK_MIN: i64 = 60;
+
 /// EDITH's live anticipation loop (runtime-only; never run in tests). Each tick
 /// it builds a verified `Signals` snapshot from the cached telemetry reading and
 /// presence, runs the PURE [`anticipate::evaluate`] with the configured policy +
@@ -1076,18 +1084,31 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
     // autonomy field, so applying it cannot loosen the gate, enable an action, or
     // raise autonomy — it only filters categories, tightens brief verbosity, and
     // can quiet the suggestion feed.
-    let focus_profile = focus::FocusProfile::from_config_str(&cfg.focus.profile);
-    let tuned = focus::apply_profile(&focus_profile, &focus::BaseBehavior::default());
+    let configured_profile = focus::FocusProfile::from_config_str(&cfg.focus.profile);
+    let configured_tuned = focus::apply_profile(&configured_profile, &focus::BaseBehavior::default());
+    // AUTO-FOCUS (opt-in, `[focus].auto`, ships OFF): when on, the active profile
+    // is RESELECTED each tick from ON-DEVICE signals (acoustic scene + fused
+    // presence + calendar + time) and applied ON TOP of the configured profile
+    // through the SAME restrict-only `apply_profile` path — so it can only ever
+    // NARROW further, never broaden past the configured profile or the base, and
+    // (like the static profile) it never enables an action, raises autonomy, or
+    // touches a gate. Read ONCE at loop entry (same as the static profile). With
+    // it OFF the configured profile is used byte-for-byte as today.
+    let auto_focus = cfg.focus.auto;
     // Surface the active focus posture ONCE so the HUD can show which lens is
     // active and state the permission-neutral contract from the wire (the card
     // carries permission_neutral=true / raises_autonomy=false / loosens_gate=false
     // — not a HUD hardcode). PERMISSION-NEUTRAL by construction: TunedBehavior has
-    // no gate/permission/autonomy field to leak.
+    // no gate/permission/autonomy field to leak. In auto mode the per-tick selector
+    // re-emits `focus.active` whenever its choice changes.
     telemetry::emit(
         "agent.edith",
         "focus.active",
-        tuned.telemetry(focus_profile.clone()),
+        configured_tuned.telemetry(configured_profile.clone()),
     );
+    // The last auto choice we emitted a `focus.active` frame for, so we emit one
+    // ONLY when the auto selection actually changes (secret-free, bounded chatter).
+    let mut last_auto_choice: Option<focus::ProfileChoice> = None;
     let mut fired = FiredState::default();
     // Throttle caches for the external (network) signals, carried across ticks so
     // calendar/mail are refreshed on an interval rather than every 60s tick.
@@ -1140,6 +1161,48 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
         )
         .await;
 
+        // AUTO-FOCUS (opt-in): reselect the active profile from ON-DEVICE signals
+        // this tick and compose it ON TOP of the configured profile through the
+        // SAME restrict-only `apply_profile` path, so `tuned` can only NARROW
+        // further than the configured floor (never broaden, never enable/loosen).
+        // Signals are all on-device: the fused presence (`attention`), the calendar
+        // busy-state derived from the SAME upcoming-events the evaluator sees, the
+        // time-of-day over the operator's quiet band, and the acoustic scene —
+        // which ships inert (no bundled classifier / capture tap unwired), so it is
+        // honestly `Unknown` here and selection rides presence/calendar/time until
+        // scene.rs's tap is built. Emits `focus.active` only when the choice
+        // changes. When `[focus].auto` is OFF this whole block is skipped and the
+        // configured profile is used byte-for-byte as today.
+        let auto_tuned = if auto_focus {
+            let fsignals = focus::FocusSignals {
+                scene: focus::AcousticScene::Unknown,
+                presence: attention,
+                calendar: focus::calendar_state(
+                    &signals.events,
+                    AUTO_FOCUS_MEETING_IMMINENT_MIN,
+                    AUTO_FOCUS_MEETING_LOOKBACK_MIN,
+                ),
+                time: focus::TimeOfDay::from_local_hour(
+                    local_hour,
+                    policy.quiet_start,
+                    policy.quiet_end,
+                ),
+            };
+            let choice = focus::select_profile(fsignals);
+            let composed = focus::apply_profile(&choice.profile, &configured_tuned.as_base());
+            if last_auto_choice.as_ref() != Some(&choice) {
+                telemetry::emit("agent.edith", "focus.active", choice.telemetry(&composed));
+                info!(profile = ?choice.profile, reason = choice.reason, "auto-focus: selection changed");
+                last_auto_choice = Some(choice);
+            }
+            Some(composed)
+        } else {
+            None
+        };
+        // The behavior in force this tick: the per-tick auto selection when on,
+        // else the once-resolved configured profile (identical to today).
+        let tuned: &focus::TunedBehavior = auto_tuned.as_ref().unwrap_or(&configured_tuned);
+
         // PROACTIVE-INTELLIGENCE SUGGESTIONS (#13 habit detector + #14 predictive
         // suggester). Runs every tick, INDEPENDENT of the EDITH brief decision
         // below (a suggestion is a separate surface). GATED by [proactive].suggest
@@ -1177,7 +1240,7 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
         // non-empty digest is the multi-item glance, an empty one honestly says
         // nothing surfaced (never padded — so we only emit when non-empty).
         let brief_signals = signals::brief_signals_from_snapshot(&signals, &policy);
-        let smart_brief = brief::build_brief(&brief_signals, &tuned);
+        let smart_brief = brief::build_brief(&brief_signals, tuned);
         if !smart_brief.empty {
             telemetry::emit("agent.edith", "proactive.digest", smart_brief.telemetry());
         }

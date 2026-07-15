@@ -227,6 +227,24 @@ impl TunedBehavior {
         self.surfacing.contains(&category)
     }
 
+    /// View this tuned behavior AS A BASE for FURTHER restriction — the seam
+    /// Auto-Focus (`select_profile`) uses to compose a second profile ON TOP
+    /// through the SAME [`apply_profile`] path while preserving the restrict-only
+    /// invariant. Re-applying a profile to this base can only NARROW further
+    /// (never re-broaden — see the idempotent-restriction property test), and
+    /// because `is_no_broader_than` is transitive, the composed result is no
+    /// broader than the ORIGINAL base too. It carries only the three
+    /// NON-CONSEQUENTIAL knobs across — there is no gate/permission/autonomy field
+    /// to smuggle through — so composition stays permission-neutral by
+    /// construction.
+    pub fn as_base(&self) -> BaseBehavior {
+        BaseBehavior {
+            surfacing: self.surfacing.clone(),
+            verbosity: self.verbosity,
+            suggestions_quieted: self.suggestions_quieted,
+        }
+    }
+
     /// THE machine-checkable PERMISSION-NEUTRALITY predicate: is this tuned
     /// behavior NO BROADER than `base` on every axis? True iff:
     ///   * its surfacing set is a SUBSET of the base's (it added no category the
@@ -460,6 +478,231 @@ pub fn apply_profile(profile: &FocusProfile, base: &BaseBehavior) -> TunedBehavi
             suggestions_quieted: quiet(true),
         },
     }
+}
+
+// ---------------------------------------------------------------------------
+// AUTO-FOCUS — presence/scene-driven profile SELECTION (restrict-only)
+//
+// Everything below is a PURE fusion layer that PICKS one of the EXISTING
+// quiet-only profiles above from sensed room state. It does NOT introduce a new
+// behavior surface: the picked profile is still applied through the identical
+// restrict-only [`apply_profile`] path, so an auto-selected profile rides the
+// SAME `is_no_broader_than` type-level invariant — it can only ever NARROW which
+// non-consequential intel surfaces, never enable an action, raise autonomy, or
+// touch a gate. The selection is the only new logic; the enforcement is
+// unchanged. Ships OPT-IN (`[focus].auto`, default OFF) because it changes what
+// surfaces based on sensed state; OFF, focus behaves exactly as today.
+// ---------------------------------------------------------------------------
+
+/// The coarse ROOM SOUNDSCAPE the auto-focus fuser reasons over. DISTINCT from
+/// [`crate::scene::SceneEvent`]'s sound-EVENT labels (doorbell/knock/…): this is
+/// the ambient-scene CLASS relevant to whether DARWIN should stay quiet.
+///
+/// `Unknown` is the HONEST default: no room-scene classifier is bundled
+/// (scene.rs ships armed-but-inert — no model, capture tap unwired), so live the
+/// scene degrades to `Unknown` and the fuser falls back to presence + calendar +
+/// time. The non-`Unknown` variants are exercised by the unit tests and by the
+/// [`AcousticScene::from_scene_events`] seam so the fusion is fully specified for
+/// when a classifier is wired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AcousticScene {
+    /// No usable scene reading this tick (classifier inert / not wired). Honest
+    /// absence — contributes nothing to the fusion.
+    Unknown,
+    /// A silent room. Non-restrictive (defer to the other signals).
+    Quiet,
+    /// Background/ambient noise that is not a conversation. Non-restrictive.
+    Ambient,
+    /// People talking in the room (an in-person meeting/conversation). A
+    /// do-not-disturb cue.
+    Conversation,
+    /// You are on/near a call (e.g. a phone ringing / call audio). A
+    /// do-not-disturb cue.
+    Call,
+}
+
+impl AcousticScene {
+    /// Whether this scene implies you are mid-conversation/call — the "call/
+    /// meeting scene" the fuser quiets for. `Unknown`/`Quiet`/`Ambient` are not
+    /// conversation cues.
+    fn indicates_conversation(self) -> bool {
+        matches!(self, AcousticScene::Call | AcousticScene::Conversation)
+    }
+
+    /// Derive a coarse focus scene from scene.rs's sound-EVENT detections (the
+    /// on-device acoustic classifier's real output type). A `phone_ring` is the
+    /// one shipped event that implies you are likely on/near a call -> `Call`.
+    /// Any other known event is ambient noise, not a conversation cue ->
+    /// `Ambient`. No events -> `Unknown` (the honest default: scene.rs ships inert
+    /// — no model, capture tap unwired — so live this stays `Unknown` and the
+    /// fuser falls back to presence/calendar/time). Wired to scene.rs's actual
+    /// type so the scene seam is live code, not a stub; it feeds selection once
+    /// scene.rs's capture tap is built.
+    ///
+    /// `#[allow(dead_code)]`: this is the SCENE seam. scene.rs ships armed-but-
+    /// inert (no bundled classifier, capture tap unwired), so the live tick has no
+    /// scene events to feed and passes `Unknown` directly — this mapper is
+    /// exercised by the `scene_from_events_*` unit test today and becomes the live
+    /// feed the moment scene.rs's tap lands. Kept as a first-class method (not
+    /// test-local) so the mapping lives next to the type, mirroring
+    /// [`TunedBehavior::is_no_broader_than`]'s treatment.
+    #[allow(dead_code)]
+    pub fn from_scene_events(events: &[crate::scene::SceneEvent]) -> AcousticScene {
+        if events.iter().any(|e| e.label == "phone_ring") {
+            AcousticScene::Call
+        } else if events.is_empty() {
+            AcousticScene::Unknown
+        } else {
+            AcousticScene::Ambient
+        }
+    }
+}
+
+/// Coarse calendar busy-state for auto-focus. `InMeeting` means a meeting is in
+/// progress (or imminent); `Free` means no known meeting; `Unknown` is an
+/// explicit no-reading (used by tests / honest degradation — the live wire never
+/// fabricates a meeting, so an unconnected calendar reads `Free`, not a made-up
+/// `InMeeting`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CalendarState {
+    Unknown,
+    Free,
+    InMeeting,
+}
+
+/// Derive the [`CalendarState`] from the SAME upcoming-events the evaluator sees.
+/// We have no per-event END time, so a bounded window around the start is the
+/// honest "in progress" proxy: an event counts as `InMeeting` from `imminent_min`
+/// minutes BEFORE it starts through `lookback_min` minutes AFTER (a
+/// `minutes_until` in `[-lookback_min, imminent_min]`). Empty/absent events ->
+/// `Free` (a not-connected calendar degrades to no known meeting, never a
+/// fabricated one). PURE.
+pub fn calendar_state(
+    events: &[crate::anticipate::UpcomingEvent],
+    imminent_min: i64,
+    lookback_min: i64,
+) -> CalendarState {
+    let busy = events
+        .iter()
+        .any(|e| e.minutes_until <= imminent_min && e.minutes_until >= -lookback_min);
+    if busy {
+        CalendarState::InMeeting
+    } else {
+        CalendarState::Free
+    }
+}
+
+/// Time-of-day bucket the fuser reasons over. `Night` (likely-asleep hours)
+/// biases toward the `Sleep` profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimeOfDay {
+    Day,
+    Night,
+}
+
+impl TimeOfDay {
+    /// Classify a local hour as `Night` iff it falls in the `[start, end)` band
+    /// (reusing [`crate::anticipate::in_quiet_hours`] so the wrap-midnight math is
+    /// shared, not re-derived). `start == end` is an empty band (never `Night`).
+    /// The live tick passes the operator's `[proactive]` quiet band as the sleep
+    /// window.
+    pub fn from_local_hour(hour: u8, start: u8, end: u8) -> TimeOfDay {
+        if crate::anticipate::in_quiet_hours(hour, start, end) {
+            TimeOfDay::Night
+        } else {
+            TimeOfDay::Day
+        }
+    }
+}
+
+/// The fused, ON-DEVICE signal snapshot [`select_profile`] reasons over. Every
+/// field is a coarse, non-secret bucket — no raw audio, no timestamps, no event
+/// titles. PURE input: the caller assembles it at the live edge from the
+/// on-device acoustic scene, the fused [`crate::presence::Presence`], the calendar
+/// busy-state, and the time-of-day.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FocusSignals {
+    /// On-device acoustic room scene (Unknown when no classifier is wired).
+    pub scene: AcousticScene,
+    /// Fused presence/attention (Away / Present / Focused).
+    pub presence: crate::presence::Presence,
+    /// Calendar busy-state (InMeeting / Free / Unknown).
+    pub calendar: CalendarState,
+    /// Time-of-day bucket (Day / Night).
+    pub time: TimeOfDay,
+}
+
+/// The result of an auto-focus selection: the chosen [`FocusProfile`] plus a
+/// stable, non-secret `reason` token for telemetry/copy. Carries NO extra power —
+/// it names one of the EXISTING restrict-only profiles; applying it goes through
+/// [`apply_profile`], so it is bound by the same invariant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileChoice {
+    pub profile: FocusProfile,
+    /// Why this profile was picked (a stable token: "away", "in_meeting",
+    /// "night", "focused_flow", "clear"). Secret-free.
+    pub reason: &'static str,
+}
+
+impl ProfileChoice {
+    fn new(profile: FocusProfile, reason: &'static str) -> Self {
+        ProfileChoice { profile, reason }
+    }
+
+    /// The `focus.active` telemetry frame for an AUTO selection: the same
+    /// permission-neutral posture the manual card carries (via
+    /// [`TunedBehavior::telemetry`]), plus `source: "auto"` and the `reason`
+    /// token so the HUD can show WHY the lens changed. Secret-free — it reuses the
+    /// tuned telemetry (which has no gate/permission field to leak) and adds two
+    /// non-secret strings.
+    pub fn telemetry(&self, tuned: &TunedBehavior) -> serde_json::Value {
+        let mut v = tuned.telemetry(self.profile.clone());
+        if let Some(obj) = v.as_object_mut() {
+            obj.insert("source".to_string(), serde_json::json!("auto"));
+            obj.insert("reason".to_string(), serde_json::json!(self.reason));
+        }
+        v
+    }
+}
+
+/// PURE. Fuse the on-device [`FocusSignals`] into ONE of the existing quiet-only
+/// profiles. This is the whole of Auto-Focus's new decision logic; enforcement of
+/// the restrict-only invariant is unchanged (the caller applies the choice via
+/// [`apply_profile`]).
+///
+/// The table, most-restrictive cue first (first match wins):
+///   1. **Away** -> `DeepFocus`. Nobody is at the machine; go fully quiet. (The
+///      single card is already presence-gated, but the multi-item digest and the
+///      suggestion feed are NOT — quieting those is the real effect.)
+///   2. **Call/meeting** (a conversation/call scene OR the calendar says
+///      InMeeting) -> `DeepFocus`. Do not disturb while you are on a call / in a
+///      meeting.
+///   3. **Night** -> `Sleep`. Likely asleep: only Critical surfaces, brief,
+///      suggestions quieted.
+///   4. **Focused** (at the machine, in silent flow) -> `Work`. Heads-down:
+///      silence news/routine/market, keep work intel.
+///   5. Otherwise (Present, quiet room, daytime, calendar free) -> `Default` (the
+///      IDENTITY — today's behavior). "Quiet room + present -> normal."
+///
+/// EVERY branch returns a profile that `apply_profile` guarantees is no broader
+/// than its base, so no [`FocusSignals`] can produce a broadening choice.
+pub fn select_profile(signals: FocusSignals) -> ProfileChoice {
+    if signals.presence == crate::presence::Presence::Away {
+        return ProfileChoice::new(FocusProfile::DeepFocus, "away");
+    }
+    if signals.scene.indicates_conversation() || signals.calendar == CalendarState::InMeeting {
+        return ProfileChoice::new(FocusProfile::DeepFocus, "in_meeting");
+    }
+    if signals.time == TimeOfDay::Night {
+        return ProfileChoice::new(FocusProfile::Sleep, "night");
+    }
+    if signals.presence == crate::presence::Presence::Focused {
+        return ProfileChoice::new(FocusProfile::Work, "focused_flow");
+    }
+    ProfileChoice::new(FocusProfile::Default, "clear")
 }
 
 #[cfg(test)]
@@ -732,6 +975,263 @@ mod tests {
         assert_eq!(v["raises_autonomy"], false);
         assert_eq!(v["loosens_gate"], false);
         // Surfacing carries only the critical floor under sleep.
+        assert_eq!(v["surfacing"], serde_json::json!(["critical"]));
+    }
+
+    // =====================================================================
+    // AUTO-FOCUS — select_profile fusion + the restrict-only invariant
+    // =====================================================================
+
+    use crate::presence::Presence;
+
+    /// A neutral snapshot: present, quiet room, no meeting, daytime — the case
+    /// that must resolve to the IDENTITY (Default). Tests override single fields.
+    fn clear_signals() -> FocusSignals {
+        FocusSignals {
+            scene: AcousticScene::Quiet,
+            presence: Presence::Present,
+            calendar: CalendarState::Free,
+            time: TimeOfDay::Day,
+        }
+    }
+
+    #[test]
+    fn quiet_room_present_daytime_selects_default_normal() {
+        // "Quiet room + present -> normal": the fuser picks the IDENTITY profile,
+        // so with auto ON in a clear room DARWIN behaves exactly as today.
+        let choice = select_profile(clear_signals());
+        assert_eq!(choice.profile, FocusProfile::Default);
+        assert_eq!(choice.reason, "clear");
+        // And applying it is the identity over the base.
+        let base = BaseBehavior::default();
+        let tuned = apply_profile(&choice.profile, &base);
+        assert_eq!(tuned, apply_profile(&FocusProfile::Default, &base));
+    }
+
+    #[test]
+    fn away_selects_deep_focus_quiet() {
+        // "Away -> quiet": nobody at the machine -> the most restrictive profile,
+        // regardless of scene/calendar/time.
+        let choice = select_profile(FocusSignals { presence: Presence::Away, ..clear_signals() });
+        assert_eq!(choice.profile, FocusProfile::DeepFocus);
+        assert_eq!(choice.reason, "away");
+    }
+
+    #[test]
+    fn call_scene_selects_deep_focus_quiet() {
+        // "Call/meeting scene -> quiet": a call scene silences everything but
+        // Critical while present in a quiet-hours-free daytime.
+        let choice = select_profile(FocusSignals { scene: AcousticScene::Call, ..clear_signals() });
+        assert_eq!(choice.profile, FocusProfile::DeepFocus);
+        assert_eq!(choice.reason, "in_meeting");
+        // A conversation scene is the same do-not-disturb cue.
+        let conv = select_profile(FocusSignals { scene: AcousticScene::Conversation, ..clear_signals() });
+        assert_eq!(conv.profile, FocusProfile::DeepFocus);
+    }
+
+    #[test]
+    fn calendar_in_meeting_selects_deep_focus_even_without_a_scene() {
+        // The calendar alone (scene Unknown — no classifier wired) still drives
+        // the do-not-disturb selection.
+        let choice = select_profile(FocusSignals {
+            scene: AcousticScene::Unknown,
+            calendar: CalendarState::InMeeting,
+            ..clear_signals()
+        });
+        assert_eq!(choice.profile, FocusProfile::DeepFocus);
+        assert_eq!(choice.reason, "in_meeting");
+    }
+
+    #[test]
+    fn night_selects_sleep() {
+        let choice = select_profile(FocusSignals { time: TimeOfDay::Night, ..clear_signals() });
+        assert_eq!(choice.profile, FocusProfile::Sleep);
+        assert_eq!(choice.reason, "night");
+    }
+
+    #[test]
+    fn focused_silent_flow_selects_work() {
+        // Present and in silent flow (no meeting/night/away) -> heads-down Work.
+        let choice = select_profile(FocusSignals { presence: Presence::Focused, ..clear_signals() });
+        assert_eq!(choice.profile, FocusProfile::Work);
+        assert_eq!(choice.reason, "focused_flow");
+    }
+
+    #[test]
+    fn away_outranks_meeting_night_and_flow() {
+        // Priority: Away wins even when a meeting/night/flow cue is also set.
+        let choice = select_profile(FocusSignals {
+            scene: AcousticScene::Call,
+            presence: Presence::Away,
+            calendar: CalendarState::InMeeting,
+            time: TimeOfDay::Night,
+        });
+        assert_eq!(choice.profile, FocusProfile::DeepFocus);
+        assert_eq!(choice.reason, "away", "away is the first-matched cue");
+    }
+
+    /// The representative cross-product of signal combinations, for the invariant
+    /// sweep below.
+    fn representative_signals() -> Vec<FocusSignals> {
+        let scenes = [
+            AcousticScene::Unknown,
+            AcousticScene::Quiet,
+            AcousticScene::Ambient,
+            AcousticScene::Conversation,
+            AcousticScene::Call,
+        ];
+        let presences = [Presence::Away, Presence::Present, Presence::Focused];
+        let calendars = [CalendarState::Unknown, CalendarState::Free, CalendarState::InMeeting];
+        let times = [TimeOfDay::Day, TimeOfDay::Night];
+        let mut out = Vec::new();
+        for &scene in &scenes {
+            for &presence in &presences {
+                for &calendar in &calendars {
+                    for &time in &times {
+                        out.push(FocusSignals { scene, presence, calendar, time });
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_auto_choice_is_a_quiet_only_profile() {
+        // select_profile may ONLY ever return one of the existing quiet-only
+        // profiles — never a broadening or novel one. (Default is the identity;
+        // the rest narrow.)
+        for s in representative_signals() {
+            let p = select_profile(s).profile;
+            assert!(
+                matches!(
+                    p,
+                    FocusProfile::Default
+                        | FocusProfile::Work
+                        | FocusProfile::Sleep
+                        | FocusProfile::DeepFocus
+                ),
+                "auto picked an unexpected profile {p:?} for {s:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn property_no_auto_choice_broadens_the_base() {
+        // THE #24 GATE for auto-selection, machine-checked: for EVERY representative
+        // signal snapshot, applying the auto-selected profile is NO BROADER than the
+        // base — auto-selection rides the SAME `is_no_broader_than` invariant as a
+        // manually named profile. It can only ever quiet more.
+        for base in [
+            BaseBehavior::default(),
+            // Compose over an already-restricted base too (the live tick composes
+            // auto ON TOP of the configured profile via `as_base`): the result must
+            // STILL be no broader than that base — restriction composes monotonically.
+            apply_profile(&FocusProfile::Work, &BaseBehavior::default()).as_base(),
+            apply_profile(&FocusProfile::DeepFocus, &BaseBehavior::default()).as_base(),
+        ] {
+            for s in representative_signals() {
+                let choice = select_profile(s);
+                let tuned = apply_profile(&choice.profile, &base);
+                assert!(
+                    tuned.is_no_broader_than(&base),
+                    "auto choice {:?} for {:?} broadened base {:?} -> {:?}",
+                    choice.profile,
+                    s,
+                    base,
+                    tuned
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn composing_auto_over_a_restrictive_configured_profile_never_re_broadens() {
+        // The live tick applies the auto choice ON TOP of the configured profile's
+        // tuned behavior (via `as_base`). Even when auto picks a LESS restrictive
+        // profile (e.g. Work) than the configured one (DeepFocus), composition can
+        // only narrow: the effective result is no broader than the configured
+        // DeepFocus, so a cautious operator's static floor is never loosened.
+        let configured = apply_profile(&FocusProfile::DeepFocus, &BaseBehavior::default());
+        // Force auto to pick Work (present, silent flow, quiet, daytime, free).
+        let choice = select_profile(FocusSignals { presence: Presence::Focused, ..clear_signals() });
+        assert_eq!(choice.profile, FocusProfile::Work, "precondition: auto picks Work here");
+        let composed = apply_profile(&choice.profile, &configured.as_base());
+        assert!(
+            composed.is_no_broader_than(&configured.as_base()),
+            "auto composed over DeepFocus re-broadened it: {composed:?}"
+        );
+        // Concretely: DeepFocus surfaced only Critical; composing Work cannot add
+        // any category back.
+        assert_eq!(composed.surfacing, vec![SignalCategory::Critical]);
+    }
+
+    #[test]
+    fn as_base_round_trips_the_three_knobs() {
+        // The composition seam carries exactly the three non-consequential knobs.
+        let tuned = apply_profile(&FocusProfile::Sleep, &BaseBehavior::default());
+        let base = tuned.as_base();
+        assert_eq!(base.surfacing, tuned.surfacing);
+        assert_eq!(base.verbosity, tuned.verbosity);
+        assert_eq!(base.suggestions_quieted, tuned.suggestions_quieted);
+        // Applying Default (identity) to it reproduces the same tuned behavior.
+        let again = apply_profile(&FocusProfile::Default, &base);
+        assert_eq!(again, tuned);
+    }
+
+    #[test]
+    fn scene_from_events_maps_phone_ring_to_call_and_degrades_honestly() {
+        use crate::scene::SceneEvent;
+        let ring = vec![SceneEvent { label: "phone_ring".into(), confidence: 0.9, ts: "2026-07-15T10:00:00Z".into() }];
+        assert_eq!(AcousticScene::from_scene_events(&ring), AcousticScene::Call);
+        let bark = vec![SceneEvent { label: "dog_bark".into(), confidence: 0.9, ts: "2026-07-15T10:00:00Z".into() }];
+        assert_eq!(AcousticScene::from_scene_events(&bark), AcousticScene::Ambient, "non-call event is ambient");
+        // No events (the live reality: scene.rs is inert) -> Unknown, the honest
+        // default that makes the fuser fall back to presence/calendar/time.
+        assert_eq!(AcousticScene::from_scene_events(&[]), AcousticScene::Unknown);
+    }
+
+    #[test]
+    fn calendar_state_uses_a_bounded_window_and_never_fabricates() {
+        use crate::anticipate::UpcomingEvent;
+        let ev = |m: i64| UpcomingEvent { summary: "Sync".into(), minutes_until: m };
+        // Imminent (starts in 3 min, window 5) -> InMeeting.
+        assert_eq!(calendar_state(&[ev(3)], 5, 60), CalendarState::InMeeting);
+        // In progress (started 20 min ago, lookback 60) -> InMeeting.
+        assert_eq!(calendar_state(&[ev(-20)], 5, 60), CalendarState::InMeeting);
+        // Far future (starts in 30 min, window 5) -> Free (not in it yet).
+        assert_eq!(calendar_state(&[ev(30)], 5, 60), CalendarState::Free);
+        // Long past (ended, older than lookback) -> Free.
+        assert_eq!(calendar_state(&[ev(-120)], 5, 60), CalendarState::Free);
+        // No events (unconnected calendar) -> Free, never a fabricated InMeeting.
+        assert_eq!(calendar_state(&[], 5, 60), CalendarState::Free);
+    }
+
+    #[test]
+    fn time_of_day_reuses_the_quiet_band_wrap_math() {
+        // Night = inside the (wrap-midnight) band; shares in_quiet_hours' logic.
+        assert_eq!(TimeOfDay::from_local_hour(23, 22, 7), TimeOfDay::Night);
+        assert_eq!(TimeOfDay::from_local_hour(3, 22, 7), TimeOfDay::Night);
+        assert_eq!(TimeOfDay::from_local_hour(12, 22, 7), TimeOfDay::Day);
+        // An empty band (start == end) is never Night.
+        assert_eq!(TimeOfDay::from_local_hour(3, 0, 0), TimeOfDay::Day);
+    }
+
+    #[test]
+    fn auto_telemetry_states_source_reason_and_the_permission_neutral_posture() {
+        let base = BaseBehavior::default();
+        let choice = select_profile(FocusSignals { presence: Presence::Away, ..clear_signals() });
+        let tuned = apply_profile(&choice.profile, &base);
+        let v = choice.telemetry(&tuned);
+        // The auto framing.
+        assert_eq!(v["source"], "auto");
+        assert_eq!(v["reason"], "away");
+        assert_eq!(v["profile"], "deep_focus");
+        // The SAME permission-neutral contract the manual card carries — auto adds
+        // no capability, only two non-secret strings.
+        assert_eq!(v["permission_neutral"], true);
+        assert_eq!(v["raises_autonomy"], false);
+        assert_eq!(v["loosens_gate"], false);
         assert_eq!(v["surfacing"], serde_json::json!(["critical"]));
     }
 }
