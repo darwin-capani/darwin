@@ -276,6 +276,16 @@ pub struct Config {
     /// act. With it false the "what would you do if ..." cue falls through to normal
     /// routing (it is just another question).
     pub precog: PrecogConfig,
+    /// [realm] — SCRATCH REALMS (realm.rs): a disposable, confined build+test
+    /// sandbox that VERIFIES a `code_propose_diff` proposal BEFORE a human applies
+    /// it. `enabled` SHIPS ON (full-power default) but is INERT WITHOUT DEPS — it
+    /// can only run with an allowlisted `[code].roots` repo (the tree it COW-copies)
+    /// AND `[shell].enabled` (it reuses the sandboxed-exec seam). The realm is a
+    /// network-denied COW copy under `state/realms/<ts>/`; the daemon READS the
+    /// user's tree for the copy but NEVER writes it (apply-to-real stays the separate
+    /// human-gated `apply_code_diff.sh`). It reports honest UNVERIFIED — never a
+    /// faked pass — when the sandbox/tooling is unavailable or no verify command is set.
+    pub realm: RealmConfig,
 }
 
 /// Every section and key the config knows, for unknown-key diagnostics
@@ -844,6 +854,14 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // construction: it describes what a real run WOULD do (and that it would PARK),
     // never acts. Listed so the key never reads as a typo.
     ("precog", &["enabled"]),
+    // [realm] — SCRATCH REALMS (realm.rs): a disposable, confined build+test sandbox
+    // that VERIFIES a code_propose_diff proposal in a network-denied COW copy of the
+    // codebase BEFORE a human applies it. `enabled` SHIPS ON (full-power default) —
+    // INERT WITHOUT DEPS: it needs an allowlisted [code].roots repo + [shell].enabled.
+    // `verify_command` SHIPS EMPTY (the operator names their project's build/test
+    // command; empty => an honest UNVERIFIED, never a faked pass). Listed here so
+    // neither key reads as a typo.
+    ("realm", &["enabled", "verify_command"]),
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2177,6 +2195,52 @@ impl Default for ShellConfig {
             // sandbox-exec profile. INERT WITHOUT DEVICE SUPPORT: exec needs
             // /usr/bin/sandbox-exec + /bin/sh on-device.
             enabled: true,
+        }
+    }
+}
+
+/// [realm] — SCRATCH REALMS (realm.rs): a disposable, confined build+test sandbox
+/// that VERIFIES a `code_propose_diff` proposal in a throwaway, network-denied copy
+/// of the user's codebase BEFORE a human applies it — closing the honesty gap the
+/// propose path admits (a proposed diff's compile/test correctness is NOT guaranteed).
+///
+///   - `enabled` (SHIPS ON, full-power default): master switch. INERT WITHOUT DEPS —
+///     a Realm can only run with an allowlisted `[code].roots` repo (the tree it
+///     COW-copies) AND `[shell].enabled` (it reuses the sandboxed-exec seam). With
+///     any of the three unmet the feature is inert (see [`crate::realm::realm_permitted`]).
+///   - `verify_command` (SHIPS EMPTY): the build/test command run INSIDE the realm
+///     (e.g. `"cargo test --offline"`). EMPTY => the Realm reports an honest
+///     UNVERIFIED (there is nothing to run) rather than faking a pass — the operator
+///     must set the command their project builds/tests with. The realm is network-
+///     denied, so a build must not need the network (pre-fetched deps / `--offline`).
+///
+/// HONESTY: the realm is a COPY-ON-WRITE copy under `state/realms/<ts>/` — the daemon
+/// READS the user's tree to copy it but NEVER writes the real tree; the proposed diff
+/// is applied INTO the realm ONLY. Apply-to-real stays the SEPARATE, human-reviewed
+/// `scripts/apply_code_diff.sh` (unchanged). The build/test runs under the DENY-DEFAULT,
+/// network-denied `sandbox-exec` profile (write-confined to the realm). A `Passed`
+/// verdict means the build/test REALLY ran and exited zero — it is never a claim; when
+/// the sandbox/tooling is unavailable or the diff does not apply, the Realm reports an
+/// honest UNVERIFIED, NEVER a faked pass. The exec is DEVICE-gated (needs
+/// `/usr/bin/sandbox-exec` + `/bin/cp` + git) and is NOT claimed proven by the hermetic
+/// tests (which use a mock runner).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RealmConfig {
+    pub enabled: bool,
+    pub verify_command: String,
+}
+
+impl Default for RealmConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS ON (full-power default) — INERT WITHOUT DEPS: a Realm needs an
+            // allowlisted [code].roots repo AND [shell].enabled to do anything.
+            enabled: true,
+            // SHIPS EMPTY — the operator must name the command their project
+            // builds/tests with (network-denied, so `--offline` / pre-fetched deps).
+            // Empty => an honest UNVERIFIED verdict, never a faked pass.
+            verify_command: String::new(),
         }
     }
 }
@@ -3674,6 +3738,7 @@ impl Config {
             boundary: section(&table, "boundary", &mut issues),
             egress: section(&table, "egress", &mut issues),
             precog: section(&table, "precog", &mut issues),
+            realm: section(&table, "realm", &mut issues),
         };
 
         // SELECTABLE QUANTIZATION (#39) value validation: an unknown [inference]

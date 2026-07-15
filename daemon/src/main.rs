@@ -206,6 +206,17 @@ mod prosody;
 // wired in the binary — the detect/surface path itself IS live.
 #[cfg_attr(not(test), allow(dead_code))]
 mod proactive_intel;
+// SCRATCH REALMS (realm.rs): a disposable, confined build+test sandbox that VERIFIES
+// a proposed code change (from code::code_propose_diff) BEFORE a human applies it. It
+// COW-copies an allowlisted [code].roots repo into a network-denied state/realms/<ts>/,
+// applies the proposed diff INTO the realm ONLY (never the user's tree), runs the
+// build/test there via the EXISTING device-gated shell::run_sandboxed seam, captures the
+// REAL pass/fail, attaches it to the proposal card, then tears the realm down. PURE
+// orchestration (path construction, confinement, verdict mapping) + a device-gated
+// runner (built, never invoked under cargo test). ARMED by default, INERT without a
+// [code].roots repo + [shell].enabled. Honest-UNVERIFIED (never a faked pass) when the
+// sandbox is unavailable. Hermetically tested in realm.rs.
+mod realm;
 mod recall;
 mod reflect;
 // REPORT GENERATION (#40): a PURE build_report(title, sources:[SourcedClaim], cfg)
