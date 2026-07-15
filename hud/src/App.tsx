@@ -61,6 +61,7 @@ import SuggestionsPanel from "./components/SuggestionsPanel";
 import UpdateDialog from "./components/UpdateDialog";
 import BriefFocusPanel from "./components/BriefFocusPanel";
 import CustomsPanel from "./components/CustomsPanel";
+import PrecogPanel from "./components/PrecogPanel";
 import BootReveal from "./components/BootReveal";
 import ConduitField from "./components/ConduitField";
 import CoreHud from "./components/CoreHud";
@@ -603,6 +604,7 @@ export default function App() {
             onDismiss={dismissSuggestion}
           />
           <BriefFocusPanel digest={state.proactiveDigest} focus={state.focusProfile} />
+          <PrecogPanel plan={state.precogPlan} />
           <CustomsPanel manifest={state.egressManifest} />
           <PresencePanel presence={state.presence} />
           <VisionPanel

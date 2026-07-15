@@ -238,6 +238,7 @@ mod selfcheck;
 mod sfx_cue;
 mod shell;
 mod signals;
+mod simulate;
 mod skills;
 mod speech;
 mod standing;
