@@ -51,11 +51,12 @@
 //! another component reads" rationale `integrations/mod.rs` uses.
 #![allow(dead_code)]
 
+use std::future::Future;
 use std::path::Path;
 
 use anyhow::Result;
 use chrono::Utc;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
@@ -71,6 +72,24 @@ pub const MAX_ENTRIES: usize = 10_000;
 /// root after a truncation). A fixed, well-known string so the chain has a
 /// deterministic anchor that `verify_chain` and `record` agree on.
 const GENESIS_PREV: &str = "GENESIS";
+
+/// Fixed, secret-free markers for a FORENSIC TRIAGE evidence record (see
+/// [`AuditLog::record_triage_evidence`]). A triage capture is read-only evidence,
+/// not a consequential decision, so it uses its own agent/tool/decision/outcome
+/// tokens rather than one of the gate's — the chain reads honestly as "an evidence
+/// bundle was frozen", never a fabricated approval/execution.
+const TRIAGE_AGENT: &str = "agent.aegis";
+const TRIAGE_TOOL: &str = "triage_snapshot";
+const TRIAGE_DECISION: &str = "ask";
+const TRIAGE_OUTCOME: &str = "evidence_captured";
+
+/// The macOS Keychain account holding the audit chain's EXTERNAL ANCHOR (the
+/// witnessed `"<seq>:<head_hash>"`). Added to `integrations::ALLOWED_ACCOUNTS`
+/// (a mirror test pins it) so the existing argv-free `resolve_secret` reader /
+/// `keychain_write` writer reach it under the `com.darwin.daemon` service. The
+/// value is a PUBLIC digest, not a credential — the Keychain is chosen because it
+/// is a DISTINCT OS protection domain from the audit SQLite file, not for secrecy.
+pub const AUDIT_ANCHOR_ACCOUNT: &str = "audit_chain_anchor";
 
 /// What happened at a consequential decision point. One value per call to
 /// [`AuditLog::record`], so the timeline reads as a sequence of decisions +
@@ -307,9 +326,26 @@ impl AuditLog {
         // site forgets. Redaction also guarantees no NUL byte (the canonical-form
         // delimiter) survives in the field.
         let target_redacted = crate::optimize::redact(target);
+        self.append_raw(agent, tool, &target_redacted, decision.as_str(), outcome.as_str())
+            .await
+    }
+
+    /// The SINGLE append path: link an ALREADY-FINAL record onto the chain, INSERT
+    /// it, and run the bounded prune+re-root. `target_stored` is written VERBATIM —
+    /// [`record`] pre-redacts it (secret-free defense in depth), while
+    /// [`record_triage_evidence`] passes a public SHA-256 digest that must survive
+    /// intact. Factoring this out keeps the seq/prev_hash linkage and the canonical
+    /// `hash_entry` preimage identical for every caller, so no two write paths can
+    /// drift on the chain bytes.
+    async fn append_raw(
+        &self,
+        agent: &str,
+        tool: &str,
+        target_stored: &str,
+        decision_s: &str,
+        outcome_s: &str,
+    ) -> Result<AuditEntry> {
         let ts = Utc::now().to_rfc3339();
-        let decision_s = decision.as_str().to_string();
-        let outcome_s = outcome.as_str().to_string();
 
         let conn = self.conn.lock().await;
         // The current tail: highest seq + its hash, or genesis when empty.
@@ -328,9 +364,9 @@ impl AuditLog {
             &ts,
             agent,
             tool,
-            &target_redacted,
-            &decision_s,
-            &outcome_s,
+            target_stored,
+            decision_s,
+            outcome_s,
         );
 
         conn.execute(
@@ -341,7 +377,7 @@ impl AuditLog {
                 ts,
                 agent,
                 tool,
-                target_redacted,
+                target_stored,
                 decision_s,
                 outcome_s,
                 prev_hash,
@@ -354,9 +390,9 @@ impl AuditLog {
             ts,
             agent: agent.to_string(),
             tool: tool.to_string(),
-            target_redacted,
-            decision: decision_s,
-            outcome: outcome_s,
+            target_redacted: target_stored.to_string(),
+            decision: decision_s.to_string(),
+            outcome: outcome_s.to_string(),
             prev_hash,
             entry_hash,
         };
@@ -368,6 +404,138 @@ impl AuditLog {
         }
 
         Ok(entry)
+    }
+
+    /// Record that a FORENSIC TRIAGE BUNDLE was frozen, folding its manifest's
+    /// SHA-256 into the hash chain so the ledger itself vouches for the bundle. A
+    /// triage capture is READ-ONLY evidence, not a consequential *decision*, so it
+    /// enters the chain with a dedicated, non-loosening marker
+    /// (`decision = "ask"`, `outcome = "evidence_captured"`) rather than one of the
+    /// gate's decision/outcome tokens.
+    ///
+    /// The stored target is `bundle <id> sha256=<hex>`. UNLIKE [`record`], the
+    /// digest is stored VERBATIM (no [`crate::optimize::redact`] pass): a SHA-256 is
+    /// a one-way, non-secret integrity value and the manifest it digests is itself
+    /// redacted at source, so the digest is safe in the clear — and it MUST survive
+    /// intact, because redaction would collapse a 64-hex run to `[redacted]` and
+    /// destroy the very anchor. The bundle id is a UTC timestamp (also non-secret).
+    pub async fn record_triage_evidence(
+        &self,
+        bundle_id: &str,
+        manifest_sha256: &str,
+    ) -> Result<AuditEntry> {
+        let target = format!("bundle {bundle_id} sha256={manifest_sha256}");
+        self.append_raw(TRIAGE_AGENT, TRIAGE_TOOL, &target, TRIAGE_DECISION, TRIAGE_OUTCOME)
+            .await
+    }
+
+    /// The current chain HEAD: `(seq, entry_hash)` of the highest-seq entry, or
+    /// `None` when the chain is empty. Read-only. Pinning the head pins the WHOLE
+    /// chain — the tail's `entry_hash` folds in every prior entry's hash — which is
+    /// why the external anchor stores exactly this value.
+    pub async fn head(&self) -> Result<Option<(i64, String)>> {
+        let conn = self.conn.lock().await;
+        let head = conn
+            .query_row(
+                "SELECT seq, entry_hash FROM audit ORDER BY seq DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?;
+        Ok(head)
+    }
+
+    /// The `entry_hash` stored at a specific `seq`, or `None` when no entry has that
+    /// seq (pruned away, or never existed). Read-only. Lets the external-anchor check
+    /// tell a legitimate append-only EXTENSION (the witnessed entry is still present
+    /// unchanged and the chain merely grew past it) from a genuine REWRITE (the entry
+    /// at the witnessed seq changed).
+    pub async fn hash_at_seq(&self, seq: i64) -> Result<Option<String>> {
+        let conn = self.conn.lock().await;
+        let h = conn
+            .query_row(
+                "SELECT entry_hash FROM audit WHERE seq = ?1",
+                params![seq],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()?;
+        Ok(h)
+    }
+
+    /// Read the live chain HEAD and WRITE it (as `"<seq>:<entry_hash>"`) to the
+    /// EXTERNAL `anchor`, returning the witnessed `(seq, head)` — or `None` on an
+    /// empty chain (nothing to witness, so no anchor is written). Call after a
+    /// chain-extending event (a triage evidence record) so the anchor tracks the
+    /// current head. The `anchor` is INJECTED so tests never touch the real Keychain.
+    pub async fn anchor_to<A: ChainAnchor>(&self, anchor: &A) -> Result<Option<(i64, String)>> {
+        let Some((seq, head)) = self.head().await? else {
+            return Ok(None);
+        };
+        anchor.write_anchor(&format!("{seq}:{head}")).await?;
+        Ok(Some((seq, head)))
+    }
+
+    /// Compare the live chain HEAD against the value stored in the EXTERNAL anchor
+    /// and report honestly. This closes the gap the module header admits: the local
+    /// hash chain cannot catch a root attacker who rewrites the ENTIRE forward chain
+    /// consistently (it still passes [`verify_chain`]), but such a rewrite MOVES the
+    /// tail's `entry_hash`, so it no longer equals the head witnessed in the
+    /// Keychain — a SEPARATE OS protection domain the SQLite-file attacker cannot
+    /// silently rewrite. A [`AnchorStatus::Mismatch`] is honestly ambiguous
+    /// (a rewrite, OR legitimate growth/pruning since the last anchor); the caller
+    /// pairs it with [`verify_chain`] + the witnessed vs live seq to interpret.
+    pub async fn verify_against_anchor<A: ChainAnchor>(
+        &self,
+        anchor: &A,
+    ) -> Result<AnchorStatus> {
+        let Some(raw) = anchor.read_anchor().await else {
+            return Ok(AnchorStatus::NoAnchor);
+        };
+        let Some((a_seq, a_head)) = parse_anchor(&raw) else {
+            // Never surface the raw value unredacted (it is only a public digest,
+            // but the redact pass is the module's blanket discipline).
+            return Ok(AnchorStatus::Malformed { raw_redacted: crate::optimize::redact(&raw) });
+        };
+        let Some((l_seq, l_head)) = self.head().await? else {
+            // An anchor exists but the live chain is EMPTY — the whole chain vanished
+            // from under the witness. Not legitimate growth: a genuine divergence.
+            return Ok(AnchorStatus::Mismatch { anchored_seq: a_seq, anchored_head: a_head, live: None });
+        };
+        // Exact corroboration.
+        if l_seq == a_seq && l_head == a_head {
+            return Ok(AnchorStatus::Match { seq: a_seq, head: a_head });
+        }
+        // Not exact. Distinguish a legitimate APPEND-ONLY extension from a REWRITE by
+        // asking whether the WITNESSED entry is still present, unchanged, at its seq.
+        // Without this the check false-alarms on EVERY boot after any new record —
+        // append-only growth advances the head — training operators to ignore it and
+        // nullifying the tamper detection the anchor exists to provide.
+        match self.hash_at_seq(a_seq).await? {
+            // Witnessed entry intact and the chain only grew past it: benign extension.
+            Some(h) if h == a_head && l_seq >= a_seq => {
+                Ok(AnchorStatus::Extended { anchored_seq: a_seq, anchored_head: a_head, live: (l_seq, l_head) })
+            }
+            // An entry EXISTS at the witnessed seq but its hash CHANGED: the chain was
+            // rewritten under the witness — the exact offline full-rewrite tamper the
+            // external anchor catches (and that verify_chain alone cannot). A rare
+            // local prune+re-root of a still-present witnessed entry also lands here
+            // (documented residual — a prune is uncommon at the generous retention cap).
+            Some(_) => Ok(AnchorStatus::Mismatch {
+                anchored_seq: a_seq,
+                anchored_head: a_head,
+                live: Some((l_seq, l_head)),
+            }),
+            // No entry at the witnessed seq: below the live head it was legitimately
+            // pruned away (bounded retention) — benign; at/above it the chain shrank.
+            None if a_seq < l_seq => {
+                Ok(AnchorStatus::Extended { anchored_seq: a_seq, anchored_head: a_head, live: (l_seq, l_head) })
+            }
+            None => Ok(AnchorStatus::Mismatch {
+                anchored_seq: a_seq,
+                anchored_head: a_head,
+                live: Some((l_seq, l_head)),
+            }),
+        }
     }
 
     /// Keep the newest `keep` entries; drop the rest and RE-ROOT the surviving
@@ -524,6 +692,167 @@ impl AuditLog {
         let conn = self.conn.lock().await;
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))?;
         Ok(count as usize)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// EXTERNAL ANCHOR — upgrading tamper-EVIDENT toward tamper-PROOF
+//
+// The hash chain lives in the same local SQLite file the entries do, so a root
+// attacker with write access could rewrite the ENTIRE forward chain and it would
+// still `verify_chain`. Anchoring the chain HEAD in a SEPARATE OS protection
+// domain — the macOS Keychain, which a SQLite-file attacker cannot silently
+// rewrite — means such a rewrite leaves the live head disagreeing with the
+// witnessed head. The seam is INJECTED (like posture.rs's command runner) so
+// tests exercise write / verify / mismatch with an in-memory anchor and NEVER
+// touch the real Keychain.
+// ---------------------------------------------------------------------------
+
+/// The external anchor seam: read / write the witnessed chain head in a store
+/// OUTSIDE the audit SQLite file. Declared with `-> impl Future + Send` (not
+/// `async fn`) so the trait carries an explicit `Send` bound (avoids the
+/// `async_fn_in_trait` lint) while the impls stay plain `async fn`.
+pub trait ChainAnchor {
+    /// The stored anchor value (`"<seq>:<head_hash>"`), or `None` when none is set.
+    fn read_anchor(&self) -> impl Future<Output = Option<String>> + Send;
+    /// Persist the anchor value. Errors are surfaced (a lost anchor is honest,
+    /// never silently swallowed).
+    fn write_anchor(&self, value: &str) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// The production anchor: the macOS Keychain at [`AUDIT_ANCHOR_ACCOUNT`], reached
+/// through the SAME argv-free `security(1)` seam the at-rest master key uses. The
+/// write is a blocking `security(1)` child, so it runs on the blocking pool rather
+/// than pinning an async worker (mirroring `resolve_encryption_key`'s key store).
+pub struct KeychainAnchor;
+
+impl ChainAnchor for KeychainAnchor {
+    async fn read_anchor(&self) -> Option<String> {
+        crate::integrations::resolve_secret(AUDIT_ANCHOR_ACCOUNT).await
+    }
+
+    async fn write_anchor(&self, value: &str) -> Result<()> {
+        let value = value.to_string();
+        tokio::task::spawn_blocking(move || {
+            crate::integrations::keychain_write(AUDIT_ANCHOR_ACCOUNT, &value)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("keychain anchor write task failed: {e}"))?
+    }
+}
+
+/// The honest verdict of [`AuditLog::verify_against_anchor`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AnchorStatus {
+    /// No external anchor is stored yet (never witnessed).
+    NoAnchor,
+    /// The live head equals the witnessed head at the same seq — the chain is
+    /// externally corroborated up to that point.
+    Match { seq: i64, head: String },
+    /// The live head advanced PAST the witnessed head by legitimate APPEND-ONLY
+    /// growth (or bounded pruning) — the witnessed entry is still corroborated at its
+    /// seq, so this is NOT a tamper. Benign: the caller advances the witness to the
+    /// live head.
+    Extended {
+        anchored_seq: i64,
+        anchored_head: String,
+        live: (i64, String),
+    },
+    /// The live head differs from the witnessed head in a way that is NOT legitimate
+    /// growth: the entry at the witnessed seq CHANGED, or the chain shrank/vanished —
+    /// the offline full-chain rewrite the external anchor catches that `verify_chain`
+    /// cannot. Both witnessed and live are carried so the caller can interpret.
+    Mismatch {
+        anchored_seq: i64,
+        anchored_head: String,
+        live: Option<(i64, String)>,
+    },
+    /// The stored anchor value was not the expected `"<seq>:<hash>"` shape.
+    Malformed { raw_redacted: String },
+}
+
+impl AnchorStatus {
+    /// Did the live head match the external anchor? (Convenience for the HUD /
+    /// operator "anchor-OK" indicator.)
+    pub fn is_match(&self) -> bool {
+        matches!(self, AnchorStatus::Match { .. })
+    }
+}
+
+/// Parse a stored anchor value `"<seq>:<hash>"` into `(seq, hash)`. Robust to
+/// surrounding whitespace; rejects a missing seq/colon or an empty hash.
+fn parse_anchor(raw: &str) -> Option<(i64, String)> {
+    let (seq, hash) = raw.trim().split_once(':')?;
+    let seq: i64 = seq.trim().parse().ok()?;
+    let hash = hash.trim();
+    (!hash.is_empty()).then(|| (seq, hash.to_string()))
+}
+
+/// The SECRET-FREE `audit.anchor` wire payload: the anchor verdict plus the
+/// witnessed vs live seq/hash. All values are public digests + integers — no raw
+/// input, no chain-internal `prev_hash` bytes beyond the single witnessed head.
+pub fn anchor_status_json(status: &AnchorStatus) -> serde_json::Value {
+    match status {
+        AnchorStatus::NoAnchor => serde_json::json!({ "ok": true, "state": "no_anchor" }),
+        AnchorStatus::Match { seq, head } => serde_json::json!({
+            "ok": true, "state": "match", "seq": seq, "head": head,
+        }),
+        AnchorStatus::Extended { anchored_seq, anchored_head, live } => serde_json::json!({
+            "ok": true,
+            "state": "extended",
+            "anchored_seq": anchored_seq,
+            "anchored_head": anchored_head,
+            "live_seq": live.0,
+            "live_head": live.1,
+        }),
+        AnchorStatus::Mismatch { anchored_seq, anchored_head, live } => serde_json::json!({
+            "ok": false,
+            "state": "mismatch",
+            "anchored_seq": anchored_seq,
+            "anchored_head": anchored_head,
+            "live_seq": live.as_ref().map(|(s, _)| *s),
+            "live_head": live.as_ref().map(|(_, h)| h.clone()),
+        }),
+        AnchorStatus::Malformed { raw_redacted } => serde_json::json!({
+            "ok": false, "state": "malformed", "raw": raw_redacted,
+        }),
+    }
+}
+
+/// One-shot: verify the installed log's live head against the macOS-Keychain
+/// external anchor, emit a secret-free `audit.anchor` frame, and then (re)witness
+/// the CURRENT head — but ONLY when the prior state was benign (Match / NoAnchor /
+/// Malformed). On a genuine MISMATCH the anchor is DELIBERATELY LEFT UNCHANGED so
+/// the divergence keeps surfacing across restarts (auto-overwriting would "bless"
+/// a rewritten chain). No-op when audit is not installed or disabled. Runtime-only
+/// (touches the real Keychain); the pure verify/anchor logic is unit-tested with an
+/// injected seam.
+pub async fn verify_and_reanchor_on_start() {
+    let Some((true, log)) = global() else { return };
+    let anchor = KeychainAnchor;
+    let status = match log.verify_against_anchor(&anchor).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "audit: could not read the external anchor; skipping the check");
+            return;
+        }
+    };
+    match &status {
+        AnchorStatus::Mismatch { .. } => {
+            warn!("audit: EXTERNAL ANCHOR MISMATCH — the live chain head diverged from the Keychain witness");
+        }
+        AnchorStatus::Malformed { .. } => {
+            warn!("audit: the stored external anchor is malformed; re-establishing it");
+        }
+        _ => {}
+    }
+    crate::telemetry::emit("system", "audit.anchor", anchor_status_json(&status));
+    // Do NOT silently overwrite a real mismatch — leave it for the operator.
+    if matches!(status, AnchorStatus::Mismatch { .. }) {
+        return;
+    }
+    if let Err(e) = log.anchor_to(&anchor).await {
+        warn!(error = %e, "audit: could not write the external anchor");
     }
 }
 
@@ -1101,5 +1430,201 @@ mod tests {
         assert_eq!(snap["chain"]["ok"], serde_json::json!(false));
         assert_eq!(snap["chain"]["broken_seq"], serde_json::json!(2));
         assert_eq!(snap["chain"]["reason"], serde_json::json!("hash mismatch"));
+    }
+
+    // -- triage evidence records ----------------------------------------------
+
+    /// A forensic-triage evidence record folds the bundle's SHA-256 into the chain
+    /// VERBATIM (a 64-hex digest is non-secret and must survive — `record`'s
+    /// redactor would collapse it to `[redacted]`), the chain still verifies, and
+    /// the entry reads honestly as evidence (its own agent/tool/decision/outcome).
+    #[tokio::test]
+    async fn triage_evidence_stores_the_digest_verbatim_and_verifies() {
+        let log = AuditLog::in_memory().unwrap();
+        // A realistic manifest SHA-256 (64 lowercase hex chars) — exactly the shape
+        // optimize::redact would otherwise treat as a secret-looking token.
+        let sha = "9f2c4e1a7b3d5f6081a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f7081";
+        let entry = log.record_triage_evidence("2026-07-15T12-00-00Z", sha).await.unwrap();
+        assert_eq!(entry.agent, "agent.aegis");
+        assert_eq!(entry.tool, "triage_snapshot");
+        assert_eq!(entry.outcome, "evidence_captured");
+        assert!(
+            entry.target_redacted.contains(sha),
+            "the digest must be stored verbatim to anchor the bundle: {}",
+            entry.target_redacted
+        );
+        assert!(!entry.target_redacted.contains("[redacted]"), "the digest was NOT redacted away");
+        assert!(log.verify_chain().await.unwrap().is_ok(), "the chain verifies with the evidence entry");
+    }
+
+    // -- external anchor: an in-memory injected seam --------------------------
+
+    /// A hermetic in-memory anchor — the injected seam. Tests exercise
+    /// write/verify/mismatch WITHOUT ever touching the real Keychain.
+    #[derive(Default)]
+    struct MemAnchor {
+        value: Mutex<Option<String>>,
+    }
+    impl ChainAnchor for MemAnchor {
+        async fn read_anchor(&self) -> Option<String> {
+            self.value.lock().await.clone()
+        }
+        async fn write_anchor(&self, value: &str) -> Result<()> {
+            *self.value.lock().await = Some(value.to_string());
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parse_anchor_reads_seq_and_hash_and_rejects_junk() {
+        assert_eq!(parse_anchor(" 3 : abc123 ").unwrap(), (3, "abc123".to_string()));
+        assert!(parse_anchor("no-colon").is_none());
+        assert!(parse_anchor("x:abc").is_none(), "non-numeric seq");
+        assert!(parse_anchor("3:").is_none(), "empty hash");
+    }
+
+    #[tokio::test]
+    async fn anchoring_an_empty_chain_writes_nothing_and_reads_no_anchor() {
+        let log = AuditLog::in_memory().unwrap();
+        let anchor = MemAnchor::default();
+        assert_eq!(log.anchor_to(&anchor).await.unwrap(), None, "nothing to witness on an empty chain");
+        assert_eq!(log.verify_against_anchor(&anchor).await.unwrap(), AnchorStatus::NoAnchor);
+    }
+
+    #[tokio::test]
+    async fn anchor_then_verify_matches_the_witnessed_head() {
+        let log = AuditLog::in_memory().unwrap();
+        log_some(&log).await; // seqs 1,2,3
+        let anchor = MemAnchor::default();
+        let (seq, head) = log.anchor_to(&anchor).await.unwrap().unwrap();
+        assert_eq!(seq, 3, "the head is the highest seq");
+        let status = log.verify_against_anchor(&anchor).await.unwrap();
+        assert!(status.is_match(), "a freshly-anchored head must match: {status:?}");
+        assert_eq!(status, AnchorStatus::Match { seq, head });
+    }
+
+    /// THE money property: a root attacker who rewrites the ENTIRE chain
+    /// CONSISTENTLY still passes `verify_chain` (the local chain cannot tell), but
+    /// the rewrite MOVES the tail hash, so it no longer equals the externally
+    /// witnessed head — `verify_against_anchor` reports the tamper.
+    #[tokio::test]
+    async fn a_full_consistent_rewrite_is_caught_by_the_external_anchor() {
+        let log = AuditLog::in_memory().unwrap();
+        log_some(&log).await; // seqs 1,2,3
+        let anchor = MemAnchor::default();
+        log.anchor_to(&anchor).await.unwrap();
+
+        // Simulate a root attacker: delete every row and re-insert a fully
+        // self-consistent chain with a CHANGED field (so `verify_chain` passes but
+        // the tail hash differs from the witnessed one).
+        {
+            let conn = log.conn.lock().await;
+            conn.execute("DELETE FROM audit", []).unwrap();
+            let mut prev = GENESIS_PREV.to_string();
+            for seq in 1..=3i64 {
+                let ts = format!("2026-02-0{seq}T00:00:00+00:00");
+                // The forged recipient — the edit the attacker wants to hide.
+                let h = hash_entry(&prev, seq, &ts, "agent.evil", "gmail_send", "attacker@x.com", "always", "executed");
+                conn.execute(
+                    "INSERT INTO audit VALUES (?1,?2,'agent.evil','gmail_send','attacker@x.com','always','executed',?3,?4)",
+                    params![seq, ts, prev, h],
+                ).unwrap();
+                prev = h;
+            }
+        }
+        // The internal chain STILL verifies — the local tripwire is defeated.
+        assert!(log.verify_chain().await.unwrap().is_ok(), "a consistent rewrite passes the local chain");
+        // ...but the external anchor catches it.
+        match log.verify_against_anchor(&anchor).await.unwrap() {
+            AnchorStatus::Mismatch { anchored_seq, live, .. } => {
+                assert_eq!(anchored_seq, 3);
+                assert!(live.is_some(), "the live head is reported alongside the witnessed one");
+            }
+            other => panic!("a full rewrite must mismatch the anchor, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn append_only_growth_is_extended_not_a_mismatch() {
+        // THE bug the review caught: after anchoring, ordinary new records advance the
+        // head every session, and the check must NOT cry tamper on legitimate
+        // append-only growth (else it false-alarms every boot → alarm fatigue).
+        let log = AuditLog::in_memory().unwrap();
+        log_some(&log).await; // seqs 1,2,3
+        let anchor = MemAnchor::default();
+        let (a_seq, a_head) = log.anchor_to(&anchor).await.unwrap().unwrap();
+        log_some(&log).await; // a new session grows the chain: seqs 4,5,6
+        match log.verify_against_anchor(&anchor).await.unwrap() {
+            AnchorStatus::Extended { anchored_seq, anchored_head, live } => {
+                assert_eq!(anchored_seq, a_seq);
+                assert_eq!(anchored_head, a_head, "witnessed entry still corroborated");
+                assert!(live.0 > a_seq, "the chain grew past the witness");
+            }
+            other => panic!("append-only growth must be Extended (benign), got {other:?}"),
+        }
+        // reanchor-on-start advances the witness forward on a benign Extended, so it
+        // does NOT stick — the next check is an exact match.
+        let (new_seq, _) = log.anchor_to(&anchor).await.unwrap().unwrap();
+        assert!(new_seq > a_seq);
+        assert!(log.verify_against_anchor(&anchor).await.unwrap().is_match());
+    }
+
+    #[tokio::test]
+    async fn a_changed_witnessed_entry_is_a_mismatch_even_when_the_chain_grew() {
+        // Growth is no cover for tampering: if the entry at the witnessed seq changed,
+        // it is a Mismatch even though the chain also grew past it.
+        let log = AuditLog::in_memory().unwrap();
+        log_some(&log).await; // 1,2,3
+        let anchor = MemAnchor::default();
+        let (a_seq, _) = log.anchor_to(&anchor).await.unwrap().unwrap();
+        {
+            let conn = log.conn.lock().await;
+            conn.execute("UPDATE audit SET entry_hash = 'deadbeef' WHERE seq = ?1", params![a_seq])
+                .unwrap();
+        }
+        log_some(&log).await; // still grows the head
+        match log.verify_against_anchor(&anchor).await.unwrap() {
+            AnchorStatus::Mismatch { anchored_seq, .. } => assert_eq!(anchored_seq, a_seq),
+            other => panic!("a changed witnessed entry must Mismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_anchor_is_reported_honestly() {
+        let log = AuditLog::in_memory().unwrap();
+        log_some(&log).await;
+        let anchor = MemAnchor::default();
+        anchor.write_anchor("this is not seq:hash shaped enough").await.unwrap();
+        // "not:hash..." actually splits on ':' — force a truly malformed value.
+        *anchor.value.lock().await = Some("garbage-no-colon".to_string());
+        assert!(matches!(
+            log.verify_against_anchor(&anchor).await.unwrap(),
+            AnchorStatus::Malformed { .. }
+        ));
+    }
+
+    /// The `audit.anchor` wire payload reports the verdict honestly and carries no
+    /// raw input — only public digests + integers.
+    #[test]
+    fn anchor_status_json_is_honest_and_secret_free() {
+        let ok = anchor_status_json(&AnchorStatus::Match { seq: 7, head: "abc".into() });
+        assert_eq!(ok["ok"], serde_json::json!(true));
+        assert_eq!(ok["state"], serde_json::json!("match"));
+        assert_eq!(ok["seq"], serde_json::json!(7));
+
+        let bad = anchor_status_json(&AnchorStatus::Mismatch {
+            anchored_seq: 3,
+            anchored_head: "witnessed".into(),
+            live: Some((5, "livehash".into())),
+        });
+        assert_eq!(bad["ok"], serde_json::json!(false));
+        assert_eq!(bad["state"], serde_json::json!("mismatch"));
+        assert_eq!(bad["anchored_seq"], serde_json::json!(3));
+        assert_eq!(bad["live_seq"], serde_json::json!(5));
+
+        assert_eq!(
+            anchor_status_json(&AnchorStatus::NoAnchor)["state"],
+            serde_json::json!("no_anchor")
+        );
     }
 }

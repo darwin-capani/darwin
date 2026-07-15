@@ -47,6 +47,17 @@ pub struct Config {
     /// when a read needs a privilege the no-sudo daemon lacks (login items ->
     /// Automation TCC). With it false the sentinel loop is not spawned.
     pub persistence: PersistenceConfig,
+    /// [exposure] — INBOUND EXPOSURE AUDITOR (exposure.rs), a defensive
+    /// "nmap-of-self". `enabled` SHIPS ON (full-power default). READ-ONLY DEFENSE:
+    /// a slow auditor that reads THIS machine's OWN listening socket table via a
+    /// FIXED-ARG bounded `netstat -anv` (it sends no packets and never touches
+    /// another host), classifies each socket loopback-only vs network-EXPOSED, maps
+    /// exposed well-known ports to their macOS sharing service, emits
+    /// `security.exposure`, and folds a summary into the posture readout. It takes
+    /// NO action — the guided-remediation `open_settings_pane` actuator that opens
+    /// the relevant Settings pane stays behind the standard per-action confirm gate.
+    /// With it false the auditor loop is not spawned.
+    pub exposure: ExposureConfig,
     pub integrations: IntegrationsConfig,
     pub standing: StandingConfig,
     /// [drafts] — AUTO-DRAFT (#25, drafts.rs). `enabled` SHIPS ON (full-power
@@ -70,6 +81,13 @@ pub struct Config {
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
     pub optimize: OptimizeConfig,
+    /// [explain] — CAUSA, the causal decision-trace explainer (explain.rs).
+    /// `enabled` SHIPS ON (full-power default): the turn loop records a small,
+    /// bounded, REDACTED ring of recent decision traces and "why did you do that" /
+    /// "why <Agent>" narrates one in persona + emits the secret-free `causa.trace`
+    /// telemetry. READ-ONLY — it explains past turns, never changes routing, and
+    /// never fabricates a rationale (an unrecorded turn returns an honest empty).
+    pub explain: ExplainConfig,
     /// [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
     /// `enabled` SHIPS ON (full-power default): it is READ-ONLY aggregate analytics
     /// (a reliability curve + ECE gap over the recent confidence/outcome window),
@@ -129,6 +147,12 @@ pub struct Config {
     pub screen_context: ScreenContextConfig,
     pub answers: AnswersConfig,
     pub audit: AuditConfig,
+    /// [triage] — FORENSIC TRIAGE SNAPSHOT (triage.rs, aegis). The one-shot
+    /// READ-ONLY "capture everything" that freezes a REDACTED, timestamped evidence
+    /// bundle under state/forensics/<ts>/ and folds its digest into the audit chain
+    /// plus the Keychain external anchor. These knobs only BOUND the capture (bundle
+    /// byte budget / log window); RESTORE is never automated, nothing is transmitted.
+    pub triage: TriageConfig,
     pub policy: PolicyConfig,
     pub security: SecurityConfig,
     /// [distill] — SELF-DISTILLATION (F17, distill.rs): an on-device LoRA
@@ -215,6 +239,18 @@ pub struct Config {
     /// firewall. UID-scoped (unprivileged lsof sees only same-UID processes; stated
     /// in every frame). With `enabled` false the sampling loop is simply not spawned.
     pub egress: EgressConfig,
+    /// [precog] — PRECOG // WHAT-IF, the counterfactual command simulator
+    /// (simulate.rs). `enabled` SHIPS ON (full-power default) — it is READ-ONLY by
+    /// CONSTRUCTION: a "what would you do if I said X" query runs the SAME pipeline
+    /// the live turn would (classify -> selector -> agent -> tier -> gate projection
+    /// -> reversibility) UP TO but NEVER THROUGH the confirmation gate, and returns a
+    /// PlannedOutcome as a `precog.plan` frame + a spoken summary. The simulate path
+    /// holds NO actuator / memory-write / inference handle (SimContext carries only
+    /// read views), so it CANNOT fire an action even a benign one — enabling it only
+    /// lets DARWIN describe what a real run would do (and that it would PARK), never
+    /// act. With it false the "what would you do if ..." cue falls through to normal
+    /// routing (it is just another question).
+    pub precog: PrecogConfig,
 }
 
 /// Every section and key the config knows, for unknown-key diagnostics
@@ -304,6 +340,11 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // (ASSESSMENT only, never executions); `max_assess` caps how many binaries are
     // assessed per scan.
     ("persistence", &["enabled", "interval_secs", "startup_delay_secs", "assess_signing", "max_assess"]),
+    // [exposure] — the INBOUND EXPOSURE AUDITOR (exposure.rs), a READ-ONLY
+    // "nmap-of-self" over the local listening socket table (netstat -anv; no
+    // packets sent). SHIPS ON. It reports (security.exposure + a posture summary);
+    // the only remediation is the gated open_settings_pane actuator.
+    ("exposure", &["enabled", "interval_secs", "startup_delay_secs"]),
     // [integrations] — `allow_consequential` is THE master gate for outward/
     // side-effecting actions. SHIPS ON (full-power default) — INERT-SAFE: a
     // CONFIRMED consequential action still clears confirm + voice-id + policy +
@@ -370,6 +411,12 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // phase ALWAYS proposes (mode KEEPS "propose") — there is no auto-apply-to-live
     // path, exactly like self-heal's mode.
     ("optimize", &["enabled", "mode"]),
+    // [explain] — CAUSA, the causal decision-trace explainer (explain.rs). `enabled`
+    // SHIPS ON (read-only observability: a redacted, bounded ring of recent decision
+    // traces, narrated by "why did you do that" + emitted as secret-free
+    // `causa.trace`). `ring_size` bounds the ring (clamped to a sane band; an
+    // out-of-range value never disables recording). Listed so neither reads as a typo.
+    ("explain", &["enabled", "ring_size"]),
     // [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
     // `enabled` SHIPS ON (read-only aggregate analytics: a reliability curve + ECE
     // gap over the recent confidence/outcome window, emitted as secret-free
@@ -631,6 +678,13 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // `max_entries` bounds retention (prune-oldest + re-root past the cap). Listed
     // here so neither key reads as a typo.
     ("audit", &["enabled", "max_entries"]),
+    // [triage] — FORENSIC TRIAGE SNAPSHOT (triage.rs, aegis). The one-shot
+    // READ-ONLY "capture everything" that freezes a REDACTED evidence bundle under
+    // state/forensics/<ts>/ and folds its digest into the audit chain + Keychain
+    // external anchor. `max_bundle_bytes` bounds the bundle; `log_window_minutes`
+    // bounds the security-subsystem `log show` excerpt. Listed so neither reads as a
+    // typo. It only reads + reports; RESTORE is never automated, nothing is transmitted.
+    ("triage", &["max_bundle_bytes", "log_window_minutes"]),
     // [policy] — the per-action policy store (policy.rs). The controlled, USER-SET
     // loosening/hardening that sits BENEATH the [integrations] master switch. It
     // SHIPS EMPTY: no rules => `evaluate` returns Ask for every action, so the
@@ -740,6 +794,11 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "alert_min_gap_secs",
         ],
     ),
+    // [precog] — PRECOG // WHAT-IF, the counterfactual command simulator
+    // (simulate.rs). `enabled` SHIPS ON (full-power default) — READ-ONLY by
+    // construction: it describes what a real run WOULD do (and that it would PARK),
+    // never acts. Listed so the key never reads as a typo.
+    ("precog", &["enabled"]),
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1668,6 +1727,41 @@ impl Default for OptimizeConfig {
     }
 }
 
+/// [explain] — CAUSA, the causal decision-trace explainer (explain.rs). A
+/// READ-ONLY, ARMED-BY-DEFAULT surface: the turn loop folds each turn's already-
+/// computed branch signals (intent / selector mode / agent / local-vs-cloud route
+/// / owner gate / capability / outcome) into an ordered, REDACTED [`DecisionTrace`]
+/// held in a small bounded ring (last `ring_size` turns). "why did you do that" /
+/// "why <Agent>" narrates the trace in persona and emits the secret-free
+/// `causa.trace` telemetry — it NEVER fabricates a rationale and returns an honest
+/// empty when a turn wasn't recorded. It changes nothing about routing; it only
+/// explains what already happened.
+///
+///   - `enabled` (SHIPS ON, full-power default): master gate for the record pass +
+///     the explain op. Off => no trace is recorded and "why did you do that" falls
+///     through to the model. Analytics/observability only — no autonomy.
+///   - `ring_size`: how many recent turns the ring retains (clamped to
+///     [`crate::explain::RING_CAP_MIN`]..=[`crate::explain::RING_CAP_MAX`]); an
+///     out-of-band value never disables recording nor grows unbounded.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ExplainConfig {
+    pub enabled: bool,
+    pub ring_size: usize,
+}
+
+impl Default for ExplainConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS ON (read-only observability). The trace is redacted at assembly
+            // and bounded; the explainer only ever DESCRIBES a past turn — no
+            // autonomy, no routing change.
+            enabled: true,
+            ring_size: crate::explain::RING_CAP_DEFAULT,
+        }
+    }
+}
+
 /// [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
 /// A READ-ONLY fold over the recent (confidence, outcome) window into a reliability
 /// curve + a scalar over/under-confidence gap (ECE-style), with a MIN_SAMPLE floor
@@ -2525,6 +2619,30 @@ impl Default for FocusConfig {
     }
 }
 
+/// [precog] — PRECOG // WHAT-IF, the counterfactual command simulator
+/// (simulate.rs). `enabled` SHIPS ON (full-power default) and is READ-ONLY by
+/// construction: the simulate path holds NO actuator / memory-write / inference
+/// handle (SimContext carries only read views), so enabling it can only ever let
+/// DARWIN DESCRIBE what a real run would do (and that it would PARK behind the
+/// gate) — it can never fire an action, even a benign one. With `enabled` false the
+/// "what would you do if I said X" cue falls through to ordinary routing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PrecogConfig {
+    /// Whether the PRECOG "what would you do if I said X" cue is answered by the
+    /// simulator. SHIPS ON (read-only observability; it never acts).
+    pub enabled: bool,
+}
+
+impl Default for PrecogConfig {
+    /// Ships ON — armed by default, because PRECOG is READ-ONLY (it describes, it
+    /// never acts). Mirrors the always-on posture of the other observability
+    /// sections ([audit] / [introspect] / [focus]).
+    fn default() -> Self {
+        PrecogConfig { enabled: true }
+    }
+}
+
 /// [apps] — the micro-app runtime substrate (docs/SANDBOX.md). `autostart`
 /// lists micro-app names darwind launches at startup; it defaults to EMPTY —
 /// nothing is autostarted unless the operator opts in. Names that do not match
@@ -2604,6 +2722,33 @@ impl Default for PersistenceConfig {
     }
 }
 
+/// [exposure] — the INBOUND EXPOSURE AUDITOR (exposure.rs): a READ-ONLY
+/// "nmap-of-self" that reads THIS machine's own listening socket table (via a
+/// fixed-arg `netstat -anv`, sending no packets), classifies each socket
+/// loopback-only vs network-exposed, and names the macOS sharing service on each
+/// exposed well-known port. It only observes and reports (secret-free counts +
+/// exposed detail); it closes nothing. The gated `open_settings_pane` actuator is
+/// the only remediation and stays behind the standard per-action confirm gate.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ExposureConfig {
+    /// Master switch for the auditor loop. SHIPS ON (read-only observability).
+    pub enabled: bool,
+    /// Seconds between scans (the listening surface moves on the order of app
+    /// launches, not seconds).
+    pub interval_secs: u64,
+    /// Seconds to wait after boot before the first scan (let the box settle).
+    pub startup_delay_secs: u64,
+}
+
+impl Default for ExposureConfig {
+    fn default() -> Self {
+        // On by default — it only reads the local socket table and reports. The
+        // cadence matches the other defensive sentinels (a slow scan).
+        Self { enabled: true, interval_secs: 300, startup_delay_secs: 40 }
+    }
+}
+
 /// [integrations] — the shared Chart-2 integration substrate (integrations.rs).
 /// `allow_consequential` is THE master gate for outward/side-effecting actions
 /// (post a message, create an event). It SHIPS ON (true) — the headline of the
@@ -2661,6 +2806,40 @@ impl Default for AuditConfig {
         Self {
             enabled: true,
             max_entries: crate::audit::MAX_ENTRIES,
+        }
+    }
+}
+
+/// [triage] — FORENSIC TRIAGE SNAPSHOT (triage.rs, agent "aegis"). The one-shot
+/// "capture everything" op that FREEZES a READ-ONLY, REDACTED, timestamped
+/// evidence bundle under `state/forensics/<ts>/` (process tree + signing, socket
+/// table, machine/TCC/persistence baselines, a bounded `log show` excerpt of the
+/// security subsystems, recent quarantine events) so the owner can hand a
+/// professional real evidence. It STRICTLY READS the machine — no kills, no
+/// config/security changes, RESTORE is never automated — and NOTHING is
+/// transmitted; it writes ONLY under `state/forensics/`. Its bundle digest is
+/// folded into the audit chain + the Keychain external anchor. These knobs only
+/// BOUND the capture; they never grant a capability.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TriageConfig {
+    /// Whole-bundle byte budget: sections are kept while the running total fits,
+    /// then truncated/dropped with an honest note. Bounds disk + the capture cost.
+    pub max_bundle_bytes: usize,
+    /// How many minutes back the bounded security-subsystem `log show` excerpt
+    /// reaches. Kept small so the read stays fast + the excerpt stays legible.
+    pub log_window_minutes: u64,
+}
+
+impl Default for TriageConfig {
+    fn default() -> Self {
+        // Generous-but-bounded defaults: an 8 MiB bundle and a 1-hour log window.
+        // A 0 for either would make a capture pointless, so the defaults are the
+        // floor the module actually reads (a config typo of 0 simply yields an
+        // empty/near-empty section rather than a crash — honest, never unbounded).
+        Self {
+            max_bundle_bytes: 8 * 1024 * 1024,
+            log_window_minutes: 60,
         }
     }
 }
@@ -3312,6 +3491,7 @@ impl Config {
             apps: section(&table, "apps", &mut issues),
             introspect: section(&table, "introspect", &mut issues),
             persistence: section(&table, "persistence", &mut issues),
+            exposure: section(&table, "exposure", &mut issues),
             integrations: section(&table, "integrations", &mut issues),
             standing: section(&table, "standing", &mut issues),
             drafts: section(&table, "drafts", &mut issues),
@@ -3320,6 +3500,7 @@ impl Config {
             mcp: section(&table, "mcp", &mut issues),
             skills: section(&table, "skills", &mut issues),
             optimize: section(&table, "optimize", &mut issues),
+            explain: section(&table, "explain", &mut issues),
             calibrate: section(&table, "calibrate", &mut issues),
             voice_id: section(&table, "voice_id", &mut issues),
             episodic: section(&table, "episodic", &mut issues),
@@ -3337,6 +3518,7 @@ impl Config {
             screen_context: section(&table, "screen_context", &mut issues),
             answers: section(&table, "answers", &mut issues),
             audit: section(&table, "audit", &mut issues),
+            triage: section(&table, "triage", &mut issues),
             policy: section(&table, "policy", &mut issues),
             security: section(&table, "security", &mut issues),
             distill: section(&table, "distill", &mut issues),
@@ -3350,6 +3532,7 @@ impl Config {
             chart: section(&table, "chart", &mut issues),
             boundary: section(&table, "boundary", &mut issues),
             egress: section(&table, "egress", &mut issues),
+            precog: section(&table, "precog", &mut issues),
         };
 
         // SELECTABLE QUANTIZATION (#39) value validation: an unknown [inference]

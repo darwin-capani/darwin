@@ -1064,6 +1064,98 @@ export function focusIsDefault(f: FocusActive): boolean {
 }
 
 /* ------------------------------------------------------------------------ *
+ * PRECOG // WHAT-IF — the counterfactual command plan (daemon/src/simulate.rs *
+ * PlannedOutcome::telemetry() -> the `precog.plan` frame, emitted by the      *
+ * router when the owner asks "what would you do if I said X").                *
+ *                                                                            *
+ * PRECOG runs the SAME pipeline a live turn would — classify -> selector ->    *
+ * agent delegation -> model tier -> confirmation-gate PROJECTION ->            *
+ * reversibility — UP TO but NEVER THROUGH the gate, and reports the plan. It   *
+ * NEVER executes and NEVER satisfies a gate: the daemon's simulate path holds  *
+ * no actuator / memory-write / inference handle by construction, so a          *
+ * simulated turn cannot fire an action even a benign one. The frame states     *
+ * that contract on the wire (`executed` / `satisfied_a_gate`), and the parser  *
+ * PINS both to false HUD-side so a hostile/garbled payload can never make the  *
+ * panel claim a simulation ran or cleared a gate.                             *
+ *                                                                            *
+ * SECRET-FREE: only the pipeline DECISIONS + the (already user-spoken)         *
+ * hypothetical ride the wire — nothing ran, so there is no fact value, memory, *
+ * or tool output to leak. `wouldPark` is the honest "a real run would PARK for *
+ * a spoken yes" signal; `tool` is the projected CONSEQUENTIAL tool class (null *
+ * for a benign/conversational turn — nothing to confirm).                     *
+ * ------------------------------------------------------------------------ */
+
+/** A complete, defensively-parsed `precog.plan` payload — the HUD's view of what
+ *  a real run WOULD do for a hypothetical utterance, WITHOUT ever executing it.
+ *  The two contract booleans (`executed` / `satisfiedAGate`) are read from the
+ *  wire but PINNED to the only honest values (a simulation never runs and never
+ *  satisfies a gate), so even a hostile payload is forced to the neutral truth. */
+export interface PrecogPlan {
+  /** The hypothetical utterance the plan is for (echoed from the query). */
+  utterance: string;
+  /** The classifier intent for the hypothetical (e.g. "app.launch"). */
+  intent: string;
+  /** The agent Darwin-Prime would delegate to. */
+  agent: string;
+  /** The capability MODE ("one_shot" | "world_query" | "world_update" | "mission"
+   *  | "standing" | "clarify"). "clarify" means a real run would ASK first, not act. */
+  mode: string;
+  /** The model TIER a real run would resolve to ("local" | "fast" | "heavy"). */
+  tier: string;
+  /** The projected CONSEQUENTIAL tool class, or null for a benign/conversational
+   *  turn (nothing to confirm). A real tool name when present. */
+  tool: string | null;
+  /** Whether a real run would PARK at the confirmation gate (true iff `tool` is a
+   *  consequential tool). PRECOG only REPORTS this — it never satisfies the gate. */
+  wouldPark: boolean;
+  /** Whether the planned action has a safe mechanical inverse (meaningful only when
+   *  `wouldPark`; true — nothing to reverse — when no gated action). */
+  reversible: boolean;
+  /** The classifier confidence for the hypothetical, in [0,1]. */
+  confidence: number;
+  /** The grounded one-line rationale for the plan (the spoken/HUD copy). */
+  why: string;
+  /** ALWAYS false: a simulation NEVER executes. Read from the wire but pinned. */
+  executed: boolean;
+  /** ALWAYS false: a simulation NEVER satisfies a gate. Read but pinned. */
+  satisfiedAGate: boolean;
+}
+
+/** Parse a `precog.plan` payload (daemon PlannedOutcome::telemetry()) into a
+ *  [`PrecogPlan`]. Defensive: string fields default to ""; `tool` is null unless a
+ *  non-empty string; `wouldPark` / `reversible` default false / true; `confidence`
+ *  is clamped to [0,1] (junk -> 0). The two contract booleans are PINNED to the
+ *  only honest values — `executed` and `satisfiedAGate` are forced FALSE — so a
+ *  hostile/garbled payload can NEVER make the panel claim a simulation ran or
+ *  cleared a gate (the copy stays grounded in the truth, not the wire's claim).
+ *  Returns null (never throws) when there is no usable plan (no utterance AND no
+ *  mode), so a junk frame simply renders nothing rather than a hollow card. */
+export function parsePrecogPlan(data: Record<string, unknown>): PrecogPlan | null {
+  const utterance = str(data, "utterance") ?? "";
+  const mode = str(data, "mode") ?? "";
+  // Nothing usable to render (a truly empty/garbled frame): render nothing.
+  if (utterance.trim().length === 0 && mode.trim().length === 0) return null;
+  const toolRaw = str(data, "tool");
+  const conf = num(data, "confidence");
+  return {
+    utterance,
+    intent: str(data, "intent") ?? "",
+    agent: str(data, "agent") ?? "",
+    mode,
+    tier: str(data, "tier") ?? "",
+    tool: toolRaw !== null && toolRaw.trim().length > 0 ? toolRaw : null,
+    wouldPark: bool(data, "would_park") ?? false,
+    reversible: bool(data, "reversible") ?? true,
+    confidence: conf === null ? 0 : Math.min(1, Math.max(0, conf)),
+    why: str(data, "why") ?? "",
+    // Pin the PRECOG contract HUD-side: a simulation NEVER runs and NEVER
+    // satisfies a gate, so we do not honor a payload that claimed otherwise.
+    executed: false,
+    satisfiedAGate: false,
+  };
+}
+
+/* ------------------------------------------------------------------------ *
  * CUSTOMS // EGRESS — the pre-flight egress manifest (boundary.manifest;      *
  * daemon/src/boundary.rs EgressManifest::telemetry(), emitted by the CLOUD    *
  * path (anthropic.rs complete_with_tools) BEFORE each cloud request leaves).  *
@@ -8111,6 +8203,97 @@ export function parseSessionRewind(data: Record<string, unknown>): SessionRewind
     countsFloor: bool(data, "counts_floor") === true,
     itemsOmitted: nonNegInt(data, "items_omitted"),
     items,
+  };
+}
+
+/* ------------------------------------------------------------------------ *
+ * CAUSA // DECISION TRACE (causa.trace) — the causal decision-trace          *
+ * explainer (daemon explain.rs): "why did you do that" / "why <Agent>"       *
+ * narrates the ordered decision steps of a recent turn — intent, selector    *
+ * mode, the agent it routed to, local-vs-cloud route, the owner gate, the    *
+ * capability it used, the outcome. REVIEW-ONLY: nothing here re-executes.     *
+ * SECRET-FREE: the utterance + outcome are pre-redacted daemon-side (and      *
+ * bounded again here); the step tokens are decision labels. An HONEST-EMPTY   *
+ * frame (`empty:true`, no steps) rides when the asked turn wasn't recorded —  *
+ * the daemon NEVER fabricates a rationale, so the panel shows the honest      *
+ * "no trace" state rather than an invented one.                              *
+ * ------------------------------------------------------------------------ */
+
+/** One decision step: which pipeline stage, what was chosen, why, and any
+ *  recorded alternatives (usually none — the daemon does not persist rejected
+ *  candidates, and never invents them). */
+export interface CausaStep {
+  stage: string;
+  chosen: string;
+  why: string;
+  alternatives: string[];
+}
+
+/** A reconstructed causal decision trace of one turn. */
+export interface CausaTrace {
+  /** What was asked: the last turn, or a named agent's last turn. */
+  query: "last" | "agent";
+  /** The agent named in a "why <Agent>" ask ("" for a plain "why did you..."). */
+  agentQuery: string;
+  /** True when no trace matched the ask — the honest empty (no steps). */
+  empty: boolean;
+  turnRef: number;
+  ts: string;
+  /** The agent that handled the explained turn. */
+  agent: string;
+  /** The redacted, bounded utterance of the explained turn. */
+  utterance: string;
+  steps: CausaStep[];
+}
+
+/** Defensive caps mirroring the daemon's bounds — the wire is never trusted. */
+export const CAUSA_STEPS_CAP = 12;
+const CAUSA_ALTS_CAP = 6;
+const CAUSA_STR_CAP = 240;
+
+function boundCausaStr(v: string | null): string {
+  return v === null ? "" : v.trim().slice(0, CAUSA_STR_CAP);
+}
+
+/** Coerce one decision step; a step without a stage is meaningless and dropped. */
+function coerceCausaStep(o: Record<string, unknown>): CausaStep | null {
+  const stage = str(o, "stage");
+  if (stage === null || stage.trim() === "") return null;
+  const alts = (strArr(o, "alternatives") ?? [])
+    .slice(0, CAUSA_ALTS_CAP)
+    .map((a) => a.trim().slice(0, CAUSA_STR_CAP));
+  return {
+    stage: boundCausaStr(stage),
+    chosen: boundCausaStr(str(o, "chosen")),
+    why: boundCausaStr(str(o, "why")),
+    alternatives: alts,
+  };
+}
+
+/** Parse a `causa.trace` payload, or null when it carries no valid `query`
+ *  (a frame with no ask is dropped, never rendered). Both the honest-empty
+ *  frame (`empty:true`, no steps) and a populated trace parse; steps are
+ *  capped and degrade individually. */
+export function parseCausaTrace(data: Record<string, unknown>): CausaTrace | null {
+  const query = str(data, "query");
+  if (query !== "last" && query !== "agent") return null;
+  const raw = data["steps"];
+  const steps = Array.isArray(raw)
+    ? raw
+        .slice(0, CAUSA_STEPS_CAP)
+        .filter(isPlainObject)
+        .map(coerceCausaStep)
+        .filter((s): s is CausaStep => s !== null)
+    : [];
+  return {
+    query,
+    agentQuery: boundCausaStr(str(data, "agent_query")),
+    empty: bool(data, "empty") === true,
+    turnRef: nonNegInt(data, "turn_ref"),
+    ts: boundCausaStr(str(data, "ts")),
+    agent: boundCausaStr(str(data, "agent")),
+    utterance: boundCausaStr(str(data, "utterance")),
+    steps,
   };
 }
 

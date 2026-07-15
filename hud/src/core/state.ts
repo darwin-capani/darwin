@@ -36,6 +36,7 @@ import {
   KnowledgeGraphResult,
   LifeLogDigest,
   SessionRewind,
+  CausaTrace,
   LiveGateEvent,
   ConsensusAdvisory,
   LocalToolsStatus,
@@ -69,6 +70,7 @@ import {
   Suggestion,
   ProactiveDigest,
   FocusActive,
+  PrecogPlan,
   EgressManifest,
   TelemetryEnvelope,
   UnifiedSearchResult,
@@ -149,6 +151,7 @@ import {
   parseKnowledgeGraphResult,
   parseLifeLogDigest,
   parseSessionRewind,
+  parseCausaTrace,
   parseLockdownStatus,
   parseNotebookActivity,
   parseUnifiedSearchResult,
@@ -184,6 +187,7 @@ import {
   parseSuggestion,
   parseProactiveDigest,
   parseFocusActive,
+  parsePrecogPlan,
   parseEgressManifest,
   parseUserModelConsolidated,
   parseVisionDescribe,
@@ -900,6 +904,12 @@ export interface HudState {
    *  pre-redacted daemon-side. Null until the first rewind command. Nothing
    *  here re-executes anything. */
   sessionRewind: SessionRewind | null;
+  /** The last CAUSA decision trace (causa.trace): the ordered, redacted
+   *  explanation of a recent turn's routing — intent, selector mode, the agent,
+   *  local-vs-cloud route, owner gate, capability, outcome — surfaced by "why did
+   *  you do that" / "why <Agent>". Null until the first ask. REVIEW-ONLY: nothing
+   *  here re-executes; an honest-empty frame rides when the turn wasn't recorded. */
+  causaTrace: CausaTrace | null;
   /** The CONSEQUENTIAL-GATE AUDIT surface (audit.snapshot): the daemon's
    *  hash-chained, tamper-EVIDENT log of every consequential decision — recent
    *  entries (newest-first, SECRET-FREE: agent/tool/REDACTED target/decision/
@@ -1151,6 +1161,16 @@ export interface HudState {
    *  booleans. */
   focusProfile: FocusActive | null;
 
+  /** The latest PRECOG // WHAT-IF plan (precog.plan, simulate.rs) — what a real
+   *  run WOULD do for a hypothetical "what would you do if I said X" query, WITHOUT
+   *  ever executing. Carries the projected pipeline decisions (intent / agent /
+   *  mode / tier / tool), whether a real run would PARK at the gate, and whether the
+   *  planned action is reversible — plus the pinned contract that a simulation never
+   *  runs and never satisfies a gate. Null until the owner asks a PRECOG query;
+   *  replaced in place each query. SECRET-FREE: only the decisions + the (already
+   *  user-spoken) hypothetical, never a fact/memory/tool-output (nothing ran). */
+  precogPlan: PrecogPlan | null;
+
   /** The CUSTOMS // EGRESS manifest (boundary.manifest, boundary.rs) — the
    *  pre-flight inventory of exactly the personal context the LAST cloud turn was
    *  about to send (facts / history / world rows / persona / system prompt, each
@@ -1369,6 +1389,7 @@ export function initialState(): HudState {
     notebook: null,
     lifelog: null,
     sessionRewind: null,
+    causaTrace: null,
     audit: null,
     liveGate: [],
     consensusAdvisory: null,
@@ -1406,6 +1427,7 @@ export function initialState(): HudState {
     dismissedSuggestions: new Set<string>(),
     proactiveDigest: null,
     focusProfile: null,
+    precogPlan: null,
     egressManifest: null,
     actionSurface: { drafts: [], missions: [], macros: [] },
     chart: null,
@@ -1971,6 +1993,20 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // the shipped "default" profile is the identity (today's behavior).
       const focus = parseFocusActive(env.data);
       return { ...s, focusProfile: focus };
+    }
+
+    case "precog.plan": {
+      // PRECOG // WHAT-IF (simulate.rs): the counterfactual plan for a "what would
+      // you do if I said X" query — what a real run WOULD do, WITHOUT ever running.
+      // parsePrecogPlan PINS the contract HUD-side (`executed` / `satisfiedAGate`
+      // forced false), so a hostile/garbled payload can NEVER make the panel claim
+      // a simulation ran or cleared a gate (PRECOG only ever describes; the daemon's
+      // simulate path holds no actuator/write/inference handle by construction). A
+      // junk frame parses to null and is dropped rather than churning a hollow card;
+      // a usable plan replaces the surface in place (the latest query's plan).
+      const plan = parsePrecogPlan(env.data);
+      if (plan === null) return s;
+      return { ...s, precogPlan: plan };
     }
 
     case "boundary.manifest": {
@@ -2902,6 +2938,18 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       const rewind = parseSessionRewind(env.data);
       if (rewind === null) return s;
       return { ...s, sessionRewind: rewind };
+    }
+
+    case "causa.trace": {
+      // A CAUSA decision-trace explanation ran (daemon explain.rs via the router
+      // arm for "why did you do that" / "why <Agent>"): the ordered, redacted
+      // decision steps of a recent turn — or an honest-empty frame when the asked
+      // turn wasn't recorded. parseCausaTrace returns null only for a frame with no
+      // valid query (dropped, same reference). A fresh ask REPLACES the prior trace
+      // (the panel shows the last thing asked about). Nothing here re-executes.
+      const trace = parseCausaTrace(env.data);
+      if (trace === null) return s;
+      return { ...s, causaTrace: trace };
     }
 
     case "chart.data": {

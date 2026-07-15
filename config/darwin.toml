@@ -79,6 +79,9 @@ beacon_max_jitter = 0.15    # coefficient-of-variation ceiling (stddev/mean of t
 alert_cooldown_secs = 21600 # per-talker alert cooldown (seconds): don't renag on the same host (6 hours)
 alert_min_gap_secs = 300    # global debounce (seconds): never two egress alerts closer than this (5 minutes) — on top of EDITH quiet hours
 
+[precog]                 # PRECOG // WHAT-IF (simulate.rs) — the counterfactual command simulator. A "what would you do if I said X" query runs the SAME pipeline the live turn would (classify -> selector -> agent -> model tier -> confirmation-gate projection -> reversibility) UP TO but NEVER THROUGH the gate, and returns a PlannedOutcome as a `precog.plan` frame + a spoken summary. READ-ONLY by CONSTRUCTION: the simulate path holds NO actuator / memory-write / inference handle (SimContext carries only read views), so it CANNOT fire an action even a benign one — it only describes what a real run would do (and that it would PARK for your spoken yes).
+enabled = true          # master gate. SHIPS ON (full-power default) — armed by default because PRECOG is read-only (it describes, it never acts), like [introspect]/[audit]. With it false the "what would you do if I said ..." cue falls through to ordinary routing (just another question). Set false to disable.
+
 [screen_context]         # #42 CONTINUOUS SCREEN CONTEXT — the MOST privacy-sensitive read feature. A bounded/redacted/transient in-RAM ring of recent on-screen OCR snapshots, fed by a DEVICE-gated continuous capture loop, recallable ("what was I working on") + forgettable ("forget my screen context"). Glyph-only, never a face/identity; pixels never leave the device; READ-ONLY.
 enabled = true          # master gate. SHIPS ON (full-power default), the MOST privacy-sensitive read — INERT WITHOUT TCC: the continuous capture loop STILL requires runtime macOS Screen-Recording consent; the flag cannot grant it, so without consent it captures NOTHING (the ring never grows, no WATCHING indicator fires). The ring stays redacted + transient (off lifelong memory / optimizer / disk) + bounded (cap below) + forgettable, with the WATCHING indicator. Set false to disable.
 interval_secs = 30      # cadence the device-gated loop grabs ONE frame (floored to >= 1). A calmer/faster watch.
@@ -173,6 +176,19 @@ mode = "propose"  # "propose" (default): write the validated app + report to sta
 # mock traces.
 enabled = true    # master gate, SHIPS ON (full-power default). Live trace recording is runtime-gated (traces accrue only while the daemon runs with this on); traces are PII-REDACTED before storage (emails / phone numbers / >=6-digit runs / URLs with embedded credentials / api-key- and token-shaped strings are stripped) and NEVER contain a secret or token; retention is bounded (oldest rows evicted past the cap). The optimizer still only PROPOSES diffs a human applies (mode below stays "propose"). Set false to disable.
 mode = "propose"  # "propose" (default): the downstream Optimizer reuses the self-heal posture — it writes a measured config/prompt/example diff for a HUMAN to review+apply and NEVER silently mutates a live config or behavior; an optimization is adopted ONLY IF it MEASURABLY beats the current baseline on held-out traces, and every adoption is reversible. "auto" is reserved and behaves as "propose" for now — there is no auto-apply-to-live path. Unknown values behave as "propose".
+
+[explain]
+# CAUSA (explain.rs): the causal decision-trace explainer — "why did you do that" /
+# "why <Agent>". At the end of each turn the loop folds the branch signals it ALREADY
+# computed (intent + confidence, selector mode, the agent it routed to, the local-vs-
+# cloud route, the per-turn owner gate, the capability it used, and the outcome) into
+# an ordered, REDACTED DecisionTrace held in a SMALL BOUNDED ring (the last `ring_size`
+# turns). Asking "why did you do that" narrates that trace in persona and emits the
+# secret-free `causa.trace` telemetry. READ-ONLY: it changes NOTHING about routing, it
+# reconstructs ONLY from records the daemon already holds, and it NEVER fabricates a
+# rationale — an unrecorded turn returns an honest empty ("I don't have a trace for that").
+enabled = true      # master gate, SHIPS ON (full-power default). The utterance + outcome in a trace are PII-REDACTED at assembly (emails / phones / >=6-digit runs / credentialed URLs / api-key- and token-shaped strings stripped) and the ring is bounded (oldest evicted). Off => no trace is recorded and "why did you do that" falls through to the model. Set false to disable.
+ring_size = 16      # how many recent turns the decision-trace ring retains. Clamped to a sane band (1..=128); an out-of-range value never disables recording nor grows the ring unbounded.
 
 [calibrate]
 # PLUMBLINE (calibrate.rs): DARWIN's honest confidence-calibration self-report. It
@@ -274,6 +290,29 @@ startup_delay_secs = 45     # wait after boot before the first scan
 # Signing assessment (codesign/spctl per backing binary — ASSESSMENT reads only).
 assess_signing     = true   # run the per-binary signing/notarization reads
 max_assess         = 64     # cap on binaries assessed per scan (bounds the work)
+
+[exposure]
+# Inbound Exposure Auditor — a defensive "nmap-of-self" (exposure.rs). A slow,
+# READ-ONLY audit of THIS machine's OWN listening sockets, read via a FIXED-ARG
+# bounded `netstat -anv` (never a shell string), so the parser is CI-tested on
+# canned output. It SENDS NO PACKETS and never touches another host — it only
+# reads the local socket table. Each listener is classified loopback-only
+# (127.0.0.0/8 / ::1) vs LAN/all-interfaces EXPOSED, and each exposed well-known
+# port is mapped to its macOS sharing service (22 -> Remote Login, 5900 ->
+# Screen Sharing, 445/139 -> File Sharing, 7000 -> AirPlay, ...) via a static
+# table. Honest about the read's limit: a service is identified by well-known
+# port, not by correlating the owning process, and an exposed port with no table
+# entry is reported as unrecognized (never hidden, never guessed). It emits the
+# `security.exposure` telemetry frame + folds a summary into the posture readout.
+# STRICTLY READ-ONLY: it closes nothing. The only remediation is the gated
+# `open_settings_pane` actuator, which deep-links to the relevant Settings pane
+# so the USER flips the switch — it stays behind the standard per-action confirm
+# gate (it is in CONSEQUENTIAL_TOOLS; it always parks, never auto-opens).
+# SHIPS ON (full-power default); with it false the auditor loop is not spawned.
+enabled = true
+# Auditor cadence (defaults shown; absent = these values).
+interval_secs      = 300    # seconds between scans (the listening surface moves slowly)
+startup_delay_secs = 40     # wait after boot before the first scan
 
 [integrations]
 # Shared substrate for the Chart-2 integrations (GitHub, Slack, Google
@@ -591,6 +630,24 @@ debate = true                  # SHIPS ON (full-power default, #22). High-stakes
 [audit]
 enabled = true                 # SHIPS ON (read-only accountability loosens nothing). false = skip all audit records.
 max_entries = 10000            # retention cap: past this the oldest are pruned and the surviving suffix re-rooted.
+
+# [triage] — FORENSIC TRIAGE SNAPSHOT (triage.rs, agent "aegis"). A one-shot READ-ONLY
+# "capture everything" that FREEZES a REDACTED, timestamped evidence bundle under
+# state/forensics/<ts>/ — the process tree + per-binary signing (codesign -dv, an
+# ASSESSMENT read that never executes), the socket table, the machine/TCC/persistence
+# baselines + current state, a BOUNDED `log show` excerpt of the security subsystems
+# (sandboxd/tccd/syspolicyd/socketfilterfw), and recent quarantine (LSQuarantine) events —
+# so the owner can hand a professional real evidence. Every value is REDACTED AT SOURCE
+# (secrets / PII / credentialed URLs / the home path). HONESTY: unified-log <private>
+# fields stay redacted by macOS without admin; the bundle says so, never de-anonymizes them.
+# STRICTLY READ-ONLY re: the machine — no kills, no config/security changes, and RESTORE is
+# NEVER automated (triage only captures). NOTHING is transmitted; it writes ONLY under
+# state/forensics/. The bundle's manifest SHA-256 is folded into the audit chain and the
+# resulting chain HEAD is written to the macOS Keychain as an EXTERNAL ANCHOR. These knobs
+# only BOUND the capture; they never grant a capability.
+[triage]
+max_bundle_bytes = 8388608     # whole-bundle byte budget (8 MiB): sections truncate/drop with an honest note past this.
+log_window_minutes = 60        # how far back the bounded security-subsystem `log show` excerpt reaches.
 
 # [policy] — PER-ACTION POLICY store (policy.rs): the controlled, USER-SET loosening/
 # hardening that sits BENEATH the [integrations].allow_consequential master switch and
