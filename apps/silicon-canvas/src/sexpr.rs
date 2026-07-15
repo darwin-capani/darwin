@@ -617,12 +617,7 @@ mod tests {
 
             // Drive the lexer to exhaustion directly — it must be total on its own.
             let mut lexer = Lexer::new(&src);
-            loop {
-                match lexer.next_token() {
-                    Ok(Some(_)) => {}
-                    Ok(None) | Err(_) => break,
-                }
-            }
+            while let Ok(Some(_)) = lexer.next_token() {}
         }
     }
 
