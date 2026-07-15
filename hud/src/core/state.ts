@@ -62,6 +62,7 @@ import {
   CapabilityMap,
   DistillStatus,
   SyncStatus,
+  FleetStatus,
   SceneStatus,
   OvernightStatus,
   Presence,
@@ -147,6 +148,7 @@ import {
   parseCapabilityMap,
   parseDistillStatus,
   parseSyncStatus,
+  parseFleetStatus,
   parseSceneStatus,
   parseOvernightStatus,
   parsePresence,
@@ -808,6 +810,11 @@ export interface HudState {
    *  syncable-fact count, key present, pending conflicts. Null until the first
    *  frame. E2E-encrypted; deletions don't propagate. */
   federatedSync: SyncStatus | null;
+  /** OVERWATCH fleet policy's honest state (fleet.status): off/armed-awaiting-
+   *  baseline/active, WHICH device authored the active baseline, and the per-tool
+   *  ceilings (Never/Ask). Null until the first frame. The floor can ONLY HARDEN —
+   *  it never grants an action. */
+  fleet: FleetStatus | null;
   /** The acoustic-scene sensor's honest state (scene.status, F6): off/armed-
    *  needs-model/listening, the sound-event vocabulary, transient events. Null
    *  until the first frame. NEVER retains audio. */
@@ -1434,6 +1441,7 @@ export function initialState(): HudState {
     pdfJailAvailable: null,
     distill: null,
     federatedSync: null,
+    fleet: null,
     scene: null,
     overnight: null,
     capabilityMap: null,
@@ -2776,6 +2784,13 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // sync::emit_status). parseSyncStatus NEVER returns null and pins the
       // honest transport-inert / deletes-don't-propagate facts.
       return { ...s, federatedSync: parseSyncStatus(env.data) };
+    }
+
+    case "fleet.status": {
+      // OVERWATCH fleet policy status (main.rs audit_snapshot_task ->
+      // fleet::emit_status). parseFleetStatus NEVER returns null and pins
+      // hardens-only true (a payload can't claim the floor grants an action).
+      return { ...s, fleet: parseFleetStatus(env.data) };
     }
 
     case "scene.status": {

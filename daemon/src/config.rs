@@ -240,6 +240,13 @@ pub struct Config {
     /// INERT without a paired peer + a shared key (Keychain only, never config).
     /// The transport is built-but-inert; a bundle never leaves the box unsealed.
     pub sync: SyncConfig,
+    /// [fleet] — OVERWATCH: E2E-encrypted fleet POLICY (fleet.rs). SHIPS OFF (like
+    /// [sync]). A signed owner-authored baseline folds into policy::evaluate_global
+    /// as a FLOOR OF STRICTNESS — it can only HARDEN a tool (Never / always-Ask),
+    /// never loosen, never grant what the master switch forbids. Rides the [sync]
+    /// sealed-bundle + shared Keychain key; the baseline enters ONLY as a signed
+    /// bundle (never written from a model).
+    pub fleet: FleetConfig,
     /// [scene] — ACOUSTIC SCENE AWARENESS (F6, scene.rs): classify the ambient
     /// soundscape into named sound EVENTS (doorbell, knock, alarm, glass-break…),
     /// distinct from speech capture. SHIPS OFF (continuous ambient listening is a
@@ -872,6 +879,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("enclave", &["enabled"]),
     ("distill", &["enabled", "python", "base_model", "iters"]),
     ("sync", &["enabled", "peer_endpoint"]),
+    ("fleet", &["enabled"]),
     ("scene", &["enabled", "confidence_floor"]),
     ("overnight", &["enabled", "min_gap_secs"]),
     // [webhooks] — WEBHOOK TRIGGERS (#35, webhooks.rs). An INBOUND network surface.
@@ -3532,6 +3540,24 @@ pub struct SyncConfig {
     pub peer_endpoint: String,
 }
 
+/// [fleet] — OVERWATCH: server-less, E2E-encrypted fleet POLICY across the owner's
+/// OWN Macs (fleet.rs). A signed, owner-authored policy BASELINE rides the SAME
+/// sealed-bundle + shared-Keychain-key path as [sync] and folds into
+/// `policy::evaluate_global` as a FLOOR OF STRICTNESS: it can force a tool stricter
+/// (Never / always-Ask), and it can ONLY harden — never loosen, never grant what a
+/// device's master switch forbids, never override a stricter LOCAL rule. SHIPS OFF
+/// (like [sync]/[distill]): with it off nothing is loaded and `evaluate_global` is
+/// byte-for-byte today. INERT without the shared key + a sealed baseline; the
+/// baseline enters ONLY as a signed owner-authored bundle (no model-write path).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+#[derive(Default)]
+pub struct FleetConfig {
+    /// Master switch. SHIPS OFF (false): with it off no baseline is loaded/installed,
+    /// the fleet floor is empty, and the status honestly reports "off".
+    pub enabled: bool,
+}
+
 
 /// [scene] — ACOUSTIC SCENE AWARENESS (F6, scene.rs). Classify the ambient
 /// soundscape into named sound events. `enabled` is a privacy master switch:
@@ -4128,6 +4154,7 @@ impl Config {
             enclave: section(&table, "enclave", &mut issues),
             distill: section(&table, "distill", &mut issues),
             sync: section(&table, "sync", &mut issues),
+            fleet: section(&table, "fleet", &mut issues),
             scene: section(&table, "scene", &mut issues),
             overnight: section(&table, "overnight", &mut issues),
             webhooks: section(&table, "webhooks", &mut issues),
