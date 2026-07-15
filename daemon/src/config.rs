@@ -324,7 +324,10 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // [focus] — FOCUS PROFILES (#24, focus.rs). `profile` ships "default" (the
     // identity — today's behavior). PERMISSION-NEUTRAL: a profile only quiets
     // which non-consequential proactive intel surfaces, never loosens a gate.
-    ("focus", &["profile"]),
+    // `auto` (AUTO-FOCUS) ships OFF: when on, the live tick reselects the profile
+    // each tick from on-device signals through the SAME restrict-only path (it can
+    // only narrow further, never broaden).
+    ("focus", &["profile", "auto"]),
     ("apps", &["autostart"]),
     // [introspect] — the READ-ONLY micro-app introspection sentinel
     // (introspect.rs): SBPL profile-drift + per-app RSS/CPU anomaly surfacing.
@@ -2600,6 +2603,14 @@ impl Default for ProactiveConfig {
 /// named CUSTOM profile — which is itself restrict-only (it can only quiet, never
 /// broaden), so a typo can never accidentally LOOSEN anything. Parsed by
 /// `focus::FocusProfile::from_config_str`.
+///
+/// `auto` (AUTO-FOCUS, focus.rs `select_profile`) ships OFF: when on, the live
+/// anticipation tick reselects the active profile each tick from ON-DEVICE signals
+/// (acoustic scene + fused presence + calendar + time) and applies it through the
+/// SAME restrict-only `apply_profile` path (composed on top of `profile`), so it
+/// can only ever narrow further — never broaden past the configured profile,
+/// enable an action, or loosen a gate. Opt-in because it changes what surfaces
+/// based on sensed room state.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct FocusConfig {
@@ -2607,14 +2618,27 @@ pub struct FocusConfig {
     /// `focus::FocusProfile::from_config_str`; an unknown value is a named custom
     /// profile (restrict-only) and a blank degrades to "default".
     pub profile: String,
+    /// AUTO-FOCUS (focus.rs `select_profile`): when true, the LIVE anticipation
+    /// tick RESELECTS the active profile each tick from ON-DEVICE signals (acoustic
+    /// scene + fused presence + calendar + time-of-day) instead of holding the
+    /// static `profile`. Ships OFF: it changes what surfaces based on SENSED room
+    /// state, so it is opt-in like the other sensing sections. Auto is
+    /// permission-neutral BY CONSTRUCTION — the auto-selected profile is applied
+    /// through the SAME restrict-only `apply_profile` path (composed ON TOP of the
+    /// configured `profile`), so it can only ever NARROW further, never broaden past
+    /// the configured profile or enable/loosen anything. With it OFF, focus behaves
+    /// exactly as today (the configured `profile` is used byte-for-byte).
+    pub auto: bool,
 }
 
 impl Default for FocusConfig {
     /// Ships NEUTRAL: the "default" profile is the identity, reproducing today's
-    /// proactive behavior with no profile active.
+    /// proactive behavior with no profile active. Auto-Focus ships OFF (sensed-
+    /// state selection is opt-in).
     fn default() -> Self {
         FocusConfig {
             profile: "default".to_string(),
+            auto: false,
         }
     }
 }
@@ -3783,6 +3807,30 @@ mod tests {
         );
         assert!(cfg.power.adaptive);
         assert_eq!(cfg.power.low_battery_pct, 15);
+    }
+
+    /// AUTO-FOCUS: [focus].profile ships "default" (the identity) and [focus].auto
+    /// ships OFF (sensed-state selection is opt-in). Both keys are KNOWN (no
+    /// unknown-key diagnostic) and round-trip, and enabling auto takes.
+    #[test]
+    fn focus_defaults_neutral_auto_off_and_keys_known() {
+        let (cfg, issues) = Config::parse("");
+        assert!(issues.is_empty(), "{issues:?}");
+        assert_eq!(cfg.focus.profile, "default", "[focus].profile ships the identity");
+        assert!(!cfg.focus.auto, "[focus].auto ships OFF (opt-in sensed-state selection)");
+
+        let raw = r#"
+            [focus]
+            profile = "work"
+            auto = true
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        assert!(
+            !issues.iter().any(|i| i.contains("focus")),
+            "[focus] keys must be KNOWN (no diagnostic): {issues:?}"
+        );
+        assert_eq!(cfg.focus.profile, "work");
+        assert!(cfg.focus.auto, "enabling auto must take");
     }
 
     /// Contract lockstep: [proactive] defaults are enabled=true,
