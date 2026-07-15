@@ -9611,6 +9611,22 @@ body,
 .presence-signal.on { color: var(--learn-green); }
 .presence-signal.off { opacity: 0.4; text-decoration: line-through; }
 
+/* Semantic pasteboard (pasteboard.status): opt-in, redacted clipboard recall. */
+.pasteboard-body { display: flex; flex-direction: column; gap: 6px; }
+.pasteboard-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.pasteboard-pill {
+  font-size: 0.66em; letter-spacing: 0.06em; padding: 1px 6px;
+  border-radius: 3px; border: 1px solid currentColor; white-space: nowrap;
+}
+.pasteboard-pill.on { color: var(--learn-green); }
+.pasteboard-pill.off { color: var(--fg-dim, rgba(255,255,255,0.4)); }
+.pasteboard-clips { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.pasteboard-clip {
+  font-size: 0.72em; opacity: 0.85; white-space: nowrap; overflow: hidden;
+  text-overflow: ellipsis; max-width: 100%;
+}
+.pasteboard-empty { font-style: italic; }
+
 /* At-rest ambient mirror (F8): a calm fullscreen overlay shown when the daemon
    reports presence "away" and there's no local activity. Fades over the HUD. */
 .ambient-mode {

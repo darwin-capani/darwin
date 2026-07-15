@@ -184,6 +184,16 @@ pub struct Config {
     /// lifelong memory / optimizer / disk) + forgettable, with the WATCHING
     /// indicator; recall is read-only.
     pub screen_context: ScreenContextConfig,
+    /// [pasteboard] — SEMANTIC PASTEBOARD (pasteboard.rs), recall-by-MEANING over
+    /// the macOS clipboard. `enabled` SHIPS OFF (deliberate: capturing the
+    /// clipboard is privacy-sensitive, so nothing is polled or stored until the
+    /// user opts in). With it off nothing is polled, nothing is stored, and the
+    /// poll loop is never spawned. When on, each new clip is PII-REDACTED at the
+    /// source (optimize::redact) and kept in a BOUNDED, transient (in-RAM only, off
+    /// lifelong memory / optimizer / disk) ring; recall ranks clips by meaning via
+    /// the recall.rs path. `retention` caps the ring (evict-oldest);
+    /// `poll_interval_secs` sets the poll cadence.
+    pub pasteboard: PasteboardConfig,
     pub answers: AnswersConfig,
     pub audit: AuditConfig,
     /// [triage] — FORENSIC TRIAGE SNAPSHOT (triage.rs, aegis). The one-shot
@@ -728,6 +738,11 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // The ring is redacted + transient (in-RAM only, off lifelong memory / optimizer /
     // disk) + forgettable; recall is read-only. Listed so no key reads as a typo.
     ("screen_context", &["enabled", "interval_secs", "cap"]),
+    // [pasteboard] — SEMANTIC PASTEBOARD (pasteboard.rs). `enabled` SHIPS OFF
+    // (capturing the clipboard is privacy-sensitive; with it off nothing is polled
+    // or stored). `retention` is the evict-oldest ring cap and `poll_interval_secs`
+    // the poll cadence — both floored to >= 1 at use. Listed so none reads as a typo.
+    ("pasteboard", &["enabled", "retention", "poll_interval_secs"]),
     // [answers] — answer annotations (anthropic.rs `answers` module): the
     // always-cite source-tracking (#5) + the self-reported confidence (#8). ALL SHIP
     // ON (full-power default):
@@ -2553,6 +2568,53 @@ impl ScreenContextConfig {
     }
 }
 
+/// [pasteboard] — SEMANTIC PASTEBOARD (pasteboard.rs): recall-by-MEANING over the
+/// macOS clipboard, on-device.
+///
+///   - `enabled` (SHIPS OFF): the master switch. Capturing the clipboard is
+///     privacy-sensitive, so it ships OFF — with it false NOTHING is polled or
+///     stored and the poll loop is never spawned. When on, each new clip is
+///     PII-REDACTED at the source and stored in a bounded, transient (in-RAM only)
+///     ring; a read-only recall ranks clips by meaning via recall.rs.
+///   - `retention`: the evict-oldest ring cap (bounded memory; floored to >= 1).
+///   - `poll_interval_secs`: the poll cadence in seconds (floored to >= 1 so a 0
+///     never busy-loops).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PasteboardConfig {
+    pub enabled: bool,
+    pub retention: usize,
+    pub poll_interval_secs: u64,
+}
+
+impl Default for PasteboardConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS OFF — capturing the clipboard is privacy-sensitive; nothing is
+            // polled or stored until the user opts in.
+            enabled: false,
+            // A calm bound on the in-RAM ring; evict-oldest past it. Floored >= 1.
+            retention: 50,
+            // A calm cadence — poll every 3s when on. Floored to >= 1 at use.
+            poll_interval_secs: 3,
+        }
+    }
+}
+
+impl PasteboardConfig {
+    /// The effective ring cap (>= 1) — a misconfigured 0 would make the ring
+    /// useless, so it is floored, never trusted raw.
+    pub fn effective_retention(&self) -> usize {
+        self.retention.max(1)
+    }
+
+    /// The effective poll interval in seconds (>= 1) — a 0 would be a busy loop,
+    /// so it is floored.
+    pub fn effective_poll_interval_secs(&self) -> u64 {
+        self.poll_interval_secs.max(1)
+    }
+}
+
 /// [answers] — answer annotations (anthropic.rs `answers` module): the
 /// always-cite source-tracking (#5) and the self-reported confidence (#8). An
 /// ADDED honesty layer over the answer, never a change to any safety gate.
@@ -3883,6 +3945,7 @@ impl Config {
             vision: section(&table, "vision", &mut issues),
             image: section(&table, "image", &mut issues),
             screen_context: section(&table, "screen_context", &mut issues),
+            pasteboard: section(&table, "pasteboard", &mut issues),
             answers: section(&table, "answers", &mut issues),
             audit: section(&table, "audit", &mut issues),
             triage: section(&table, "triage", &mut issues),
@@ -4333,6 +4396,51 @@ mod tests {
         assert!(
             issues.iter().any(|i| i.contains("enable")),
             "a typo'd [screen_context] key must be diagnosed: {issues:?}"
+        );
+    }
+
+    /// SEMANTIC PASTEBOARD: [pasteboard] SHIPS OFF (privacy-sensitive), with sane
+    /// bounds (retention/interval floored to >= 1), and its keys are known
+    /// (lockstep with KNOWN_KEYS so a typo is diagnosed).
+    #[test]
+    fn pasteboard_ships_off_with_sane_bounds_and_known_keys() {
+        // The Default impl is OFF — capturing the clipboard is opt-in.
+        let d = super::PasteboardConfig::default();
+        assert!(!d.enabled, "the semantic pasteboard SHIPS OFF (privacy-sensitive; opt-in)");
+        assert_eq!(d.retention, 50);
+        assert_eq!(d.poll_interval_secs, 3);
+        assert!(d.effective_retention() >= 1);
+        assert!(d.effective_poll_interval_secs() >= 1);
+
+        // An empty config (no [pasteboard] block) parses to OFF, no diagnostic.
+        let (cfg, issues) = Config::parse("");
+        assert!(
+            !cfg.pasteboard.enabled,
+            "an absent [pasteboard] block falls back to the OFF default"
+        );
+        assert!(
+            issues.iter().all(|i| !i.contains("pasteboard")),
+            "the [pasteboard] keys must be known (no unknown-key diagnostic): {issues:?}"
+        );
+
+        // The keys take + a misconfigured 0 retention/interval is FLOORED.
+        let (cfg, issues) = Config::parse(
+            "[pasteboard]\nenabled = true\nretention = 0\npoll_interval_secs = 0\n",
+        );
+        assert!(issues.is_empty(), "valid keys parse clean: {issues:?}");
+        assert!(cfg.pasteboard.enabled);
+        assert_eq!(cfg.pasteboard.effective_retention(), 1, "a 0 retention is floored to 1");
+        assert_eq!(
+            cfg.pasteboard.effective_poll_interval_secs(),
+            1,
+            "a 0 interval is floored to 1 (never a busy loop)"
+        );
+
+        // A typo'd key under [pasteboard] IS flagged (lockstep with KNOWN_KEYS).
+        let (_cfg, issues) = Config::parse("[pasteboard]\nenable = true\n");
+        assert!(
+            issues.iter().any(|i| i.contains("enable")),
+            "a typo'd [pasteboard] key must be diagnosed: {issues:?}"
         );
     }
 

@@ -6193,6 +6193,60 @@ export function parsePresence(data: Record<string, unknown>): Presence {
 }
 
 /* ------------------------------------------------------------------------ *
+ * SEMANTIC PASTEBOARD (daemon pasteboard.rs -> `pasteboard / pasteboard.status`). *
+ *                                                                            *
+ * An OPT-IN (ships OFF) poller of the macOS clipboard: each new clip is       *
+ * PII-REDACTED at the source and kept in a bounded, transient in-RAM ring.    *
+ * The status frame carries the enabled gate, the clip COUNT + cap + poll      *
+ * cadence, and up to a few ALREADY-redacted + truncated clip PREVIEWS for the *
+ * panel (never raw clip text, never anything pre-redaction). When off, the    *
+ * count is 0 and there are no previews — nothing was ever captured.           *
+ * ------------------------------------------------------------------------ */
+
+export const PASTEBOARD_TOPIC_STATUS = "pasteboard.status";
+
+/** Cap on recent redacted-clip previews the panel retains/renders (defensive
+ *  against a hostile/oversized frame). */
+export const PASTEBOARD_PREVIEW_CAP = 8;
+
+/** The semantic-pasteboard status. `recent` holds ALREADY-redacted, truncated
+ *  clip previews (never raw clip text). Any unknown/garbled field coerces
+ *  conservatively (off, zero counts, no previews) — the panel never invents a
+ *  captured state, and a disabled pasteboard shows nothing captured. */
+export interface PasteboardStatus {
+  enabled: boolean;
+  count: number;
+  cap: number;
+  pollIntervalSecs: number;
+  /** Recent redacted clip previews (empty when off). */
+  recent: string[];
+}
+
+/** Parse a `pasteboard.status` payload. NEVER returns null / never throws; an
+ *  absent or garbled payload yields the honest OFF, empty snapshot. When off,
+ *  previews are dropped (a disabled pasteboard shows nothing captured), so the
+ *  panel can never render clip text for a pasteboard that is not running. */
+export function parsePasteboardStatus(data: Record<string, unknown>): PasteboardStatus {
+  const enabled = bool(data, "enabled") === true;
+  const count = num(data, "count");
+  const cap = num(data, "cap");
+  const poll = num(data, "poll_interval_secs");
+  const rawRecent = strArr(data, "recent") ?? [];
+  // Off => never surface previews, even if a frame carried some.
+  const recent = enabled
+    ? rawRecent.filter((s) => s.length > 0).slice(0, PASTEBOARD_PREVIEW_CAP)
+    : [];
+  const nonNeg = (v: number | null): number => (v === null || v < 0 ? 0 : Math.floor(v));
+  return {
+    enabled,
+    count: nonNeg(count),
+    cap: nonNeg(cap),
+    pollIntervalSecs: nonNeg(poll),
+    recent,
+  };
+}
+
+/* ------------------------------------------------------------------------ *
  * CAPABILITY MAP — the live honest "armed by default, gated per action"       *
  * readout (daemon capability.rs -> `system / capability.map`, audit-snapshot  *
  * cadence). One row per notable subsystem: ready / armed-but-needs-a-          *
