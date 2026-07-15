@@ -15,7 +15,13 @@ mod atlas;
 mod attribution;
 mod audio;
 mod audit;
+mod boundary;
 mod brief;
+// PLUMBLINE (calibrate.rs): the confidence-calibration self-report — a PURE fold of
+// the recent (confidence, outcome) window into a reliability curve + an ECE gap,
+// emitting the secret-free calibrate.report telemetry. Fully tested in calibrate.rs;
+// the reduce-only clarify-band hook it exposes ships OFF ([calibrate].influence_routing).
+mod calibrate;
 mod capability;
 mod cartographer;
 // DATA -> CHART (#41): a daemon ChartSpec {kind, series:[{label, points:[(x,y)]}],
@@ -64,6 +70,14 @@ mod drafts;
 // Hermetically tested in durable_missions.rs.
 mod durable_missions;
 mod egress;
+// EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs): the longitudinal
+// follow-on to the read-only Egress Sentinel. Keeps a BOUNDED baseline of
+// outbound talkers and runs two PURE classifiers — new-host diff + beacon
+// cadence (regular C2-callback intervals) — over rising-edge samples. Alerts
+// RIDE EDITH's quiet-hours + cooldown + debounce so they never spam. Any
+// "block" is PROPOSE-ONLY: a pf rule rendered as TEXT the user applies with
+// sudo — the module never mutates the firewall. ON by default ([egress].enabled).
+mod egress_beacon;
 mod episodic;
 // LIVE ENDPOINT SECURITY NOTIFY client (feature `endpoint-security`, DEVICE-GATED).
 // OFF by default — the normal build never compiles it. When on, it feeds kernel
@@ -147,6 +161,11 @@ mod notebook;
 // optimize_task calls optimize::run_optimizer (propose-only, never mutates the
 // live config). Exercised in full by optimize.rs's own hermetic tests.
 mod optimize;
+// Persistence Sentinel ("Autoruns for the Mac", persistence.rs): a READ-ONLY
+// inventory of the host's autostart/persistence surfaces + per-binary
+// signing/notarization + Gatekeeper, with a pure baseline diff. It reports; it
+// never remediates.
+mod persistence;
 mod playback;
 mod plugin_sdk;
 mod policy;
@@ -527,6 +546,18 @@ fn open_tcc_baseline(path: &Path, key: Option<&crypto::SecretKey>) -> Result<tcc
     match key {
         Some(k) => tcc::TccBaseline::open_encrypted(path, k),
         None => tcc::TccBaseline::open(path),
+    }
+}
+
+/// Open the Persistence-sentinel baseline store honoring the resolved encryption
+/// state (same plaintext/SQLCipher seam as the TCC baseline).
+fn open_persistence_baseline(
+    path: &Path,
+    key: Option<&crypto::SecretKey>,
+) -> Result<persistence::PersistenceBaseline> {
+    match key {
+        Some(k) => persistence::PersistenceBaseline::open_encrypted(path, k),
+        None => persistence::PersistenceBaseline::open(path),
     }
 }
 
@@ -1633,6 +1664,15 @@ async fn main() -> Result<()> {
         cfg.answers.cross_check_model_pass,
         cfg.answers.debate,
     );
+    // CUSTOMS // EGRESS gate ([boundary].enabled ships ON as a neutral PREVIEW,
+    // default_trim ships "none" == the identity): wire it ONCE so the cloud path
+    // (complete_with_tools) reads one process-global to decide whether to build +
+    // emit the pre-flight egress manifest and which reduce-only trim to apply —
+    // mirrors init_answers, no Config threading through the cloud call. With
+    // default_trim = "none" the turn sends byte-for-byte what it sends today; the
+    // manifest is a READ-ONLY inventory, and the LOCAL inference path never reaches
+    // it (it egresses nothing).
+    boundary::init(cfg.boundary.enabled, &cfg.boundary.default_trim);
     // MCP CLIENT (docs/SANDBOX.md): connect every configured external tool server
     // ONCE at startup, then install the connected manager as the process-global so
     // the cloud tool loop can offer + route its tools WITHOUT threading a manager
@@ -1730,6 +1770,16 @@ async fn main() -> Result<()> {
         &state_dir.join("tcc_baseline.db"),
         master_key.as_ref(),
     )?);
+    // The Persistence sentinel's durable baseline (same plaintext/encrypted seam).
+    // Opened only when the sentinel is armed (built inside its spawn gate below).
+    let persistence_baseline = if cfg.persistence.enabled {
+        Some(Arc::new(open_persistence_baseline(
+            &state_dir.join("persistence_baseline.db"),
+            master_key.as_ref(),
+        )?))
+    } else {
+        None
+    };
 
     // The EVAL scorecard's live, in-memory rolling state (eval.rs): bounded
     // windows of MEASURED per-turn latencies + cloud token usage. Held for the
@@ -2079,6 +2129,12 @@ async fn main() -> Result<()> {
         trace_store.clone(),
         eval_state.clone(),
     ));
+    // PLUMBLINE report pass (calibrate.rs): folds the live (confidence, outcome)
+    // window into a reliability curve + an ECE over/under-confidence gap and emits
+    // the secret-free `calibrate.report` telemetry. READ-ONLY analytics — it never
+    // touches routing (the reduce-only clarify-band hook is a separate, config-gated
+    // read the router performs, OFF by default); inert when [calibrate].enabled is off.
+    tokio::spawn(calibrate::calibrate_report_task(cfg.clone()));
     // Periodic AUDIT snapshot pass: reads the installed global audit log and emits
     // the secret-free `audit.snapshot` telemetry for the HUD AuditPanel timeline.
     // READ-ONLY accountability — it never records/prunes/mutates the log (the gate
@@ -2101,6 +2157,25 @@ async fn main() -> Result<()> {
     // and tcc.anomaly (new grant / denied->allowed escalation) for the HUD. It
     // never mutates TCC; only its own baseline store is written.
     tokio::spawn(tcc::sentinel_task(tcc_baseline));
+    // Ambient PERSISTENCE sentinel ("Autoruns for the Mac"): a slow, READ-ONLY
+    // scan of the host's autostart/persistence surfaces (LaunchAgents /
+    // LaunchDaemons / login items / cron / third-party kexts) + each backing
+    // binary's signing/notarization (codesign/spctl ASSESSMENT reads, never
+    // executions) + the Gatekeeper switch. It seeds a baseline on first run, then
+    // emits security.persistence (counts + any new/removed/unsigned anomalies) and
+    // folds a summary into the posture readout. DARWIN's own two launch items are
+    // labeled self, never alarmed on. It never mutates any OS surface; only its own
+    // baseline store is written. Ships ON ([persistence].enabled); with it false
+    // the loop is not spawned.
+    if let Some(persistence_baseline) = persistence_baseline {
+        tokio::spawn(persistence::sentinel_task(
+            persistence_baseline,
+            cfg.persistence.startup_delay_secs,
+            cfg.persistence.interval_secs,
+            cfg.persistence.assess_signing,
+            cfg.persistence.max_assess,
+        ));
+    }
     // Ambient micro-app introspection: a slow, READ-ONLY sentinel over darwind's
     // OWN sandboxed children — SBPL profile-drift (fingerprint vs on-disk) and
     // per-app RSS/CPU anomaly classification via sysinfo (same-UID, no
@@ -2125,6 +2200,18 @@ async fn main() -> Result<()> {
         // the entitlement/root aren't present the light path above is unaffected.
         #[cfg(feature = "endpoint-security")]
         es::start_and_report();
+    }
+    // Ambient EGRESS BASELINE + BEACON loop: a slow, READ-ONLY sampler over the
+    // host's outbound connections (the same lsof snapshot the Egress Sentinel
+    // uses). It folds each sample into a BOUNDED longitudinal baseline and runs
+    // two PURE classifiers — first-seen talker + regular-interval beacon cadence
+    // — emitting a guarded, PROPOSE-ONLY egress.newhost/egress.beacon frame for
+    // any survivor. Alerts ride EDITH's quiet-hours + cooldown + debounce so
+    // they never spam; any "block" is TEXT the user applies with sudo — this
+    // loop never mutates the firewall. Ships ON ([egress].enabled). UID-scoped:
+    // unprivileged lsof sees only same-UID processes (stated in every frame).
+    if cfg.egress.enabled {
+        tokio::spawn(egress_beacon::run_task(cfg.clone()));
     }
     // Ambient CAPABILITY-HEALTH loop: a slow, READ-ONLY periodic pass over the
     // optimizer's own trace corpus that emits the PROPOSE-ONLY `attribution.health`
@@ -3087,6 +3174,12 @@ async fn run_pipeline(
                             ),
                             Err(e) => warn!(error = %e, "optimize: failed to label prior trace corrected"),
                         }
+                        // PLUMBLINE: mirror the correction into the calibration
+                        // window so the prior turn's confidence is scored against
+                        // its true (corrected) outcome, not the provisional Success.
+                        if cfg.calibrate.enabled {
+                            calibrate::relabel(prior.trace_id, optimize::Outcome::CorrectedNextTurn);
+                        }
                     }
                 }
                 // Record this turn (default outcome Success; a future turn may
@@ -3117,6 +3210,14 @@ async fn run_pipeline(
                 .await
                 {
                     Ok(Some(id)) => {
+                        // PLUMBLINE: pair THIS turn's classifier confidence with its
+                        // trace id in the calibration window (provisional Success; a
+                        // next-turn correction re-labels it above). Same posture as
+                        // the optimizer trace: recorded only while enabled, and the
+                        // sample is secret-free (a float + an outcome).
+                        if cfg.calibrate.enabled {
+                            calibrate::record(id, class.confidence);
+                        }
                         *prior_turn = Some(optimize::PriorTurn {
                             trace_id: id,
                             intent: class.intent.clone(),

@@ -62,6 +62,23 @@ enabled = true          # master gate. SHIPS ON (full-power default). The read-o
 [chart]                  # #41 DATA -> CHART. NEUTRAL PRESENTATION: serializes a ChartSpec (the EXACT data points) as a `chart.data` telemetry envelope the HUD plots exactly — no interpolation, no invented/extrapolated point, honest axes + honest-empty. Changes no gate, takes no action, reaches no network.
 enabled = true          # master gate. SHIPS ON (full-power default). "chart this"/"plot the system load" surfaces the latest REAL system snapshot's exact cpu/mem values as a chart.data envelope (honest-empty when no reading is available yet). Changes no gate, reaches no network — safe to enable outright. Set false to disable.
 
+[boundary]               # CUSTOMS // EGRESS (boundary.rs). A PRE-FLIGHT egress boundary gate: before a CLOUD turn goes out, CUSTOMS builds a READ-ONLY manifest of exactly the personal context about to be sent (facts / history / world rows / persona / system prompt), classifies each by sensitivity + size, and emits it as a `boundary.manifest` frame. INSPECTS + (reduce-only) TRIMS; it never mutates, never sends, and never touches the LOCAL inference path (which egresses nothing off the box).
+enabled = true          # master gate for the pre-flight manifest. SHIPS ON (full-power default) as a NEUTRAL READ-ONLY preview of cloud egress. Off => the cloud turn is byte-for-byte today's (no manifest computed/emitted). Set false to disable.
+default_trim = "none"   # the default REDUCE-ONLY trim on every cloud turn. SHIPS "none" (the IDENTITY — send everything, today's behavior). "no_facts" withholds the remembered FACTS; "no_memory" withholds FACTS + conversation HISTORY. A trim can ONLY withhold whole categories, never add one; an unknown value degrades to "none". A per-turn voice command can override this for a single turn.
+[egress]                 # EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs) — the longitudinal follow-on to the read-only Egress Sentinel. Samples the SAME lsof outbound snapshot, keeps a BOUNDED baseline, and runs two PURE classifiers: first-seen talker + regular-interval beacon cadence (the C2-callback signature). READ-ONLY. Any "block" is PROPOSE-ONLY: a pf rule rendered as TEXT you apply yourself with sudo — the loop NEVER mutates the firewall. UID-scoped: unprivileged lsof sees only same-UID processes (stated in every alert frame). Alerts RIDE EDITH's quiet-hours (from [proactive]) + cooldown + debounce so they never spam.
+enabled = true              # master gate. SHIPS ON (full-power default) — pure read-only observability, like [introspect]/[audit]. With it false the sampling loop is simply not spawned. Set false to disable.
+startup_delay_secs = 45     # wait this long after boot before the first sample (let the host settle)
+sample_interval_secs = 60   # seconds between outbound-connection samples. Beacon-cadence resolution is bounded by this: a beacon that opens AND closes entirely between two samples is invisible to snapshot sampling (an honest limit, not a bug).
+retention_secs = 86400      # a talker unseen for longer than this (seconds) is pruned from the baseline (1 day; bounded retention)
+max_talkers = 2048          # hard cap on distinct talkers held; the least-recently-seen is evicted when a new talker would exceed it (bounded memory)
+max_samples_per_talker = 64 # ring cap on rising-edge timestamps kept per talker (bounded memory)
+beacon_min_samples = 6      # minimum rising-edge timestamps before a beacon-cadence verdict is trusted (=> 5 intervals)
+beacon_min_interval_secs = 30    # mean inter-arrival at/above this — below it a series is bursty reconnection noise, not a beacon
+beacon_max_interval_secs = 3600  # mean inter-arrival at/below this — above it the cadence is indistinguishable from ordinary slow polling at our sample resolution (1 hour)
+beacon_max_jitter = 0.15    # coefficient-of-variation ceiling (stddev/mean of the deltas). A tight, regular cadence sits well below this; a jittery/random one blows past it.
+alert_cooldown_secs = 21600 # per-talker alert cooldown (seconds): don't renag on the same host (6 hours)
+alert_min_gap_secs = 300    # global debounce (seconds): never two egress alerts closer than this (5 minutes) — on top of EDITH quiet hours
+
 [screen_context]         # #42 CONTINUOUS SCREEN CONTEXT — the MOST privacy-sensitive read feature. A bounded/redacted/transient in-RAM ring of recent on-screen OCR snapshots, fed by a DEVICE-gated continuous capture loop, recallable ("what was I working on") + forgettable ("forget my screen context"). Glyph-only, never a face/identity; pixels never leave the device; READ-ONLY.
 enabled = true          # master gate. SHIPS ON (full-power default), the MOST privacy-sensitive read — INERT WITHOUT TCC: the continuous capture loop STILL requires runtime macOS Screen-Recording consent; the flag cannot grant it, so without consent it captures NOTHING (the ring never grows, no WATCHING indicator fires). The ring stays redacted + transient (off lifelong memory / optimizer / disk) + bounded (cap below) + forgettable, with the WATCHING indicator. Set false to disable.
 interval_secs = 30      # cadence the device-gated loop grabs ONE frame (floored to >= 1). A calmer/faster watch.
@@ -157,6 +174,21 @@ mode = "propose"  # "propose" (default): write the validated app + report to sta
 enabled = true    # master gate, SHIPS ON (full-power default). Live trace recording is runtime-gated (traces accrue only while the daemon runs with this on); traces are PII-REDACTED before storage (emails / phone numbers / >=6-digit runs / URLs with embedded credentials / api-key- and token-shaped strings are stripped) and NEVER contain a secret or token; retention is bounded (oldest rows evicted past the cap). The optimizer still only PROPOSES diffs a human applies (mode below stays "propose"). Set false to disable.
 mode = "propose"  # "propose" (default): the downstream Optimizer reuses the self-heal posture — it writes a measured config/prompt/example diff for a HUMAN to review+apply and NEVER silently mutates a live config or behavior; an optimization is adopted ONLY IF it MEASURABLY beats the current baseline on held-out traces, and every adoption is reversible. "auto" is reserved and behaves as "propose" for now — there is no auto-apply-to-live path. Unknown values behave as "propose".
 
+[calibrate]
+# PLUMBLINE (calibrate.rs): DARWIN's honest confidence-calibration self-report. It
+# folds the recent (classifier-confidence, outcome) window into a RELIABILITY CURVE
+# (per confidence bucket: how often DARWIN was actually right) + a single scalar
+# over/under-confidence GAP (ECE-style), applying a MIN_SAMPLE floor so a thin bucket
+# is reported "insufficient data", never judged. READ-ONLY aggregate analytics: a
+# sample is a float + an outcome (NO utterance, no PII), emitted as the secret-free
+# `calibrate.report` telemetry. It changes NOTHING on its own.
+enabled = true               # master gate for the report pass, SHIPS ON (full-power default) — the same always-on, no-autonomy posture as the eval scorecard. Off => no report is emitted. Set false to disable.
+influence_routing = false    # gates the REDUCE-ONLY clarify-band hook. SHIPS OFF so the first landing is pure analytics and routing is byte-for-byte today's. When ON, the router MAY RAISE its clarify/low-confidence threshold in a bucket PLUMBLINE measured as overconfident — asking MORE clarifying questions there. The hook is mathematically incapable of LOWERING the threshold: it can only ever make DARWIN more cautious, never bolder.
+n_bins = 10                  # reliability resolution (deciles). Fine enough to see a miscalibration bend, coarse enough that a bucket can reach the floor on a real corpus.
+min_sample = 20              # per-bucket honesty floor: below this many GRADED turns a bucket is "insufficient data" and is EXCLUDED from the ECE / gap (never judged on noise).
+overconfidence_margin = 0.1  # dead-band: a bucket counts as "overconfident" (and eligible for the reduce-only widen) only if actual success lags the claimed confidence by MORE than this, so ordinary sampling noise never widens the clarify band.
+max_widen = 0.15             # cap on the reduce-only hook's widen: it never raises the clarify threshold by more than this, and the result is always capped at 1.0.
+
 [standing]
 # Standing Missions (standing.rs): durable, scheduled, autonomous goals that run
 # on the standing-missions scheduler tick (a dedicated runtime loop, separate from
@@ -213,6 +245,35 @@ interval_secs      = 60     # seconds between ticks (profile-drift + resource sa
 startup_delay_secs = 30     # wait after boot before the first tick (let apps settle)
 cpu_alert_percent  = 95.0   # sustained CPU% above which an app is flagged
 rss_growth_ratio   = 3.0    # RSS growth multiple over baseline that counts as a runaway
+
+[persistence]
+# Persistence Sentinel — "Autoruns for the Mac" (persistence.rs). A slow,
+# READ-ONLY inventory of the host's autostart / persistence surfaces, each read
+# via a FIXED-ARG bounded subprocess (never a shell string), so the parsers are
+# CI-tested on canned output:
+#   * ~/Library/LaunchAgents, /Library/LaunchAgents, /Library/LaunchDaemons
+#     plist listings (Label / Program / RunAtLoad / ProgramArguments)
+#   * user-domain `launchctl list` (third-party jobs; com.apple.* filtered)
+#   * `crontab -l`
+#   * login items via System Events (Automation-TCC gated -> honest SKIP without
+#     the grant, NEVER a fabricated empty list)
+#   * loaded third-party kexts (`kmutil showloaded`; com.apple.* filtered)
+#   * Gatekeeper status (`spctl --status`)
+#   * per-autostart-binary signing/notarization (`codesign -dv`, `spctl --assess`
+#     — ASSESSMENT reads only, never executions)
+# It keeps a baseline and reports DELTAS (a NEW / REMOVED / newly-UNSIGNED
+# autostart item) via the `security.persistence` telemetry frame + a summary in
+# the posture readout. DARWIN's own two launch items (com.darwin.daemon /
+# com.darwin.inference) are LABELED as self and are NEVER alarmed on. STRICTLY
+# READ-ONLY: no writes to user data, no kills, no unloads, no remediation.
+# SHIPS ON (full-power default); with it false the sentinel loop is not spawned.
+enabled = true
+# Sentinel cadence (defaults shown; absent = these values).
+interval_secs      = 300    # seconds between scans (the autostart surface moves slowly)
+startup_delay_secs = 45     # wait after boot before the first scan
+# Signing assessment (codesign/spctl per backing binary — ASSESSMENT reads only).
+assess_signing     = true   # run the per-binary signing/notarization reads
+max_assess         = 64     # cap on binaries assessed per scan (bounds the work)
 
 [integrations]
 # Shared substrate for the Chart-2 integrations (GitHub, Slack, Google

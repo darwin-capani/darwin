@@ -35,6 +35,18 @@ pub struct Config {
     /// app runs; with it false the sentinel loop is not spawned (the cheap
     /// record_profile/record_child hooks in apps.rs still populate their maps).
     pub introspect: IntrospectConfig,
+    /// [persistence] — PERSISTENCE SENTINEL ("Autoruns for the Mac", persistence.rs).
+    /// `enabled` SHIPS ON (full-power default). READ-ONLY DEFENSE: a slow sentinel
+    /// that inventories the host's autostart/persistence surfaces (LaunchAgents,
+    /// LaunchDaemons, login items, cron, third-party kexts) + each backing binary's
+    /// signing/notarization + the Gatekeeper switch via FIXED-ARG bounded
+    /// subprocesses, keeps a baseline, and flags what is NEW / REMOVED / newly
+    /// UNSIGNED. DARWIN's own two launch items are labeled self, never alarmed on. It
+    /// emits `security.persistence` for the HUD/posture and takes NO action —
+    /// remediating a finding would be consequential and is out of scope. Honest SKIP
+    /// when a read needs a privilege the no-sudo daemon lacks (login items ->
+    /// Automation TCC). With it false the sentinel loop is not spawned.
+    pub persistence: PersistenceConfig,
     pub integrations: IntegrationsConfig,
     pub standing: StandingConfig,
     /// [drafts] — AUTO-DRAFT (#25, drafts.rs). `enabled` SHIPS ON (full-power
@@ -58,6 +70,15 @@ pub struct Config {
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
     pub optimize: OptimizeConfig,
+    /// [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
+    /// `enabled` SHIPS ON (full-power default): it is READ-ONLY aggregate analytics
+    /// (a reliability curve + ECE gap over the recent confidence/outcome window),
+    /// emitting the secret-free `calibrate.report` telemetry — the same always-on,
+    /// no-autonomy posture as [episodic] / the eval scorecard. `influence_routing`
+    /// SHIPS OFF: it gates the REDUCE-ONLY clarify-band hook, which can only ever
+    /// make DARWIN ask MORE clarifying questions in a measurably-overconfident bucket,
+    /// never act more boldly — off by default so the first landing is pure analytics.
+    pub calibrate: CalibrateConfig,
     pub voice_id: VoiceIdConfig,
     pub episodic: EpisodicConfig,
     pub notebooks: NotebookConfig,
@@ -171,6 +192,29 @@ pub struct Config {
     /// changes no gate, takes no action, reaches no network — safe to enable
     /// outright.
     pub chart: ChartConfig,
+    /// [boundary] — CUSTOMS // EGRESS, a PRE-FLIGHT egress boundary gate
+    /// (boundary.rs). `enabled` SHIPS ON (full-power default) as a NEUTRAL
+    /// PREVIEW: before a CLOUD turn goes out, CUSTOMS builds a READ-ONLY manifest
+    /// of exactly the personal context about to be sent (facts / history / world
+    /// rows / persona / system prompt), classifies each by sensitivity, and emits
+    /// it as a `boundary.manifest` frame. `default_trim` SHIPS "none" (the
+    /// IDENTITY — send everything, today's behavior byte-for-byte). A trim is
+    /// REDUCE-ONLY (it can only WITHHOLD whole categories, never add one) and the
+    /// LOCAL inference path never reaches CUSTOMS (it egresses nothing), so
+    /// enabling only adds an honest inventory + an opt-in trim — never a new
+    /// egress.
+    pub boundary: BoundaryConfig,
+    /// [egress] — EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs), the
+    /// longitudinal follow-on to the read-only Egress Sentinel. `enabled` SHIPS ON
+    /// (full-power default) — like `[introspect]`/`[audit]` it is pure, READ-ONLY
+    /// observability: it samples the SAME lsof outbound snapshot, keeps a BOUNDED
+    /// baseline, and runs two PURE classifiers (first-seen talker + regular-interval
+    /// beacon cadence). Alerts RIDE EDITH's quiet-hours (`[proactive]`) + cooldown +
+    /// debounce so they never spam, and any "block" is PROPOSE-ONLY: a pf rule
+    /// rendered as TEXT the user applies with sudo — the loop never mutates the
+    /// firewall. UID-scoped (unprivileged lsof sees only same-UID processes; stated
+    /// in every frame). With `enabled` false the sampling loop is simply not spawned.
+    pub egress: EgressConfig,
 }
 
 /// Every section and key the config knows, for unknown-key diagnostics
@@ -251,6 +295,15 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // `enabled` SHIPS ON (full-power default); it only observes darwind's own
     // children (same-UID, no entitlement) and never acts.
     ("introspect", &["enabled", "interval_secs", "startup_delay_secs", "cpu_alert_percent", "rss_growth_ratio"]),
+    // [persistence] — the READ-ONLY Persistence Sentinel (persistence.rs): an
+    // "Autoruns for the Mac" inventory of autostart surfaces (LaunchAgents /
+    // LaunchDaemons / login items / cron / third-party kexts) + per-binary
+    // signing/notarization + Gatekeeper, with a baseline diff (new/removed/
+    // unsigned). `enabled` SHIPS ON (full-power default); it only reads + reports,
+    // never remediates. `assess_signing` gates the codesign/spctl per-binary reads
+    // (ASSESSMENT only, never executions); `max_assess` caps how many binaries are
+    // assessed per scan.
+    ("persistence", &["enabled", "interval_secs", "startup_delay_secs", "assess_signing", "max_assess"]),
     // [integrations] — `allow_consequential` is THE master gate for outward/
     // side-effecting actions. SHIPS ON (full-power default) — INERT-SAFE: a
     // CONFIRMED consequential action still clears confirm + voice-id + policy +
@@ -317,6 +370,17 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // phase ALWAYS proposes (mode KEEPS "propose") — there is no auto-apply-to-live
     // path, exactly like self-heal's mode.
     ("optimize", &["enabled", "mode"]),
+    // [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
+    // `enabled` SHIPS ON (read-only aggregate analytics: a reliability curve + ECE
+    // gap over the recent confidence/outcome window, emitted as secret-free
+    // `calibrate.report`). `influence_routing` SHIPS OFF and gates the REDUCE-ONLY
+    // clarify-band hook (it can only ever make DARWIN ask MORE, never act bolder).
+    // The remaining keys tune the curve resolution + the sample-size honesty floor +
+    // the overconfidence dead-band + the widen cap; listed so none reads as a typo.
+    (
+        "calibrate",
+        &["enabled", "influence_routing", "n_bins", "min_sample", "overconfidence_margin", "max_widen"],
+    ),
     // [voice_id] — on-device speaker verification (voiceid.rs). `enabled` is the
     // master switch and SHIPS OFF (deliberate: voice-id is a fail-closed GATE, not a
     // feature; enrollment is always explicit). With it false (or with no enrolled
@@ -648,6 +712,34 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // point, honest axes/empty); it changes no gate, takes no action, reaches no
     // network — safe to enable outright. Listed so the key never reads as a typo.
     ("chart", &["enabled"]),
+    // [boundary] — CUSTOMS // EGRESS (boundary.rs). `enabled` SHIPS ON (a neutral
+    // READ-ONLY preview of the cloud egress manifest); `default_trim` SHIPS "none"
+    // (the identity — send everything, today's behavior). A trim is REDUCE-ONLY
+    // ("none" | "no_facts" | "no_memory"); an unknown value degrades to "none".
+    // Listed so neither key reads as a typo.
+    ("boundary", &["enabled", "default_trim"]),
+    // [egress] — EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs). `enabled`
+    // SHIPS ON (read-only observability). The remaining keys tune the bounded
+    // baseline retention and the beacon-cadence + alert-suppression thresholds;
+    // quiet-hours is inherited from [proactive], not repeated here. Listed so a
+    // key never reads as a typo.
+    (
+        "egress",
+        &[
+            "enabled",
+            "startup_delay_secs",
+            "sample_interval_secs",
+            "retention_secs",
+            "max_talkers",
+            "max_samples_per_talker",
+            "beacon_min_samples",
+            "beacon_min_interval_secs",
+            "beacon_max_interval_secs",
+            "beacon_max_jitter",
+            "alert_cooldown_secs",
+            "alert_min_gap_secs",
+        ],
+    ),
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1386,6 +1478,125 @@ impl Default for ChartConfig {
     }
 }
 
+/// [boundary] — CUSTOMS // EGRESS, the pre-flight egress boundary gate
+/// (boundary.rs). CUSTOMS INSPECTS + (reduce-only) TRIMS the personal context a
+/// CLOUD turn is about to send — it never mutates state, never sends anything, and
+/// never touches the LOCAL inference path (which egresses nothing off the box, so
+/// there is nothing for CUSTOMS to gate there).
+///
+/// `enabled` SHIPS ON (full-power default) as a NEUTRAL PREVIEW: with it on the
+/// cloud path builds a READ-ONLY [`crate::boundary::EgressManifest`] of exactly
+/// what egresses (facts / history / world rows / persona / system prompt, each
+/// classified by sensitivity with a count + byte-size) and emits it as a
+/// `boundary.manifest` frame BEFORE the request leaves. With it off the manifest
+/// path is skipped and the cloud turn is byte-for-byte today's.
+///
+/// `default_trim` SHIPS "none" — the IDENTITY: send everything, today's behavior
+/// byte-for-byte. A trim is REDUCE-ONLY (`crate::boundary::TrimSpec`): it can only
+/// WITHHOLD whole categories from egress, never add one. Recognized values:
+///
+///   * "none"      — withhold nothing (the shipped identity);
+///   * "no_facts"  — withhold the remembered FACTS ("don't send my facts");
+///   * "no_memory" — withhold FACTS and conversation HISTORY.
+///
+/// An unknown value degrades to "none" (a trim must be EXPLICIT — CUSTOMS never
+/// silently withholds context the operator did not clearly ask to drop). A
+/// per-turn voice command can override this for a single turn without changing the
+/// default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BoundaryConfig {
+    /// Master gate for the CUSTOMS pre-flight manifest. SHIPS ON (full-power
+    /// default) as a neutral READ-ONLY preview of cloud egress. Off => the cloud
+    /// turn is byte-for-byte today's (no manifest computed/emitted).
+    pub enabled: bool,
+    /// The default REDUCE-ONLY trim applied to every cloud turn. SHIPS "none" (the
+    /// identity — send everything). "no_facts" withholds the remembered facts;
+    /// "no_memory" withholds facts + history; an unknown value degrades to "none".
+    /// Parsed by `crate::boundary::TrimSpec::from_str`.
+    pub default_trim: String,
+}
+
+impl Default for BoundaryConfig {
+    /// Ships NEUTRAL: the preview is ON (read-only inventory of cloud egress) and
+    /// the trim is "none" (the identity — the turn sends exactly what it sends
+    /// today). CUSTOMS observes + reports until the operator opts into a trim.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_trim: "none".to_string(),
+        }
+    }
+}
+
+/// [egress] — EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs), the
+/// longitudinal follow-on to the read-only Egress Sentinel. `enabled` SHIPS ON:
+/// like `[introspect]`/`[audit]` it is pure READ-ONLY observability — it samples
+/// the SAME lsof outbound snapshot, keeps a BOUNDED baseline, and runs two PURE
+/// classifiers (first-seen talker + regular-interval beacon cadence). Alerts RIDE
+/// EDITH's quiet-hours (inherited from `[proactive]`) + cooldown + debounce so
+/// they never spam, and any "block" is PROPOSE-ONLY: a pf rule rendered as TEXT
+/// the user applies with sudo — the loop never mutates the firewall.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EgressConfig {
+    /// Master switch for the sampling loop. SHIPS ON (read-only observability);
+    /// with it false the loop is simply not spawned.
+    pub enabled: bool,
+    /// Seconds to wait after boot before the first sample (let the host settle).
+    pub startup_delay_secs: u64,
+    /// Seconds between outbound-connection samples. The beacon-cadence resolution
+    /// is bounded by this: a beacon that opens AND closes entirely between two
+    /// samples is invisible to snapshot sampling (an honest limit, not a bug).
+    pub sample_interval_secs: u64,
+    /// A talker not seen for longer than this (seconds) is pruned from the
+    /// baseline (bounded retention).
+    pub retention_secs: u64,
+    /// Hard cap on distinct talkers held; the least-recently-seen is evicted when
+    /// a new talker would exceed it (bounded memory).
+    pub max_talkers: usize,
+    /// Ring cap on rising-edge timestamps kept per talker (bounded memory).
+    pub max_samples_per_talker: usize,
+    /// Minimum rising-edge timestamps before a beacon-cadence verdict is trusted.
+    pub beacon_min_samples: usize,
+    /// Mean inter-arrival at/above this (seconds) — below it a series is treated
+    /// as bursty reconnection noise, not a beacon.
+    pub beacon_min_interval_secs: u64,
+    /// Mean inter-arrival at/below this (seconds) — above it the cadence is
+    /// indistinguishable from ordinary slow polling at our sample resolution.
+    pub beacon_max_interval_secs: u64,
+    /// Coefficient-of-variation ceiling (stddev/mean of the deltas). A tight,
+    /// regular cadence sits well below this; a jittery/random one blows past it.
+    pub beacon_max_jitter: f64,
+    /// Per-talker alert cooldown (seconds): don't renag on the same host.
+    pub alert_cooldown_secs: u64,
+    /// Global debounce (seconds): never two egress alerts closer than this.
+    pub alert_min_gap_secs: u64,
+}
+
+impl Default for EgressConfig {
+    fn default() -> Self {
+        // SHIPS ON (read-only observability). Conservative retention + beacon/alert
+        // thresholds: sample once a minute, keep a day of baseline, flag only tight
+        // (CV <= 0.15) regular cadences between 30s and 1h, and gate alerts behind a
+        // 6h per-host cooldown + a 5-min global debounce (on top of EDITH quiet hours).
+        Self {
+            enabled: true,
+            startup_delay_secs: 45,
+            sample_interval_secs: 60,
+            retention_secs: 24 * 60 * 60, // 1 day
+            max_talkers: 2048,
+            max_samples_per_talker: 64,
+            beacon_min_samples: 6,
+            beacon_min_interval_secs: 30,
+            beacon_max_interval_secs: 60 * 60, // 1 hour
+            beacon_max_jitter: 0.15,
+            alert_cooldown_secs: 6 * 60 * 60, // 6 hours
+            alert_min_gap_secs: 5 * 60,       // 5 minutes
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SelfHealConfig {
@@ -1453,6 +1664,66 @@ impl Default for OptimizeConfig {
             // review+apply, adopted only if it beats baseline on held-out traces.
             // There is no auto-apply-to-live path; NEVER ship "auto" as the default.
             mode: "propose".to_string(),
+        }
+    }
+}
+
+/// [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
+/// A READ-ONLY fold over the recent (confidence, outcome) window into a reliability
+/// curve + a scalar over/under-confidence gap (ECE-style), with a MIN_SAMPLE floor
+/// so a thin bucket is reported "insufficient data" rather than judged. It emits the
+/// aggregate, secret-free `calibrate.report` telemetry and changes NOTHING on its
+/// own.
+///
+///   - `enabled` (SHIPS ON, full-power default): master gate for the report pass.
+///     Analytics only — no PII (a sample is a float + an outcome enum), no autonomy.
+///     Off => no report is emitted (the pure math is unaffected).
+///   - `influence_routing` (SHIPS OFF): gates the REDUCE-ONLY clarify-band hook
+///     ([`crate::calibrate::adjusted_clarify_threshold`]). When on, the router MAY
+///     RAISE its clarify/low-confidence threshold in a bucket PLUMBLINE measured as
+///     overconfident — asking MORE clarifying questions there. The hook is
+///     mathematically incapable of LOWERING the threshold, so it can only ever make
+///     DARWIN more cautious, never bolder. Off by default: routing is byte-for-byte
+///     today's and PLUMBLINE is pure analytics.
+///   - `n_bins` (deciles): reliability resolution. `min_sample`: the per-bucket
+///     honesty floor. `overconfidence_margin`: how far actual must lag the claim
+///     before a bucket counts as overconfident (dead-band against noise).
+///     `max_widen`: the cap on how far the reduce-only hook may raise the threshold.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CalibrateConfig {
+    pub enabled: bool,
+    pub influence_routing: bool,
+    pub n_bins: usize,
+    pub min_sample: usize,
+    pub overconfidence_margin: f64,
+    pub max_widen: f64,
+}
+
+impl Default for CalibrateConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS ON — READ-ONLY aggregate analytics (a reliability curve + ECE
+            // gap over the recent confidence/outcome window), the same always-on,
+            // no-autonomy posture as the eval scorecard / [episodic].
+            enabled: true,
+            // SHIPS OFF — the reduce-only clarify-band hook is inert by default so
+            // the first landing is pure analytics and routing is unchanged. Even
+            // when on, it can ONLY widen the clarify band (ask more), never narrow
+            // it (act bolder).
+            influence_routing: false,
+            // Deciles — fine enough to see a miscalibration bend, coarse enough that
+            // a bucket can reach the floor on a real corpus.
+            n_bins: crate::calibrate::DEFAULT_BINS,
+            // Per-bucket honesty floor: below this many graded turns a bucket is
+            // "insufficient data" and excluded from the ECE / gap.
+            min_sample: crate::calibrate::DEFAULT_MIN_SAMPLE,
+            // A bucket is only "overconfident" if actual success lags the claim by
+            // MORE than this — a dead-band so ordinary sampling noise never widens.
+            overconfidence_margin: 0.1,
+            // Cap on the reduce-only widen (the hook never raises the threshold by
+            // more than this, and the result is always capped at 1.0).
+            max_widen: 0.15,
         }
     }
 }
@@ -2299,6 +2570,40 @@ impl Default for IntrospectConfig {
     }
 }
 
+/// [persistence] — the PERSISTENCE SENTINEL (persistence.rs): a READ-ONLY
+/// "Autoruns for the Mac" inventory of the host's autostart surfaces + per-binary
+/// signing/notarization + Gatekeeper, with a pure baseline diff. It only observes
+/// and reports (secret-free counts + anomalies); it never remediates.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PersistenceConfig {
+    /// Master switch for the sentinel loop. SHIPS ON (read-only observability).
+    pub enabled: bool,
+    /// Seconds between sentinel scans (the autostart surface moves slowly).
+    pub interval_secs: u64,
+    /// Seconds to wait after boot before the first scan (let the box settle).
+    pub startup_delay_secs: u64,
+    /// Whether to run the per-binary `codesign`/`spctl` ASSESSMENT reads. SHIPS ON.
+    pub assess_signing: bool,
+    /// Cap on how many binaries are signing-assessed per scan (bounds the work).
+    pub max_assess: usize,
+}
+
+impl Default for PersistenceConfig {
+    fn default() -> Self {
+        // On by default — it only reads the host's autostart surfaces and reports.
+        // The cadence matches the TCC sentinel (a slow scan; the surface moves on
+        // the order of installs). Signing assessment is on but bounded.
+        Self {
+            enabled: true,
+            interval_secs: 300,
+            startup_delay_secs: 45,
+            assess_signing: true,
+            max_assess: 64,
+        }
+    }
+}
+
 /// [integrations] — the shared Chart-2 integration substrate (integrations.rs).
 /// `allow_consequential` is THE master gate for outward/side-effecting actions
 /// (post a message, create an event). It SHIPS ON (true) — the headline of the
@@ -3006,6 +3311,7 @@ impl Config {
             focus: section(&table, "focus", &mut issues),
             apps: section(&table, "apps", &mut issues),
             introspect: section(&table, "introspect", &mut issues),
+            persistence: section(&table, "persistence", &mut issues),
             integrations: section(&table, "integrations", &mut issues),
             standing: section(&table, "standing", &mut issues),
             drafts: section(&table, "drafts", &mut issues),
@@ -3014,6 +3320,7 @@ impl Config {
             mcp: section(&table, "mcp", &mut issues),
             skills: section(&table, "skills", &mut issues),
             optimize: section(&table, "optimize", &mut issues),
+            calibrate: section(&table, "calibrate", &mut issues),
             voice_id: section(&table, "voice_id", &mut issues),
             episodic: section(&table, "episodic", &mut issues),
             notebooks: section(&table, "notebooks", &mut issues),
@@ -3041,6 +3348,8 @@ impl Config {
             power: section(&table, "power", &mut issues),
             report: section(&table, "report", &mut issues),
             chart: section(&table, "chart", &mut issues),
+            boundary: section(&table, "boundary", &mut issues),
+            egress: section(&table, "egress", &mut issues),
         };
 
         // SELECTABLE QUANTIZATION (#39) value validation: an unknown [inference]

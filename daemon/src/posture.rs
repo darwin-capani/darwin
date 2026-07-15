@@ -159,6 +159,15 @@ where
         lines.push(line);
     }
 
+    // Persistence Sentinel (persistence.rs): a secret-free, read-only summary of
+    // the host's autostart surfaces (LaunchAgents/Daemons/login-items/cron/kexts)
+    // + how many are unsigned + the Gatekeeper switch. None until the sentinel has
+    // scanned — then this line joins the posture the same way the others do. It
+    // reports; it never acts on a persistence finding.
+    if let Some(line) = crate::persistence::posture_line() {
+        lines.push(line);
+    }
+
     format!(
         "Security posture (read-only — I report it; turning anything on is yours to do in System Settings): {}",
         lines.join("; ")

@@ -15,6 +15,7 @@ use tokio::process::Command;
 use tracing::{info, warn};
 
 use crate::actions;
+use crate::boundary;
 use crate::memory::Memory;
 use crate::telemetry;
 
@@ -1842,6 +1843,50 @@ pub async fn complete_with_tools(
     if let Some(block) = confidence_tail(answers_gate().1) {
         world_tail.push(block);
     }
+
+    // CUSTOMS // EGRESS (boundary.rs) — the PRE-FLIGHT egress boundary gate. Before
+    // this CLOUD request goes out, build a READ-ONLY manifest of EXACTLY the
+    // personal context assembled above (the SAME facts / history / world rows /
+    // persona / system prompt this turn sends), apply the active REDUCE-ONLY trim
+    // (config default or a per-turn voice override), and emit it as a
+    // `boundary.manifest` frame so the operator sees what egresses BEFORE it leaves.
+    // The trim ALSO reduces what is ACTUALLY sent: a withheld category's data is
+    // dropped from `facts`/`history` here, never added to (reduce-only by
+    // construction). INERT under the shipped default (enabled preview, trim "none")
+    // => `facts`/`history` are untouched and the prompt is byte-for-byte today's.
+    // HONESTY: this gates ONLY the cloud path — the LOCAL inference path routes
+    // through `complete_with_local_tools`, never this function, so it never reaches
+    // CUSTOMS (it egresses nothing off the box, and the manifest says so on the wire).
+    let (customs_on, trim) = boundary::gate_and_trim();
+    if customs_on {
+        // Inventory the FULL egress, then apply the trim to get the honest, subset
+        // manifest of what actually leaves. Both the manifest and the data reduction
+        // below derive from the SAME `trim`, so the frame can never disagree with
+        // what egressed.
+        let full = boundary::build_egress_manifest(
+            persona(),
+            agent_persona,
+            facts,
+            history,
+            world_context,
+            personalization,
+            utterance,
+        );
+        let manifest = boundary::apply_trim(&full, trim);
+        debug_assert!(
+            manifest.is_subset_of(&full),
+            "CUSTOMS trim must never broaden the egress manifest"
+        );
+        telemetry::emit("cloud", "boundary.manifest", manifest.telemetry());
+    }
+    // REDUCE-ONLY: withhold a trimmed category's data from the actual request. With
+    // the shipped "none" trim (or CUSTOMS off) both drop-checks are false, so
+    // `facts`/`history` are untouched and the prompt is byte-for-byte today's.
+    let facts: &[(String, String)] =
+        if customs_on && trim.drops(boundary::ContextCategory::Facts) { &[] } else { facts };
+    let history: &[(String, String)] =
+        if customs_on && trim.drops(boundary::ContextCategory::History) { &[] } else { history };
+
     let system = build_system_blocks(agent_persona, facts, &world_tail);
     let mut messages = build_messages(history, utterance);
     let max_tokens = spoken_cap(max_tokens);
@@ -6484,6 +6529,35 @@ pub async fn execute_tool(
                 json!({"tool": name, "agent": namespace}),
             );
             return (refusal, true);
+        }
+    }
+
+    // CUSTOMS EGRESS TRIM (reduce-only). When a boundary trim withholds a category
+    // (facts / history), the recall tools that would read those same categories back
+    // out of the LOCAL store are refused HERE — the single robust enforcement point.
+    // The offered-set can't be filtered for a wildcard-allowlist agent, but every
+    // tool call funnels through execute_tool, so this closes the loophole the review
+    // found: without it, a `no_memory` turn empties the seeded facts yet the model
+    // calls `recall_facts` and re-egresses them. HONEST: the model is told the recall
+    // was WITHHELD BY POLICY, never handed empty data as if the store were empty.
+    {
+        let (customs_on, trim) = boundary::gate_and_trim();
+        if customs_on && trim.withheld_recall_tools().contains(&name) {
+            warn!(tool = name, trim = trim.as_str(), "CUSTOMS: refusing a recall that a trim withholds");
+            crate::telemetry::emit(
+                "system",
+                "egress.refused",
+                json!({"tool": name, "agent": namespace, "reason": "boundary_trim", "trim": trim.as_str()}),
+            );
+            return (
+                format!(
+                    "Withheld by the CUSTOMS egress policy (trim: {}). This recall was not \
+                     performed — its category is excluded from what may leave the device this \
+                     turn. Answer from the live request without it.",
+                    trim.as_str()
+                ),
+                true,
+            );
         }
     }
 

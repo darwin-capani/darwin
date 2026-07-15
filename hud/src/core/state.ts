@@ -69,6 +69,7 @@ import {
   Suggestion,
   ProactiveDigest,
   FocusActive,
+  EgressManifest,
   TelemetryEnvelope,
   UnifiedSearchResult,
   VerifyStatus,
@@ -183,6 +184,7 @@ import {
   parseSuggestion,
   parseProactiveDigest,
   parseFocusActive,
+  parseEgressManifest,
   parseUserModelConsolidated,
   parseVisionDescribe,
   parseAudioSoundMonitor,
@@ -1149,6 +1151,17 @@ export interface HudState {
    *  booleans. */
   focusProfile: FocusActive | null;
 
+  /** The CUSTOMS // EGRESS manifest (boundary.manifest, boundary.rs) — the
+   *  pre-flight inventory of exactly the personal context the LAST cloud turn was
+   *  about to send (facts / history / world rows / persona / system prompt, each
+   *  classified by sensitivity with a unit count + byte size), plus any REDUCE-ONLY
+   *  trim that withheld a category. Null until the first cloud turn emits it (the
+   *  LOCAL path never egresses, so a local-only session leaves this null). A trim
+   *  can ONLY withhold — never broaden — and the manifest pins the honesty contract
+   *  (read-only, never gates the local path). SECRET-FREE: only shape, never the
+   *  fact values / history text / utterance. */
+  egressManifest: EgressManifest | null;
+
   /** The ACTION surface (#25 auto-draft / #26 durable missions / #27 macros):
    *  pending drafts (subject/preview only — NEVER the full body), durable
    *  missions (id/goal/status + sub-task progress), and recorded macros (name +
@@ -1393,6 +1406,7 @@ export function initialState(): HudState {
     dismissedSuggestions: new Set<string>(),
     proactiveDigest: null,
     focusProfile: null,
+    egressManifest: null,
     actionSurface: { drafts: [], missions: [], macros: [] },
     chart: null,
     report: null,
@@ -1957,6 +1971,21 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // the shipped "default" profile is the identity (today's behavior).
       const focus = parseFocusActive(env.data);
       return { ...s, focusProfile: focus };
+    }
+
+    case "boundary.manifest": {
+      // CUSTOMS // EGRESS (boundary.rs): the pre-flight egress manifest, emitted by
+      // the CLOUD path (anthropic.rs complete_with_tools) BEFORE each cloud request
+      // leaves — an honest inventory of exactly the personal context about to be
+      // sent, plus any REDUCE-ONLY trim that withheld a category. parseEgressManifest
+      // PINS the honesty contract HUD-side (read_only forced true, local_path_egresses
+      // forced false), so a hostile/garbled payload can NEVER make the panel claim
+      // CUSTOMS mutated state or gated the local path (it only inspects + trims cloud
+      // egress; the local path egresses nothing). It never returns null — the surface
+      // reflects the LATEST cloud turn's manifest, replaced in place each cloud turn.
+      // SECRET-FREE: only category labels + sensitivity bands + counts/sizes.
+      const manifest = parseEgressManifest(env.data);
+      return { ...s, egressManifest: manifest };
     }
 
     case "standing.run": {

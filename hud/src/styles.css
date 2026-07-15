@@ -6383,6 +6383,97 @@ svg.tri circle {
 }
 .focus-foot { margin-top: 2px; line-height: 1.35; }
 
+/* ------------------------------------------------------- CUSTOMS // EGRESS */
+/* CUSTOMS // EGRESS — the read-only pre-flight egress manifest (daemon/src/
+   boundary.rs, emitted as `boundary.manifest` by the CLOUD path before each cloud
+   request leaves). An honest INVENTORY of exactly the personal context about to be
+   sent (facts / history / world rows / persona / system prompt), each with a coarse
+   sensitivity band + unit count + byte size, plus any REDUCE-ONLY trim that withheld
+   a category. SECRET-FREE: only shape, never content. Amber = personal / trimmed
+   (the sensitive + held-back states); cyan = contextual; dim/green = public /
+   full-context clean pass-through (real, honest states — RED stays for alerts). No
+   button — review only. */
+.customs-body { display: flex; flex-direction: column; gap: 8px; padding: 4px 2px; }
+.customs-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.customs-title {
+  font-size: 0.72em;
+  letter-spacing: 0.1em;
+  font-weight: 600;
+  color: var(--cyan-bright);
+}
+.customs-pill {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+}
+.customs-pill.full { color: var(--learn-green); }
+.customs-pill.trimmed { color: var(--warn-amber); }
+.customs-pill.total { color: var(--cyan-dim); margin-left: auto; }
+
+.customs-empty { padding: 2px 0; line-height: 1.4; }
+.customs-item-list { display: flex; flex-direction: column; gap: 4px; }
+.customs-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 4px 8px;
+  border: 1px solid rgba(26, 214, 255, 0.16);
+  border-radius: 4px;
+  background: rgba(26, 214, 255, 0.03);
+}
+.customs-sens {
+  font-size: 0.62em;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid currentColor;
+  flex: 0 0 auto;
+}
+.customs-sens.sens-personal { color: var(--warn-amber); }
+.customs-sens.sens-contextual { color: var(--cyan); }
+.customs-sens.sens-public { color: var(--cyan-dim); }
+.customs-cat {
+  font-size: 0.82em;
+  font-weight: 600;
+  color: var(--fg, rgba(255, 255, 255, 0.85));
+  flex: 1 1 auto;
+  min-width: 0;
+  word-break: break-word;
+}
+.customs-count { font-size: 0.72em; color: var(--cyan-dim); flex: 0 0 auto; }
+.customs-bytes {
+  font-size: 0.72em;
+  letter-spacing: 0.04em;
+  font-weight: 600;
+  color: var(--cyan-dim);
+  flex: 0 0 auto;
+}
+
+.customs-withheld { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.customs-withheld.clean { line-height: 1.4; }
+.customs-withheld-label {
+  font-size: 0.66em;
+  letter-spacing: 0.06em;
+  font-weight: 600;
+  color: var(--warn-amber);
+  text-transform: uppercase;
+  flex: 0 0 auto;
+}
+.customs-withheld-value { display: flex; gap: 5px; flex-wrap: wrap; }
+.customs-withheld-value.muted { color: var(--cyan-dim); }
+.customs-held-cat {
+  font-size: 0.8em;
+  padding: 0 5px;
+  border-radius: 3px;
+  border: 1px solid rgba(255, 176, 0, 0.3);
+  color: var(--warn-amber);
+}
+.customs-foot { margin-top: 2px; line-height: 1.35; }
+
 /* ------------------------------------------------- RESEARCH NOTEBOOKS panel */
 /* RESEARCH // NOTEBOOKS — the user's saved research (daemon/src/notebook.rs,
    emitted as `notebook.card`). HONEST + READ-ONLY: it surfaces a notebook voice

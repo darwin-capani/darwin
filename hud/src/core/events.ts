@@ -1063,6 +1063,162 @@ export function focusIsDefault(f: FocusActive): boolean {
   );
 }
 
+/* ------------------------------------------------------------------------ *
+ * CUSTOMS // EGRESS — the pre-flight egress manifest (boundary.manifest;      *
+ * daemon/src/boundary.rs EgressManifest::telemetry(), emitted by the CLOUD    *
+ * path (anthropic.rs complete_with_tools) BEFORE each cloud request leaves).  *
+ *                                                                            *
+ * CUSTOMS is a READ-ONLY inspector + a REDUCE-ONLY trim over the personal     *
+ * context a cloud turn is about to send. The manifest is an honest INVENTORY  *
+ * of exactly what egresses — facts / history / world rows / persona / system  *
+ * prompt — each classified by a coarse sensitivity band with a unit COUNT and *
+ * a BYTE size. It is SECRET-FREE: only the SHAPE of the egress rides the wire, *
+ * never a fact value, the history text, or the utterance itself.              *
+ *                                                                            *
+ * A trim is REDUCE-ONLY: it can only WITHHOLD whole categories ('no memory'   *
+ * drops facts+history; 'no facts' drops facts), never add one. A trimmed turn *
+ * is LABELED honestly — the frame carries the active trim + the exact list of *
+ * withheld categories, so the readout can never claim to have sent something  *
+ * it dropped.                                                                 *
+ *                                                                            *
+ * HONESTY CONTRACT (pinned HUD-side, like focus's permission-neutral flags):  *
+ * CUSTOMS gates ONLY the cloud path. The LOCAL inference path egresses nothing *
+ * off the box, so it never reaches CUSTOMS — `read_only` is forced true and   *
+ * `local_path_egresses` forced false here, so a hostile/garbled payload can   *
+ * NEVER make the panel claim CUSTOMS mutated state or blocked a local turn.    *
+ * Parsed DEFENSIVELY: junk degrades to an honest-empty inventory, never a throw. *
+ * ------------------------------------------------------------------------ */
+
+/** The coarse sensitivity band of one egress item (boundary.rs Sensitivity,
+ *  lowercase on the wire). Closed union; an unknown value normalizes to
+ *  "personal" (the MOST sensitive) — a garbled label never UNDERSTATES how
+ *  sensitive a slice of egress is. */
+export type EgressSensitivity = "public" | "contextual" | "personal";
+
+/** One inventoried slice of cloud egress: its context category (facts / history /
+ *  world_rows / persona / system_prompt / personalization / utterance), the coarse
+ *  sensitivity band, the unit COUNT (facts, conversation turns, or 1 for a single
+ *  block) and its BYTE size. SECRET-FREE — only shape, never content. */
+export interface EgressItem {
+  /** The context category label (e.g. "facts", "history", "world_rows"). */
+  category: string;
+  /** The coarse sensitivity band (public | contextual | personal). */
+  sensitivity: EgressSensitivity;
+  /** Discrete units in this slice (fact count / turn count / 1 for a block). */
+  count: number;
+  /** The byte-size of this slice's content (what would ride the wire). */
+  bytes: number;
+}
+
+/** A complete, defensively-parsed `boundary.manifest` payload — the HUD's view of
+ *  what a cloud turn is about to send. `items` are the slices being SENT (already
+ *  post-trim); `withheld` are the categories a trim held back this turn; `trim` is
+ *  the active reduce-only policy; `trimmed` is whether anything was actually
+ *  withheld. The two contract booleans are PINNED to the only honest values (a
+ *  hostile payload cannot make the panel claim CUSTOMS mutated state or gated the
+ *  local path). */
+export interface EgressManifest {
+  /** The context slices being sent this turn (present + not trimmed). */
+  items: EgressItem[];
+  /** Total bytes across `items` (what egresses this turn). */
+  totalBytes: number;
+  /** The active reduce-only trim policy (none | no_facts | no_memory | a label). */
+  trim: string;
+  /** Whether a trim actually WITHHELD something this turn. */
+  trimmed: boolean;
+  /** The categories a trim withheld from egress this turn (honest; empty when the
+   *  trim withheld nothing). Non-string entries are dropped. */
+  withheld: string[];
+  /** ALWAYS true: CUSTOMS is read-only (it inspects + trims, never mutates/sends).
+   *  Read from the wire but pinned — the panel states the posture from the payload. */
+  readOnly: boolean;
+  /** ALWAYS false: the LOCAL inference path egresses nothing, so CUSTOMS never
+   *  gates it. Pinned (a claimed `true` is a contract violation and not honored). */
+  localPathEgresses: boolean;
+}
+
+/** Normalize a wire sensitivity string to the closed [`EgressSensitivity`] union.
+ *  An unknown value normalizes to "personal" (the MOST sensitive) — a garbled
+ *  label never understates how sensitive a slice is. */
+function normalizeEgressSensitivity(v: string | null): EgressSensitivity {
+  return v === "public" || v === "contextual" || v === "personal" ? v : "personal";
+}
+
+/** Coerce one untrusted manifest-item object into an [`EgressItem`], or null when
+ *  it lacks a usable `category` — an unlabeled slice is not surfaced. `count`/
+ *  `bytes` default to 0 and floor at 0 (a negative/garbled size never renders as a
+ *  phantom). Only the four contracted fields are read — never a secret. Never
+ *  throws. */
+function coerceEgressItem(o: Record<string, unknown>): EgressItem | null {
+  const category = str(o, "category");
+  if (category === null || category.trim().length === 0) return null;
+  const count = num(o, "count");
+  const bytes = num(o, "bytes");
+  return {
+    category,
+    sensitivity: normalizeEgressSensitivity(str(o, "sensitivity")),
+    count: count !== null && count >= 0 ? Math.floor(count) : 0,
+    bytes: bytes !== null && bytes >= 0 ? Math.floor(bytes) : 0,
+  };
+}
+
+/** Parse a `boundary.manifest` payload (daemon EgressManifest::telemetry()) into an
+ *  [`EgressManifest`]. `items` are coerced row-by-row — a row with no category is
+ *  DROPPED. `totalBytes` uses the wire's `total_bytes` when honest, else falls back
+ *  to the sum of the surviving item bytes (never trusts a smaller claimed total than
+ *  what the items add up to — a manifest can't UNDERSTATE its own egress). `trim`
+ *  defaults to "none"; `trimmed` reflects the wire but is forced false when nothing
+ *  was withheld; `withheld` drops non-string entries. The two contract booleans are
+ *  PINNED — `read_only` forced true and `local_path_egresses` forced false — so a
+ *  hostile/garbled payload can NEVER make the panel claim CUSTOMS mutated state or
+ *  gated the local path. NEVER returns null + never throws. SECRET-FREE: only the
+ *  category labels + sensitivity bands + counts + sizes survive. */
+export function parseEgressManifest(data: Record<string, unknown>): EgressManifest {
+  const rawItems = data["items"];
+  const items = Array.isArray(rawItems)
+    ? rawItems
+        .filter(isPlainObject)
+        .map(coerceEgressItem)
+        .filter((it): it is EgressItem => it !== null)
+    : [];
+  const itemsBytes = items.reduce((sum, it) => sum + it.bytes, 0);
+  // Trust the wire's total only when it is at least the sum of the items (a
+  // manifest must never UNDERSTATE its own egress); otherwise use the item sum.
+  const wireTotal = num(data, "total_bytes");
+  const totalBytes = wireTotal !== null && wireTotal >= itemsBytes ? wireTotal : itemsBytes;
+  const withheld = strArr(data, "withheld") ?? [];
+  const trimStr = str(data, "trim");
+  return {
+    items,
+    totalBytes,
+    trim: trimStr !== null && trimStr.trim().length > 0 ? trimStr : "none",
+    // Honest: only "trimmed" when the wire says so AND something was withheld.
+    trimmed: (bool(data, "trimmed") ?? false) && withheld.length > 0,
+    withheld,
+    // Pin the honesty contract HUD-side: CUSTOMS is read-only and never gates the
+    // local path, so we do not honor a payload that claimed otherwise.
+    readOnly: true,
+    localPathEgresses: false,
+  };
+}
+
+/** True when a manifest is the CLEAN pass-through — no trim active, nothing
+ *  withheld. The panel uses this to render the honest "full context — nothing
+ *  withheld" state rather than a list of what was held back. */
+export function egressIsClean(m: EgressManifest): boolean {
+  return !m.trimmed && m.withheld.length === 0 && m.trim === "none";
+}
+
+/** A compact human byte-size label for the egress readout (e.g. "1.2 KB").
+ *  Deterministic + pure so the panel copy is unit-testable. Sub-KB stays in bytes;
+ *  KB/MB round to one decimal. */
+export function egressByteLabel(bytes: number): string {
+  const b = Number.isFinite(bytes) && bytes > 0 ? Math.floor(bytes) : 0;
+  if (b < 1024) return `${b} B`;
+  if (b < 1024 * 1024) return `${(b / 1024).toFixed(1)} KB`;
+  return `${(b / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 /** system / agent.active — router.rs (CONTRACT part A). Emitted when Darwin-
  *  Prime delegates a request to an agent, and once per agent during a roll
  *  call. `hue` (0..360) drives the R3F core color + the constellation glow;
