@@ -278,6 +278,21 @@ impl BaselineStore {
 /// NOT in the baseline `known` set — first-seen talkers. At most one
 /// observation per new pair is returned (the first), so several ports to one new
 /// host raise a single finding.
+/// DARWIN's own process names — never alarm on the daemon's own outbound (esp. its
+/// api.anthropic.com cloud lifeline). Mirrors persistence.rs's SELF_LABELS: self is
+/// recognized, never flagged.
+const SELF_PROCESSES: &[&str] = &["darwind", "darwin-inference"];
+
+/// Whether a (process, host) is DARWIN itself or a loopback peer, and so must never
+/// be alarmed on. PURE — unit-tested. Loopback covers the HUD/telemetry socket
+/// (127.0.0.1 / ::1); the self-process check covers the daemon's cloud lifeline.
+pub fn is_self_or_loopback(process: &str, host: &str) -> bool {
+    SELF_PROCESSES.contains(&process)
+        || host == "::1"
+        || host == "localhost"
+        || host.starts_with("127.")
+}
+
 pub fn diff_new_hosts(current: &[Observation], known: &HashSet<(String, String)>) -> Vec<Observation> {
     let mut seen: HashSet<(String, String)> = HashSet::new();
     current
@@ -376,11 +391,17 @@ pub enum AlertGate {
     Suppressed(&'static str),
 }
 
+/// Hard cap on distinct alert keys the ledger retains, bounding memory over the
+/// daemon's lifetime (every other structure here is capped too: max_talkers,
+/// max_samples_per_talker, retention_secs).
+const MAX_LEDGER_KEYS: usize = 4096;
+
 /// Per-key cooldown + global debounce ledger — the same shape as EDITH's
 /// `anticipate::FiredState`, carried by the live loop across ticks.
 #[derive(Debug, Clone, Default)]
 pub struct AlertLedger {
-    /// (alert key, unix secs it last fired) — the per-key cooldown ledger.
+    /// (alert key, unix secs it last fired) — the per-key cooldown ledger. Bounded
+    /// by `MAX_LEDGER_KEYS` (see [`AlertLedger::record`]).
     last_fired: Vec<(String, u64)>,
     /// The most recent alert time, for the global min-gap debounce.
     most_recent: Option<u64>,
@@ -396,11 +417,27 @@ impl AlertLedger {
 
     /// Record that `key` fired at `now`: stamp the cooldown ledger and advance
     /// the global debounce clock. Called by the live loop only when it ACTS on
-    /// an `Allow`.
+    /// an `Allow`. BOUNDED: like every other structure in this module, the per-key
+    /// ledger is capped — when it would exceed `MAX_LEDGER_KEYS` the oldest-fired
+    /// key is evicted. Re-alerting an evicted key later is acceptable (worst case
+    /// one extra proposal), and it prevents unbounded growth on a host that reaches
+    /// many first-seen destinations over the daemon's lifetime.
     pub fn record(&mut self, key: &str, now: u64) {
         match self.last_fired.iter_mut().find(|(k, _)| k == key) {
             Some(slot) => slot.1 = now,
             None => self.last_fired.push((key.to_string(), now)),
+        }
+        if self.last_fired.len() > MAX_LEDGER_KEYS {
+            // Evict the least-recently-fired key (smallest ts) to stay bounded.
+            if let Some(oldest) = self
+                .last_fired
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, (_, t))| *t)
+                .map(|(i, _)| i)
+            {
+                self.last_fired.swap_remove(oldest);
+            }
         }
         self.most_recent = Some(now);
     }
@@ -527,14 +564,23 @@ pub async fn run_task(cfg: std::sync::Arc<crate::config::Config>) {
         let obs: Vec<Observation> = crate::egress::sample_talkers()
             .await
             .into_iter()
-            .map(|(process, remote)| {
+            .filter_map(|(process, remote)| {
                 let (host, port) = split_host_port(&remote);
-                Observation {
+                // SELF-EXCLUSION (mirrors persistence.rs's SELF_LABELS discipline):
+                // never alarm on DARWIN's OWN egress — its api.anthropic.com cloud
+                // lifeline is owned by `darwind`, and the HUD/telemetry socket is a
+                // loopback connection. Both are the daemon working as designed, not a
+                // suspicious talker; flagging them (or proposing a pf rule to sever the
+                // cloud lifeline) would be a self-inflicted false positive.
+                if is_self_or_loopback(&process, &host) {
+                    return None;
+                }
+                Some(Observation {
                     process,
                     host,
                     port,
                     ts: now,
-                }
+                })
             })
             .collect();
 
@@ -909,5 +955,34 @@ mod tests {
         assert_eq!(bf["period_secs"], 60.0, "period rounded to one decimal");
         assert_eq!(bf["jitter_ratio"], 0.012, "jitter rounded to three decimals");
         assert_eq!(bf["caveat"], UID_CAVEAT);
+    }
+
+    #[test]
+    fn self_and_loopback_are_never_alarmed() {
+        // DARWIN's own cloud lifeline (darwind -> api.anthropic.com) must never be
+        // flagged or proposed for a block; the HUD/telemetry loopback socket likewise.
+        assert!(is_self_or_loopback("darwind", "160.79.104.10"), "own cloud egress excluded");
+        assert!(is_self_or_loopback("darwin-inference", "1.2.3.4"), "inference sidecar excluded");
+        assert!(is_self_or_loopback("anything", "127.0.0.1"), "loopback excluded");
+        assert!(is_self_or_loopback("anything", "127.5.5.5"), "127/8 loopback excluded");
+        assert!(is_self_or_loopback("anything", "::1"), "ipv6 loopback excluded");
+        assert!(is_self_or_loopback("anything", "localhost"), "localhost excluded");
+        // A genuine third-party talker to a public host is NOT excluded.
+        assert!(!is_self_or_loopback("implant", "203.0.113.7"), "third-party talker kept");
+        assert!(!is_self_or_loopback("curl", "8.8.8.8"), "ordinary process kept");
+    }
+
+    #[test]
+    fn ledger_is_bounded_and_evicts_the_oldest() {
+        let mut led = AlertLedger::default();
+        // Fill past the cap; each distinct key fires at an increasing ts.
+        for i in 0..(MAX_LEDGER_KEYS + 50) {
+            led.record(&format!("newhost:p:{i}"), i as u64);
+        }
+        assert!(led.last_fired.len() <= MAX_LEDGER_KEYS, "ledger stays bounded");
+        // The oldest keys (smallest ts) were evicted; the most-recent key survives.
+        let newest = format!("newhost:p:{}", MAX_LEDGER_KEYS + 49);
+        assert!(led.last_fired_at(&newest).is_some(), "most-recent key retained");
+        assert!(led.last_fired_at("newhost:p:0").is_none(), "oldest key evicted");
     }
 }

@@ -575,14 +575,15 @@ where
 /// Collect loaded jobs from the user domain (`launchctl list`), keeping the
 /// THIRD-PARTY ones (Apple's own `com.apple.*` are filtered as noise, mirroring
 /// the kext filter) and labeling DARWIN's own as self.
-async fn collect_launchctl<F, Fut>(run: &F) -> Vec<AutostartItem>
+async fn collect_launchctl<F, Fut>(run: &F) -> (Vec<AutostartItem>, Option<(&'static str, String)>)
 where
     F: Fn(&'static str, Vec<String>, Duration) -> Fut,
     Fut: Future<Output = ReadOutput>,
 {
     let text = match run(LAUNCHCTL, vec!["list".into()], PERSIST_TIMEOUT).await {
         ReadOutput::Text(t) => t,
-        ReadOutput::Unavailable(_) => return Vec::new(),
+        // Honest SKIP, never a fabricated empty inventory (contract, lines 19-21).
+        ReadOutput::Unavailable(why) => return (Vec::new(), Some(("launchctl", why))),
     };
     let mut out = Vec::new();
     for (pid, status, label) in parse_launchctl_list(&text) {
@@ -602,24 +603,26 @@ where
         });
         let _ = (pid, status);
     }
-    out
+    (out, None)
 }
 
 /// Collect the current user's cron jobs (`crontab -l`). An empty crontab is an
-/// HONEST empty result (never fabricated).
-async fn collect_crontab<F, Fut>(run: &F) -> Vec<AutostartItem>
+/// HONEST empty result (never fabricated); an UNREADABLE one is an honest SKIP.
+async fn collect_crontab<F, Fut>(run: &F) -> (Vec<AutostartItem>, Option<(&'static str, String)>)
 where
     F: Fn(&'static str, Vec<String>, Duration) -> Fut,
     Fut: Future<Output = ReadOutput>,
 {
     let text = match run(CRONTAB, vec!["-l".into()], PERSIST_TIMEOUT).await {
         ReadOutput::Text(t) => t,
-        ReadOutput::Unavailable(_) => return Vec::new(),
+        // Distinct from an empty crontab (an honest empty below): a timed-out /
+        // unavailable read is a SKIP, never "no cron jobs".
+        ReadOutput::Unavailable(why) => return (Vec::new(), Some(("crontab", why))),
     };
     if crontab_is_empty(&text) {
-        return Vec::new();
+        return (Vec::new(), None);
     }
-    parse_crontab(&text)
+    let out = parse_crontab(&text)
         .into_iter()
         .map(|line| AutostartItem {
             surface: "crontab",
@@ -630,7 +633,8 @@ where
             signed: Signedness::NotAssessed,
             is_self: false,
         })
-        .collect()
+        .collect();
+    (out, None)
 }
 
 /// Collect login items via System Events. Returns the items on success, or a
@@ -683,7 +687,7 @@ where
 
 /// Collect the THIRD-PARTY loaded kexts (`kmutil showloaded`). Non-Apple code in
 /// the kernel is inherently notable; the presence of a NEW one is the alert.
-async fn collect_kexts<F, Fut>(run: &F) -> Vec<AutostartItem>
+async fn collect_kexts<F, Fut>(run: &F) -> (Vec<AutostartItem>, Option<(&'static str, String)>)
 where
     F: Fn(&'static str, Vec<String>, Duration) -> Fut,
     Fut: Future<Output = ReadOutput>,
@@ -692,9 +696,11 @@ where
         .await
     {
         ReadOutput::Text(t) => t,
-        ReadOutput::Unavailable(_) => return Vec::new(),
+        // kmutil is absent pre-macOS 11 and the read can time out on a busy host:
+        // an honest SKIP, never a fabricated "no third-party kexts".
+        ReadOutput::Unavailable(why) => return (Vec::new(), Some(("kext", why))),
     };
-    parse_kexts(&text)
+    let out = parse_kexts(&text)
         .into_iter()
         .map(|k| {
             let label = if k.version.is_empty() {
@@ -712,7 +718,8 @@ where
                 is_self: false,
             }
         })
-        .collect()
+        .collect();
+    (out, None)
 }
 
 /// Read the Gatekeeper switch (`spctl --status`).
@@ -770,14 +777,26 @@ async fn build_inventory(assess_signing: bool, max_assess: usize) -> Inventory {
 
     let paths = launch_plist_paths();
     items.extend(collect_launch_jobs(&run_real, &paths, assess_signing, &mut budget).await);
-    items.extend(collect_launchctl(&run_real).await);
-    items.extend(collect_crontab(&run_real).await);
+    let (launchctl, launchctl_skip) = collect_launchctl(&run_real).await;
+    items.extend(launchctl);
+    if let Some(skip) = launchctl_skip {
+        skips.push(skip);
+    }
+    let (crontab, crontab_skip) = collect_crontab(&run_real).await;
+    items.extend(crontab);
+    if let Some(skip) = crontab_skip {
+        skips.push(skip);
+    }
     let (login, login_skip) = collect_login_items(&run_real).await;
     items.extend(login);
     if let Some(skip) = login_skip {
         skips.push(skip);
     }
-    items.extend(collect_kexts(&run_real).await);
+    let (kexts, kext_skip) = collect_kexts(&run_real).await;
+    items.extend(kexts);
+    if let Some(skip) = kext_skip {
+        skips.push(skip);
+    }
     let gatekeeper = collect_gatekeeper(&run_real).await;
 
     Inventory { items, gatekeeper, skips }
@@ -1390,12 +1409,24 @@ mod tests {
         // Unclear, and the list surfaces yield an honest empty (not a fake list).
         let mut m = std::collections::HashMap::new();
         stub_unavail(&mut m, SPCTL, "not available on this machine");
+        stub_unavail(&mut m, LAUNCHCTL, "the check timed out");
         stub_unavail(&mut m, CRONTAB, "the check timed out");
         stub_unavail(&mut m, KMUTIL, "not available on this machine");
         let run = canned(m);
         assert_eq!(collect_gatekeeper(&run).await, Gatekeeper::Unclear);
-        assert!(collect_crontab(&run).await.is_empty());
-        assert!(collect_kexts(&run).await.is_empty());
+        // Every LIST surface that can't be read must record an honest SKIP naming the
+        // surface — NEVER a fabricated empty inventory (the module contract). A silent
+        // empty here would assert "no cron jobs / no kexts" when the surface was in
+        // fact unreadable.
+        let (lc, lc_skip) = collect_launchctl(&run).await;
+        assert!(lc.is_empty());
+        assert_eq!(lc_skip.expect("unavailable launchctl must SKIP").0, "launchctl");
+        let (cron, cron_skip) = collect_crontab(&run).await;
+        assert!(cron.is_empty());
+        assert_eq!(cron_skip.expect("unavailable crontab must SKIP").0, "crontab");
+        let (kexts, kext_skip) = collect_kexts(&run).await;
+        assert!(kexts.is_empty());
+        assert_eq!(kext_skip.expect("unavailable kmutil must SKIP").0, "kext");
         // A login-items read that can't run SKIPs (records the surface), never
         // silently returns "no login items".
         let (items, skip) = collect_login_items(&run).await;
@@ -1412,7 +1443,8 @@ mod tests {
             "PID\tStatus\tLabel\n1\t0\tcom.apple.foo\n-\t0\tcom.example.agent\n42\t0\tcom.darwin.daemon",
         );
         let run = canned(m);
-        let items = collect_launchctl(&run).await;
+        let (items, skip) = collect_launchctl(&run).await;
+        assert!(skip.is_none(), "a successful read records no skip");
         assert_eq!(items.len(), 2, "com.apple.* filtered: {items:?}");
         assert!(items.iter().any(|i| i.key == "com.example.agent" && !i.is_self));
         assert!(items.iter().any(|i| i.key == "com.darwin.daemon" && i.is_self), "self labeled");

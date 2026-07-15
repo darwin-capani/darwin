@@ -6532,6 +6532,35 @@ pub async fn execute_tool(
         }
     }
 
+    // CUSTOMS EGRESS TRIM (reduce-only). When a boundary trim withholds a category
+    // (facts / history), the recall tools that would read those same categories back
+    // out of the LOCAL store are refused HERE — the single robust enforcement point.
+    // The offered-set can't be filtered for a wildcard-allowlist agent, but every
+    // tool call funnels through execute_tool, so this closes the loophole the review
+    // found: without it, a `no_memory` turn empties the seeded facts yet the model
+    // calls `recall_facts` and re-egresses them. HONEST: the model is told the recall
+    // was WITHHELD BY POLICY, never handed empty data as if the store were empty.
+    {
+        let (customs_on, trim) = boundary::gate_and_trim();
+        if customs_on && trim.withheld_recall_tools().contains(&name) {
+            warn!(tool = name, trim = trim.as_str(), "CUSTOMS: refusing a recall that a trim withholds");
+            crate::telemetry::emit(
+                "system",
+                "egress.refused",
+                json!({"tool": name, "agent": namespace, "reason": "boundary_trim", "trim": trim.as_str()}),
+            );
+            return (
+                format!(
+                    "Withheld by the CUSTOMS egress policy (trim: {}). This recall was not \
+                     performed — its category is excluded from what may leave the device this \
+                     turn. Answer from the live request without it.",
+                    trim.as_str()
+                ),
+                true,
+            );
+        }
+    }
+
     // DYNAMIC MCP TOOLS (mcp__<server>__<tool>) are discovered at runtime, so they
     // are NOT in the static `allowed` allowlist or `dispatch_tool`'s match. They
     // route to the process-global manager, which enforces the SAME safety: the

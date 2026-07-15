@@ -310,6 +310,23 @@ impl TrimSpec {
         self.dropped().contains(&category)
     }
 
+    /// The memory-recall TOOL NAMES this trim must refuse in the cloud tool loop.
+    /// CUSTOMS empties the SEEDED facts/history from the initial prompt, but the loop
+    /// also offers recall tools that read the SAME local store — leaving them usable
+    /// would let the model pull a withheld category BACK into egress mid-loop,
+    /// silently defeating the trim's stated guarantee. Facts withheld => the fact +
+    /// semantic-memory recall tools; History withheld => the episodic recall tool.
+    /// Reduce-only: this only names tools to REFUSE, never one to add. Enforced at
+    /// the single robust chokepoint (`execute_tool`), so it holds even for a
+    /// wildcard-allowlist agent whose offered set can't be filtered by name.
+    pub fn withheld_recall_tools(&self) -> &'static [&'static str] {
+        match self {
+            TrimSpec::None => &[],
+            TrimSpec::NoFacts => &["recall_facts", "mnemosyne_recall"],
+            TrimSpec::NoMemory => &["recall_facts", "mnemosyne_recall", "episodic_recall"],
+        }
+    }
+
     /// Parse a `[boundary].default_trim` / voice-command string into a spec.
     /// Blank / "none" / "off" / an UNRECOGNIZED value => `None` (the identity):
     /// a trim must be EXPLICIT — CUSTOMS never SILENTLY withholds context the
@@ -836,6 +853,27 @@ mod tests {
     // =====================================================================
     // GATE + per-turn override wiring
     // =====================================================================
+
+    #[test]
+    fn a_trim_strips_the_recall_tools_that_could_re_egress_a_withheld_category() {
+        // The identity offers everything.
+        assert!(TrimSpec::None.withheld_recall_tools().is_empty());
+        // Facts withheld => the fact + semantic-memory recall tools are refused, so
+        // the model cannot pull the seeded-then-dropped facts back into egress.
+        let nf = TrimSpec::NoFacts.withheld_recall_tools();
+        assert!(nf.contains(&"recall_facts"));
+        assert!(nf.contains(&"mnemosyne_recall"));
+        assert!(!nf.contains(&"episodic_recall"), "history is still allowed under no_facts");
+        // No-memory withholds facts + history => all three recall tools refused.
+        let nm = TrimSpec::NoMemory.withheld_recall_tools();
+        for t in ["recall_facts", "mnemosyne_recall", "episodic_recall"] {
+            assert!(nm.contains(&t), "{t} must be refused under no_memory");
+        }
+        // The stripped set aligns with the categories the trim drops (no tool leaks a
+        // category the trim claims to keep).
+        assert!(TrimSpec::NoFacts.drops(ContextCategory::Facts));
+        assert!(!TrimSpec::NoFacts.drops(ContextCategory::History));
+    }
 
     #[test]
     fn uninitialized_gate_is_inert() {
