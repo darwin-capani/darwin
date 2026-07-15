@@ -471,11 +471,28 @@ thread_local! {
 }
 
 /// The chokepoint read path: evaluate the installed policy for one action,
-/// folding in the layer master switch. With the layer DISABLED (or the global
-/// never installed) this returns [`Decision::Ask`] for everything — so the
-/// consequential chokepoints behave exactly as today. READ-ONLY; this is the
-/// ONLY policy entry point the model-driven tool loop reaches.
+/// folding in the layer master switch AND the OVERWATCH fleet floor. With the
+/// layer DISABLED (or the global never installed) the LOCAL evaluation returns
+/// [`Decision::Ask`] for everything — so the consequential chokepoints behave
+/// exactly as today — and with [fleet] OFF (the shipped default) the fold is a
+/// no-op. READ-ONLY; this is the ONLY policy entry point the model-driven tool
+/// loop reaches.
+///
+/// FLEET FLOOR (OVERWATCH, fleet.rs): the local decision is folded with the
+/// active signed fleet baseline via [`crate::fleet::harden_global`], a FLOOR OF
+/// STRICTNESS that can ONLY HARDEN — force a named tool stricter (Never /
+/// always-Ask) — and can NEVER loosen a device below its LOCAL decision nor grant
+/// what the master switch forbids (the baseline can't even express `Always`). OFF
+/// or no baseline => `harden_global` returns the local decision verbatim, so this
+/// stays byte-for-byte today.
 pub fn evaluate_global(tool: &str, agent: &str, target: &str) -> Decision {
+    crate::fleet::harden_global(evaluate_local_global(tool, agent, target), tool)
+}
+
+/// The device-LOCAL half of [`evaluate_global`]: the installed user policy store
+/// folded with the layer master switch, BEFORE the fleet floor. Split out so the
+/// fleet fold in `evaluate_global` is a single, obvious seam over the local result.
+fn evaluate_local_global(tool: &str, agent: &str, target: &str) -> Decision {
     #[cfg(test)]
     {
         if let Some(d) = POLICY_OVERRIDE.with(|c| {

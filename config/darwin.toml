@@ -785,6 +785,23 @@ encrypt_memory = false         # SHIPS OFF (enabling changes the on-disk format 
 [enclave]
 enabled = true                 # ARMED by default; inert (honest Keychain fallback) without a Secure Enclave + SE entitlement.
 
+# [fleet] — OVERWATCH: server-less, E2E-encrypted fleet POLICY across your OWN Macs (fleet.rs).
+# A SIGNED, owner-authored policy BASELINE authored on one Mac is enforced on every device as a
+# FLOOR OF STRICTNESS folded into policy::evaluate_global. It can force a tool STRICTER (Never, or
+# always-Ask / a feature ceiling), and it can ONLY harden:
+#   - it can NEVER loosen a device below its own decision (a stricter LOCAL rule still wins),
+#   - it can NEVER grant what a device's master switch forbids (a fleet rule can't even express
+#     "always" — the type forbids it; the [integrations] master switch is a separate downstream AND),
+#   - a tool the baseline doesn't name is untouched.
+# It rides the SAME sealed-bundle + shared-Keychain-key path as [sync] (account sync_shared_key,
+# paired only between your own devices) — the AES-256-GCM seal IS the signature, so a baseline that
+# opens was authored by you on one of your Macs. NO-MODEL-WRITE: the daemon only OPENS + INSTALLS a
+# pre-sealed baseline (state/fleet/baseline.sealed); it never authors one from a model.
+# SHIPS OFF (like [sync]/[distill]): with it off nothing is loaded, the floor is empty, and
+# policy::evaluate_global is byte-for-byte today. INERT without the shared key + a sealed baseline.
+[fleet]
+enabled = false                # SHIPS OFF. true = load + enforce the owner-authored signed baseline as a floor of strictness (hardens only; never loosens, never grants). Set true after you've sealed a baseline onto this device.
+
 [voice.voices]
 # Per-agent ElevenLabs voice ids: agent name -> EL voice id. An UNMAPPED agent
 # falls back to that agent's on-device Kokoro voice. DARWIN ships mapped to the

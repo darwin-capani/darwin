@@ -6507,6 +6507,86 @@ export function parseSyncStatus(data: Record<string, unknown>): SyncStatus {
 }
 
 /* ------------------------------------------------------------------------ *
+ * OVERWATCH FLEET POLICY (fleet.status) — the honest state of the E2E-        *
+ * encrypted, signed policy BASELINE the owner authored on one Mac and that    *
+ * every device enforces as a FLOOR OF STRICTNESS (daemon fleet.rs, audit-     *
+ * snapshot cadence). SHIPS OFF (with [sync]). The floor can ONLY HARDEN — a   *
+ * ceiling forces a tool stricter (Never / always-Ask), never looser — so      *
+ * `hardensOnly` is pinned true (a payload can't claim it grants). Each rule   *
+ * carries only a tool id + a hardening (never/ask), NEVER a fact value or the *
+ * shared key. The rules list is bounded defensively (the wire is never        *
+ * trusted).                                                                    *
+ * ------------------------------------------------------------------------ */
+
+/** A fleet baseline ceiling as surfaced to the HUD: a tool id + the hardening it
+ *  is forced to. `decision` is only ever "never" | "ask" — a fleet rule cannot
+ *  express "always" (the daemon type forbids it), so a junk token coerces to the
+ *  strictest "never" for an honest (never looser) display. */
+export type FleetHardening = "never" | "ask";
+
+/** Coerce an untrusted hardening token, defaulting a junk value to the strictest
+ *  "never" — a garbled ceiling must never DISPLAY as looser than it is. */
+export function coerceFleetHardening(v: unknown): FleetHardening {
+  return v === "never" || v === "ask" ? v : "never";
+}
+
+/** One per-tool fleet ceiling. */
+export interface FleetRule {
+  tool: string;
+  decision: FleetHardening;
+}
+
+/** The whole OVERWATCH fleet-policy surface (fleet.status). `enabled` is the
+ *  [fleet] on/off posture; `baselineActive` is whether a signed baseline is
+ *  installed; `authoredBy` is the device id that SET it (a device name, not a
+ *  secret); `created` is when; `rules` is the per-tool ceilings in the daemon's
+ *  order. `hardensOnly` is pinned true (the floor can never grant). SHIPPED-OFF
+ *  default: enabled=false, baselineActive=false, rules=[]. */
+export interface FleetStatus {
+  enabled: boolean;
+  baselineActive: boolean;
+  authoredBy: string;
+  created: string;
+  ruleCount: number;
+  rules: FleetRule[];
+  hardensOnly: boolean;
+}
+
+/** Coerce one untrusted fleet rule, or null if it lacks a usable tool id (a rule
+ *  is always anchored to a specific tool). A junk hardening reads as the strictest
+ *  "never" (never a looser display). Never throws. */
+function coerceFleetRule(o: Record<string, unknown>): FleetRule | null {
+  const tool = str(o, "tool");
+  if (tool === null || tool.length === 0) return null;
+  return { tool, decision: coerceFleetHardening(o["decision"]) };
+}
+
+/** Parse a `fleet.status` payload. NEVER returns null / never throws; a malformed
+ *  frame degrades to the honest off state. `hardensOnly` is PINNED true — a
+ *  payload can never claim the floor grants an action. `baselineActive` reads a
+ *  literal true only (a garbled frame is never "active"). Rules are coerced
+ *  item-by-item (junk dropped) and bounded defensively. */
+export function parseFleetStatus(data: Record<string, unknown>): FleetStatus {
+  const rawRules = data["rules"];
+  const rules = Array.isArray(rawRules)
+    ? rawRules
+        .filter(isPlainObject)
+        .map(coerceFleetRule)
+        .filter((r): r is FleetRule => r !== null)
+        .slice(0, 256)
+    : [];
+  return {
+    enabled: bool(data, "enabled") === true,
+    baselineActive: bool(data, "baseline_active") === true,
+    authoredBy: str(data, "authored_by") ?? "",
+    created: str(data, "created") ?? "",
+    ruleCount: nonNegInt(data, "rule_count"),
+    rules,
+    hardensOnly: true,
+  };
+}
+
+/* ------------------------------------------------------------------------ *
  * ACOUSTIC SCENE (scene.status) — the honest state of the ambient sound-      *
  * event sensor (daemon scene.rs, audit-snapshot cadence, F6). SHIPS OFF;      *
  * inert without a bundled classifier model (`listening` reads a literal true  *

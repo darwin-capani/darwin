@@ -105,6 +105,7 @@ mod es;
 mod eval;
 mod explain;
 mod exposure;
+mod fleet;
 mod focus;
 mod forecast;
 mod forge;
@@ -1034,6 +1035,13 @@ async fn audit_snapshot_task(cfg: Arc<Config>, memory: Arc<Memory>, root: PathBu
         // READ-ONLY — counts + probes, runs no sync; OFF (the shipped default)
         // never touches the Keychain.
         sync::emit_status(&live, &memory, &root).await;
+        // The HUD's FleetPanel (FLEET // POLICY) shows OVERWATCH's honest state
+        // (fleet.rs): off/armed-awaiting-baseline/active, WHICH device authored the
+        // active baseline, and the per-tool ceilings (Never/Ask). READ-ONLY — it
+        // reports the baseline installed once at startup, so it never touches the
+        // Keychain or a file on the tick; OFF (the shipped default) emits the honest
+        // off payload. The floor can ONLY HARDEN — it never grants an action.
+        fleet::emit_status(&live, &root).await;
         // The HUD's ScenePanel shows the acoustic-scene sensor's honest state
         // (scene.rs, F6): off/armed-needs-model/listening, the sound-event
         // vocabulary, and that audio is NEVER retained. READ-ONLY — probes for a
@@ -2022,6 +2030,16 @@ async fn main() -> Result<()> {
     // chokepoints only ever READ this global.
     let policy_store = policy::PolicyStore::load(&root.join("state").join("policy.json"));
     policy::install(cfg.policy.enabled, policy_store);
+    // OVERWATCH FLEET POLICY ([fleet], ships OFF — fleet.rs). Load the owner-authored
+    // SIGNED baseline (state/fleet/baseline.sealed, sealed under the shared sync key)
+    // and install it as the process-global FLOOR OF STRICTNESS that
+    // `policy::evaluate_global` folds over the local decision. NO-MODEL-WRITE: this
+    // only OPENS + INSTALLS a pre-sealed, owner-authored bundle — the daemon never
+    // authors a baseline. Fail-safe: OFF is a no-op (no Keychain touch, no disk read),
+    // and an absent/unpaired/unopenable bundle installs NOTHING (the floor stays
+    // empty, so evaluate_global is byte-for-byte today). The baseline can ONLY HARDEN.
+    let fleet_active = fleet::load_and_install(&cfg, &root).await;
+    info!(fleet_baseline_active = fleet_active, "fleet: OVERWATCH policy baseline load complete");
     // CONSEQUENTIAL AUDIT LOG ([audit], ships ON — read-only accountability): open
     // the append-only, hash-chained, tamper-EVIDENT log in its OWN SQLite file
     // (state/audit.db) and install the process-global the chokepoints record to via
