@@ -6247,6 +6247,97 @@ export function parsePasteboardStatus(data: Record<string, unknown>): Pasteboard
 }
 
 /* ------------------------------------------------------------------------ *
+ * APERTURE (daemon aperture.rs -> `aperture / aperture.status`).              *
+ *                                                                            *
+ * A private, owner-gated, ON-DEVICE activity timeline. An OPT-IN (ships OFF)  *
+ * poller records WHICH app was frontmost + its window TITLE (PII-REDACTED at  *
+ * the source) + duration in a bounded, transient in-RAM ring. The status      *
+ * frame carries the enabled gate, the activity COUNT + cap + poll cadence,    *
+ * and up to a few recent activities (app + an ALREADY-redacted, truncated     *
+ * title + a duration in seconds) for the panel — NEVER screen pixels, never   *
+ * raw title text. When off, the count is 0 and there are no activities.        *
+ * ------------------------------------------------------------------------ */
+
+export const APERTURE_TOPIC_STATUS = "aperture.status";
+
+/** Cap on recent activities the panel retains/renders (defensive against a
+ *  hostile/oversized frame). */
+export const APERTURE_PREVIEW_CAP = 8;
+
+/** One recent activity in the timeline: the frontmost app, its ALREADY-redacted
+ *  window title (may be empty), and how long it stayed frontmost (seconds). */
+export interface ApertureActivity {
+  app: string;
+  title: string;
+  durationSecs: number;
+}
+
+/** The activity-timeline status. `recent` holds ALREADY-redacted, truncated
+ *  titles (never raw window text). Any unknown/garbled field coerces
+ *  conservatively (off, zero counts, no activities) — the panel never invents a
+ *  recorded state, and a disabled timeline shows nothing recorded. */
+export interface ApertureStatus {
+  enabled: boolean;
+  count: number;
+  cap: number;
+  pollIntervalSecs: number;
+  /** Recent activities (empty when off). */
+  recent: ApertureActivity[];
+}
+
+/** Coerce one `recent` row into an [`ApertureActivity`], or null when it is not a
+ *  usable row (no app name). The title defaults to "" (an app with no window title
+ *  is still a valid activity); the duration coerces to a non-negative integer. */
+function coerceApertureActivity(o: Record<string, unknown>): ApertureActivity | null {
+  const app = str(o, "app");
+  if (app === null || app.trim().length === 0) return null;
+  const title = str(o, "title") ?? "";
+  const rawDur = num(o, "duration_secs");
+  const durationSecs = rawDur === null || rawDur < 0 ? 0 : Math.floor(rawDur);
+  return { app, title, durationSecs };
+}
+
+/** Parse an `aperture.status` payload. NEVER returns null / never throws; an
+ *  absent or garbled payload yields the honest OFF, empty snapshot. When off,
+ *  activities are dropped (a disabled timeline shows nothing recorded), so the
+ *  panel can never render activity for a timeline that is not running. */
+export function parseApertureStatus(data: Record<string, unknown>): ApertureStatus {
+  const enabled = bool(data, "enabled") === true;
+  const count = num(data, "count");
+  const cap = num(data, "cap");
+  const poll = num(data, "poll_interval_secs");
+  const rawRecent = data["recent"];
+  // Off => never surface activities, even if a frame carried some.
+  const recent = enabled && Array.isArray(rawRecent)
+    ? rawRecent
+        .filter(isPlainObject)
+        .map(coerceApertureActivity)
+        .filter((a): a is ApertureActivity => a !== null)
+        .slice(0, APERTURE_PREVIEW_CAP)
+    : [];
+  const nonNeg = (v: number | null): number => (v === null || v < 0 ? 0 : Math.floor(v));
+  return {
+    enabled,
+    count: nonNeg(count),
+    cap: nonNeg(cap),
+    pollIntervalSecs: nonNeg(poll),
+    recent,
+  };
+}
+
+/** Bucket a duration in seconds into a compact, human label — the HUD twin of the
+ *  daemon's `aperture::format_duration` so a span reads the same on both sides.
+ *  `< 60s` -> "under a minute"; `< 1h` -> "Nm"; else "Hh" / "Hh Mm". */
+export function formatApertureDuration(secs: number): string {
+  const s = Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0;
+  if (s < 60) return "under a minute";
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  const hours = Math.floor(s / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  return mins === 0 ? `${hours}h` : `${hours}h ${mins}m`;
+}
+
+/* ------------------------------------------------------------------------ *
  * CAPABILITY MAP — the live honest "armed by default, gated per action"       *
  * readout (daemon capability.rs -> `system / capability.map`, audit-snapshot  *
  * cadence). One row per notable subsystem: ready / armed-but-needs-a-          *

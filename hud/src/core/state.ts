@@ -50,6 +50,7 @@ import {
   IntrospectStatus,
   IntrospectCapability,
   PasteboardStatus,
+  ApertureStatus,
   PostureSnapshot,
   AttributionHealth,
   McpStatus,
@@ -169,6 +170,7 @@ import {
   TCC_ANOMALY_CAP,
   parseIntrospectSnapshot,
   parsePasteboardStatus,
+  parseApertureStatus,
   introspectDriftLine,
   introspectAnomalyLine,
   introspectModuleViolationLine,
@@ -708,6 +710,11 @@ export interface HudState {
    *  clip count + cap + poll cadence, and up to a few ALREADY-redacted, truncated
    *  clip previews. Null until the first status frame. SHIPS OFF (opt-in). */
   pasteboard: PasteboardStatus | null;
+  /** The activity-timeline status (aperture.status): the enabled gate, the activity
+   *  count + cap + poll cadence, and up to a few recent activities (app + an
+   *  ALREADY-redacted, truncated window title + a duration). Null until the first
+   *  status frame. SHIPS OFF (opt-in); records app + title + time, NEVER pixels. */
+  aperture: ApertureStatus | null;
   /** The machine security posture (posture.snapshot, 30-min cadence): FileVault /
    *  firewall / SIP / pending-updates verdicts from the read-only status
    *  commands. Null until the first frame. REVIEW-ONLY — the daemon reports;
@@ -1419,6 +1426,7 @@ export function initialState(): HudState {
     introspectAlerts: [],
     introspectCapabilities: [],
     pasteboard: null,
+    aperture: null,
     posture: null,
     attributionHealth: null,
     security: null,
@@ -2489,6 +2497,16 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // are dropped so the panel never renders text for a pasteboard that is not
       // running. SHIPS OFF (opt-in) and REDACTED at the source.
       return { ...s, pasteboard: parsePasteboardStatus(env.data) };
+    }
+
+    case "aperture.status": {
+      // Aperture (aperture.rs): the on-device activity timeline. enabled gate +
+      // activity count/cap/cadence + up to a few ALREADY-redacted, truncated
+      // activities (app + window title + duration). Never null — a malformed payload
+      // yields an honest OFF/empty snapshot; when off, activities are dropped so the
+      // panel never renders a timeline that is not running. SHIPS OFF (opt-in);
+      // records app + title + time only, NEVER screen pixels.
+      return { ...s, aperture: parseApertureStatus(env.data) };
     }
 
     case "introspect.profile_drift": {

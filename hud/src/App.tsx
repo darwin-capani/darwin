@@ -43,6 +43,7 @@ import { isAtRest } from "./core/ambient";
 import TccSentinelPanel from "./components/TccSentinelPanel";
 import IntrospectPanel from "./components/IntrospectPanel";
 import PasteboardPanel from "./components/PasteboardPanel";
+import AperturePanel from "./components/AperturePanel";
 import PostureDashboardPanel from "./components/PostureDashboardPanel";
 import AttributionHealthPanel from "./components/AttributionHealthPanel";
 import AppDeckPanel from "./components/AppDeckPanel";
@@ -668,6 +669,7 @@ export default function App() {
             capabilities={state.introspectCapabilities}
           />
           <PasteboardPanel pasteboard={state.pasteboard} />
+          <AperturePanel aperture={state.aperture} />
           <PostureDashboardPanel posture={state.posture} />
           <ConnectorMarketplacePanel mcp={state.mcp} />
           <ExtensibilityPanel webhooks={state.webhooks} plugins={state.plugins} />
