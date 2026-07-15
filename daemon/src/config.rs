@@ -171,6 +171,18 @@ pub struct Config {
     /// changes no gate, takes no action, reaches no network — safe to enable
     /// outright.
     pub chart: ChartConfig,
+    /// [boundary] — CUSTOMS // EGRESS, a PRE-FLIGHT egress boundary gate
+    /// (boundary.rs). `enabled` SHIPS ON (full-power default) as a NEUTRAL
+    /// PREVIEW: before a CLOUD turn goes out, CUSTOMS builds a READ-ONLY manifest
+    /// of exactly the personal context about to be sent (facts / history / world
+    /// rows / persona / system prompt), classifies each by sensitivity, and emits
+    /// it as a `boundary.manifest` frame. `default_trim` SHIPS "none" (the
+    /// IDENTITY — send everything, today's behavior byte-for-byte). A trim is
+    /// REDUCE-ONLY (it can only WITHHOLD whole categories, never add one) and the
+    /// LOCAL inference path never reaches CUSTOMS (it egresses nothing), so
+    /// enabling only adds an honest inventory + an opt-in trim — never a new
+    /// egress.
+    pub boundary: BoundaryConfig,
 }
 
 /// Every section and key the config knows, for unknown-key diagnostics
@@ -648,6 +660,12 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // point, honest axes/empty); it changes no gate, takes no action, reaches no
     // network — safe to enable outright. Listed so the key never reads as a typo.
     ("chart", &["enabled"]),
+    // [boundary] — CUSTOMS // EGRESS (boundary.rs). `enabled` SHIPS ON (a neutral
+    // READ-ONLY preview of the cloud egress manifest); `default_trim` SHIPS "none"
+    // (the identity — send everything, today's behavior). A trim is REDUCE-ONLY
+    // ("none" | "no_facts" | "no_memory"); an unknown value degrades to "none".
+    // Listed so neither key reads as a typo.
+    ("boundary", &["enabled", "default_trim"]),
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1383,6 +1401,57 @@ impl Default for ChartConfig {
         // interpolation/invented point, honest-empty). Changes no gate, takes no
         // action, reaches no network — safe to enable outright.
         Self { enabled: true }
+    }
+}
+
+/// [boundary] — CUSTOMS // EGRESS, the pre-flight egress boundary gate
+/// (boundary.rs). CUSTOMS INSPECTS + (reduce-only) TRIMS the personal context a
+/// CLOUD turn is about to send — it never mutates state, never sends anything, and
+/// never touches the LOCAL inference path (which egresses nothing off the box, so
+/// there is nothing for CUSTOMS to gate there).
+///
+/// `enabled` SHIPS ON (full-power default) as a NEUTRAL PREVIEW: with it on the
+/// cloud path builds a READ-ONLY [`crate::boundary::EgressManifest`] of exactly
+/// what egresses (facts / history / world rows / persona / system prompt, each
+/// classified by sensitivity with a count + byte-size) and emits it as a
+/// `boundary.manifest` frame BEFORE the request leaves. With it off the manifest
+/// path is skipped and the cloud turn is byte-for-byte today's.
+///
+/// `default_trim` SHIPS "none" — the IDENTITY: send everything, today's behavior
+/// byte-for-byte. A trim is REDUCE-ONLY (`crate::boundary::TrimSpec`): it can only
+/// WITHHOLD whole categories from egress, never add one. Recognized values:
+///
+///   * "none"      — withhold nothing (the shipped identity);
+///   * "no_facts"  — withhold the remembered FACTS ("don't send my facts");
+///   * "no_memory" — withhold FACTS and conversation HISTORY.
+///
+/// An unknown value degrades to "none" (a trim must be EXPLICIT — CUSTOMS never
+/// silently withholds context the operator did not clearly ask to drop). A
+/// per-turn voice command can override this for a single turn without changing the
+/// default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct BoundaryConfig {
+    /// Master gate for the CUSTOMS pre-flight manifest. SHIPS ON (full-power
+    /// default) as a neutral READ-ONLY preview of cloud egress. Off => the cloud
+    /// turn is byte-for-byte today's (no manifest computed/emitted).
+    pub enabled: bool,
+    /// The default REDUCE-ONLY trim applied to every cloud turn. SHIPS "none" (the
+    /// identity — send everything). "no_facts" withholds the remembered facts;
+    /// "no_memory" withholds facts + history; an unknown value degrades to "none".
+    /// Parsed by `crate::boundary::TrimSpec::from_str`.
+    pub default_trim: String,
+}
+
+impl Default for BoundaryConfig {
+    /// Ships NEUTRAL: the preview is ON (read-only inventory of cloud egress) and
+    /// the trim is "none" (the identity — the turn sends exactly what it sends
+    /// today). CUSTOMS observes + reports until the operator opts into a trim.
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            default_trim: "none".to_string(),
+        }
     }
 }
 
@@ -3041,6 +3110,7 @@ impl Config {
             power: section(&table, "power", &mut issues),
             report: section(&table, "report", &mut issues),
             chart: section(&table, "chart", &mut issues),
+            boundary: section(&table, "boundary", &mut issues),
         };
 
         // SELECTABLE QUANTIZATION (#39) value validation: an unknown [inference]
