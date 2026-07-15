@@ -737,6 +737,22 @@ enabled = true                 # layer master switch, SHIPS ON but INERT (store 
 [security]
 encrypt_memory = false         # SHIPS OFF (enabling changes the on-disk format + migrates). true = encrypt the sensitive stores at rest.
 
+# [enclave] — ENCLAVE CUSTODY (enclave.rs): ADDITIVE, hardware-bound custody of the at-rest
+# DB master key OVER the existing macOS Keychain path. WHERE an Apple Secure Enclave + the SE
+# entitlement (a code-signed host) are present, the master key is wrapped by a NON-EXPORTABLE,
+# hardware-bound Secure-Enclave key (kSecAttrTokenIDSecureEnclave) — the wrapping key never
+# leaves the chip and cannot be exfiltrated even by root. Where absent (the shipped, unentitled
+# posture), custody FALLS BACK to the unchanged OS-protected Keychain path.
+#   - enabled = true (the default): ARMED, but INERT until the SE hardware + entitlement are
+#     present — reported honestly (a self-check SKIP + an enclave.status frame with active=false),
+#     NEVER a fabricated "enclave-protected" claim.
+#   - enabled = false: custody is exactly today's Keychain path.
+# HONESTY: this is custody-hardening ONLY. It never changes which key at-rest encryption resolves
+# ([security].encrypt_memory), and it never touches per-agent credential isolation. With
+# encryption OFF there is no master key to bind, so enclave is a no-op regardless of this switch.
+[enclave]
+enabled = true                 # ARMED by default; inert (honest Keychain fallback) without a Secure Enclave + SE entitlement.
+
 [voice.voices]
 # Per-agent ElevenLabs voice ids: agent name -> EL voice id. An UNMAPPED agent
 # falls back to that agent's on-device Kokoro voice. DARWIN ships mapped to the
