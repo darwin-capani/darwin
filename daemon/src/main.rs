@@ -78,6 +78,13 @@ mod egress;
 // "block" is PROPOSE-ONLY: a pf rule rendered as TEXT the user applies with
 // sudo — the module never mutates the firewall. ON by default ([egress].enabled).
 mod egress_beacon;
+// ENCLAVE CUSTODY (enclave.rs): ADDITIVE, hardware-bound custody of the at-rest DB
+// master key. WHERE a Secure Enclave + the SE entitlement are present, the master
+// key is wrapped by a non-exportable SE-bound key OVER the existing Keychain path;
+// otherwise (the shipped, unentitled posture) custody honestly falls back to the
+// unchanged OS-protected Keychain — never a fabricated enclave claim. ARMED by
+// default ([enclave].enabled), inert without its hardware/entitlement dependency.
+mod enclave;
 mod episodic;
 // LIVE ENDPOINT SECURITY NOTIFY client (feature `endpoint-security`, DEVICE-GATED).
 // OFF by default — the normal build never compiles it. When on, it feeds kernel
@@ -1870,6 +1877,28 @@ async fn main() -> Result<()> {
 
     let master_key = resolve_encryption_key(cfg.security.encrypt_memory, &state_dir).await;
 
+    // ENCLAVE CUSTODY (enclave.rs, ADDITIVE over the Keychain path). Purely a
+    // custody-hardening decision made AFTER the master key is resolved/installed —
+    // it never changes which key was resolved nor its Keychain custody. WHERE a
+    // Secure Enclave + the SE entitlement are present, the resolved master key is
+    // wrapped by a non-exportable, hardware-bound SE key; otherwise (the shipped
+    // unentitled posture) this is an HONEST no-op that reports the Keychain
+    // fallback. The result only feeds the `enclave.status` telemetry frame below —
+    // it does not gate or alter any store open. Per-agent credential isolation (the
+    // integrations allowlist) is untouched: enclave concerns only the master key.
+    let enclave_custody = enclave::resolve_custody(cfg.enclave.enabled, master_key.as_ref());
+    {
+        // Honest PASS/SKIP custody line in the startup log (never the key). PASS =
+        // the master key is SE-wrapped; SKIP = the inert Keychain fallback with its
+        // reason. Informational only — NOT a structural startup gate.
+        let check = enclave::selfcheck(&enclave_custody);
+        info!(
+            status = check.status.label(),
+            detail = %check.detail,
+            "enclave: master-key custody self-check"
+        );
+    }
+
     let memory = Arc::new(open_memory(&state_dir.join("darwin.db"), master_key.as_ref())?);
 
     // CONSEQUENTIAL POLICY STORE ([policy], ships EMPTY): load the USER's per-action
@@ -2053,6 +2082,12 @@ async fn main() -> Result<()> {
             "cipher": "SQLCipher AES-256 (transparent, whole-file, page-level)"
         }),
     );
+    // ENCLAVE CUSTODY status (enclave.rs; secret-free — NEVER the key). Drives the
+    // HUD's "hardware-bound custody" indicator with the GROUND-TRUTH `active` (the
+    // SE wrap actually engaged this run), the honest availability reason when inert,
+    // and the public SE key label — never any key material. On the shipped
+    // unentitled build this reads "keychain-fallback / inert" honestly.
+    telemetry::emit("system", "enclave.status", enclave::status_frame(&enclave_custody));
     // SKILLS MARKETPLACE status (secret-free): the hand-written in-tree skill
     // catalog the HUD Skills panel browses — every skill's name, category,
     // one-line "when to use", and the consequential / source-gated markers, plus

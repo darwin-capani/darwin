@@ -180,6 +180,16 @@ pub struct Config {
     pub triage: TriageConfig,
     pub policy: PolicyConfig,
     pub security: SecurityConfig,
+    /// [enclave] — ENCLAVE CUSTODY (enclave.rs): ADDITIVE, hardware-bound custody of
+    /// the at-rest DB master key. `enabled` SHIPS ON (armed by default) — but INERT
+    /// WITHOUT its dependency: minting a non-exportable Secure-Enclave-bound key
+    /// needs an Apple Secure Enclave AND the SE entitlement on a code-signed host.
+    /// Where present, the master key is wrapped by an SE key OVER the existing
+    /// Keychain custody; otherwise custody honestly falls back to the unchanged
+    /// OS-protected Keychain path (reported as a self-check SKIP, never a fabricated
+    /// "enclave-protected"). It never changes the resolved key or per-agent
+    /// credential isolation — custody-hardening only.
+    pub enclave: EnclaveConfig,
     /// [distill] — SELF-DISTILLATION (F17, distill.rs): an on-device LoRA
     /// pipeline that learns a personal adapter from the user's OWN graded
     /// interactions. SHIPS OFF (like [security]) because training MUTATES
@@ -757,6 +767,13 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // covered; lose the Keychain item => the DBs are unrecoverable. Listed here so
     // the key never reads as a typo.
     ("security", &["encrypt_memory"]),
+    // [enclave] — ENCLAVE CUSTODY (enclave.rs). `enabled` SHIPS ON (armed by
+    // default) but is INERT WITHOUT the Secure Enclave + SE entitlement: it wraps
+    // the at-rest master key with a non-exportable hardware-bound SE key WHERE
+    // present, else custody honestly falls back to the unchanged OS-protected
+    // Keychain path (a self-check SKIP, never a fabricated enclave claim). Listed
+    // here so the key never reads as a typo.
+    ("enclave", &["enabled"]),
     ("distill", &["enabled", "python", "base_model", "iters"]),
     ("sync", &["enabled", "peer_endpoint"]),
     ("scene", &["enabled", "confidence_floor"]),
@@ -3024,6 +3041,40 @@ pub struct SecurityConfig {
     pub encrypt_memory: bool,
 }
 
+/// [enclave] — ENCLAVE CUSTODY (enclave.rs): ADDITIVE, hardware-bound custody of
+/// the at-rest DB master key OVER the existing macOS Keychain path (crypto.rs).
+///
+///   - `enabled` (SHIPS ON, armed by default): the master switch. When ON AND a
+///     Secure Enclave + the SE entitlement are genuinely reachable, the at-rest
+///     master key is wrapped by a non-exportable, hardware-bound Secure-Enclave key
+///     (`kSecAttrTokenIDSecureEnclave`) — the wrapping key never leaves the chip and
+///     cannot be exfiltrated even by root. When OFF, or when the SE is not reachable
+///     (the shipped unentitled posture), custody FALLS BACK to the unchanged
+///     OS-protected Keychain path.
+///
+/// ARMED-BUT-INERT (be honest): this ships ON but does nothing until its hardware +
+/// entitlement dependency is present — reported as a self-check SKIP + an
+/// `enclave.status` frame with `active=false`, NEVER a fabricated "enclave-protected"
+/// claim. It is custody-hardening ONLY: it never changes which `SecretKey` startup
+/// resolves/installs, and never touches per-agent credential isolation (the
+/// integrations allowlist).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct EnclaveConfig {
+    /// Master switch for Secure-Enclave-bound custody. SHIPS ON (armed) but inert
+    /// without the SE hardware + entitlement; with it false custody is exactly
+    /// today's Keychain path.
+    pub enabled: bool,
+}
+
+impl Default for EnclaveConfig {
+    fn default() -> Self {
+        // Armed by default; inert (honest Keychain fallback) without the Secure
+        // Enclave + entitlement dependency.
+        Self { enabled: true }
+    }
+}
+
 
 /// [distill] — self-distillation (F17). SHIPS OFF: training produces weights (an
 /// adapter), a consequential + device-heavy op, so it is a deliberate operator
@@ -3662,6 +3713,7 @@ impl Config {
             triage: section(&table, "triage", &mut issues),
             policy: section(&table, "policy", &mut issues),
             security: section(&table, "security", &mut issues),
+            enclave: section(&table, "enclave", &mut issues),
             distill: section(&table, "distill", &mut issues),
             sync: section(&table, "sync", &mut issues),
             scene: section(&table, "scene", &mut issues),
