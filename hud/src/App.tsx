@@ -26,6 +26,7 @@ import KnowledgeGraphPanel from "./components/KnowledgeGraphPanel";
 import LatencyStrip from "./components/LatencyStrip";
 import LifeLogPanel from "./components/LifeLogPanel";
 import SessionRewindPanel from "./components/SessionRewindPanel";
+import CausaTracePanel from "./components/CausaTracePanel";
 import MarkForgePanel, { MARK_FORGE_APP_NAME } from "./components/MarkForgePanel";
 import McpPanel from "./components/McpPanel";
 import CapabilityAtlasPanel from "./components/CapabilityAtlasPanel";
@@ -672,6 +673,7 @@ export default function App() {
           <ChartPanel spec={state.chart} />
           <LifeLogPanel digest={state.lifelog} />
           <SessionRewindPanel rewind={state.sessionRewind} />
+          <CausaTracePanel trace={state.causaTrace} />
           <MemoryPanel memory={state.memory} />
           <EvalPanel report={state.evalReport} proposal={state.optimizerProposal} />
           <SkillsPanel skills={state.skills} />

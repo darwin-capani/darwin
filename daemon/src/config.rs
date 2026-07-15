@@ -81,6 +81,13 @@ pub struct Config {
     pub mcp: McpConfig,
     pub skills: SkillsConfig,
     pub optimize: OptimizeConfig,
+    /// [explain] — CAUSA, the causal decision-trace explainer (explain.rs).
+    /// `enabled` SHIPS ON (full-power default): the turn loop records a small,
+    /// bounded, REDACTED ring of recent decision traces and "why did you do that" /
+    /// "why <Agent>" narrates one in persona + emits the secret-free `causa.trace`
+    /// telemetry. READ-ONLY — it explains past turns, never changes routing, and
+    /// never fabricates a rationale (an unrecorded turn returns an honest empty).
+    pub explain: ExplainConfig,
     /// [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
     /// `enabled` SHIPS ON (full-power default): it is READ-ONLY aggregate analytics
     /// (a reliability curve + ECE gap over the recent confidence/outcome window),
@@ -392,6 +399,12 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // phase ALWAYS proposes (mode KEEPS "propose") — there is no auto-apply-to-live
     // path, exactly like self-heal's mode.
     ("optimize", &["enabled", "mode"]),
+    // [explain] — CAUSA, the causal decision-trace explainer (explain.rs). `enabled`
+    // SHIPS ON (read-only observability: a redacted, bounded ring of recent decision
+    // traces, narrated by "why did you do that" + emitted as secret-free
+    // `causa.trace`). `ring_size` bounds the ring (clamped to a sane band; an
+    // out-of-range value never disables recording). Listed so neither reads as a typo.
+    ("explain", &["enabled", "ring_size"]),
     // [calibrate] — PLUMBLINE, the confidence-calibration self-report (calibrate.rs).
     // `enabled` SHIPS ON (read-only aggregate analytics: a reliability curve + ECE
     // gap over the recent confidence/outcome window, emitted as secret-free
@@ -1693,6 +1706,41 @@ impl Default for OptimizeConfig {
             // review+apply, adopted only if it beats baseline on held-out traces.
             // There is no auto-apply-to-live path; NEVER ship "auto" as the default.
             mode: "propose".to_string(),
+        }
+    }
+}
+
+/// [explain] — CAUSA, the causal decision-trace explainer (explain.rs). A
+/// READ-ONLY, ARMED-BY-DEFAULT surface: the turn loop folds each turn's already-
+/// computed branch signals (intent / selector mode / agent / local-vs-cloud route
+/// / owner gate / capability / outcome) into an ordered, REDACTED [`DecisionTrace`]
+/// held in a small bounded ring (last `ring_size` turns). "why did you do that" /
+/// "why <Agent>" narrates the trace in persona and emits the secret-free
+/// `causa.trace` telemetry — it NEVER fabricates a rationale and returns an honest
+/// empty when a turn wasn't recorded. It changes nothing about routing; it only
+/// explains what already happened.
+///
+///   - `enabled` (SHIPS ON, full-power default): master gate for the record pass +
+///     the explain op. Off => no trace is recorded and "why did you do that" falls
+///     through to the model. Analytics/observability only — no autonomy.
+///   - `ring_size`: how many recent turns the ring retains (clamped to
+///     [`crate::explain::RING_CAP_MIN`]..=[`crate::explain::RING_CAP_MAX`]); an
+///     out-of-band value never disables recording nor grows unbounded.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ExplainConfig {
+    pub enabled: bool,
+    pub ring_size: usize,
+}
+
+impl Default for ExplainConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS ON (read-only observability). The trace is redacted at assembly
+            // and bounded; the explainer only ever DESCRIBES a past turn — no
+            // autonomy, no routing change.
+            enabled: true,
+            ring_size: crate::explain::RING_CAP_DEFAULT,
         }
     }
 }
@@ -3411,6 +3459,7 @@ impl Config {
             mcp: section(&table, "mcp", &mut issues),
             skills: section(&table, "skills", &mut issues),
             optimize: section(&table, "optimize", &mut issues),
+            explain: section(&table, "explain", &mut issues),
             calibrate: section(&table, "calibrate", &mut issues),
             voice_id: section(&table, "voice_id", &mut issues),
             episodic: section(&table, "episodic", &mut issues),

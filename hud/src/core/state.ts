@@ -36,6 +36,7 @@ import {
   KnowledgeGraphResult,
   LifeLogDigest,
   SessionRewind,
+  CausaTrace,
   LiveGateEvent,
   ConsensusAdvisory,
   LocalToolsStatus,
@@ -149,6 +150,7 @@ import {
   parseKnowledgeGraphResult,
   parseLifeLogDigest,
   parseSessionRewind,
+  parseCausaTrace,
   parseLockdownStatus,
   parseNotebookActivity,
   parseUnifiedSearchResult,
@@ -900,6 +902,12 @@ export interface HudState {
    *  pre-redacted daemon-side. Null until the first rewind command. Nothing
    *  here re-executes anything. */
   sessionRewind: SessionRewind | null;
+  /** The last CAUSA decision trace (causa.trace): the ordered, redacted
+   *  explanation of a recent turn's routing — intent, selector mode, the agent,
+   *  local-vs-cloud route, owner gate, capability, outcome — surfaced by "why did
+   *  you do that" / "why <Agent>". Null until the first ask. REVIEW-ONLY: nothing
+   *  here re-executes; an honest-empty frame rides when the turn wasn't recorded. */
+  causaTrace: CausaTrace | null;
   /** The CONSEQUENTIAL-GATE AUDIT surface (audit.snapshot): the daemon's
    *  hash-chained, tamper-EVIDENT log of every consequential decision — recent
    *  entries (newest-first, SECRET-FREE: agent/tool/REDACTED target/decision/
@@ -1369,6 +1377,7 @@ export function initialState(): HudState {
     notebook: null,
     lifelog: null,
     sessionRewind: null,
+    causaTrace: null,
     audit: null,
     liveGate: [],
     consensusAdvisory: null,
@@ -2902,6 +2911,18 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       const rewind = parseSessionRewind(env.data);
       if (rewind === null) return s;
       return { ...s, sessionRewind: rewind };
+    }
+
+    case "causa.trace": {
+      // A CAUSA decision-trace explanation ran (daemon explain.rs via the router
+      // arm for "why did you do that" / "why <Agent>"): the ordered, redacted
+      // decision steps of a recent turn — or an honest-empty frame when the asked
+      // turn wasn't recorded. parseCausaTrace returns null only for a frame with no
+      // valid query (dropped, same reference). A fresh ask REPLACES the prior trace
+      // (the panel shows the last thing asked about). Nothing here re-executes.
+      const trace = parseCausaTrace(env.data);
+      if (trace === null) return s;
+      return { ...s, causaTrace: trace };
     }
 
     case "chart.data": {

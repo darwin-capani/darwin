@@ -87,6 +87,7 @@ mod episodic;
 #[cfg(feature = "endpoint-security")]
 mod es;
 mod eval;
+mod explain;
 mod exposure;
 mod focus;
 mod forecast;
@@ -3030,6 +3031,10 @@ async fn run_pipeline(
                 // work to re-run — replaying a captured "undo that" later would
                 // arm the inverse of whatever happened to be newest THEN.
                 && crate::journal::classify_undo_command(&text).is_none()
+                // "why did you do that" / "why <Agent>" is a review verb about the
+                // session — narrating a past decision, not re-runnable work — so it
+                // must never be captured into a macro either.
+                && crate::explain::classify_explain_intent(&text).is_none()
             {
                 crate::macros::capture(&text, &class.intent);
             }
@@ -3162,6 +3167,56 @@ async fn run_pipeline(
                 Err(e) => warn!(error = %e, "failed to record episode"),
             }
 
+            // PER-TURN DECISION SIGNALS shared by the CAUSA decision trace and the
+            // optimizer trace below: the selector's PURE mode classification (no
+            // I/O) + the LAST-WINS capability this turn used. Captured ONCE per
+            // NON-transient turn (take_turn_tool clears the per-turn slot, so the
+            // capability never leaks into the next turn's trace) and shared, so
+            // neither feature double-consumes it. On a transient turn (screen read /
+            // image gen) neither is recorded and the tool slot is left untouched.
+            let (mode, tool_or_skill): (&str, String) = if !transient {
+                (
+                    selector::classify_mode(&text, &agents::LexicalAgentScorer)
+                        .mode()
+                        .map(|m| m.as_str())
+                        .unwrap_or("clarify"),
+                    anthropic::take_turn_tool().unwrap_or_default(),
+                )
+            } else {
+                ("clarify", String::new())
+            };
+
+            // CAUSA (causal decision-trace explainer, explain.rs). Fold THIS
+            // completed turn's already-computed branch signals — intent + confidence
+            // (the classifier), selector mode, the agent + namespace it routed to,
+            // the local-vs-cloud route, the per-turn owner gate, the capability it
+            // used, and the outcome — into the small, bounded, REDACTED ring that
+            // "why did you do that" narrates. GATED like the optimizer trace:
+            // [explain].enabled (ships ON) AND non-transient (a screen read can
+            // carry on-screen secrets and must never seed a trace). READ-ONLY: it
+            // records what already happened; the utterance + outcome are redacted at
+            // assembly, and it never fabricates a rationale.
+            if cfg.explain.enabled && !transient {
+                let gate = voiceid::current_turn_gate();
+                explain::record(
+                    &explain::TurnSignals {
+                        utterance: text.clone(),
+                        intent: class.intent.clone(),
+                        confidence: class.confidence,
+                        mode: mode.to_string(),
+                        agent: outcome.agent.clone(),
+                        namespace: outcome.namespace.clone(),
+                        routed_to: outcome.routed_to.to_string(),
+                        gate_enforcing: gate.enforcing,
+                        gate_verified: gate.verified,
+                        tool_or_skill: tool_or_skill.clone(),
+                        outcome: outcome.response.clone(),
+                        ts: chrono::Utc::now().to_rfc3339(),
+                    },
+                    cfg.explain.ring_size,
+                );
+            }
+
             // OPTIMIZER TRACE (round: WireOptimizer). Record THIS completed turn
             // as a redacted optimizer trace — GATED by exactly the same posture as
             // the transcript/episodic/learning loop above: a NO-OP unless
@@ -3176,10 +3231,6 @@ async fn run_pipeline(
             // trace Corrected (the learnable signal). The recorder + labeler are
             // pure no-ops when disabled, so the shipped-OFF default does nothing.
             if cfg.optimize.enabled && !transient {
-                let mode = selector::classify_mode(&text, &agents::LexicalAgentScorer)
-                    .mode()
-                    .map(|m| m.as_str())
-                    .unwrap_or("clarify");
                 // Cross-turn correction: did THIS turn correct the prior route?
                 if let Some(prior) = prior_turn.as_ref() {
                     if optimize::is_correction(prior, &class.intent, &outcome.agent, &text) {
@@ -3210,11 +3261,9 @@ async fn run_pipeline(
                     .duration_since(SystemTime::UNIX_EPOCH)
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
-                // The capability this turn routed to (the tool loop's LAST-WINS
-                // capture; skill_invoke resolves to the skill name). Read + cleared
-                // once per turn, so it never leaks into the next turn's trace. ""
-                // when the turn used no tool/skill.
-                let tool_or_skill = anthropic::take_turn_tool().unwrap_or_default();
+                // The capability this turn used (`mode` + `tool_or_skill` were
+                // captured once above and shared with the CAUSA trace, so
+                // take_turn_tool is consumed exactly once per turn).
                 match optimize::record_trace(
                     cfg,
                     trace_store,

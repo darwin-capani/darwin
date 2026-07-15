@@ -794,6 +794,32 @@ pub async fn route(
         });
     }
 
+    // CAUSA (causal decision-trace explainer, explain.rs): "why did you do that" /
+    // "why <Agent>" narrates the ordered, REDACTED decision trace of the relevant
+    // recent turn (recorded at the END of run_pipeline). GATED by [explain].enabled
+    // (ships ON); when off, the question simply falls through to the model. Placed
+    // right after rewind so the review-family verbs stay together and after the
+    // higher-priority control arms (panic/unlock/confirm/undo/…). REVIEW-ONLY: it
+    // re-executes nothing — it explains what ALREADY happened, from records the
+    // daemon already holds, and returns an HONEST EMPTY (never a fabricated
+    // rationale) when there is no trace for the ask.
+    if cfg.explain.enabled {
+        if let Some(query) = crate::explain::classify_explain_intent(text) {
+            let prime = agents.orchestrator();
+            emit_agent_active(prime);
+            let trace = crate::explain::lookup(&query);
+            telemetry::emit("system", "causa.trace", crate::explain::payload(&query, trace.as_ref()));
+            let response = crate::explain::render_spoken(&query, trace.as_ref());
+            return Ok(RouteOutcome {
+                routed_to: "local",
+                response,
+                agent: prime.name.clone(),
+                namespace: prime.namespace.clone(),
+                spoken: None,
+            });
+        }
+    }
+
     // Roll-call (item 3, the reel centerpiece): "introduce the team" / "roll
     // call" / "assemble" -> each agent speaks its one-line self-introduction in
     // ITS OWN voice, in order, emitting agent.active per agent so the HUD
