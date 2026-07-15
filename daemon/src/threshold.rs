@@ -93,10 +93,12 @@ pub const GUEST_READ_ONLY_TOOLS: &[&str] = &[
     "episodic_recall",
     "user_model_query",
     "world_query",
-    // On-device retrieval / search — read-only, on-device.
+    // On-device retrieval / search — read-only, on-device. NOTE: `unified_search`
+    // is deliberately NOT here — it fans the query out to the OWNER's connected
+    // Gmail / Calendar / Slack and returns their private data, so it is neither
+    // on-device nor safe to expose to a bystander (it is not in SAFE_LOCAL_TOOLS).
     "doc_search",
     "search_files",
-    "unified_search",
     // Read-only status + the skill CATALOG (listing, not invocation).
     "system_status",
     "skill_list",
@@ -774,6 +776,29 @@ mod tests {
         assert_eq!(v["reason"], "owner");
         // Even the inactive frame states the restrict-only posture (never loosens).
         assert_eq!(v["loosens_gate"], false);
+    }
+
+    #[test]
+    fn the_guest_tool_set_is_strictly_on_device_read_only() {
+        // REGRESSION: unified_search fans out to the OWNER's Gmail / Calendar / Slack —
+        // it is NOT on-device and NOT safe to hand a bystander; it must never be a
+        // guest tool (the exact thing guest mode exists to withhold).
+        assert!(
+            !GUEST_READ_ONLY_TOOLS.contains(&"unified_search"),
+            "unified_search reads the owner's connected cloud accounts — never a guest tool"
+        );
+        // The module's stated contract: every guest tool is a STRICT subset of the
+        // author's on-device read-only curation SAFE_LOCAL_TOOLS.
+        for t in GUEST_READ_ONLY_TOOLS {
+            assert!(
+                crate::anthropic::SAFE_LOCAL_TOOLS.contains(t),
+                "guest tool {t:?} must be in SAFE_LOCAL_TOOLS (proven on-device + read-only)"
+            );
+        }
+        // No write / outward / consequential tool slipped in.
+        for banned in ["remember_fact", "open_url", "web_search", "gmail_send", "ui_actuate", "shell_run"] {
+            assert!(!GUEST_READ_ONLY_TOOLS.contains(&banned), "{banned:?} must not be a guest tool");
+        }
     }
 
     // =====================================================================

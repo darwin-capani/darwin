@@ -577,6 +577,19 @@ pub async fn run_sandboxed(
     profile: &str,
     scratch_dir: &Path,
 ) -> anyhow::Result<ShellRunResult> {
+    run_sandboxed_with_timeout(cmd, profile, scratch_dir, EXEC_TIMEOUT).await
+}
+
+/// Like [`run_sandboxed`] but with a caller-chosen wall-clock `timeout`. The shell
+/// tool uses the short [`EXEC_TIMEOUT`] (quick utility commands); a realm build/test
+/// — which must actually COMPILE — passes a much longer bound so a real Passed/Failed
+/// verdict is reachable instead of always timing out to Unverified.
+pub async fn run_sandboxed_with_timeout(
+    cmd: &str,
+    profile: &str,
+    scratch_dir: &Path,
+    timeout: std::time::Duration,
+) -> anyhow::Result<ShellRunResult> {
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
@@ -626,7 +639,7 @@ pub async fn run_sandboxed(
         Ok::<_, anyhow::Error>((status, out_buf, err_buf))
     };
 
-    let result = match tokio::time::timeout(EXEC_TIMEOUT, run).await {
+    let result = match tokio::time::timeout(timeout, run).await {
         Ok(Ok((status, out_buf, err_buf))) => {
             let truncated = out_buf.len() > MAX_OUTPUT_BYTES || err_buf.len() > MAX_OUTPUT_BYTES;
             ShellRunResult {

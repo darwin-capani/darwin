@@ -125,6 +125,9 @@ pub struct RealmSpec<'a> {
     pub diff: &'a str,
     /// The build/test command run INSIDE the realm under the sandboxed-exec seam.
     pub verify_command: &'a str,
+    /// Wall-clock cap (seconds) for the build/test — long enough for a real compile
+    /// (a quick-command timeout would make every real build time out to Unverified).
+    pub verify_timeout_secs: u64,
 }
 
 /// The raw outcome of a runner: either the verify command REALLY ran (carrying its
@@ -187,6 +190,17 @@ pub fn verdict_from_outcome(outcome: RealmRunOutcome) -> RealmVerdict {
         },
         RealmRunOutcome::Ran { exit_code: Some(0), output, timed_out: false } => {
             RealmVerdict::Passed { output }
+        }
+        // 126/127 = the verify command was NOT executable / NOT found on the sandbox's
+        // restricted PATH — so it never actually ran. That is UNVERIFIED, never a
+        // FAILED change: we must not tell the user their code failed when the build
+        // tool (e.g. cargo/npm not on PATH=/usr/bin:/bin:...) was never located.
+        RealmRunOutcome::Ran { exit_code: Some(126) | Some(127), timed_out: false, .. } => {
+            RealmVerdict::Unverified {
+                reason: "the verify command could not be run in the sandbox (not found or not \
+                         executable on the sandbox PATH) — the change was NOT built or tested"
+                    .to_string(),
+            }
         }
         RealmRunOutcome::Ran { exit_code: Some(code), output, timed_out: false } => {
             RealmVerdict::Failed { exit_code: Some(code), output }
@@ -359,6 +373,7 @@ pub async fn verify_proposal(
     ts: u64,
     diff: &str,
     verify_command: &str,
+    verify_timeout_secs: u64,
 ) -> RealmVerdict {
     let root = realms_root(state_dir);
     let dir = realm_dir(state_dir, ts);
@@ -376,7 +391,7 @@ pub async fn verify_proposal(
             reason: "no build/test command is configured for the Realm".to_string(),
         };
     }
-    let spec = RealmSpec { code_root, realm_dir: &dir, diff, verify_command };
+    let spec = RealmSpec { code_root, realm_dir: &dir, diff, verify_command, verify_timeout_secs };
     verdict_from_outcome(runner.run(&spec).await)
 }
 
@@ -469,8 +484,23 @@ impl SandboxedRealmRunner {
 
         // (3) RUN the build/test INSIDE the realm under the deny-default, NETWORK-
         // DENIED shell sandbox whose ONLY writable location is the realm itself.
-        let profile = crate::shell::generate_shell_sbpl(realm, &self.home, &self.daemon_state);
-        match crate::shell::run_sandboxed(spec.verify_command, &profile, realm).await {
+        // CANONICALIZE the realm first: macOS seatbelt matches file ops against the
+        // symlink-resolved path, so if state/ resolves through a symlink (e.g.
+        // /tmp -> /private/tmp) the SBPL write-allow subpath must be the resolved path
+        // or the build's writes are denied and every realm silently fails/Unverifies
+        // (mirrors the shell tool's canonicalize discipline). Falls back to the
+        // as-given path if canonicalize fails.
+        let realm_canon = std::fs::canonicalize(realm).unwrap_or_else(|_| realm.to_path_buf());
+        let profile =
+            crate::shell::generate_shell_sbpl(&realm_canon, &self.home, &self.daemon_state);
+        match crate::shell::run_sandboxed_with_timeout(
+            spec.verify_command,
+            &profile,
+            &realm_canon,
+            std::time::Duration::from_secs(spec.verify_timeout_secs.max(1)),
+        )
+        .await
+        {
             Ok(result) => {
                 let mut output = String::new();
                 if !result.stdout.trim().is_empty() {
@@ -747,6 +777,29 @@ mod tests {
         assert!(a.len() < MAX_ANNOTATION_OUTPUT_BYTES + 2_000, "the annotation stays finite: {}", a.len());
     }
 
+    #[test]
+    fn a_command_not_found_exit_is_unverified_not_failed() {
+        // REGRESSION: exit 126/127 = the verify command was not found / not executable
+        // on the sandbox's restricted PATH — it never ran, so the change is UNVERIFIED,
+        // NEVER reported as a failed change (an env/harness failure must not be
+        // presented as "your code failed").
+        for code in [126, 127] {
+            let v = verdict_from_outcome(RealmRunOutcome::Ran {
+                exit_code: Some(code),
+                output: "sh: cargo: command not found".to_string(),
+                timed_out: false,
+            });
+            assert!(matches!(v, RealmVerdict::Unverified { .. }), "exit {code} => Unverified, got {v:?}");
+        }
+        // A genuine non-zero (the tests actually ran and FAILED) stays Failed.
+        let failed = verdict_from_outcome(RealmRunOutcome::Ran {
+            exit_code: Some(1),
+            output: "test result: FAILED".to_string(),
+            timed_out: false,
+        });
+        assert!(matches!(failed, RealmVerdict::Failed { .. }), "a real test failure stays Failed");
+    }
+
     // =====================================================================
     // (5) ORCHESTRATOR — with a MOCK runner (no real copy/exec)
     // =====================================================================
@@ -789,7 +842,7 @@ mod tests {
             output: "all tests passed".into(),
             timed_out: false,
         });
-        let v = verify_proposal(&pass, state, root, 1, "--- a/x\n+++ b/x\n@@\n", "cargo test").await;
+        let v = verify_proposal(&pass, state, root, 1, "--- a/x\n+++ b/x\n@@\n", "cargo test", 300).await;
         assert!(matches!(v, RealmVerdict::Passed { .. }), "a clean run => Passed, got {v:?}");
         assert!(pass.called.load(std::sync::atomic::Ordering::SeqCst), "the runner ran");
 
@@ -799,7 +852,7 @@ mod tests {
             output: "1 test failed".into(),
             timed_out: false,
         });
-        let v = verify_proposal(&fail, state, root, 2, "diff", "make test").await;
+        let v = verify_proposal(&fail, state, root, 2, "diff", "make test", 300).await;
         assert!(matches!(v, RealmVerdict::Failed { exit_code: Some(1), .. }), "a failing run => Failed, got {v:?}");
     }
 
@@ -812,7 +865,7 @@ mod tests {
         let down = MockRunner::new(RealmRunOutcome::Unavailable {
             reason: "the shell sandbox (/usr/bin/sandbox-exec) is unavailable on this device".into(),
         });
-        let v = verify_proposal(&down, state, root, 3, "diff", "cargo test").await;
+        let v = verify_proposal(&down, state, root, 3, "diff", "cargo test", 300).await;
         match v {
             RealmVerdict::Unverified { reason } => {
                 assert!(reason.contains("sandbox"), "the honest reason names the missing sandbox: {reason}");
@@ -827,7 +880,7 @@ mod tests {
         let root = Path::new("/proj/repo");
         // With NO verify command there is nothing to run: Unverified WITHOUT ever
         // reaching the runner (a PanicRunner proves the short-circuit).
-        let v = verify_proposal(&PanicRunner, state, root, 4, "diff", "   ").await;
+        let v = verify_proposal(&PanicRunner, state, root, 4, "diff", "   ", 300).await;
         assert!(
             matches!(v, RealmVerdict::Unverified { .. }),
             "no verify command => Unverified (never a faked pass), got {v:?}"

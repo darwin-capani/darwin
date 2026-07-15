@@ -246,7 +246,10 @@ const OFF_PHRASES: &[&str] = &[
 const ON_PHRASES: &[&str] = &[
     "go dark",
     "vault mode on",
-    "vault mode",
+    // NOTE: the BARE "vault mode" is deliberately NOT here — matches_phrase treats a
+    // phrase as a leading imperative, so "vault mode, what does it do?" would strip
+    // "vault mode" and engage the vault when the user is merely ASKING about it. An
+    // intentional toggle uses an explicit verb form below.
     "vault on",
     "turn on vault",
     "turn on vault mode",
@@ -499,6 +502,10 @@ mod tests {
         for s in [
             "what is vault mode",
             "tell me about vault mode and how it works",
+            // REGRESSION: a leading "vault mode ..." QUESTION must not engage the vault
+            // (the bare "vault mode" imperative phrase was removed for exactly this).
+            "vault mode what does it do",
+            "vault mode is that a good idea",
             "the room went dark last night",
             "i left my documents in the vault",
             "should i go dark or stay online",

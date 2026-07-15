@@ -909,7 +909,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // `verify_command` SHIPS EMPTY (the operator names their project's build/test
     // command; empty => an honest UNVERIFIED, never a faked pass). Listed here so
     // neither key reads as a typo.
-    ("realm", &["enabled", "verify_command"]),
+    ("realm", &["enabled", "verify_command", "timeout_secs"]),
 ];
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2307,6 +2307,11 @@ impl Default for ShellConfig {
 pub struct RealmConfig {
     pub enabled: bool,
     pub verify_command: String,
+    /// Wall-clock cap (seconds) for the realm build/test. Compiling from source in a
+    /// fresh network-denied realm is far slower than a quick shell command, so this
+    /// is generous — a too-short bound makes every real build time out to UNVERIFIED,
+    /// defeating the point of the realm (which is a REAL pass/fail verdict).
+    pub timeout_secs: u64,
 }
 
 impl Default for RealmConfig {
@@ -2319,6 +2324,9 @@ impl Default for RealmConfig {
             // builds/tests with (network-denied, so `--offline` / pre-fetched deps).
             // Empty => an honest UNVERIFIED verdict, never a faked pass.
             verify_command: String::new(),
+            // 5 minutes: enough for a real from-source compile+test, so a genuine
+            // verdict is reachable instead of always timing out to UNVERIFIED.
+            timeout_secs: 300,
         }
     }
 }

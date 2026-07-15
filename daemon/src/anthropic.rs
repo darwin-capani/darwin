@@ -2390,7 +2390,7 @@ async fn tool_loop(
 /// skill still parks via `execute_tool` (the gate is enforced there, not by this
 /// list). This is the OUTER boundary: `safe_local_subset` intersects any config
 /// override with this set, so a misconfiguration can never widen past it.
-const SAFE_LOCAL_TOOLS: &[&str] = &[
+pub(crate) const SAFE_LOCAL_TOOLS: &[&str] = &[
     // Memory (local store): recall is read-only; remember is a local write, gated
     // as today (not consequential).
     "recall_facts",
@@ -8278,7 +8278,12 @@ pub(crate) fn edith_brief_now() -> String {
 /// `complete_with_tools` so a mission born of injected content cannot reset the
 /// egress guard to open on its sub-tasks' call 0 (the exfiltration bypass).
 pub(crate) async fn run_fury_mission(goal: &str, memory: &Memory, trusted: bool) -> String {
-    let cloud_reachable = resolve_api_key().await.is_some();
+    // VAULT MODE restrict-only gate: a mission must honor an active vault exactly like
+    // the direct-turn cloud decision does. run_fury_mission recomputes reachability
+    // from the key, so without this a vault-active Mission-mode turn would still plan +
+    // dispatch to the Anthropic cloud (the review's HIGH leak). deny_cloud can only
+    // REMOVE cloud (returns key_present && !vault_active), never add it.
+    let cloud_reachable = crate::vault::deny_cloud(resolve_api_key().await.is_some());
     let registry = crate::agents::AgentRegistry::canonical();
     let model = mission_model().to_string();
     let planner = crate::mission::CloudPlanner {
@@ -9283,6 +9288,7 @@ async fn verify_proposal_in_realm(
         ts,
         diff,
         &realm_cfg.verify_command,
+        realm_cfg.timeout_secs,
     )
     .await;
     // Attach the verdict to the proposal card (an artifact under the proposal store)
