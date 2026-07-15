@@ -615,6 +615,24 @@ debate = true                  # SHIPS ON (full-power default, #22). High-stakes
 enabled = true                 # SHIPS ON (read-only accountability loosens nothing). false = skip all audit records.
 max_entries = 10000            # retention cap: past this the oldest are pruned and the surviving suffix re-rooted.
 
+# [triage] — FORENSIC TRIAGE SNAPSHOT (triage.rs, agent "aegis"). A one-shot READ-ONLY
+# "capture everything" that FREEZES a REDACTED, timestamped evidence bundle under
+# state/forensics/<ts>/ — the process tree + per-binary signing (codesign -dv, an
+# ASSESSMENT read that never executes), the socket table, the machine/TCC/persistence
+# baselines + current state, a BOUNDED `log show` excerpt of the security subsystems
+# (sandboxd/tccd/syspolicyd/socketfilterfw), and recent quarantine (LSQuarantine) events —
+# so the owner can hand a professional real evidence. Every value is REDACTED AT SOURCE
+# (secrets / PII / credentialed URLs / the home path). HONESTY: unified-log <private>
+# fields stay redacted by macOS without admin; the bundle says so, never de-anonymizes them.
+# STRICTLY READ-ONLY re: the machine — no kills, no config/security changes, and RESTORE is
+# NEVER automated (triage only captures). NOTHING is transmitted; it writes ONLY under
+# state/forensics/. The bundle's manifest SHA-256 is folded into the audit chain and the
+# resulting chain HEAD is written to the macOS Keychain as an EXTERNAL ANCHOR. These knobs
+# only BOUND the capture; they never grant a capability.
+[triage]
+max_bundle_bytes = 8388608     # whole-bundle byte budget (8 MiB): sections truncate/drop with an honest note past this.
+log_window_minutes = 60        # how far back the bounded security-subsystem `log show` excerpt reaches.
+
 # [policy] — PER-ACTION POLICY store (policy.rs): the controlled, USER-SET loosening/
 # hardening that sits BENEATH the [integrations].allow_consequential master switch and
 # ABOVE the cross-turn confirmation gate. Precedence NEVER > ALWAYS > ASK.
