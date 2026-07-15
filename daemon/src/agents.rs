@@ -1910,6 +1910,14 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
             // recollective remit. Ships OFF ([pasteboard].enabled=false); with it off
             // / nothing copied, recall honestly returns an empty history.
             "pasteboard_recall",
+            // APERTURE: aperture_recall is READ-ONLY recall over the owner's private,
+            // PII-redacted, bounded, transient on-device activity timeline ("what was
+            // I working on around 3pm"). It summarizes app + window title + duration
+            // (never screen pixels), stores nothing, sends nothing — so it never
+            // touches integrations::gate(). Squarely her recollective remit. Ships OFF
+            // ([aperture].enabled=false); with it off / nothing recorded, recall
+            // honestly returns no activity.
+            "aperture_recall",
             // The file-RAG WRITE/FORGET triggers (the local intents the classifier
             // emits for "index my documents"/"reindex" and "forget my file index").
             // Both are CONFINED to the user's OWN allowlisted folders + the local

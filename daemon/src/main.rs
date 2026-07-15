@@ -203,6 +203,14 @@ mod optimize;
 // confirm-gated pasteboard_put. With [pasteboard].enabled=false nothing is polled
 // or stored.
 mod pasteboard;
+// Aperture (aperture.rs): a private, owner-gated, ON-DEVICE activity timeline
+// ("Recall done right"). An OPT-IN (ships OFF) poller that records WHICH app was
+// frontmost + its window TITLE + duration into a bounded, PII-redacted, transient
+// in-RAM ring, plus a read-only recall ("what was I working on around 3pm" / "what
+// did I do this morning"). It records app + title + time only — NEVER screen
+// pixels — and nothing leaves the box. With [aperture].enabled=false nothing is
+// polled or stored.
+mod aperture;
 // Persistence Sentinel ("Autoruns for the Mac", persistence.rs): a READ-ONLY
 // inventory of the host's autostart/persistence surfaces + per-binary
 // signing/notarization + Gatekeeper, with a pure baseline diff. It reports; it
@@ -1874,6 +1882,25 @@ async fn main() -> Result<()> {
             "poll_interval_secs": cfg.pasteboard.effective_poll_interval_secs(),
         }),
     );
+    // APERTURE (aperture.rs): install the [aperture] settings ONCE so the recall op
+    // + the poll loop read one process-global gate. SHIPS OFF (enabled=false) — an
+    // activity timeline is privacy-sensitive, so with it off nothing is polled or
+    // stored and the poll loop below is never spawned. Only the bool + bounds are
+    // installed (no app/title text).
+    aperture::install_settings(
+        cfg.aperture.enabled,
+        cfg.aperture.effective_retention(),
+        cfg.aperture.effective_poll_interval_secs(),
+    );
+    telemetry::emit(
+        "system",
+        "aperture.configured",
+        serde_json::json!({
+            "enabled": cfg.aperture.enabled,
+            "retention": cfg.aperture.effective_retention(),
+            "poll_interval_secs": cfg.aperture.effective_poll_interval_secs(),
+        }),
+    );
     // FURY's mission engine plans + dispatches with the heavy cloud model; wire
     // it from config ONCE so the fury_mission tool arm reads one process-global
     // (mirrors init_persona — no model threading through execute_tool).
@@ -2721,6 +2748,23 @@ async fn main() -> Result<()> {
         telemetry::emit(
             "system",
             "pasteboard.loop_started",
+            json!({"poll_interval_secs": interval}),
+        );
+    }
+
+    // APERTURE (aperture.rs): if [aperture].enabled, spawn the OPT-IN activity poll
+    // loop. STRICTLY GATED — this block is skipped entirely when enabled=false (the
+    // shipped default), so nothing is ever polled or stored. The loop reads the
+    // frontmost app + window title (device-gated: the AXTitle read needs runtime
+    // Accessibility TCC consent), PII-redacts the title, records the merged span in
+    // the bounded in-RAM ring, and emits aperture.status.
+    if cfg.aperture.enabled {
+        let interval = cfg.aperture.effective_poll_interval_secs();
+        tokio::spawn(aperture::poll_loop(interval));
+        info!(poll_interval_secs = interval, "started aperture activity-timeline poll loop");
+        telemetry::emit(
+            "system",
+            "aperture.loop_started",
             json!({"poll_interval_secs": interval}),
         );
     }

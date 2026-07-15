@@ -208,6 +208,16 @@ pub struct Config {
     /// the recall.rs path. `retention` caps the ring (evict-oldest);
     /// `poll_interval_secs` sets the poll cadence.
     pub pasteboard: PasteboardConfig,
+    /// [aperture] — APERTURE (aperture.rs), a private, owner-gated, ON-DEVICE
+    /// activity timeline. `enabled` SHIPS OFF (deliberate: an activity timeline is
+    /// privacy-sensitive, so nothing is polled or stored until the owner opts in).
+    /// With it off nothing is polled/stored and the poll loop is never spawned. When
+    /// on, the poller records WHICH app was frontmost + its window TITLE (PII-redacted
+    /// via optimize::redact) + duration into a BOUNDED, transient (in-RAM only) ring;
+    /// recall summarizes app/time only — NEVER screen pixels — and nothing leaves the
+    /// box. `retention` caps the ring (evict-oldest); `poll_interval_secs` sets the
+    /// sampling cadence.
+    pub aperture: ApertureConfig,
     pub answers: AnswersConfig,
     pub audit: AuditConfig,
     /// [triage] — FORENSIC TRIAGE SNAPSHOT (triage.rs, aegis). The one-shot
@@ -786,6 +796,12 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // or stored). `retention` is the evict-oldest ring cap and `poll_interval_secs`
     // the poll cadence — both floored to >= 1 at use. Listed so none reads as a typo.
     ("pasteboard", &["enabled", "retention", "poll_interval_secs"]),
+    // [aperture] — APERTURE (aperture.rs), the on-device activity timeline. `enabled`
+    // SHIPS OFF (an activity timeline is privacy-sensitive; with it off nothing is
+    // polled or stored). `retention` is the evict-oldest ring cap and
+    // `poll_interval_secs` the sampling cadence — both floored to >= 1 at use. Listed
+    // so none reads as a typo.
+    ("aperture", &["enabled", "retention", "poll_interval_secs"]),
     // [answers] — answer annotations (anthropic.rs `answers` module): the
     // always-cite source-tracking (#5) + the self-reported confidence (#8). ALL SHIP
     // ON (full-power default):
@@ -2787,6 +2803,58 @@ impl PasteboardConfig {
     }
 }
 
+/// [aperture] — APERTURE (aperture.rs): a private, owner-gated, ON-DEVICE activity
+/// timeline ("Recall done right"). It records WHICH app was frontmost + its window
+/// TITLE + duration — never a screen pixel — so the owner can ask "what was I
+/// working on around 3pm" on-device.
+///
+///   - `enabled` (SHIPS OFF): the master switch. An activity timeline is
+///     privacy-sensitive, so it ships OFF — with it false NOTHING is polled or
+///     stored and the poll loop is never spawned. When on, each frontmost sample's
+///     window TITLE is PII-REDACTED at the source and stored (with the app name +
+///     duration) in a bounded, transient (in-RAM only) ring; recall summarizes
+///     app + time only.
+///   - `retention`: the evict-oldest ring cap (bounded memory; floored to >= 1).
+///   - `poll_interval_secs`: the sampling cadence in seconds (floored to >= 1 so a 0
+///     never busy-loops).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ApertureConfig {
+    pub enabled: bool,
+    pub retention: usize,
+    pub poll_interval_secs: u64,
+}
+
+impl Default for ApertureConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS OFF — an activity timeline is privacy-sensitive; nothing is
+            // polled or stored until the owner opts in.
+            enabled: false,
+            // A calm bound on the in-RAM timeline ring; evict-oldest past it.
+            // Floored >= 1.
+            retention: 500,
+            // A calm cadence — sample the frontmost app every 20s when on. Floored
+            // to >= 1 at use.
+            poll_interval_secs: 20,
+        }
+    }
+}
+
+impl ApertureConfig {
+    /// The effective ring cap (>= 1) — a misconfigured 0 would make the timeline
+    /// useless, so it is floored, never trusted raw.
+    pub fn effective_retention(&self) -> usize {
+        self.retention.max(1)
+    }
+
+    /// The effective sampling interval in seconds (>= 1) — a 0 would be a busy loop,
+    /// so it is floored.
+    pub fn effective_poll_interval_secs(&self) -> u64 {
+        self.poll_interval_secs.max(1)
+    }
+}
+
 /// [answers] — answer annotations (anthropic.rs `answers` module): the
 /// always-cite source-tracking (#5) and the self-reported confidence (#8). An
 /// ADDED honesty layer over the answer, never a change to any safety gate.
@@ -4120,6 +4188,7 @@ impl Config {
             screen_context: section(&table, "screen_context", &mut issues),
             lumen: section(&table, "lumen", &mut issues),
             pasteboard: section(&table, "pasteboard", &mut issues),
+            aperture: section(&table, "aperture", &mut issues),
             answers: section(&table, "answers", &mut issues),
             audit: section(&table, "audit", &mut issues),
             triage: section(&table, "triage", &mut issues),
@@ -4616,6 +4685,51 @@ mod tests {
         assert!(
             issues.iter().any(|i| i.contains("enable")),
             "a typo'd [pasteboard] key must be diagnosed: {issues:?}"
+        );
+    }
+
+    /// APERTURE: [aperture] SHIPS OFF (an activity timeline is privacy-sensitive),
+    /// with sane bounds (retention/interval floored to >= 1), and its keys are known
+    /// (lockstep with KNOWN_KEYS so a typo is diagnosed).
+    #[test]
+    fn aperture_ships_off_with_sane_bounds_and_known_keys() {
+        // The Default impl is OFF — recording an activity timeline is opt-in.
+        let d = super::ApertureConfig::default();
+        assert!(!d.enabled, "the activity timeline SHIPS OFF (privacy-sensitive; opt-in)");
+        assert_eq!(d.retention, 500);
+        assert_eq!(d.poll_interval_secs, 20);
+        assert!(d.effective_retention() >= 1);
+        assert!(d.effective_poll_interval_secs() >= 1);
+
+        // An empty config (no [aperture] block) parses to OFF, no diagnostic.
+        let (cfg, issues) = Config::parse("");
+        assert!(
+            !cfg.aperture.enabled,
+            "an absent [aperture] block falls back to the OFF default"
+        );
+        assert!(
+            issues.iter().all(|i| !i.contains("aperture")),
+            "the [aperture] keys must be known (no unknown-key diagnostic): {issues:?}"
+        );
+
+        // The keys take + a misconfigured 0 retention/interval is FLOORED.
+        let (cfg, issues) = Config::parse(
+            "[aperture]\nenabled = true\nretention = 0\npoll_interval_secs = 0\n",
+        );
+        assert!(issues.is_empty(), "valid keys parse clean: {issues:?}");
+        assert!(cfg.aperture.enabled);
+        assert_eq!(cfg.aperture.effective_retention(), 1, "a 0 retention is floored to 1");
+        assert_eq!(
+            cfg.aperture.effective_poll_interval_secs(),
+            1,
+            "a 0 interval is floored to 1 (never a busy loop)"
+        );
+
+        // A typo'd key under [aperture] IS flagged (lockstep with KNOWN_KEYS).
+        let (_cfg, issues) = Config::parse("[aperture]\nenable = true\n");
+        assert!(
+            issues.iter().any(|i| i.contains("enable")),
+            "a typo'd [aperture] key must be diagnosed: {issues:?}"
         );
     }
 
