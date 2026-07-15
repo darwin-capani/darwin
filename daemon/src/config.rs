@@ -129,6 +129,12 @@ pub struct Config {
     pub screen_context: ScreenContextConfig,
     pub answers: AnswersConfig,
     pub audit: AuditConfig,
+    /// [triage] — FORENSIC TRIAGE SNAPSHOT (triage.rs, aegis). The one-shot
+    /// READ-ONLY "capture everything" that freezes a REDACTED, timestamped evidence
+    /// bundle under state/forensics/<ts>/ and folds its digest into the audit chain
+    /// plus the Keychain external anchor. These knobs only BOUND the capture (bundle
+    /// byte budget / log window); RESTORE is never automated, nothing is transmitted.
+    pub triage: TriageConfig,
     pub policy: PolicyConfig,
     pub security: SecurityConfig,
     /// [distill] — SELF-DISTILLATION (F17, distill.rs): an on-device LoRA
@@ -631,6 +637,13 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // `max_entries` bounds retention (prune-oldest + re-root past the cap). Listed
     // here so neither key reads as a typo.
     ("audit", &["enabled", "max_entries"]),
+    // [triage] — FORENSIC TRIAGE SNAPSHOT (triage.rs, aegis). The one-shot
+    // READ-ONLY "capture everything" that freezes a REDACTED evidence bundle under
+    // state/forensics/<ts>/ and folds its digest into the audit chain + Keychain
+    // external anchor. `max_bundle_bytes` bounds the bundle; `log_window_minutes`
+    // bounds the security-subsystem `log show` excerpt. Listed so neither reads as a
+    // typo. It only reads + reports; RESTORE is never automated, nothing is transmitted.
+    ("triage", &["max_bundle_bytes", "log_window_minutes"]),
     // [policy] — the per-action policy store (policy.rs). The controlled, USER-SET
     // loosening/hardening that sits BENEATH the [integrations] master switch. It
     // SHIPS EMPTY: no rules => `evaluate` returns Ask for every action, so the
@@ -2665,6 +2678,40 @@ impl Default for AuditConfig {
     }
 }
 
+/// [triage] — FORENSIC TRIAGE SNAPSHOT (triage.rs, agent "aegis"). The one-shot
+/// "capture everything" op that FREEZES a READ-ONLY, REDACTED, timestamped
+/// evidence bundle under `state/forensics/<ts>/` (process tree + signing, socket
+/// table, machine/TCC/persistence baselines, a bounded `log show` excerpt of the
+/// security subsystems, recent quarantine events) so the owner can hand a
+/// professional real evidence. It STRICTLY READS the machine — no kills, no
+/// config/security changes, RESTORE is never automated — and NOTHING is
+/// transmitted; it writes ONLY under `state/forensics/`. Its bundle digest is
+/// folded into the audit chain + the Keychain external anchor. These knobs only
+/// BOUND the capture; they never grant a capability.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TriageConfig {
+    /// Whole-bundle byte budget: sections are kept while the running total fits,
+    /// then truncated/dropped with an honest note. Bounds disk + the capture cost.
+    pub max_bundle_bytes: usize,
+    /// How many minutes back the bounded security-subsystem `log show` excerpt
+    /// reaches. Kept small so the read stays fast + the excerpt stays legible.
+    pub log_window_minutes: u64,
+}
+
+impl Default for TriageConfig {
+    fn default() -> Self {
+        // Generous-but-bounded defaults: an 8 MiB bundle and a 1-hour log window.
+        // A 0 for either would make a capture pointless, so the defaults are the
+        // floor the module actually reads (a config typo of 0 simply yields an
+        // empty/near-empty section rather than a crash — honest, never unbounded).
+        Self {
+            max_bundle_bytes: 8 * 1024 * 1024,
+            log_window_minutes: 60,
+        }
+    }
+}
+
 /// [policy] — the per-action policy store (policy.rs): the controlled, USER-SET
 /// loosening/hardening BENEATH the [integrations] master switch. SHIPS EMPTY
 /// (no rules => Ask everywhere => behavior is exactly today's). Rules are USER-SET
@@ -3337,6 +3384,7 @@ impl Config {
             screen_context: section(&table, "screen_context", &mut issues),
             answers: section(&table, "answers", &mut issues),
             audit: section(&table, "audit", &mut issues),
+            triage: section(&table, "triage", &mut issues),
             policy: section(&table, "policy", &mut issues),
             security: section(&table, "security", &mut issues),
             distill: section(&table, "distill", &mut issues),

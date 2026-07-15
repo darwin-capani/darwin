@@ -241,6 +241,11 @@ mod speech;
 mod standing;
 mod tcc;
 mod telemetry;
+// FORENSIC TRIAGE SNAPSHOT (aegis): a one-shot READ-ONLY "capture everything" that
+// freezes a REDACTED, timestamped evidence bundle under state/forensics/<ts>/ and
+// folds its manifest SHA-256 into the audit chain + the Keychain external anchor.
+// Read-only re: the machine; nothing is transmitted; RESTORE is never automated.
+mod triage;
 // GATED UI AUTOMATION (#44, the CAPSTONE): the single most dangerous capability —
 // actually ACTUATING the macOS UI (click/type/key). A PURE single-action planner
 // (ONE plan = ONE actuation, can't batch) + the device-gated CGEvent/AX seam

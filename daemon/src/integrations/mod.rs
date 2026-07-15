@@ -296,6 +296,17 @@ const ALLOWED_ACCOUNTS: &[&str] = &[
     // lives in the OS Keychain — lose that item and the encrypted DBs are
     // unrecoverable.
     "memory_encryption_key",
+    // AUDIT CHAIN EXTERNAL ANCHOR (triage.rs / audit.rs). The witnessed audit
+    // chain-head (`"<seq>:<head_hash>"`) written to a SEPARATE OS protection domain
+    // — the Keychain — so a root attacker who rewrites the whole audit SQLite file
+    // consistently (still passing the local hash chain) is caught when the live head
+    // no longer equals the witnessed one. NOT a credential: the value is a PUBLIC
+    // SHA-256 digest; the Keychain is chosen as a distinct write domain, not for
+    // secrecy. WRITTEN by DARWIN via the same argv-free `security add-generic-password
+    // -U` seam as the OAuth refresh tokens; READ back by `resolve_secret` to verify.
+    // The constant lives in `crate::audit::AUDIT_ANCHOR_ACCOUNT`; a mirror test keeps
+    // the allowlist + the module in lockstep.
+    "audit_chain_anchor",
 ];
 
 /// The exact security(1) argv for a Keychain read of `account`. Factored out
@@ -1189,10 +1200,11 @@ mod tests {
             "user_email",
             "elevenlabs_api_key",
             "memory_encryption_key",
+            "audit_chain_anchor",
         ] {
             assert!(account_allowed(account), "{account} must be allowed");
         }
-        assert_eq!(ALLOWED_ACCOUNTS.len(), 38, "the allowlist must not grow silently");
+        assert_eq!(ALLOWED_ACCOUNTS.len(), 39, "the allowlist must not grow silently");
     }
 
     /// Lockstep: the at-rest encryption master-key account literal on the allowlist
@@ -1207,6 +1219,19 @@ mod tests {
             crate::crypto::MASTER_KEY_ACCOUNT
         );
         assert_eq!(crate::crypto::MASTER_KEY_ACCOUNT, "memory_encryption_key");
+    }
+
+    /// Lockstep: the audit-chain external-anchor account literal on the allowlist
+    /// matches the `AUDIT_ANCHOR_ACCOUNT` constant `audit.rs` owns, so the allowlist
+    /// and the audit module can never drift on the account name.
+    #[test]
+    fn allowlist_includes_the_audit_anchor_account_constant() {
+        assert!(
+            account_allowed(crate::audit::AUDIT_ANCHOR_ACCOUNT),
+            "{} (audit const) must be allowed",
+            crate::audit::AUDIT_ANCHOR_ACCOUNT
+        );
+        assert_eq!(crate::audit::AUDIT_ANCHOR_ACCOUNT, "audit_chain_anchor");
     }
 
     /// Lockstep: the Google OAuth account literals on the allowlist match the
@@ -1494,8 +1519,9 @@ mod tests {
                 "mcp_{bad_name}_token must be refused"
             );
         }
-        // The fixed allowlist did not grow (38 incl. F18's sync_shared_key).
-        assert_eq!(ALLOWED_ACCOUNTS.len(), 38, "the fixed allowlist must not change");
+        // The fixed allowlist did not grow (39 incl. F18's sync_shared_key + the
+        // audit chain external anchor).
+        assert_eq!(ALLOWED_ACCOUNTS.len(), 39, "the fixed allowlist must not change");
     }
 
     /// `resolve_secret` returns `None` for a non-allowlisted account WITHOUT
