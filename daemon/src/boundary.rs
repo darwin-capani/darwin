@@ -294,6 +294,18 @@ impl TrimSpec {
         }
     }
 
+    /// The MAXIMAL reduce-only trim — the one that withholds the MOST. `NoMemory`
+    /// drops Facts + History, a superset of every other variant's withholding, so it
+    /// is the strongest personal-context reduction CUSTOMS offers. VAULT MODE forces
+    /// this (via `gate_and_trim`): "go dark" tightens CUSTOMS to its maximum. Kept as
+    /// a named function (not a bare `NoMemory`) so the "maximal" intent is explicit
+    /// and the `maximal_withholds_a_superset_of_every_trim` test pins the invariant —
+    /// if a stronger variant is ever added, that test forces `maximal()` to follow,
+    /// keeping "vault => maximal" restrict-only.
+    pub fn maximal() -> TrimSpec {
+        TrimSpec::NoMemory
+    }
+
     /// The categories this trim WITHHOLDS. `None` withholds nothing; `NoFacts`
     /// withholds Facts; `NoMemory` withholds Facts + History. This closed table is
     /// the ONLY thing a trim can do — it names categories to REMOVE, never to add.
@@ -510,6 +522,13 @@ pub fn init(enabled: bool, default_trim: &str) {
 pub fn gate_and_trim() -> (bool, TrimSpec) {
     let (enabled, default_trim) = BOUNDARY_GATE.get().copied().unwrap_or((false, TrimSpec::None));
     let trim = current_turn_trim().unwrap_or(default_trim);
+    // VAULT MODE ("go dark", vault.rs): an active vault forces CUSTOMS to the
+    // MAXIMAL reduce-only trim. RESTRICT-ONLY — `TrimSpec::maximal()` withholds a
+    // superset of every other trim (pinned by a boundary test), so this can only
+    // ever TIGHTEN the egress, never loosen a stronger operator / per-turn trim.
+    // Inert when vault is off (byte-for-byte today's trim). Vault is the maximal
+    // reduce; CUSTOMS is the inventory + partial reduce it strengthens.
+    let trim = if crate::vault::active() { TrimSpec::maximal() } else { trim };
     (enabled, trim)
 }
 
@@ -683,6 +702,27 @@ mod tests {
             assert!(!spec.drops(ContextCategory::SystemPrompt));
             assert!(!spec.drops(ContextCategory::Utterance));
         }
+    }
+
+    #[test]
+    fn maximal_withholds_a_superset_of_every_trim() {
+        // THE invariant VAULT relies on: `maximal()` is the STRONGEST reduce — it
+        // withholds every category any other trim withholds (a superset). This is
+        // what makes "vault => force maximal" RESTRICT-ONLY: forcing maximal can only
+        // tighten, never loosen a stronger operator/per-turn trim. If a stronger
+        // variant is ever added, this test fails until `maximal()` follows it.
+        let max = TrimSpec::maximal();
+        for spec in [TrimSpec::None, TrimSpec::NoFacts, TrimSpec::NoMemory] {
+            for cat in spec.dropped() {
+                assert!(
+                    max.drops(*cat),
+                    "maximal() must withhold {cat:?} that {spec:?} withholds"
+                );
+            }
+        }
+        // Concretely, the maximal trim withholds both personal-memory categories.
+        assert!(max.drops(ContextCategory::Facts));
+        assert!(max.drops(ContextCategory::History));
     }
 
     #[test]

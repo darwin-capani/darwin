@@ -253,6 +253,13 @@ pub struct Config {
     /// enabling only adds an honest inventory + an opt-in trim — never a new
     /// egress.
     pub boundary: BoundaryConfig,
+    /// [vault] — VAULT MODE ("go dark", vault.rs). `enabled` SHIPS OFF (vault
+    /// removes cloud access, so it is opt-in and never engages silently). With it
+    /// active the router forces LOCAL-ONLY routing (no Anthropic-fallback
+    /// escalation) and CUSTOMS is forced to its maximal reduce-only trim. It is a
+    /// RESTRICT-ONLY tightening — vault can only remove cloud + strengthen the trim,
+    /// never add either — toggled at runtime by a `vault` op or a spoken "go dark".
+    pub vault: VaultConfig,
     /// [egress] — EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs), the
     /// longitudinal follow-on to the read-only Egress Sentinel. `enabled` SHIPS ON
     /// (full-power default) — like `[introspect]`/`[audit]` it is pure, READ-ONLY
@@ -817,6 +824,9 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // ("none" | "no_facts" | "no_memory"); an unknown value degrades to "none".
     // Listed so neither key reads as a typo.
     ("boundary", &["enabled", "default_trim"]),
+    // [vault] — VAULT MODE ("go dark", vault.rs). `enabled` SHIPS OFF (vault removes
+    // cloud access, so it is opt-in). Listed so the key never reads as a typo.
+    ("vault", &["enabled"]),
     // [egress] — EGRESS BASELINE + BEACON DETECTOR (egress_beacon.rs). `enabled`
     // SHIPS ON (read-only observability). The remaining keys tune the bounded
     // baseline retention and the beacon-cadence + alert-suppression thresholds;
@@ -1630,6 +1640,36 @@ impl Default for BoundaryConfig {
             enabled: true,
             default_trim: "none".to_string(),
         }
+    }
+}
+
+/// [vault] — VAULT MODE ("go dark", vault.rs), a one-word forcing switch that keeps
+/// a turn LOCAL-ONLY for sensitive work. Where CUSTOMS ([boundary]) inventories +
+/// trims the cloud egress, Vault removes the cloud turn ALTOGETHER: with it active
+/// the router refuses to escalate to the Anthropic fallback (the turn stays on the
+/// local MLX brain, or honestly says it can't do this offline) and CUSTOMS is forced
+/// to its strongest reduce-only trim.
+///
+/// `enabled` SHIPS OFF: vault CHANGES BEHAVIOR (it removes cloud access), so it is
+/// opt-in and never engages silently. It is toggled at runtime — a `vault` router op
+/// or a spoken "go dark" / "vault mode on|off" — and this key is only the boot
+/// default. RESTRICT-ONLY: vault can only ever REMOVE cloud + tighten the egress
+/// trim, never add either — a turn under vault egresses nothing the non-vault turn
+/// wouldn't, and with it off the cloud decision is byte-for-byte today's.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct VaultConfig {
+    /// The boot default for vault mode. SHIPS OFF (vault removes cloud access, so it
+    /// is opt-in). Runtime toggles ("go dark" / the `vault` op) flip the live mode;
+    /// this only sets the state at startup.
+    pub enabled: bool,
+}
+
+impl Default for VaultConfig {
+    /// Ships OFF — vault changes behavior (local-only + maximal egress trim), so it
+    /// never engages until the operator opts in (config default or a runtime toggle).
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 
@@ -3672,6 +3712,7 @@ impl Config {
             report: section(&table, "report", &mut issues),
             chart: section(&table, "chart", &mut issues),
             boundary: section(&table, "boundary", &mut issues),
+            vault: section(&table, "vault", &mut issues),
             egress: section(&table, "egress", &mut issues),
             precog: section(&table, "precog", &mut issues),
         };
