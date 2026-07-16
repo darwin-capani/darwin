@@ -10,6 +10,7 @@ import AuditPanel from "./components/AuditPanel";
 import SecondLookPanel from "./components/SecondLookPanel";
 import PlanDiffPanel from "./components/PlanDiffPanel";
 import ChartPanel from "./components/ChartPanel";
+import ChangeQueuePanel from "./components/ChangeQueuePanel";
 import CodeIntelPanel from "./components/CodeIntelPanel";
 import CommandDeck from "./components/CommandDeck";
 import ShellPanel from "./components/ShellPanel";
@@ -690,6 +691,7 @@ export default function App() {
             pdfJail={state.pdfJailAvailable}
           />
           <CodeIntelPanel code={state.codeIntel} />
+          <ChangeQueuePanel changeq={state.changeq} />
           <ShellPanel shell={state.shell} />
           <UiActuatePanel uiActuate={state.uiActuate} />
           <UnifiedSearchPanel result={state.unifiedSearch} />
