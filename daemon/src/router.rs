@@ -440,6 +440,68 @@ pub async fn route(
         });
     }
 
+    // APERTURE VOICE COMMANDS (aperture.rs): the on-device activity timeline —
+    // "what did I do this morning" / "what was I working on around 3pm" (RECALL) and
+    // "forget my activity timeline" (FORGET). Handled BEFORE the screen-context block
+    // below and CONSERVATIVELY anchored: classify_aperture_intent only fires on a
+    // recall cue that ALSO carries a resolvable TIME WINDOW ("this morning", "around
+    // 3pm", "the last hour", "today") OR an explicit "activity"/"timeline" word. That
+    // is exactly how it COEXISTS with the recent screen-context recall: a bare "what
+    // was I working on" (no window, no timeline word) falls through here and is
+    // handled by screen_context below. READ-ONLY: RECALL summarizes the BOUNDED,
+    // PII-REDACTED timeline (app + window title + duration — NEVER screen pixels); an
+    // off / un-fed timeline is an HONEST "no activity recorded", never fabricated.
+    // FORGET wipes the in-RAM ring. SHIPS OFF ([aperture].enabled=false) — with it
+    // off nothing was ever recorded. Runs after the owner voice-id all-scope gate, so
+    // an unrecognized bystander cannot recall or wipe the owner's activity timeline.
+    if let Some(intent) = crate::aperture::classify_aperture_intent(text, &chrono::Local::now()) {
+        let prime = agents.orchestrator();
+        emit_agent_active(prime);
+        let (verb, response) = if !cfg.aperture.enabled {
+            // OFF (the shipped default): nothing was ever recorded. Honest, never a
+            // fabricated timeline and never a claim the feature is running.
+            (
+                "off",
+                "The activity timeline is off, sir — I'm not recording what you work on. \
+                 Enable [aperture] and I'll keep a private, on-device record of which app \
+                 you're in and its window title (never your screen) so I can tell you what \
+                 you were working on."
+                    .to_string(),
+            )
+        } else {
+            match intent {
+                crate::aperture::ApertureIntent::Recall(query) => {
+                    // Summarize the redacted timeline for the constructed query
+                    // (window + optional subject). Honest-empty on an un-fed ring.
+                    ("recall", crate::aperture::global_render_recall(&query, 6))
+                }
+                crate::aperture::ApertureIntent::Forget => {
+                    let cleared = crate::aperture::global_clear();
+                    let ack = if cleared {
+                        "Done, sir — I've wiped your activity timeline.".to_string()
+                    } else {
+                        "There was no activity timeline to forget, sir.".to_string()
+                    };
+                    ("forget", ack)
+                }
+            }
+        };
+        // SECRET-FREE telemetry: the verb + the gate only — never the recalled
+        // (already-redacted) app/title text.
+        telemetry::emit(
+            "system",
+            "aperture.command",
+            json!({ "verb": verb, "enabled": cfg.aperture.enabled }),
+        );
+        return Ok(RouteOutcome {
+            routed_to: "local",
+            response,
+            agent: prime.name.clone(),
+            namespace: prime.namespace.clone(),
+            spoken: None,
+        });
+    }
+
     // CONTINUOUS SCREEN CONTEXT VOICE COMMANDS (#42): "what was I working on" /
     // "recall my screen context" (RECALL) and "forget my screen context" (FORGET).
     // CONSERVATIVELY anchored (screen_context::classify_screen_context_intent

@@ -1221,6 +1221,18 @@ fn tool_defs() -> &'static Value {
                 }
             },
             {
+                "name": "aperture_recall",
+                "description": "Recall from APERTURE — DARWIN's private, owner-gated, ON-DEVICE activity timeline. READ-ONLY: it summarizes which APP the user had frontmost, its window TITLE, and for HOW LONG, over an optional time window the query names ('what was I working on around 3pm', 'what did I do this morning', 'what was I doing this afternoon about the budget'). It stores nothing, sends nothing to the cloud, and changes nothing. HONEST ABOUT COVERAGE — Aperture records the app name + window title + time ONLY; it does NOT capture screen pixels, screenshots, or what was typed. Say that; never imply it saw the screen. PRIVACY + HONESTY: the activity timeline SHIPS OFF and only records once the owner has enabled it — when it is off, or nothing was recorded in the asked-about period, it honestly says there's no activity recorded; do NOT invent a session. Every window title was PII-REDACTED at capture (emails/secrets/card+phone numbers stripped), so a recalled title may show '[redacted]' spans. Pass the user's question verbatim as 'query' (it carries the time phrase); the daemon resolves the window on-device. Returns the top apps by time, most first, each with a bucketed duration and a representative window title.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string", "description": "The user's question in their own words — it carries the time phrase ('this morning' / 'around 3pm') and any topic ('about the budget')."},
+                        "k": {"type": "integer", "description": "Max number of apps to return (default 5; capped). The most-used come first."}
+                    },
+                    "required": ["query"]
+                }
+            },
+            {
                 "name": "pasteboard_put",
                 "description": "Place text on the user's macOS clipboard (a pasteboard SET) so they can paste it. CONSEQUENTIAL but BENIGN: it ONLY sets the clipboard — it never types a keystroke, mutates a file, or reaches the network. It defaults to a DRY-RUN PREVIEW and copies nothing. Set confirm=true ONLY after the user has explicitly approved copying THIS exact text — never on your own initiative. Even with confirm=true it still will NOT copy unless the operator has separately enabled consequential actions; otherwise it returns a preview. Call this when the user asks you to copy / put something on their clipboard for them to paste.",
                 "input_schema": {
@@ -3501,6 +3513,20 @@ struct PasteboardRecallArgs {
     k: Option<usize>,
 }
 
+// -- APERTURE tool args (crate::aperture) ---------------------------------------
+// aperture_recall is READ-ONLY: summarize the bounded, PII-redacted, on-device
+// activity timeline (app + window title + duration) for the time window the query
+// names. Nothing is stored/changed; nothing leaves the device. The daemon resolves
+// the time window on-device from the query text + the local clock.
+#[derive(Deserialize)]
+struct ApertureRecallArgs {
+    /// The user's question in their own words — it carries the time phrase.
+    query: String,
+    /// Max number of apps to return. Default 5; clamped to a safe ceiling.
+    #[serde(default)]
+    k: Option<usize>,
+}
+
 // pasteboard_put is CONSEQUENTIAL but BENIGN: it SETS the clipboard (a pasteboard
 // set only — never a keystroke/file/network). It defaults to a DryRun preview;
 // `confirm` (only ever set by the confirmation replay) gates the real set.
@@ -5564,6 +5590,7 @@ fn tool_carries_citation(name: &str) -> bool {
             | "recall_facts"
             | "episodic_recall"
             | "pasteboard_recall"
+            | "aperture_recall"
             | "web_search"
             | "open_url"
             | "karen_triage"
@@ -5595,6 +5622,7 @@ fn citation_for_tool(name: &str, input: &Value, outcome: &str) -> Option<(String
         "mnemosyne_recall" | "recall_facts" => "stored memory".to_string(),
         "episodic_recall" => "past episodes".to_string(),
         "pasteboard_recall" => "clipboard history".to_string(),
+        "aperture_recall" => "activity timeline".to_string(),
         "karen_triage" => "comms triage".to_string(),
         "web_search" | "open_url" => input
             .get("url")
@@ -5631,6 +5659,8 @@ fn is_empty_retrieval(outcome: &str) -> bool {
         "no facts stored yet",     // recall_facts empty
         "nothing has been copied", // pasteboard_recall empty (no history yet)
         "i have nothing in your clipboard history", // pasteboard_recall no-match
+        "i have no activity recorded", // aperture_recall empty / no-match subject
+        "i have no record of", // aperture_recall no activity in the asked-about window
         "tell me what to search",  // unified_search empty query
         "no comms surfaces were available", // karen_triage all-disconnected
     ];
@@ -7678,6 +7708,20 @@ async fn dispatch_tool(
                 Ok(crate::pasteboard::global_rank_render_runtime(&args.query, k, &embedder).await)
             }
             Err(e) => Err(anyhow!("invalid pasteboard_recall arguments: {e}")),
+        },
+        // -- APERTURE (crate::aperture) ---------------------------------------
+        // aperture_recall is READ-ONLY: summarize the bounded, PII-redacted,
+        // transient in-RAM activity timeline (app + window title + duration) for the
+        // time window the query names. Nothing is stored/sent — so it never touches
+        // integrations::gate(). The daemon resolves the window on-device from the
+        // query + the local clock. When the timeline is off / empty / nothing was
+        // recorded in the period, it honestly says so — never a fabricated session.
+        "aperture_recall" => match serde_json::from_value::<ApertureRecallArgs>(input.clone()) {
+            Ok(args) => {
+                let k = args.k.unwrap_or(MNEMOSYNE_DEFAULT_K).clamp(1, MNEMOSYNE_MAX_K);
+                Ok(crate::aperture::global_render_recall_text(&args.query, &chrono::Local::now(), k))
+            }
+            Err(e) => Err(anyhow!("invalid aperture_recall arguments: {e}")),
         },
         // pasteboard_put SETS the clipboard — CONSEQUENTIAL but BENIGN (a pasteboard
         // set only, never a keystroke/file/network). It is in CONSEQUENTIAL_TOOLS,
@@ -13043,6 +13087,7 @@ mod tests {
                 "cassandra_simulate",
                 "mnemosyne_recall",
                 "pasteboard_recall",
+                "aperture_recall",
                 "pasteboard_put",
                 "episodic_recall",
                 "doc_search",

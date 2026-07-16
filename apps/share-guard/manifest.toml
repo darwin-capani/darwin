@@ -1,0 +1,42 @@
+# Share Guard — on-device PII auto-redactor micro-app (runtime = "binary": a
+# prebuilt Swift binary in the app dir, mirrors vision/silicon-canvas).
+# Schema: docs/SANDBOX.md / daemon/src/apps.rs::AppManifest.
+#
+# DEFENSIVE-ONLY, ON-DEVICE ONLY:
+#   - net_hosts = [] -> fully offline. The payload text/images, the recognized
+#     glyphs, and the redacted copy NEVER leave the device. No cloud, no upload.
+#   - Built-in Apple Vision (VNRecognizeTextRequest) for the image OCR path — NO
+#     external model download. Glyph text only, NEVER a face / person identity.
+#   - Writes the redacted copy ONLY inside its OWN sandbox dir (fs_write below),
+#     NEVER the user's original file. DARWIN cannot SEND — the user shares the
+#     scrubbed copy themselves.
+#   - Redaction is BEST-EFFORT text detection (emails / phones / Luhn-valid card
+#     & account numbers), NOT a guarantee.
+
+[app]
+name        = "share-guard"
+version     = "0.1.0"
+description = "On-device PII auto-redactor: run BEFORE sharing an artifact to detect emails, phone numbers, and Luhn-valid card/account numbers (via the built-in on-device VNRecognizeTextRequest OCR for images, or a supplied text payload) and write a REDACTED copy inside the app's own sandbox dir. Fully offline, defensive-only — glyph text only, no identity recognition, no upload; DARWIN cannot send, the user shares the scrubbed copy themselves. Best-effort, not a guarantee."
+entry       = "apps/share-guard/.build/release/share-guard"   # project-root-relative path to the prebuilt Swift binary (swift build -c release)
+runtime     = "binary"
+
+[permissions]
+# Opens NO device: no microphone, no camera, no screen capture. It scrubs a
+# SUPPLIED payload, not live capture.
+audio     = false
+net_hosts = []                              # fully offline — payload/glyphs/redacted copy NEVER leave the device
+gpu       = true                            # ANE / GPU for the built-in VNRecognizeTextRequest OCR (image path)
+camera    = false                           # never opens the camera
+screen    = false                           # never captures the screen
+fs_read   = [
+  "state/tmp/share-guard/input",            # host stages a to-be-scrubbed IMAGE payload here (scrub.image)
+]
+fs_write  = ["state/tmp/share-guard"]       # the app's OWN sandbox dir: the redacted copy goes under redacted/
+
+[ui]
+surface          = "panel"
+telemetry_topics = [
+  "share.redactions",   # the scrub result: per-kind counts, best-effort preview, sandbox output path (SECRET-FREE — never the PII or the redacted body)
+  "share.status",       # lifecycle: idle / scrubbing / stopped
+  "share.error",        # recoverable errors (bad op, denied path, OCR/write failure)
+]

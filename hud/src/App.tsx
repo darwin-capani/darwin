@@ -36,6 +36,8 @@ import PresencePanel from "./components/PresencePanel";
 import CapabilityStatusPanel from "./components/CapabilityStatusPanel";
 import DistillPanel from "./components/DistillPanel";
 import SyncPanel from "./components/SyncPanel";
+import FleetPanel from "./components/FleetPanel";
+import HandoffPanel from "./components/HandoffPanel";
 import ScenePanel from "./components/ScenePanel";
 import OvernightPanel from "./components/OvernightPanel";
 import AmbientMode from "./components/AmbientMode";
@@ -43,6 +45,7 @@ import { isAtRest } from "./core/ambient";
 import TccSentinelPanel from "./components/TccSentinelPanel";
 import IntrospectPanel from "./components/IntrospectPanel";
 import PasteboardPanel from "./components/PasteboardPanel";
+import AperturePanel from "./components/AperturePanel";
 import PostureDashboardPanel from "./components/PostureDashboardPanel";
 import AttributionHealthPanel from "./components/AttributionHealthPanel";
 import AppDeckPanel from "./components/AppDeckPanel";
@@ -652,6 +655,8 @@ export default function App() {
           <CapabilityStatusPanel map={state.capabilityMap} />
           <DistillPanel distill={state.distill} />
           <SyncPanel sync={state.federatedSync} />
+          <FleetPanel fleet={state.fleet} />
+          <HandoffPanel handoff={state.handoff} />
           <ScenePanel scene={state.scene} />
           <OvernightPanel overnight={state.overnight} />
           <CapabilityAtlasPanel atlas={state.capabilityAtlas} />
@@ -668,6 +673,7 @@ export default function App() {
             capabilities={state.introspectCapabilities}
           />
           <PasteboardPanel pasteboard={state.pasteboard} />
+          <AperturePanel aperture={state.aperture} />
           <PostureDashboardPanel posture={state.posture} />
           <ConnectorMarketplacePanel mcp={state.mcp} />
           <ExtensibilityPanel webhooks={state.webhooks} plugins={state.plugins} />

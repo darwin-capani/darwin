@@ -105,6 +105,7 @@ mod es;
 mod eval;
 mod explain;
 mod exposure;
+mod fleet;
 mod focus;
 mod forecast;
 mod forge;
@@ -203,6 +204,14 @@ mod optimize;
 // confirm-gated pasteboard_put. With [pasteboard].enabled=false nothing is polled
 // or stored.
 mod pasteboard;
+// Aperture (aperture.rs): a private, owner-gated, ON-DEVICE activity timeline
+// ("Recall done right"). An OPT-IN (ships OFF) poller that records WHICH app was
+// frontmost + its window TITLE + duration into a bounded, PII-redacted, transient
+// in-RAM ring, plus a read-only recall ("what was I working on around 3pm" / "what
+// did I do this morning"). It records app + title + time only — NEVER screen
+// pixels — and nothing leaves the box. With [aperture].enabled=false nothing is
+// polled or stored.
+mod aperture;
 // Persistence Sentinel ("Autoruns for the Mac", persistence.rs): a READ-ONLY
 // inventory of the host's autostart/persistence surfaces + per-binary
 // signing/notarization + Gatekeeper, with a pure baseline diff. It reports; it
@@ -276,6 +285,15 @@ mod rewind;
 mod overnight;
 mod scene;
 mod sync;
+// CONTINUITY HANDOFF (handoff.rs): resume a LIVE cognitive session on another of
+// the owner's Macs. Seals a SessionCapsule (transcript window, active agent,
+// mission ref, pending world-model deltas, draft ids, focus profile) over the SAME
+// sync.rs AES-256-GCM sealed path under a Keychain-paired handoff_shared_key; the
+// receiving daemon RESTORES the context and PARKS. AUTHORITY NEVER TRANSFERS — the
+// capsule carries no resolved credential/bearer (redacted like a macro), and every
+// consequential step on the receiving device re-hits the fresh confirm + voice-id +
+// master switch + lockdown. Ships OFF (rides sync, also OFF). Hermetically tested.
+mod handoff;
 mod router;
 mod screen_context;
 mod secret_scan;
@@ -1026,6 +1044,20 @@ async fn audit_snapshot_task(cfg: Arc<Config>, memory: Arc<Memory>, root: PathBu
         // READ-ONLY — counts + probes, runs no sync; OFF (the shipped default)
         // never touches the Keychain.
         sync::emit_status(&live, &memory, &root).await;
+        // The HUD's FleetPanel (FLEET // POLICY) shows OVERWATCH's honest state
+        // (fleet.rs): off/armed-awaiting-baseline/active, WHICH device authored the
+        // active baseline, and the per-tool ceilings (Never/Ask). READ-ONLY — it
+        // reports the baseline installed once at startup, so it never touches the
+        // Keychain or a file on the tick; OFF (the shipped default) emits the honest
+        // off payload. The floor can ONLY HARDEN — it never grants an action.
+        fleet::emit_status(&live, &root).await;
+        // The HUD's HandoffPanel shows the continuity-handoff pipeline's honest
+        // state (handoff.rs): off/armed-needs-pairing/armed-paired, whether an
+        // inbound session capsule is staged to resume, and the two pinned truths —
+        // a capsule carries NO credentials and restoring context PARKS (authority
+        // never transfers). READ-ONLY — probes the key/peer/inbox, runs no handoff;
+        // OFF (the shipped default) never touches the Keychain.
+        handoff::emit_status(&live, &root).await;
         // The HUD's ScenePanel shows the acoustic-scene sensor's honest state
         // (scene.rs, F6): off/armed-needs-model/listening, the sound-event
         // vocabulary, and that audio is NEVER retained. READ-ONLY — probes for a
@@ -1874,6 +1906,25 @@ async fn main() -> Result<()> {
             "poll_interval_secs": cfg.pasteboard.effective_poll_interval_secs(),
         }),
     );
+    // APERTURE (aperture.rs): install the [aperture] settings ONCE so the recall op
+    // + the poll loop read one process-global gate. SHIPS OFF (enabled=false) — an
+    // activity timeline is privacy-sensitive, so with it off nothing is polled or
+    // stored and the poll loop below is never spawned. Only the bool + bounds are
+    // installed (no app/title text).
+    aperture::install_settings(
+        cfg.aperture.enabled,
+        cfg.aperture.effective_retention(),
+        cfg.aperture.effective_poll_interval_secs(),
+    );
+    telemetry::emit(
+        "system",
+        "aperture.configured",
+        serde_json::json!({
+            "enabled": cfg.aperture.enabled,
+            "retention": cfg.aperture.effective_retention(),
+            "poll_interval_secs": cfg.aperture.effective_poll_interval_secs(),
+        }),
+    );
     // FURY's mission engine plans + dispatches with the heavy cloud model; wire
     // it from config ONCE so the fury_mission tool arm reads one process-global
     // (mirrors init_persona — no model threading through execute_tool).
@@ -1995,6 +2046,16 @@ async fn main() -> Result<()> {
     // chokepoints only ever READ this global.
     let policy_store = policy::PolicyStore::load(&root.join("state").join("policy.json"));
     policy::install(cfg.policy.enabled, policy_store);
+    // OVERWATCH FLEET POLICY ([fleet], ships OFF — fleet.rs). Load the owner-authored
+    // SIGNED baseline (state/fleet/baseline.sealed, sealed under the shared sync key)
+    // and install it as the process-global FLOOR OF STRICTNESS that
+    // `policy::evaluate_global` folds over the local decision. NO-MODEL-WRITE: this
+    // only OPENS + INSTALLS a pre-sealed, owner-authored bundle — the daemon never
+    // authors a baseline. Fail-safe: OFF is a no-op (no Keychain touch, no disk read),
+    // and an absent/unpaired/unopenable bundle installs NOTHING (the floor stays
+    // empty, so evaluate_global is byte-for-byte today). The baseline can ONLY HARDEN.
+    let fleet_active = fleet::load_and_install(&cfg, &root).await;
+    info!(fleet_baseline_active = fleet_active, "fleet: OVERWATCH policy baseline load complete");
     // CONSEQUENTIAL AUDIT LOG ([audit], ships ON — read-only accountability): open
     // the append-only, hash-chained, tamper-EVIDENT log in its OWN SQLite file
     // (state/audit.db) and install the process-global the chokepoints record to via
@@ -2721,6 +2782,23 @@ async fn main() -> Result<()> {
         telemetry::emit(
             "system",
             "pasteboard.loop_started",
+            json!({"poll_interval_secs": interval}),
+        );
+    }
+
+    // APERTURE (aperture.rs): if [aperture].enabled, spawn the OPT-IN activity poll
+    // loop. STRICTLY GATED — this block is skipped entirely when enabled=false (the
+    // shipped default), so nothing is ever polled or stored. The loop reads the
+    // frontmost app + window title (device-gated: the AXTitle read needs runtime
+    // Accessibility TCC consent), PII-redacts the title, records the merged span in
+    // the bounded in-RAM ring, and emits aperture.status.
+    if cfg.aperture.enabled {
+        let interval = cfg.aperture.effective_poll_interval_secs();
+        tokio::spawn(aperture::poll_loop(interval));
+        info!(poll_interval_secs = interval, "started aperture activity-timeline poll loop");
+        telemetry::emit(
+            "system",
+            "aperture.loop_started",
             json!({"poll_interval_secs": interval}),
         );
     }

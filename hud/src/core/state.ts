@@ -50,6 +50,7 @@ import {
   IntrospectStatus,
   IntrospectCapability,
   PasteboardStatus,
+  ApertureStatus,
   PostureSnapshot,
   AttributionHealth,
   McpStatus,
@@ -62,6 +63,8 @@ import {
   CapabilityMap,
   DistillStatus,
   SyncStatus,
+  FleetStatus,
+  HandoffStatus,
   SceneStatus,
   OvernightStatus,
   Presence,
@@ -147,6 +150,8 @@ import {
   parseCapabilityMap,
   parseDistillStatus,
   parseSyncStatus,
+  parseFleetStatus,
+  parseHandoffStatus,
   parseSceneStatus,
   parseOvernightStatus,
   parsePresence,
@@ -169,6 +174,7 @@ import {
   TCC_ANOMALY_CAP,
   parseIntrospectSnapshot,
   parsePasteboardStatus,
+  parseApertureStatus,
   introspectDriftLine,
   introspectAnomalyLine,
   introspectModuleViolationLine,
@@ -708,6 +714,11 @@ export interface HudState {
    *  clip count + cap + poll cadence, and up to a few ALREADY-redacted, truncated
    *  clip previews. Null until the first status frame. SHIPS OFF (opt-in). */
   pasteboard: PasteboardStatus | null;
+  /** The activity-timeline status (aperture.status): the enabled gate, the activity
+   *  count + cap + poll cadence, and up to a few recent activities (app + an
+   *  ALREADY-redacted, truncated window title + a duration). Null until the first
+   *  status frame. SHIPS OFF (opt-in); records app + title + time, NEVER pixels. */
+  aperture: ApertureStatus | null;
   /** The machine security posture (posture.snapshot, 30-min cadence): FileVault /
    *  firewall / SIP / pending-updates verdicts from the read-only status
    *  commands. Null until the first frame. REVIEW-ONLY — the daemon reports;
@@ -808,6 +819,16 @@ export interface HudState {
    *  syncable-fact count, key present, pending conflicts. Null until the first
    *  frame. E2E-encrypted; deletions don't propagate. */
   federatedSync: SyncStatus | null;
+  /** OVERWATCH fleet policy's honest state (fleet.status): off/armed-awaiting-
+   *  baseline/active, WHICH device authored the active baseline, and the per-tool
+   *  ceilings (Never/Ask). Null until the first frame. The floor can ONLY HARDEN —
+   *  it never grants an action. */
+  fleet: FleetStatus | null;
+  /** The continuity-handoff pipeline's honest state (handoff.status): off/armed-
+   *  needs-pairing/paired, whether an inbound session capsule is staged, and the
+   *  two pinned truths — carries NO credentials, and restoring context PARKS
+   *  (authority never transfers). Null until the first frame. REVIEW-ONLY. */
+  handoff: HandoffStatus | null;
   /** The acoustic-scene sensor's honest state (scene.status, F6): off/armed-
    *  needs-model/listening, the sound-event vocabulary, transient events. Null
    *  until the first frame. NEVER retains audio. */
@@ -1419,6 +1440,7 @@ export function initialState(): HudState {
     introspectAlerts: [],
     introspectCapabilities: [],
     pasteboard: null,
+    aperture: null,
     posture: null,
     attributionHealth: null,
     security: null,
@@ -1434,6 +1456,8 @@ export function initialState(): HudState {
     pdfJailAvailable: null,
     distill: null,
     federatedSync: null,
+    fleet: null,
+    handoff: null,
     scene: null,
     overnight: null,
     capabilityMap: null,
@@ -2491,6 +2515,16 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       return { ...s, pasteboard: parsePasteboardStatus(env.data) };
     }
 
+    case "aperture.status": {
+      // Aperture (aperture.rs): the on-device activity timeline. enabled gate +
+      // activity count/cap/cadence + up to a few ALREADY-redacted, truncated
+      // activities (app + window title + duration). Never null — a malformed payload
+      // yields an honest OFF/empty snapshot; when off, activities are dropped so the
+      // panel never renders a timeline that is not running. SHIPS OFF (opt-in);
+      // records app + title + time only, NEVER screen pixels.
+      return { ...s, aperture: parseApertureStatus(env.data) };
+    }
+
     case "introspect.profile_drift": {
       // The on-disk seatbelt profile was tampered/removed since launch — a
       // sandbox-integrity finding. Accumulate (deduped, capped). REVIEW-ONLY.
@@ -2776,6 +2810,19 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // sync::emit_status). parseSyncStatus NEVER returns null and pins the
       // honest transport-inert / deletes-don't-propagate facts.
       return { ...s, federatedSync: parseSyncStatus(env.data) };
+    }
+
+    case "fleet.status": {
+      // OVERWATCH fleet policy status (main.rs audit_snapshot_task ->
+      // fleet::emit_status). parseFleetStatus NEVER returns null and pins
+      // hardens-only true (a payload can't claim the floor grants an action).
+      return { ...s, fleet: parseFleetStatus(env.data) };
+    }
+    case "handoff.status": {
+      // The continuity-handoff pipeline status (main.rs audit_snapshot_task ->
+      // handoff::emit_status). parseHandoffStatus NEVER returns null and pins the
+      // honest transport-inert / no-credentials / restore-parks facts.
+      return { ...s, handoff: parseHandoffStatus(env.data) };
     }
 
     case "scene.status": {

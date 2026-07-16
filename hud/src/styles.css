@@ -9760,6 +9760,30 @@ body,
 }
 .pasteboard-empty { font-style: italic; }
 
+/* Aperture (aperture.status): opt-in, on-device activity timeline (app + window
+   title + duration; never screen pixels). */
+.aperture-body { display: flex; flex-direction: column; gap: 6px; }
+.aperture-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.aperture-pill {
+  font-size: 0.66em; letter-spacing: 0.06em; padding: 1px 6px;
+  border-radius: 3px; border: 1px solid currentColor; white-space: nowrap;
+}
+.aperture-pill.on { color: var(--learn-green); }
+.aperture-pill.off { color: var(--fg-dim, rgba(255,255,255,0.4)); }
+.aperture-coverage { font-size: 0.66em; letter-spacing: 0.02em; margin: 0; }
+.aperture-activities { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.aperture-activity {
+  font-size: 0.72em; display: flex; align-items: baseline; gap: 8px;
+  max-width: 100%; overflow: hidden;
+}
+.aperture-app { font-weight: 600; white-space: nowrap; }
+.aperture-duration { opacity: 0.7; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.aperture-title {
+  opacity: 0.75; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  min-width: 0; flex: 1 1 auto;
+}
+.aperture-empty { font-style: italic; }
+
 /* At-rest ambient mirror (F8): a calm fullscreen overlay shown when the daemon
    reports presence "away" and there's no local activity. Fades over the HUD. */
 .ambient-mode {
@@ -9981,6 +10005,46 @@ body,
 .sync-facts { font-size: 0.66em; }
 .sync-conflicts { font-size: 0.7em; color: var(--warn-amber); overflow-wrap: anywhere; }
 .sync-foot { margin-top: 4px; }
+
+/* OVERWATCH fleet policy (fleet.status): a signed, owner-authored baseline
+   enforced as a FLOOR OF STRICTNESS. OFF (dim) / ARMED (amber — awaiting a
+   baseline) / ACTIVE (green). Each ceiling shows a tool + its hardening: NEVER
+   (red, a hard block) or ALWAYS ASK (amber, a stripped auto-approve). The floor
+   can only tighten — never loosen, never grant. */
+.fleet-body { display: flex; flex-direction: column; gap: 5px; }
+.fleet-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.fleet-pill {
+  font-size: 0.62em; letter-spacing: 0.06em; padding: 1px 6px;
+  border-radius: 3px; border: 1px solid currentColor; white-space: nowrap;
+}
+.fleet-pill.off { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
+.fleet-pill.armed { color: var(--warn-amber); }
+.fleet-pill.ready { color: var(--learn-green); }
+.fleet-author { font-size: 0.66em; overflow-wrap: anywhere; }
+.fleet-rules { list-style: none; margin: 2px 0 0; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.fleet-rule { display: flex; align-items: baseline; gap: 8px; justify-content: space-between; font-size: 0.72em; }
+.fleet-rule-tool { font-family: var(--mono, monospace); overflow-wrap: anywhere; }
+.fleet-rule-decision { font-size: 0.86em; letter-spacing: 0.05em; white-space: nowrap; }
+.fleet-rule-decision.never { color: var(--alert-red, #ff5f56); }
+.fleet-rule-decision.ask { color: var(--warn-amber); }
+.fleet-empty { font-size: 0.7em; }
+.fleet-foot { margin-top: 4px; }
+/* HANDOFF // CONTINUITY (handoff.rs) — resume a live session on another of the
+   owner's Macs. Same pill palette as sync: OFF (dim) / ARMED · NEEDS PAIRING
+   (amber) / ARMED · PAIRED (green). AUTHORITY NEVER TRANSFERS — a capsule
+   carries no credentials and restoring context parks; the footnote says so. */
+.handoff-body { display: flex; flex-direction: column; gap: 5px; }
+.handoff-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.handoff-pill {
+  font-size: 0.62em; letter-spacing: 0.06em; padding: 1px 6px;
+  border-radius: 3px; border: 1px solid currentColor; white-space: nowrap;
+}
+.handoff-pill.off { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
+.handoff-pill.armed { color: var(--warn-amber); }
+.handoff-pill.ready { color: var(--learn-green); }
+.handoff-resume { font-size: 0.66em; }
+.handoff-pending { font-size: 0.7em; color: var(--warn-amber); overflow-wrap: anywhere; }
+.handoff-foot { margin-top: 4px; }
 
 /* Acoustic scene awareness (scene.status, F6): ambient sound-event sensor.
    OFF (dim) / ARMED (amber — needs a bundled model) / LISTENING (green).

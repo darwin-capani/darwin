@@ -6247,6 +6247,97 @@ export function parsePasteboardStatus(data: Record<string, unknown>): Pasteboard
 }
 
 /* ------------------------------------------------------------------------ *
+ * APERTURE (daemon aperture.rs -> `aperture / aperture.status`).              *
+ *                                                                            *
+ * A private, owner-gated, ON-DEVICE activity timeline. An OPT-IN (ships OFF)  *
+ * poller records WHICH app was frontmost + its window TITLE (PII-REDACTED at  *
+ * the source) + duration in a bounded, transient in-RAM ring. The status      *
+ * frame carries the enabled gate, the activity COUNT + cap + poll cadence,    *
+ * and up to a few recent activities (app + an ALREADY-redacted, truncated     *
+ * title + a duration in seconds) for the panel — NEVER screen pixels, never   *
+ * raw title text. When off, the count is 0 and there are no activities.        *
+ * ------------------------------------------------------------------------ */
+
+export const APERTURE_TOPIC_STATUS = "aperture.status";
+
+/** Cap on recent activities the panel retains/renders (defensive against a
+ *  hostile/oversized frame). */
+export const APERTURE_PREVIEW_CAP = 8;
+
+/** One recent activity in the timeline: the frontmost app, its ALREADY-redacted
+ *  window title (may be empty), and how long it stayed frontmost (seconds). */
+export interface ApertureActivity {
+  app: string;
+  title: string;
+  durationSecs: number;
+}
+
+/** The activity-timeline status. `recent` holds ALREADY-redacted, truncated
+ *  titles (never raw window text). Any unknown/garbled field coerces
+ *  conservatively (off, zero counts, no activities) — the panel never invents a
+ *  recorded state, and a disabled timeline shows nothing recorded. */
+export interface ApertureStatus {
+  enabled: boolean;
+  count: number;
+  cap: number;
+  pollIntervalSecs: number;
+  /** Recent activities (empty when off). */
+  recent: ApertureActivity[];
+}
+
+/** Coerce one `recent` row into an [`ApertureActivity`], or null when it is not a
+ *  usable row (no app name). The title defaults to "" (an app with no window title
+ *  is still a valid activity); the duration coerces to a non-negative integer. */
+function coerceApertureActivity(o: Record<string, unknown>): ApertureActivity | null {
+  const app = str(o, "app");
+  if (app === null || app.trim().length === 0) return null;
+  const title = str(o, "title") ?? "";
+  const rawDur = num(o, "duration_secs");
+  const durationSecs = rawDur === null || rawDur < 0 ? 0 : Math.floor(rawDur);
+  return { app, title, durationSecs };
+}
+
+/** Parse an `aperture.status` payload. NEVER returns null / never throws; an
+ *  absent or garbled payload yields the honest OFF, empty snapshot. When off,
+ *  activities are dropped (a disabled timeline shows nothing recorded), so the
+ *  panel can never render activity for a timeline that is not running. */
+export function parseApertureStatus(data: Record<string, unknown>): ApertureStatus {
+  const enabled = bool(data, "enabled") === true;
+  const count = num(data, "count");
+  const cap = num(data, "cap");
+  const poll = num(data, "poll_interval_secs");
+  const rawRecent = data["recent"];
+  // Off => never surface activities, even if a frame carried some.
+  const recent = enabled && Array.isArray(rawRecent)
+    ? rawRecent
+        .filter(isPlainObject)
+        .map(coerceApertureActivity)
+        .filter((a): a is ApertureActivity => a !== null)
+        .slice(0, APERTURE_PREVIEW_CAP)
+    : [];
+  const nonNeg = (v: number | null): number => (v === null || v < 0 ? 0 : Math.floor(v));
+  return {
+    enabled,
+    count: nonNeg(count),
+    cap: nonNeg(cap),
+    pollIntervalSecs: nonNeg(poll),
+    recent,
+  };
+}
+
+/** Bucket a duration in seconds into a compact, human label — the HUD twin of the
+ *  daemon's `aperture::format_duration` so a span reads the same on both sides.
+ *  `< 60s` -> "under a minute"; `< 1h` -> "Nm"; else "Hh" / "Hh Mm". */
+export function formatApertureDuration(secs: number): string {
+  const s = Number.isFinite(secs) && secs > 0 ? Math.floor(secs) : 0;
+  if (s < 60) return "under a minute";
+  if (s < 3600) return `${Math.floor(s / 60)}m`;
+  const hours = Math.floor(s / 3600);
+  const mins = Math.floor((s % 3600) / 60);
+  return mins === 0 ? `${hours}h` : `${hours}h ${mins}m`;
+}
+
+/* ------------------------------------------------------------------------ *
  * CAPABILITY MAP — the live honest "armed by default, gated per action"       *
  * readout (daemon capability.rs -> `system / capability.map`, audit-snapshot  *
  * cadence). One row per notable subsystem: ready / armed-but-needs-a-          *
@@ -6412,6 +6503,135 @@ export function parseSyncStatus(data: Record<string, unknown>): SyncStatus {
     syncableFacts: nonNegInt(data, "syncable_facts"),
     pendingConflicts: nonNegInt(data, "pending_conflicts"),
     deletesPropagate: false,
+  };
+}
+
+/* ------------------------------------------------------------------------ *
+ * OVERWATCH FLEET POLICY (fleet.status) — the honest state of the E2E-        *
+ * encrypted, signed policy BASELINE the owner authored on one Mac and that    *
+ * every device enforces as a FLOOR OF STRICTNESS (daemon fleet.rs, audit-     *
+ * snapshot cadence). SHIPS OFF (with [sync]). The floor can ONLY HARDEN — a   *
+ * ceiling forces a tool stricter (Never / always-Ask), never looser — so      *
+ * `hardensOnly` is pinned true (a payload can't claim it grants). Each rule   *
+ * carries only a tool id + a hardening (never/ask), NEVER a fact value or the *
+ * shared key. The rules list is bounded defensively (the wire is never        *
+ * trusted).                                                                    *
+ * ------------------------------------------------------------------------ */
+
+/** A fleet baseline ceiling as surfaced to the HUD: a tool id + the hardening it
+ *  is forced to. `decision` is only ever "never" | "ask" — a fleet rule cannot
+ *  express "always" (the daemon type forbids it), so a junk token coerces to the
+ *  strictest "never" for an honest (never looser) display. */
+export type FleetHardening = "never" | "ask";
+
+/** Coerce an untrusted hardening token, defaulting a junk value to the strictest
+ *  "never" — a garbled ceiling must never DISPLAY as looser than it is. */
+export function coerceFleetHardening(v: unknown): FleetHardening {
+  return v === "never" || v === "ask" ? v : "never";
+}
+
+/** One per-tool fleet ceiling. */
+export interface FleetRule {
+  tool: string;
+  decision: FleetHardening;
+}
+
+/** The whole OVERWATCH fleet-policy surface (fleet.status). `enabled` is the
+ *  [fleet] on/off posture; `baselineActive` is whether a signed baseline is
+ *  installed; `authoredBy` is the device id that SET it (a device name, not a
+ *  secret); `created` is when; `rules` is the per-tool ceilings in the daemon's
+ *  order. `hardensOnly` is pinned true (the floor can never grant). SHIPPED-OFF
+ *  default: enabled=false, baselineActive=false, rules=[]. */
+export interface FleetStatus {
+  enabled: boolean;
+  baselineActive: boolean;
+  authoredBy: string;
+  created: string;
+  ruleCount: number;
+  rules: FleetRule[];
+  hardensOnly: boolean;
+}
+
+/** Coerce one untrusted fleet rule, or null if it lacks a usable tool id (a rule
+ *  is always anchored to a specific tool). A junk hardening reads as the strictest
+ *  "never" (never a looser display). Never throws. */
+function coerceFleetRule(o: Record<string, unknown>): FleetRule | null {
+  const tool = str(o, "tool");
+  if (tool === null || tool.length === 0) return null;
+  return { tool, decision: coerceFleetHardening(o["decision"]) };
+}
+
+/** Parse a `fleet.status` payload. NEVER returns null / never throws; a malformed
+ *  frame degrades to the honest off state. `hardensOnly` is PINNED true — a
+ *  payload can never claim the floor grants an action. `baselineActive` reads a
+ *  literal true only (a garbled frame is never "active"). Rules are coerced
+ *  item-by-item (junk dropped) and bounded defensively. */
+export function parseFleetStatus(data: Record<string, unknown>): FleetStatus {
+  const rawRules = data["rules"];
+  const rules = Array.isArray(rawRules)
+    ? rawRules
+        .filter(isPlainObject)
+        .map(coerceFleetRule)
+        .filter((r): r is FleetRule => r !== null)
+        .slice(0, 256)
+    : [];
+  return {
+    enabled: bool(data, "enabled") === true,
+    baselineActive: bool(data, "baseline_active") === true,
+    authoredBy: str(data, "authored_by") ?? "",
+    created: str(data, "created") ?? "",
+    ruleCount: nonNegInt(data, "rule_count"),
+    rules,
+    hardensOnly: true,
+  };
+}
+
+/* ------------------------------------------------------------------------ *
+ * CONTINUITY HANDOFF (handoff.status) — the honest state of resuming a LIVE   *
+ * session on another of the owner's Macs (daemon handoff.rs, audit-snapshot   *
+ * cadence). SHIPS OFF; rides sync (also OFF). A session capsule is sealed over *
+ * the SAME sync.rs sealed path; the network transport is armed-but-inert       *
+ * (`transportInert` pinned true). AUTHORITY NEVER TRANSFERS — the capsule       *
+ * carries NO resolved credential/bearer (`carriesCredentials` pinned false),   *
+ * and restoring context PARKS (`restoreParks` pinned true): every consequential *
+ * step on the receiving Mac re-hits the fresh confirm + voice-id + master       *
+ * switch. SECRET-FREE: booleans + a non-secret device label only.               *
+ * ------------------------------------------------------------------------ */
+
+/** The continuity-handoff pipeline status. */
+export interface HandoffStatus {
+  enabled: boolean;
+  keyPresent: boolean;
+  peerConfigured: boolean;
+  transportInert: boolean;
+  /** Pinned false — a capsule carries context, never credentials/bearers. */
+  carriesCredentials: boolean;
+  /** Pinned true — restoring context never restores permission; it parks. */
+  restoreParks: boolean;
+  /** Whether an inbound session capsule from a paired Mac is staged to resume. */
+  pendingCapsule: boolean;
+  /** The paired device's non-secret label ("Resume on <device>"); may be empty. */
+  device: string;
+}
+
+/** Defensive cap on the device label — a short id/name, never free-text. */
+const HANDOFF_DEVICE_CAP = 64;
+
+/** Parse a `handoff.status` payload. NEVER returns null / never throws; a
+ *  malformed frame degrades to the honest off state. `transportInert`,
+ *  `carriesCredentials`, and `restoreParks` are PINNED to their honest values —
+ *  a payload can never claim the transport is live, that credentials ride across,
+ *  or that a restore grants permission. */
+export function parseHandoffStatus(data: Record<string, unknown>): HandoffStatus {
+  return {
+    enabled: bool(data, "enabled") === true,
+    keyPresent: bool(data, "key_present") === true,
+    peerConfigured: bool(data, "peer_configured") === true,
+    transportInert: true,
+    carriesCredentials: false,
+    restoreParks: true,
+    pendingCapsule: bool(data, "pending_capsule") === true,
+    device: (str(data, "device") ?? "").slice(0, HANDOFF_DEVICE_CAP),
   };
 }
 
