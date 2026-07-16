@@ -13,9 +13,12 @@
 //!     bystander. The live recall dispatch consults [`is_guest_turn`] and feeds a
 //!     guest turn an EMPTY fact + history feed (fail-closed) — there is no "safe
 //!     subset" of the owner's memory to hand a bystander;
-//!   * a quieter focus profile (a [`crate::focus::FocusProfile`]), COMPOSED on top
-//!     of the owner's active profile through the SAME restrict-only
-//!     [`crate::focus::apply_profile`] path, so it can only ever quiet further.
+//!   * a quieter focus profile (a [`crate::focus::FocusProfile`]) carried as a
+//!     restrict-only knob — provably no-broader than the owner's via
+//!     [`crate::focus::apply_profile`]. NB: this scope is per-TURN, so it governs
+//!     the guest's own spoken turn, NOT the ambient anticipation/mission loops.
+//!     "Ambient guest-presence quieting" of proactive briefs is a SEPARATE future
+//!     feature (it needs a PERSISTENT guest-presence signal, not a per-turn one).
 //!
 //! ## The sacred invariant: guest scope can ONLY NARROW — it LAYERS ON TOP
 //! A guest scope is derived from the owner scope and is provably NO BROADER than
@@ -65,8 +68,6 @@
 //! another component reads" rationale — the unused-item lint is allowed module-wide.
 //! The invariant lives next to the type it guards; the tests exercise every item.
 #![allow(dead_code)]
-
-use std::sync::Mutex;
 
 use serde_json::json;
 
@@ -392,71 +393,76 @@ pub fn emit_guest(decision: &GuestDecision) {
 
 // ---------------------------------------------------------------------------
 // The per-turn GUEST SCOPE — how the installed [`Scope`] threads into the deep
-// recall dispatch, the tool loop, and the anticipation tick WITHOUT parameter
-// threading, EXACTLY mirroring `voiceid`'s per-turn `TURN_GATE` global.
+// recall dispatch and the tool loop of the GUEST'S OWN TURN, WITHOUT parameter
+// threading. It is a TASK-LOCAL confined to the run_pipeline turn task, so a
+// CONCURRENT background task (the anticipation loop, a durable/standing mission)
+// runs OUTSIDE any turn scope and can NEVER read — nor be governed by — a guest
+// turn's scope. A per-turn signal governs a TURN, never ambient background work.
 // ---------------------------------------------------------------------------
 
-/// Process-global current-turn GUEST SCOPE. `None` = no guest scope installed
-/// this turn, which reads as the OWNER PATH (no restriction): the recall
-/// dispatch uses the owner namespace, the tool loop offers the full agent
-/// allowlist, and the anticipation tick uses the owner's tuned behavior — all
-/// byte-for-byte unchanged. `Some(scope)` = a guest turn is scoped by `scope`.
-///
-/// Set once per turn near the top of `run_pipeline` (after voice-id, via
-/// [`set_turn_scope`] on an active guest decision, else [`clear_turn_scope`]),
-/// read at the deep recall/tool-loop sites + the anticipation tick
-/// ([`current_turn_scope`]), and CLEARED unconditionally at turn end by
-/// `main.rs`'s `TurnScopeGuard` (installed ahead of every early return) so a guest
-/// turn's scope can NEVER leak into the owner's next turn. Mirrors
-/// `voiceid::TURN_GATE` / its `TurnGateGuard` (a `Scope` is not `Copy`, so this is
-/// a `Mutex<Option<Scope>>` cloned on read rather than a `Cell`).
-static TURN_SCOPE: Mutex<Option<Scope>> = Mutex::new(None);
+tokio::task_local! {
+    /// The current TURN's guest scope. Established fresh for EACH turn by
+    /// [`with_turn_scope`] (the event loop wraps every `run_pipeline` call), so:
+    ///   * only the turn's OWN task sees it — a concurrent mission/anticipation
+    ///     task reads `None` (see [`current_turn_scope`]);
+    ///   * it resets to `None` for the next turn BY CONSTRUCTION — a guest turn's
+    ///     scope can never leak into the owner's next turn.
+    /// `RefCell` gives interior mutability so the decision (known only mid-turn,
+    /// after STT) can be installed via [`set_turn_scope`] within the same scope.
+    static TURN_SCOPE: std::cell::RefCell<Option<Scope>>;
+}
 
 // Test-only thread-local override, mirroring `voiceid`'s `GATE_OVERRIDE`: a test
-// forces the current-turn scope on its OWN thread without touching the
-// process-global slot other (parallel) tests read. The outer `Option` is "is an
-// override installed", the inner `Option<Scope>` is the forced value (Some =
-// guest scope, None = owner path). Compiled out in release.
+// forces the current-turn scope on its OWN thread without establishing a task
+// scope. The outer `Option` is "is an override installed", the inner
+// `Option<Scope>` is the forced value (Some = guest scope, None = owner path).
+// Compiled out in release.
 #[cfg(test)]
 thread_local! {
     static SCOPE_OVERRIDE: std::cell::RefCell<Option<Option<Scope>>> =
         const { std::cell::RefCell::new(None) };
 }
 
+/// Run one turn's pipeline `fut` inside a FRESH per-turn guest-scope slot. The
+/// event loop wraps EVERY `run_pipeline` call in this, so the guest scope is
+/// confined to that turn's task and reset for the next turn. A background task
+/// (anticipation / mission) is NOT wrapped, so its [`current_turn_scope`] reads
+/// `None` and it is never governed by a guest turn.
+pub async fn with_turn_scope<F>(fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    TURN_SCOPE.scope(std::cell::RefCell::new(None), fut).await
+}
+
 /// Install THIS turn's guest scope (called once near the top of `run_pipeline`
-/// when the decision is active). Poison-tolerant.
+/// when the decision is active). A no-op if somehow called outside a turn scope
+/// (a background task), so it can never affect ambient work.
 pub fn set_turn_scope(scope: Scope) {
-    *TURN_SCOPE.lock().unwrap_or_else(|p| p.into_inner()) = Some(scope);
+    let _ = TURN_SCOPE.try_with(|c| *c.borrow_mut() = Some(scope));
 }
 
-/// Clear the per-turn guest scope (called on an OWNER-path turn, and any time no
-/// guest scope should be in force) so a later turn never inherits a stale guest
-/// scope. Poison-tolerant.
+/// Clear the per-turn guest scope (the OWNER-path branch). A no-op outside a turn
+/// scope. Belt-and-suspenders on top of the per-turn reset [`with_turn_scope`]
+/// already guarantees.
 pub fn clear_turn_scope() {
-    *TURN_SCOPE.lock().unwrap_or_else(|p| p.into_inner()) = None;
+    let _ = TURN_SCOPE.try_with(|c| *c.borrow_mut() = None);
 }
 
-/// The current turn's installed guest scope — `None` (the OWNER path) when none
-/// is installed. This is the deep read consulted by the recall dispatch, the
-/// tool loop, and the anticipation tick.
+/// The current TURN's installed guest scope — `None` (the OWNER path) when none is
+/// installed OR when called from a BACKGROUND task that is not a turn (a mission,
+/// the anticipation loop). This is the deep read consulted by the recall dispatch
+/// and the tool loop.
 ///
-/// In TEST builds this reads ONLY the thread-local override (never the
-/// process-global), so a test exercising the `set_turn_scope`/`clear_turn_scope`
-/// guard primitives can NEVER contaminate a parallel test's view; every
-/// guest-scope test drives this through [`ScopeOverride`]. Live builds read the
-/// process-global that `run_pipeline` installs and `TurnScopeGuard` clears.
+/// In TEST builds a thread-local override takes precedence (so a test can force a
+/// scope on its own thread); absent an override it falls through to the task-local
+/// (so a test exercising [`with_turn_scope`] observes the real mechanism).
 pub fn current_turn_scope() -> Option<Scope> {
     #[cfg(test)]
-    {
-        SCOPE_OVERRIDE.with(|c| c.borrow().clone()).flatten()
+    if let Some(over) = SCOPE_OVERRIDE.with(|c| c.borrow().clone()) {
+        return over;
     }
-    #[cfg(not(test))]
-    {
-        TURN_SCOPE
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-    }
+    TURN_SCOPE.try_with(|c| c.borrow().clone()).unwrap_or(None)
 }
 
 /// Whether THIS turn is a GUEST turn — i.e. a guest scope is installed. The live
@@ -994,8 +1000,8 @@ mod tests {
     #[test]
     fn current_turn_scope_defaults_to_the_owner_path_and_the_override_restores() {
         // Default (no install / no override) reads as the OWNER path (None) — so the
-        // recall dispatch, tool loop, and anticipation tick are all byte-for-byte
-        // today's until a guest scope is installed.
+        // recall dispatch and tool loop are byte-for-byte today's until a guest scope
+        // is installed.
         assert!(current_turn_scope().is_none(), "no scope installed -> owner path");
         {
             let guest = guest_from(&orchestrator_owner(), &FocusProfile::DeepFocus);
@@ -1012,26 +1018,41 @@ mod tests {
         assert!(current_turn_scope().is_none());
     }
 
-    #[test]
-    fn the_per_turn_scope_global_clears_so_a_guest_scope_never_leaks_to_the_next_turn() {
-        // FINDING 2: what `run_pipeline`'s `TurnScopeGuard` guarantees — a guest turn's
-        // scope is CLEARED at turn end and cannot leak into the owner's next turn.
-        // Exercise the exact primitives the guard uses (`set_turn_scope` for the turn,
-        // `clear_turn_scope` on drop). Read the process-global DIRECTLY: in test builds
-        // `current_turn_scope` deliberately ignores the global for isolation, and this
-        // is the ONLY test that touches it — every other guest-scope test uses the
-        // thread-local override — so there is no parallel contamination. Fully
-        // synchronous (no await between set and clear).
-        let peek = || TURN_SCOPE.lock().unwrap_or_else(|p| p.into_inner()).is_some();
-        clear_turn_scope();
-        assert!(!peek(), "a turn starts with no guest scope");
-        // Turn N: a guest turn installs a scope.
-        set_turn_scope(guest_from(&orchestrator_owner(), &FocusProfile::DeepFocus));
-        assert!(peek(), "the guest scope is installed for the guest turn");
-        // Turn end: TurnScopeGuard::drop calls exactly this.
-        clear_turn_scope();
-        // Turn N+1: the owner's next turn sees NO leaked guest scope.
-        assert!(!peek(), "the guest scope did NOT leak into the next turn");
+    #[tokio::test]
+    async fn the_guest_scope_is_confined_to_its_own_turn_and_never_leaks_or_touches_background_tasks() {
+        // FINDING 2 + 4: the per-turn scope is a TASK-LOCAL established by
+        // `with_turn_scope`. Prove (a) a BACKGROUND task (no wrapper — a mission /
+        // the anticipation loop) reads None, so it is NEVER governed by a guest turn;
+        // (b) the scope is visible WITHIN its own turn; (c) it resets for the next
+        // turn by construction — no cross-turn leak.
+        //
+        // NB: in test builds `current_turn_scope` prefers a thread-local override
+        // (used by the other guest tests); with NO override installed it falls through
+        // to the task-local, which is what this test exercises.
+
+        // (a) Outside any turn scope -> None (a concurrent mission/anticipation task).
+        assert!(current_turn_scope().is_none(), "a background task reads no scope");
+
+        // (b) A turn wraps its work in with_turn_scope; the installed scope is visible.
+        with_turn_scope(async {
+            assert!(current_turn_scope().is_none(), "a turn starts with no scope");
+            set_turn_scope(guest_from(&orchestrator_owner(), &FocusProfile::DeepFocus));
+            assert!(current_turn_scope().is_some(), "the scope is visible within its own turn");
+            // A clear within the turn takes effect immediately.
+            clear_turn_scope();
+            assert!(current_turn_scope().is_none(), "clear within the turn empties the slot");
+            set_turn_scope(guest_from(&orchestrator_owner(), &FocusProfile::DeepFocus));
+        })
+        .await;
+
+        // (c) The NEXT turn is a FRESH scope — the previous turn's scope did not leak.
+        with_turn_scope(async {
+            assert!(current_turn_scope().is_none(), "the guest scope did NOT leak into the next turn");
+        })
+        .await;
+
+        // And after all turns, a background task still reads None.
+        assert!(current_turn_scope().is_none(), "background tasks remain unaffected");
     }
 
     #[test]
@@ -1125,17 +1146,18 @@ mod tests {
     }
 
     // =====================================================================
-    // ANTICIPATION TICK composition (WIRING POINT 4)
+    // A guest scope's focus profile is a restrict-only knob (NOT wired to any
+    // ambient tick — that is a separate future feature; see the module doc).
     // =====================================================================
 
     #[test]
-    fn anticipation_guest_composition_can_only_quiet_the_owners_tuned_behavior() {
+    fn a_guest_scopes_focus_profile_is_provably_no_broader_than_the_owners() {
         use crate::focus::SignalCategory;
-        // The EXACT composition the anticipation tick performs when a guest scope is
-        // installed: apply_profile(&scope.profile, &owner_tuned.as_base()) — the guest
-        // focus profile layered ON TOP of the owner's tuned behavior. It must be NO
-        // BROADER than the owner's tuned behavior (it can only quiet further, never
-        // surface more) for EVERY owner behavior a tick could be running under.
+        // The guest scope carries a focus profile as a restrict-only knob. Composed
+        // on top of the owner's tuned behavior it is provably NO BROADER (it can only
+        // quiet further), which is the profile axis of `is_no_broader_than`. This is a
+        // PURE property of the scope; it is NOT read by the anticipation/mission loops
+        // (a per-turn scope must not govern ambient background tasks).
         let owner_bases = [
             BaseBehavior::default(),
             apply_profile(&FocusProfile::Work, &BaseBehavior::default()).as_base(),
@@ -1144,16 +1166,13 @@ mod tests {
         for owner_base in owner_bases {
             let owner_tuned = apply_profile(&FocusProfile::Default, &owner_base);
             let scope = guest_from(&orchestrator_owner(), &FocusProfile::DeepFocus);
-            // This is precisely `main.rs`'s WIRING POINT 4 expression.
-            let guest_tuned = apply_profile(&scope.profile, &owner_tuned.as_base());
+            let guest_tuned = scope.behavior(&owner_tuned.as_base());
             assert!(
                 guest_tuned.is_no_broader_than(&owner_tuned.as_base()),
-                "the guest anticipation composition must never surface more than the owner's tuned behavior"
+                "the guest scope's profile must never surface more than the owner's tuned behavior"
             );
-            // The Critical floor still holds (a genuinely critical signal is never
-            // withheld even from the guest-quieted tick); ordinary intel is quieted.
-            assert!(guest_tuned.surfaces(SignalCategory::Critical), "critical floor holds for a guest tick");
-            assert!(!guest_tuned.surfaces(SignalCategory::News), "the guest tick quiets ordinary intel");
+            assert!(guest_tuned.surfaces(SignalCategory::Critical), "critical floor holds");
+            assert!(!guest_tuned.surfaces(SignalCategory::News), "the guest profile quiets ordinary intel");
         }
     }
 }

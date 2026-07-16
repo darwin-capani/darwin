@@ -3131,6 +3131,14 @@ fn guest_denied_fast_path(text: &str, cfg: &Config) -> Option<&'static str> {
     if describe_command(text).is_some() {
         return Some("vision describe");
     }
+    // The agent ROSTER / roll-call — route() fast paths that expose the owner's
+    // configured agent constellation. Not owner-personal data, but the guest
+    // allowlist is deny-by-default for EVERY route() fast path, so refuse these too
+    // (a guest gets conversation / translation / non-personal status, nothing about
+    // the owner's private setup).
+    if crate::agents::is_roll_call(text) || crate::agents::is_agent_query(text) {
+        return Some("agent roster");
+    }
     None
 }
 
@@ -8591,6 +8599,10 @@ mod tests {
             "undo that",                       // journal undo (consequential)
             "always allow the gmail_send action", // policy control (pure classify, no write)
             "use the local model",             // model swap control
+            "roll call",                       // agent roster (finding 2)
+            "who's on the team",               // agent roster (finding 2)
+            "list my agents",                  // agent query (finding 2)
+            "what agents do you have",         // agent query (finding 2)
         ] {
             assert!(
                 super::guest_denied_fast_path(u, &cfg).is_some(),

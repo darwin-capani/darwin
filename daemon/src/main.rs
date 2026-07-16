@@ -816,6 +816,48 @@ fn discard_wav(path: &Path) {
 /// server for durable facts from the exchange and upsert them. Runs on its
 /// own InferenceClient (the main loop owns the other one mutably) and only
 /// ever logs on failure — learning must never delay or break a response.
+/// Apply a spoken guest-mode toggle to the persistent `guest_mode` flag under the
+/// SPEAKER GUARD, then return the EXPLICIT guest flag that feeds `threshold::decide`
+/// (auto-guest from an Unrecognized voice is folded in by `decide` itself):
+///   * "guest mode on"  — ANY speaker may set the flag (it can only NARROW).
+///   * "guest mode off" — ONLY the verified OWNER (or an unenforced voice-id) may
+///     clear it; a bystander's OFF is IGNORED, so they can neither un-scope
+///     themselves (auto-guest still holds) nor strip the owner's explicit protection
+///     (the safety net against a voice-id false-accept).
+///   * the returned explicit flag = `guest_mode && (owner-verified OR unenforced)`,
+///     so an Unrecognized speaker is scoped BY THEIR VOICE, never by/despite the flag.
+///
+/// Pure over (toggle, speaker, &mut flag); unit-tested.
+fn resolve_explicit_guest(
+    toggle: Option<threshold::GuestToggle>,
+    speaker: threshold::SpeakerState,
+    guest_mode: &mut bool,
+) -> bool {
+    let owner_or_unenforced = matches!(
+        speaker,
+        threshold::SpeakerState::OwnerVerified | threshold::SpeakerState::Unenforced
+    );
+    match toggle {
+        Some(threshold::GuestToggle::On) => *guest_mode = true,
+        Some(threshold::GuestToggle::Off) if owner_or_unenforced => *guest_mode = false,
+        Some(threshold::GuestToggle::Off) => {
+            info!("THRESHOLD: ignoring a guest-mode-off toggle from a non-owner speaker");
+        }
+        None => {}
+    }
+    *guest_mode && owner_or_unenforced
+}
+
+/// Whether THIS turn's passive fact-learner should run. False for a transient
+/// perception read, an empty response, OR a GUEST turn. The guest clause is the
+/// security-critical one: the learner extracts first-person claims and WRITES them
+/// into the OWNER's fact store, so a bystander's turn must never seed it — mirroring
+/// the episodic VoiceGate that keeps an unrecognized speaker out of durable memory.
+/// Pure over the args + the per-turn guest scope, so the boundary is unit-tested.
+fn should_learn_turn(response: &str, transient: bool) -> bool {
+    !response.is_empty() && !transient && !threshold::is_guest_turn()
+}
+
 fn spawn_learning_task(sock: PathBuf, memory: Arc<Memory>, utterance: String, response: String) {
     tokio::spawn(async move {
         let mut infer = InferenceClient::new(sock);
@@ -1342,17 +1384,13 @@ async fn anticipation_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>,
         // else the once-resolved configured profile (identical to today).
         let tuned: &focus::TunedBehavior = auto_tuned.as_ref().unwrap_or(&configured_tuned);
 
-        // THRESHOLD — GUEST MODE (threshold.rs), WIRING POINT 4. When a guest scope
-        // is installed (a bystander at the mic), compose the guest focus profile ON
-        // TOP of the owner's tuned behavior through the SAME restrict-only
-        // `apply_profile` path Auto-Focus uses (`owner_tuned.as_base()`), so EDITH is
-        // at least as QUIET for a guest and its private surfaces are withheld — it
-        // can only ever narrow further, never broaden, never enable or loosen a gate.
-        // With no guest scope in force (the owner path) this is skipped and the tick
-        // is byte-for-byte today's.
-        let guest_tuned = threshold::current_turn_scope()
-            .map(|scope| focus::apply_profile(&scope.profile, &tuned.as_base()));
-        let tuned: &focus::TunedBehavior = guest_tuned.as_ref().unwrap_or(tuned);
+        // THRESHOLD — GUEST MODE does NOT touch this ambient tick. The per-turn guest
+        // scope governs a guest's OWN spoken turn (its reads / tools), NOT the
+        // background anticipation loop: this loop is a separate task, so it never
+        // reads a turn's task-local scope. "Ambient guest-presence quieting" of
+        // proactive briefs/missions is a SEPARATE future feature — it needs a
+        // PERSISTENT guest-presence signal (not a per-turn one), and is out of scope
+        // here. The tick is byte-for-byte today's regardless of any guest turn.
 
         // PROACTIVE-INTELLIGENCE SUGGESTIONS (#13 habit detector + #14 predictive
         // suggester). Runs every tick, INDEPENDENT of the EDITH brief decision
@@ -3057,7 +3095,11 @@ async fn main() -> Result<()> {
     let mut prior_turn: Option<optimize::PriorTurn> = None;
     while let Some(event) = rx.recv().await {
         let Event::Utterance { wav, embedding } = event;
-        let response = run_pipeline(
+        // THRESHOLD — GUEST MODE: run each turn inside a FRESH per-turn guest-scope
+        // slot (task-local). The scope is confined to THIS turn's task, so a
+        // concurrent background task (anticipation / a durable mission) never reads
+        // it, and it resets for the next turn by construction — no cross-turn leak.
+        let response = threshold::with_turn_scope(run_pipeline(
             wav,
             embedding,
             &root,
@@ -3076,7 +3118,7 @@ async fn main() -> Result<()> {
             &mut clone_state,
             &mut cloned_voices,
             &mut guest_mode,
-        )
+        ))
         .await;
         // Keep the last NON-empty spoken reply; a turn that produced nothing
         // (dropped/abandoned) leaves the prior reply as the echo reference.
@@ -3459,19 +3501,14 @@ async fn run_pipeline(
     // the master switch / per-action confirm / voice-id / lockdown gates: it can
     // only ever NARROW (fewer tools, shared-only recall, a quieter profile).
     {
-        // The EXPLICIT toggle persists across turns (like the owner profile): an
-        // owner who hands the mic to a guest stays scoped until they explicitly end
-        // it. CONSERVATIVE, anchored-imperative classifier — an ordinary utterance
-        // never flips it, and a bystander can only ever turn it ON (which merely
-        // narrows), never widen anything. AUTO-guest (an Unrecognized speaker) needs
-        // no persistent state — it is derived per turn from the voice gate below, so
-        // a guest can never un-scope themselves by saying "guest mode off".
-        match threshold::classify_guest_toggle(&text) {
-            Some(threshold::GuestToggle::On) => *guest_mode = true,
-            Some(threshold::GuestToggle::Off) => *guest_mode = false,
-            None => {}
-        }
+        // Resolve THIS turn's speaker signal FIRST, then the EXPLICIT guest flag
+        // under the SPEAKER GUARD (see `resolve_explicit_guest`): any speaker may turn
+        // guest mode ON (it can only NARROW), but ONLY the verified OWNER or an
+        // unenforced voice-id may turn it OFF — a bystander can never un-scope anyone,
+        // and auto-guest (an Unrecognized voice) is folded in by `decide`.
         let speaker = threshold::SpeakerState::from_owner_gate(&voiceid::current_turn_gate());
+        let explicit_guest =
+            resolve_explicit_guest(threshold::classify_guest_toggle(&text), speaker, guest_mode);
         let cfg_view = threshold::ThresholdConfigView::from_config(&cfg.threshold);
         // The owner scope this turn would run under: the orchestrator wildcard tools
         // + the identity focus profile — the WIDEST owner baseline, so the guest
@@ -3479,7 +3516,7 @@ async fn run_pipeline(
         // tool loop re-intersects the guest tools with the ACTIVE agent's allowlist.
         let owner_scope =
             threshold::Scope::owner(vec!["*".to_string()], focus::FocusProfile::Default);
-        let decision = threshold::decide(speaker, *guest_mode, &cfg_view, &owner_scope);
+        let decision = threshold::decide(speaker, explicit_guest, &cfg_view, &owner_scope);
         threshold::emit_guest(&decision);
         if decision.active {
             // HARD SAFETY RAIL: the installed guest scope can only ever NARROW the
@@ -3840,7 +3877,11 @@ async fn run_pipeline(
                 || router::is_generate_image_request(&text)
                 || router::is_identify_sound_request(&text)
                 || screen_context::is_screen_context_recall(&text);
-            if !outcome.response.is_empty() && !transient {
+            // THRESHOLD — GUEST MODE: `should_learn_turn` skips the passive
+            // fact-learner on a guest turn, so a bystander's first-person claims never
+            // poison the OWNER's fact store (mirrors the episodic VoiceGate below).
+            // Owner path: byte-for-byte today's.
+            if should_learn_turn(&outcome.response, transient) {
                 spawn_learning_task(
                     sock_path.to_path_buf(),
                     memory.clone(),
@@ -4239,13 +4280,13 @@ impl Drop for TurnGateGuard {
     }
 }
 
-/// RAII guard that clears the per-turn THRESHOLD guest scope when `run_pipeline`
-/// returns by ANY path (every early return drops it). EXACT analogue of
-/// `TurnGateGuard` for voice-id: without it, a guest turn's scope would PERSIST
-/// into the OWNER's next turn — over-restricting the owner's tools/recall and (via
-/// the anticipation tick) suppressing the owner's own briefs. Installed at the TOP
-/// of `run_pipeline`, ahead of every early return, so the guest scope is strictly
-/// per-turn: set/replaced inside the turn, unconditionally cleared here at turn end.
+/// RAII guard that clears the per-turn THRESHOLD guest scope on EVERY return path.
+/// The guest scope is a TASK-LOCAL established fresh per turn by
+/// `threshold::with_turn_scope` (the event loop wraps each `run_pipeline` call), so
+/// per-turn isolation already holds by construction — this guard is belt-and-
+/// suspenders that empties the slot the moment the turn's work is done, ahead of
+/// any late-turn code. Installed at the TOP of `run_pipeline`. (`clear_turn_scope`
+/// is a no-op outside a turn scope, so this can never touch a background task.)
 struct TurnScopeGuard;
 impl Drop for TurnScopeGuard {
     fn drop(&mut self) {
@@ -4997,9 +5038,87 @@ async fn trigger_create_pronunciation(
 
 #[cfg(test)]
 mod tests {
-    use super::{fmt_ms, is_self_echo, is_stale_wait, RotatingLogWriter, STALE_UTTERANCE_WAIT};
+    use super::{
+        fmt_ms, is_self_echo, is_stale_wait, resolve_explicit_guest, should_learn_turn,
+        RotatingLogWriter, STALE_UTTERANCE_WAIT,
+    };
+    use super::{focus, threshold};
     use std::io::Write;
     use std::time::Duration;
+
+    /// A representative guest scope for the guest-turn assertions below.
+    fn guest_scope() -> threshold::Scope {
+        threshold::guest_from(
+            &threshold::Scope::owner(vec!["*".to_string()], focus::FocusProfile::Default),
+            &focus::FocusProfile::DeepFocus,
+        )
+    }
+
+    // THRESHOLD — GUEST MODE, finding 1: the passive fact-learner never runs on a
+    // guest turn, so a bystander's first-person claims never poison owner memory.
+    #[test]
+    fn a_guest_turn_never_runs_the_passive_fact_learner() {
+        // Owner path (no guest scope): a real, non-transient turn learns as today.
+        assert!(should_learn_turn("You're Darwin.", false), "owner learns a real turn");
+        // Transient / empty turns never learn (unchanged).
+        assert!(!should_learn_turn("You're Darwin.", true), "transient never learns");
+        assert!(!should_learn_turn("", false), "empty response never learns");
+        // GUEST turn: NEVER learns — no write into the owner's fact store.
+        let _o = threshold::ScopeOverride::guest(guest_scope());
+        assert!(
+            !should_learn_turn("My name is Mallory.", false),
+            "a guest turn must never run the fact-learner (no owner-memory write)"
+        );
+    }
+
+    // THRESHOLD — GUEST MODE, finding 3: the explicit toggle is speaker-guarded so a
+    // bystander can never un-scope themselves, and a non-owner OFF is ignored.
+    #[test]
+    fn the_guest_toggle_is_speaker_guarded() {
+        use threshold::{GuestToggle, SpeakerState};
+
+        // A bystander (Unrecognized) saying "guest mode off" does NOT clear the flag,
+        // and the effective explicit flag is false — but decide()'s auto-guest (not
+        // exercised here) keeps them scoped by their voice.
+        let mut flag = true; // the owner had turned guest mode ON earlier
+        let eff = resolve_explicit_guest(Some(GuestToggle::Off), SpeakerState::Unrecognized, &mut flag);
+        assert!(flag, "a bystander's OFF must NOT clear the owner's explicit flag");
+        assert!(!eff, "the explicit flag never takes effect for an Unrecognized speaker");
+
+        // A bystander CAN turn guest mode ON (it can only narrow).
+        let mut flag = false;
+        let eff = resolve_explicit_guest(Some(GuestToggle::On), SpeakerState::Unrecognized, &mut flag);
+        assert!(flag, "any speaker may turn guest mode ON");
+        assert!(!eff, "an Unrecognized speaker's explicit flag still defers to auto-guest, not Explicit");
+
+        // The verified OWNER may turn guest mode OFF and un-scope themselves.
+        let mut flag = true;
+        let eff = resolve_explicit_guest(Some(GuestToggle::Off), SpeakerState::OwnerVerified, &mut flag);
+        assert!(!flag, "the verified owner may clear the flag");
+        assert!(!eff, "owner OFF -> no explicit guest");
+
+        // The verified OWNER may turn guest mode ON (hand the mic to a guest).
+        let mut flag = false;
+        let eff = resolve_explicit_guest(Some(GuestToggle::On), SpeakerState::OwnerVerified, &mut flag);
+        assert!(flag && eff, "owner ON -> explicit guest active");
+
+        // With voice-id UNENFORCED, OFF is allowed (no speaker distinction exists).
+        let mut flag = true;
+        let eff = resolve_explicit_guest(Some(GuestToggle::Off), SpeakerState::Unenforced, &mut flag);
+        assert!(!flag && !eff, "unenforced OFF clears the flag");
+
+        // No toggle: the flag is unchanged; effective only for owner/unenforced.
+        let mut flag = true;
+        assert!(
+            resolve_explicit_guest(None, SpeakerState::Unenforced, &mut flag),
+            "a persisted ON flag stays effective for an unenforced turn"
+        );
+        let mut flag = true;
+        assert!(
+            !resolve_explicit_guest(None, SpeakerState::Unrecognized, &mut flag),
+            "a persisted ON flag NEVER makes an Unrecognized speaker Explicit (auto-guest governs)"
+        );
+    }
 
     /// STARTUP-ORDER pin (source-level, like forge.rs's no_auto_deploy proof):
     /// `telemetry::init()` must run BEFORE `apps::AppRegistry::discover(` in
