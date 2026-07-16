@@ -89,24 +89,71 @@ public enum PIIDetector {
         for range in matchRanges(numberRegex, in: text) {
             // Drop a number that overlaps an email (its digits are the email's).
             if emailRanges.contains(where: { rangesOverlap($0, range) }) { continue }
-            let token = String(text[range])
-            let digitCount = token.reduce(0) { $0 + ($1.isNumber ? 1 : 0) }
-            if cardDigitRange.contains(digitCount) {
-                // Long-number band: a CARD only if Luhn-valid; otherwise NOT
-                // masked (do not over-mask an arbitrary long number, and never
-                // demote it to a phone — phone is strictly below this band).
-                if luhnValid(token) {
-                    spans.append(PIISpan(kind: .card, range: range, matched: token))
-                }
-            } else if phoneDigitRange.contains(digitCount) {
-                spans.append(PIISpan(kind: .phone, range: range, matched: token))
-            }
-            // else: < 10 or > 19 digits -> not PII, left untouched.
+            classifyNumberCandidate(String(text[range]), at: range, in: text, into: &spans)
         }
 
         // Source order (ascending start). Emails and numbers can interleave.
         spans.sort { $0.range.lowerBound < $1.range.lowerBound }
         return spans
+    }
+
+    /// The band of ONE numeric token: card (13–19 digits AND Luhn-valid), phone
+    /// (10–12), or `nil` (not PII). A long number that is not Luhn-valid is never
+    /// masked (no over-mask) and never demoted to a phone.
+    static func numberBand(_ token: String, _ digitCount: Int) -> PIIKind? {
+        if cardDigitRange.contains(digitCount) {
+            return luhnValid(token) ? .card : nil
+        }
+        if phoneDigitRange.contains(digitCount) {
+            return .phone
+        }
+        return nil
+    }
+
+    /// Classify a number CANDIDATE (which — because the run class allows whitespace
+    /// to catch a spaced phone like "555 123 4567" — may greedily span TWO
+    /// bare-adjacent numbers) into 0+ spans. A real grouped phone/card has small
+    /// groups (≤4 digits each: "555 123 4567", "4539 5787 6362 1486"); when a
+    /// whitespace-separated group is LARGER, the whitespace joins SEPARATE numbers,
+    /// so we split and classify each over ITS OWN range. Without this, two adjacent
+    /// numbers merge into one out-of-band run and BOTH silently leak — the
+    /// dangerous under-mask direction for a redactor (the review's finding).
+    static func classifyNumberCandidate(
+        _ token: String,
+        at range: Range<String.Index>,
+        in text: String,
+        into spans: inout [PIISpan]
+    ) {
+        let digitsOf: (Substring) -> Int = { $0.reduce(0) { $0 + ($1.isNumber ? 1 : 0) } }
+
+        // If the WHOLE candidate is a valid single number — a grouped phone/card like
+        // "555 123 4567", "(555) 123-4567", or "4539 5787 6362 1486" — it is ONE
+        // number. (Two benign shorts that happen to sum into a band, e.g. "12345
+        // 67890", are structurally indistinguishable from a real spaced phone, so
+        // masking them is the SAFE over-mask direction for a redactor.)
+        let whole = token.reduce(0) { $0 + ($1.isNumber ? 1 : 0) }
+        if let kind = numberBand(token, whole) {
+            spans.append(PIISpan(kind: kind, range: range, matched: token))
+            return
+        }
+
+        // Out of every band. If it contains whitespace, the run class glued SEPARATE
+        // numbers together (e.g. "5551234567 5559876543" -> a 20-digit run): split
+        // and classify each piece over ITS OWN range so both redact, instead of
+        // silently leaking both as one out-of-band run (the review's under-mask leak).
+        guard token.contains(where: { $0.isWhitespace }) else { return }
+        var cursor = range.lowerBound
+        for sub in token.split(omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace }) {
+            while cursor < range.upperBound, text[cursor].isWhitespace {
+                cursor = text.index(after: cursor)
+            }
+            let subStart = cursor
+            for _ in 0..<sub.count { cursor = text.index(after: cursor) }
+            let subToken = String(sub)
+            if let kind = numberBand(subToken, digitsOf(sub)) {
+                spans.append(PIISpan(kind: kind, range: subStart..<cursor, matched: subToken))
+            }
+        }
     }
 
     // -- Luhn -----------------------------------------------------------------

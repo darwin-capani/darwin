@@ -126,4 +126,34 @@ final class PIIDetectorTests: XCTestCase {
         // The bands are non-overlapping and phone sits strictly below card.
         XCTAssertLessThan(PIIDetector.phoneDigitRange.upperBound, PIIDetector.cardDigitRange.lowerBound)
     }
+
+    // --- adjacent-number merge (the review's under-mask leak) ----------------
+
+    func testTwoAdjacentNumbersAreEachRedactedNotMergedAndLeaked() {
+        // REGRESSION: two bare-adjacent numbers separated only by a space must NOT
+        // merge into one out-of-band run that leaks BOTH. Each is classified.
+        let phones = PIIDetector.detect(in: "call 5551234567 5559876543 now")
+        XCTAssertEqual(phones.count, 2, "both phones detected, not merged: \(phones)")
+        XCTAssertTrue(phones.allSatisfy { $0.kind == .phone })
+
+        // Two Luhn-valid 16-digit cards side by side (a 32-digit merged run would leak).
+        let cards = PIIDetector.detect(in: "4539578763621486 4485275742308327")
+        XCTAssertEqual(cards.count, 2, "both cards detected, not merged: \(cards)")
+        XCTAssertTrue(cards.allSatisfy { $0.kind == .card })
+    }
+
+    func testGroupedPhoneAndCardStillDetectAsOne() {
+        // A genuine grouped phone / card (small <=4-digit groups) is ONE number.
+        XCTAssertEqual(PIIDetector.detect(in: "555 123 4567").count, 1, "spaced phone is one")
+        XCTAssertEqual(PIIDetector.detect(in: "4539 5787 6362 1486").first?.kind, .card, "spaced card is one card")
+    }
+
+    func testLoneShortNumbersAreNotMasked() {
+        // A single short number (< phone band) is left alone. (Two adjacent shorts
+        // that sum into the phone band are indistinguishable from a real spaced
+        // phone, so masking THEM is the safe over-mask direction — not tested as a
+        // no-op here, since the safe choice is to mask.)
+        XCTAssertTrue(PIIDetector.detect(in: "code 12345 here").isEmpty, "a lone short number is untouched")
+        XCTAssertTrue(PIIDetector.detect(in: "the year 2026 was").isEmpty, "a 4-digit year is untouched")
+    }
 }
