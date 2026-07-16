@@ -310,6 +310,16 @@ pub struct Config {
     /// or serious thermal pressure — it never loosens a gate, never makes a cloud
     /// call. The LIVE pmset/thermal reader is device-gated behind this flag.
     pub power: PowerConfig,
+    /// [obol] — CLOUD-SPEND LEDGER + DOLLAR-CAP ROUTING BUDGET (obol.rs). A durable,
+    /// bounded, secret-free spend ledger (one row per cloud call: model + token
+    /// counts + dollar estimate + agent + ts) fed from the SAME point eval.rs records
+    /// cloud usage. `daily_usd_cap` SHIPS 0.0 == NO CAP (INERT): the budget is a
+    /// REDUCE-ONLY routing input (Override > Budget-floor > Auto > Fallback) that can
+    /// ONLY step a near/over-cap turn DOWN to a cheaper/on-device tier — it never
+    /// loosens a gate, never escalates to a pricier model, and never blocks a call the
+    /// user EXPLICITLY forces. With the cap 0 the budget influences nothing (routing is
+    /// byte-for-byte today's); the ledger still records honest accounting.
+    pub obol: ObolConfig,
     /// [report] — REPORT GENERATION (#40, report.rs). `enabled` SHIPS ON (full-power
     /// default). The op is READ-ONLY — it pulls the already-cited notebook/research
     /// material and folds it into a BOUNDED markdown report, REUSING research.rs's
@@ -965,6 +975,9 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // below which (on battery) DARWIN prefers Fast + defers heavy work. Listed so
     // neither reads as a typo.
     ("power", &["adaptive", "low_battery_pct"]),
+    // [obol] — CLOUD-SPEND LEDGER + DOLLAR-CAP BUDGET. `daily_usd_cap` ships 0.0
+    // (no cap == inert; the budget is REDUCE-ONLY once a cap is set).
+    ("obol", &["daily_usd_cap"]),
     // [report] — REPORT GENERATION (#40, report.rs). `enabled` SHIPS ON (full-power
     // default). The read-only op folds already-cited notebook/research material into a
     // bounded markdown report under research.rs's cite discipline (every citation a
@@ -1755,6 +1768,33 @@ impl Default for PowerConfig {
             // cheaper local Fast sub-tier + defer heavy work.
             low_battery_pct: 20,
         }
+    }
+}
+
+/// [obol] — CLOUD-SPEND LEDGER + DOLLAR-CAP ROUTING BUDGET (obol.rs). The durable,
+/// bounded, secret-free spend ledger records every cloud call (model, token counts,
+/// dollar estimate, agent, ts) from the SAME feed point as the eval cost window.
+/// `daily_usd_cap` is the ONLY knob and it SHIPS 0.0 == NO CAP (the feature is
+/// INERT): the budget is a REDUCE-ONLY routing input that, once a real cap is set,
+/// can only step a near/over-cap turn DOWN to a cheaper/on-device tier
+/// (Override > Budget-floor > Auto > Fallback). It NEVER loosens a gate, NEVER
+/// escalates to a pricier model, and NEVER blocks a call the user explicitly forces.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ObolConfig {
+    /// The daily cloud-spend cap in USD. `0.0` (the shipped default) means NO CAP:
+    /// [`crate::obol::budget_pressure`] is always `None`, so routing is byte-for-byte
+    /// today's. A positive value arms the REDUCE-ONLY budget-floor: at ~80% of the
+    /// cap a Heavy turn eases down to Fast; at/over the cap the turn is floored to the
+    /// on-device Local path (no further cloud spend). It only ever routes cheaper.
+    pub daily_usd_cap: f64,
+}
+
+impl Default for ObolConfig {
+    fn default() -> Self {
+        // SHIPS INERT: no cap. The ledger still records honest accounting, but the
+        // budget throttles NOTHING until the owner sets a real dollar cap.
+        Self { daily_usd_cap: 0.0 }
     }
 }
 
@@ -4307,6 +4347,7 @@ impl Config {
             webhooks: section(&table, "webhooks", &mut issues),
             plugin_sdk: section(&table, "plugin_sdk", &mut issues),
             power: section(&table, "power", &mut issues),
+            obol: section(&table, "obol", &mut issues),
             report: section(&table, "report", &mut issues),
             chart: section(&table, "chart", &mut issues),
             artifact: section(&table, "artifact", &mut issues),

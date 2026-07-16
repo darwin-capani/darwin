@@ -16,6 +16,7 @@ import UiActuatePanel from "./components/UiActuatePanel";
 import DiagnosticsPanel from "./components/DiagnosticsPanel";
 import DocSearchPanel from "./components/DocSearchPanel";
 import EvalPanel from "./components/EvalPanel";
+import SpendMeter from "./components/SpendMeter";
 import FirstRunSetup from "./components/FirstRunSetup";
 import ForgePanel from "./components/ForgePanel";
 import GlobalScanPanel, { GLOBAL_SCAN_APP } from "./components/GlobalScanPanel";
@@ -708,6 +709,7 @@ export default function App() {
           <MirrorPanel mirror={state.mirror} onContest={contestBelief} />
           <MemoryPanel memory={state.memory} />
           <EvalPanel report={state.evalReport} proposal={state.optimizerProposal} />
+          <SpendMeter spend={state.obolSpend} />
           <SkillsPanel skills={state.skills} />
           <InferencePerfPanel perf={state.inferencePerf} />
           <DiagnosticsPanel gauges={state.gauges} facts={state.facts} actions={state.actions} />

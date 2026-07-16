@@ -33,6 +33,7 @@ import {
   DocIndexStatus,
   DocSearchResult,
   EvalReport,
+  ObolSpend,
   KnowledgeGraphResult,
   LifeLogDigest,
   SessionRewind,
@@ -167,6 +168,7 @@ import {
   parseUnifiedSearchResult,
   parseEpisodicRecorded,
   parseEvalReport,
+  parseObolSpend,
   parseForgeProposed,
   parseCapabilityAtlas,
   parseTccSnapshot,
@@ -785,6 +787,13 @@ export interface HudState {
    *  percentiles, sums, rates, and counts; latency/cost read "awaiting turns"
    *  until real turns/cloud calls feed them (runtime-gated). */
   evalReport: EvalReport | null;
+  /** The OBOL SPEND // CLOUD METER snapshot (obol.spend): today's cloud spend vs
+   *  the daily $ cap, the REDUCE-ONLY budget pressure (none/ease/floor), headroom,
+   *  a call count, and the recent secret-free rows. Null until the daemon emits the
+   *  first periodic meter (~20s after startup). SECRET-FREE — the wire carries only
+   *  dollars, counts, model/agent names, and the reduce-only posture. The dollars
+   *  are a labelled ESTIMATE; the budget can only route cheaper/on-device. */
+  obolSpend: ObolSpend | null;
   /** The last optimizer PROPOSAL (optimize.proposed): a REVIEWABLE artifact the
    *  propose-only optimizer wrote under state/optimize/proposals/<ts>/, awaiting
    *  the MANUAL scripts/apply_optimization.sh step. Null when none is pending —
@@ -1450,6 +1459,7 @@ export function initialState(): HudState {
     vault: null,
     skills: null,
     evalReport: null,
+    obolSpend: null,
     optimizerProposal: null,
     docIndex: null,
     docSearch: null,
@@ -2753,6 +2763,16 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // "awaiting turns", the routing/correction rates, and the OFF/propose
       // optimizer posture. REVIEW-ONLY: the eval framework measures, never tunes.
       return { ...s, evalReport: parseEvalReport(env.data) };
+    }
+
+    case "obol.spend": {
+      // The periodic AGGREGATE-ONLY spend meter (obol.rs). parseObolSpend NEVER
+      // returns null (a malformed payload yields an honest all-zero/"none"
+      // snapshot rather than a stale one) and NEVER carries PII — so the SPEND //
+      // CLOUD METER gauge always renders the current honest state: today's spend
+      // vs the daily $ cap, the REDUCE-ONLY budget pressure, and the recent
+      // secret-free rows. REVIEW-ONLY: the budget only ever routes cheaper.
+      return { ...s, obolSpend: parseObolSpend(env.data) };
     }
 
     case "optimize.proposed": {
