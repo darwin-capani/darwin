@@ -26,6 +26,14 @@ pub struct Config {
     /// by default; INERT WITHOUT A REPO (with no git repo the branch commit is a
     /// no-op — the in-memory queue + read-only list still work).
     pub changeq: ChangeqConfig,
+    /// [registry] — ATTESTED REGISTRY + SBOM (registry.rs): verify plugin bytes on
+    /// YOUR OWN machine instead of trusting the publisher. ARMED BY DEFAULT for
+    /// VERIFY but INERT until the owner adds a trusted signer — the allowlist ships
+    /// EMPTY, so with no allowlisted ed25519 key NO attestation can verify and
+    /// admission is FAIL-CLOSED (nothing is admitted). Adds NO new install
+    /// authority: install stays the human-gated step; the registry only decides
+    /// eligibility.
+    pub registry: RegistryConfig,
     pub telemetry: TelemetryConfig,
     pub proactive: ProactiveConfig,
     /// [focus] — FOCUS PROFILES (#24, focus.rs). `profile` ships "default" (the
@@ -467,6 +475,11 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // every propose-only artifact. "enabled" is the master gate; "max_pending"
     // bounds the in-memory review window. See ChangeqConfig.
     ("changeq", &["enabled", "max_pending"]),
+    // [registry] — ATTESTED REGISTRY + SBOM (registry.rs). `verify` is the master
+    // switch; `require_rebuild_match` also demands a matching local staging rebuild;
+    // `signers` is the ed25519 allowlist (key-id -> hex pubkey), which ships EMPTY so
+    // the gate is inert until the owner adds a trusted key. See RegistryConfig.
+    ("registry", &["verify", "require_rebuild_match", "signers"]),
     ("telemetry", &["port"]),
     (
         "proactive",
@@ -3237,6 +3250,47 @@ impl Default for ForgeConfig {
     }
 }
 
+/// [registry] — ATTESTED REGISTRY + SBOM (registry.rs): verify plugin bytes on
+/// YOUR OWN machine instead of trusting the publisher.
+///
+///   - `verify` (ships true): the VERIFY master switch. ARMED BY DEFAULT — a
+///     read-only verification gate, like [introspect]/[audit] — but INERT UNTIL
+///     THE OWNER ADDS A TRUSTED SIGNER: `signers` ships EMPTY, so with no
+///     allowlisted ed25519 key NO attestation can verify and admission refuses
+///     everything (fail-closed, not a bypass).
+///   - `require_rebuild_match` (ships true): also require a LOCAL staging rebuild
+///     whose artifact + dependency-closure (SBOM) hash MATCH the attestation (the
+///     reproducible-build check). Fail-closed: no rebuild / any mismatch => no
+///     admission.
+///   - `signers`: the allowlisted ed25519 signers, `key_id -> hex(32-byte
+///     public key)`. EMPTY by default. A malformed entry is ignored (never
+///     trusted), so a typo can only make the gate refuse more, never admit.
+///
+/// This gate adds NO NEW INSTALL AUTHORITY. Admission is ELIGIBILITY for the
+/// signed local index; the actual install stays the human-gated step (apps.rs /
+/// scripts/apply_forge.sh), exactly like forge's propose-only contract.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RegistryConfig {
+    pub verify: bool,
+    pub require_rebuild_match: bool,
+    pub signers: std::collections::BTreeMap<String, String>,
+}
+
+impl Default for RegistryConfig {
+    fn default() -> Self {
+        Self {
+            // ARMED for VERIFY (full-power default) — INERT WITHOUT A TRUSTED SIGNER:
+            // the empty `signers` allowlist admits nothing until the owner adds a key.
+            verify: true,
+            // Reproducible-build check ON: a local rebuild must match the attestation.
+            require_rebuild_match: true,
+            // EMPTY: no signer is trusted until the owner adds one (the gate is inert).
+            signers: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct TelemetryConfig {
@@ -4385,6 +4439,7 @@ impl Config {
             self_heal: section(&table, "self_heal", &mut issues),
             forge: section(&table, "forge", &mut issues),
             changeq: section(&table, "changeq", &mut issues),
+            registry: section(&table, "registry", &mut issues),
             telemetry: section(&table, "telemetry", &mut issues),
             proactive: section(&table, "proactive", &mut issues),
             focus: section(&table, "focus", &mut issues),

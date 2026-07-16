@@ -216,6 +216,23 @@ mode = "propose"  # "propose" (default): the downstream Optimizer reuses the sel
 enabled = true       # master gate, SHIPS ON (full-power default) — INERT WITHOUT A REPO: with no git repo the branch commit is a no-op (the in-memory queue + the read-only list still work); it never fabricates a branch it could not create. It changes NOTHING about any writer's propose-only contract — apply still runs each type's mandatory re-validation + human confirmation. Set false to register nothing.
 max_pending = 64     # BOUND on the in-memory review window (clamped to [1, 512]); past it the OLDEST pending proposal is evicted so the lane can never grow without bound.
 
+[registry]
+# ATTESTED REGISTRY + SBOM (registry.rs): verify plugin bytes ON YOUR OWN MACHINE
+# instead of trusting the publisher. A plugin is ADMITTED to DARWIN's signed LOCAL
+# index only when BOTH gates clear: (a) a re-derived build in the STAGING sandbox
+# produces an artifact hash + a dependency-closure (SBOM) hash that MATCH the plugin's
+# attestation (the reproducible-build check), AND (b) an allowlisted ed25519 signature
+# over the attestation verifies (reuses `ring`, the vetted crate already in the tree).
+# FAIL-CLOSED: any hash mismatch, a non-allowlisted signer, or an invalid/tampered
+# signature REFUSES admission. This is a VERIFICATION GATE and adds NO new install
+# authority — install stays the human-gated step (apps.rs / scripts/apply_forge.sh); the
+# registry only decides ELIGIBILITY. "Trust the publisher" becomes "verify the bytes on
+# my own machine".
+verify = true                 # VERIFY master switch. ARMED BY DEFAULT (read-only verification gate, like [introspect]/[audit]) — but INERT WITHOUT A TRUSTED SIGNER: the [registry.signers] allowlist ships EMPTY, so with no allowlisted ed25519 key NO attestation can verify and admission is FAIL-CLOSED (nothing is admitted) until the owner adds a trusted key. Set false to disable.
+require_rebuild_match = true  # also require a LOCAL staging rebuild whose artifact + dependency-closure (SBOM) hash MATCH the attestation before admission (the reproducible-build check). SHIPS ON; fail-closed (no rebuild / any mismatch => no admission).
+# [registry.signers]          # allowlisted ed25519 signers: <key-id> = "<hex-encoded 32-byte public key>". EMPTY by default (the gate is inert until the owner adds a trusted key). A malformed entry is ignored (never trusted). Example:
+# owner-key-1 = "3b6a27bcceb6a42d62a3a8d02a6f0d73653215771de243a63ac048a18b59da29"
+
 [explain]
 # CAUSA (explain.rs): the causal decision-trace explainer — "why did you do that" /
 # "why <Agent>". At the end of each turn the loop folds the branch signals it ALREADY

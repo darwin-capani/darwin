@@ -279,6 +279,16 @@ mod proactive_intel;
 mod realm;
 mod recall;
 mod reflect;
+// ATTESTED REGISTRY + SBOM (registry.rs): verify plugin bytes ON YOUR OWN MACHINE
+// instead of trusting the publisher. A plugin is ADMITTED to the signed LOCAL index
+// only when (a) a STAGING rebuild's artifact + dependency-closure (SBOM) hash MATCH
+// the plugin's attestation AND (b) an allowlisted ed25519 signature over the
+// attestation verifies (reuses `ring`). PURE + FAIL-CLOSED: any mismatch / a
+// non-allowlisted or invalid signature REFUSES admission. Adds NO new install
+// authority — install stays the human-gated step (apps.rs / apply_forge.sh); the
+// registry only decides eligibility. Armed by default; INERT until the owner adds a
+// trusted signer (empty allowlist admits nothing).
+mod registry;
 // REPORT GENERATION (#40): a PURE build_report(title, sources:[SourcedClaim], cfg)
 // -> Report {sections:[{heading, body, citations}], all_citations, empty} +
 // render_markdown. Assembles already-cited notebook/research material into one
@@ -2663,6 +2673,17 @@ async fn main() -> Result<()> {
         #[cfg(feature = "endpoint-security")]
         es::start_and_report();
     }
+    // ATTESTED REGISTRY + SBOM (registry.rs): announce the verify-gate posture
+    // ONCE so a HUD that connects after boot learns whether plugin-byte
+    // verification is armed and how many trusted signers exist (0 => INERT). This
+    // is a SECRET-FREE status frame (a count, never a key); the verification gate
+    // itself is consulted at the human-gated install site (reconciled at
+    // integration). Read-only announce — it admits/installs nothing.
+    registry::announce_status(
+        cfg.registry.verify,
+        cfg.registry.require_rebuild_match,
+        &cfg.registry.signers,
+    );
     // Ambient EGRESS BASELINE + BEACON loop: a slow, READ-ONLY sampler over the
     // host's outbound connections (the same lsof snapshot the Egress Sentinel
     // uses). It folds each sample into a BOUNDED longitudinal baseline and runs
