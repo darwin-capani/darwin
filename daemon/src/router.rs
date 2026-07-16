@@ -1319,6 +1319,9 @@ pub async fn route(
     // it and the core color shifts to its hue.
     let agent = select_agent(agents, &class.intent, text, cloud_reachable, to_cloud);
     emit_agent_active(agent);
+    // OBOL: note the handling agent so a cloud spend row this turn attributes cost
+    // to it (a secret-free agent NAME, never an utterance). No-op accounting seam.
+    crate::obol::note_active_agent(&agent.name);
 
     if actuating_cloud {
         let model = cloud_model(needs_deep_reasoning, cfg);
@@ -2193,6 +2196,12 @@ fn conversation_brain(
     cloud_key_present: bool,
     class: &Classification,
 ) -> (ConversationBrain, crate::model_tier::Tier, crate::model_tier::Reason) {
+    // OBOL BUDGET-FLOOR: the current dollar-budget pressure (Pressure::None under
+    // the shipped no-cap default, so byte-for-byte today's routing until the owner
+    // sets `[obol].daily_usd_cap`). Read synchronously from the in-memory day total;
+    // it is a REDUCE-ONLY precedence input (Override > Budget-floor > Auto > Fallback)
+    // that can only step the tier DOWN toward the cheaper/on-device path.
+    let budget = crate::obol::current_budget_pressure(cfg);
     let (tier, reason) = crate::model_tier::resolve_tier(
         cfg,
         crate::model_tier::current_override(),
@@ -2200,6 +2209,7 @@ fn conversation_brain(
         class.confidence,
         cfg.router.cloud_confidence_threshold,
         cloud_key_present,
+        budget,
     );
     let brain = match crate::model_tier::tier_to_model(tier, cfg) {
         crate::model_tier::ModelChoice::Cloud(model) => ConversationBrain::Cloud(model),
