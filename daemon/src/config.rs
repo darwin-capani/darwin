@@ -318,6 +318,18 @@ pub struct Config {
     /// or serious thermal pressure — it never loosens a gate, never makes a cloud
     /// call. The LIVE pmset/thermal reader is device-gated behind this flag.
     pub power: PowerConfig,
+    /// [snapshot] — SAFETY SNAPSHOT (snapshot.rs). `enabled` SHIPS ON
+    /// (armed-by-default). BENIGN-ONLY: before a consequential, hard-to-reverse
+    /// step (a self-heal apply, a consequential mission step) DARWIN takes a
+    /// bounded, device-gated `tmutil localsnapshot` and records the resulting
+    /// APFS restore point into the reversible journal so "undo that" can name a
+    /// concrete OS-level rollback target. Snapshot CREATION writes/deletes NONE
+    /// of the user's data (a COW marker macOS thins automatically), so it ships
+    /// on within the benign-only contract. RESTORE is NEVER automated — DARWIN
+    /// only SURFACES the restore point + the exact user-run `tmutil` command.
+    /// INERT WITHOUT APFS: a non-APFS / no-space / no-permission volume degrades
+    /// to an honest "would-have" and changes nothing.
+    pub snapshot: SnapshotConfig,
     /// [obol] — CLOUD-SPEND LEDGER + DOLLAR-CAP ROUTING BUDGET (obol.rs). A durable,
     /// bounded, secret-free spend ledger (one row per cloud call: model + token
     /// counts + dollar estimate + agent + ts) fed from the SAME point eval.rs records
@@ -1008,6 +1020,15 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // below which (on battery) DARWIN prefers Fast + defers heavy work. Listed so
     // neither reads as a typo.
     ("power", &["adaptive", "low_battery_pct"]),
+    // [snapshot] — SAFETY SNAPSHOT (snapshot.rs). `enabled` SHIPS ON (armed-by-
+    // default). BENIGN-ONLY: before a consequential step (a self-heal apply, a
+    // consequential mission step) DARWIN takes a bounded `tmutil localsnapshot`
+    // and records the APFS restore point into the reversible journal so "undo
+    // that" can name a concrete OS-level rollback target. Creation writes/deletes
+    // nothing (macOS thins snapshots automatically); RESTORE is never automated —
+    // it only surfaces the user-run `tmutil` command. Listed so it never reads as
+    // a typo.
+    ("snapshot", &["enabled"]),
     // [obol] — CLOUD-SPEND LEDGER + DOLLAR-CAP BUDGET. `daily_usd_cap` ships 0.0
     // (no cap == inert; the budget is REDUCE-ONLY once a cap is set).
     ("obol", &["daily_usd_cap"]),
@@ -1826,6 +1847,38 @@ impl Default for PowerConfig {
             // Conservative discharge threshold: below 20% on battery, prefer the
             // cheaper local Fast sub-tier + defer heavy work.
             low_battery_pct: 20,
+        }
+    }
+}
+
+/// [snapshot] — SAFETY SNAPSHOT (snapshot.rs). BENIGN-ONLY, armed by default.
+///
+///   - `enabled` (SHIPS ON, armed-by-default): the master gate. Before a
+///     consequential, hard-to-reverse step (a self-heal apply, a consequential
+///     mission step) DARWIN takes a bounded, fixed-arg `tmutil localsnapshot`
+///     and records the resulting APFS restore point into the reversible journal
+///     so "undo that" can name a concrete OS-level rollback target. Snapshot
+///     CREATION is ADDITIVE-BENIGN (a COW marker that writes/deletes NONE of the
+///     user's data; macOS thins local snapshots automatically), so it ships on
+///     within the benign-only contract. RESTORE is NEVER automated — DARWIN only
+///     SURFACES the restore point + the exact user-run `tmutil` command; it never
+///     rolls back on its own. Off => no snapshot is taken and no anchor recorded.
+///     INERT WITHOUT APFS: a non-APFS / no-space / no-permission volume degrades
+///     to an honest "would-have" and changes nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SnapshotConfig {
+    pub enabled: bool,
+}
+
+impl Default for SnapshotConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS ON (armed-by-default). BENIGN-ONLY: snapshot CREATION writes/
+            // deletes none of the user's data (a COW APFS marker macOS thins
+            // automatically), and RESTORE is never automated — DARWIN only ever
+            // surfaces the restore point + the user-run `tmutil` command.
+            enabled: true,
         }
     }
 }
@@ -4496,6 +4549,7 @@ impl Config {
             webhooks: section(&table, "webhooks", &mut issues),
             plugin_sdk: section(&table, "plugin_sdk", &mut issues),
             power: section(&table, "power", &mut issues),
+            snapshot: section(&table, "snapshot", &mut issues),
             obol: section(&table, "obol", &mut issues),
             report: section(&table, "report", &mut issues),
             chart: section(&table, "chart", &mut issues),
@@ -4757,6 +4811,30 @@ mod tests {
         );
         assert!(cfg.power.adaptive);
         assert_eq!(cfg.power.low_battery_pct, 15);
+    }
+
+    /// SAFETY SNAPSHOT: [snapshot].enabled SHIPS ON (armed-by-default; benign-only
+    /// — snapshot creation writes/deletes nothing and RESTORE is never automated),
+    /// the key is KNOWN (no unknown-key diagnostic), and it round-trips off.
+    #[test]
+    fn snapshot_defaults_on_and_key_known() {
+        let (cfg, issues) = Config::parse("");
+        assert!(issues.is_empty(), "{issues:?}");
+        assert!(
+            cfg.snapshot.enabled,
+            "[snapshot].enabled SHIPS ON (armed-by-default; benign create, restore never automated)"
+        );
+
+        let raw = r#"
+            [snapshot]
+            enabled = false
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        assert!(
+            !issues.iter().any(|i| i.contains("snapshot")),
+            "[snapshot] keys must be KNOWN (no diagnostic): {issues:?}"
+        );
+        assert!(!cfg.snapshot.enabled, "an explicit off must take");
     }
 
     /// AUTO-FOCUS: [focus].profile ships "default" (the identity) and [focus].auto

@@ -336,6 +336,15 @@ mod shell;
 mod signals;
 mod simulate;
 mod skills;
+// SAFETY SNAPSHOT (snapshot.rs): before a consequential, hard-to-reverse step (a
+// self-heal apply, a consequential mission step) DARWIN takes a bounded, device-
+// gated `tmutil localsnapshot` and records the resulting APFS restore point into
+// the reversible journal, so "undo that" can name a concrete OS-level rollback
+// target. BENIGN-ONLY (creation writes/deletes nothing; macOS thins snapshots) so
+// it ships ON; RESTORE is NEVER automated — DARWIN only surfaces the user-run
+// `tmutil` command. Non-APFS/no-space/no-permission => an honest "would-have".
+// Hermetically tested (tmutil exec injected; never spawned under test).
+mod snapshot;
 mod speech;
 mod standing;
 mod tcc;
