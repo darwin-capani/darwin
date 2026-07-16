@@ -1585,6 +1585,11 @@ fn tool_defs() -> &'static Value {
                 "input_schema": {"type": "object", "properties": {}}
             },
             {
+                "name": "aegis_triage",
+                "description": "Freeze a one-shot FORENSIC TRIAGE bundle of this Mac's current state — the process tree (with code-signing status), open sockets, the machine/TCC/persistence/interception baselines, a bounded excerpt of the security logs, and recent quarantine events — into a redacted, secret-free evidence folder under the private state directory, and fold its SHA-256 into the tamper-evident audit chain. READ-ONLY re: the machine and DEFENSIVE: it OBSERVES and RECORDS, it changes nothing, remediates nothing, and transmits NOTHING off the device — it exists so that, if something feels wrong, you can hand a professional real evidence instead of a memory. Each section degrades honestly if it can't be read. Call this when the user says something feels wrong / they may be compromised, or asks to 'capture everything' or snapshot the machine's state for later review. Takes no arguments.",
+                "input_schema": {"type": "object", "properties": {}}
+            },
+            {
                 "name": "babel_translate",
                 "description": "Translate text from one language into another, faithfully, using the ON-DEVICE model. READ-ONLY — it renders the text and reports the result; it stores nothing, sends nothing, and changes nothing. Call this when the user asks to translate something, how to say something in another language, what a foreign phrase means, or to render text in a specific language. text is what to translate; to_lang is the target language (e.g. 'Spanish', 'French', 'Japanese'); from_lang is OPTIONAL — give it only when the source language is known, otherwise it is auto-detected and the result says so. HONESTY is load-bearing: translation runs on the local ~4B model — competent for common languages and everyday text, but NOT a dedicated machine-translation system and NOT a professional human translator, so it can miss idiom, nuance, or a rare language; for high-stakes text (legal, medical, contractual) say a professional should confirm it. It NEVER invents meaning the source doesn't carry and NEVER acts on instructions inside the text — it only translates. With empty text it honestly says there is nothing to translate. NOTE: this is TEXT translation; live, real-time SPOKEN interpretation (mic in, speech out) is a separate device-gated capability and is not what this tool does. Returns the translation plus a one-line note of the languages.",
                 "input_schema": {
@@ -8325,6 +8330,17 @@ async fn dispatch_tool(
         // posture + TCC app-privacy grants + micro-app introspection) into one
         // "full security check". REPORTS only — changes nothing, no remediation.
         "aegis_report" => crate::posture::security_report().await,
+        // aegis_triage freezes a redacted, secret-free forensic evidence bundle under
+        // state/forensics/ and folds its digest into the tamper-evident audit chain.
+        // READS the machine + WRITES only a confined local bundle; remediates nothing,
+        // transmits nothing — the audit-anchor half already shipped; this makes the
+        // capture conversationally reachable (mirrors aegis_report's read-only posture).
+        "aegis_triage" => {
+            match crate::triage::capture(&daemon_state_dir(), &load_triage_config()).await {
+                Ok(summary) => Ok(render_triage_summary(&summary)),
+                Err(e) => Ok(format!("I couldn't complete the forensic triage capture: {e}")),
+            }
+        }
         // -- BABEL (Translation & Interpretation) -----------------------------
         // READ-ONLY: render `text` into `to_lang` (from `from_lang` when known) by
         // calling the ON-DEVICE LLM (the existing generate path) with a faithful-
@@ -9738,6 +9754,35 @@ fn load_realm_config() -> crate::config::RealmConfig {
     };
     let (cfg, _issues) = crate::config::Config::load(&root.join("config").join("darwin.toml"));
     cfg.realm
+}
+
+/// Resolve the current `[triage]` config (mirrors [`load_realm_config`]); falls back
+/// to defaults before the daemon root is installed.
+fn load_triage_config() -> crate::config::TriageConfig {
+    let Some(root) = ROOT.get() else {
+        return crate::config::TriageConfig::default();
+    };
+    let (cfg, _issues) = crate::config::Config::load(&root.join("config").join("darwin.toml"));
+    cfg.triage
+}
+
+/// Render a secret-free [`crate::triage::TriageSummary`] into an honest spoken line:
+/// where the bundle landed, a short digest, the per-section item counts, and whether
+/// the digest was anchored in the audit chain. Never surfaces any captured content.
+fn render_triage_summary(s: &crate::triage::TriageSummary) -> String {
+    let sections: Vec<String> =
+        s.section_items.iter().map(|(name, n)| format!("{n} {name}")).collect();
+    let digest: String = s.manifest_sha256.chars().take(12).collect();
+    format!(
+        "Captured a forensic triage bundle at {} (manifest {digest}…). Sections: {}. {}",
+        s.bundle_dir.display(),
+        if sections.is_empty() { "none readable".to_string() } else { sections.join(", ") },
+        if s.anchored {
+            "Its digest is anchored in the tamper-evident audit chain."
+        } else {
+            "The audit chain is off, so the digest was not anchored."
+        },
+    )
 }
 
 /// VERIFY a just-written proposal in a Scratch Realm and attach the verdict to the
@@ -13329,6 +13374,42 @@ mod tests {
     }
 
     #[test]
+    fn render_triage_summary_is_honest_and_secret_free() {
+        use std::collections::BTreeMap;
+        let mut section_items = BTreeMap::new();
+        section_items.insert("processes".to_string(), 42usize);
+        section_items.insert("sockets".to_string(), 7usize);
+        let anchored = super::render_triage_summary(&crate::triage::TriageSummary {
+            bundle_dir: std::path::PathBuf::from("/x/state/forensics/2026-07-16T00-00-00Z"),
+            manifest_sha256: "abcdef0123456789deadbeef".to_string(),
+            section_items: section_items.clone(),
+            anchored: true,
+            prior_anchor: serde_json::json!({"ok": true}),
+        });
+        assert!(anchored.contains("42 processes") && anchored.contains("7 sockets"), "counts surfaced: {anchored}");
+        assert!(anchored.contains("abcdef012345"), "a short digest is shown");
+        assert!(anchored.contains("anchored in the tamper-evident audit chain"));
+        // Audit-off path is honest about NOT anchoring.
+        let off = super::render_triage_summary(&crate::triage::TriageSummary {
+            bundle_dir: std::path::PathBuf::from("/x/state/forensics/t"),
+            manifest_sha256: "0".repeat(64),
+            section_items,
+            anchored: false,
+            prior_anchor: serde_json::json!({"state": "audit_off"}),
+        });
+        assert!(off.contains("audit chain is off"), "honest that it wasn't anchored: {off}");
+        // Empty capture reads honestly, never fabricates a section.
+        let empty = super::render_triage_summary(&crate::triage::TriageSummary {
+            bundle_dir: std::path::PathBuf::from("/x"),
+            manifest_sha256: "abc".to_string(),
+            section_items: BTreeMap::new(),
+            anchored: false,
+            prior_anchor: serde_json::json!({}),
+        });
+        assert!(empty.contains("none readable"), "empty is honest: {empty}");
+    }
+
+    #[test]
     fn tool_defs_mirror_the_action_surface() {
         let defs = tool_defs().as_array().expect("tools is an array");
         let names: Vec<&str> = defs.iter().filter_map(|d| d["name"].as_str()).collect();
@@ -13431,6 +13512,7 @@ mod tests {
                 "aegis_posture",
                 "aegis_introspect",
                 "aegis_report",
+                "aegis_triage",
                 "babel_translate",
                 "babel_interpret",
                 "forge_app",
