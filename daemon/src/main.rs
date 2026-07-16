@@ -3124,6 +3124,11 @@ async fn run_pipeline(
     // skips verification never inherits a stale verified=true. A guard makes every
     // early return safe.
     let _gate_guard = TurnGateGuard;
+    // THRESHOLD guest scope: the SAME per-turn discipline. Installed FIRST, ahead of
+    // every early return, so a guest turn's scope is cleared unconditionally at turn
+    // end and can never leak into the owner's next turn (tools / recall / the
+    // anticipation tick that would otherwise suppress the owner's own briefs).
+    let _scope_guard = TurnScopeGuard;
 
     // Per-turn RESPONSE-VOICE-LANGUAGE: the babel_interpret TOOL records the language
     // it translated INTO (to_lang) in a per-turn process-global so the response-speak
@@ -3504,6 +3509,13 @@ async fn run_pipeline(
     // inference clone seam and stores the returned voice id. A "forget the clone"
     // intent drops the stored id. All three return a spoken acknowledgment without
     // routing; an ordinary utterance returns None and falls through. NEVER automatic.
+    //
+    // THRESHOLD — GUEST MODE: voice cloning is a consequential action on the owner's
+    // account (it uploads a sample to the cloud clone seam) and manages the owner's
+    // stored clones. A guest reaches none of it — this block runs BEFORE route()'s
+    // gate, so skip it for a guest and fall through to the guest-gated conversational
+    // path. Owner path: byte-for-byte today's.
+    if !threshold::is_guest_turn() {
     if let Some(resp) = handle_voice_clone(
         &text,
         root,
@@ -3518,6 +3530,7 @@ async fn run_pipeline(
         discard_wav(&wav);
         return Some(resp);
     }
+    }
 
     // MACRO REPLAY (#27), AFTER STT and BEFORE classify/route. A "replay macro X"
     // utterance re-runs each recorded command through the FULL classify -> route ->
@@ -3531,6 +3544,17 @@ async fn run_pipeline(
     if let Some(crate::macros::MacroCommand::Replay { name }) =
         crate::macros::classify_macro_command(&text)
     {
+        // THRESHOLD — GUEST MODE: this block runs BEFORE route()'s guest fast-path
+        // gate, so refuse macro replay for a guest HERE — a bystander may not re-run
+        // the owner's saved commands. Nothing is replayed.
+        if threshold::is_guest_turn() {
+            info!(macro_name = %name, "THRESHOLD: refusing macro replay for a guest");
+            let msg = "I can't replay macros in guest mode — those re-run the owner's saved \
+                       commands. The owner can do it.".to_string();
+            let _ = speech::speak(&msg, infer, cfg, started, &mut reply).await;
+            discard_wav(&wav);
+            return Some(msg);
+        }
         // Compute the same brief + cloud-reachability the normal route path uses, so
         // each replayed step routes identically to a live command.
         let brief = proactive::first_contact_brief(cfg, memory).await;
@@ -3588,7 +3612,14 @@ async fn run_pipeline(
     // Proactive learning: when this utterance ends an away gap longer than
     // [proactive].idle_gap_hours, the first-contact brief rides into the
     // converse data and the persona phrases it (emits proactive.brief).
-    let brief = proactive::first_contact_brief(cfg, memory).await;
+    // THRESHOLD — GUEST MODE: the first-contact brief is the OWNER's proactive intel
+    // (calendar / mail / signals). A guest turn gets NONE of it — withheld like every
+    // other owner-data feed. Owner path: byte-for-byte today's.
+    let brief = if threshold::is_guest_turn() {
+        None
+    } else {
+        proactive::first_contact_brief(cfg, memory).await
+    };
 
     // Cloud reachability for Darwin-Prime delegation: the API key is the
     // honest signal (resolved once, cached). With no key, conversational turns
@@ -4205,6 +4236,20 @@ struct TurnGateGuard;
 impl Drop for TurnGateGuard {
     fn drop(&mut self) {
         voiceid::clear_turn_gate();
+    }
+}
+
+/// RAII guard that clears the per-turn THRESHOLD guest scope when `run_pipeline`
+/// returns by ANY path (every early return drops it). EXACT analogue of
+/// `TurnGateGuard` for voice-id: without it, a guest turn's scope would PERSIST
+/// into the OWNER's next turn — over-restricting the owner's tools/recall and (via
+/// the anticipation tick) suppressing the owner's own briefs. Installed at the TOP
+/// of `run_pipeline`, ahead of every early return, so the guest scope is strictly
+/// per-turn: set/replaced inside the turn, unconditionally cleared here at turn end.
+struct TurnScopeGuard;
+impl Drop for TurnScopeGuard {
+    fn drop(&mut self) {
+        threshold::clear_turn_scope();
     }
 }
 

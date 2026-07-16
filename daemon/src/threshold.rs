@@ -3,14 +3,16 @@
 //! ## What this is
 //! When voice-id reports an UNRECOGNIZED speaker (or the owner explicitly turns
 //! "guest mode" on), THRESHOLD projects a GUEST SCOPE over the turn:
-//!   * a restricted, strictly READ-ONLY tool allowlist (no consequential/outward
-//!     tools, no writes) — [`GUEST_READ_ONLY_TOOLS`], intersected with the owner's
-//!     own allowlist so it can never NAME a tool the owner lacks;
-//!   * recall routed to the SHARED-only namespace — never the owner's private
-//!     `agent.*` facts — by REUSING the existing namespace-isolation guard
-//!     ([`crate::memory::Memory::agent_scoped_facts`]) with a reserved sentinel
-//!     namespace no agent ever writes under, so the guard returns exactly the
-//!     shared tier;
+//!   * a restricted, strictly NON-PERSONAL tool allowlist — [`GUEST_READ_ONLY_TOOLS`]
+//!     (only `system_status`, `skill_list`, `babel_translate`), intersected with the
+//!     owner's own allowlist so it can never NAME a tool the owner lacks. NO tool
+//!     that reads or writes the owner's personal data is offered;
+//!   * NO owner memory at all. The whole fact store is the owner's personal data —
+//!     the "shared across agents" (`not agent.*`) tier still holds the owner's
+//!     `user.*` / `user.model.*` / `user.world.*` rows, so it is NOT safe for a
+//!     bystander. The live recall dispatch consults [`is_guest_turn`] and feeds a
+//!     guest turn an EMPTY fact + history feed (fail-closed) — there is no "safe
+//!     subset" of the owner's memory to hand a bystander;
 //!   * a quieter focus profile (a [`crate::focus::FocusProfile`]), COMPOSED on top
 //!     of the owner's active profile through the SAME restrict-only
 //!     [`crate::focus::apply_profile`] path, so it can only ever quiet further.
@@ -19,7 +21,8 @@
 //! A guest scope is derived from the owner scope and is provably NO BROADER than
 //! it on every axis ([`Scope::is_no_broader_than`], asserted by the property
 //! test): its tools are a SUBSET of the owner's, its recall is at least as
-//! restricted (shared-only), and its focus profile is at least as quiet. There is
+//! restricted (owner memory withheld), and its focus profile is at least as quiet.
+//! There is
 //! NO axis on which a guest scope can loosen anything — [`Scope`] carries only the
 //! three restrict-only knobs (tools / shared-recall / profile) and NOTHING that
 //! could express "loosen a gate", "raise autonomy", or "enable a consequential
@@ -51,13 +54,16 @@
 //! `[threshold].enabled = false` the feature never scopes anything (owner behavior
 //! byte-for-byte).
 //!
-//! This module is a PURE decision seam whose LIVE wiring (the router installing the
-//! per-turn guest scope, the recall path reading `shared_recall_only`, the tool
-//! loop consulting `read_only_tools`, and the `emit_guest` telemetry call) lands at
-//! integration. Until then its public API is unused in the live build, so — exactly
-//! like `policy.rs`'s "a shared contract another component reads" rationale — the
-//! unused-item lint is allowed module-wide. The invariant lives next to the type it
-//! guards; the tests exercise every item.
+//! This module is a PURE decision seam. Its LIVE wiring is installed by the daemon:
+//! `run_pipeline` decides + installs the per-turn guest scope (cleared at turn end
+//! by `TurnScopeGuard`); the recall dispatch consults [`is_guest_turn`] to withhold
+//! owner memory; the tool loop intersects the offered tools with the guest scope and
+//! `execute_tool` refuses any tool outside it; `route()` refuses every owner-data /
+//! consequential fast path for a guest; and `emit_guest` publishes the frame. A few
+//! pure helpers exist for the invariant proofs (`is_no_broader_than`, `behavior`)
+//! and are not all live-called, so — exactly like `policy.rs`'s "a shared contract
+//! another component reads" rationale — the unused-item lint is allowed module-wide.
+//! The invariant lives next to the type it guards; the tests exercise every item.
 #![allow(dead_code)]
 
 use std::sync::Mutex;
@@ -66,44 +72,39 @@ use serde_json::json;
 
 use crate::focus::{apply_profile, BaseBehavior, FocusProfile, TunedBehavior};
 
-/// The reserved sentinel memory namespace a GUEST recalls under. It is a valid
-/// `agent.*`-shaped string that NO enrolled agent (and not the owner) ever writes
-/// facts under, chosen deliberately free of SQL `LIKE` metacharacters (`_`, `%`)
-/// so it can never wildcard-match a real namespace. Feeding it to the EXISTING
-/// own+shared guard [`crate::memory::Memory::agent_scoped_facts`] therefore yields
-/// ONLY the shared tier (the `agent.<sentinel>.` own-prefix matches nothing, so
-/// just the `NOT LIKE 'agent.%'` shared rows survive) — the honest reuse of the
-/// isolation guard, not a second recall path.
-pub const GUEST_NAMESPACE: &str = "agent.guest-scope";
-
 /// The tools wildcard the orchestrator (`darwin`) holds. Mirrors
 /// `agents::TOOLS_WILDCARD` / [`crate::agents::Agent::may_use`].
 const TOOLS_WILDCARD: &str = "*";
 
-/// The CURATED, strictly-READ-ONLY local tool allowlist a guest may use. Every
-/// entry runs entirely on-device and is read-only: it stores nothing, sends
-/// nothing to the cloud, and takes NO consequential/outward action. This is a
-/// STRICT subset of `anthropic::SAFE_LOCAL_TOOLS` with the two non-read entries
-/// deliberately DROPPED: `remember_fact` (a durable WRITE) and `skill_invoke` (can
-/// dispatch a CONSEQUENTIAL skill). A guest gets to ASK and RETRIEVE, never to
-/// change state or reach outward. The guest recall tools additionally read only
-/// the SHARED tier (see [`GUEST_NAMESPACE`]).
+/// The CURATED tool allowlist a guest may use — narrowed to ONLY genuinely
+/// NON-PERSONAL tools, ones whose dispatch touches NO owner-stored personal data
+/// and takes NO consequential/outward/write action:
+///   * `system_status` — machine health (RAM + disk-free pct); no owner data.
+///   * `skill_list` — the skill CATALOG (capability names/categories); no owner data.
+///   * `babel_translate` — transforms the guest's own text; stores nothing, reads
+///     nothing, sends nothing.
+///
+/// A guest can TALK, TRANSLATE, and see non-personal STATUS — nothing personal.
+///
+/// DELIBERATELY EXCLUDED (each reads or writes the OWNER's private data, so the
+/// "shared across agents" tier is NOT safe for a bystander — that tier still holds
+/// the owner's personal `user.*` / `user.model.*` / `user.world.*` rows):
+///   * `recall_facts` / `mnemosyne_recall` / `episodic_recall` — read the owner's
+///     memory store (routing to a "shared" namespace does NOT protect the owner,
+///     because that tier IS the owner's personal facts);
+///   * `user_model_query` — the owner's personal profile (`user.model.*`);
+///   * `world_query` — the owner's personal world graph (`user.world.*`);
+///   * `doc_search` — the owner's indexed documents;
+///   * `search_files` — the owner's `$HOME` filesystem;
+///   * `remember_fact` / `skill_invoke` — a durable WRITE / a consequential dispatch.
+///
+/// A bystander gets NO owner-memory access at all.
 pub const GUEST_READ_ONLY_TOOLS: &[&str] = &[
-    // Memory / semantic recall — read-only retrieval (shared-tier only for a guest).
-    "recall_facts",
-    "mnemosyne_recall",
-    "episodic_recall",
-    "user_model_query",
-    "world_query",
-    // On-device retrieval / search — read-only, on-device. NOTE: `unified_search`
-    // is deliberately NOT here — it fans the query out to the OWNER's connected
-    // Gmail / Calendar / Slack and returns their private data, so it is neither
-    // on-device nor safe to expose to a bystander (it is not in SAFE_LOCAL_TOOLS).
-    "doc_search",
-    "search_files",
-    // Read-only status + the skill CATALOG (listing, not invocation).
+    // Read-only machine status + the skill CATALOG (listing, not invocation).
     "system_status",
     "skill_list",
+    // On-device translation of the guest's OWN text — no owner data touched.
+    "babel_translate",
 ];
 
 /// The per-turn SPEAKER signal THRESHOLD reasons over, derived from the voice-id
@@ -182,8 +183,10 @@ impl GuestReason {
 ///
 /// The three restrict-only knobs:
 ///   * `tools` — the tool allowlist (`["*"]` = the orchestrator wildcard).
-///   * `shared_recall_only` — when true, recall is confined to the SHARED tier
-///     (via [`GUEST_NAMESPACE`]); when false, the owner's normal own+shared recall.
+///   * `shared_recall_only` — when true, the owner's stored memory is WITHHELD from
+///     this turn ENTIRELY (a guest reads none of it — see [`is_guest_turn`], which
+///     the live recall dispatch consults to return an empty feed); when false, the
+///     owner's normal own+shared recall. It only ever TIGHTENS recall.
 ///   * `profile` — the focus lens applied to (composed onto) the base behavior.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Scope {
@@ -208,19 +211,6 @@ impl Scope {
     /// so guest tool admission uses the IDENTICAL rule as the live allowlist gate.
     pub fn admits(&self, tool: &str) -> bool {
         admits(&self.tools, tool)
-    }
-
-    /// The memory namespace this scope recalls under, GIVEN the owner's active
-    /// namespace. A shared-only (guest) scope recalls under the reserved
-    /// [`GUEST_NAMESPACE`] sentinel — so the EXISTING own+shared guard returns only
-    /// the shared tier; an owner scope recalls under the owner's own namespace
-    /// (own + shared, exactly as today).
-    pub fn recall_namespace<'a>(&self, owner_namespace: &'a str) -> &'a str {
-        if self.shared_recall_only {
-            GUEST_NAMESPACE
-        } else {
-            owner_namespace
-        }
     }
 
     /// The focus behavior this scope yields when COMPOSED on top of `base`. For an
@@ -415,10 +405,11 @@ pub fn emit_guest(decision: &GuestDecision) {
 /// Set once per turn near the top of `run_pipeline` (after voice-id, via
 /// [`set_turn_scope`] on an active guest decision, else [`clear_turn_scope`]),
 /// read at the deep recall/tool-loop sites + the anticipation tick
-/// ([`current_turn_scope`]), and REPLACED every full turn so an owner turn never
-/// inherits a stale guest scope. Mirrors `voiceid::TURN_GATE` (a `Scope` is not
-/// `Copy`, so this is a `Mutex<Option<Scope>>` cloned on read rather than a
-/// `Cell`).
+/// ([`current_turn_scope`]), and CLEARED unconditionally at turn end by
+/// `main.rs`'s `TurnScopeGuard` (installed ahead of every early return) so a guest
+/// turn's scope can NEVER leak into the owner's next turn. Mirrors
+/// `voiceid::TURN_GATE` / its `TurnGateGuard` (a `Scope` is not `Copy`, so this is
+/// a `Mutex<Option<Scope>>` cloned on read rather than a `Cell`).
 static TURN_SCOPE: Mutex<Option<Scope>> = Mutex::new(None);
 
 // Test-only thread-local override, mirroring `voiceid`'s `GATE_OVERRIDE`: a test
@@ -448,32 +439,38 @@ pub fn clear_turn_scope() {
 /// The current turn's installed guest scope — `None` (the OWNER path) when none
 /// is installed. This is the deep read consulted by the recall dispatch, the
 /// tool loop, and the anticipation tick.
+///
+/// In TEST builds this reads ONLY the thread-local override (never the
+/// process-global), so a test exercising the `set_turn_scope`/`clear_turn_scope`
+/// guard primitives can NEVER contaminate a parallel test's view; every
+/// guest-scope test drives this through [`ScopeOverride`]. Live builds read the
+/// process-global that `run_pipeline` installs and `TurnScopeGuard` clears.
 pub fn current_turn_scope() -> Option<Scope> {
     #[cfg(test)]
     {
-        if let Some(over) = SCOPE_OVERRIDE.with(|c| c.borrow().clone()) {
-            return over;
-        }
+        SCOPE_OVERRIDE.with(|c| c.borrow().clone()).flatten()
     }
-    TURN_SCOPE
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .clone()
+    #[cfg(not(test))]
+    {
+        TURN_SCOPE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
+    }
 }
 
-/// The memory namespace to recall under THIS turn, honoring an installed guest
-/// scope: when a guest scope is active the reserved shared-only [`GUEST_NAMESPACE`]
-/// sentinel (so the EXISTING own+shared guard returns only the SHARED tier), else
-/// the owner namespace UNCHANGED. This is the single seam the live recall
-/// dispatch (`grounded_facts`, the `recall_facts` / `mnemosyne_recall` /
-/// `episodic_recall` tools, `router::agent_facts`) calls so a guest NEVER reads
-/// the owner's private `agent.*` facts — while the owner path is byte-for-byte
-/// today's (returns `owner_namespace` verbatim).
-pub fn recall_namespace_for_turn(owner_namespace: &str) -> String {
-    match current_turn_scope() {
-        Some(scope) => scope.recall_namespace(owner_namespace).to_string(),
-        None => owner_namespace.to_string(),
-    }
+/// Whether THIS turn is a GUEST turn — i.e. a guest scope is installed. The live
+/// recall dispatch (`grounded_facts` / `router::agent_facts`) consults this to
+/// WITHHOLD the owner's stored memory from a guest ENTIRELY: a guest turn feeds NO
+/// owner facts to the prompt and is offered NO owner-memory recall tool. The whole
+/// `user.*` / `user.model.*` / `user.world.*` / `agent.*` store is the OWNER's
+/// personal data — the "shared across agents" (`not agent.*`) tier is NOT safe for
+/// a bystander, since it still holds the owner's `user.*` rows — so a guest reads
+/// NONE of it. On the owner path this is false and the feed is byte-for-byte
+/// today's. This is the honest, fail-closed replacement for any namespace routing:
+/// there is no "safe subset" of the owner's memory to hand a bystander.
+pub fn is_guest_turn() -> bool {
+    current_turn_scope().is_some()
 }
 
 /// `#[cfg(test)]`-only RAII guard forcing [`current_turn_scope`] to a value on the
@@ -600,17 +597,19 @@ mod tests {
         Scope::owner(vec!["*".to_string()], FocusProfile::Default)
     }
 
-    /// A representative SPECIALIST owner scope: a finite allowlist mixing read-only
-    /// tools with consequential/outward ones. Its guest projection must keep ONLY
-    /// the read-only ones it already holds.
+    /// A representative SPECIALIST owner scope: a finite allowlist mixing the ONE
+    /// non-personal guest tool it holds (`system_status`) with owner-data readers and
+    /// consequential/write tools. Its guest projection must keep ONLY the non-personal
+    /// tool it already holds, dropping every owner-data / consequential one.
     fn specialist_owner() -> Scope {
         Scope::owner(
             vec![
-                "recall_facts".to_string(),
-                "doc_search".to_string(),
-                "gmail_send".to_string(), // consequential/outward — dropped for guest
-                "remember_fact".to_string(), // a write — dropped for guest
-                "shell_run".to_string(),  // maximally dangerous — dropped for guest
+                "system_status".to_string(), // non-personal — kept for a guest
+                "recall_facts".to_string(),  // owner memory — dropped for guest
+                "doc_search".to_string(),    // owner documents — dropped for guest
+                "gmail_send".to_string(),     // consequential/outward — dropped for guest
+                "remember_fact".to_string(),  // a write — dropped for guest
+                "shell_run".to_string(),      // maximally dangerous — dropped for guest
             ],
             FocusProfile::Work,
         )
@@ -658,6 +657,22 @@ mod tests {
     }
 
     #[test]
+    fn an_unrecognized_speaker_cannot_un_scope_themselves() {
+        // SECURITY: the explicit "guest mode off" toggle only clears the PERSISTENT
+        // flag (guest_flag=false); it does NOT clear the per-turn voice signal. So an
+        // UNRECOGNIZED speaker who says "guest mode off" (guest_flag=false) is STILL
+        // auto-scoped to guest — the voice-gate auto-scope wins. A bystander can never
+        // talk their way out of the guest scope while voice-id is enforcing.
+        let owner = orchestrator_owner();
+        let d = decide(SpeakerState::Unrecognized, false, &armed_cfg(), &owner);
+        assert!(d.active, "an unrecognized speaker stays scoped even with the explicit flag OFF");
+        assert_eq!(d.reason, GuestReason::Unrecognized);
+        // Only a VERIFIED owner turning the flag off returns to the full owner scope.
+        let d2 = decide(SpeakerState::OwnerVerified, false, &armed_cfg(), &owner);
+        assert!(!d2.active, "the verified owner with the flag off gets the full owner scope");
+    }
+
+    #[test]
     fn explicit_guest_toggle_scopes_even_for_a_recognized_owner() {
         // The owner can hand the mic to a guest explicitly, even while recognized.
         let owner = orchestrator_owner();
@@ -700,17 +715,18 @@ mod tests {
     }
 
     #[test]
-    fn specialist_guest_keeps_only_its_own_read_only_tools() {
-        // A specialist owner's guest projection is the intersection: it keeps only
-        // the read-only tools the owner ALREADY held (recall_facts, doc_search) and
-        // drops the consequential/write ones (gmail_send, remember_fact, shell_run).
+    fn specialist_guest_keeps_only_its_own_non_personal_tools() {
+        // A specialist owner's guest projection is the intersection: it keeps ONLY
+        // the non-personal tool the owner ALREADY held (system_status) and drops the
+        // owner-data readers (recall_facts, doc_search) and the consequential/write
+        // ones (gmail_send, remember_fact, shell_run).
         let owner = specialist_owner();
         let d = decide(SpeakerState::Unrecognized, false, &armed_cfg(), &owner);
         assert!(d.active);
         assert_eq!(
             d.scope.tools,
-            vec!["recall_facts".to_string(), "doc_search".to_string()],
-            "guest keeps only the read-only tools the owner held"
+            vec!["system_status".to_string()],
+            "guest keeps only the non-personal tools the owner held"
         );
     }
 
@@ -782,17 +798,22 @@ mod tests {
 
     #[test]
     fn guest_read_only_tools_intersects_never_unions() {
-        // Wildcard owner -> the whole read-only set.
+        // Wildcard owner -> the whole non-personal guest set.
         let full = guest_read_only_tools(&["*".to_string()]);
         assert_eq!(full.len(), GUEST_READ_ONLY_TOOLS.len());
-        // A narrow owner -> only the overlap, and NEVER a tool the owner lacks.
+        // A narrow owner -> only the overlap, and NEVER a tool the owner lacks. Here
+        // the owner holds one guest tool (system_status) and one it doesn't grant a
+        // guest (gmail_send), so the guest keeps only system_status.
         let narrow = guest_read_only_tools(&[
-            "doc_search".to_string(),
-            "gmail_send".to_string(), // not read-only -> not admitted into the guest set
+            "system_status".to_string(),
+            "gmail_send".to_string(), // not a guest tool -> not admitted into the guest set
         ]);
-        assert_eq!(narrow, vec!["doc_search".to_string()]);
-        // An owner with NO read-only tools -> an empty guest set (nothing to grant).
+        assert_eq!(narrow, vec!["system_status".to_string()]);
+        // An owner with NO non-personal guest tools -> an empty guest set. Note an
+        // owner-DATA reader (doc_search) does NOT grant a guest anything.
         assert!(guest_read_only_tools(&["gmail_send".to_string()]).is_empty());
+        assert!(guest_read_only_tools(&["doc_search".to_string()]).is_empty(),
+            "an owner-data reader is never a guest tool");
     }
 
     // =====================================================================
@@ -879,61 +900,6 @@ mod tests {
     }
 
     // =====================================================================
-    // RECALL ROUTING: reuse of the existing namespace-isolation guard
-    // =====================================================================
-
-    #[test]
-    fn guest_recall_namespace_is_the_sentinel_owner_is_the_owner_namespace() {
-        let owner = orchestrator_owner();
-        assert_eq!(owner.recall_namespace("agent.darwin"), "agent.darwin", "owner recalls under its own ns");
-        let guest = guest_from(&owner, &FocusProfile::DeepFocus);
-        assert_eq!(guest.recall_namespace("agent.darwin"), GUEST_NAMESPACE, "guest recalls under the sentinel");
-        // The sentinel is free of SQL LIKE metacharacters so it can never wildcard.
-        assert!(!GUEST_NAMESPACE.contains('_'), "sentinel must avoid the LIKE '_' wildcard");
-        assert!(!GUEST_NAMESPACE.contains('%'), "sentinel must avoid the LIKE '%' wildcard");
-    }
-
-    #[tokio::test]
-    async fn guest_recall_sees_only_shared_facts_via_the_existing_guard() {
-        // END-TO-END proof that routing a guest through the reserved sentinel
-        // namespace and the EXISTING own+shared guard yields SHARED-ONLY recall —
-        // never the owner's private `agent.*` facts.
-        let path = std::env::temp_dir().join(format!("darwin-threshold-recall-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let mem = crate::memory::Memory::open(&path).expect("open temp memory");
-
-        // A shared fact (common knowledge) + the OWNER's private namespaced fact.
-        mem.upsert_fact("user.name", "Darwin").await.unwrap();
-        mem.upsert_fact("agent.darwin.secret_note", "the owner's private note").await.unwrap();
-
-        // The OWNER (recalling under its own namespace) sees BOTH.
-        let owner_ns = orchestrator_owner();
-        let owner_view = mem
-            .agent_scoped_facts(owner_ns.recall_namespace("agent.darwin"), 50)
-            .await
-            .unwrap();
-        let owner_keys: Vec<&str> = owner_view.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(owner_keys.contains(&"user.name"));
-        assert!(owner_keys.contains(&"agent.darwin.secret_note"), "owner sees its private fact");
-
-        // The GUEST (recalling under the sentinel) sees ONLY the shared fact — the
-        // owner's private `agent.darwin.*` note is invisible.
-        let guest = guest_from(&owner_ns, &FocusProfile::DeepFocus);
-        let guest_view = mem
-            .agent_scoped_facts(guest.recall_namespace("agent.darwin"), 50)
-            .await
-            .unwrap();
-        let guest_keys: Vec<&str> = guest_view.iter().map(|(k, _)| k.as_str()).collect();
-        assert!(guest_keys.contains(&"user.name"), "guest sees shared knowledge");
-        assert!(
-            !guest_keys.contains(&"agent.darwin.secret_note"),
-            "guest MUST NOT see the owner's private fact: {guest_keys:?}"
-        );
-
-        let _ = std::fs::remove_file(&path);
-    }
-
-    // =====================================================================
     // TELEMETRY shape
     // =====================================================================
 
@@ -968,25 +934,33 @@ mod tests {
     }
 
     #[test]
-    fn the_guest_tool_set_is_strictly_on_device_read_only() {
-        // REGRESSION: unified_search fans out to the OWNER's Gmail / Calendar / Slack —
-        // it is NOT on-device and NOT safe to hand a bystander; it must never be a
-        // guest tool (the exact thing guest mode exists to withhold).
-        assert!(
-            !GUEST_READ_ONLY_TOOLS.contains(&"unified_search"),
-            "unified_search reads the owner's connected cloud accounts — never a guest tool"
+    fn the_guest_tool_set_is_exactly_the_three_non_personal_tools() {
+        // The guest allowlist is narrowed to ONLY genuinely non-personal tools —
+        // ones whose dispatch touches NO owner-stored personal data and takes no
+        // consequential/write action.
+        assert_eq!(
+            GUEST_READ_ONLY_TOOLS,
+            &["system_status", "skill_list", "babel_translate"],
+            "the guest set is exactly the three non-personal tools"
         );
-        // The module's stated contract: every guest tool is a STRICT subset of the
-        // author's on-device read-only curation SAFE_LOCAL_TOOLS.
-        for t in GUEST_READ_ONLY_TOOLS {
+        // REGRESSION: NONE of the owner-data readers or write/outward tools may ever
+        // be a guest tool. `unified_search` fans out to the owner's connected cloud
+        // accounts; the memory-recall tools read the owner's fact store (the "shared"
+        // tier still holds the owner's user.* rows); user_model_query / world_query
+        // read the owner's profile / world graph; doc_search / search_files read the
+        // owner's documents / $HOME; remember_fact / skill_invoke write / dispatch.
+        for banned in [
+            "unified_search",
+            "recall_facts", "mnemosyne_recall", "episodic_recall",
+            "user_model_query", "world_query",
+            "doc_search", "search_files",
+            "remember_fact", "skill_invoke",
+            "open_url", "web_search", "gmail_send", "ui_actuate", "shell_run",
+        ] {
             assert!(
-                crate::anthropic::SAFE_LOCAL_TOOLS.contains(t),
-                "guest tool {t:?} must be in SAFE_LOCAL_TOOLS (proven on-device + read-only)"
+                !GUEST_READ_ONLY_TOOLS.contains(&banned),
+                "{banned:?} reads or writes the owner's data — must NEVER be a guest tool"
             );
-        }
-        // No write / outward / consequential tool slipped in.
-        for banned in ["remember_fact", "open_url", "web_search", "gmail_send", "ui_actuate", "shell_run"] {
-            assert!(!GUEST_READ_ONLY_TOOLS.contains(&banned), "{banned:?} must not be a guest tool");
         }
     }
 
@@ -1039,64 +1013,44 @@ mod tests {
     }
 
     #[test]
-    fn recall_namespace_for_turn_is_the_owner_ns_on_the_owner_path_and_the_sentinel_for_a_guest() {
-        // OWNER PATH (no guest scope): recall_namespace_for_turn returns the owner
-        // namespace VERBATIM — the recall dispatch is byte-for-byte unchanged.
-        {
-            let _o = ScopeOverride::owner();
-            assert_eq!(recall_namespace_for_turn("agent.darwin"), "agent.darwin");
-            assert_eq!(recall_namespace_for_turn("agent.friday"), "agent.friday");
-        }
-        // GUEST PATH: the shared-only sentinel, so the EXISTING own+shared guard
-        // yields only the shared tier — never the owner's private agent.* facts.
-        {
-            let guest = guest_from(&orchestrator_owner(), &FocusProfile::DeepFocus);
-            let _o = ScopeOverride::guest(guest);
-            assert_eq!(recall_namespace_for_turn("agent.darwin"), GUEST_NAMESPACE);
-            assert_eq!(recall_namespace_for_turn("agent.friday"), GUEST_NAMESPACE);
-        }
+    fn the_per_turn_scope_global_clears_so_a_guest_scope_never_leaks_to_the_next_turn() {
+        // FINDING 2: what `run_pipeline`'s `TurnScopeGuard` guarantees — a guest turn's
+        // scope is CLEARED at turn end and cannot leak into the owner's next turn.
+        // Exercise the exact primitives the guard uses (`set_turn_scope` for the turn,
+        // `clear_turn_scope` on drop). Read the process-global DIRECTLY: in test builds
+        // `current_turn_scope` deliberately ignores the global for isolation, and this
+        // is the ONLY test that touches it — every other guest-scope test uses the
+        // thread-local override — so there is no parallel contamination. Fully
+        // synchronous (no await between set and clear).
+        let peek = || TURN_SCOPE.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+        clear_turn_scope();
+        assert!(!peek(), "a turn starts with no guest scope");
+        // Turn N: a guest turn installs a scope.
+        set_turn_scope(guest_from(&orchestrator_owner(), &FocusProfile::DeepFocus));
+        assert!(peek(), "the guest scope is installed for the guest turn");
+        // Turn end: TurnScopeGuard::drop calls exactly this.
+        clear_turn_scope();
+        // Turn N+1: the owner's next turn sees NO leaked guest scope.
+        assert!(!peek(), "the guest scope did NOT leak into the next turn");
     }
 
-    #[tokio::test]
-    async fn live_recall_seam_hides_the_owners_private_fact_from_a_guest_end_to_end() {
-        // END-TO-END proof of the WIRING: the LIVE recall dispatch feeds
-        // `recall_namespace_for_turn(owner_ns)` to the EXISTING own+shared guard.
-        // With a guest scope installed that routes to the sentinel, so the owner's
-        // private agent.* fact is invisible; with no scope (owner path) both facts
-        // are visible — byte-for-byte today's recall.
-        let path = std::env::temp_dir().join(format!("darwin-threshold-wire-recall-{}.db", std::process::id()));
-        let _ = std::fs::remove_file(&path);
-        let mem = crate::memory::Memory::open(&path).expect("open temp memory");
-        mem.upsert_fact("user.name", "Darwin").await.unwrap();
-        mem.upsert_fact("agent.darwin.secret_note", "the owner's private note").await.unwrap();
-
-        // OWNER PATH: recall_namespace_for_turn("agent.darwin") == "agent.darwin",
-        // so the guard returns own + shared — both facts visible (unchanged).
+    #[test]
+    fn is_guest_turn_tracks_the_installed_scope() {
+        // OWNER PATH (no guest scope): is_guest_turn() is false — the recall dispatch
+        // is byte-for-byte unchanged and feeds the owner's memory as today.
         {
             let _o = ScopeOverride::owner();
-            let ns = recall_namespace_for_turn("agent.darwin");
-            let view = mem.agent_scoped_facts(&ns, 50).await.unwrap();
-            let keys: Vec<&str> = view.iter().map(|(k, _)| k.as_str()).collect();
-            assert!(keys.contains(&"user.name"), "owner sees shared knowledge");
-            assert!(keys.contains(&"agent.darwin.secret_note"), "owner path sees the private fact (unchanged)");
+            assert!(!is_guest_turn(), "owner path is not a guest turn");
         }
-
-        // GUEST PATH: the live seam routes to the sentinel, so the guard returns
-        // SHARED-only — the owner's private note is invisible to the guest.
+        // GUEST PATH: is_guest_turn() is true — the live recall dispatch consults
+        // this to WITHHOLD the owner's memory ENTIRELY (empty feed).
         {
             let guest = guest_from(&orchestrator_owner(), &FocusProfile::DeepFocus);
             let _o = ScopeOverride::guest(guest);
-            let ns = recall_namespace_for_turn("agent.darwin");
-            let view = mem.agent_scoped_facts(&ns, 50).await.unwrap();
-            let keys: Vec<&str> = view.iter().map(|(k, _)| k.as_str()).collect();
-            assert!(keys.contains(&"user.name"), "guest still sees shared knowledge");
-            assert!(
-                !keys.contains(&"agent.darwin.secret_note"),
-                "guest MUST NOT see the owner's private fact via the LIVE recall seam: {keys:?}"
-            );
+            assert!(is_guest_turn(), "an installed guest scope makes it a guest turn");
         }
-
-        let _ = std::fs::remove_file(&path);
+        // Restored on drop — the override never leaks into the next test.
+        assert!(!is_guest_turn(), "override restored the owner path");
     }
 
     #[test]

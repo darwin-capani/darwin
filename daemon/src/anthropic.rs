@@ -7065,6 +7065,27 @@ pub async fn replay_confirmed_action(
         );
         return (crate::voiceid::unrecognized_refusal(), true);
     }
+    // THRESHOLD — GUEST MODE: a parked action is the OWNER's; a guest may NEVER
+    // confirm/replay it. This replay path calls `dispatch_tool` DIRECTLY (below),
+    // bypassing the `execute_tool` guest gate, so refuse HERE — mirroring the voice-id
+    // confirm gate above. It closes the case that gate does not: an EXPLICIT guest
+    // turn while voice-id is OFF (the owner handed the mic to a guest). The pending
+    // was already taken from the slot by the caller, so refusing simply DROPS it (the
+    // action fires nothing); the owner can re-initiate. Owner path (no scope): a no-op.
+    if crate::threshold::is_guest_turn() {
+        warn!(tool = %pending.tool, "THRESHOLD: refusing to replay a parked action for a guest");
+        crate::telemetry::emit(
+            "system",
+            "threshold.confirm_refused",
+            json!({"tool": pending.tool, "agent": pending.agent, "phase": "confirm"}),
+        );
+        return (
+            "Guest mode is active — only the owner can confirm a parked action, so I've left it \
+             unrun. The owner can start it again."
+                .to_string(),
+            true,
+        );
+    }
     // Defense in depth: the agent that parked must still be permitted the tool.
     if !agent_may_use(&pending.allowed, &pending.tool) {
         warn!(tool = %pending.tool, "confirmed action is outside the agent allowlist; refusing replay");
@@ -7408,12 +7429,11 @@ async fn dispatch_tool(
         // Scoped to the active agent's namespace + shared facts (constellation
         // isolation): a cross-agent recall never surfaces another agent's private
         // agent.<other>.* namespace. meta.* is filtered inside agent_scoped_facts.
-        // THRESHOLD guest mode (WIRING POINT 2): under an installed guest scope
-        // `recall_namespace_for_turn` routes this read to the shared-only sentinel,
-        // so a guest calling recall_facts sees ONLY shared facts, never the owner's
-        // private agent.* tier. Owner path: `namespace` verbatim (unchanged).
+        // (A GUEST turn never reaches this arm: recall_facts is not in the guest
+        // allowlist and execute_tool's guest gate refuses it — a bystander gets NO
+        // owner-memory access at all, so there is no "shared tier" to route to.)
         "recall_facts" => memory
-            .agent_scoped_facts(&crate::threshold::recall_namespace_for_turn(namespace), RECALL_FACTS_LIMIT)
+            .agent_scoped_facts(namespace, RECALL_FACTS_LIMIT)
             .await
             .map(|facts| {
                 if facts.is_empty() {
@@ -8055,13 +8075,10 @@ async fn dispatch_tool(
         "episodic_recall" => match serde_json::from_value::<EpisodicRecallArgs>(input.clone()) {
             Ok(args) => {
                 let embedder = InferenceEmbedder::over_inference_socket();
-                // THRESHOLD guest mode (WIRING POINT 2): under an installed guest
-                // scope the episodic read is routed to the shared-only sentinel
-                // namespace (no episodes are recorded under it), so a guest never
-                // recalls the owner's private episodic history. Owner path: the
-                // agent's namespace verbatim (unchanged).
-                let recall_ns = crate::threshold::recall_namespace_for_turn(namespace);
-                Ok(episodic_recall_tool(&args, memory, &recall_ns, &embedder).await)
+                // (A GUEST turn never reaches this arm: episodic_recall is not in the
+                // guest allowlist and execute_tool's guest gate refuses it — a
+                // bystander gets NO access to the owner's episodic history.)
+                Ok(episodic_recall_tool(&args, memory, namespace, &embedder).await)
             }
             Err(e) => Err(anyhow!("invalid episodic_recall arguments: {e}")),
         },
@@ -9075,21 +9092,22 @@ async fn grounded_facts(
     k: usize,
     token_budget: usize,
 ) -> Vec<(String, String)> {
+    // THRESHOLD — GUEST MODE recall WITHHOLDING (WIRING POINT 2): a GUEST turn feeds
+    // NO owner memory to the prompt AT ALL. The entire fact store is the owner's
+    // personal data — the "shared across agents" (`not agent.*`) tier still holds
+    // the owner's `user.*` / `user.model.*` / `user.world.*` rows — so there is no
+    // safe subset to route a bystander to. Return an empty feed (fail-closed). On
+    // the owner path this is skipped and the feed is byte-for-byte today's.
+    if crate::threshold::is_guest_turn() {
+        return Vec::new();
+    }
     // Isolation-safe window: own namespace + shared user.* only (meta.* and other
     // agents' private namespaces excluded inside agent_scoped_facts). A busy/failed
     // DB degrades to no facts rather than killing the reply.
-    //
-    // THRESHOLD — GUEST MODE recall routing (WIRING POINT 2): when a guest scope is
-    // installed this turn, `recall_namespace_for_turn` returns the reserved
-    // shared-only sentinel, so the EXISTING own+shared guard yields ONLY shared
-    // facts — a guest's auto-RAG feed can NEVER carry the owner's private agent.*
-    // facts. On the owner path it returns `namespace` verbatim, so the feed is
-    // byte-for-byte today's.
-    let recall_ns = crate::threshold::recall_namespace_for_turn(namespace);
-    let stored = match memory.agent_scoped_facts(&recall_ns, window).await {
+    let stored = match memory.agent_scoped_facts(namespace, window).await {
         Ok(rows) => rows,
         Err(e) => {
-            warn!(error = %e, namespace = %recall_ns, "grounded_facts could not read memory; prompt carries no facts");
+            warn!(error = %e, namespace, "grounded_facts could not read memory; prompt carries no facts");
             return Vec::new();
         }
     };
@@ -9168,6 +9186,12 @@ pub async fn grounded_facts_live(
 /// FALLBACK: a busy/failed store read degrades to an empty string (a DB hiccup must
 /// never kill a reply — same policy `grounded_facts`/`fetch_history` use).
 pub async fn grounded_world_live(utterance: &str, memory: &Memory) -> String {
+    // THRESHOLD — GUEST MODE: the World Model (`user.world.*`) is the OWNER's personal
+    // world graph. A guest turn's prompt carries NONE of it — fail-closed to an empty
+    // context. Owner path: byte-for-byte today's.
+    if crate::threshold::is_guest_turn() {
+        return String::new();
+    }
     match crate::world_model::query(memory, utterance).await {
         Ok(state) => crate::world_model::render(&state),
         Err(e) => {
@@ -9200,6 +9224,12 @@ pub async fn grounded_world_live(utterance: &str, memory: &Memory) -> String {
 /// design. FALLBACK: a busy/failed store read degrades to an empty string (a DB
 /// hiccup must never kill a reply — same policy as `grounded_world_live`).
 pub async fn grounded_personalization_live(memory: &Memory) -> String {
+    // THRESHOLD — GUEST MODE: the user-model profile (`user.model.*`) is the OWNER's
+    // personal profile. A guest turn's prompt carries NONE of it — fail-closed to an
+    // empty summary. Owner path: byte-for-byte today's.
+    if crate::threshold::is_guest_turn() {
+        return String::new();
+    }
     match crate::user_model::snapshot(memory).await {
         Ok(profile) => crate::user_model::summary(&profile),
         Err(e) => {
@@ -9258,14 +9288,10 @@ async fn mnemosyne_recall(
     let k = k.unwrap_or(MNEMOSYNE_DEFAULT_K).clamp(1, MNEMOSYNE_MAX_K);
     // agent_scoped_facts already excludes internal meta.* bookkeeping AND other
     // agents' private namespaces; pull a generous window so the ranker has the
-    // full visible store to rank over.
-    //
-    // THRESHOLD guest mode (WIRING POINT 2): under an installed guest scope
-    // `recall_namespace_for_turn` routes this read to the shared-only sentinel, so a
-    // guest's semantic recall ranks ONLY shared facts, never the owner's private
-    // agent.* tier. Owner path: `namespace` verbatim (unchanged).
-    let recall_ns = crate::threshold::recall_namespace_for_turn(namespace);
-    let stored = match memory.agent_scoped_facts(&recall_ns, 200).await {
+    // full visible store to rank over. (A GUEST turn never reaches this function:
+    // mnemosyne_recall is not in the guest allowlist and execute_tool's guest gate
+    // refuses it — a bystander gets NO owner-memory access.)
+    let stored = match memory.agent_scoped_facts(namespace, 200).await {
         Ok(rows) => rows,
         Err(e) => {
             warn!(error = %e, "mnemosyne_recall could not read memory");
@@ -15162,6 +15188,39 @@ mod tests {
         cleanup_temp_memory(&mem_path("confirm_allow_ok"));
     }
 
+    #[tokio::test]
+    async fn threshold_guest_cannot_replay_a_parked_owner_action() {
+        // DEFENSE IN DEPTH: the confirm-replay path calls dispatch_tool DIRECTLY,
+        // bypassing execute_tool's guest gate. A guest (here EXPLICIT guest mode with
+        // voice-id OFF, so the voice-id confirm gate would permit it) must STILL be
+        // refused from firing the owner's parked consequential action.
+        let mem = open_temp_memory("confirm_guest_refuse");
+        let pending = crate::confirm::PendingConfirmation {
+            agent: "agent.pepper".into(),
+            tool: "gmail_send".into(),
+            input: json!({"to": "a@b.com", "subject": "Hi", "body": "x"}),
+            allowed: pepper_tools(),
+            preview: "Would send an email to a@b.com".into(),
+            created_at: std::time::Instant::now(),
+            id: String::new(),
+            plan: None,
+        };
+        // GUEST: refused BEFORE any dispatch — no email fires.
+        {
+            let _o = crate::threshold::ScopeOverride::guest(guest_scope_for_test());
+            let (outcome, is_error) = replay_confirmed_action(&pending, &mem).await;
+            assert!(is_error, "a guest replay must be refused: {outcome}");
+            assert!(outcome.contains("Guest mode is active"), "the THRESHOLD confirm refusal: {outcome}");
+        }
+        // OWNER: the same replay reaches the normal dispatch (no guest refusal).
+        {
+            let _o = crate::threshold::ScopeOverride::owner();
+            let (outcome, _is_error) = replay_confirmed_action(&pending, &mem).await;
+            assert!(!outcome.contains("Guest mode is active"), "owner replay is unchanged: {outcome}");
+        }
+        cleanup_temp_memory(&mem_path("confirm_guest_refuse"));
+    }
+
     // ---- PLAN-APPLY: the state-hash bind can ONLY add a failure -------------
 
     /// Build a structured plan whose state_hash cannot match the current state.
@@ -16119,8 +16178,8 @@ mod tests {
     // =====================================================================
 
     /// A representative guest scope, exactly what `run_pipeline` installs for an
-    /// unrecognized/guest turn under a wildcard owner: the full read-only tool set,
-    /// shared-only recall, a quiet profile.
+    /// unrecognized/guest turn under a wildcard owner: the narrowed NON-PERSONAL tool
+    /// set, owner memory withheld, a quiet profile.
     fn guest_scope_for_test() -> crate::threshold::Scope {
         crate::threshold::guest_from(
             &crate::threshold::Scope::owner(vec!["*".to_string()], crate::focus::FocusProfile::Default),
@@ -16129,28 +16188,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guest_scope_refuses_every_consequential_write_and_mcp_tool_at_execute_tool() {
+    async fn guest_scope_refuses_every_owner_data_consequential_and_mcp_tool_at_execute_tool() {
         // WIRING POINT 3, the robust enforcement point: with a guest scope installed,
-        // execute_tool refuses ANY tool the read-only guest scope does not admit —
+        // execute_tool refuses ANY tool the non-personal guest scope does not admit —
         // BEFORE arg-parsing, the park gate, and (crucially) the dynamic-MCP dispatch
-        // that bypasses the static allowlist. A guest can NEVER fire a consequential,
-        // outward, write, or MCP tool.
+        // that bypasses the static allowlist. A guest can NEVER fire an owner-data,
+        // consequential, outward, write, or MCP tool.
         let mem = open_temp_memory("threshold_guest_refuse");
         let _o = crate::threshold::ScopeOverride::guest(guest_scope_for_test());
 
-        // Consequential / outward / write / maximally-dangerous built-ins + an MCP
-        // flat-named tool (which is dispatched before the built-in allowlist gate).
         for tool in [
-            "gmail_send",
-            "slack_post_message",
-            "x_post",
-            "remember_fact",   // a durable WRITE — dropped for a guest
-            "skill_invoke",    // can dispatch a consequential skill — dropped
-            "shell_run",       // maximally dangerous
-            "ui_actuate",
-            "open_url",        // outward
+            // Owner-MEMORY / personal-data readers — refused (a bystander reads none).
+            "recall_facts", "mnemosyne_recall", "episodic_recall",
+            "user_model_query", "world_query",
+            "doc_search", "search_files",
             "unified_search",  // fans out to the owner's connected cloud accounts
-            "mcp__github__create_issue", // dynamic MCP — bypasses the static gate
+            // Writes / consequential / outward / maximally-dangerous.
+            "gmail_send", "slack_post_message", "x_post",
+            "remember_fact",   // a durable WRITE
+            "skill_invoke",    // can dispatch a consequential skill
+            "shell_run", "ui_actuate", "open_url",
+            // Dynamic MCP — dispatched BEFORE the built-in allowlist gate.
+            "mcp__github__create_issue",
         ] {
             let (out, is_error) = exec_t(tool, &json!({}), &mem, &["*".to_string()]).await;
             assert!(is_error, "guest must be refused {tool}: {out}");
@@ -16163,38 +16222,79 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn guest_scope_admits_read_only_recall_and_routes_it_to_shared_only_facts() {
-        // WIRING POINTS 2 & 3 end-to-end through the LIVE tool path: a guest MAY call
-        // recall_facts (a read-only guest tool), and the LIVE recall dispatch routes
-        // it to the shared-only sentinel, so the owner's PRIVATE agent.* fact is
-        // invisible while shared knowledge is still returned.
+    async fn guest_gets_no_owner_memory_via_the_recall_tools_while_the_owner_is_unchanged() {
+        // FINDING 1 end-to-end: a guest may NOT reach the owner's memory through ANY
+        // recall tool — recall_facts is refused (not in the guest allowlist), so the
+        // owner's private fact never surfaces. The owner path is byte-for-byte today's
+        // (recall_facts returns the fact).
         let mem = open_temp_memory("threshold_guest_recall");
         mem.upsert_fact("user.name", "Darwin").await.unwrap();
+        mem.upsert_fact("user.model.diet", "vegetarian").await.unwrap(); // owner-personal shared row
         mem.upsert_fact("agent.darwin.secret_note", "the owner's private note").await.unwrap();
 
-        // GUEST: recall_facts is admitted, but reads shared-only.
+        // GUEST: recall_facts is REFUSED — no owner fact, personal or shared, leaks.
         {
             let _o = crate::threshold::ScopeOverride::guest(guest_scope_for_test());
             let (out, is_error) = exec_t("recall_facts", &json!({}), &mem, &["*".to_string()]).await;
-            assert!(!is_error, "recall_facts is a read-only guest tool: {out}");
-            assert!(!out.contains("Guest mode is active"), "recall_facts must not be refused for a guest: {out}");
-            assert!(out.contains("user.name"), "guest still sees shared knowledge: {out}");
-            assert!(
-                !out.contains("secret_note"),
-                "guest MUST NOT see the owner's private fact via recall_facts: {out}"
-            );
+            assert!(is_error, "recall_facts must be refused for a guest: {out}");
+            assert!(out.contains("Guest mode is active"), "the refusal is the guest-mode refusal: {out}");
+            assert!(!out.contains("Darwin"), "no owner user.* fact leaks: {out}");
+            assert!(!out.contains("vegetarian"), "no owner user.model.* personal fact leaks: {out}");
+            assert!(!out.contains("secret_note"), "no owner private fact leaks: {out}");
         }
 
-        // OWNER PATH (no scope): the SAME recall returns BOTH facts — byte-for-byte
-        // today's behavior, so the wiring never narrows the owner.
+        // OWNER PATH (no scope): recall_facts returns the facts — byte-for-byte today's.
         {
             let _o = crate::threshold::ScopeOverride::owner();
             let (out, is_error) = exec_t("recall_facts", &json!({}), &mem, &["*".to_string()]).await;
             assert!(!is_error, "owner recall_facts: {out}");
-            assert!(out.contains("user.name"), "owner sees shared knowledge: {out}");
+            assert!(out.contains("user.name"), "owner sees their facts: {out}");
             assert!(out.contains("secret_note"), "owner path sees the private fact (unchanged): {out}");
         }
         cleanup_temp_memory(&mem_path("threshold_guest_recall"));
+    }
+
+    #[tokio::test]
+    async fn guest_world_and_personalization_prompt_feeds_are_withheld() {
+        // FINDING 1 (prompt grounding): the cloud prompt's WORLD context (user.world.*
+        // — the owner's world graph) and PERSONALIZATION (user.model.* — the owner's
+        // profile) are OWNER-personal. A guest turn's prompt carries NEITHER — the
+        // grounding feeds are force-emptied for a guest regardless of what is stored.
+        let mem = open_temp_memory("threshold_guest_grounding");
+        // Seed the owner's world model via the real writer so a non-guest read would
+        // return content (proving the guest emptiness is the gate, not empty data).
+        crate::world_model::set_attribute(
+            &mem,
+            crate::world_model::EntityType::Person,
+            "alice",
+            "role",
+            "my manager",
+        )
+        .await
+        .unwrap();
+
+        // Non-guest read returns the owner's world context (data is really there).
+        {
+            let _o = crate::threshold::ScopeOverride::owner();
+            assert!(
+                !super::grounded_world_live("alice", &mem).await.is_empty(),
+                "sanity: the owner's world context is present when NOT a guest turn"
+            );
+        }
+        // GUEST: BOTH grounding feeds are force-emptied — no owner world graph, no
+        // owner profile reaches the bystander's prompt.
+        {
+            let _o = crate::threshold::ScopeOverride::guest(guest_scope_for_test());
+            assert!(
+                super::grounded_world_live("alice", &mem).await.is_empty(),
+                "guest prompt carries no owner world context"
+            );
+            assert!(
+                super::grounded_personalization_live(&mem).await.is_empty(),
+                "guest prompt carries no owner personalization"
+            );
+        }
+        cleanup_temp_memory(&mem_path("threshold_guest_grounding"));
     }
 
     #[tokio::test]
@@ -16215,15 +16315,15 @@ mod tests {
     }
 
     #[test]
-    fn guest_offered_tools_are_the_read_only_set_intersected_with_the_agent_allowlist() {
+    fn guest_offered_tools_are_the_non_personal_set_intersected_with_the_agent_allowlist() {
         // WIRING POINT 3, the OFFERED-set narrowing logic the cloud + local paths
-        // apply inline: for each read-only guest tool, keep it only if the ACTIVE
+        // apply inline: for each non-personal guest tool, keep it only if the ACTIVE
         // agent may already use it (mirrors offline_tools_for_agent). A wildcard
-        // owner keeps the whole read-only set; a specialist keeps only its overlap;
-        // NO consequential/write/outward tool ever appears.
+        // owner keeps the whole non-personal set; a specialist keeps only its overlap;
+        // NO owner-data / consequential / write tool ever appears.
         let scope = guest_scope_for_test();
 
-        // Orchestrator (wildcard) -> the whole curated read-only set.
+        // Orchestrator (wildcard) -> exactly the three non-personal tools.
         let orch: Vec<String> = scope
             .tools
             .iter()
@@ -16232,23 +16332,28 @@ mod tests {
             .collect();
         assert_eq!(
             orch,
-            crate::threshold::GUEST_READ_ONLY_TOOLS.iter().map(|t| t.to_string()).collect::<Vec<_>>(),
-            "wildcard owner offers the full read-only set to a guest"
+            vec!["system_status".to_string(), "skill_list".to_string(), "babel_translate".to_string()],
+            "wildcard owner offers exactly the three non-personal tools to a guest"
         );
 
-        // A specialist that holds only doc_search + a consequential tool -> a guest
-        // keeps ONLY doc_search (the read-only overlap), never the consequential one.
-        let specialist = vec!["doc_search".to_string(), "gmail_send".to_string()];
+        // A specialist that holds system_status + a consequential tool -> a guest
+        // keeps ONLY system_status (the non-personal overlap), never the consequential
+        // one. An owner-data tool (doc_search) the specialist also holds is NOT
+        // offered to a guest either.
+        let specialist = vec!["system_status".to_string(), "doc_search".to_string(), "gmail_send".to_string()];
         let narrowed: Vec<String> = scope
             .tools
             .iter()
             .filter(|t| agent_may_use(&specialist, t))
             .cloned()
             .collect();
-        assert_eq!(narrowed, vec!["doc_search".to_string()], "guest keeps only the read-only overlap");
+        assert_eq!(narrowed, vec!["system_status".to_string()], "guest keeps only the non-personal overlap");
 
-        // No consequential/write/outward tool is ever in a guest's offered set.
-        for banned in ["gmail_send", "remember_fact", "shell_run", "open_url", "skill_invoke", "unified_search"] {
+        // No owner-data / consequential / write / outward tool is ever offered.
+        for banned in [
+            "recall_facts", "user_model_query", "world_query", "doc_search", "search_files",
+            "gmail_send", "remember_fact", "shell_run", "open_url", "skill_invoke", "unified_search",
+        ] {
             assert!(!orch.contains(&banned.to_string()), "{banned} must never be offered to a guest");
         }
     }
