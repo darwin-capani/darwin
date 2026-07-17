@@ -418,10 +418,14 @@ pub fn spotlight_available() -> bool {
 }
 
 /// What `docsearch.status` should REPORT for the Spotlight leg: the integration
-/// is claimed only when `[docsearch].spotlight` is ON *and* the bridge is
-/// actually answering ([`spotlight_available`]) — an operator who turned the
-/// flag off sees an honest false even if mdfind last answered fine. Surfaced on
-/// every status tick ([`crate::docsearch::emit_status`]) for the HUD pill.
+/// is claimed only when EVERY leg of the live gate holds — docsearch itself
+/// OPERATIONAL (`[docsearch].enabled` + non-empty roots, the same
+/// `indexing_permitted` check the search path enforces), the
+/// `[docsearch].spotlight` flag ON, *and* the bridge actually answering
+/// ([`spotlight_available`]). An operator who turned the flag off, disabled
+/// docsearch, or emptied its roots sees an honest false even if mdfind last
+/// answered fine. Surfaced on every status tick
+/// ([`crate::docsearch::emit_status`]) for the HUD pill.
 pub fn reported_available(spotlight_enabled: bool, docsearch_operational: bool) -> bool {
     // The pill claims a LIVE capability, so every leg of the live gate must
     // hold: docsearch itself operational ([docsearch].enabled AND non-empty

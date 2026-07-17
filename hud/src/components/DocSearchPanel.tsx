@@ -165,7 +165,7 @@ function IndexStatusRow({
             className={`docsearch-pill ${spotlight ? "spotlight-on" : "spotlight-idle"}`}
             title={
               spotlight
-                ? "macOS Spotlight is feeding read-only candidates: file searches also ask mdfind, confined with -onlyin to your allowlisted roots (never an unrestricted query); every candidate re-runs the same path-confinement and extraction rules before it can be indexed. This reflects the most recent real query — a failure flips it off."
+                ? "macOS Spotlight is feeding read-only candidates: file searches also ask mdfind, confined with -onlyin to your allowlisted roots (never an unrestricted query); every candidate re-runs the same path-confinement and extraction rules before it can be indexed. This reflects the most recent real query — a failure, disabling document search, emptying its roots, or turning [docsearch].spotlight off flips it off."
                 : "Spotlight is not answering right now — document search is disabled or has no allowlisted roots, [docsearch].spotlight is off, no file search has queried it yet, or the most recent mdfind query failed (mdfind unavailable / Spotlight indexing disabled); searches still run over the on-device index"
             }
           >

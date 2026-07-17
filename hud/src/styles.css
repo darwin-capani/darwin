@@ -5738,9 +5738,10 @@ svg.tri circle {
    guard — the same ok/degraded palette as the NEURAL/BM25 pill beside it. */
 .docsearch-pill.jailed { color: var(--learn-green); }
 .docsearch-pill.unjailed { color: var(--warn-amber); }
-/* The Spotlight candidate-bridge pill (docsearch.status): green when the
-   read-only mdfind bridge has actually answered a root-confined query, dim when
-   idle/unavailable (NOT amber — an idle bridge is normal, not degraded: the
+/* The Spotlight candidate-bridge pill (docsearch.status): green only while
+   EVERY leg of the live gate holds — docsearch operational (enabled + roots),
+   [docsearch].spotlight on, and the most recent real mdfind query answered —
+   dim otherwise (NOT amber — an idle bridge is normal, not degraded: the
    search still runs over the on-device index). */
 .docsearch-pill.spotlight-on { color: var(--learn-green); }
 .docsearch-pill.spotlight-idle { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
