@@ -565,17 +565,26 @@ pub async fn augment_index(
     }
 }
 
-/// Enrich CITED search hits with Spotlight metadata — LIVE + CONFIG-GATED
-/// (`[docsearch].spotlight`). Returns one `Option<FileMetadata>` PER HIT (same
-/// order): `Some` only when the hit's file still confines under the CURRENT
-/// allowlisted roots (a stale citation from a since-removed root gets no mdls
-/// read) AND mdls actually returned at least one field. Bounded: hits are
-/// already capped at the search `k`, and repeat paths are read once.
+/// Enrich CITED search hits with Spotlight metadata — LIVE + CONFIG-GATED under
+/// the SAME full permit as candidate generation: `[docsearch].spotlight` AND
+/// docsearch operational ([`crate::docsearch::indexing_permitted`]: `enabled` +
+/// non-empty `roots`). An operator who disabled docsearch (or emptied its
+/// roots) gets NO live mdls spawns from a search over the retained store —
+/// review-caught: enrichment previously ran on the flag alone, making the two
+/// bridge legs run under DIFFERENT gates while the docs claimed one. Returns
+/// one `Option<FileMetadata>` PER HIT (same order): `Some` only when the hit's
+/// file still confines under the CURRENT allowlisted roots (a stale citation
+/// from a since-removed root gets no mdls read) AND mdls actually returned at
+/// least one field. Bounded: hits are already capped at the search `k`, and
+/// repeat paths are read once.
 pub async fn enrich_hits(
     cfg: &crate::config::DocSearchConfig,
     hits: &[DocHit],
 ) -> Vec<Option<FileMetadata>> {
-    if !cfg.spotlight || hits.is_empty() {
+    if !cfg.spotlight
+        || !crate::docsearch::indexing_permitted(cfg.enabled, &cfg.roots)
+        || hits.is_empty()
+    {
         return vec![None; hits.len()];
     }
     let canon = crate::docsearch::canonical_roots(&cfg.roots);
@@ -919,6 +928,58 @@ kMDItemLastUsedDate = 2026-07-01 09:14:22 +0000
         // A failed mdls run -> EVERY field absent (honest degradation).
         let meta = file_metadata(Path::new("/tmp/a.txt"), down).await;
         assert!(meta.is_empty(), "an unreadable file has NO metadata, not fake metadata");
+    }
+
+    // =====================================================================
+    // ENRICHMENT GATE — same full permit as candidate generation
+    // =====================================================================
+
+    #[tokio::test]
+    async fn enrich_hits_is_gated_on_the_full_permit_not_the_flag_alone() {
+        // A real in-root hit that WOULD enrich if the gate were open.
+        let t = TempTree::new("enrich-gate");
+        let root = t.join("vault");
+        fs::create_dir_all(&root).unwrap();
+        let file = t.write("vault/note.md", "x");
+        let hit = DocHit {
+            file_path: file.display().to_string(),
+            root: root.display().to_string(),
+            byte_offset: 0,
+            snippet: "x".into(),
+            score: 1.0,
+        };
+        let base = crate::config::DocSearchConfig {
+            spotlight: true,
+            roots: vec![root.display().to_string()],
+            ..Default::default()
+        };
+
+        // enabled=false -> NO enrichment (the review-caught leg): enrich must
+        // return all-None WITHOUT spawning mdls, exactly like augment_index
+        // refuses. If this leg were missing, a live mdls read would run over the
+        // retained store after docsearch was disabled.
+        let disabled = crate::config::DocSearchConfig { enabled: false, ..base.clone() };
+        assert_eq!(
+            enrich_hits(&disabled, std::slice::from_ref(&hit)).await,
+            vec![None],
+            "enabled=false must gate enrichment off, same as candidate generation"
+        );
+
+        // enabled=true but EMPTY roots -> also gated off (not operational).
+        let rootless = crate::config::DocSearchConfig {
+            enabled: true,
+            roots: vec![],
+            ..base.clone()
+        };
+        assert_eq!(enrich_hits(&rootless, std::slice::from_ref(&hit)).await, vec![None]);
+
+        // Flag off -> gated off regardless of the operational legs.
+        let flag_off = crate::config::DocSearchConfig { spotlight: false, ..base.clone() };
+        assert_eq!(enrich_hits(&flag_off, std::slice::from_ref(&hit)).await, vec![None]);
+
+        // Empty hit list -> empty result, no work.
+        let all_on = crate::config::DocSearchConfig { enabled: true, ..base };
+        assert!(enrich_hits(&all_on, &[]).await.is_empty());
     }
 
     // =====================================================================
