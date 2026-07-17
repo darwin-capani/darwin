@@ -352,6 +352,8 @@ def _bench_llm_cached(eng, prompt_text, max_tokens, runs, warmup):
         {"role": "system", "content": BENCH_PERSONA},
         {"role": "user", "content": prompt_text},
     ]
+    import mlx.core as mx
+
     with eng._lock:
         eng._ensure_llm()
         if eng._gen_cache is None:
@@ -360,6 +362,11 @@ def _bench_llm_cached(eng, prompt_text, max_tokens, runs, warmup):
     per_run = []
     with eng._lock:
         for _ in range(runs + warmup):
+            # Reset the process-wide GPU high-water mark BEFORE each run so the
+            # reported peak_memory_gb is this cached run's own working set — not the
+            # residual peak bled over from the preceding (long-context) benchmark.
+            # Matches the "reset per run" methodology + the uncached path.
+            mx.reset_peak_memory()
             _text, metrics = eng._generate_cached(prompt, max_tokens)
             per_run.append({
                 "prefill_tps": (metrics or {}).get("prompt_tps"),

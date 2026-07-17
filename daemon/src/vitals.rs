@@ -95,12 +95,14 @@ impl BatteryState {
 }
 
 /// One battery reading. `percent` is `None` on a desktop Mac / read failure
-/// (NEVER a fabricated low), `on_ac` is the AC-power state, `state` the coarse
-/// charge state.
+/// (NEVER a fabricated low). `on_ac` is the AC-power state as a THREE-valued
+/// honest signal: `Some(true)`/`Some(false)` when pmset was actually read,
+/// `None` when the read failed/timed out (we genuinely don't know — never a
+/// fabricated `true`). `state` is the coarse charge state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BatteryReading {
     pub percent: Option<u8>,
-    pub on_ac: bool,
+    pub on_ac: Option<bool>,
     pub state: BatteryState,
 }
 
@@ -111,7 +113,8 @@ pub fn parse_battery(out: &str) -> BatteryReading {
     let (percent, on_ac) = crate::power::parse_pmset(out);
     BatteryReading {
         percent,
-        on_ac,
+        // pmset was actually read here, so the AC state is a real observation.
+        on_ac: Some(on_ac),
         state: parse_battery_state(out),
     }
 }
@@ -284,7 +287,10 @@ impl VitalsSnapshot {
 
 /// Read the live battery state on-device via `/usr/bin/pmset -g batt` (bounded,
 /// fixed-args subprocess — the power.rs discipline). Any failure/timeout degrades
-/// to an honest "no battery concern, unknown state" — NEVER a fabricated low.
+/// EVERY field to an honest unknown (`percent: None`, `on_ac: None`,
+/// `state: Unknown`) — NEVER a fabricated reading. `on_ac: None` in particular
+/// says "we couldn't read AC state", not the definite `true` a fabrication would
+/// assert (which on a laptop running on battery would be a lie).
 /// DEVICE-GATED: not exercised under test (the tests drive [`parse_battery`]).
 async fn read_battery_live() -> BatteryReading {
     use tokio::process::Command;
@@ -294,7 +300,7 @@ async fn read_battery_live() -> BatteryReading {
         Ok(Ok(out)) => parse_battery(&String::from_utf8_lossy(&out.stdout)),
         _ => BatteryReading {
             percent: None,
-            on_ac: true,
+            on_ac: None,
             state: BatteryState::Unknown,
         },
     }
@@ -365,7 +371,7 @@ mod tests {
             -InternalBattery-0 (id=1)\t42%; discharging; 2:10 remaining present: true";
         let b = parse_battery(out);
         assert_eq!(b.percent, Some(42));
-        assert!(!b.on_ac);
+        assert_eq!(b.on_ac, Some(false));
         assert_eq!(b.state, BatteryState::Discharging);
     }
 
@@ -375,7 +381,7 @@ mod tests {
             -InternalBattery-0 (id=1)\t80%; charging; 0:35 remaining present: true";
         let b = parse_battery(out);
         assert_eq!(b.percent, Some(80));
-        assert!(b.on_ac);
+        assert_eq!(b.on_ac, Some(true));
         assert_eq!(b.state, BatteryState::Charging);
     }
 
@@ -389,14 +395,16 @@ mod tests {
             -InternalBattery-0 (id=1)\t80%; AC attached; not charging present: true";
         let b = parse_battery(held);
         assert_eq!(b.state, BatteryState::Charged, "'not charging' must not read as charging");
-        assert!(b.on_ac);
+        assert_eq!(b.on_ac, Some(true));
     }
 
     #[test]
     fn parse_battery_desktop_no_battery_is_unknown_none() {
         let b = parse_battery("Now drawing from 'AC Power'");
         assert_eq!(b.percent, None, "no battery line => None, never a fabricated low");
-        assert!(b.on_ac);
+        // Desktop on AC is a REAL read of AC power (Some(true)), distinct from a
+        // read failure (None) — see `to_json_read_miss_on_ac_is_null`.
+        assert_eq!(b.on_ac, Some(true));
         assert_eq!(b.state, BatteryState::Unknown);
     }
 
@@ -419,7 +427,7 @@ mod tests {
         VitalsSnapshot {
             battery: BatteryReading {
                 percent: Some(55),
-                on_ac: false,
+                on_ac: Some(false),
                 state: BatteryState::Discharging,
             },
             thermal: ThermalState::Serious,
@@ -493,7 +501,7 @@ mod tests {
         let mut snap = sample_snapshot();
         snap.battery = BatteryReading {
             percent: None,
-            on_ac: true,
+            on_ac: Some(true),
             state: BatteryState::Unknown,
         };
         snap.thermal = ThermalState::Nominal;
@@ -502,5 +510,26 @@ mod tests {
         assert_eq!(v["battery"]["on_ac"], json!(true));
         assert_eq!(v["battery"]["charge_state"], json!("unknown"));
         assert_eq!(v["thermal"], json!("nominal"));
+    }
+
+    #[test]
+    fn to_json_read_miss_on_ac_is_null_not_fabricated_true() {
+        // A pmset read failure/timeout (read_battery_live's degrade arm) leaves
+        // `on_ac: None`. It MUST serialize to JSON null — an honest "unknown" —
+        // never a fabricated `true`. On a laptop actually running on battery, a
+        // fabricated `true` would tell the HUD it's plugged in when it isn't.
+        let mut snap = sample_snapshot();
+        snap.battery = BatteryReading {
+            percent: None,
+            on_ac: None,
+            state: BatteryState::Unknown,
+        };
+        let v = snap.to_json();
+        assert!(
+            v["battery"]["on_ac"].is_null(),
+            "unreadable AC state => null, never a fabricated true"
+        );
+        assert!(v["battery"]["percent"].is_null());
+        assert_eq!(v["battery"]["charge_state"], json!("unknown"));
     }
 }

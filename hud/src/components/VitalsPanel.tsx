@@ -94,12 +94,15 @@ export default function VitalsPanel({ vitals }: { vitals: HardwareVitals | null 
   const { battery, thermal, memory, cpu, volumes } = vitals;
   const memPct = memUsedPercent(memory);
   const cpuAvg = cpuAverage(cpu.perCore);
+  // AC state is three-valued: on AC, on battery, or unknown ("?") when the read
+  // failed — we never render a fabricated "AC" for an unknown reading.
+  const acLabel = battery.onAc === null ? "?" : battery.onAc ? "AC" : "batt";
   const batteryValue =
     battery.percent === null
-      ? battery.onAc
+      ? battery.onAc === true
         ? "AC"
         : "—"
-      : `${battery.percent}% · ${battery.onAc ? "AC" : "batt"}`;
+      : `${battery.percent}% · ${acLabel}`;
   const loadText =
     cpu.loadAvg === null
       ? "—"
@@ -114,7 +117,7 @@ export default function VitalsPanel({ vitals }: { vitals: HardwareVitals | null 
           pct={battery.percent}
           hot={
             battery.percent !== null &&
-            !battery.onAc &&
+            battery.onAc === false &&
             battery.chargeState === "discharging" &&
             battery.percent <= 20
           }

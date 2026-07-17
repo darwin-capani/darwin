@@ -36,8 +36,9 @@ export interface VitalsBattery {
   /** Charge percent 0..100, or null on a desktop Mac / read failure (NEVER a
    *  fabricated low). */
   percent: number | null;
-  /** Whether the machine is on AC power. */
-  onAc: boolean;
+  /** Whether the machine is on AC power, or null when the AC state was
+   *  unreadable (a pmset read miss) — NEVER coerced to a fabricated false/true. */
+  onAc: boolean | null;
   chargeState: ChargeState;
 }
 
@@ -101,7 +102,9 @@ function parseBattery(v: unknown): VitalsBattery {
   return {
     // Round + clamp; a null (no battery) is preserved honestly, never faked.
     percent: pct === null ? null : Math.round(clampPct(pct)),
-    onAc: bool(o, "on_ac") ?? false,
+    // A missing/null on_ac (unreadable AC state) is preserved as null — the
+    // daemon degrades a pmset read miss to null, and we must not fabricate it.
+    onAc: bool(o, "on_ac"),
     chargeState: coerceCharge(str(o, "charge_state")),
   };
 }

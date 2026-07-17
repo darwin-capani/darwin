@@ -67,7 +67,9 @@ describe("parseVitals", () => {
 
   it("degrades a fully-malformed frame to honest unknowns, never throwing", () => {
     const v = parseVitals({} as Record<string, unknown>);
-    expect(v.battery).toEqual({ percent: null, onAc: false, chargeState: "unknown" });
+    // onAc degrades to null (unknown), NOT a fabricated false — mirrors the
+    // daemon's `on_ac: None` read-miss arm (vitals.rs).
+    expect(v.battery).toEqual({ percent: null, onAc: null, chargeState: "unknown" });
     expect(v.thermal).toBe("unknown");
     expect(v.memory).toEqual({ usedBytes: null, totalBytes: null, pressure: "unknown" });
     expect(v.cpu.perCore).toEqual([]);
@@ -81,6 +83,19 @@ describe("parseVitals", () => {
     expect(v.battery.percent).toBeNull();
     expect(v.battery.onAc).toBe(true);
     expect(v.battery.chargeState).toBe("unknown");
+  });
+
+  it("preserves an unreadable AC state as null, never a fabricated false", () => {
+    // The daemon degrades a pmset read miss to on_ac: null. A battery object with
+    // on_ac absent (or explicitly null) must stay null — not be coerced to false,
+    // which on a laptop on battery would read as "unknown", not the true "batt".
+    const missing = parseVitals({ ...FULL, battery: { percent: null, charge_state: "unknown" } });
+    expect(missing.battery.onAc).toBeNull();
+    const explicitNull = parseVitals({
+      ...FULL,
+      battery: { percent: null, on_ac: null, charge_state: "unknown" },
+    });
+    expect(explicitNull.battery.onAc).toBeNull();
   });
 
   it("coerces unknown enum values to 'unknown'", () => {
@@ -203,5 +218,20 @@ describe("VitalsPanel", () => {
     const html = renderToStaticMarkup(createElement(VitalsPanel, { vitals: desktop }));
     expect(html).toContain("AC");
     expect(html).not.toContain("73%");
+  });
+
+  it("renders '?' for an unreadable AC state, never a fabricated AC/batt", () => {
+    // Battery percent readable but the AC state came back null (read miss): the
+    // panel shows "60% · ?" — it must not claim "AC" or "batt" it didn't read.
+    const unknownAc = parseVitals({
+      ...FULL,
+      battery: { percent: 60, on_ac: null, charge_state: "unknown" },
+    });
+    const html = renderToStaticMarkup(createElement(VitalsPanel, { vitals: unknownAc }));
+    // The battery VALUE reads "60% · ?" — check the full value string so the
+    // assertion can't collide with the "BATT · battery" gauge label.
+    expect(html).toContain("60% · ?");
+    expect(html).not.toContain("60% · AC");
+    expect(html).not.toContain("60% · batt");
   });
 });
