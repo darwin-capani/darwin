@@ -94,15 +94,20 @@ pub async fn route(
 ) -> Result<RouteOutcome> {
     let route_entry = Instant::now();
 
-    // VAULT MODE ("go dark", vault.rs) — SEAM 1 of 2. Fold an active vault into THIS
-    // turn's cloud reachability ONCE, at entry, so EVERY downstream cloud decision
-    // that consults `cloud_reachable` (the conversation brain, the roster answer,
-    // capability routing, agent selection) deterministically sees NO cloud this turn
-    // and stays on the local MLX brain. RESTRICT-ONLY: `vault::deny_cloud` can only
-    // turn a reachable cloud UNREACHABLE, never the reverse, so with the vault OFF
-    // this is byte-for-byte today's `cloud_reachable`. The actuating tool-loop gate
-    // (which does not consult reachability) is closed separately at SEAM 2 below.
-    let cloud_reachable = crate::vault::deny_cloud(cloud_reachable);
+    // VAULT MODE ("go dark", vault.rs) + THRESHOLD GUEST (guest = local-only) — SEAM 1
+    // of 2. Fold BOTH an active vault AND a guest turn into THIS turn's cloud
+    // reachability ONCE, at entry, so EVERY downstream cloud decision that consults
+    // `cloud_reachable` (the conversation brain, the roster answer, capability routing,
+    // agent selection) deterministically sees NO cloud this turn and stays on the local
+    // MLX brain. RESTRICT-ONLY + COMPOSABLE (`guest OR vault -> local`): each
+    // `deny_cloud` can only turn a reachable cloud UNREACHABLE, never the reverse, so
+    // with BOTH off this is byte-for-byte today's `cloud_reachable` (the owner still
+    // uses the cloud by default). GUEST rationale: a bystander's turn must never reach
+    // the owner's PAID cloud — that would append an obol spend row + bump the owner's
+    // daily budget (a durable, owner-readable trace) and egress the guest's turn under
+    // the owner's key. The actuating tool-loop gate (which does not consult
+    // reachability) is closed separately at SEAM 2 below.
+    let cloud_reachable = crate::threshold::deny_cloud(crate::vault::deny_cloud(cloud_reachable));
 
     // PANIC / LOCKDOWN (task #12) — THE emergency stop, honored BEFORE anything
     // else, even mid-confirmation / mid-anything. Any panic phrase ("panic",
@@ -1344,15 +1349,17 @@ pub async fn route(
     }
 
     let needs_deep_reasoning = class.complexity == "heavy";
-    // VAULT MODE ("go dark") — SEAM 2 of 2. The actuating tool-loop gate does NOT
-    // consult `cloud_reachable` (it would otherwise try the cloud and degrade on the
-    // resolve_api_key error), so close it here at the decision itself: an active
-    // vault forces `to_cloud` false, so a heavy / low-confidence turn never reaches
-    // the cloud tool loop and instead stays on the local path (or honestly degrades
-    // offline). RESTRICT-ONLY via the same `vault::deny_cloud` gate as SEAM 1 — it
-    // can only turn a cloud decision OFF; with the vault off this is exactly
-    // `wants_cloud(class, cfg)`.
-    let to_cloud = crate::vault::deny_cloud(wants_cloud(class, cfg));
+    // VAULT MODE ("go dark") + THRESHOLD GUEST (guest = local-only) — SEAM 2 of 2. The
+    // actuating tool-loop gate does NOT consult `cloud_reachable` (it would otherwise
+    // try the cloud and degrade on the resolve_api_key error), so close it here at the
+    // decision itself: an active vault OR a guest turn forces `to_cloud` false, so a
+    // heavy / low-confidence turn never reaches the cloud tool loop and instead stays
+    // on the local path (or honestly degrades offline). RESTRICT-ONLY + COMPOSABLE via
+    // the same `deny_cloud` gates as SEAM 1 — each can only turn a cloud decision OFF;
+    // with BOTH off this is exactly `wants_cloud(class, cfg)`. GUEST: this is the
+    // second half of forcing a bystander local — no cloud tool loop, so no obol spend
+    // and no owner-key egress on a guest turn.
+    let to_cloud = crate::threshold::deny_cloud(crate::vault::deny_cloud(wants_cloud(class, cfg)));
     // RC-6: a turn that is cloud-bound ONLY because the classifier was unsure
     // (low confidence on a conversation intent — the CLASSIFY_FALLBACK shape a
     // garbled echo produces) must NOT reach the actuating cloud tool loop. An
@@ -6349,6 +6356,58 @@ mod tests {
         // Unknown value falls back to the safe, always-available local path.
         cfg.router.conversation_route = "wat".to_string();
         assert_eq!(conversation_brain(&cfg, true, &heavy).0, ConversationBrain::Local);
+    }
+
+    /// THRESHOLD finding 1 — GUEST = LOCAL-ONLY. A guest turn must NEVER reach the
+    /// owner's PAID cloud (a cloud call appends an obol spend row + bumps the owner's
+    /// daily budget — a durable, owner-readable trace — and egresses the guest's turn
+    /// under the owner's API key). The fix forces a guest local at the SAME two seams
+    /// vault uses; proven here at the cloud-vs-local decision the seams compute, with
+    /// the composition `guest OR vault -> local`. The owner path is byte-for-byte
+    /// unchanged (still cloud by default).
+    #[test]
+    fn a_guest_turn_is_forced_local_only_never_the_owners_paid_cloud() {
+        let _guard = crate::model_tier::OverrideGuard::force(None);
+        let cfg = Config::default(); // conversation_route defaults to cloud_heavy
+        assert_eq!(cfg.router.conversation_route, "cloud_heavy");
+        let heavy = classification("conversation", "heavy", 0.95);
+
+        // OWNER path (no guest scope): a reachable-cloud turn is UNCHANGED — the seam
+        // composition passes it through, and the conversation brain picks the cloud.
+        assert!(
+            crate::threshold::deny_cloud(crate::vault::deny_cloud(true)),
+            "owner: a reachable cloud turn is passed through unchanged"
+        );
+        let owner_reachable = crate::threshold::deny_cloud(crate::vault::deny_cloud(true));
+        assert!(
+            matches!(conversation_brain(&cfg, owner_reachable, &heavy).0, ConversationBrain::Cloud(_)),
+            "the owner still uses the paid cloud brain by default"
+        );
+
+        // GUEST: the SAME seam composition forces LOCAL — no cloud call, hence no obol
+        // spend row / no budget bump / no owner-key egress on a bystander's turn.
+        let guest = crate::threshold::guest_from(
+            &crate::threshold::Scope::owner(vec!["*".to_string()], crate::focus::FocusProfile::Default),
+            &crate::focus::FocusProfile::DeepFocus,
+        );
+        let _o = crate::threshold::ScopeOverride::guest(guest);
+        assert!(crate::threshold::is_guest_turn());
+        // SEAM 1 (cloud_reachable) is forced off even with the cloud reachable + vault off.
+        assert!(
+            !crate::threshold::deny_cloud(crate::vault::deny_cloud(true)),
+            "guest: seam 1 (cloud_reachable) is forced local"
+        );
+        let guest_reachable = crate::threshold::deny_cloud(crate::vault::deny_cloud(true));
+        assert_eq!(
+            conversation_brain(&cfg, guest_reachable, &heavy).0,
+            ConversationBrain::Local,
+            "a guest conversation is answered by the on-device brain, never the paid cloud"
+        );
+        // SEAM 2 (the actuating tool-loop `to_cloud`) is likewise forced off for a guest.
+        assert!(
+            !crate::threshold::deny_cloud(crate::vault::deny_cloud(true)),
+            "guest: seam 2 (to_cloud) is forced local"
+        );
     }
 
     /// MODEL TIER wired into the conversation brain: an explicit override beats the

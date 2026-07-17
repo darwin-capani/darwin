@@ -531,8 +531,42 @@ pub fn is_guest_turn() -> bool {
 /// per-turn in-RAM scratch (the source accumulator, `take_turn_tool`, the verify
 /// outcome), secret-free latency aggregates, and the guest's OWN spoken reply are
 /// NOT durable owner state and flow normally.
+///
+/// ONE honest caveat about ordering: a single CONTENT-FREE capture MARKER —
+/// `record_event("audio", "utterance.captured", <wav_path>)` — is emitted DURING STT
+/// (overlapped with transcription), which is BEFORE the guest scope can be decided
+/// (the decision needs the TRANSCRIPT, for the explicit "guest mode" toggle, so it
+/// cannot be known pre-STT). At that instant `is_guest_turn()` is still false, so the
+/// chokepoint does not gate that one row. It carries NO transcript / NO utterance
+/// content / NO owner data (just a wav path + timestamp; the wav is discarded after
+/// the turn), the `events` table has NO owner-facing ROW reader, and it is
+/// retention-pruned — so no bystander's WORDS ever enter the durable log. The
+/// utterance CONTENT, which rides the router's `route.cloud` / `route.local` event
+/// payloads (recorded AFTER the scope is installed), IS gated here.
 pub fn guest_write_blocked() -> bool {
     is_guest_turn()
+}
+
+/// GUEST = LOCAL-ONLY. The cloud-routing twin of [`crate::vault::deny_cloud`]:
+/// fold a guest turn into THIS turn's cloud-vs-local decision so a bystander's turn
+/// NEVER reaches the owner's PAID cloud brain. A guest conversation therefore stays
+/// on the on-device model, which closes a durable-write path that no per-sink gate
+/// should: with no cloud call there is NO obol spend row and NO bump of the owner's
+/// daily budget total (a durable, owner-readable, budget-influencing trace), NO
+/// egress of the guest's turn under the owner's API key — and it is MORE private for
+/// the guest too. This is a principled SCOPE EXTENSION (guest = local-only), not
+/// another per-sink write gate.
+///
+/// RESTRICT-ONLY + COMPOSABLE with the vault gate — `guest OR vault -> local`. It can
+/// only ever turn a would-be cloud turn LOCAL, never the reverse. With no guest scope
+/// installed (the owner path, and EVERY background task — it reads the task-local, so
+/// a mission/anticipation tick is unaffected) this is byte-for-byte `would_go_cloud`,
+/// so the owner still uses the cloud by default. Applied at the SAME two router seams
+/// vault uses: the `cloud_reachable` entry seam (which the conversation brain, the
+/// roster answer, capability routing, and agent selection all consult) and the
+/// actuating tool-loop `to_cloud` seam.
+pub fn deny_cloud(would_go_cloud: bool) -> bool {
+    would_go_cloud && !is_guest_turn()
 }
 
 /// `#[cfg(test)]`-only RAII guard forcing [`current_turn_scope`] to a value on the

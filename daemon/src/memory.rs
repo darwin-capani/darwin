@@ -1492,4 +1492,43 @@ mod tests {
         assert_eq!(mem.recent_exchanges(5).await.unwrap().len(), 1);
         assert_eq!(mem.all_facts(5).await.unwrap().len(), 1);
     }
+
+    /// THRESHOLD finding 2 — honest ordering of the `record_event` chokepoint. The
+    /// CONTENT-FREE "utterance.captured" marker (wav path + ts, NO transcript) is
+    /// emitted DURING STT, BEFORE the guest scope is installed (the decision needs the
+    /// transcript), so `is_guest_turn()` is false then and it writes — as it must for
+    /// an owner turn. The CONTENT-carrying route.cloud/route.local events are recorded
+    /// AFTER the scope installs, so on a guest turn they NO-OP at the chokepoint. Same
+    /// primitive; the installed task-local scope is the only difference. This pins the
+    /// honest claim: a bystander's WORDS never enter the durable events log.
+    #[tokio::test]
+    async fn record_event_chokepoint_gates_content_events_but_not_the_pre_scope_capture_marker() {
+        let db = TempDb::new("utterance-captured-ordering");
+        let mem = Memory::open(&db.0).unwrap();
+
+        // Pre-scope window (no guest scope installed) == the utterance.captured marker:
+        // it records (this is exactly the owner-path behavior, byte-for-byte).
+        mem.record_event("audio", "utterance.captured", "/tmp/x.wav")
+            .await
+            .unwrap();
+        assert_eq!(mem.events_count().await.unwrap(), 1, "the pre-scope capture marker must record");
+
+        // Post-scope GUEST window == route.cloud/route.local carrying the utterance:
+        // the chokepoint no-ops, so a bystander's words never enter the durable log.
+        crate::threshold::with_turn_scope(async {
+            crate::threshold::set_turn_scope(crate::threshold::guest_from(
+                &crate::threshold::Scope::owner(vec!["*".to_string()], crate::focus::FocusProfile::Default),
+                &crate::focus::FocusProfile::DeepFocus,
+            ));
+            mem.record_event("local", "conversation", "the guest's words")
+                .await
+                .unwrap();
+        })
+        .await;
+        assert_eq!(
+            mem.events_count().await.unwrap(),
+            1,
+            "a guest turn's content-carrying event must not enter the durable events log"
+        );
+    }
 }

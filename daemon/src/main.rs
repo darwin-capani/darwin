@@ -3281,6 +3281,14 @@ async fn run_pipeline(
             (result, stt_started.elapsed().as_millis() as u64)
         },
         async {
+            // THRESHOLD note: this CONTENT-FREE capture marker (wav path + ts, NO
+            // transcript) is emitted DURING STT — BEFORE the guest scope is decided
+            // (the decision needs the transcript for the explicit toggle), so the
+            // record_event chokepoint does not gate it. It carries no utterance
+            // content / no owner data and the events table has no owner-facing row
+            // reader; a bystander's WORDS never enter the durable log (the utterance
+            // content rides route.cloud/route.local, recorded AFTER the scope installs
+            // and gated there). See threshold::guest_write_blocked's HONESTY note.
             if let Err(e) = memory.record_event("audio", "utterance.captured", &wav_str).await {
                 warn!(error = %e, "failed to record utterance event");
             }
