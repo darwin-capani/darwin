@@ -2186,6 +2186,18 @@ async fn relay_line(
                 // continuous context lives only in the transient ring.
                 return;
             }
+            // LUMEN voice-navigation: a one-shot on-request screen read
+            // (read_kind=screen) is the readout Lumen consults to resolve a
+            // voice-named UI action — cache its controls so "read me the buttons,
+            // then click the third" can select a target. READ-ONLY: the cache is
+            // only ever consulted by the per-action-gated `ui_actuate` path (which
+            // still PARKS for a spoken confirm), never an autonomous click; parse is
+            // bounded. The readout still relays to the HUD below.
+            if topic == "vision.screen"
+                && payload.get("read_kind").and_then(Value::as_str) == Some("screen")
+            {
+                crate::lumen::remember_readout(&payload);
+            }
             telemetry::emit(
                 "system",
                 "app.data",

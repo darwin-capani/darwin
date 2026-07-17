@@ -2666,6 +2666,11 @@ async fn handle_runbook_command(
                             &self.allowed,
                             &self.namespace,
                             false,
+                            // context_trusted=false: a runbook step PARKS fresh even
+                            // under an Always policy — preserving the runbook's
+                            // never-pre-approved invariant (the user confirms each
+                            // consequential step, one at a time).
+                            false,
                         )
                         .await;
                         // A consequential step is NEVER mapped to a produced value (it
@@ -3621,6 +3626,9 @@ async fn handle_lumen(
                         memory,
                         &actor.tools,
                         &actor.namespace,
+                        true,
+                        // context_trusted=true: a live, attended voice actuation
+                        // (ui_actuate is NEVER_AUTO_APPROVE regardless, so it parks).
                         true,
                     )
                     .await;
@@ -4944,18 +4952,30 @@ pub fn lumen_command(text: &str) -> Option<LumenCommand> {
 /// it. A degenerate "click" with no target still routes here and is REFUSED
 /// honestly by the selector (never a guess), which is the correct place to say so.
 fn lumen_is_act(lower: &str) -> bool {
-    let has_strong = contains_word(lower, "click")
-        || contains_word(lower, "tap")
+    // Only "click"/"double-click" are rare enough in ordinary speech to count BARE.
+    // "tap"/"press"/"push" are common English ("tap water", "on tap", "press on",
+    // "push harder"), so they count ONLY alongside a control noun or an ordinal.
+    // "click"/"double-click" are rare enough in ordinary speech to count anywhere.
+    if contains_word(lower, "click")
         || lower.contains("double click")
-        || lower.contains("double-click");
-    let has_press = contains_word(lower, "press") || contains_word(lower, "push");
-    if !has_strong && !has_press {
-        return false;
-    }
-    if has_strong {
+        || lower.contains("double-click")
+    {
         return true;
     }
-    // press/push: require a concrete UI target to avoid ordinary-speech false hits.
+    // "tap" is common English ("tap water", "on tap", "tap out"), so it counts as a
+    // command ONLY when it is the LEADING imperative ("tap Submit", "tap the third")
+    // — never mid-sentence, so "is the tap water safe?" never triggers.
+    let trimmed = lower.trim_start();
+    if trimmed == "tap" || trimmed.starts_with("tap ") {
+        return true;
+    }
+    // "press"/"push" (and a non-leading "tap") require a concrete UI target.
+    let has_targeted_verb = contains_word(lower, "tap")
+        || contains_word(lower, "press")
+        || contains_word(lower, "push");
+    if !has_targeted_verb {
+        return false;
+    }
     lumen_mentions_control_noun(lower) || lumen_mentions_ordinal(lower)
 }
 
@@ -7242,6 +7262,9 @@ mod tests {
             "press play",           // press + no control noun/ordinal
             "push harder",          // push + no control noun/ordinal
             "let's press on",       // press + no control noun/ordinal
+            "is the tap water safe", // REGRESSION: "tap" mid-sentence is not a command
+            "i'll be on tap all night",
+            "he had to tap out of the match",
             "select all my emails", // "select" is NOT a Lumen act verb
             "choose a restaurant",  // "choose" is NOT a Lumen act verb
             // These belong to the more-specific Vision ops (deferred by Lumen).
@@ -7337,6 +7360,7 @@ mod tests {
             &actuator.tools,
             &actuator.namespace,
             true,
+            true, // context_trusted: mirrors the attended live-actuation production call
         )
         .await;
         assert!(
