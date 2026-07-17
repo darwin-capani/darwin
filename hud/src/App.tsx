@@ -691,6 +691,7 @@ export default function App() {
             index={state.docIndex}
             search={state.docSearch}
             pdfJail={state.pdfJailAvailable}
+            spotlight={state.spotlightAvailable}
           />
           <CodeIntelPanel code={state.codeIntel} />
           <ChangeQueuePanel changeq={state.changeq} />

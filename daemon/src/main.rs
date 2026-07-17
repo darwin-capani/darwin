@@ -363,6 +363,12 @@ mod skills;
 // Hermetically tested (tmutil exec injected; never spawned under test).
 mod snapshot;
 mod speech;
+// SPOTLIGHT BRIDGE (spotlight.rs): READ-ONLY mdfind/mdls candidate generation +
+// metadata enrichment for docsearch — root-confined (`-onlyin` per allowlisted
+// root, never an unrestricted query), bounded, honest. Candidates run the SAME
+// docsearch confinement/allowlist/extraction pipeline; nothing here can mutate
+// Spotlight state. Hermetically tested (runner injected; never spawned in tests).
+mod spotlight;
 mod standing;
 mod tcc;
 mod telemetry;
@@ -1147,8 +1153,11 @@ async fn audit_snapshot_task(cfg: Arc<Config>, memory: Arc<Memory>, root: PathBu
         // (the pdfjail helper sits next to THIS executable) or silently on the
         // weaker in-process fallback guard — a production install on the fallback
         // must be VISIBLE, not just a one-shot log WARN + the CLI selfcheck board.
+        // The same frame carries the Spotlight-bridge leg, gated on the LIVE
+        // [docsearch].spotlight flag (an operator turning it off sees the pill
+        // drop honestly on the next tick, whatever mdfind last answered).
         // One stat() per tick; READ-ONLY, like its two siblings above.
-        docsearch::emit_status();
+        docsearch::emit_status(live.docsearch.spotlight);
         // The HUD's DistillPanel shows the self-distillation pipeline's honest
         // state (distill.rs): armed/inert, how many redacted examples are ready,
         // the last run, and that adapters are NEVER auto-promoted. READ-ONLY —
