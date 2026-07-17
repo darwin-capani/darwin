@@ -151,12 +151,15 @@ function IndexStatusRow({
         )}
         {/* The READ-ONLY Spotlight candidate bridge (docsearch.status, same
             precedent as the pdfjail pill). Null = no status frame yet (an older
-            daemon) — claim nothing. The daemon reports the MOST RECENT real
-            mdfind attempt, config-gated — so IDLE covers "no search has queried
-            Spotlight yet", "[docsearch].spotlight is off", and "mdfind is
-            unavailable / the last query failed (Spotlight indexing disabled)".
-            A working claim is never stale: a later failure or a flag flip drops
-            the pill on the next frame. */}
+            daemon) — claim nothing. The daemon reports EVERY leg of the live
+            gate (docsearch OPERATIONAL — enabled + non-empty roots — AND
+            [docsearch].spotlight ON AND the MOST RECENT real mdfind attempt
+            succeeding) — so IDLE covers "document search is disabled or has no
+            allowlisted roots", "no search has queried Spotlight yet",
+            "[docsearch].spotlight is off", and "mdfind is unavailable / the
+            last query failed (Spotlight indexing disabled)". A working claim is
+            never stale: a later failure, a flag flip, disabling docsearch, or
+            emptying its roots drops the pill on the next frame. */}
         {spotlight !== null && (
           <span
             className={`docsearch-pill ${spotlight ? "spotlight-on" : "spotlight-idle"}`}
