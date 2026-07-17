@@ -476,6 +476,37 @@ pub fn verify_command_token(presented: &str) -> bool {
 }
 
 // ===========================================================================
+// Process-global registry handle
+// ===========================================================================
+//
+// The router threads the `Arc<AppRegistry>` explicitly into every app handler
+// (handle_silicon_canvas/…), which is the primary path. But a MODEL-callable tool
+// (`share_guard_scrub`) runs under `anthropic::execute_tool`, which is NOT given
+// the registry, so it reaches the app runtime through this process-global handle
+// — the SAME pattern `mcp::global()` uses for its manager. Set ONCE at startup
+// (next to `AppRegistry::discover`); `None` until then (a pre-startup / unit-test
+// caller gets an honest "runtime not up" rather than a panic).
+
+/// The one live app registry, set once at daemon startup. Read via
+/// [`global_registry`]; the router's explicit `Arc<AppRegistry>` threading is
+/// unchanged and remains the primary path.
+static GLOBAL_REGISTRY: OnceLock<Arc<AppRegistry>> = OnceLock::new();
+
+/// Publish the process-global app registry (called ONCE at startup, right after
+/// `AppRegistry::discover`). Idempotent: a second call is ignored so a stray
+/// re-init can never swap the live registry out from under running apps.
+pub fn set_global_registry(registry: Arc<AppRegistry>) {
+    let _ = GLOBAL_REGISTRY.set(registry);
+}
+
+/// The process-global app registry, or `None` before startup published it (a
+/// pre-startup or unit-test caller). Callers answer honestly on `None` — the app
+/// runtime simply isn't up yet.
+pub fn global_registry() -> Option<Arc<AppRegistry>> {
+    GLOBAL_REGISTRY.get().cloned()
+}
+
+// ===========================================================================
 // SBPL (seatbelt) profile generation
 // ===========================================================================
 
@@ -1164,6 +1195,13 @@ impl AppRegistry {
             #[cfg(test)]
             interpreter_override: None,
         })
+    }
+
+    /// The absolute project root this registry resolves app paths against. Used by
+    /// callers that must resolve a manifest-relative sandbox dir (e.g. the Share
+    /// Guard bridge staging an image under `state/tmp/share-guard/input`).
+    pub fn project_root(&self) -> &Path {
+        &self.project_root
     }
 
     /// Read-only listing for the router's intent matcher (sorted by name).
@@ -2147,6 +2185,18 @@ async fn relay_line(
                 // Do NOT relay the sensitive glyphs onward as app.data; the
                 // continuous context lives only in the transient ring.
                 return;
+            }
+            // LUMEN voice-navigation: a one-shot on-request screen read
+            // (read_kind=screen) is the readout Lumen consults to resolve a
+            // voice-named UI action — cache its controls so "read me the buttons,
+            // then click the third" can select a target. READ-ONLY: the cache is
+            // only ever consulted by the per-action-gated `ui_actuate` path (which
+            // still PARKS for a spoken confirm), never an autonomous click; parse is
+            // bounded. The readout still relays to the HUD below.
+            if topic == "vision.screen"
+                && payload.get("read_kind").and_then(Value::as_str) == Some("screen")
+            {
+                crate::lumen::remember_readout(&payload);
             }
             telemetry::emit(
                 "system",
