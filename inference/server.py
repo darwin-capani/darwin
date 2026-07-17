@@ -1433,6 +1433,134 @@ EXTRACT_FACTS_MAX_TOKENS = 120
 # request cannot enqueue an unbounded number of forward passes.
 EMBED_MAX_TOKENS = 512
 EMBED_MAX_BATCH = 256
+# op=embed runs the whole request as ONE padded forward per chunk instead of a
+# forward per text (the daemon sends a query + K candidate facts together, so
+# batching amortizes the per-forward launch/graph overhead — ~2.2x on M1 Pro for
+# a realistic batch). We chunk the batch so the padded [chunk, maxlen, hidden]
+# activation tensor stays bounded no matter how large EMBED_MAX_BATCH is, and so
+# one long input only pads its own chunk. Right-padding + the model's default
+# causal mask means each real token attends only to earlier REAL tokens, so a
+# real token's hidden state is identical to the unpadded run; pad positions are
+# excluded from the mean-pool. Vectors match the per-text path up to fp
+# reduction-order noise (cosine >= 0.9999) — behaviour-preserving for retrieval.
+#
+# A chunk is closed by WHICHEVER cap hits first:
+#   - EMBED_BATCH_CHUNK rows, or
+#   - EMBED_CHUNK_TOKEN_BUDGET PADDED tokens (rows x the chunk's max length), or
+#   - EMBED_CHUNK_WASTE_FACTOR: padded tokens would exceed this multiple of the
+#     chunk's REAL tokens (the padding-waste guard).
+# The token budget is the activation bound: without it, 32 rows x 512 tokens =
+# 16384 padded tokens in ONE forward — an activation spike the old per-text path
+# (never more than 512 tokens in flight) could not hit. The waste guard bounds
+# AMPLIFICATION: without it, a crafted short/long mix (31 one-token texts + one
+# 128-token text = 32 rows x maxlen 128) computes 4096 padded positions for 159
+# real tokens — ~26x the PADDED TOKENS (~3x the GPU time, per-forward overhead
+# absorbs the rest — review-measured) of the per-text path for the same
+# request, all under the engine lock. With the guard, a multi-row
+# chunk's padded cost is <= EMBED_CHUNK_WASTE_FACTOR x its real tokens BY
+# CONSTRUCTION, so no length mix can multiply lock-hold time past that factor;
+# a single row is always a legal chunk of one (exact cost, nothing to waste).
+# A realistic short-fact batch (~15 tokens/text, near-uniform) triggers neither
+# cap and still packs EMBED_BATCH_CHUNK rows into one forward.
+EMBED_BATCH_CHUNK = 32
+EMBED_CHUNK_TOKEN_BUDGET = 4096
+EMBED_CHUNK_WASTE_FACTOR = 2
+
+
+def _pack_embed_chunks(lengths, row_cap=None, token_budget=None, waste_factor=None):
+    """PURE, ORDER-PRESERVING chunker for the batched embed forward: split the
+    row index space [0, len(lengths)) into contiguous [start, end) ranges where
+    each range holds at most `row_cap` rows, at most `token_budget` PADDED
+    tokens (rows x the range's max length — the true activation footprint of the
+    padded forward), AND — for multi-row ranges — padded tokens no more than
+    `waste_factor` x the range's REAL tokens (the amplification guard). Greedy:
+    extend the current chunk until adding the next row would break a cap, then
+    close it. A single row always forms a legal chunk, whatever its length (it
+    cannot be split, and alone it wastes nothing). Returns a list of (start, end).
+
+    INVARIANT (tested): for every returned multi-row range,
+    rows x max(lengths) <= min(token_budget, waste_factor x sum(lengths)) — so a
+    crafted short/long mix cannot multiply the GPU cost of the padded forward
+    past waste_factor of what the per-text path would have paid."""
+    if row_cap is None:
+        row_cap = EMBED_BATCH_CHUNK
+    if token_budget is None:
+        token_budget = EMBED_CHUNK_TOKEN_BUDGET
+    if waste_factor is None:
+        waste_factor = EMBED_CHUNK_WASTE_FACTOR
+    ranges = []
+    start = 0
+    cur_max = 0
+    real = 0  # real (unpadded) tokens in the current chunk
+    for i, n in enumerate(lengths):
+        rows = i - start + 1
+        new_max = n if n > cur_max else cur_max
+        # The padded cost if row i joins the current chunk, vs all three caps.
+        padded = rows * new_max
+        if i > start and (
+            rows > row_cap
+            or padded > token_budget
+            or padded > waste_factor * (real + n)
+        ):
+            ranges.append((start, i))
+            start = i
+            new_max = n
+            real = 0
+        cur_max = new_max
+        real += n
+    if start < len(lengths):
+        ranges.append((start, len(lengths)))
+    return ranges
+
+
+def _plan_embed_batches(lengths, row_cap=None, token_budget=None, waste_factor=None):
+    """PURE planner for the batched embed forwards: pack rows LENGTH-SORTED so
+    chunkmates have near-equal lengths, then return each chunk as a list of
+    ORIGINAL indices (the caller computes in plan order and writes each result
+    back to its original slot, so output order is untouched).
+
+    Why sort: the greedy packer alone admits crafted short/long mixes with up to
+    ~26x padded-token amplification (e.g. one 128-token text + 31 one-token
+    texts packs as 32 rows x maxlen 128 = 4096 padded positions for 159 real
+    tokens — review-confirmed), multiplying the GPU time spent under the engine
+    lock vs the per-text path for the SAME request. Sorting makes each chunk's
+    lengths adjacent in the distribution (so the packer's waste guard almost
+    never has to fragment a real batch), while the packer's
+    EMBED_CHUNK_WASTE_FACTOR cap HARD-bounds amplification for any residual
+    mix. Each row's vector depends only on its own tokens (causal mask + masked
+    pool), so grouping order cannot change any result. The sort is stable ->
+    deterministic plan."""
+    order = sorted(range(len(lengths)), key=lambda i: lengths[i])
+    ranges = _pack_embed_chunks(
+        [lengths[i] for i in order],
+        row_cap=row_cap,
+        token_budget=token_budget,
+        waste_factor=waste_factor,
+    )
+    return [order[a:b] for a, b in ranges]
+
+
+def _pool_normalize(mx, hidden, lengths):
+    """PURE masked-mean-pool + L2-normalize. `hidden` is a [B, T, H] tensor of
+    per-token last hidden states; `lengths[i]` is row i's real-token count (the
+    rest are right-padding). Mean-pool over each row's real tokens only, then
+    L2-normalize so cosine similarity is a dot product, mapping any non-finite
+    component to 0.0 (a degenerate-but-finite vector keeps the JSON response
+    strict-valid instead of failing the whole batch). Returns a [B, H] tensor.
+
+    No model / no tokenizer / no I/O — unit-testable with synthetic hidden states
+    and a stub decoder. `mx` is injected so this stays import-light."""
+    _b, t, _h = hidden.shape
+    # [B, T] boolean: column j is real iff j < lengths[i]. Built on-device from
+    # `lengths` so there is no per-token Python loop.
+    valid = mx.arange(t)[None, :] < mx.array(lengths)[:, None]
+    maskf = valid.astype(hidden.dtype)[:, :, None]  # [B, T, 1]
+    summed = mx.sum(hidden * maskf, axis=1)  # [B, H] — pads contribute 0
+    counts = mx.maximum(mx.sum(maskf[:, :, 0], axis=1), 1.0)[:, None]  # [B, 1]
+    pooled = summed / counts
+    norm = mx.sqrt(mx.sum(pooled * pooled, axis=1, keepdims=True))
+    normed = pooled / mx.maximum(norm, 1e-12)
+    return mx.where(mx.isnan(normed) | mx.isinf(normed), 0.0, normed)
 
 # op=describe_image (on-device VLM): structured marker the op returns when the
 # vision-language model cannot run (mlx-vlm not installed, or the checkpoint not
@@ -3597,52 +3725,63 @@ class InferenceEngine:
             # with no per-token stream, so metrics are honestly absent.
             return (out, {"speculative": False, "quant": quant_loaded, "metrics": None})
 
-    def _embed_one(self, mx, text):
-        """Compute one L2-normalized embedding VECTOR for `text` by mean-pooling
-        the LLM's last hidden states ON-DEVICE. Caller holds self._lock and the
-        LLM is loaded. NO new model is downloaded: we reuse the already-resident
-        generate model's hidden states (the alternative — a dedicated sentence
-        embedding model — would need a separate weight download, which the
-        contract forbids).
-
-        Method: encode the text (capped at EMBED_MAX_TOKENS), run the
-        transformer BODY (model.model(...) — the decoder stack WITHOUT the
-        LM head, which most mlx_lm architectures expose) to get per-token last
-        hidden states, mean-pool over the token axis, then L2-normalize so
-        cosine similarity is a plain dot product. Returns a Python list[float].
-        Deterministic given the model + text (a forward pass, no sampling)."""
-        # Cap the input so a giant blob cannot hold the GPU lock / blow memory.
+    def _embed_encode(self, text):
+        """Encode one input to a capped list of token ids for embedding. An input
+        that tokenizes to nothing (e.g. "") still needs a vector, so it falls back
+        to a single space so the forward pass has at least one token. Capped at
+        EMBED_MAX_TOKENS so a giant blob cannot hold the GPU lock / blow memory."""
         token_ids = self._tokenizer.encode(text if text else " ")
         if not token_ids:
-            # An input that tokenizes to nothing (e.g. "") still needs a vector;
-            # encode a single space so the forward pass has at least one token.
             token_ids = self._tokenizer.encode(" ")
-        token_ids = token_ids[:EMBED_MAX_TOKENS]
-        tokens = mx.array(token_ids)[None]  # shape [1, seq]
+        return token_ids[:EMBED_MAX_TOKENS]
 
-        # Run the transformer body to get last hidden states [1, seq, hidden].
-        # mlx_lm causal-LM modules wrap an inner `.model` (the decoder stack)
-        # whose __call__ returns hidden states; the outer module then applies
-        # the LM head. We want the hidden states, so call the inner stack.
+    def _embed_batch(self, mx, texts):
+        """Compute one L2-normalized embedding VECTOR per input by mean-pooling the
+        resident LLM's last hidden states ON-DEVICE, as ONE padded forward per
+        chunk. Caller holds self._lock and the LLM is loaded. NO new model is
+        downloaded: we reuse the already-resident generate model's hidden states
+        (the alternative — a dedicated sentence embedding model — would need a
+        separate weight download, which the contract forbids).
+
+        Method: encode each text (capped at EMBED_MAX_TOKENS); split into chunks
+        capped by BOTH EMBED_BATCH_CHUNK rows and EMBED_CHUNK_TOKEN_BUDGET padded
+        tokens (see _pack_embed_chunks); for each chunk right-pad to the chunk's
+        max length and run the transformer BODY once (model.model(...) — the decoder
+        stack WITHOUT the LM head, which most mlx_lm architectures expose) to get
+        per-token last hidden states [chunk, maxlen, hidden]; masked-mean-pool over
+        each row's REAL tokens; L2-normalize. Right-padding + the default causal
+        mask means a real token attends only to earlier real tokens, so its hidden
+        state is identical to the unpadded run. Returns a list of Python
+        list[float] in input order. Deterministic (a forward pass, no sampling)."""
         inner = getattr(self._model, "model", None)
         if inner is None or not callable(inner):
             raise ValueError(
                 "this model does not expose an inner decoder stack for embeddings"
             )
-        hidden = inner(tokens)  # [1, seq, hidden]
-        # Mean-pool over the token (seq) axis -> [1, hidden] -> [hidden].
-        pooled = mx.mean(hidden, axis=1)[0]
-        # L2-normalize so cosine similarity is a dot product. Guard a zero norm.
-        norm = mx.sqrt(mx.sum(pooled * pooled))
-        normed = pooled / mx.maximum(norm, 1e-12)
-        # Defensive: a pathological forward pass could leave NaN/Inf components,
-        # which json.dumps emits as bare NaN/Infinity tokens that the daemon's
-        # serde_json rejects, failing the WHOLE batch instead of degrading.
-        # Map any non-finite entry to 0.0 so the JSON response stays strict-valid
-        # (a degenerate-but-finite vector; recall still falls back cleanly if needed).
-        normed = mx.where(mx.isnan(normed) | mx.isinf(normed), 0.0, normed)
-        mx.eval(normed)
-        return [float(x) for x in normed.tolist()]
+        encoded = [self._embed_encode(t) for t in texts]
+        vectors = [None] * len(encoded)
+        # Plan chunks LENGTH-SORTED and bounded by BOTH caps (rows AND padded
+        # tokens), then write each result back to its ORIGINAL slot — output
+        # order is untouched. See _plan_embed_batches / _pack_embed_chunks.
+        for indices in _plan_embed_batches([len(ids) for ids in encoded]):
+            chunk = [encoded[i] for i in indices]
+            lengths = [len(ids) for ids in chunk]
+            maxlen = max(lengths)
+            # Pad id is irrelevant to the result: pad positions are never attended
+            # by real tokens (causal mask) and are excluded from the mean-pool.
+            padded = [ids + [0] * (maxlen - len(ids)) for ids in chunk]
+            hidden = inner(mx.array(padded))  # [chunk, maxlen, hidden]
+            normed = _pool_normalize(mx, hidden, lengths)  # [chunk, hidden]
+            mx.eval(normed)
+            for i, row in zip(indices, normed.tolist()):
+                vectors[i] = [float(x) for x in row]
+        return vectors
+
+    def _embed_one(self, mx, text):
+        """One L2-normalized embedding VECTOR for `text`. Thin wrapper over
+        [`_embed_batch`] (a batch of one) so the single- and multi-text paths share
+        one implementation. Caller holds self._lock and the LLM is loaded."""
+        return self._embed_batch(mx, [text])[0]
 
     def embed(self, texts):
         """Return one L2-normalized embedding VECTOR per input string, computed
@@ -3651,10 +3790,12 @@ class InferenceEngine:
         reuses the already-loaded generate model so NO new model is downloaded.
 
         `texts` is a list of strings (the daemon sends the query + the candidate
-        facts in one batch). The batch is capped at EMBED_MAX_BATCH and each
-        input at EMBED_MAX_TOKENS. Returns a list of equal-length float vectors,
-        in the SAME ORDER as the inputs. Deterministic (a forward pass, no
-        sampling). Holds the GPU lock for the batch like the other LLM ops."""
+        facts in one batch). The batch is capped at EMBED_MAX_BATCH and each input
+        at EMBED_MAX_TOKENS. Returns a list of equal-length float vectors, in the
+        SAME ORDER as the inputs — computed as one padded forward per chunk of
+        EMBED_BATCH_CHUNK rather than a forward per text. Deterministic (a forward
+        pass, no sampling). Holds the GPU lock for the batch like the other LLM
+        ops."""
         import mlx.core as mx
 
         if not isinstance(texts, list):
@@ -3666,12 +3807,11 @@ class InferenceEngine:
         for t in texts:
             if not isinstance(t, str):
                 raise ValueError("'texts' entries must be strings for op=embed")
-        vectors = []
+        if not texts:
+            return []
         with self._lock:
             self._ensure_llm()
-            for t in texts:
-                vectors.append(self._embed_one(mx, t))
-        return vectors
+            return self._embed_batch(mx, texts)
 
     # -- on-device vision-language model (op=describe_image) ------------
     # _ensure_vlm must be called with self._lock held.
