@@ -147,7 +147,10 @@ mod interception;
 mod interpret;
 // MICRO-APP INTROSPECTION (introspect.rs): a DEFENSIVE, READ-ONLY sentinel over
 // darwind's OWN sandboxed children — SBPL profile-drift detection (fingerprint
-// vs on-disk) + per-app RSS/CPU anomaly classification via sysinfo. No ES, no
+// vs on-disk) + per-app RSS/CPU anomaly classification via a libproc
+// PROC_PIDTASKINFO struct read (procwatch's shared reader — NEVER sysinfo's
+// per-process API, whose refresh would sysctl KERN_PROCARGS2 argv+env onto the
+// daemon heap; see procwatch.rs's whole-daemon invariant). No ES, no
 // task_for_pid, no ptrace, no entitlement (it watches same-UID children it
 // spawned). It relays through the telemetry bus; it observes, it never acts.
 mod introspect;
@@ -2861,8 +2864,10 @@ async fn main() -> Result<()> {
     }
     // Ambient micro-app introspection: a slow, READ-ONLY sentinel over darwind's
     // OWN sandboxed children — SBPL profile-drift (fingerprint vs on-disk) and
-    // per-app RSS/CPU anomaly classification via sysinfo (same-UID, no
-    // entitlement). It emits introspect.snapshot/profile_drift/anomaly for the
+    // per-app RSS/CPU anomaly classification via a libproc PROC_PIDTASKINFO
+    // struct read (procwatch's shared reader; never sysinfo's per-process API —
+    // the whole-daemon no-KERN_PROCARGS2 invariant in procwatch.rs). Same-UID,
+    // no entitlement. It emits introspect.snapshot/profile_drift/anomaly for the
     // HUD/posture; it observes, it never signals/kills/injects/writes. Ships ON
     // ([introspect].enabled) and stays inert (nothing to observe) until an app
     // runs. record_profile/record_child in apps.rs feed it regardless of the
