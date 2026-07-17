@@ -335,6 +335,15 @@ pub struct Config {
     /// that degrades honestly (never fabricated) when unreadable. `poll_secs` is
     /// the refresh cadence (clamped to a sane floor).
     pub vitals: VitalsConfig,
+    /// [procwatch] — PROCESS OBSERVATORY (procwatch.rs). `enabled` SHIPS ON
+    /// (armed-by-default). STRICTLY READ-ONLY: a bounded poll that snapshots the
+    /// LIVE process table and emits one SECRET-FREE `system.processes` frame
+    /// (total count, top-N by CPU/memory, new-since-last-poll, load average) to
+    /// the HUD. Process NAME + pid only — NEVER argv/env/open files (those can
+    /// carry secrets). It never kills/signals/renices anything — no such code
+    /// path exists. `poll_secs` is the cadence (clamped to a sane floor);
+    /// `top_n` the per-list size (hard-capped at 32).
+    pub procwatch: ProcwatchConfig,
     /// [snapshot] — SAFETY SNAPSHOT (snapshot.rs). `enabled` SHIPS ON
     /// (armed-by-default). BENIGN-ONLY: before a consequential, hard-to-reverse
     /// step (a self-heal apply, a consequential mission step) DARWIN takes a
@@ -1057,6 +1066,13 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // to the HUD. No action, no actuator, no root. `poll_secs` is the refresh
     // cadence (clamped to a sane floor). Listed so neither reads as a typo.
     ("vitals", &["enabled", "poll_secs"]),
+    // [procwatch] — PROCESS OBSERVATORY (procwatch.rs). `enabled` SHIPS ON
+    // (armed-by-default). STRICTLY READ-ONLY: a bounded poll of the LIVE process
+    // table -> one SECRET-FREE `system.processes` frame (name + pid only —
+    // never argv/env/open files; no kill/signal/renice path exists). `poll_secs`
+    // is the cadence (clamped to a sane floor); `top_n` the per-list size
+    // (hard-capped at 32). Listed so none reads as a typo.
+    ("procwatch", &["enabled", "poll_secs", "top_n"]),
     // [snapshot] — SAFETY SNAPSHOT (snapshot.rs). `enabled` SHIPS ON (armed-by-
     // default). BENIGN-ONLY: before a consequential step (a self-heal apply, a
     // consequential mission step) DARWIN takes a bounded `tmutil localsnapshot`
@@ -1927,6 +1943,50 @@ impl Default for VitalsConfig {
             // A calm 5s cadence: fresh enough for a live panel, light on the
             // machine. Clamped to VITALS_MIN_POLL_SECS at read time.
             poll_secs: 5,
+        }
+    }
+}
+
+/// [procwatch] — PROCESS OBSERVATORY (procwatch.rs). STRICTLY READ-ONLY, armed
+/// by default.
+///
+///   - `enabled` (SHIPS ON, armed-by-default): the master gate for the
+///     `system.processes` poll. When ON, DARWIN snapshots the LIVE process
+///     table and surfaces one bounded, SECRET-FREE frame (total count, top-N by
+///     CPU/memory, new-since-last-poll, load average). The wire carries process
+///     NAME + pid (+ ppid/uid) only — NEVER argv/command line, NEVER
+///     environment, NEVER open files/paths (those routinely carry secrets; the
+///     collector never reads them, by construction). It OBSERVES only: no
+///     kill/signal/renice code path exists. OFF => the poll never spawns and
+///     the panel stays honestly empty.
+///   - `poll_secs` (default 10): the snapshot cadence. Clamped at read time to
+///     a sane floor (>= [`procwatch::PROCWATCH_MIN_POLL_SECS`]) so a
+///     hostile/typo'd 0 can't busy-spin the poll.
+///   - `top_n` (default 12): how many processes each top-CPU / top-memory list
+///     carries. Hard-capped at [`procwatch::PROCWATCH_MAX_TOP_N`] so a
+///     hostile/typo'd value can never flood the frame.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ProcwatchConfig {
+    pub enabled: bool,
+    pub poll_secs: u64,
+    pub top_n: u64,
+}
+
+impl Default for ProcwatchConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS ON (armed-by-default). STRICTLY READ-ONLY: the poll only
+            // OBSERVES the process table — it never kills/signals/renices, and
+            // the wire is secret-free (name + pid; never argv/env/files).
+            enabled: true,
+            // A calm 10s cadence: the process table changes slowly enough that
+            // a live panel needs nothing faster; light on the machine. Clamped
+            // to PROCWATCH_MIN_POLL_SECS at read time.
+            poll_secs: 10,
+            // 12 rows per list reads comfortably in the HUD panel; hard-capped
+            // at PROCWATCH_MAX_TOP_N (32) at read time.
+            top_n: 12,
         }
     }
 }
@@ -4709,6 +4769,7 @@ impl Config {
             plugin_sdk: section(&table, "plugin_sdk", &mut issues),
             power: section(&table, "power", &mut issues),
             vitals: section(&table, "vitals", &mut issues),
+            procwatch: section(&table, "procwatch", &mut issues),
             snapshot: section(&table, "snapshot", &mut issues),
             obol: section(&table, "obol", &mut issues),
             report: section(&table, "report", &mut issues),
@@ -4999,6 +5060,37 @@ mod tests {
         );
         assert!(!cfg.vitals.enabled);
         assert_eq!(cfg.vitals.poll_secs, 10);
+    }
+
+    /// [procwatch] PROCESS OBSERVATORY SHIPS ON (armed-by-default; strictly
+    /// READ-ONLY — observes the live process table, never kills/signals/renices;
+    /// secret-free wire: name + pid, never argv/env), with the calm 10s poll and
+    /// 12-row top-N defaults. The keys are KNOWN and round-trip.
+    #[test]
+    fn procwatch_defaults_on_and_keys_known() {
+        let (cfg, issues) = Config::parse("");
+        assert!(issues.is_empty(), "{issues:?}");
+        assert!(
+            cfg.procwatch.enabled,
+            "[procwatch].enabled SHIPS ON (armed-by-default; strictly read-only)"
+        );
+        assert_eq!(cfg.procwatch.poll_secs, 10);
+        assert_eq!(cfg.procwatch.top_n, 12);
+
+        let raw = r#"
+            [procwatch]
+            enabled = false
+            poll_secs = 30
+            top_n = 5
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        assert!(
+            !issues.iter().any(|i| i.contains("procwatch")),
+            "[procwatch] keys must be KNOWN (no diagnostic): {issues:?}"
+        );
+        assert!(!cfg.procwatch.enabled);
+        assert_eq!(cfg.procwatch.poll_secs, 30);
+        assert_eq!(cfg.procwatch.top_n, 5);
     }
 
     /// SAFETY SNAPSHOT: [snapshot].enabled SHIPS ON (armed-by-default; benign-only
