@@ -200,7 +200,9 @@ class CachedGeneratePeerCancellation(unittest.TestCase):
         fake.install()
         try:
             engine = self._cached_engine()
-            out = engine._generate_cached(
+            # _generate_cached returns (text, metrics) — the second element is the
+            # honest decode telemetry surfaced by accel/benchmark-foundation.
+            out, _metrics = engine._generate_cached(
                 "some prompt", 40, cancelled=lambda: fake.pulled >= 5
             )
             self.assertEqual(fake.pulled, 5, "decode must stop at the cancel poll")
@@ -213,7 +215,7 @@ class CachedGeneratePeerCancellation(unittest.TestCase):
         fake.install()
         try:
             engine = self._cached_engine()
-            out = engine._generate_cached("some prompt", 40)
+            out, _metrics = engine._generate_cached("some prompt", 40)
             self.assertEqual(fake.pulled, 8)
             self.assertEqual(out, "a " * 8)
         finally:

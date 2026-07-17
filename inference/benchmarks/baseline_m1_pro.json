@@ -1,0 +1,357 @@
+{
+  "schema": "darwin.inference.baseline/1",
+  "generated_at": "2026-07-17T03:36:15.307320+00:00",
+  "environment": {
+    "chip": "Apple M1 Pro",
+    "cores": 10,
+    "memory_gib": 16,
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "python": "3.11.7",
+    "mlx": "0.31.2",
+    "mlx_lm": "0.31.3",
+    "mlx_whisper": "0.4.3",
+    "metal_available": true
+  },
+  "models": {
+    "llm": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+    "draft": "mlx-community/Qwen3-0.6B-4bit",
+    "speculative_config": true,
+    "stt": "mlx-community/whisper-small-mlx",
+    "classifier": "(reuses llm mlx-community/Qwen3-4B-Instruct-2507-4bit)",
+    "tts_engine": "kokoro",
+    "tts_voice": "bm_george",
+    "vlm_config": "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+  },
+  "methodology": {
+    "warm": "each model is loaded and a warm-up run is executed and DISCARDED before any timed run (kernel compile / first-alloc excluded).",
+    "aggregation": "median of N timed runs after the warm-up; min/max and the raw kept runs are included alongside each median.",
+    "prefill_tps": "mlx_lm GenerationResponse.prompt_tps \u2014 prompt tokens prefilled per second.",
+    "decode_tps": "mlx_lm GenerationResponse.generation_tps \u2014 output tokens decoded per second (the headline throughput).",
+    "first_token_ms": "wall-clock milliseconds from the generate call to the first streamed token (prefill + first decode step).",
+    "peak_memory_gb": "mx.get_peak_memory() in GB, reset per run \u2014 peak GPU working set during that run.",
+    "stt_latency_ms": "wall-clock milliseconds for one whisper transcribe of a short synthesized speech clip (audio length reported).",
+    "tts_rtf": "real-time factor = synth_seconds / audio_seconds; < 1.0 is faster than real time (lower is better).",
+    "embed_latency_ms": "wall-clock milliseconds to compute one mean-pooled embedding via the resident LLM forward pass.",
+    "speculative": "decode tok/s with the draft model ON vs OFF on the uncached path; the persona-cached path is reported unreachable when mlx_lm rejects draft_model together with a prompt_cache.",
+    "sampler_note": "the persona_cached runs use DARWIN's production persona sampler (temperature + top-p), matching the live generate path; the representative/long_context/speculative uncached runs use mlx_lm's default sampler. Decode tok/s is dominated by the model, but the small cached-vs-uncached decode gap is partly this sampler difference \u2014 not a cache effect (the KV cache only saves PREFILL)."
+  },
+  "config": {
+    "runs": 5,
+    "warmup": 1,
+    "max_tokens": 128,
+    "long_max_tokens": 64
+  },
+  "results": {
+    "llm": {
+      "representative": {
+        "prefill_tps": {
+          "median": 175.77037289684304,
+          "min": 175.2655815987725,
+          "max": 176.74310478675446,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            176.74310478675446,
+            175.73193032251422,
+            175.77037289684304,
+            175.2655815987725,
+            176.09582221286033
+          ]
+        },
+        "decode_tps": {
+          "median": 62.85420972848329,
+          "min": 62.59478875526184,
+          "max": 62.90761630563965,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            62.59478875526184,
+            62.861974791702444,
+            62.85420972848329,
+            62.90761630563965,
+            62.63644622686015
+          ]
+        },
+        "first_token_ms": {
+          "median": 352.0025000907481,
+          "min": 349.75045919418335,
+          "max": 353.7526251748204,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            349.75045919418335,
+            352.0025000907481,
+            353.7526251748204,
+            353.5286667756736,
+            351.81979183107615
+          ]
+        },
+        "peak_memory_gb": {
+          "median": 2.50006678,
+          "min": 2.50006678,
+          "max": 2.50006678,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            2.50006678,
+            2.50006678,
+            2.50006678,
+            2.50006678,
+            2.50006678
+          ]
+        },
+        "prompt_label": "representative",
+        "prompt_tokens": 46,
+        "max_tokens": 128,
+        "generation_tokens_last": 18
+      },
+      "long_context": {
+        "prefill_tps": {
+          "median": 288.1382632801986,
+          "min": 287.97731996831556,
+          "max": 288.27716145216374,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            287.97731996831556,
+            288.27716145216374,
+            288.2066178694163,
+            288.00107452340166,
+            288.1382632801986
+          ]
+        },
+        "decode_tps": {
+          "median": 50.74992030710923,
+          "min": 50.27358134354184,
+          "max": 50.780940539311814,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            50.780940539311814,
+            50.74992030710923,
+            50.65352046507094,
+            50.775764760120595,
+            50.27358134354184
+          ]
+        },
+        "first_token_ms": {
+          "median": 7057.048208080232,
+          "min": 7050.948250107467,
+          "max": 7060.128666926175,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            7060.128666926175,
+            7050.948250107467,
+            7055.565250106156,
+            7058.551999740303,
+            7057.048208080232
+          ]
+        },
+        "peak_memory_gb": {
+          "median": 3.319307328,
+          "min": 3.319307328,
+          "max": 3.319307328,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            3.319307328,
+            3.319307328,
+            3.319307328,
+            3.319307328,
+            3.319307328
+          ]
+        },
+        "prompt_label": "long_context",
+        "prompt_tokens": 2007,
+        "max_tokens": 64,
+        "generation_tokens_last": 34
+      },
+      "persona_cached": {
+        "prefill_tps": {
+          "median": 173.07419636030724,
+          "min": 171.8258158814599,
+          "max": 175.40359802022775,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            175.40359802022775,
+            171.8258158814599,
+            172.78686838766708,
+            173.2160875203587,
+            173.07419636030724
+          ]
+        },
+        "decode_tps": {
+          "median": 60.47785060279447,
+          "min": 60.04979127058695,
+          "max": 60.59654784787429,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            60.41786508432165,
+            60.59654784787429,
+            60.54425943662849,
+            60.04979127058695,
+            60.47785060279447
+          ]
+        },
+        "peak_memory_gb": {
+          "median": 3.319307328,
+          "min": 3.319307328,
+          "max": 3.319307328,
+          "n": 5,
+          "warmup": 1,
+          "runs": [
+            3.319307328,
+            3.319307328,
+            3.319307328,
+            3.319307328,
+            3.319307328
+          ]
+        },
+        "path": "persona_kv_cached",
+        "max_tokens": 128
+      }
+    },
+    "speculative": {
+      "available": true,
+      "draft_model": "mlx-community/Qwen3-0.6B-4bit",
+      "uncached": {
+        "off": {
+          "decode_tps": {
+            "median": 62.710814157070445,
+            "min": 62.512643586110265,
+            "max": 62.77291512388325,
+            "n": 5,
+            "warmup": 1,
+            "runs": [
+              62.512643586110265,
+              62.71615839245004,
+              62.710814157070445,
+              62.58222060107861,
+              62.77291512388325
+            ]
+          },
+          "peak_memory_gb": {
+            "median": 2.835447316,
+            "min": 2.835447316,
+            "max": 2.835447316,
+            "n": 5,
+            "warmup": 1,
+            "runs": [
+              2.835447316,
+              2.835447316,
+              2.835447316,
+              2.835447316,
+              2.835447316
+            ]
+          }
+        },
+        "on": {
+          "decode_tps": {
+            "median": 44.177764449031606,
+            "min": 44.09647242680314,
+            "max": 44.598902566967965,
+            "n": 5,
+            "warmup": 1,
+            "runs": [
+              44.598902566967965,
+              44.22042615849478,
+              44.135536568692494,
+              44.09647242680314,
+              44.177764449031606
+            ]
+          },
+          "peak_memory_gb": {
+            "median": 2.864807628,
+            "min": 2.864807628,
+            "max": 2.864807628,
+            "n": 5,
+            "warmup": 1,
+            "runs": [
+              2.864807628,
+              2.864807628,
+              2.864807628,
+              2.864807628,
+              2.864807628
+            ]
+          }
+        },
+        "delta": {
+          "decode_tps_abs": -18.53304970803884,
+          "decode_tps_ratio": 0.7044680418018573
+        }
+      },
+      "cached": {
+        "reachable": false,
+        "reason": "IndexError: list index out of range",
+        "note": "speculative + persona KV cache not supported together; DARWIN's cached path runs normal (non-speculative) decode."
+      }
+    },
+    "stt": {
+      "available": true,
+      "model": "mlx-community/whisper-small-mlx",
+      "audio_seconds": 4.2,
+      "latency_ms": {
+        "median": 315.88812498375773,
+        "min": 314.15208382532,
+        "max": 319.88254096359015,
+        "n": 5,
+        "warmup": 1,
+        "runs": [
+          319.88254096359015,
+          314.2621251754463,
+          315.88812498375773,
+          317.06020794808865,
+          314.15208382532
+        ]
+      },
+      "transcript": "The quick brown fox jumps over the lazy dog near the river."
+    },
+    "tts": {
+      "available": true,
+      "engine": "kokoro",
+      "voice": "bm_george",
+      "sample_rate": 24000,
+      "audio_seconds": 7.25,
+      "rtf": {
+        "median": 0.06810858620908754,
+        "min": 0.06731168386237375,
+        "max": 0.09522847696368036,
+        "n": 5,
+        "warmup": 1,
+        "runs": [
+          0.06731168386237375,
+          0.06786025861470864,
+          0.06810858620908754,
+          0.09522847696368036,
+          0.07213625292582758
+        ]
+      }
+    },
+    "embed": {
+      "available": true,
+      "model": "mlx-community/Qwen3-4B-Instruct-2507-4bit",
+      "dim": 2560,
+      "latency_ms": {
+        "median": 126.26137537881732,
+        "min": 124.95062500238419,
+        "max": 127.38649966195226,
+        "n": 5,
+        "warmup": 1,
+        "runs": [
+          124.95062500238419,
+          125.78820902854204,
+          126.76391564309597,
+          127.38649966195226,
+          126.26137537881732
+        ]
+      }
+    }
+  },
+  "unavailable": {
+    "image_generation": "mflux not installed \u2014 op=generate_image ships unavailable; not benchmarked.",
+    "vlm_describe_image": "mlx-vlm not installed \u2014 op=describe_image ships unavailable; not benchmarked."
+  }
+}
