@@ -3772,27 +3772,27 @@ async fn run_pipeline(
                 }),
             );
             // THRESHOLD — GUEST MODE: a guest turn must leave NO trace in the OWNER's
-            // DURABLE state. Every owner-durable post-turn recorder below (transcript,
-            // episodic store, CAUSA decision-trace, optimizer trace — the fact-learner
-            // is already gated) is skipped for a guest turn, so a bystander's utterance
-            // never poisons the owner's memory / history / routing corpus (which the
-            // owner later reads back via fetch_history / episodic_recall / "why did you
-            // do that"). A single shared flag gates them all — the honest, robust form
-            // of the per-writer guards.
-            let guest_turn = crate::threshold::is_guest_turn();
-            if !guest_turn {
-                if let Err(e) = memory
-                    .record_transcript(
-                        Some(&wav.display().to_string()),
-                        &text,
-                        &class.intent,
-                        outcome.routed_to,
-                        Some(&outcome.response),
-                    )
-                    .await
-                {
-                    warn!(error = %e, "failed to record transcript");
-                }
+            // DURABLE state. This is now enforced at the PERSISTENCE-BOUNDARY CHOKEPOINT
+            // (threshold::guest_write_blocked, checked inside every durable-write
+            // PRIMITIVE) rather than here at the scattered call sites: record_transcript,
+            // episodic/record_episode, explain::record, and the optimizer trace below
+            // each NO-OP on a guest turn no matter which caller reaches them. The old
+            // per-writer `!guest_turn` gates were whack-a-mole (each review found a new
+            // uncovered writer); the chokepoint is load-bearing, so these sites run
+            // unguarded and the write simply does nothing on a guest turn. (The passive
+            // fact-learner is the ONE exception — it is tokio::spawn'd, so it escapes the
+            // task-local scope and keeps its own should_learn_turn spawn-gate below.)
+            if let Err(e) = memory
+                .record_transcript(
+                    Some(&wav.display().to_string()),
+                    &text,
+                    &class.intent,
+                    outcome.routed_to,
+                    Some(&outcome.response),
+                )
+                .await
+            {
+                warn!(error = %e, "failed to record transcript");
             }
             // MACRO CAPTURE (#27): while a recording is in progress, append THIS
             // command (the utterance + its classified intent) to the buffer — but
@@ -3929,28 +3929,29 @@ async fn run_pipeline(
             // GUEST GATE (in addition to VoiceGate): with voice-id OFF, an explicit
             // "guest mode on" installs a guest scope but the VoiceGate permits
             // recording (OwnerGate::OFF), so a bystander's turn would otherwise seed
-            // the owner's episodic store — poisoning it. Skip for a guest turn.
-            if !guest_turn {
-                let voice = episodic::VoiceGate::from_owner_gate(voiceid::current_turn_gate());
-                match episodic::record_episode(
-                    cfg,
-                    memory,
-                    &outcome.namespace,
-                    &text,
-                    &outcome.response,
-                    &class.intent,
-                    transient,
-                    voice,
-                )
-                .await
-                {
-                    Ok(recorded) => telemetry::emit(
-                        "system",
-                        "episodic.recorded",
-                        json!({"recorded": recorded, "agent": outcome.agent}),
-                    ),
-                    Err(e) => warn!(error = %e, "failed to record episode"),
-                }
+            // the owner's episodic store. This is now enforced at the chokepoint —
+            // episodic::record_episode returns Ok(false) on a guest turn (and the
+            // Memory::record_episode store guard is the load-bearing backstop) — so
+            // episodic.recorded honestly reports false and nothing is persisted.
+            let voice = episodic::VoiceGate::from_owner_gate(voiceid::current_turn_gate());
+            match episodic::record_episode(
+                cfg,
+                memory,
+                &outcome.namespace,
+                &text,
+                &outcome.response,
+                &class.intent,
+                transient,
+                voice,
+            )
+            .await
+            {
+                Ok(recorded) => telemetry::emit(
+                    "system",
+                    "episodic.recorded",
+                    json!({"recorded": recorded, "agent": outcome.agent}),
+                ),
+                Err(e) => warn!(error = %e, "failed to record episode"),
             }
 
             // PER-TURN DECISION SIGNALS shared by the CAUSA decision trace and the
@@ -3982,7 +3983,10 @@ async fn run_pipeline(
             // carry on-screen secrets and must never seed a trace). READ-ONLY: it
             // records what already happened; the utterance + outcome are redacted at
             // assembly, and it never fabricates a rationale.
-            if cfg.explain.enabled && !transient && !guest_turn {
+            // GUEST GATE: enforced at the chokepoint — explain::record NO-OPs on a
+            // guest turn — so this site runs unguarded and simply records nothing for
+            // a bystander (no owner-readable "why did you do that" trace is seeded).
+            if cfg.explain.enabled && !transient {
                 let gate = voiceid::current_turn_gate();
                 explain::record(
                     &explain::TurnSignals {
@@ -4016,7 +4020,11 @@ async fn run_pipeline(
             // explicit redirect cue — optimize::is_correction), re-label the prior
             // trace Corrected (the learnable signal). The recorder + labeler are
             // pure no-ops when disabled, so the shipped-OFF default does nothing.
-            if cfg.optimize.enabled && !transient && !guest_turn {
+            // GUEST GATE: enforced at the chokepoint — record_trace returns Ok(None)
+            // and label_outcome/calibrate NO-OP on a guest turn — so this site runs
+            // unguarded and seeds neither the optimizer corpus nor the calibration
+            // window for a bystander.
+            if cfg.optimize.enabled && !transient {
                 // Cross-turn correction: did THIS turn correct the prior route?
                 if let Some(prior) = prior_turn.as_ref() {
                     if optimize::is_correction(prior, &class.intent, &outcome.agent, &text) {

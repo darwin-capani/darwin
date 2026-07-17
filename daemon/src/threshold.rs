@@ -485,6 +485,56 @@ pub fn is_guest_turn() -> bool {
     TURN_SCOPE.try_with(|c| c.borrow().is_some()).unwrap_or(false)
 }
 
+/// THE WRITE-INTEGRITY CHOKEPOINT PREDICATE — the WRITE-side twin of
+/// [`is_guest_turn`]'s READ-side withholding.
+///
+/// ## The invariant it enforces
+/// **A guest turn leaves NO durable trace in the owner's state.** Rather than
+/// gate the UNBOUNDED, scattered durable-write CALL SITES (transcript, the passive
+/// learner, episodic, the CAUSA decision-trace, the optimizer trace, macro-capture,
+/// `record_event`, `record_interaction`, … — each of which a review keeps
+/// re-finding, whack-a-mole), the invariant is enforced ONCE at the BOUNDED,
+/// enumerable PERSISTENCE BOUNDARY: the finite set of durable-write PRIMITIVES.
+/// Each such primitive calls this and NO-OPs (writes nothing) when it returns true,
+/// so a guest turn STRUCTURALLY cannot durably write — no matter which caller
+/// reaches the primitive, now or in the future.
+///
+/// The gated primitives (the enumeration the tests pin) are:
+///   * every `Memory` INSERT/UPDATE write: `record_event`, `upsert_fact_at` (the
+///     single fact-write leaf that `upsert_fact` / `upsert_user_fact` — and thus
+///     the cloud `remember_fact` tool, `user_model`, `standing`, `macros::save`,
+///     `proactive::record_interaction` — all funnel through), `record_transcript`,
+///     `record_episode`, `save_notebook_entry`;
+///   * the optimizer [`crate::optimize::TraceStore`] (`record_returning_id` /
+///     `record_trace` / `label_outcome`);
+///   * `crate::macros::capture` (the recording buffer whose contents become durable
+///     at "stop recording");
+///   * `crate::episodic::record_episode`;
+///   * `crate::explain::record` (the decision-trace ring the owner reads back via
+///     "why did you do that");
+///   * `crate::calibrate::record` / `relabel` (the calibration window that shifts
+///     the owner's clarify threshold).
+///
+/// ## Background tasks are UNAFFECTED (by construction)
+/// The guest scope is a per-turn TASK-LOCAL ([`with_turn_scope`]). A concurrent
+/// BACKGROUND task — a mission, the anticipation / retention / reflection loop —
+/// runs OUTSIDE any turn scope and reads FALSE here, so its writes proceed
+/// normally. The one durable write that ESCAPES this chokepoint is the passive
+/// fact-learner: it is `tokio::spawn`ed (`spawn_learning_task`), so it runs in a
+/// DETACHED task that does NOT inherit the turn's task-local and would read FALSE
+/// here. It therefore keeps its OWN call-site gate (`should_learn_turn`, which
+/// refuses to SPAWN on a guest turn) — that gate is load-bearing and is NOT
+/// subsumed by this chokepoint.
+///
+/// ## HONESTY
+/// Only DURABLE owner-durable / owner-influencing state is gated. Telemetry emits,
+/// per-turn in-RAM scratch (the source accumulator, `take_turn_tool`, the verify
+/// outcome), secret-free latency aggregates, and the guest's OWN spoken reply are
+/// NOT durable owner state and flow normally.
+pub fn guest_write_blocked() -> bool {
+    is_guest_turn()
+}
+
 /// `#[cfg(test)]`-only RAII guard forcing [`current_turn_scope`] to a value on the
 /// current thread, restoring the prior state on drop (so the override never leaks
 /// into another test). Mirrors `voiceid::GateOverride`; the whole seam is
@@ -1180,5 +1230,171 @@ mod tests {
             assert!(guest_tuned.surfaces(SignalCategory::Critical), "critical floor holds");
             assert!(!guest_tuned.surfaces(SignalCategory::News), "the guest profile quiets ordinary intel");
         }
+    }
+
+    // =====================================================================
+    // WRITE-INTEGRITY CHOKEPOINT — the persistence-boundary enumeration
+    //
+    // THE invariant: a guest turn leaves NO durable trace in the owner's state.
+    // This test ENUMERATES every DURABLE-STORE write primitive (the finite
+    // persistence layer) and proves each is a NO-OP under a guest turn
+    // (with_turn_scope + set_turn_scope, the REAL task-local mechanism) and
+    // UNCHANGED for an owner turn. The three process-global RING primitives
+    // (macros::capture, explain::record, calibrate::record/relabel) are proven
+    // in their home modules (natural serialization); together they cover the
+    // full set guarded by threshold::guest_write_blocked.
+    // =====================================================================
+
+    /// Remove a temp DB and its WAL/SHM sidecars.
+    fn rm_db(path: &std::path::Path) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut s = path.to_path_buf().into_os_string();
+            s.push(suffix);
+            let _ = std::fs::remove_file(std::path::PathBuf::from(s));
+        }
+    }
+
+    #[tokio::test]
+    async fn write_integrity_every_durable_store_primitive_is_a_noop_on_a_guest_turn() {
+        use crate::config::Config;
+        use crate::episodic;
+        use crate::memory::{Episode, Memory, NotebookCitation, NotebookEntry};
+        use crate::optimize::{self, Outcome, Trace, TraceStore};
+        use crate::voiceid::OwnerGate;
+
+        // Isolated on-disk stores (unique per test) so every assertion is EXACT and
+        // immune to any other test.
+        let base = std::env::temp_dir().join(format!("darwin-threshold-writeint-{}", std::process::id()));
+        let mem_path = std::path::PathBuf::from(format!("{}-mem.db", base.display()));
+        let trace_path = std::path::PathBuf::from(format!("{}-trace.db", base.display()));
+        rm_db(&mem_path);
+        rm_db(&trace_path);
+        let mem = Memory::open(&mem_path).unwrap();
+        let store = TraceStore::open(&trace_path).unwrap();
+
+        let mut cfg = Config::default();
+        cfg.episodic.enabled = true;
+        cfg.optimize.enabled = true;
+        // OwnerGate::OFF => voice-id not enforcing => the VoiceGate permits recording,
+        // so an OWNER turn WOULD record an episode (isolating the guest guard as the
+        // ONLY reason a guest turn does not).
+        let voice = episodic::VoiceGate::from_owner_gate(OwnerGate::OFF);
+
+        let episode = || Episode {
+            id: 0,
+            ts: String::new(),
+            agent_namespace: "agent.darwin".to_string(),
+            utterance_redacted: "hello there".to_string(),
+            topic: "conversation".to_string(),
+            salient_entities: vec![],
+            outcome: "ok".to_string(),
+            summary: "a greeting".to_string(),
+        };
+        let notebook = || NotebookEntry {
+            id: 0,
+            ts: String::new(),
+            agent_namespace: "agent.darwin".to_string(),
+            topic_key: "topic".to_string(),
+            topic: "Topic".to_string(),
+            synthesized: "a synthesized body".to_string(),
+            citations: vec![NotebookCitation {
+                source_id: 1,
+                title: "t".to_string(),
+                url: "https://example.com".to_string(),
+            }],
+        };
+        let a_trace = || Trace::new("hello there", "conversation", "agent.darwin", "clarify", "", Outcome::Success, 1, 1);
+
+        let guest = guest_from(&orchestrator_owner(), &FocusProfile::DeepFocus);
+
+        // ---- PHASE 1: GUEST TURN — every durable-write primitive must NO-OP ----
+        with_turn_scope(async {
+            set_turn_scope(guest.clone());
+            assert!(is_guest_turn(), "the guest scope is installed for this turn");
+
+            // Memory INSERT/UPDATE primitives.
+            mem.record_event("cloud", "route.cloud", "guest utterance").await.unwrap();
+            mem.upsert_fact("user.enum.fact", "leak").await.unwrap();
+            mem.upsert_user_fact("user.enum.userfact", "leak").await.unwrap();
+            mem.record_transcript(Some("/tmp/g.wav"), "guest utterance", "conversation", "cloud", Some("guest reply"))
+                .await
+                .unwrap();
+            mem.record_episode(&episode()).await.unwrap();
+            let nb_id = mem.save_notebook_entry(&notebook()).await.unwrap();
+            assert_eq!(nb_id, 0, "a guest notebook write returns the no-row sentinel and inserts nothing");
+
+            // The episodic recorder honestly reports it recorded NOTHING.
+            let recorded = episodic::record_episode(&cfg, &mem, "agent.darwin", "guest utterance", "guest reply", "conversation", false, voice)
+                .await
+                .unwrap();
+            assert!(!recorded, "episodic::record_episode records nothing for a guest (and says so)");
+
+            // Optimizer TraceStore primitives.
+            let direct = store.record_returning_id(&a_trace()).await.unwrap();
+            assert_eq!(direct, 0, "a guest trace INSERT returns the no-row sentinel and inserts nothing");
+            let rec = optimize::record_trace(&cfg, &store, "guest utterance", "conversation", "agent.darwin", "clarify", "", Outcome::Success, 1, 1)
+                .await
+                .unwrap();
+            assert!(rec.is_none(), "record_trace seeds no optimizer trace for a guest");
+        })
+        .await;
+
+        // Every durable store is EMPTY after the guest turn.
+        assert_eq!(mem.events_count().await.unwrap(), 0, "a guest turn wrote a durable event");
+        assert!(mem.get_fact("user.enum.fact").await.unwrap().is_none(), "a guest turn wrote a fact");
+        assert!(mem.get_fact("user.enum.userfact").await.unwrap().is_none(), "a guest turn wrote a user fact");
+        assert_eq!(mem.recent_exchanges(10).await.unwrap().len(), 0, "a guest turn wrote a transcript");
+        assert_eq!(mem.episodes_count().await.unwrap(), 0, "a guest turn wrote an episode");
+        assert_eq!(mem.notebook_entries_count().await.unwrap(), 0, "a guest turn wrote a notebook entry");
+        assert_eq!(store.count().await.unwrap(), 0, "a guest turn wrote an optimizer trace");
+
+        // ---- PHASE 2: OWNER TURN — every primitive writes exactly as today ----
+        // No turn scope installed => is_guest_turn() == false (the owner path).
+        assert!(!is_guest_turn(), "no scope installed -> owner path");
+        mem.record_event("cloud", "route.cloud", "owner utterance").await.unwrap();
+        mem.upsert_fact("user.enum.fact", "kept").await.unwrap();
+        mem.upsert_user_fact("user.enum.userfact", "kept").await.unwrap();
+        mem.record_transcript(Some("/tmp/o.wav"), "owner utterance", "conversation", "cloud", Some("owner reply"))
+            .await
+            .unwrap();
+        mem.record_episode(&episode()).await.unwrap();
+        let nb_id = mem.save_notebook_entry(&notebook()).await.unwrap();
+        assert!(nb_id > 0, "an owner notebook write returns a real row id");
+        let recorded = episodic::record_episode(&cfg, &mem, "agent.darwin", "owner utterance", "owner reply", "conversation", false, voice)
+            .await
+            .unwrap();
+        assert!(recorded, "an owner episodic write records");
+        let direct = store.record_returning_id(&a_trace()).await.unwrap();
+        assert!(direct > 0, "an owner trace INSERT returns a real row id");
+        let owner_trace_id = optimize::record_trace(&cfg, &store, "owner utterance", "conversation", "agent.darwin", "clarify", "", Outcome::Success, 1, 2)
+            .await
+            .unwrap()
+            .expect("an owner record_trace returns a row id");
+
+        // Every durable store now reflects the OWNER writes.
+        assert_eq!(mem.events_count().await.unwrap(), 1, "the owner event was not recorded");
+        assert_eq!(mem.get_fact("user.enum.fact").await.unwrap().as_deref(), Some("kept"));
+        assert_eq!(mem.get_fact("user.enum.userfact").await.unwrap().as_deref(), Some("kept"));
+        assert_eq!(mem.recent_exchanges(10).await.unwrap().len(), 1, "the owner transcript was not recorded");
+        // record_episode (direct) + episodic::record_episode == 2 episodes.
+        assert_eq!(mem.episodes_count().await.unwrap(), 2, "the owner episodes were not recorded");
+        assert_eq!(mem.notebook_entries_count().await.unwrap(), 1, "the owner notebook was not recorded");
+        // record_returning_id + record_trace == 2 traces.
+        assert_eq!(store.count().await.unwrap(), 2, "the owner traces were not recorded");
+
+        // ---- label_outcome: a guest turn relabels 0 rows; the owner path relabels 1.
+        let guest_relabel = with_turn_scope(async {
+            set_turn_scope(guest.clone());
+            store.label_outcome(owner_trace_id, Outcome::CorrectedNextTurn).await.unwrap()
+        })
+        .await;
+        assert_eq!(guest_relabel, 0, "a guest turn relabeled the owner's optimizer trace");
+        let owner_relabel = store.label_outcome(owner_trace_id, Outcome::CorrectedNextTurn).await.unwrap();
+        assert_eq!(owner_relabel, 1, "the owner path did not relabel the row");
+
+        drop(mem);
+        drop(store);
+        rm_db(&mem_path);
+        rm_db(&trace_path);
     }
 }
