@@ -238,6 +238,7 @@ import {
 import { agentProfile, normalizeHue } from "./agents";
 import { type ChangeqState, changeqReduce, parseChangeqList } from "./changeq";
 import { type HardwareVitals, parseVitals } from "./vitals";
+import { type ProcessesFrame, parseProcesses } from "./procwatch";
 
 /* ------------------------------------------------------------------------ */
 
@@ -636,6 +637,11 @@ export interface HudState {
    *  load average, and every mounted volume's free/total. STRICTLY READ-ONLY +
    *  secret-free. Null until the first frame (nothing read yet). */
   vitals: HardwareVitals | null;
+  /** PROCESS OBSERVATORY reduction (system.processes, procwatch.rs): total
+   *  process count, top-N by CPU/memory (name + pid only — the daemon never
+   *  reads argv/env), new-since-last-poll, load average. STRICTLY READ-ONLY +
+   *  secret-free. Null until the first frame (nothing read yet). */
+  processes: ProcessesFrame | null;
   lastTimings: PipelineTimings | null;
 
   /** Daemon-side is_speaking(): mic is muted because DARWIN is talking.
@@ -1463,6 +1469,7 @@ export function initialState(): HudState {
       uptimeSecs: null,
     },
     vitals: null,
+    processes: null,
     lastTimings: null,
     micMuted: false,
     loudStreak: 0,
@@ -1879,6 +1886,14 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // never a fabricated reading) and STRICTLY READ-ONLY — the panel only
       // displays, it actuates nothing.
       return { ...s, vitals: parseVitals(env.data) };
+    }
+
+    case "system.processes": {
+      // PROCESS OBSERVATORY (procwatch.rs, [procwatch].poll_secs cadence).
+      // parseProcesses is DEFENSIVE (a malformed field degrades to an honest
+      // unknown/empty, never a fabricated reading; hostile arrays bounded) and
+      // STRICTLY READ-ONLY — the panel only displays, it actuates nothing.
+      return { ...s, processes: parseProcesses(env.data) };
     }
 
     case "daemon.started": {

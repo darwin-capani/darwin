@@ -251,6 +251,12 @@ mod presence;
 mod posture;
 mod power;
 mod proactive;
+// PROCESS OBSERVATORY (procwatch.rs): a STRICTLY READ-ONLY poll of the LIVE
+// process table -> one bounded, SECRET-FREE `system.processes` frame (name +
+// pid only; direct libproc fixed-size struct reads — the argv/env sysctl is
+// never issued; no kill/signal/renice path exists). Pure sample->frame
+// reduction incl. the two-sample CPU delta, tested on synthetic records.
+mod procwatch;
 // Expressiveness layer (#33 adaptive prosody + #34 whisper/discreet mode). PURE +
 // ON by default ([voice].adaptive_prosody / [voice].whisper / whisper_auto all ship
 // true); EXPRESSIVENESS-ONLY (delivery, never a gate). Rich prosody is EL-v3-GATED (Kokoro gets a coarse/neutral mapping,
@@ -2357,6 +2363,14 @@ async fn main() -> Result<()> {
     // [vitals].enabled (armed by default); OFF, the task returns without spawning
     // any read. It OBSERVES and reports — no action, no actuator, no root.
     tokio::spawn(vitals::vitals_task(cfg.clone()));
+    // PROCESS OBSERVATORY (procwatch.rs): a STRICTLY READ-ONLY poll of the live
+    // process table -> the HUD `system.processes` panel (total count, top-N by
+    // CPU/memory, new-since-last-poll, load). SECRET-FREE at the syscall
+    // boundary (direct libproc fixed-size struct reads; the argv/env sysctl is
+    // never issued) and it acts on NOTHING: no kill/signal/renice code path
+    // exists. Gated by [procwatch].enabled (armed by default); OFF, the task
+    // returns without spawning any read.
+    tokio::spawn(procwatch::procwatch_task(cfg.clone()));
 
     // ARTIFACT REGISTRY (artifact.rs): apply the [artifact] master gate + retention
     // bound to the process-global registry the producers register into and the
