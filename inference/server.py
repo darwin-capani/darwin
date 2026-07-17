@@ -1741,6 +1741,41 @@ def should_use_speculative(speculative_on, draft_model, draft_available):
     return bool(speculative_on) and bool(draft_model) and bool(draft_available)
 
 
+def metrics_from_response(resp, path=None):
+    """Extract the HONEST decode telemetry mlx_lm attaches to the LAST
+    GenerationResponse of a stream_generate run (accel/benchmark-foundation).
+
+    mlx_lm's stream_generate yields a GenerationResponse per token whose final
+    value carries measured, real fields the server used to DISCARD (it read only
+    `.text`): prefill/decode tok/s and running peak GPU memory. This returns
+    those fields as a plain dict, or None when `resp` is falsy (no token was ever
+    produced — e.g. an immediately-cancelled decode). Only fields mlx_lm actually
+    reports are surfaced — nothing here is estimated, extrapolated, or fabricated.
+
+      * prompt_tps          — prefill throughput (tokens/sec) mlx_lm measured
+      * generation_tps      — DECODE throughput (tokens/sec) mlx_lm measured
+      * peak_memory_gb      — running peak GPU memory (GB) per mx.get_peak_memory
+      * prompt_tokens       — prompt tokens actually prefilled this call
+      * generation_tokens   — tokens actually decoded this call
+      * finish_reason       — mlx_lm's own stop reason ("stop"/"length"/None)
+      * path (optional)     — which server decode path produced this (label only)
+
+    PURE: reads attributes off the response object, no MLX call, no I/O."""
+    if resp is None:
+        return None
+    m = {
+        "prompt_tps": getattr(resp, "prompt_tps", None),
+        "generation_tps": getattr(resp, "generation_tps", None),
+        "peak_memory_gb": getattr(resp, "peak_memory", None),
+        "prompt_tokens": getattr(resp, "prompt_tokens", None),
+        "generation_tokens": getattr(resp, "generation_tokens", None),
+        "finish_reason": getattr(resp, "finish_reason", None),
+    }
+    if path is not None:
+        m["path"] = path
+    return m
+
+
 class LocalWarmManager:
     """Keeps up to N local MLX models WARM under a RAM budget so the Local tier
     can swap between them instantly. The class is PURE bookkeeping over the
@@ -2562,6 +2597,32 @@ class InferenceEngine:
         from collections import OrderedDict as _OrderedDict
 
         self._agent_gen_caches = _OrderedDict()
+        # In-process LAST-METRICS store (accel/benchmark-foundation). The decode
+        # loops used to throw away the tok/s + peak-memory mlx_lm measures on the
+        # final GenerationResponse; we now record the most-recent stream_generate
+        # run's honest telemetry here so the op response can surface it AND an
+        # in-process reader (last_metrics()) can poll the latest decode's numbers.
+        # A single reference, replaced whole (CPython dict assignment is atomic);
+        # the GPU lock already serializes the decodes that write it.
+        self._last_metrics = None
+
+    def last_metrics(self):
+        """Return the most-recent decode's honest telemetry dict (tok/s + peak
+        memory from the last stream_generate run), or None if nothing has been
+        decoded yet. Reference read; no lock needed (see _last_metrics above)."""
+        return self._last_metrics
+
+    def _record_metrics(self, resp, path):
+        """Capture the honest decode telemetry off `resp` (the LAST
+        GenerationResponse of a stream_generate loop) into the in-process store
+        and return it. Called under self._lock at the end of a decode. A None/
+        empty resp (no token produced) leaves the previous value untouched and
+        returns None, so a cancelled-before-first-token decode never clobbers the
+        store with blanks."""
+        m = metrics_from_response(resp, path)
+        if m is not None:
+            self._last_metrics = m
+        return m
 
     @staticmethod
     def _voice_valid_for_engine(engine, voice):
@@ -2966,6 +3027,7 @@ class InferenceEngine:
         suffix_tokens = full_tokens[self._cls_cache_len :]
         pieces = []
         generated = 0
+        last_resp = None
         try:
             for resp in stream_generate(
                 self._cls_model,
@@ -2976,6 +3038,7 @@ class InferenceEngine:
             ):
                 pieces.append(resp.text)
                 generated += 1
+                last_resp = resp
         finally:
             # Trim everything past the static prefix so the cache is
             # reusable — on success AND on any mid-decode exception (audit
@@ -2991,7 +3054,9 @@ class InferenceEngine:
             )
             if added > 0:
                 trim_prompt_cache(self._cls_cache, added)
-        return "".join(pieces)
+        # Surface the decode telemetry the loop used to discard (additive).
+        metrics = self._record_metrics(last_resp, "classify.cached")
+        return "".join(pieces), metrics
 
     # -- persona (generate) prompt cache ---------------------------------
 
@@ -3142,6 +3207,7 @@ class InferenceEngine:
         suffix_tokens = full_tokens[self._gen_cache_len :]
         pieces = []
         generated = 0
+        last_resp = None
         try:
             for resp in stream_generate(
                 self._model,
@@ -3159,6 +3225,7 @@ class InferenceEngine:
                     break
                 pieces.append(resp.text)
                 generated += 1
+                last_resp = resp
         finally:
             # Trim everything past the static prefix so the cache is
             # reusable — on success AND on any mid-decode exception (audit
@@ -3172,7 +3239,9 @@ class InferenceEngine:
             )
             if added > 0:
                 trim_prompt_cache(self._gen_cache, added)
-        return "".join(pieces)
+        # Surface the decode telemetry the loop used to discard (additive).
+        metrics = self._record_metrics(last_resp, "generate.cached")
+        return "".join(pieces), metrics
 
     # -- ops -----------------------------------------------------------
 
@@ -3480,8 +3549,11 @@ class InferenceEngine:
                 # Cached normal path (today's behavior). Speculative is incompatible
                 # with the prefilled persona cache, so a speculative turn skips it.
                 try:
-                    out = self._generate_cached(prompt, max_tokens, cancelled=cancelled)
-                    return (out, {"speculative": False, "quant": quant_loaded})
+                    out, metrics = self._generate_cached(prompt, max_tokens, cancelled=cancelled)
+                    # `metrics` carries the honest decode telemetry (tok/s + peak
+                    # mem) mlx_lm measured on this stream_generate run; None only
+                    # if nothing was decoded (immediate cancel).
+                    return (out, {"speculative": False, "quant": quant_loaded, "metrics": metrics})
                 except Exception:
                     log.exception("cached generate failed; rebuilding cache and falling back")
                     try:
@@ -3500,7 +3572,12 @@ class InferenceEngine:
                         sampler=self._persona_sampler(),
                         draft_model=draft[0],
                     )
-                    return (out, {"speculative": True, "quant": quant_loaded})
+                    # The speculative/uncached path is a single blocking
+                    # mlx_lm.generate() call that returns only text — no
+                    # per-token GenerationResponse stream to read tok/s from, so
+                    # metrics are honestly absent here (never fabricated). The
+                    # benchmark harness measures the speculative delta directly.
+                    return (out, {"speculative": True, "quant": quant_loaded, "metrics": None})
                 except Exception:
                     # A runtime speculative failure (version mismatch, draft
                     # incompatibility) HONESTLY falls back to normal generation and
@@ -3516,7 +3593,9 @@ class InferenceEngine:
                 max_tokens=max_tokens,
                 sampler=self._persona_sampler(),
             )
-            return (out, {"speculative": False, "quant": quant_loaded})
+            # Uncached normal path: also a single blocking mlx_lm.generate() call
+            # with no per-token stream, so metrics are honestly absent.
+            return (out, {"speculative": False, "quant": quant_loaded, "metrics": None})
 
     def _embed_one(self, mx, text):
         """Compute one L2-normalized embedding VECTOR for `text` by mean-pooling
@@ -3965,7 +4044,13 @@ class InferenceEngine:
             model, tokenizer = self._ensure_classifier()
             if self._cls_cache is not None:
                 try:
-                    return parse_classification(self._classify_cached(text))
+                    raw, metrics = self._classify_cached(text)
+                    result = parse_classification(raw)
+                    # Additive: carry the honest decode telemetry out under a
+                    # private key the op handler surfaces; parse_classification
+                    # never emits it, so nothing downstream is disturbed.
+                    result["_metrics"] = metrics
+                    return result
                 except Exception:
                     log.exception("cached classify failed; rebuilding cache and falling back")
                     try:
@@ -4837,6 +4922,7 @@ class InferenceEngine:
             first_sentence_ms = None
             generated = 0
             aborted = False
+            last_resp = None
 
             def speak_sentence(sentence):
                 """Synthesize one completed sentence and emit its event.
@@ -4877,6 +4963,7 @@ class InferenceEngine:
                         break
                     pieces.append(resp.text)
                     generated += 1
+                    last_resp = resp
                     if spoken < CONVERSE_MAX_SPOKEN_SENTENCES:
                         pending += resp.text
                         sentences, pending = _split_complete_sentences(pending)
@@ -4909,10 +4996,13 @@ class InferenceEngine:
                     if added > 0:
                         trim_prompt_cache(cache, added)
 
+        # Surface the decode telemetry the loop used to discard (additive).
+        metrics = self._record_metrics(last_resp, "converse")
         return {
             "text": "".join(pieces).strip(),
             "sentences": spoken,
             "first_sentence_ms": first_sentence_ms,
+            "metrics": metrics,
         }
 
 
@@ -5609,6 +5699,10 @@ class InferenceServer:
                     "confidence": result["confidence"],
                     "complexity": result["complexity"],
                     "args": result.get("args", {}),
+                    # Additive honest decode telemetry (tok/s + peak mem) from the
+                    # cached path; None on the uncached fallback (no per-token
+                    # stream to measure) — never fabricated.
+                    "metrics": result.get("_metrics"),
                     "latency_ms": latency_ms(),
                 }
 
@@ -5701,6 +5795,9 @@ class InferenceServer:
                         if result["first_sentence_ms"] is not None
                         else lat
                     ),
+                    # Additive honest decode telemetry (tok/s + peak mem) from the
+                    # converse stream_generate loop; None if nothing was decoded.
+                    "metrics": result.get("metrics"),
                     "latency_ms": lat,
                 }
 
