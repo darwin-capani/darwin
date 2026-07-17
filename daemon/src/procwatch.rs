@@ -32,9 +32,13 @@
 //!     copies every readable process's full argv+env block into the caller's
 //!     heap on refresh (its refresh-kind gates only skip the parsing, not the
 //!     read), which would expose terminal-exported secrets to core dumps /
-//!     debuggers / any future memory-disclosure bug. vitals.rs's HOST-level
-//!     sysinfo use (memory totals, per-core CPU, disks) never touches the
-//!     per-process API and is unaffected.
+//!     debuggers / any future memory-disclosure bug. The daemon's two other
+//!     sysinfo users (vitals.rs, telemetry.rs) are HOST-level only and are
+//!     constructed with cpu+memory refresh kinds and NO process refresh
+//!     (review-caught: they previously used `System::new_all()`, whose
+//!     everything-refresh DID sysctl and retain every process's argv+env —
+//!     the process-wide claim above is only true because those constructors
+//!     exclude the per-process API entirely).
 //!   * HONEST / degrades cleanly — every field is a REAL read; anything that
 //!     cannot be read degrades to `None`/JSON null, NEVER a fabricated value
 //!     (the vitals.rs `on_ac` precedent). In particular CPU % is a TWO-SAMPLE
@@ -437,11 +441,11 @@ fn pidinfo<T: Copy>(pid: i32, flavor: libc::c_int) -> Option<T> {
 /// with headroom for processes spawned in between). An empty Vec on failure —
 /// honest empty, never a fabricated table.
 #[cfg(target_os = "macos")]
-fn read_pids() -> Vec<i32> {
+fn read_pids() -> (usize, Vec<i32>) {
     // SAFETY: a NULL buffer asks the kernel for the current pid count only.
     let n = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     if n <= 0 {
-        return Vec::new();
+        return (0, Vec::new());
     }
     let cap = n as usize + 64;
     let mut pids = vec![0i32; cap];
@@ -454,11 +458,18 @@ fn read_pids() -> Vec<i32> {
         )
     };
     if filled <= 0 {
-        return Vec::new();
+        return (0, Vec::new());
     }
     pids.truncate(filled as usize);
+    // `kernel_count` is the honest total: the kernel's own list length,
+    // INCLUDING pid 0 (kernel_task). The retain below only prunes the
+    // per-pid INSPECTION list — pid 0 refuses TBSDINFO unprivileged, so
+    // inspecting it is a guaranteed-wasted syscall — and must never shrink
+    // the reported total (review-caught off-by-one: total was the kernel
+    // list length MINUS the real pid-0 entry).
+    let kernel_count = pids.len();
     pids.retain(|&p| p > 0);
-    pids
+    (kernel_count, pids)
 }
 
 /// One pid -> one [`ProcSample`], from the TWO fixed-size struct reads and
@@ -492,8 +503,7 @@ fn read_sample(pid: i32) -> Option<ProcSample> {
 /// length as "total" would silently understate the machine.
 #[cfg(target_os = "macos")]
 fn read_samples() -> (usize, Vec<ProcSample>) {
-    let pids = read_pids();
-    let total = pids.len();
+    let (total, pids) = read_pids();
     (total, pids.into_iter().filter_map(read_sample).collect())
 }
 

@@ -35,8 +35,9 @@
 //!     true only while mdfind is present AND the last real query succeeded — a
 //!     machine with Spotlight indexing disabled, or one where mdfind STOPS
 //!     answering mid-session, honestly reports false (never a stale claim). The
-//!     status emission additionally reports false whenever the config flag is
-//!     off ([`reported_available`]).
+//!     status emission additionally reports false whenever the `[docsearch].spotlight`
+//!     flag is off OR docsearch itself is not operational (disabled / empty
+//!     roots) ([`reported_available`] — every leg of the LIVE gate must hold).
 //!
 //! ## PURE seam vs DEVICE-GATED runner (the power.rs / posture.rs house pattern)
 //!
@@ -421,8 +422,15 @@ pub fn spotlight_available() -> bool {
 /// actually answering ([`spotlight_available`]) — an operator who turned the
 /// flag off sees an honest false even if mdfind last answered fine. Surfaced on
 /// every status tick ([`crate::docsearch::emit_status`]) for the HUD pill.
-pub fn reported_available(spotlight_enabled: bool) -> bool {
-    spotlight_enabled && spotlight_available()
+pub fn reported_available(spotlight_enabled: bool, docsearch_operational: bool) -> bool {
+    // The pill claims a LIVE capability, so every leg of the live gate must
+    // hold: docsearch itself operational ([docsearch].enabled AND non-empty
+    // roots — the same indexing_permitted gate the search path enforces), the
+    // [docsearch].spotlight flag on, and the most recent real mdfind attempt
+    // successful. Review-caught: gating on the spotlight flag alone left the
+    // pill claiming SPOTLIGHT ON after docsearch was disabled or its roots
+    // emptied — a capability no search could actually exercise.
+    docsearch_operational && spotlight_enabled && spotlight_available()
 }
 
 // ---------------------------------------------------------------------------
@@ -944,13 +952,24 @@ kMDItemLastUsedDate = 2026-07-01 09:14:22 +0000
     }
 
     #[test]
-    fn reported_availability_is_off_when_the_config_flag_is_off() {
-        // The status emission must never claim the integration while the
-        // operator has [docsearch].spotlight off — whatever the live health
-        // says. (Under test the live health is untouched, so the enabled leg
-        // simply mirrors spotlight_available().)
-        assert!(!reported_available(false), "config OFF -> reported unavailable");
-        assert_eq!(reported_available(true), spotlight_available());
+    fn reported_availability_requires_every_leg_of_the_live_gate() {
+        // The status emission must never claim the integration while ANY leg
+        // of the live gate is down: the [docsearch].spotlight flag, or
+        // docsearch itself being operational (enabled + non-empty roots) —
+        // whatever the live health says. Review-caught: gating on the flag
+        // alone left the pill ON after docsearch was disabled or its roots
+        // emptied. (Under test the live health is untouched, so the all-legs-up
+        // case simply mirrors spotlight_available().)
+        assert!(
+            !reported_available(false, true),
+            "spotlight flag OFF -> reported unavailable"
+        );
+        assert!(
+            !reported_available(true, false),
+            "docsearch not operational (disabled / no roots) -> reported unavailable"
+        );
+        assert!(!reported_available(false, false));
+        assert_eq!(reported_available(true, true), spotlight_available());
     }
 
     // =====================================================================

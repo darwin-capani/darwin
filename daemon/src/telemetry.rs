@@ -273,7 +273,16 @@ pub fn root_disk_free_and_total(disks: &sysinfo::Disks) -> Option<(u64, u64)> {
 /// Emits cpu/memory/disk/uptime every 2s for the HUD's system gauges and
 /// publishes the same reading as the SystemSnapshot cache.
 pub async fn system_load_task() {
-    let mut sys = sysinfo::System::new_all();
+    // HOST-ONLY sysinfo construction (cpu + memory, NO process refresh): this
+    // task only reads global cpu/memory, and `new_all()` would copy AND retain
+    // every process's argv+env (KERN_PROCARGS2) in daemon memory for the
+    // daemon's lifetime — forbidden by the process-wide secret-free contract
+    // (see procwatch.rs).
+    let mut sys = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::new()
+            .with_cpu(sysinfo::CpuRefreshKind::everything())
+            .with_memory(sysinfo::MemoryRefreshKind::everything()),
+    );
     let mut interval = tokio::time::interval(Duration::from_secs(2));
     loop {
         interval.tick().await;

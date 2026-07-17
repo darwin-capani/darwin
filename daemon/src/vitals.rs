@@ -334,7 +334,17 @@ pub async fn vitals_task(cfg: Arc<Config>) {
         return;
     }
     let poll = cfg.vitals.poll_secs.max(VITALS_MIN_POLL_SECS);
-    let mut sys = sysinfo::System::new_all();
+    // HOST-ONLY sysinfo construction: cpu + memory refresh kinds, NO process
+    // refresh. `new_all()` would sysctl KERN_PROCARGS2 (every process's full
+    // argv+env) into this daemon's heap and RETAIN it in the process map for
+    // the daemon's lifetime — this task only ever reads per-core CPU + memory,
+    // and the process-wide secret-free contract (see procwatch.rs) forbids
+    // argv/env bytes transiting daemon memory at all.
+    let mut sys = sysinfo::System::new_with_specifics(
+        sysinfo::RefreshKind::new()
+            .with_cpu(sysinfo::CpuRefreshKind::everything())
+            .with_memory(sysinfo::MemoryRefreshKind::everything()),
+    );
     let mut interval = tokio::time::interval(Duration::from_secs(poll));
     loop {
         interval.tick().await;

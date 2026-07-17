@@ -646,18 +646,20 @@ fn status_payload(pdfjail_available: bool, spotlight_available: bool) -> serde_j
 /// executable, i.e. whether PDF extraction runs memory-jailed or on the weaker
 /// in-process fallback guard ([`pdf_text_in_process`]'s documented residuals) —
 /// and whether the READ-ONLY Spotlight candidate generator is actually answering
-/// ([`crate::spotlight::reported_available`]: the `[docsearch].spotlight` flag
-/// is ON — the caller passes the LIVE config value — AND mdfind is present AND
-/// the MOST RECENT real query succeeded; honest false when the flag is off,
-/// Spotlight indexing is disabled, or the last attempt failed). One `stat()`
-/// (each) per tick.
-pub fn emit_status(spotlight_enabled: bool) {
+/// ([`crate::spotlight::reported_available`]: docsearch itself OPERATIONAL —
+/// `[docsearch].enabled` + non-empty roots, the [`indexing_permitted`] gate the
+/// search path enforces — AND the `[docsearch].spotlight` flag ON — the caller
+/// passes both LIVE config legs — AND mdfind is present AND the MOST RECENT
+/// real query succeeded; honest false when docsearch is disabled/rootless, the
+/// flag is off, Spotlight indexing is disabled, or the last attempt failed).
+/// One `stat()` (each) per tick.
+pub fn emit_status(docsearch_operational: bool, spotlight_enabled: bool) {
     crate::telemetry::emit(
         "system",
         "docsearch.status",
         status_payload(
             pdfjail_available(),
-            crate::spotlight::reported_available(spotlight_enabled),
+            crate::spotlight::reported_available(spotlight_enabled, docsearch_operational),
         ),
     );
 }
