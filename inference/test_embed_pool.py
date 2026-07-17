@@ -85,5 +85,63 @@ def _pool_normalize_list(hidden, lengths):
     return [[float(x) for x in row] for row in out.tolist()]
 
 
+class PackEmbedChunksTests(unittest.TestCase):
+    """The PURE order-preserving chunker that bounds each padded forward by BOTH
+    a row cap and a padded-token budget (rows x chunk max length)."""
+
+    def _check_invariants(self, lengths, ranges, row_cap, token_budget):
+        # Contiguous, ordered, complete cover of [0, len(lengths)).
+        self.assertEqual(ranges[0][0], 0)
+        self.assertEqual(ranges[-1][1], len(lengths))
+        for (a, b), (c, _d) in zip(ranges, ranges[1:]):
+            self.assertLess(a, b)
+            self.assertEqual(b, c)
+        # Every chunk respects both caps (a single row is always legal).
+        for a, b in ranges:
+            rows = b - a
+            padded = rows * max(lengths[a:b])
+            if rows > 1:
+                self.assertLessEqual(rows, row_cap)
+                self.assertLessEqual(padded, token_budget)
+
+    def test_short_facts_pack_into_one_chunk(self):
+        """A realistic MNEMOSYNE batch (short facts) stays ONE forward."""
+        lengths = [14] * 8
+        ranges = server._pack_embed_chunks(lengths, row_cap=32, token_budget=4096)
+        self.assertEqual(ranges, [(0, 8)])
+        self._check_invariants(lengths, ranges, 32, 4096)
+
+    def test_hostile_max_length_batch_degrades_to_small_chunks(self):
+        """256 max-length texts must NOT form 16k-token forwards: with a 4096
+        budget each chunk holds at most 8 rows of 512."""
+        lengths = [512] * 256
+        ranges = server._pack_embed_chunks(lengths, row_cap=32, token_budget=4096)
+        self._check_invariants(lengths, ranges, 32, 4096)
+        self.assertTrue(all((b - a) * 512 <= 4096 for a, b in ranges))
+        self.assertEqual(sum(b - a for a, b in ranges), 256)
+
+    def test_row_cap_still_applies_to_tiny_texts(self):
+        lengths = [1] * 100
+        ranges = server._pack_embed_chunks(lengths, row_cap=32, token_budget=4096)
+        self._check_invariants(lengths, ranges, 32, 4096)
+        self.assertTrue(all(b - a <= 32 for a, b in ranges))
+
+    def test_one_long_text_closes_its_own_chunk(self):
+        """A long text mid-batch must not inflate its neighbours' padding past
+        the budget: the packer accounts for the max-length jump."""
+        lengths = [10, 10, 512, 10, 10]
+        ranges = server._pack_embed_chunks(lengths, row_cap=32, token_budget=1024)
+        self._check_invariants(lengths, ranges, 32, 1024)
+
+    def test_single_overlong_row_is_still_a_legal_chunk(self):
+        """One row above the budget on its own cannot be split — it forms a
+        chunk of one (the old per-text cost), never an infinite loop."""
+        ranges = server._pack_embed_chunks([5000], row_cap=32, token_budget=1024)
+        self.assertEqual(ranges, [(0, 1)])
+
+    def test_empty_input_gives_no_ranges(self):
+        self.assertEqual(server._pack_embed_chunks([], 32, 1024), [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

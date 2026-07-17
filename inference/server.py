@@ -1443,7 +1443,48 @@ EMBED_MAX_BATCH = 256
 # real token's hidden state is identical to the unpadded run; pad positions are
 # excluded from the mean-pool. Vectors match the per-text path up to fp
 # reduction-order noise (cosine >= 0.9999) — behaviour-preserving for retrieval.
+#
+# A chunk is closed by WHICHEVER cap hits first:
+#   - EMBED_BATCH_CHUNK rows, or
+#   - EMBED_CHUNK_TOKEN_BUDGET PADDED tokens (rows x the chunk's max length).
+# The token budget is the worst-case bound: without it, 32 rows x 512 tokens =
+# 16384 padded tokens in ONE forward — an activation spike the old per-text path
+# (never more than 512 tokens in flight) could not hit. With it, a hostile batch
+# of max-length texts degrades to a few texts per forward (the old cost), while
+# a realistic short-fact batch (~15 tokens/text) still packs EMBED_BATCH_CHUNK
+# rows into one forward. A single text is always a legal chunk of one (<= 512
+# padded tokens <= the budget by construction).
 EMBED_BATCH_CHUNK = 32
+EMBED_CHUNK_TOKEN_BUDGET = 4096
+
+
+def _pack_embed_chunks(lengths, row_cap=None, token_budget=None):
+    """PURE, ORDER-PRESERVING chunker for the batched embed forward: split the
+    row index space [0, len(lengths)) into contiguous [start, end) ranges where
+    each range holds at most `row_cap` rows AND at most `token_budget` PADDED
+    tokens (rows x the range's max length — the true activation footprint of the
+    padded forward). Greedy: extend the current chunk until adding the next row
+    would break a cap, then close it. A single row always forms a legal chunk,
+    whatever its length (it cannot be split). Returns a list of (start, end)."""
+    if row_cap is None:
+        row_cap = EMBED_BATCH_CHUNK
+    if token_budget is None:
+        token_budget = EMBED_CHUNK_TOKEN_BUDGET
+    ranges = []
+    start = 0
+    cur_max = 0
+    for i, n in enumerate(lengths):
+        rows = i - start + 1
+        new_max = n if n > cur_max else cur_max
+        # The padded cost if row i joins the current chunk.
+        if i > start and (rows > row_cap or rows * new_max > token_budget):
+            ranges.append((start, i))
+            start = i
+            new_max = n
+        cur_max = new_max
+    if start < len(lengths):
+        ranges.append((start, len(lengths)))
+    return ranges
 
 
 def _pool_normalize(mx, hidden, lengths):
@@ -3650,8 +3691,9 @@ class InferenceEngine:
         separate weight download, which the contract forbids).
 
         Method: encode each text (capped at EMBED_MAX_TOKENS); split into chunks
-        of at most EMBED_BATCH_CHUNK; for each chunk right-pad to the chunk's max
-        length and run the transformer BODY once (model.model(...) — the decoder
+        capped by BOTH EMBED_BATCH_CHUNK rows and EMBED_CHUNK_TOKEN_BUDGET padded
+        tokens (see _pack_embed_chunks); for each chunk right-pad to the chunk's
+        max length and run the transformer BODY once (model.model(...) — the decoder
         stack WITHOUT the LM head, which most mlx_lm architectures expose) to get
         per-token last hidden states [chunk, maxlen, hidden]; masked-mean-pool over
         each row's REAL tokens; L2-normalize. Right-padding + the default causal
@@ -3665,8 +3707,11 @@ class InferenceEngine:
             )
         encoded = [self._embed_encode(t) for t in texts]
         vectors = []
-        for start in range(0, len(encoded), EMBED_BATCH_CHUNK):
-            chunk = encoded[start:start + EMBED_BATCH_CHUNK]
+        # Chunk by BOTH caps (rows AND padded tokens) so the padded activation
+        # tensor stays bounded even for a hostile batch of max-length texts —
+        # see _pack_embed_chunks.
+        for start, end in _pack_embed_chunks([len(ids) for ids in encoded]):
+            chunk = encoded[start:end]
             lengths = [len(ids) for ids in chunk]
             maxlen = max(lengths)
             # Pad id is irrelevant to the result: pad positions are never attended
