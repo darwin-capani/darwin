@@ -1,0 +1,16 @@
+{
+  "what": "MEASURED transport decision for the LIVE learned-VAD path: per-frame op=vad RPC to the inference server vs an in-process pure-Rust port of the Silero core. Decides how daemon/src/audio.rs gets its per-frame speech probability.",
+  "measured": "2026-07-18, Apple M1 Pro, on-device",
+  "method": {
+    "op_vad_rpc": "A temporary op=vad endpoint (stateless: x[576] + state[256] -> prob + state, newline-JSON over the unix socket, asyncio.to_thread dispatch — the op=embed pattern) was added to server.py and measured from a client streaming 4s of voiced audio at frame cadence with the recurrent state threaded through each request. Idle = no other server activity; loaded = a second connection concurrently running op=embed K=8 batches (the Core ML bge embedder), the realistic docsearch-reindex-while-capturing workload.",
+    "frame_budget_ms": 32.0
+  },
+  "results": {
+    "rpc_idle_ms": {"median": 0.982, "mean": 1.002, "p90": 1.15, "p99": 1.261, "max": 1.279, "n": 120},
+    "rpc_under_concurrent_embed_ms": {"median": 131.308, "p90": 139.054, "p99": 157.608, "max": 169.734, "n": 120},
+    "rpc_warm_first_call_s": 2.56,
+    "in_process_rust_port_us": "see daemon/src/silero.rs parity test output (silero_parity_against_torch_reference_and_latency) — sub-millisecond per step"
+  },
+  "decision": "IN-PROCESS RUST PORT (daemon/src/silero.rs). The RPC is realtime-safe idle (0.98 ms << 32 ms) but collapses to 131 ms median under a concurrent op=embed load (Python GIL + backend locks) — 4x OVER the frame budget — which would silently degrade the learned VAD to the RMS fallback exactly when the machine is busy. The in-process port has deterministic sub-ms latency, no server coupling, and never touches the MLX GPU; the cost is the ANE for the VAD (the Core ML package remains the ANE-eligible variant + the committed eval's subject). The op=vad endpoint was removed after measurement (no unwired wire surface).",
+  "weights_delivery": "inference/coreml_vad.py::export_native_weights -> state/models/silero_vad_v5_f32.bin (atomic, idempotent), run by the inference server's preload; the daemon validates magic + per-tensor sizes and falls back to the RMS gate (surfaced) while absent."
+}
