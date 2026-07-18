@@ -2355,7 +2355,17 @@ async fn rank_cite_rerank(
                         perm.iter().map(|&j| ordered[j]).collect();
                     head.extend_from_slice(&ordered[head_n..]);
                     ordered = head;
-                    method = RankMethod::Reranked;
+                    // The reranked label must reflect the TRUE stage one: this
+                    // path is reached with a Lexical base whenever the stored
+                    // vector space is stale (reindex_needed) even though the
+                    // server is up and the cross-encoder answers — so a BM25
+                    // base becomes LexicalReranked, never Reranked (which would
+                    // falsely claim a neural embedding stage one to the user).
+                    method = match base_method {
+                        RankMethod::Embedding => RankMethod::Reranked,
+                        RankMethod::Lexical => RankMethod::LexicalReranked,
+                        other => other,
+                    };
                 }
             }
         }

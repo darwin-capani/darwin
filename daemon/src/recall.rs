@@ -77,10 +77,19 @@ pub enum RankMethod {
     Embedding,
     /// TWO-STAGE retrieval: neural bi-encoder recall (`Embedding`) THEN a Core ML
     /// cross-encoder RERANK of the top-K candidates (the inference server's
-    /// `rerank` op, `[inference].reranker`). Reported ONLY when the cross-encoder
-    /// actually re-scored the shortlist — never when it was disabled or fell back
-    /// (that stays `Embedding`), so the label never overstates what ran.
+    /// `rerank` op, `[inference].reranker`). Reported ONLY when stage one was
+    /// genuinely `Embedding` AND the cross-encoder actually re-scored — never
+    /// when rerank was disabled/fell back (that stays `Embedding`), and never
+    /// when stage one was BM25 (that is `LexicalReranked`), so the label never
+    /// overstates that stage one was neural.
     Reranked,
+    /// TWO-STAGE over a LEXICAL stage one: BM25 retrieval (the honest fallback
+    /// when the vector space is stale/unavailable) THEN the cross-encoder rerank
+    /// of that keyword shortlist. Stage one was NOT neural cosine — the
+    /// cross-encoder still sharpens the ORDER, but the label must not claim
+    /// embedding recall (review-caught: relabeling a BM25 base as `Reranked`
+    /// surfaced a false "cosine over embedding vectors" claim).
+    LexicalReranked,
 }
 
 impl RankMethod {
@@ -93,6 +102,7 @@ impl RankMethod {
             RankMethod::Lexical => "lexical-bm25",
             RankMethod::Embedding => "neural-embedding",
             RankMethod::Reranked => "neural-reranked",
+            RankMethod::LexicalReranked => "lexical-reranked",
         }
     }
 
@@ -123,6 +133,15 @@ impl RankMethod {
                  sharper order. Both stages run on the local inference server; if \
                  the reranker is off or unavailable I keep the plain embedding \
                  order and say so."
+            }
+            RankMethod::LexicalReranked => {
+                "lexical-then-rerank recall: I first retrieve candidates by BM25 \
+                 keyword relevance (the fallback used when the embedding vector \
+                 space is stale or the embedder is unavailable), then RE-RANK that \
+                 keyword shortlist with an on-device cross-encoder that reads each \
+                 candidate together with your query for a sharper order. Stage one \
+                 was keyword-semantic, NOT neural embedding cosine — the \
+                 cross-encoder improved the order, not the initial recall."
             }
         }
     }
@@ -755,8 +774,12 @@ pub async fn rank_runtime_selected(
             }
         }
         // Wrong vector count OR an error: fall back to lexical BM25, honestly.
-        // (The reranker rides the same server, so when embed is down rerank is too
-        // and the fallback below keeps this lexical order.)
+        // The reranker rides a SEPARATE inference-socket connection, so it can
+        // still answer when embed fell back here (e.g. a large embed batch times
+        // out while a <=20-passage rerank succeeds). The stage-two step below
+        // therefore may re-order this BM25 shortlist — but it labels the result
+        // `LexicalReranked` (keyword retrieve + rerank), NEVER `Reranked` (which
+        // asserts a neural embedding stage one).
         _ => lexical_result(rank(query, facts, retrieve_k, &lexical)),
     };
 
@@ -791,10 +814,18 @@ async fn finish_with_optional_rerank(
             let mut reordered: Vec<Hit> = perm.iter().map(|&i| dense.hits[i].clone()).collect();
             reordered.extend_from_slice(&dense.hits[head_n..]);
             reordered.truncate(k);
+            // The reranked label must reflect what stage ONE actually was: neural
+            // embedding -> Reranked; BM25 fallback -> LexicalReranked. Anything
+            // else (should not occur) keeps its own method rather than overstate.
+            let reranked_method = match dense.method {
+                RankMethod::Embedding => RankMethod::Reranked,
+                RankMethod::Lexical => RankMethod::LexicalReranked,
+                other => other,
+            };
             return RankedRecall {
                 hits: reordered,
-                method: RankMethod::Reranked,
-                method_status: RankMethod::Reranked.description().to_string(),
+                method: reranked_method,
+                method_status: reranked_method.description().to_string(),
             };
         }
     }
@@ -1433,6 +1464,42 @@ mod tests {
             "the boosted (corgi) fact is promoted to the top"
         );
         assert_eq!(out.hits[1].fact.key, "user.car");
+    }
+
+    #[tokio::test]
+    async fn rerank_over_a_bm25_base_is_lexicalreranked_not_reranked() {
+        // Review-caught: embed can FAIL (stale vector space / wrong-count / a
+        // large batch timing out) while the SEPARATE-connection rerank still
+        // answers on an up server. Stage one is then BM25 lexical — the rerank
+        // may sharpen the ORDER, but the label must be LexicalReranked, NEVER
+        // Reranked (which asserts a neural embedding stage one to the user).
+        let facts = vec![
+            Fact::new("user.car", "Subaru Outback vehicle"),
+            Fact::new("user.pet", "corgi vehicle companion"),
+        ];
+        // `down()` => embed errors => BM25 base; rerank enabled + boosts "corgi".
+        // The query shares "vehicle" with BOTH facts so BM25 returns both (a
+        // no-overlap query would return nothing and never reach the rerank).
+        let embedder = MockEmbedder::down().with_rerank_boost("corgi");
+        let out = rank_runtime_selected("vehicle", &facts, 3, &embedder).await;
+        assert_eq!(
+            out.method,
+            RankMethod::LexicalReranked,
+            "BM25 stage one + rerank must be LexicalReranked, not Reranked"
+        );
+        let status = out.method_status.to_lowercase();
+        assert!(
+            status.contains("bm25") || status.contains("keyword"),
+            "the status must name the keyword/BM25 stage one honestly: {}",
+            out.method_status
+        );
+        // It may mention "cosine" only to DISCLAIM it ("NOT ... cosine"); it must
+        // never positively CLAIM stage one was cosine embedding.
+        assert!(
+            !status.contains("by cosine") && !status.contains("cosine similarity over"),
+            "must NOT positively claim cosine embedding over a BM25 base: {}",
+            out.method_status
+        );
     }
 
     #[tokio::test]

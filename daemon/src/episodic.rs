@@ -93,9 +93,14 @@ pub enum RecallMethod {
     /// Neural on-device embedding topical ranking (the embedder answered).
     Embedding,
     /// Two-stage: neural embedding recall THEN a Core ML cross-encoder rerank of
-    /// the top candidates (the reranker answered). Reported only when the rerank
-    /// actually ran — never when it was off or fell back (that stays `Embedding`).
+    /// the top candidates (the reranker answered). Reported only when stage one
+    /// was neural embedding AND the rerank actually ran — never when it was off
+    /// or fell back (that stays `Embedding`), and never over a BM25 stage one
+    /// (that is `LexicalReranked`).
     Reranked,
+    /// Two-stage over a LEXICAL stage one: BM25 retrieval then the cross-encoder
+    /// rerank of that keyword shortlist. Stage one was NOT neural embedding.
+    LexicalReranked,
 }
 
 impl RecallMethod {
@@ -124,6 +129,13 @@ impl RecallMethod {
                  it needs the inference server running and falls back to lexical \
                  BM25 when that server is down."
             }
+            RecallMethod::LexicalReranked => {
+                "lexical-then-rerank recall: I first ranked your recorded episodes \
+                 by BM25 keyword relevance (the fallback when embedding recall is \
+                 unavailable), then re-ranked that keyword shortlist with an \
+                 on-device cross-encoder for a sharper order. Stage one was \
+                 keyword-semantic, NOT neural embedding."
+            }
         }
     }
 }
@@ -134,6 +146,7 @@ impl From<RankMethod> for RecallMethod {
             RankMethod::Lexical => RecallMethod::Lexical,
             RankMethod::Embedding => RecallMethod::Embedding,
             RankMethod::Reranked => RecallMethod::Reranked,
+            RankMethod::LexicalReranked => RecallMethod::LexicalReranked,
         }
     }
 }
