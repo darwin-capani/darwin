@@ -1,0 +1,99 @@
+{
+  "meta": {
+    "generated": "2026-07-18T18:00:57",
+    "sample_rate": 16000,
+    "frame_ms": 32.0,
+    "rms_threshold": 0.015,
+    "prob_threshold": 0.5,
+    "min_speech_ms": 250,
+    "silence_ms": 350,
+    "speech_clips": 40,
+    "noise_clips": 6,
+    "say_voices": [
+      "Samantha",
+      "Daniel",
+      "Karen",
+      "Fred"
+    ],
+    "synthetic_note": "macOS `say` speech + synthesized noise adversaries; SYNTHETIC-but-representative, directional build evidence, NOT ground-truth production data.",
+    "coreml_per_frame_latency_ms": {
+      "median": 0.076,
+      "p90": 0.086,
+      "frame_budget_ms": 32.0
+    }
+  },
+  "rms_gate": {
+    "false_accept_rate_clips": 0.8333,
+    "false_accept_clips": "5/6",
+    "false_reject_rate_clips": 0.0,
+    "false_reject_clips": "0/40",
+    "detect_latency_ms_median": 224.0,
+    "detect_latency_ms_p90": 515.2,
+    "frame_false_accept_rate": 0.3964,
+    "frame_false_reject_rate": 0.0798,
+    "by_category": {
+      "clean": {
+        "n": 8,
+        "miss": 0,
+        "median_latency_ms": 256.0
+      },
+      "snr10": {
+        "n": 8,
+        "miss": 0,
+        "median_latency_ms": 224.0
+      },
+      "snr5": {
+        "n": 8,
+        "miss": 0,
+        "median_latency_ms": 224.0
+      },
+      "snr0": {
+        "n": 8,
+        "miss": 0,
+        "median_latency_ms": 224.0
+      },
+      "quiet": {
+        "n": 8,
+        "miss": 0,
+        "median_latency_ms": 416.0
+      }
+    }
+  },
+  "coreml_silero": {
+    "false_accept_rate_clips": 0.0,
+    "false_accept_clips": "0/6",
+    "false_reject_rate_clips": 0.0,
+    "false_reject_clips": "0/40",
+    "detect_latency_ms_median": 288.0,
+    "detect_latency_ms_p90": 416.0,
+    "frame_false_accept_rate": 0.0,
+    "frame_false_reject_rate": 0.0563,
+    "by_category": {
+      "clean": {
+        "n": 8,
+        "miss": 0,
+        "median_latency_ms": 272.0
+      },
+      "snr10": {
+        "n": 8,
+        "miss": 0,
+        "median_latency_ms": 288.0
+      },
+      "snr5": {
+        "n": 8,
+        "miss": 0,
+        "median_latency_ms": 304.0
+      },
+      "snr0": {
+        "n": 8,
+        "miss": 0,
+        "median_latency_ms": 400.0
+      },
+      "quiet": {
+        "n": 8,
+        "miss": 0,
+        "median_latency_ms": 288.0
+      }
+    }
+  }
+}

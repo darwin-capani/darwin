@@ -38,6 +38,17 @@ coremltools==9.0  # Core ML dispatch. ALSO the runtime for the DEFAULT op=embed 
 transformers==5.11.0
 torch==2.12.0
 
+# LEARNED VAD (inference/coreml_vad.py) — the Core ML Silero VAD backend that
+# replaces the RMS energy gate (measured win under inference/benchmarks/vad_eval/).
+# silero-vad ships the bundled ~1.3MB v5 checkpoint (silero_vad.jit) the backend
+# converts to Core ML ONE-TIME via the torch above (jit.trace -> coremltools);
+# steady-state prediction uses ONLY coremltools. soundfile reads the test-set WAVs
+# in the eval harness. IMPORT-GUARDED like the embedder: coreml_vad.py imports fine
+# (py_compile / pyflakes pass) WITHOUT these; if absent the learned VAD cannot build
+# and the daemon HONESTLY falls back to the RMS gate (surfaced, never silent).
+silero-vad==6.2.1
+soundfile==0.14.0
+
 # TTS ("speak" op): Kokoro-82M on MLX. English G2P comes from misaki — install
 # the pieces below explicitly instead of `misaki[en]`, because that extra pulls
 # spacy-curated-transformers (and with it torch, which we do not want here).
