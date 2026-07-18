@@ -265,15 +265,32 @@ function Count({
 function SearchResults({ search }: { search: DocSearchResult | null }) {
   if (search === null) return null;
 
-  const neural = search.method === "neural-embedding";
+  // Stage one is neural iff the method is a "neural-*" family (embedding OR
+  // neural-then-reranked). A "lexical-*" method retrieved by BM25 — the pill
+  // color reflects the RETRIEVAL stage; the tooltip names any rerank.
+  const neural = search.method.startsWith("neural-");
   // Render the method honestly. Tolerant of an unknown future method string
   // (shown verbatim) so the panel never breaks on a new backend.
   const methodLabel =
     search.method === "neural-embedding"
       ? "NEURAL (on-device embeddings)"
-      : search.method === "lexical-bm25"
-        ? "LEXICAL (BM25 keyword)"
-        : search.method.toUpperCase();
+      : search.method === "neural-reranked"
+        ? "NEURAL + RERANK"
+        : search.method === "lexical-bm25"
+          ? "LEXICAL (BM25 keyword)"
+          : search.method === "lexical-reranked"
+            ? "LEXICAL + RERANK"
+            : search.method.toUpperCase();
+  const methodTitle =
+    search.method === "neural-embedding"
+      ? "ranked by cosine over on-device embedding vectors"
+      : search.method === "neural-reranked"
+        ? "retrieved by cosine over on-device embedding vectors, then re-ranked by an on-device cross-encoder for a sharper order"
+        : search.method === "lexical-reranked"
+          ? "retrieved by BM25 keyword relevance (the embedding vector space was stale/unavailable), then re-ranked by an on-device cross-encoder"
+          : search.method === "lexical-bm25"
+            ? "ranked by BM25 keyword relevance (the on-device embedder was unavailable)"
+            : `ranking method: ${methodLabel}`;
 
   return (
     <div className="docsearch-results">
@@ -281,11 +298,7 @@ function SearchResults({ search }: { search: DocSearchResult | null }) {
         <span className="docsearch-results-title">LAST SEARCH</span>
         <span
           className={`docsearch-pill ${neural ? "neural" : "bm25"}`}
-          title={
-            neural
-              ? "ranked by cosine over on-device embedding vectors"
-              : "ranked by BM25 keyword relevance (the on-device embedder was unavailable)"
-          }
+          title={methodTitle}
         >
           {methodLabel}
         </span>

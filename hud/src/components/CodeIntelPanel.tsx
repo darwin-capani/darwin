@@ -91,18 +91,26 @@ export default function CodeIntelPanel({ code }: { code: CodeIntel | null }) {
  *  ran, and the real cited code chunks. An empty hit set is the HONEST
  *  not-indexed reply — shown plainly, never hidden or faked. */
 function ExplainSection({ explained }: { explained: CodeExplained }) {
-  const neural = explained.method === "neural-embedding";
+  // Neural iff a "neural-*" method (embedding OR neural-then-reranked); a
+  // "lexical-*" method retrieved by BM25. The tooltip names any rerank stage.
+  const neural = explained.method.startsWith("neural-");
+  const explainTitle =
+    explained.method === "neural-embedding"
+      ? "grounded chunks were retrieved by cosine over on-device embedding vectors"
+      : explained.method === "neural-reranked"
+        ? "grounded chunks were retrieved by cosine over on-device embedding vectors, then re-ranked by an on-device cross-encoder"
+        : explained.method === "lexical-reranked"
+          ? "grounded chunks were retrieved by BM25 keyword relevance (the embedding vector space was stale/unavailable), then re-ranked by an on-device cross-encoder"
+          : explained.method === "lexical-bm25"
+            ? "grounded chunks were retrieved by BM25 keyword relevance (the on-device embedder was unavailable)"
+            : `retrieval method: ${codeMethodLabel(explained.method)}`;
   return (
     <div className="codeintel-explain">
       <div className="codeintel-head">
         <span className="codeintel-title">LAST EXPLAIN</span>
         <span
           className={`codeintel-pill ${neural ? "neural" : "bm25"}`}
-          title={
-            neural
-              ? "grounded chunks were retrieved by cosine over on-device embedding vectors"
-              : "grounded chunks were retrieved by BM25 keyword relevance (the on-device embedder was unavailable)"
-          }
+          title={explainTitle}
         >
           {codeMethodLabel(explained.method)}
         </span>

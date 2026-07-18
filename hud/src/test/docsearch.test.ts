@@ -386,6 +386,27 @@ describe("DocSearchPanel (cited, honest, review-only)", () => {
     expect(html).toContain("docsearch-pill unjailed");
   });
 
+  it("a neural-reranked search shows the NEURAL pill, never the false 'embedder unavailable' tooltip", () => {
+    // Review-caught: the pill keyed only on method==='neural-embedding', so a
+    // genuinely neural-then-reranked result rendered as bm25 + "the on-device
+    // embedder was unavailable" — a false claim (stage one WAS neural).
+    const search = parseDocSearchResult({ ...searchedNeural, method: "neural-reranked" });
+    const html = render(parseDocIndexStatus(indexedNeural), search);
+    expect(html).toContain("docsearch-pill neural");
+    expect(html).not.toContain("docsearch-pill bm25");
+    expect(html).not.toContain("embedder was unavailable");
+    expect(html).toContain("re-ranked by an on-device cross-encoder");
+  });
+
+  it("a lexical-reranked search shows the bm25 pill and an HONEST 'BM25 then rerank' tooltip", () => {
+    const search = parseDocSearchResult({ ...searchedNeural, method: "lexical-reranked" });
+    const html = render(parseDocIndexStatus(indexedNeural), search);
+    expect(html).toContain("docsearch-pill bm25");
+    // Honest: names BM25 retrieval AND the rerank; never claims neural cosine stage one.
+    expect(html).toContain("BM25 keyword relevance");
+    expect(html).toContain("re-ranked by an on-device cross-encoder");
+  });
+
   it("claims nothing about the guard before a status frame arrives (older daemons)", () => {
     const html = render(parseDocIndexStatus(indexedNeural), null, null);
     expect(html).not.toContain("PDF JAIL");
