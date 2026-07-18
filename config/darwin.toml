@@ -26,6 +26,16 @@ sound_monitor = true    # Ambient sound monitor (task #15). SHIPS ON (full-power
                         #   device. DISTINCT from STT. The one-shot "what was that
                         #   sound" intent (on a clip the daemon already captured)
                         #   works regardless of this flag. Set false to disable.
+vad = "rms"             # Per-frame VAD backend: "rms" (energy gate — default) or
+                        #   "coreml-silero" (the learned Core ML Silero VAD). The
+                        #   learned backend MEASURABLY beats the RMS gate on false-
+                        #   accepts (loud non-speech — a fan, keyboard, music; see
+                        #   inference/benchmarks/vad_eval/), but its inference runs
+                        #   as a Core ML model and the daemon has NO in-process Core
+                        #   ML runtime, so "coreml-silero" today resolves to the RMS
+                        #   gate with a SURFACED reason (warn + telemetry) — armed
+                        #   but inert without its dependency, never a silent no-op.
+                        #   The min_speech_ms/silence_ms debounce is the same either way.
 
 [models]
 llm = "mlx-community/Qwen3-4B-Instruct-2507-4bit"   # local generation (+ converse decode) (MLX, Metal GPU)

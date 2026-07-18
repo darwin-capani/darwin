@@ -396,6 +396,7 @@ mod triage;
 mod ui_automation;
 mod unified_search;
 mod user_model;
+mod vad;
 mod vault;
 mod vitals;
 mod voiceid;

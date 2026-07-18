@@ -591,19 +591,26 @@ fn write_wav(path: &std::path::Path, sample_rate: u32, samples: &[f32]) -> Resul
     Ok(())
 }
 
-/// Energy-based VAD over ~30ms frames. Speech begins once RMS stays above the
-/// threshold for min_speech_ms (the run-up is buffered so the segment keeps
-/// its onset); it ends after silence_ms below the threshold.
+/// Frame-level VAD over ~30ms frames. Speech begins once the per-frame VOICED
+/// verdict stays true for min_speech_ms (the run-up is buffered so the segment
+/// keeps its onset); it ends after silence_ms of not-voiced. The verdict source
+/// is the resolved [`crate::vad::VadMode`] backend: today that is always the RMS
+/// energy gate (`rms > threshold`) — the learned "coreml-silero" backend is
+/// selectable but has no in-process Core ML runtime to execute it in this
+/// realtime loop, so it resolves to the RMS gate with a SURFACED reason (see
+/// `Vad::new`). When an in-process Core ML runtime lands, only the per-frame
+/// verdict (`Vad::step`'s `rms > threshold`) changes to `prob > threshold`; the
+/// min_speech/silence debounce is already backend-agnostic (see `crate::vad`).
 struct Vad {
     threshold: f32,
     frame_len: usize,
-    min_speech_samples: usize,
-    silence_limit_samples: usize,
     max_segment_samples: usize,
     frame: Vec<f32>,
-    in_speech: bool,
-    voiced_run: usize,
-    silent_run: usize,
+    /// The onset/offset debounce state machine — the SHARED pure decision seam
+    /// (`crate::vad::SpeechDebounce`) the learned VAD also drives. It is fed the
+    /// per-frame voiced verdict (`rms > threshold` today); the sample buffering
+    /// (`pending`/`segment`) stays here.
+    debounce: crate::vad::SpeechDebounce,
     pending: Vec<f32>,
     segment: Vec<f32>,
     counter: u64,
@@ -611,17 +618,39 @@ struct Vad {
 
 impl Vad {
     fn new(cfg: &Config, sample_rate: u32) -> Self {
+        // Resolve the configured VAD backend against what can run in-process. The
+        // learned Core ML VAD is armed but inert without an in-process Core ML
+        // runtime, so `coreml-silero` resolves to the RMS gate here — surfaced via
+        // warn + telemetry, never a silent no-op.
+        let requested = crate::vad::VadMode::from_config_str(&cfg.audio.vad);
+        let resolved = crate::vad::resolve_backend(requested);
+        if let Some(reason) = &resolved.fallback_reason {
+            warn!(requested = requested.as_str(), active = resolved.active.as_str(), "{reason}");
+            telemetry::emit(
+                "audio",
+                "vad.backend_fallback",
+                json!({"requested": requested.as_str(), "active": resolved.active.as_str(), "reason": reason}),
+            );
+        } else {
+            info!(vad = resolved.active.as_str(), "VAD backend active");
+        }
         let per_ms = sample_rate as usize / 1000;
+        let frame_len = (per_ms * FRAME_MS as usize).max(1);
+        let min_speech_samples = (per_ms * cfg.audio.min_speech_ms as usize).max(1);
+        let silence_limit_samples = (per_ms * cfg.audio.silence_ms as usize).max(1);
+        // Convert the sample-count debounce windows to frame counts. Every frame
+        // fed to the debounce is exactly `frame_len` samples, so a voiced run of
+        // `ceil(min_speech_samples / frame_len)` frames is the first run whose
+        // sample total reaches `min_speech_samples` — byte-for-byte the old
+        // `voiced_run >= min_speech_samples` boundary (same for silence).
+        let min_speech_frames = min_speech_samples.div_ceil(frame_len);
+        let silence_frames = silence_limit_samples.div_ceil(frame_len);
         Self {
             threshold: cfg.audio.rms_threshold as f32,
-            frame_len: (per_ms * FRAME_MS as usize).max(1),
-            min_speech_samples: (per_ms * cfg.audio.min_speech_ms as usize).max(1),
-            silence_limit_samples: (per_ms * cfg.audio.silence_ms as usize).max(1),
+            frame_len,
             max_segment_samples: (sample_rate as usize * MAX_SEGMENT_SECS).max(1),
             frame: Vec::new(),
-            in_speech: false,
-            voiced_run: 0,
-            silent_run: 0,
+            debounce: crate::vad::SpeechDebounce::new(min_speech_frames, silence_frames),
             pending: Vec::new(),
             segment: Vec::new(),
             counter: 0,
@@ -640,52 +669,61 @@ impl Vad {
     }
 
     fn step(&mut self, rms: f32, frame: Vec<f32>) -> Option<Vec<f32>> {
-        if !self.in_speech {
-            if rms > self.threshold {
-                self.voiced_run += frame.len();
+        // The per-frame VOICED verdict. Today the resolved backend is always the
+        // RMS energy gate; a live Core ML backend would substitute
+        // `crate::vad::prob_is_voiced(prob, threshold)` here with ZERO change to
+        // the debounce below (that is the point of the shared seam).
+        let voiced = rms > self.threshold;
+        let was_in_speech = self.debounce.in_speech();
+        // Buffer the run-up while not yet in speech, so a segment keeps its onset
+        // (the old `pending`): the frame that finally crosses `min_speech` is
+        // already in `pending` when the run completes, and a run that dies clears.
+        if !was_in_speech {
+            if voiced {
                 self.pending.extend_from_slice(&frame);
-                if self.voiced_run >= self.min_speech_samples {
-                    self.in_speech = true;
-                    self.silent_run = 0;
-                    self.segment = std::mem::take(&mut self.pending);
-                }
             } else {
-                self.voiced_run = 0;
                 self.pending.clear();
             }
-            return None;
         }
-
-        self.segment.extend_from_slice(&frame);
-        // Force-emit at the cap: better to transcribe the first 30s than to
-        // buffer forever waiting for silence that may be minutes away.
-        if self.segment.len() >= self.max_segment_samples {
-            warn!(
-                samples = self.segment.len(),
-                "VAD segment hit the {MAX_SEGMENT_SECS}s cap; force-emitting"
-            );
-            telemetry::emit(
-                "audio",
-                "vad.segment_capped",
-                json!({"samples": self.segment.len(), "cap_secs": MAX_SEGMENT_SECS}),
-            );
-            return Some(self.finish_segment());
+        match self.debounce.push(voiced) {
+            Some(crate::vad::DebounceEvent::SpeechStart) => {
+                // Started on this frame: the buffered run-up (incl. this frame) is
+                // the segment onset. This frame is NOT re-appended below.
+                self.segment = std::mem::take(&mut self.pending);
+                None
+            }
+            Some(crate::vad::DebounceEvent::SpeechEnd) => {
+                // The trailing silent frame that closed the segment is kept, then
+                // the utterance is emitted.
+                self.segment.extend_from_slice(&frame);
+                Some(self.finish_segment())
+            }
+            None => {
+                if was_in_speech {
+                    self.segment.extend_from_slice(&frame);
+                    // Force-emit at the cap: better to transcribe the first 30s
+                    // than to buffer forever waiting for silence minutes away.
+                    if self.segment.len() >= self.max_segment_samples {
+                        warn!(
+                            samples = self.segment.len(),
+                            "VAD segment hit the {MAX_SEGMENT_SECS}s cap; force-emitting"
+                        );
+                        telemetry::emit(
+                            "audio",
+                            "vad.segment_capped",
+                            json!({"samples": self.segment.len(), "cap_secs": MAX_SEGMENT_SECS}),
+                        );
+                        return Some(self.finish_segment());
+                    }
+                }
+                None
+            }
         }
-        if rms > self.threshold {
-            self.silent_run = 0;
-            return None;
-        }
-        self.silent_run += frame.len();
-        if self.silent_run < self.silence_limit_samples {
-            return None;
-        }
-        Some(self.finish_segment())
     }
 
     fn finish_segment(&mut self) -> Vec<f32> {
-        self.in_speech = false;
-        self.voiced_run = 0;
-        self.silent_run = 0;
+        self.debounce.reset();
+        self.pending.clear();
         self.counter += 1;
         std::mem::take(&mut self.segment)
     }
@@ -699,9 +737,7 @@ impl Vad {
         self.frame.clear();
         self.pending.clear();
         self.segment.clear();
-        self.in_speech = false;
-        self.voiced_run = 0;
-        self.silent_run = 0;
+        self.debounce.reset();
     }
 }
 
@@ -959,8 +995,58 @@ fn round4(v: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{round4, LevelMeter, LEVEL_INTERVAL};
+    use super::{round4, LevelMeter, Vad, LEVEL_INTERVAL};
+    use crate::config::Config;
     use std::time::{Duration, Instant};
+
+    /// End-to-end regression for the `Vad` after its debounce was factored onto
+    /// the shared `crate::vad::SpeechDebounce` seam: a real sample stream
+    /// (silence -> a voiced run past min_speech_ms -> silence past silence_ms)
+    /// must still produce exactly ONE segment, keep its onset run-up, and end
+    /// cleanly. Guards the "byte-for-byte capture behavior" invariant.
+    #[test]
+    fn vad_segments_a_voiced_run_between_silences() {
+        let sr = 16_000u32;
+        let cfg = Config::default(); // rms_threshold 0.015, min_speech 250ms, silence 350ms
+        let mut vad = Vad::new(&cfg, sr);
+        let frame = (sr / 1000 * super::FRAME_MS as u32) as usize; // 480 samples/frame
+        // Build a 0.1-amplitude sine (rms ~0.071, well above the 0.015 gate).
+        let voiced_frame: Vec<f32> = (0..frame)
+            .map(|n| 0.1 * (2.0 * std::f32::consts::PI * 200.0 * n as f32 / sr as f32).sin())
+            .collect();
+        let silent_frame = vec![0.0f32; frame];
+
+        let mut segments = Vec::new();
+        let mut feed = |vad: &mut Vad, f: &[f32], segs: &mut Vec<Vec<f32>>| {
+            for &s in f {
+                if let Some(seg) = vad.push(s) {
+                    segs.push(seg);
+                }
+            }
+        };
+        // 3 silent frames -> no capture yet.
+        for _ in 0..3 {
+            feed(&mut vad, &silent_frame, &mut segments);
+        }
+        assert!(segments.is_empty(), "silence alone never starts a segment");
+        // 12 voiced frames (> the 9-frame min_speech window at 16kHz) -> starts.
+        for _ in 0..12 {
+            feed(&mut vad, &voiced_frame, &mut segments);
+        }
+        assert!(segments.is_empty(), "segment is still open (no trailing silence yet)");
+        // 15 silent frames (> the 12-frame silence window) -> ends exactly once.
+        for _ in 0..15 {
+            feed(&mut vad, &silent_frame, &mut segments);
+        }
+        assert_eq!(segments.len(), 1, "exactly one utterance segment emitted");
+        assert_eq!(vad.take_counter(), 1, "the finished-segment counter advanced once");
+        let seg = &segments[0];
+        // The segment keeps the voiced run-up (onset), so it is at least the
+        // min_speech window long, and bounded by voiced + trailing-silence frames.
+        let min_speech_samples = (sr as usize / 1000) * cfg.audio.min_speech_ms as usize;
+        assert!(seg.len() >= min_speech_samples, "segment keeps its onset run-up");
+        assert!(seg.len() <= 30 * frame, "segment is bounded, not runaway");
+    }
 
     fn meter_at(origin: Instant) -> LevelMeter {
         LevelMeter {
