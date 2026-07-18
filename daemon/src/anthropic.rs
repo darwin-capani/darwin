@@ -1260,7 +1260,7 @@ fn tool_defs() -> &'static Value {
             },
             {
                 "name": "doc_search",
-                "description": "Search the user's OWN indexed FILES — an on-device document search (RAG) over the folders the user explicitly allowlisted. Returns CITED results: each is a real chunk of a real indexed file, with the FILE PATH, a byte OFFSET, and a snippet. READ-ONLY — it retrieves, stores nothing, sends nothing to the cloud, changes nothing. Call this when the user asks you to find/search/look up something in their files, notes, or documents ('search my notes for the launch plan', 'find where I wrote about the budget', 'what do my docs say about X'). 100% ON-DEVICE: file contents and the embeddings NEVER leave the device — embedding is the on-device model, and when that server is down search FALLS BACK to lexical BM25 (keyword term-overlap). The returned report NAMES which method actually ran (neural on-device embeddings, or lexical BM25 on fallback); report it the same way and never claim neural when it fell back. It indexes TEXT-LIKE files only (notes, markdown, source, config) — PDFs and other binaries are NOT indexed in this version; if the user expects a PDF, say it isn't covered yet, don't pretend it was searched. It CITES only real indexed chunks and NEVER fabricates a result: when the index is empty, the feature is off, or nothing matches, it honestly says so — tell the user they may need to enable file search and add a folder, and never invent a file or a quote. The index covers ONLY explicitly-allowlisted folders (never the whole disk) and is forgettable.",
+                "description": "Search the user's OWN indexed FILES — an on-device document search (RAG) over the folders the user explicitly allowlisted. Returns CITED results: each is a real chunk of a real indexed file, with the FILE PATH, a byte OFFSET, and a snippet. ON-DEVICE ONLY — it sends nothing to the cloud and never modifies the user's files; the ONE thing a search may write is the LOCAL index itself: with Spotlight integration on, matching files under the allowlisted folders can be absorbed into the index during the search (bounded by the configured max_files/max_chunks caps, cleared by 'forget my file index', rebuilt by reindex). Call this when the user asks you to find/search/look up something in their files, notes, or documents ('search my notes for the launch plan', 'find where I wrote about the budget', 'what do my docs say about X'). 100% ON-DEVICE: file contents and the embeddings NEVER leave the device — embedding is the on-device model, and when that server is down search FALLS BACK to lexical BM25 (keyword term-overlap). The returned report NAMES which method actually ran (neural on-device embeddings, or lexical BM25 on fallback); report it the same way and never claim neural when it fell back. It indexes TEXT-LIKE files (notes, markdown, source, config) plus born-digital PDFs and Office documents (.docx/.xlsx/.pptx) via on-device extractors; a scanned/encrypted/corrupt file is SKIPPED honestly (never indexed as garbage) — if a result the user expects is missing, say the file may have been skipped or not yet indexed, don't pretend it was searched. It CITES only real indexed chunks and NEVER fabricates a result: when the index is empty, the feature is off, or nothing matches, it honestly says so — tell the user they may need to enable file search and add a folder, and never invent a file or a quote. The index covers ONLY explicitly-allowlisted folders (never the whole disk) and is forgettable.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -8058,12 +8058,15 @@ async fn dispatch_tool(
             Err(e) => Err(anyhow!("invalid pasteboard_put arguments: {e}")),
         },
         // -- DOC SEARCH (crate::docsearch) -----------------------------------
-        // READ-ONLY on-device file RAG: rank the indexed file CHUNKS and return
-        // CITED results (file path + offset + snippet). The index is built only
+        // On-device file RAG: rank the indexed file CHUNKS and return CITED
+        // results (file path + offset + snippet). The index is built only
         // over the user's explicitly-allowlisted folders (never the whole disk),
         // every candidate was PATH-CONFINED at index time, and file contents +
-        // embeddings never leave the device. Nothing is stored/sent by a search —
-        // so it never touches integrations::gate(). Ranking is RUNTIME-SELECTED
+        // embeddings never leave the device. A search SENDS nothing anywhere —
+        // so it never touches integrations::gate() — and its ONE write is
+        // LOCAL: with [docsearch].spotlight on it may ABSORB bounded Spotlight
+        // candidates into the local index (max_files/max_chunks-capped,
+        // forgettable, rebuilt by reindex). Ranking is RUNTIME-SELECTED
         // (neural on-device embeddings when the LOCAL inference server is up and
         // every chunk is embedded, else lexical BM25); the report names whichever
         // ran. The live arm injects InferenceEmbedder; tests inject a mock. When
@@ -9468,15 +9471,31 @@ fn docsearch_db_path() -> std::path::PathBuf {
     root.join("state").join("docsearch.db")
 }
 
+/// Load the live [docsearch] config from the on-disk darwin.toml (one source of
+/// truth, like load_code_config). When no root is resolved, returns the default —
+/// whose EMPTY roots keep the Spotlight bridge inert (it never widens scope).
+fn load_docsearch_config() -> crate::config::DocSearchConfig {
+    let Some(root) = ROOT.get() else {
+        return crate::config::DocSearchConfig::default();
+    };
+    let (cfg, _issues) = crate::config::Config::load(&root.join("config").join("darwin.toml"));
+    cfg.docsearch
+}
+
 /// Run the `doc_search` tool: an on-device file RAG over the user's indexed files.
-/// READ-ONLY — it opens the local doc-chunk store and ranks the stored chunks via
+/// It opens the local doc-chunk store and ranks the stored chunks via
 /// [`crate::docsearch::DocIndex::search`] (neural on-device embeddings when the
 /// LOCAL inference server is up AND every chunk is embedded, else lexical BM25 —
 /// the report NAMES whichever ran). It CITES only real indexed chunks (file path +
 /// snippet) and NEVER fabricates one: an empty/unbuilt index or a no-match query
 /// honestly returns "nothing found" and points the user at enabling file search +
-/// allowlisting a folder. Nothing is stored or sent (the only network is the LOCAL
-/// embed socket); file contents + embeddings never leave the device.
+/// allowlisting a folder. NOTHING IS SENT (the only network is the LOCAL embed
+/// socket); file contents + embeddings never leave the device. The ONE write a
+/// search may make is LOCAL and BOUNDED: with `[docsearch].spotlight` on, the
+/// Spotlight bridge may ABSORB matching allowlisted files into the index
+/// ([`crate::spotlight::augment_index`] — capped by max_files/max_chunks,
+/// cleared by `forget my file index`, rebuilt by a reindex); the user's own
+/// files are never modified.
 async fn doc_search_tool(
     query: &str,
     k: Option<usize>,
@@ -9497,7 +9516,21 @@ async fn doc_search_tool(
             return "I couldn't open the on-device file index just now, sir.".to_string();
         }
     };
+    // SPOTLIGHT CANDIDATE GENERATION (READ-ONLY, config-gated on
+    // [docsearch].spotlight AND the indexer's own enabled+roots permit): ask the
+    // OS index for files matching the query UNDER THE ALLOWLISTED ROOTS ONLY
+    // (`-onlyin` per root — never an unrestricted query) and absorb them through
+    // the SAME confined/bounded/honest-skip indexing pipeline BEFORE ranking, so
+    // a file the bounded walk missed (or that appeared since the last reindex)
+    // is retrievable + cited exactly like any other. Any failure degrades to 0
+    // absorbed and the search proceeds over the index as it was.
+    let ds_cfg = load_docsearch_config();
+    crate::spotlight::augment_index(&ds_cfg, &idx, query, embedder).await;
     let DocSearchResult { hits, method } = idx.search(query, k, embedder).await;
+    // Spotlight METADATA ENRICHMENT (mdls, READ-ONLY, same gate): optional
+    // content-type / last-used / authors per cited hit — absent when unreadable,
+    // NEVER fabricated. Parallel to `hits` (one Option per hit, same order).
+    let enrichment = crate::spotlight::enrich_hits(&ds_cfg, &hits).await;
     let method_note = method.description();
     // Surface the CITED result to the HUD's read-only file-search panel. Carries
     // only what the persona already speaks aloud / shows in the transcript: the
@@ -9512,13 +9545,30 @@ async fn doc_search_tool(
         json!({
             "query": query,
             "method": method.as_str(),
-            "hits": hits.iter().map(|h| json!({
-                "file_path": h.file_path,
-                "root": h.root,
-                "byte_offset": h.byte_offset,
-                "snippet": h.snippet,
-                "score": h.score,
-            })).collect::<Vec<_>>(),
+            "hits": hits.iter().zip(enrichment.iter()).map(|(h, m)| {
+                let mut hit = json!({
+                    "file_path": h.file_path,
+                    "root": h.root,
+                    "byte_offset": h.byte_offset,
+                    "snippet": h.snippet,
+                    "score": h.score,
+                });
+                // Spotlight metadata rides along ONLY when actually read (the
+                // HUD parser tolerates the extra optional keys); an unreadable
+                // file carries none — never a fabricated field.
+                if let Some(m) = m {
+                    if let Some(ct) = &m.content_type {
+                        hit["content_type"] = json!(ct);
+                    }
+                    if let Some(lu) = &m.last_used {
+                        hit["last_used"] = json!(lu);
+                    }
+                    if let Some(a) = &m.authors {
+                        hit["authors"] = json!(a);
+                    }
+                }
+                hit
+            }).collect::<Vec<_>>(),
         }),
     );
     if hits.is_empty() {
@@ -9535,12 +9585,30 @@ async fn doc_search_tool(
     }
     let lines: Vec<String> = hits
         .iter()
-        .map(|h| {
-            // CITE the real file + offset, then the real chunk snippet.
-            format!(
+        .zip(enrichment.iter())
+        .map(|(h, m)| {
+            // CITE the real file + offset, then the real chunk snippet. When
+            // Spotlight metadata was readable, append it — real values only.
+            let mut line = format!(
                 "- {} (offset {}):\n  {}",
                 h.file_path, h.byte_offset, h.snippet
-            )
+            );
+            if let Some(m) = m {
+                let mut extras: Vec<String> = Vec::new();
+                if let Some(ct) = &m.content_type {
+                    extras.push(format!("type {ct}"));
+                }
+                if let Some(lu) = &m.last_used {
+                    extras.push(format!("last used {lu}"));
+                }
+                if let Some(a) = &m.authors {
+                    extras.push(format!("by {a}"));
+                }
+                if !extras.is_empty() {
+                    line.push_str(&format!("\n  [{}]", extras.join("; ")));
+                }
+            }
+            line
         })
         .collect();
     format!(

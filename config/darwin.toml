@@ -59,6 +59,11 @@ low_battery_pct = 20    # #38 discharge threshold: below this % ON BATTERY, pref
 [snapshot]               # SAFETY SNAPSHOT — APFS restore-point anchoring in the reversible journal. Before a consequential, hard-to-reverse step (a self-heal apply, a consequential mission step) DARWIN takes a bounded, device-gated `tmutil localsnapshot` and records the resulting APFS restore point into the journal so "undo that" can name a concrete OS-level rollback target.
 enabled = true           # SHIPS ON (armed-by-default). BENIGN-ONLY: snapshot CREATION writes/deletes NONE of your data (a COW APFS marker macOS thins automatically). RESTORE is NEVER automated — DARWIN only SURFACES the restore point + the exact user-run `tmutil` command; it never rolls back on its own. INERT WITHOUT APFS: a non-APFS / no-space / no-permission volume degrades to an honest "would-have" and changes nothing. Set false to disable.
 
+[procwatch]              # PROCESS OBSERVATORY — a STRICTLY READ-ONLY poll of the LIVE process table -> one bounded, SECRET-FREE `system.processes` frame for the HUD (total count, top-N by CPU/memory, new-since-last-poll, load average). The wire carries process NAME + pid (+ ppid/uid) ONLY — NEVER argv/command line, NEVER environment, NEVER open files/paths (those routinely carry secrets). SECRET-FREE AT THE SYSCALL BOUNDARY, by construction: the collector issues only per-pid fixed-size libproc struct reads (PROC_PIDTBSDINFO/PROC_PIDTASKINFO + proc_listallpids + getloadavg) — the kernel's argv/env block (KERN_PROCARGS2) and every path flavor are never requested, so no argv/env byte ever transits daemon memory. It OBSERVES only: no kill/signal/renice code path exists. Orthogonal to the Persistence Sentinel (persistence.rs watches AUTOSTART surfaces for changes; this is the live table).
+enabled = true           # master gate. SHIPS ON (armed-by-default; strictly read-only + secret-free, so safe to enable outright). OFF => the poll never spawns and the HUD panel stays honestly empty. Set false to disable.
+poll_secs = 10           # snapshot cadence in seconds. Clamped at read time to a sane floor (>= 2) so a hostile/typo'd 0 can't busy-spin the poll. CPU % is a TWO-SAMPLE delta across consecutive polls: the first poll honestly reports cpu as unknown (null; empty top-CPU list), never a fabricated 0.0 — real deltas from the second poll on.
+top_n = 12               # rows per top-CPU / top-memory list. Hard-capped at 32 at read time so a hostile/typo'd value can never flood the frame.
+
 [obol]                   # OBOL — CLOUD-SPEND LEDGER + DOLLAR-CAP ROUTING BUDGET. A durable, bounded, SECRET-FREE spend ledger (one row per cloud call: model + token counts + $ estimate + agent + ts) fed from the SAME point eval.rs records cloud usage. The budget is REDUCE-ONLY: Override > Budget-floor > Auto > Fallback — it can ONLY step a near/over-cap turn DOWN to a cheaper/on-device tier. It NEVER loosens a gate, NEVER escalates to a pricier model, and NEVER blocks a call you EXPLICITLY force (a voice/HUD override beats the budget-floor).
 daily_usd_cap = 0.0     # daily cloud-spend cap in USD. SHIPS 0.0 == NO CAP (INERT): budget_pressure is always None, so routing is byte-for-byte today's; the ledger still records honest accounting. Set a positive value to arm the budget-floor — at ~80% of the cap a Heavy turn eases down to Fast; at/over the cap the turn is floored to the on-device Local path (no further cloud spend). It only ever routes cheaper.
 
@@ -339,8 +344,9 @@ autostart = []
 # Micro-app introspection sentinel (introspect.rs, docs/INTROSPECT.md). A slow,
 # READ-ONLY watch over darwind's OWN sandboxed children: SBPL profile-drift
 # (fingerprint the profile we wrote vs. what's on disk) + per-app RSS/CPU
-# anomaly surfacing via sysinfo (same-UID children, no entitlement, no
-# EndpointSecurity/ptrace/task_for_pid). It emits introspect.snapshot /
+# anomaly surfacing via a libproc PROC_PIDTASKINFO struct read — never argv/env
+# (same-UID children, no entitlement, no EndpointSecurity/ptrace/task_for_pid).
+# It emits introspect.snapshot /
 # introspect.profile_drift / introspect.anomaly for the HUD + posture and takes
 # NO action — reacting to a finding would be consequential and rides the normal
 # confirm + voice-id + policy + lockdown gates. SHIPS ON; inert until an app
@@ -702,6 +708,8 @@ max_depth = 16                 # bound: recursion depth under each root (root = 
 chunk_chars = 1200             # chunk window size in chars.
 chunk_overlap = 200            # overlap between consecutive chunks (must be < chunk_chars).
 build_graph = true             # KNOWLEDGE-GRAPH build over already-indexed chunks, SHIPS ON (full-power default) — INERT WITHOUT INDEXED DOCS: the deterministic extractor only reads chunks the confined allowlisted indexer produced (never re-walks disk) and writes the shared user.world.* tier (provenance-tagged, deduped, bounded). Inert until docsearch has roots + an index. Set false to disable.
+spotlight = true               # macOS SPOTLIGHT BRIDGE (spotlight.rs), SHIPS ON (full-power default) — READ-ONLY (mdfind/mdls only; nothing can mutate Spotlight state) and INERT WITHOUT ROOTS: every mdfind query is confined with -onlyin to the roots above (never an unrestricted whole-Mac query), and every candidate re-runs the SAME path-confinement/allowlist/size/extraction pipeline before it may be indexed. Cited hits gain mdls metadata (content type / last used / authors) when readable — absent when not, never fabricated. Set false to disable.
+spotlight_max_candidates = 64  # bound: max Spotlight candidate paths considered per search (clamped to a hard ceiling in code).
 
 # [code] — CODE INTELLIGENCE (code.rs): code_explain (a grounded, CITED answer over
 # the on-device code index — never fabricating code not indexed) + code_propose_diff

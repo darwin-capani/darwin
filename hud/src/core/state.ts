@@ -150,6 +150,7 @@ import {
   parseDocIndexStatus,
   parseDocSearchResult,
   parsePdfJailAvailable,
+  parseSpotlightAvailable,
   parseCapabilityMap,
   parseDistillStatus,
   parseSyncStatus,
@@ -238,6 +239,7 @@ import {
 import { agentProfile, normalizeHue } from "./agents";
 import { type ChangeqState, changeqReduce, parseChangeqList } from "./changeq";
 import { type HardwareVitals, parseVitals } from "./vitals";
+import { type ProcessesFrame, parseProcesses } from "./procwatch";
 
 /* ------------------------------------------------------------------------ */
 
@@ -636,6 +638,11 @@ export interface HudState {
    *  load average, and every mounted volume's free/total. STRICTLY READ-ONLY +
    *  secret-free. Null until the first frame (nothing read yet). */
   vitals: HardwareVitals | null;
+  /** PROCESS OBSERVATORY reduction (system.processes, procwatch.rs): total
+   *  process count, top-N by CPU/memory (name + pid only — the daemon never
+   *  reads argv/env), new-since-last-poll, load average. STRICTLY READ-ONLY +
+   *  secret-free. Null until the first frame (nothing read yet). */
+  processes: ProcessesFrame | null;
   lastTimings: PipelineTimings | null;
 
   /** Daemon-side is_speaking(): mic is muted because DARWIN is talking.
@@ -836,6 +843,18 @@ export interface HudState {
    *  fallback is never silent. Null until the first status frame arrives (an
    *  older daemon never sends one), in which case the panel claims nothing. */
   pdfJailAvailable: boolean | null;
+  /** Whether the daemon's READ-ONLY Spotlight candidate bridge (spotlight.rs:
+   *  root-confined mdfind/mdls) is ACTUALLY answering (docsearch.status, same
+   *  cadence) — EVERY leg of the live gate: docsearch OPERATIONAL (enabled +
+   *  non-empty roots), [docsearch].spotlight ON, mdfind present, AND the MOST
+   *  RECENT real query succeeded. Disabling docsearch, emptying its roots,
+   *  turning the flag off, or a later failure flips it back to false on the
+   *  next frame — never a stale "worked once" claim. `false` honestly covers
+   *  "docsearch disabled/rootless", "not yet queried", "flag off", "Spotlight
+   *  indexing disabled / last attempt failed", and a malformed payload — the
+   *  DocSearchPanel pill never overclaims. Null until the first status frame
+   *  (an older daemon), in which case claim nothing. */
+  spotlightAvailable: boolean | null;
   /** The self-distillation pipeline's honest state (distill.status): armed/
    *  inert, examples ready, last run — and that adapters are NEVER auto-
    *  promoted. Null until the first frame. REVIEW-ONLY. */
@@ -1463,6 +1482,7 @@ export function initialState(): HudState {
       uptimeSecs: null,
     },
     vitals: null,
+    processes: null,
     lastTimings: null,
     micMuted: false,
     loudStreak: 0,
@@ -1508,6 +1528,7 @@ export function initialState(): HudState {
     docIndex: null,
     docSearch: null,
     pdfJailAvailable: null,
+    spotlightAvailable: null,
     distill: null,
     federatedSync: null,
     fleet: null,
@@ -1879,6 +1900,14 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // never a fabricated reading) and STRICTLY READ-ONLY — the panel only
       // displays, it actuates nothing.
       return { ...s, vitals: parseVitals(env.data) };
+    }
+
+    case "system.processes": {
+      // PROCESS OBSERVATORY (procwatch.rs, [procwatch].poll_secs cadence).
+      // parseProcesses is DEFENSIVE (a malformed field degrades to an honest
+      // unknown/empty, never a fabricated reading; hostile arrays bounded) and
+      // STRICTLY READ-ONLY — the panel only displays, it actuates nothing.
+      return { ...s, processes: parseProcesses(env.data) };
     }
 
     case "daemon.started": {
@@ -2925,12 +2954,17 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
     case "docsearch.status": {
       // The daemon's periodic document-extraction guard status (main.rs::
       // audit_snapshot_task -> docsearch::emit_status): whether the pdfjail
-      // memory-jail helper sits next to the running darwind. parsePdfJailAvailable
-      // is STRICT — only a literal JSON `true` claims the jail is armed (never
-      // overclaim the stronger guard) — so `false` here honestly covers both "the
-      // daemon says the helper is missing" and "the payload was malformed". The
-      // DocSearchPanel shows the amber PDF JAIL MISSING pill on `false`.
-      return { ...s, pdfJailAvailable: parsePdfJailAvailable(env.data) };
+      // memory-jail helper sits next to the running darwind, and whether the
+      // READ-ONLY Spotlight candidate bridge is actually answering. Both parses
+      // are STRICT — only a literal JSON `true` claims the stronger/working
+      // state (never overclaim) — so `false` honestly covers "the daemon says
+      // no" and "the payload was malformed". The DocSearchPanel shows the amber
+      // PDF JAIL MISSING pill / the dim SPOTLIGHT IDLE pill on `false`.
+      return {
+        ...s,
+        pdfJailAvailable: parsePdfJailAvailable(env.data),
+        spotlightAvailable: parseSpotlightAvailable(env.data),
+      };
     }
 
     case "capability.map": {

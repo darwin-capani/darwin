@@ -17,6 +17,7 @@ import ShellPanel from "./components/ShellPanel";
 import UiActuatePanel from "./components/UiActuatePanel";
 import DiagnosticsPanel from "./components/DiagnosticsPanel";
 import VitalsPanel from "./components/VitalsPanel";
+import ProcPanel from "./components/ProcPanel";
 import DocSearchPanel from "./components/DocSearchPanel";
 import EvalPanel from "./components/EvalPanel";
 import SpendMeter from "./components/SpendMeter";
@@ -690,6 +691,7 @@ export default function App() {
             index={state.docIndex}
             search={state.docSearch}
             pdfJail={state.pdfJailAvailable}
+            spotlight={state.spotlightAvailable}
           />
           <CodeIntelPanel code={state.codeIntel} />
           <ChangeQueuePanel changeq={state.changeq} />
@@ -719,6 +721,7 @@ export default function App() {
           <InferencePerfPanel perf={state.inferencePerf} />
           <DiagnosticsPanel gauges={state.gauges} facts={state.facts} actions={state.actions} />
           <VitalsPanel vitals={state.vitals} />
+          <ProcPanel proc={state.processes} />
         </div></ErrorBoundary>
         <Waveform connected={state.connected} />
       </div>

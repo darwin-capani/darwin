@@ -68,6 +68,30 @@ export interface HardwareVitalsData {
   uptime_secs: number;
 }
 
+/** system / system.processes — procwatch.rs::procwatch_task, every
+ *  [procwatch].poll_secs. A STRICTLY READ-ONLY, SECRET-FREE reduction of the
+ *  LIVE process table: process NAME + pid (+ ppid/uid) only — NEVER
+ *  argv/command line, NEVER environment, NEVER open files/paths (the daemon
+ *  reads only fixed-size libproc structs; the argv/env sysctl is never
+ *  issued). CPU % is a TWO-SAMPLE delta: on the FIRST poll every cpu_pct is
+ *  null and top_cpu is honestly EMPTY (warm-up, never a fabricated 0.0).
+ *  Parsed defensively by core/procwatch.ts (parseProcesses); the shape is
+ *  documented here for the wire. */
+export interface SystemProcessesData {
+  total: number; // the KERNEL'S live pid count (includes pids the unprivileged daemon can't inspect; those can't appear in the lists)
+  new_since_poll: number | null; // null on the FIRST poll (no baseline yet)
+  top_cpu: Array<{
+    name: string; // short process name, <= 64 chars — never a command line
+    pid: number;
+    ppid: number | null; // null where unreadable (honest absent)
+    uid: number | null; // null where unavailable (honest absent)
+    cpu_pct: number | null; // two-sample delta; null until a baseline exists. Can honestly exceed 100 on multi-core
+    mem_bytes: number | null; // null where TASKINFO was unreadable
+  }>;
+  top_mem: SystemProcessesData["top_cpu"]; // same entry shape, ranked by memory (measured rows only)
+  load_avg: [number, number, number] | null; // 1 / 5 / 15 min; null when unreadable
+}
+
 /** system / daemon.started — main.rs. `cloud_key_present` added by contract #2. */
 export interface DaemonStartedData {
   root: string;
@@ -6177,11 +6201,18 @@ export function parseOptimizerProposal(
  *     transcript). `method` is the backend that ACTUALLY ran, so the panel never *
  *     claims neural when it fell back to BM25. The daemon NEVER fabricates a hit;  *
  *     the parser carries that forward — it surfaces ONLY real returned hits.     *
- *   - `system / docsearch.status` ({pdfjail_available}) — emitted every audit-   *
- *     snapshot tick (main.rs::audit_snapshot_task -> docsearch::emit_status):    *
- *     whether the daemon found its pdfjail memory-jail helper, i.e. whether PDF  *
- *     extraction runs jailed or on the weaker in-process fallback guard. One     *
- *     boolean, so a production install silently on the fallback is VISIBLE.     *
+ *   - `system / docsearch.status` ({pdfjail_available, spotlight_available}) —   *
+ *     emitted every audit-snapshot tick (main.rs::audit_snapshot_task ->         *
+ *     docsearch::emit_status): whether the daemon found its pdfjail memory-jail  *
+ *     helper (PDF extraction jailed vs the weaker in-process fallback guard),    *
+ *     and whether the READ-ONLY Spotlight candidate bridge is actually           *
+ *     answering (EVERY leg of the live gate: docsearch OPERATIONAL — enabled +   *
+ *     non-empty roots — AND [docsearch].spotlight ON AND mdfind present AND the  *
+ *     MOST RECENT real query succeeded — honest false when docsearch is          *
+ *     disabled/rootless, the flag is off, Spotlight indexing is disabled, or     *
+ *     the last attempt failed; never a stale "worked once" claim). Flat          *
+ *     booleans, so a production install silently degraded on either front is     *
+ *     VISIBLE.                                                                   *
  *                                                                                *
  * 100% ON-DEVICE: telemetry is the local 127.0.0.1 broadcast only — file         *
  * contents + embeddings never leave the device. SHIPPED-OFF: the feature is      *
@@ -6288,6 +6319,21 @@ export function parseDocSearchResult(data: Record<string, unknown>): DocSearchRe
  *  jailed is merely conservative). NEVER throws. */
 export function parsePdfJailAvailable(data: Record<string, unknown>): boolean {
   return bool(data, "pdfjail_available") === true;
+}
+
+/** Parse a `docsearch.status` payload's Spotlight leg: whether the daemon's
+ *  READ-ONLY Spotlight candidate bridge (spotlight.rs: mdfind/mdls, root-
+ *  confined) is ACTUALLY answering — EVERY leg of the live gate: docsearch
+ *  OPERATIONAL (enabled + non-empty roots), [docsearch].spotlight ON, mdfind
+ *  present, AND the MOST RECENT real query succeeded (disabling docsearch,
+ *  emptying its roots, or a later failure flips it back to false; never a
+ *  sticky "worked once" claim). STRICT, same rule as the pdfjail
+ *  parse: only a literal JSON `true` claims the integration (an absent field —
+ *  an older daemon — a malformed or truthy-but-not-boolean value all coerce to
+ *  `false`), because overclaiming a working integration is the dishonest
+ *  direction. NEVER throws. */
+export function parseSpotlightAvailable(data: Record<string, unknown>): boolean {
+  return bool(data, "spotlight_available") === true;
 }
 
 /* ------------------------------------------------------------------------ *

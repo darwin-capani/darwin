@@ -45,7 +45,8 @@ pub struct Config {
     /// [introspect] — MICRO-APP INTROSPECTION (introspect.rs). `enabled` SHIPS ON
     /// (full-power default). READ-ONLY DEFENSE: a slow sentinel over darwind's OWN
     /// sandboxed children that flags SBPL profile-drift (on-disk tamper) and RSS/
-    /// CPU anomalies via sysinfo (same-UID, no entitlement, no ES/ptrace). It
+    /// CPU anomalies via a same-UID libproc struct read (`PROC_PIDTASKINFO`, shared
+    /// with procwatch — no KERN_PROCARGS2, no entitlement, no ES/ptrace). It
     /// emits telemetry for the HUD/posture and takes NO action — reacting to a
     /// finding would be consequential and rides the existing gates. Inert until an
     /// app runs; with it false the sentinel loop is not spawned (the cheap
@@ -335,6 +336,19 @@ pub struct Config {
     /// that degrades honestly (never fabricated) when unreadable. `poll_secs` is
     /// the refresh cadence (clamped to a sane floor).
     pub vitals: VitalsConfig,
+    /// [procwatch] — PROCESS OBSERVATORY (procwatch.rs). `enabled` SHIPS ON
+    /// (armed-by-default). STRICTLY READ-ONLY: a bounded poll that snapshots the
+    /// LIVE process table via DIRECT libproc fixed-size struct reads
+    /// (TBSDINFO/TASKINFO) and emits one SECRET-FREE `system.processes` frame
+    /// (total count, top-N by CPU/memory, new-since-last-poll, load average) to
+    /// the HUD. Process NAME + pid only — the argv/env sysctl (KERN_PROCARGS2)
+    /// and every path flavor are NEVER issued, so argv/env/open files (which
+    /// can carry secrets) never even transit daemon memory. CPU % is a
+    /// two-sample delta: the first poll honestly reports null, never 0.0. It
+    /// never kills/signals/renices anything — no such code path exists.
+    /// `poll_secs` is the cadence (clamped to a sane floor); `top_n` the
+    /// per-list size (hard-capped at 32).
+    pub procwatch: ProcwatchConfig,
     /// [snapshot] — SAFETY SNAPSHOT (snapshot.rs). `enabled` SHIPS ON
     /// (armed-by-default). BENIGN-ONLY: before a consequential, hard-to-reverse
     /// step (a self-heal apply, a consequential mission step) DARWIN takes a
@@ -800,8 +814,10 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // knowledge-graph build only over chunks the confined indexer already produced.
     // It is a real parsed DocSearchConfig field, so it MUST be listed here or the
     // daemon falsely warns "unknown config key docsearch.build_graph ignored" while
-    // still honoring it. Listed here so none reads as a typo; the `roots` array is
-    // validated structurally by serde.
+    // still honoring it. `spotlight` + `spotlight_max_candidates` (spotlight.rs)
+    // gate/bound the READ-ONLY mdfind/mdls Spotlight bridge (SHIPS ON — inert
+    // without roots; candidates run the same confined pipeline). Listed here so
+    // none reads as a typo; the `roots` array is validated structurally by serde.
     (
         "docsearch",
         &[
@@ -814,6 +830,8 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "chunk_chars",
             "chunk_overlap",
             "build_graph",
+            "spotlight",
+            "spotlight_max_candidates",
         ],
     ),
     // [code] — CODE INTELLIGENCE (code.rs): code_explain (grounded answers over the
@@ -1057,6 +1075,14 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // to the HUD. No action, no actuator, no root. `poll_secs` is the refresh
     // cadence (clamped to a sane floor). Listed so neither reads as a typo.
     ("vitals", &["enabled", "poll_secs"]),
+    // [procwatch] — PROCESS OBSERVATORY (procwatch.rs). `enabled` SHIPS ON
+    // (armed-by-default). STRICTLY READ-ONLY: a bounded poll of the LIVE process
+    // table via direct libproc fixed-size struct reads -> one SECRET-FREE
+    // `system.processes` frame (name + pid only — the argv/env sysctl is never
+    // issued; no kill/signal/renice path exists). `poll_secs` is the cadence
+    // (clamped to a sane floor); `top_n` the per-list size (hard-capped at 32).
+    // Listed so none reads as a typo.
+    ("procwatch", &["enabled", "poll_secs", "top_n"]),
     // [snapshot] — SAFETY SNAPSHOT (snapshot.rs). `enabled` SHIPS ON (armed-by-
     // default). BENIGN-ONLY: before a consequential step (a self-heal apply, a
     // consequential mission step) DARWIN takes a bounded `tmutil localsnapshot`
@@ -1931,6 +1957,55 @@ impl Default for VitalsConfig {
     }
 }
 
+/// [procwatch] — PROCESS OBSERVATORY (procwatch.rs). STRICTLY READ-ONLY, armed
+/// by default.
+///
+///   - `enabled` (SHIPS ON, armed-by-default): the master gate for the
+///     `system.processes` poll. When ON, DARWIN snapshots the LIVE process
+///     table and surfaces one bounded, SECRET-FREE frame (total count, top-N by
+///     CPU/memory, new-since-last-poll, load average). The wire carries process
+///     NAME + pid (+ ppid/uid) only — NEVER argv/command line, NEVER
+///     environment, NEVER open files/paths (those routinely carry secrets).
+///     Secret-free AT THE SYSCALL BOUNDARY, by construction: the collector
+///     issues only per-pid fixed-size libproc struct reads (PROC_PIDTBSDINFO /
+///     PROC_PIDTASKINFO) — the kernel's argv/env block (KERN_PROCARGS2) and
+///     every path flavor are never requested, so no argv/env byte ever transits
+///     daemon memory. CPU % is a two-sample delta; the FIRST poll honestly
+///     reports cpu as null (empty top-CPU list), never a fabricated 0.0. It
+///     OBSERVES only: no kill/signal/renice code path exists. OFF => the poll
+///     never spawns and the panel stays honestly empty.
+///   - `poll_secs` (default 10): the snapshot cadence. Clamped at read time to
+///     a sane floor (>= [`procwatch::PROCWATCH_MIN_POLL_SECS`]) so a
+///     hostile/typo'd 0 can't busy-spin the poll.
+///   - `top_n` (default 12): how many processes each top-CPU / top-memory list
+///     carries. Hard-capped at [`procwatch::PROCWATCH_MAX_TOP_N`] so a
+///     hostile/typo'd value can never flood the frame.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ProcwatchConfig {
+    pub enabled: bool,
+    pub poll_secs: u64,
+    pub top_n: u64,
+}
+
+impl Default for ProcwatchConfig {
+    fn default() -> Self {
+        Self {
+            // SHIPS ON (armed-by-default). STRICTLY READ-ONLY: the poll only
+            // OBSERVES the process table — it never kills/signals/renices, and
+            // the wire is secret-free (name + pid; never argv/env/files).
+            enabled: true,
+            // A calm 10s cadence: the process table changes slowly enough that
+            // a live panel needs nothing faster; light on the machine. Clamped
+            // to PROCWATCH_MIN_POLL_SECS at read time.
+            poll_secs: 10,
+            // 12 rows per list reads comfortably in the HUD panel; hard-capped
+            // at PROCWATCH_MAX_TOP_N (32) at read time.
+            top_n: 12,
+        }
+    }
+}
+
 /// [snapshot] — SAFETY SNAPSHOT (snapshot.rs). BENIGN-ONLY, armed by default.
 ///
 ///   - `enabled` (SHIPS ON, armed-by-default): the master gate. Before a
@@ -2601,6 +2676,19 @@ pub struct DocSearchConfig {
     /// shared world tier; it never re-walks the disk and never writes an agent's
     /// private namespace. Inert until docsearch has roots + an index.
     pub build_graph: bool,
+    /// SPOTLIGHT BRIDGE (spotlight.rs): when true, a file search ALSO asks macOS
+    /// Spotlight (READ-ONLY `mdfind`, always `-onlyin` per allowlisted root —
+    /// never an unrestricted query) for candidate files, absorbed through the
+    /// SAME confined/bounded/honest-skip indexing pipeline, and enriches cited
+    /// hits with `mdls` metadata (absent when unreadable — never fabricated).
+    /// SHIPS ON (full-power default) — INERT WITHOUT ROOTS: it is additionally
+    /// gated on `enabled` + a non-empty `roots`, so it can never widen what
+    /// docsearch may touch. Nothing here can mutate Spotlight state.
+    pub spotlight: bool,
+    /// Bound: max Spotlight candidate paths considered per search (the mdfind
+    /// result list is capped HERE before any confinement/read work). Clamped to
+    /// a hard ceiling in spotlight.rs so a typo can never bulk-ingest a disk.
+    pub spotlight_max_candidates: usize,
 }
 
 impl Default for DocSearchConfig {
@@ -2632,6 +2720,13 @@ impl Default for DocSearchConfig {
             // user.world.* tier (provenance-tagged, deduped, bounded). Inert until
             // docsearch has roots + an index.
             build_graph: true,
+            // SHIPS ON (full-power default) — INERT WITHOUT ROOTS: the Spotlight
+            // bridge is READ-ONLY (mdfind/mdls only) and root-confined; with no
+            // allowlisted root it never issues a query at all.
+            spotlight: true,
+            // A focused candidate list per search; clamped to a hard ceiling in
+            // spotlight.rs regardless of what is configured here.
+            spotlight_max_candidates: 64,
         }
     }
 }
@@ -4712,6 +4807,7 @@ impl Config {
             plugin_sdk: section(&table, "plugin_sdk", &mut issues),
             power: section(&table, "power", &mut issues),
             vitals: section(&table, "vitals", &mut issues),
+            procwatch: section(&table, "procwatch", &mut issues),
             snapshot: section(&table, "snapshot", &mut issues),
             obol: section(&table, "obol", &mut issues),
             report: section(&table, "report", &mut issues),
@@ -5002,6 +5098,37 @@ mod tests {
         );
         assert!(!cfg.vitals.enabled);
         assert_eq!(cfg.vitals.poll_secs, 10);
+    }
+
+    /// [procwatch] PROCESS OBSERVATORY SHIPS ON (armed-by-default; strictly
+    /// READ-ONLY — observes the live process table, never kills/signals/renices;
+    /// secret-free wire: name + pid, never argv/env), with the calm 10s poll and
+    /// 12-row top-N defaults. The keys are KNOWN and round-trip.
+    #[test]
+    fn procwatch_defaults_on_and_keys_known() {
+        let (cfg, issues) = Config::parse("");
+        assert!(issues.is_empty(), "{issues:?}");
+        assert!(
+            cfg.procwatch.enabled,
+            "[procwatch].enabled SHIPS ON (armed-by-default; strictly read-only)"
+        );
+        assert_eq!(cfg.procwatch.poll_secs, 10);
+        assert_eq!(cfg.procwatch.top_n, 12);
+
+        let raw = r#"
+            [procwatch]
+            enabled = false
+            poll_secs = 30
+            top_n = 5
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        assert!(
+            !issues.iter().any(|i| i.contains("procwatch")),
+            "[procwatch] keys must be KNOWN (no diagnostic): {issues:?}"
+        );
+        assert!(!cfg.procwatch.enabled);
+        assert_eq!(cfg.procwatch.poll_secs, 30);
+        assert_eq!(cfg.procwatch.top_n, 5);
     }
 
     /// SAFETY SNAPSHOT: [snapshot].enabled SHIPS ON (armed-by-default; benign-only
@@ -5954,6 +6081,13 @@ mod tests {
             cfg.docsearch.chunk_overlap < cfg.docsearch.chunk_chars,
             "overlap must be smaller than the chunk window or chunking never advances"
         );
+        // The READ-ONLY Spotlight bridge SHIPS ON (inert without roots, like the
+        // subsystem itself) with a real, finite candidate bound.
+        assert!(cfg.docsearch.spotlight, "Spotlight bridge SHIPS ON (read-only; inert without roots)");
+        assert!(
+            cfg.docsearch.spotlight_max_candidates > 0,
+            "spotlight_max_candidates must be a real bound"
+        );
 
         // The operator can turn it on, allowlist a root, and retune the bounds —
         // all known keys, all round-tripping.
@@ -5968,6 +6102,8 @@ mod tests {
             chunk_chars = 800
             chunk_overlap = 100
             build_graph = true
+            spotlight = false
+            spotlight_max_candidates = 16
         "#;
         let (cfg, issues) = Config::parse(raw);
         assert!(issues.is_empty(), "docsearch keys must all be known: {issues:?}");
@@ -5982,6 +6118,10 @@ mod tests {
         // `build_graph` is a real parsed field, so it must round-trip AND be a known
         // key (no false "unknown config key docsearch.build_graph ignored").
         assert!(cfg.docsearch.build_graph);
+        // The Spotlight keys round-trip too (an operator can turn the bridge off
+        // and retune the candidate bound without an unknown-key diagnostic).
+        assert!(!cfg.docsearch.spotlight);
+        assert_eq!(cfg.docsearch.spotlight_max_candidates, 16);
 
         // A typo'd docsearch key is diagnosed, not silently swallowed.
         let (_cfg, issues) = Config::parse("[docsearch]\nenabledd = true\n");

@@ -147,7 +147,10 @@ mod interception;
 mod interpret;
 // MICRO-APP INTROSPECTION (introspect.rs): a DEFENSIVE, READ-ONLY sentinel over
 // darwind's OWN sandboxed children — SBPL profile-drift detection (fingerprint
-// vs on-disk) + per-app RSS/CPU anomaly classification via sysinfo. No ES, no
+// vs on-disk) + per-app RSS/CPU anomaly classification via a libproc
+// PROC_PIDTASKINFO struct read (procwatch's shared reader — NEVER sysinfo's
+// per-process API, whose refresh would sysctl KERN_PROCARGS2 argv+env onto the
+// daemon heap; see procwatch.rs's whole-daemon invariant). No ES, no
 // task_for_pid, no ptrace, no entitlement (it watches same-UID children it
 // spawned). It relays through the telemetry bus; it observes, it never acts.
 mod introspect;
@@ -251,6 +254,12 @@ mod presence;
 mod posture;
 mod power;
 mod proactive;
+// PROCESS OBSERVATORY (procwatch.rs): a STRICTLY READ-ONLY poll of the LIVE
+// process table -> one bounded, SECRET-FREE `system.processes` frame (name +
+// pid only; direct libproc fixed-size struct reads — the argv/env sysctl is
+// never issued; no kill/signal/renice path exists). Pure sample->frame
+// reduction incl. the two-sample CPU delta, tested on synthetic records.
+mod procwatch;
 // Expressiveness layer (#33 adaptive prosody + #34 whisper/discreet mode). PURE +
 // ON by default ([voice].adaptive_prosody / [voice].whisper / whisper_auto all ship
 // true); EXPRESSIVENESS-ONLY (delivery, never a gate). Rich prosody is EL-v3-GATED (Kokoro gets a coarse/neutral mapping,
@@ -357,6 +366,12 @@ mod skills;
 // Hermetically tested (tmutil exec injected; never spawned under test).
 mod snapshot;
 mod speech;
+// SPOTLIGHT BRIDGE (spotlight.rs): READ-ONLY mdfind/mdls candidate generation +
+// metadata enrichment for docsearch — root-confined (`-onlyin` per allowlisted
+// root, never an unrestricted query), bounded, honest. Candidates run the SAME
+// docsearch confinement/allowlist/extraction pipeline; nothing here can mutate
+// Spotlight state. Hermetically tested (runner injected; never spawned in tests).
+mod spotlight;
 mod standing;
 mod tcc;
 mod telemetry;
@@ -1141,8 +1156,17 @@ async fn audit_snapshot_task(cfg: Arc<Config>, memory: Arc<Memory>, root: PathBu
         // (the pdfjail helper sits next to THIS executable) or silently on the
         // weaker in-process fallback guard — a production install on the fallback
         // must be VISIBLE, not just a one-shot log WARN + the CLI selfcheck board.
+        // The same frame carries the Spotlight-bridge leg, gated on the FULL
+        // live gate: docsearch operational (enabled + non-empty roots — the
+        // same indexing_permitted check the search path enforces) AND the
+        // [docsearch].spotlight flag. An operator disabling docsearch,
+        // emptying its roots, or turning the flag off sees the pill drop
+        // honestly on the next tick, whatever mdfind last answered.
         // One stat() per tick; READ-ONLY, like its two siblings above.
-        docsearch::emit_status();
+        docsearch::emit_status(
+            docsearch::indexing_permitted(live.docsearch.enabled, &live.docsearch.roots),
+            live.docsearch.spotlight,
+        );
         // The HUD's DistillPanel shows the self-distillation pipeline's honest
         // state (distill.rs): armed/inert, how many redacted examples are ready,
         // the last run, and that adapters are NEVER auto-promoted. READ-ONLY —
@@ -2357,6 +2381,14 @@ async fn main() -> Result<()> {
     // [vitals].enabled (armed by default); OFF, the task returns without spawning
     // any read. It OBSERVES and reports — no action, no actuator, no root.
     tokio::spawn(vitals::vitals_task(cfg.clone()));
+    // PROCESS OBSERVATORY (procwatch.rs): a STRICTLY READ-ONLY poll of the live
+    // process table -> the HUD `system.processes` panel (total count, top-N by
+    // CPU/memory, new-since-last-poll, load). SECRET-FREE at the syscall
+    // boundary (direct libproc fixed-size struct reads; the argv/env sysctl is
+    // never issued) and it acts on NOTHING: no kill/signal/renice code path
+    // exists. Gated by [procwatch].enabled (armed by default); OFF, the task
+    // returns without spawning any read.
+    tokio::spawn(procwatch::procwatch_task(cfg.clone()));
 
     // ARTIFACT REGISTRY (artifact.rs): apply the [artifact] master gate + retention
     // bound to the process-global registry the producers register into and the
@@ -2832,8 +2864,10 @@ async fn main() -> Result<()> {
     }
     // Ambient micro-app introspection: a slow, READ-ONLY sentinel over darwind's
     // OWN sandboxed children — SBPL profile-drift (fingerprint vs on-disk) and
-    // per-app RSS/CPU anomaly classification via sysinfo (same-UID, no
-    // entitlement). It emits introspect.snapshot/profile_drift/anomaly for the
+    // per-app RSS/CPU anomaly classification via a libproc PROC_PIDTASKINFO
+    // struct read (procwatch's shared reader; never sysinfo's per-process API —
+    // the whole-daemon no-KERN_PROCARGS2 invariant in procwatch.rs). Same-UID,
+    // no entitlement. It emits introspect.snapshot/profile_drift/anomaly for the
     // HUD/posture; it observes, it never signals/kills/injects/writes. Ships ON
     // ([introspect].enabled) and stays inert (nothing to observe) until an app
     // runs. record_profile/record_child in apps.rs feed it regardless of the
