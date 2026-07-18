@@ -167,7 +167,7 @@ Two voice engines back this, consistent with the rest of the system — **armed 
 
 ### Hardware reality (read before contributing)
 
-DARWIN was developed on an M4 Mac Mini, but the whole stack (arm64 + Metal/MLX + Core ML/ANE + macOS) is present on **every** Apple Silicon chip — local performance simply scales with the chip and unified memory.
+DARWIN targets **every** Apple Silicon chip (M1 or later): the whole stack (arm64 + Metal/MLX + Core ML/ANE + macOS) is present on all of them, and local performance simply scales with the chip and unified memory. It was developed and benchmarked on an Apple M1 Pro (MacBookPro18,1, 16 GiB) — the committed performance baseline is honest, measured M1 Pro data, so newer chips run faster than the documented numbers, never slower.
 
 - **macOS is the host, not Linux.** MLX (the Apple-GPU Metal backend) and Core ML/ANE access exist **only** on macOS. Asahi Linux is a non-starter on M4-generation silicon, and even where Asahi boots, MLX/Core ML need macOS — so macOS is the host regardless of chip.
 - **MLX runs on the Apple GPU via Metal, not the Neural Engine.** LLM decode is memory-bandwidth-bound and the GPU sees full unified-memory bandwidth, so the model stays on the GPU. The ANE — reachable only through Core ML — is reserved for Phase-3 auxiliary models (wake-word, VAD, embeddings).
