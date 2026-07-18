@@ -1,11 +1,23 @@
-"""On-device Core ML voice-activity detector (learned VAD backend).
+"""On-device learned voice-activity detector (Silero VAD v5): Core ML
+conversion + eval harness + the daemon's native-weights exporter.
 
 WHAT: Silero VAD v5 (snakers4/silero-vad — a tiny streaming speech-probability
-model, ~1.3 MB of weights) converted to Core ML (FP16 mlprogram,
-compute_units=ALL, ANE-ELIGIBLE) and used as a learned, per-frame
-speech-probability source in place of the daemon's RMS energy gate. It is the
-canonical "tiny always-on model on the Neural Engine" workload: a sub-megabyte
-graph that Core ML may schedule onto the ANE, freeing the GPU for MLX.
+model, ~1.3 MB of weights) as a learned, per-frame speech-probability source in
+place of the daemon's RMS energy gate. This module has TWO roles:
+  1. Core ML conversion (FP16 mlprogram, compute_units=ALL, ANE-ELIGIBLE): the
+     variant the committed eval (inference/benchmarks/vad_eval/) measured, and
+     the on-ANE candidate for any future server-side use.
+  2. `export_native_weights`: the raw-fp32 weights export the daemon's SHIPPED
+     live path consumes — daemon/src/silero.rs runs this exact elementary-op
+     core IN-PROCESS on the realtime audio thread. TRANSPORT DECISION (measured,
+     2026-07-18, this M1 Pro): a per-frame op=vad RPC through the inference
+     server round-tripped 0.98 ms median idle — realtime-safe alone — but 131 ms
+     MEDIAN (p99 158 ms) under a concurrent op=embed load (GIL + backend locks),
+     4x over the ~32 ms frame budget; the learned VAD would have degraded to the
+     RMS fallback exactly when the machine was busy. The in-process port has
+     deterministic sub-ms latency and no server coupling, at the cost of the ANE
+     for the VAD (the GPU-freeing "tiny aux model" goal is still met — the VAD
+     never touches the MLX GPU).
 
 WHY: the RMS energy gate calls any 30 ms frame louder than a fixed threshold
 "speech". Loud non-speech — a fan, a keyboard, music, a slammed door — sails
@@ -106,6 +118,32 @@ DEFAULT_THRESHOLD = 0.5
 
 # Compiled-model artifact name under the per-model cache dir.
 _MODEL_NAME = "vad.mlpackage"
+
+# ---- NATIVE WEIGHTS EXPORT (the daemon's in-process Rust port) ---------------
+# The daemon runs this SAME elementary-op Silero core IN-PROCESS on its realtime
+# audio thread (daemon/src/silero.rs) instead of calling Core ML over IPC. That
+# is a MEASURED transport decision: an op=vad RPC to the inference server round-
+# tripped 0.98 ms idle but 131 ms MEDIAN under a concurrent op=embed load (GIL +
+# backend locks), 4x over the ~32 ms frame budget — an in-process port has
+# deterministic latency and no server coupling, at the cost of the ANE (the
+# Core ML package above stays the ANE-eligible variant + the committed eval's
+# subject). `export_native_weights` writes the raw fp32 tensors in the FIXED
+# order below; daemon/src/silero.rs mirrors this order EXACTLY (lockstep).
+NATIVE_WEIGHTS_NAME = "silero_vad_v5_f32.bin"
+NATIVE_WEIGHTS_MAGIC = b"DVADRS1\n"
+# (name, shape) in file order — flattened C-order fp32 LE, each prefixed by a
+# u32 LE element count. Architecture constants (kernel 3 / pad 1 / strides
+# 1,2,2,1 / STFT stride 128 / reflect-pad (0,64)) live in code on both sides.
+NATIVE_TENSORS = (
+    ("stft_basis", (258, 1, 256)),
+    ("enc0_w", (128, 129, 3)), ("enc0_b", (128,)),
+    ("enc1_w", (64, 128, 3)), ("enc1_b", (64,)),
+    ("enc2_w", (64, 64, 3)), ("enc2_b", (64,)),
+    ("enc3_w", (128, 64, 3)), ("enc3_b", (128,)),
+    ("lstm_wih", (512, 128)), ("lstm_whh", (512, 128)),
+    ("lstm_bih", (512,)), ("lstm_bhh", (512,)),
+    ("dec_w", (1, 128, 1)), ("dec_b", (1,)),
+)
 
 
 def hf_cache_root():
@@ -480,6 +518,122 @@ class CoreMLVAD:
         return probs
 
 
+def _load_silero_inner():
+    """Load the bundled Silero VAD TorchScript and return its pure 16 kHz
+    per-chunk core (`_model`). Needs torch + silero_vad (lazy)."""
+    import torch
+    from silero_vad import load_silero_vad
+
+    torch.set_num_threads(1)
+    top = load_silero_vad(onnx=False)
+    return top._model if hasattr(top, "_model") else top
+
+
+def _native_tensor_values(inner):
+    """Extract the NATIVE_TENSORS values (numpy float32, C-order) from the
+    Silero inner model, in file order. Shapes are VALIDATED against the
+    NATIVE_TENSORS contract so an upstream model change can never silently
+    export a file the Rust loader would misparse."""
+    import numpy as np
+
+    enc = {name: mod for name, mod in inner.encoder.named_children()}
+    rnn = dict(inner.decoder.rnn.named_parameters())
+    dec = dict(inner.decoder.decoder.named_parameters())
+    raw = {
+        "stft_basis": inner.stft.forward_basis_buffer,
+        "enc0_w": enc["0"].reparam_conv.weight, "enc0_b": enc["0"].reparam_conv.bias,
+        "enc1_w": enc["1"].reparam_conv.weight, "enc1_b": enc["1"].reparam_conv.bias,
+        "enc2_w": enc["2"].reparam_conv.weight, "enc2_b": enc["2"].reparam_conv.bias,
+        "enc3_w": enc["3"].reparam_conv.weight, "enc3_b": enc["3"].reparam_conv.bias,
+        "lstm_wih": rnn["weight_ih"], "lstm_whh": rnn["weight_hh"],
+        "lstm_bih": rnn["bias_ih"], "lstm_bhh": rnn["bias_hh"],
+        "dec_w": dec["2.weight"], "dec_b": dec["2.bias"],
+    }
+    out = []
+    for name, shape in NATIVE_TENSORS:
+        arr = np.ascontiguousarray(
+            raw[name].detach().cpu().numpy(), dtype=np.float32
+        )
+        if arr.shape != shape:
+            raise ValueError(
+                f"native export: tensor {name} has shape {arr.shape}, "
+                f"expected {shape} (upstream silero-vad changed?)"
+            )
+        out.append(arr.reshape(-1))
+    return out
+
+
+def native_weights_valid(path):
+    """PURE-ish (stat + one read): does `path` hold a structurally-valid native
+    weights file (magic + exact per-tensor lengths + exact total size)? Used to
+    make the export idempotent and to reject a truncated/partial file."""
+    import struct
+
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError:
+        return False
+    if not data.startswith(NATIVE_WEIGHTS_MAGIC):
+        return False
+    off = len(NATIVE_WEIGHTS_MAGIC)
+    if len(data) < off + 4:
+        return False
+    (count,) = struct.unpack_from("<I", data, off)
+    off += 4
+    if count != len(NATIVE_TENSORS):
+        return False
+    for _name, shape in NATIVE_TENSORS:
+        n = int(np.prod(shape))
+        if len(data) < off + 4:
+            return False
+        (stored,) = struct.unpack_from("<I", data, off)
+        off += 4
+        if stored != n:
+            return False
+        off += 4 * n
+        if len(data) < off:
+            return False
+    return len(data) == off
+
+
+def export_native_weights(dest, force=False):
+    """Export the Silero core's raw fp32 weights to `dest` for the daemon's
+    in-process Rust port (daemon/src/silero.rs — the file order/shape contract is
+    NATIVE_TENSORS). Idempotent: an existing STRUCTURALLY-VALID file is kept
+    (returns False) unless `force`. ATOMIC: written to a temp file in the same
+    directory then os.replace'd, so the daemon can never load a half-written
+    file (it also validates magic + sizes on its side). Returns True when a new
+    file was written. Needs torch + silero_vad (heavy, one-time); raises on any
+    failure (the caller logs and the daemon stays on its RMS gate, surfaced)."""
+    import struct
+
+    dest = os.fspath(dest)
+    if not force and native_weights_valid(dest):
+        return False
+    values = _native_tensor_values(_load_silero_inner())
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(
+        prefix=".export-", suffix=".bin", dir=os.path.dirname(dest)
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(NATIVE_WEIGHTS_MAGIC)
+            f.write(struct.pack("<I", len(values)))
+            for flat in values:
+                f.write(struct.pack("<I", flat.shape[0]))
+                f.write(flat.astype("<f4").tobytes())
+        os.replace(tmp, dest)
+        tmp = None
+    finally:
+        if tmp is not None:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    return True
+
+
 class StreamingVAD:
     """Stateful per-chunk streaming wrapper over `CoreMLVAD`: feed 512-sample
     (32 ms @ 16 kHz) chunks, get a speech probability per chunk, with the
@@ -565,4 +719,14 @@ def _smoke():
 
 
 if __name__ == "__main__":
-    _smoke()
+    import sys
+
+    if "--export-native" in sys.argv[1:]:
+        # Manual native-weights export (the server's preload does this
+        # automatically): .venv/bin/python inference/coreml_vad.py --export-native [dest]
+        args = [a for a in sys.argv[1:] if not a.startswith("--")]
+        dest = args[0] if args else os.path.join("state", "models", NATIVE_WEIGHTS_NAME)
+        wrote = export_native_weights(dest, force="--force" in sys.argv[1:])
+        print(f"{'exported' if wrote else 'already valid'}: {dest}")
+    else:
+        _smoke()

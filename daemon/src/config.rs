@@ -1228,15 +1228,21 @@ pub struct AudioConfig {
     /// was that sound" intent on an already-captured clip works regardless.
     pub sound_monitor: bool,
     /// Per-frame VAD backend that decides speech vs silence in the capture loop:
-    /// "rms" (the RMS energy gate — shipped default) or "coreml-silero" (the
-    /// learned Core ML Silero VAD, `inference/coreml_vad.py`). The learned backend
-    /// MEASURABLY beats the RMS gate on false-accepts (loud non-speech; see
-    /// `inference/benchmarks/vad_eval/`), but its inference runs as a Core ML model
-    /// and the daemon has NO in-process Core ML runtime — so selecting
-    /// "coreml-silero" today resolves to the RMS gate with a SURFACED reason
-    /// (warn + telemetry), never a silent no-op. Parsed via [`crate::vad::VadMode`];
-    /// an unknown value is the safe "rms" default. The `min_speech_ms`/`silence_ms`
-    /// debounce is identical for both backends.
+    /// "silero" (the learned Silero VAD — SHIPS as the default) or "rms" (the
+    /// classic RMS energy gate, the explicit opt-out). The learned backend runs
+    /// IN-PROCESS on the audio processing thread (a pure-Rust port of the Silero
+    /// v5 core, `crate::silero` — sub-millisecond per frame, no IPC; the
+    /// RPC-per-frame transport was MEASURED unsafe under load and rejected, see
+    /// silero.rs) and MEASURABLY beats the RMS gate on false-accepts (loud
+    /// non-speech 0.833 -> 0.0; `inference/benchmarks/vad_eval/`). ARMED BUT
+    /// HONEST: its weights file (state/models/, exported by the inference
+    /// server's preload) may not exist yet on a fresh install — until it does the
+    /// capture loop runs the RMS gate and SAYS SO (warn + vad.backend_fallback
+    /// telemetry, retrying; vad.backend_live announces the flip). Parsed via
+    /// [`crate::vad::VadMode`]; an unknown value keeps the LEARNED default (a
+    /// typo never silently disarms it — the sound_monitor precedent), and the
+    /// historical "coreml-silero" alias still selects the learned backend. The
+    /// `min_speech_ms`/`silence_ms` debounce is identical for both.
     pub vad: String,
 }
 
@@ -1256,10 +1262,11 @@ impl Default for AudioConfig {
             // and it is DISTINCT from STT. The one-shot "what was that sound"
             // intent works regardless of this switch.
             sound_monitor: true,
-            // The RMS energy gate — the shipped default. "coreml-silero" selects
-            // the learned Core ML VAD; it is armed but INERT WITHOUT an in-process
-            // Core ML runtime (resolves to RMS with a surfaced reason today).
-            vad: "rms".to_string(),
+            // The learned in-process Silero VAD — the shipped (full-power)
+            // default; it measurably beats the RMS gate (vad_eval). HONEST
+            // fallback: until its weights file exists the capture loop runs the
+            // RMS gate, surfaced. "rms" is the explicit opt-out.
+            vad: "silero".to_string(),
         }
     }
 }
@@ -6412,39 +6419,60 @@ mod tests {
     }
 
     /// Contract lockstep: [audio].vad selects the per-frame VAD backend and SHIPS
-    /// "rms" (the RMS energy gate — today's byte-for-byte behavior). "coreml-silero"
-    /// selects the learned Core ML Silero VAD (measured to beat the RMS gate on
-    /// false-accepts; see inference/benchmarks/vad_eval/), but it is armed-but-inert
-    /// without an in-process Core ML runtime and RESOLVES to RMS with a surfaced
-    /// reason (crate::vad::resolve_backend). The key is known; a typo is diagnosed.
+    /// "silero" — the learned in-process Silero VAD (full-power default; it
+    /// measurably beats the RMS gate on false-accepts, see
+    /// inference/benchmarks/vad_eval/), with an HONEST surfaced RMS fallback while
+    /// its weights file is absent. "rms" is the explicit opt-out; an unknown value
+    /// keeps the learned default (a typo never silently disarms it); the
+    /// historical "coreml-silero" alias still selects the learned backend. The key
+    /// is known; a typo'd KEY is diagnosed.
     #[test]
-    fn vad_backend_ships_rms_and_key_is_known_with_honest_coreml_resolution() {
+    fn vad_backend_ships_learned_silero_with_rms_opt_out() {
         let (cfg, issues) = Config::parse("");
         assert!(issues.is_empty());
-        assert_eq!(cfg.audio.vad, "rms", "the RMS energy gate is the shipped default");
-        // Additive: the rest of the audio contract is untouched by the new field.
+        assert_eq!(cfg.audio.vad, "silero", "the learned VAD is the shipped default");
+        assert_eq!(
+            crate::vad::VadMode::from_config_str(&cfg.audio.vad),
+            crate::vad::VadMode::Silero,
+        );
+        // Additive: the rest of the audio contract is untouched by the field.
         assert_eq!(cfg.audio.silence_ms, 350);
         assert_eq!(cfg.audio.min_speech_ms, 250);
         assert!(cfg.audio.sound_monitor);
 
-        // Selecting the learned backend is a KNOWN key (no unknown-key diagnostic)
-        // and parses through to VadMode; today it resolves to RMS with a reason.
-        let (cfg, issues) = Config::parse("[audio]\nvad = \"coreml-silero\"\n");
+        // The explicit opt-out is a KNOWN key value and round-trips to Rms.
+        let (cfg, issues) = Config::parse("[audio]\nvad = \"rms\"\n");
         assert!(issues.is_empty(), "vad must be a known key: {issues:?}");
-        assert_eq!(cfg.audio.vad, "coreml-silero");
-        let mode = crate::vad::VadMode::from_config_str(&cfg.audio.vad);
-        assert_eq!(mode, crate::vad::VadMode::CoremlSilero);
-        let resolved = crate::vad::resolve_backend(mode);
-        assert_eq!(resolved.active, crate::vad::VadMode::Rms, "no in-process runtime -> RMS");
-        assert!(resolved.fallback_reason.is_some(), "the fallback must be surfaced");
+        assert_eq!(
+            crate::vad::VadMode::from_config_str(&cfg.audio.vad),
+            crate::vad::VadMode::Rms,
+            "the operator can deliberately opt out to the RMS gate"
+        );
 
-        // A typo'd key is diagnosed, not silently swallowed.
-        let (cfg, issues) = Config::parse("[audio]\nvadd = \"coreml-silero\"\n");
+        // The historical alias keeps selecting the learned backend.
+        let (cfg, issues) = Config::parse("[audio]\nvad = \"coreml-silero\"\n");
+        assert!(issues.is_empty());
+        assert_eq!(
+            crate::vad::VadMode::from_config_str(&cfg.audio.vad),
+            crate::vad::VadMode::Silero,
+        );
+
+        // An unknown VALUE keeps the learned default (never a silent disarm)...
+        let (cfg, issues) = Config::parse("[audio]\nvad = \"rmz\"\n");
+        assert!(issues.is_empty(), "unknown value is not an unknown key");
+        assert_eq!(
+            crate::vad::VadMode::from_config_str(&cfg.audio.vad),
+            crate::vad::VadMode::Silero,
+            "a typo'd opt-out never silently disarms the learned VAD"
+        );
+
+        // ...and a typo'd KEY is diagnosed, not silently swallowed.
+        let (cfg, issues) = Config::parse("[audio]\nvadd = \"rms\"\n");
         assert!(
             issues.iter().any(|i| i.contains("audio.vadd")),
             "typo'd vad key must be reported: {issues:?}"
         );
-        assert_eq!(cfg.audio.vad, "rms", "a typo'd override never leaves the default");
+        assert_eq!(cfg.audio.vad, "silero", "a typo'd key never changes the default");
     }
 
     /// Contract lockstep: [voice] (the ElevenLabs cloud voice tier) SHIPS ON

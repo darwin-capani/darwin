@@ -115,7 +115,21 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
     }
 
     let tmp_dir = root.join("state").join("tmp");
-    let mut vad = Vad::new(&cfg, sample_rate);
+    // The LEARNED VAD (shipped default): the in-process Silero port, running on
+    // THIS processing thread (never the CoreAudio realtime callback — that only
+    // ever does raw_tx.send). Its weights are exported by the inference server's
+    // preload into state/models/; until they exist LearnedVad surfaces the RMS
+    // fallback and retries. [audio].vad = "rms" is the explicit opt-out.
+    let live = match crate::vad::VadMode::from_config_str(&cfg.audio.vad) {
+        crate::vad::VadMode::Silero => Some(crate::vad::LearnedVad::new(
+            root.join("state")
+                .join("models")
+                .join(crate::vad::NATIVE_WEIGHTS_NAME),
+            sample_rate,
+        )),
+        crate::vad::VadMode::Rms => None,
+    };
+    let mut vad = Vad::new(&cfg, sample_rate, live);
     let mut barge = BargeDetector::new(&cfg, sample_rate);
     let mut meter = LevelMeter::new();
     // Barge-in tuning aid: rate-limited log of the mic level DURING playback, so
@@ -594,45 +608,46 @@ fn write_wav(path: &std::path::Path, sample_rate: u32, samples: &[f32]) -> Resul
 /// Frame-level VAD over ~30ms frames. Speech begins once the per-frame VOICED
 /// verdict stays true for min_speech_ms (the run-up is buffered so the segment
 /// keeps its onset); it ends after silence_ms of not-voiced. The verdict source
-/// is the resolved [`crate::vad::VadMode`] backend: today that is always the RMS
-/// energy gate (`rms > threshold`) — the learned "coreml-silero" backend is
-/// selectable but has no in-process Core ML runtime to execute it in this
-/// realtime loop, so it resolves to the RMS gate with a SURFACED reason (see
-/// `Vad::new`). When an in-process Core ML runtime lands, only the per-frame
-/// verdict (`Vad::step`'s `rms > threshold`) changes to `prob > threshold`; the
-/// min_speech/silence debounce is already backend-agnostic (see `crate::vad`).
+/// is the configured [`crate::vad::VadMode`] backend:
+///
+///   * `"silero"` (the shipped default): the LEARNED verdict from the in-process
+///     Silero port ([`crate::vad::LearnedVad`] -> `silero.rs`), running RIGHT
+///     HERE on the processing thread — pure math, sub-millisecond, no IPC (the
+///     RPC transport was measured unsafe under load; see `silero.rs`). While its
+///     weights file is not yet available the per-frame verdict HONESTLY falls
+///     back to the RMS gate (surfaced by `LearnedVad`, never silent).
+///   * `"rms"`: the classic energy gate (`rms > threshold`), the explicit
+///     opt-out.
+///
+/// Only the per-frame verdict differs; the min_speech/silence debounce is the
+/// SHARED `crate::vad::SpeechDebounce` seam either way.
 struct Vad {
     threshold: f32,
     frame_len: usize,
     max_segment_samples: usize,
     frame: Vec<f32>,
     /// The onset/offset debounce state machine — the SHARED pure decision seam
-    /// (`crate::vad::SpeechDebounce`) the learned VAD also drives. It is fed the
-    /// per-frame voiced verdict (`rms > threshold` today); the sample buffering
-    /// (`pending`/`segment`) stays here.
+    /// (`crate::vad::SpeechDebounce`) both verdict sources drive. The sample
+    /// buffering (`pending`/`segment`) stays here.
     debounce: crate::vad::SpeechDebounce,
+    /// The live learned-VAD verdict source (`None` = the RMS opt-out). Runs
+    /// in-process on THIS thread; per-frame `None` answers (weights not yet
+    /// exported) fall back to the RMS verdict for that frame.
+    live: Option<crate::vad::LearnedVad>,
     pending: Vec<f32>,
     segment: Vec<f32>,
     counter: u64,
 }
 
 impl Vad {
-    fn new(cfg: &Config, sample_rate: u32) -> Self {
-        // Resolve the configured VAD backend against what can run in-process. The
-        // learned Core ML VAD is armed but inert without an in-process Core ML
-        // runtime, so `coreml-silero` resolves to the RMS gate here — surfaced via
-        // warn + telemetry, never a silent no-op.
-        let requested = crate::vad::VadMode::from_config_str(&cfg.audio.vad);
-        let resolved = crate::vad::resolve_backend(requested);
-        if let Some(reason) = &resolved.fallback_reason {
-            warn!(requested = requested.as_str(), active = resolved.active.as_str(), "{reason}");
-            telemetry::emit(
-                "audio",
-                "vad.backend_fallback",
-                json!({"requested": requested.as_str(), "active": resolved.active.as_str(), "reason": reason}),
-            );
-        } else {
-            info!(vad = resolved.active.as_str(), "VAD backend active");
+    fn new(cfg: &Config, sample_rate: u32, live: Option<crate::vad::LearnedVad>) -> Self {
+        match &live {
+            Some(l) => info!(
+                vad = "silero",
+                live = l.is_live(),
+                "VAD backend armed: learned in-process Silero (RMS fallback until its weights load)"
+            ),
+            None => info!(vad = "rms", "VAD backend active: RMS energy gate (explicit opt-out)"),
         }
         let per_ms = sample_rate as usize / 1000;
         let frame_len = (per_ms * FRAME_MS as usize).max(1);
@@ -651,6 +666,7 @@ impl Vad {
             max_segment_samples: (sample_rate as usize * MAX_SEGMENT_SECS).max(1),
             frame: Vec::new(),
             debounce: crate::vad::SpeechDebounce::new(min_speech_frames, silence_frames),
+            live,
             pending: Vec::new(),
             segment: Vec::new(),
             counter: 0,
@@ -669,11 +685,13 @@ impl Vad {
     }
 
     fn step(&mut self, rms: f32, frame: Vec<f32>) -> Option<Vec<f32>> {
-        // The per-frame VOICED verdict. Today the resolved backend is always the
-        // RMS energy gate; a live Core ML backend would substitute
-        // `crate::vad::prob_is_voiced(prob, threshold)` here with ZERO change to
-        // the debounce below (that is the point of the shared seam).
-        let voiced = rms > self.threshold;
+        // The per-frame VOICED verdict — the ONE line where the backends differ.
+        // The learned path (in-process Silero on THIS thread, sub-ms) answers
+        // Some(voiced); a None (RMS opt-out, or the learned weights not yet
+        // available — surfaced by LearnedVad) falls back to the RMS gate FOR
+        // THIS FRAME. The debounce below is identical either way.
+        let learned = self.live.as_mut().and_then(|l| l.push_frame(&frame));
+        let voiced = learned.unwrap_or(rms > self.threshold);
         let was_in_speech = self.debounce.in_speech();
         // Buffer the run-up while not yet in speech, so a segment keeps its onset
         // (the old `pending`): the frame that finally crosses `min_speech` is
@@ -738,6 +756,11 @@ impl Vad {
         self.pending.clear();
         self.segment.clear();
         self.debounce.reset();
+        if let Some(l) = self.live.as_mut() {
+            // The learned stream restarts too (resampler/chunker/recurrence),
+            // so DARWIN's own speech can never linger in the model's memory.
+            l.reset();
+        }
     }
 }
 
@@ -1008,7 +1031,7 @@ mod tests {
     fn vad_segments_a_voiced_run_between_silences() {
         let sr = 16_000u32;
         let cfg = Config::default(); // rms_threshold 0.015, min_speech 250ms, silence 350ms
-        let mut vad = Vad::new(&cfg, sr);
+        let mut vad = Vad::new(&cfg, sr, None);
         let frame = (sr / 1000 * super::FRAME_MS as u32) as usize; // 480 samples/frame
         // Build a 0.1-amplitude sine (rms ~0.071, well above the 0.015 gate).
         let voiced_frame: Vec<f32> = (0..frame)
@@ -1017,7 +1040,7 @@ mod tests {
         let silent_frame = vec![0.0f32; frame];
 
         let mut segments = Vec::new();
-        let mut feed = |vad: &mut Vad, f: &[f32], segs: &mut Vec<Vec<f32>>| {
+        let feed = |vad: &mut Vad, f: &[f32], segs: &mut Vec<Vec<f32>>| {
             for &s in f {
                 if let Some(seg) = vad.push(s) {
                     segs.push(seg);
@@ -1046,6 +1069,146 @@ mod tests {
         let min_speech_samples = (sr as usize / 1000) * cfg.audio.min_speech_ms as usize;
         assert!(seg.len() >= min_speech_samples, "segment keeps its onset run-up");
         assert!(seg.len() <= 30 * frame, "segment is bounded, not runaway");
+    }
+
+    /// The LEARNED verdict is load-bearing inside `Vad`: with a live LearnedVad
+    /// whose (synthetic) model rejects everything, a LOUD stream that the RMS
+    /// gate would happily segment (the measured false-accept failure mode)
+    /// produces NO segment — while the identical stream through the RMS opt-out
+    /// (`live: None`) does. Headless: the synthetic weights collapse the real
+    /// Silero forward pass to a constant not-voiced verdict.
+    #[test]
+    fn vad_learned_verdict_overrides_the_rms_gate() {
+        let sr = 16_000u32;
+        let cfg = Config::default();
+        let frame = (sr / 1000 * super::FRAME_MS as u32) as usize;
+        // A loud 200 Hz tone (rms ~0.35): far above rms_threshold 0.015.
+        let loud: Vec<f32> = (0..frame * 20)
+            .map(|n| 0.5 * (2.0 * std::f32::consts::PI * 200.0 * n as f32 / sr as f32).sin())
+            .collect();
+        let silence = vec![0.0f32; frame * 20];
+
+        let run = |mut vad: Vad| -> usize {
+            let mut segments = 0;
+            for &s in loud.iter().chain(silence.iter()) {
+                if vad.push(s).is_some() {
+                    segments += 1;
+                }
+            }
+            segments
+        };
+
+        // RMS opt-out: the loud non-speech IS segmented (the false accept).
+        assert_eq!(run(Vad::new(&cfg, sr, None)), 1, "RMS gate accepts loud non-speech");
+
+        // Learned path live, model says NOT voiced (dec bias -10): no segment.
+        let weights = std::env::temp_dir().join(format!(
+            "darwin-audio-vad-test-{}.bin",
+            std::process::id()
+        ));
+        std::fs::write(&weights, crate::silero::synthetic_weights(-10.0)).unwrap();
+        let lv = crate::vad::LearnedVad::new(weights.clone(), sr);
+        assert!(lv.is_live());
+        assert_eq!(
+            run(Vad::new(&cfg, sr, Some(lv))),
+            0,
+            "learned verdict rejects the loud non-speech the RMS gate accepted"
+        );
+        std::fs::remove_file(&weights).ok();
+    }
+
+    /// DEVICE-GATED end-to-end smoke: the LIVE learned VAD (real exported
+    /// weights) decides speech start/end on REAL audio through the REAL `Vad`
+    /// path, side by side with the RMS gate on the identical stream. The test
+    /// stream is [silence | speech (a macOS `say` WAV via $DARWIN_VAD_SMOKE_WAV,
+    /// else a synthetic voiced signal) | silence | loud noise (the RMS gate's
+    /// false-accept adversary) | silence]. PASS = the learned path segments the
+    /// speech and rejects the noise; the trace + realtime factor are printed.
+    /// Run once by hand:
+    ///   DARWIN_VAD_SMOKE_WAV=... cargo test --release --bin darwind \
+    ///     live_vad_end_to_end_smoke -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_vad_end_to_end_smoke() {
+        use std::path::Path;
+        let sr = 16_000u32;
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap();
+        let weights = root.join("state/models/silero_vad_v5_f32.bin");
+
+        // Speech body: the say-WAV if provided (16 kHz mono i16), else synth.
+        let speech: Vec<f32> = match std::env::var("DARWIN_VAD_SMOKE_WAV") {
+            Ok(p) => {
+                let mut r = hound::WavReader::open(&p).expect("open smoke wav");
+                assert_eq!(r.spec().sample_rate, sr, "smoke wav must be 16 kHz");
+                r.samples::<i16>()
+                    .map(|s| s.unwrap() as f32 / i16::MAX as f32)
+                    .collect()
+            }
+            Err(_) => (0..sr as usize)
+                .map(|n| {
+                    let t = n as f32 / sr as f32;
+                    (0.3 * (2.0 * std::f32::consts::PI * 140.0 * t).sin()
+                        + 0.2 * (2.0 * std::f32::consts::PI * 280.0 * t).sin())
+                        * (0.5 + 0.5 * (2.0 * std::f32::consts::PI * 4.0 * t).sin())
+                })
+                .collect(),
+        };
+        // Loud noise adversary: deterministic LCG white noise scaled to RMS 0.05
+        // (3.3x the 0.015 RMS threshold — the measured false-accept case).
+        let mut lcg: u64 = 0x2545F4914F6CDD1D;
+        let mut noise: Vec<f32> = (0..(sr as usize * 3 / 2))
+            .map(|_| {
+                lcg = lcg.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((lcg >> 33) as f32 / (u32::MAX >> 1) as f32) - 1.0
+            })
+            .collect();
+        let nr = (noise.iter().map(|s| s * s).sum::<f32>() / noise.len() as f32).sqrt();
+        for s in noise.iter_mut() {
+            *s *= 0.05 / nr;
+        }
+        let gap = vec![0.0f32; sr as usize / 2];
+        let stream: Vec<f32> = gap
+            .iter()
+            .chain(speech.iter())
+            .chain(gap.iter())
+            .chain(noise.iter())
+            .chain(gap.iter())
+            .copied()
+            .collect();
+
+        let cfg = Config::default();
+        let run = |live: Option<crate::vad::LearnedVad>, label: &str| -> usize {
+            let mut vad = Vad::new(&cfg, sr, live);
+            let mut segs: Vec<(usize, usize)> = Vec::new(); // (end sample idx, len)
+            let t0 = Instant::now();
+            for (i, &s) in stream.iter().enumerate() {
+                if let Some(seg) = vad.push(s) {
+                    segs.push((i, seg.len()));
+                }
+            }
+            let took = t0.elapsed().as_secs_f64();
+            let audio_secs = stream.len() as f64 / sr as f64;
+            println!(
+                "  [{label}] segments: {:?} (end_sample, len) | processed {audio_secs:.1}s of audio in {took:.3}s ({:.0}x realtime)",
+                segs,
+                audio_secs / took
+            );
+            segs.len()
+        };
+
+        println!("live VAD end-to-end smoke (speech {} samples, noise {} samples):", speech.len(), noise.len());
+        let lv = crate::vad::LearnedVad::new(weights, sr);
+        assert!(lv.is_live(), "real weights must load (run the export first)");
+        let learned_segs = run(Some(lv), "learned-silero");
+        let rms_segs = run(None, "rms-gate");
+        assert_eq!(
+            learned_segs, 1,
+            "learned VAD must segment the speech once and reject the noise"
+        );
+        assert!(
+            rms_segs >= 2,
+            "the RMS gate false-accepts the loud noise (that is the measured failure mode it has)"
+        );
     }
 
     fn meter_at(origin: Instant) -> LevelMeter {

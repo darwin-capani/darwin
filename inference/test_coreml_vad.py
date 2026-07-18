@@ -160,5 +160,64 @@ class GeometryConstantsTests(unittest.TestCase):
         self.assertAlmostEqual(1000.0 * cv.CHUNK / cv.SAMPLE_RATE, 32.0)
 
 
+def _fake_native_blob():
+    """A structurally-valid native weights blob (zeros) per NATIVE_TENSORS —
+    the exact byte layout daemon/src/silero.rs parses (lockstep contract)."""
+    import struct
+
+    out = [cv.NATIVE_WEIGHTS_MAGIC, struct.pack("<I", len(cv.NATIVE_TENSORS))]
+    for _name, shape in cv.NATIVE_TENSORS:
+        n = int(np.prod(shape))
+        out.append(struct.pack("<I", n))
+        out.append(b"\x00" * (4 * n))
+    return b"".join(out)
+
+
+class NativeWeightsFormatTests(unittest.TestCase):
+    """The export-file contract the daemon's Rust loader (silero.rs) depends on.
+    These run WITHOUT torch/silero_vad — pure file-format logic."""
+
+    def test_valid_blob_passes_validation(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+            f.write(_fake_native_blob())
+            f.flush()
+            self.assertTrue(cv.native_weights_valid(f.name))
+
+    def test_truncated_and_corrupt_blobs_are_rejected(self):
+        import tempfile
+
+        blob = _fake_native_blob()
+        cases = [
+            ("truncated", blob[:-10]),
+            ("bad magic", b"XXXXXXX\n" + blob[8:]),
+            ("trailing garbage", blob + b"\x00" * 8),
+            ("empty", b""),
+        ]
+        for name, data in cases:
+            with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+                f.write(data)
+                f.flush()
+                self.assertFalse(cv.native_weights_valid(f.name), name)
+
+    def test_missing_file_is_invalid(self):
+        self.assertFalse(cv.native_weights_valid("/nonexistent/vad/weights.bin"))
+
+    def test_tensor_table_matches_the_documented_geometry(self):
+        # The lockstep numbers silero.rs mirrors: total parameter count and the
+        # LSTM/STFT dimensions the architecture fixes.
+        sizes = {name: int(np.prod(shape)) for name, shape in cv.NATIVE_TENSORS}
+        self.assertEqual(sizes["stft_basis"], 258 * 256)
+        self.assertEqual(sizes["lstm_wih"], 4 * 128 * 128)
+        self.assertEqual(sizes["lstm_bih"], 4 * 128)
+        self.assertEqual(sizes["dec_w"], 128)
+        self.assertEqual(sizes["dec_b"], 1)
+        total = sum(sizes.values())
+        # 309,633 fp32 values -> the exported file is exactly 1,238,604 bytes
+        # (8 magic + 4 count + 15*4 length prefixes + 4*total data).
+        self.assertEqual(total, 309_633, "total fp32 parameter count is pinned")
+
+
 if __name__ == "__main__":
     unittest.main()

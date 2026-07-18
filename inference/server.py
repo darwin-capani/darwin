@@ -3232,6 +3232,35 @@ class InferenceEngine:
                     "preload: Core ML embedder warm failed; op=embed will fall "
                     "back to the mean-pool path",
                 )
+        # LEARNED VAD native weights (inference/coreml_vad.py, task: replace the
+        # RMS-gate VAD). The daemon runs the learned Silero VAD IN-PROCESS on its
+        # realtime audio thread (daemon/src/silero.rs) — an RPC-per-frame design
+        # was MEASURED unsafe: op=vad round-trips were 0.98ms idle but 131ms
+        # median under a concurrent op=embed load on this server (GIL + backend
+        # locks), 4x over the daemon's ~32ms frame budget — so the daemon loads
+        # the raw weights and never depends on this server at capture time. This
+        # preload step EXPORTS those weights (atomic, idempotent) to
+        # state/models/, where the daemon picks them up (it retries while the
+        # file is absent and carries capture on its RMS gate until then,
+        # surfaced). Failure is non-fatal: the daemon simply stays on the RMS
+        # gate and says so.
+        try:
+            from coreml_vad import NATIVE_WEIGHTS_NAME, export_native_weights
+
+            t0 = time.perf_counter()
+            dest = PROJECT_ROOT / "state" / "models" / NATIVE_WEIGHTS_NAME
+            if export_native_weights(dest):
+                log.info(
+                    "preload: learned-VAD native weights exported to %s (%.1fs)",
+                    dest, time.perf_counter() - t0,
+                )
+            else:
+                log.info("preload: learned-VAD native weights already present at %s", dest)
+        except Exception:
+            log.exception(
+                "preload: learned-VAD native weights export failed; the daemon "
+                "stays on the RMS gate (surfaced daemon-side) until an export succeeds",
+            )
         try:
             t0 = time.perf_counter()
             with self._lock:
@@ -3959,6 +3988,7 @@ class InferenceEngine:
             emb = self._coreml_embedder
         emb.ensure_loaded()  # convert-on-first-use / load (own lock); may raise
         return emb
+
 
     def _embed_4b(self, texts):
         """The LEGACY op=embed backend: one L2-normalized VECTOR per input,

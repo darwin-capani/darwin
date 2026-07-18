@@ -354,6 +354,7 @@ mod selfcheck;
 mod sfx_cue;
 mod shell;
 mod signals;
+mod silero;
 mod simulate;
 mod skills;
 // SAFETY SNAPSHOT (snapshot.rs): before a consequential, hard-to-reverse step (a
