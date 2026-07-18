@@ -29,6 +29,19 @@
 //!   * HONEST: a search returns ONLY chunks that were really indexed (the snippet
 //!     is the stored chunk text, the citation is its real file + offset). An empty
 //!     index or a no-match query returns NOTHING — never a fabricated citation.
+//!   * ONE VECTOR SPACE: the inference server has TWO embedding backends in
+//!     DIFFERENT vector spaces (the Core ML bge sentence embedder, 384-dim, and
+//!     the legacy 4B mean-pool path, 2560-dim — selected by `[inference].embedder`),
+//!     and cosine between vectors from different spaces is MEANINGLESS. Because
+//!     this store PERSISTS vectors, it is STAMPED with the id of the embedder
+//!     that produced them (the `doc_meta` "embedder" row): search REFUSES to
+//!     rank neurally when the active embedder differs from the stamp (it
+//!     degrades to lexical BM25 and surfaces `reindex_needed`), absorption
+//!     REFUSES to mix spaces (a mismatched batch inserts nothing), and only a
+//!     full REINDEX — which clears, re-embeds, and re-stamps — moves the store
+//!     to a new space. An old store with vectors but no stamp is keyed to the
+//!     legacy id on first open ([`EMBEDDER_ID_LEGACY`]: the only embedder that
+//!     ever existed before the stamp).
 //!   * ON by default but INERT WITHOUT ROOTS: gated by `[docsearch].enabled` (ships
 //!     true) AND a non-empty `roots` (ships empty). The daemon checks both before ever
 //!     indexing, so even enabled it indexes NOTHING until a folder is allowlisted.
@@ -58,7 +71,9 @@ use anyhow::{Context, Result};
 use rusqlite::{params, Connection};
 use tokio::sync::Mutex;
 
-use crate::recall::{cosine_similarity, Bm25Params, Embedder, Fact, LexicalProvider, RankMethod};
+use crate::recall::{
+    cosine_similarity, Bm25Params, EmbeddedBatch, Embedder, Fact, LexicalProvider, RankMethod,
+};
 
 /// The TEXT-LIKE extension allowlist (lowercased, no dot): prose/notes + common
 /// source/config formats whose bytes ARE the text (read directly, no extractor).
@@ -93,6 +108,145 @@ pub const DOCSEARCH_MAX_K: usize = 20;
 /// How many characters of a chunk are returned as the citation SNIPPET (the full
 /// chunk is stored; the snippet is a bounded preview for display).
 const SNIPPET_CHARS: usize = 280;
+
+// ---------------------------------------------------------------------------
+// VECTOR-SPACE identity — one embedder per store, cross-space cosine refused
+// ---------------------------------------------------------------------------
+
+/// The stable id of the server's Core ML bge sentence-embedder backend
+/// (384-dim). MUST equal inference/server.py's `EMBEDDER_COREML`: it is the id
+/// the op=embed response reports and the id stamped into `doc_meta` when this
+/// backend produced the stored vectors.
+// The guard itself never needs this id by name (it compares whatever ids the
+// wire reports); the const pins the exact server string in the unit tests.
+#[allow(dead_code)]
+pub const EMBEDDER_ID_COREML: &str = "coreml-bge-small-en-v1.5";
+
+/// The stable id of the server's legacy 4B mean-pool backend (2560-dim). MUST
+/// equal inference/server.py's `EMBEDDER_LLM_MEANPOOL`. ALSO the id this module
+/// assumes for (a) an embed response with NO `embedder` metadata and (b) an
+/// existing store with vectors but NO `doc_meta` stamp: the space metadata and
+/// the Core ML backend shipped TOGETHER, so anything that predates one predates
+/// both — and the 4B mean-pool path is the ONLY embedder that ever existed
+/// before them. The assumption is therefore exact, not a guess.
+pub const EMBEDDER_ID_LEGACY: &str = "llm-qwen3-4b-meanpool";
+
+/// The `doc_meta` key under which the store's vector-space stamp lives.
+const META_EMBEDDER_KEY: &str = "embedder";
+
+/// The vector-space id of one embed batch: the server-reported embedder id, or
+/// — when the response predates the space metadata — [`EMBEDDER_ID_LEGACY`]
+/// (the only backend a metadata-less server can be; see that const).
+fn batch_space(batch: &EmbeddedBatch) -> String {
+    batch
+        .embedder
+        .clone()
+        .unwrap_or_else(|| EMBEDDER_ID_LEGACY.to_string())
+}
+
+/// Read the store's raw vector-space stamp (`doc_meta["embedder"]`), or `None`
+/// when the store is unstamped.
+fn read_embedder_tag(conn: &Connection) -> Option<String> {
+    conn.query_row(
+        "SELECT value FROM doc_meta WHERE key = ?1",
+        params![META_EMBEDDER_KEY],
+        |r| r.get(0),
+    )
+    .ok()
+}
+
+/// Stamp (upsert) the store's ONE vector-space id.
+fn write_embedder_tag(conn: &Connection, id: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO doc_meta(key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![META_EMBEDDER_KEY, id],
+    )?;
+    Ok(())
+}
+
+/// The store's RESOLVED vector space: the stamp when present; else — for a
+/// store that HAS vectors but no stamp — [`EMBEDDER_ID_LEGACY`] (the only
+/// embedder that predates the stamp; see that const); else `None` (a store
+/// with no vectors lives in no space at all). The open-time migration in
+/// [`DocIndex::init_conn`] materializes the untagged-with-vectors case into a
+/// real stamp, so post-open this only resolves to the legacy id for vectors
+/// written by an even older concurrent process — the rule stays identical
+/// either way.
+fn resolve_store_space(conn: &Connection) -> Result<Option<String>> {
+    if let Some(tag) = read_embedder_tag(conn) {
+        return Ok(Some(tag));
+    }
+    let has_vectors: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM doc_chunks WHERE vector IS NOT NULL)",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(has_vectors.then(|| EMBEDDER_ID_LEGACY.to_string()))
+}
+
+/// The MOST RECENT vector-space observation this process made, feeding the
+/// `docsearch.status` payload (which is emitted from main.rs's audit-snapshot
+/// task, where no `DocIndex` handle exists — same process-local pattern as
+/// spotlight's most-recent-query availability). `store_embedder` is the store's
+/// resolved space as of that observation (`None` for a vector-less store);
+/// `reindex_needed` is true iff the observation was a MISMATCH (the store's
+/// vectors were produced by a different embedder than the active one).
+struct SpaceObservation {
+    store_embedder: Option<String>,
+    reindex_needed: bool,
+}
+
+/// `None` until the first operation of THIS process that OBSERVES the store's
+/// space: a reindex (embedded or vector-less), a forget, an absorption that
+/// landed rows or was REFUSED for a space mismatch (a zero-row budget stop
+/// proves nothing about the space and records nothing), or a fully-embedded
+/// search whose query embed answered.
+static SPACE_OBSERVATION: std::sync::Mutex<Option<SpaceObservation>> = std::sync::Mutex::new(None);
+
+/// Record a space observation (overwrites the previous one — the status payload
+/// reports the LATEST verdict, never a stale sticky one).
+fn record_space_observation(store_embedder: Option<&str>, reindex_needed: bool) {
+    if let Ok(mut slot) = SPACE_OBSERVATION.lock() {
+        *slot = Some(SpaceObservation {
+            store_embedder: store_embedder.map(str::to_string),
+            reindex_needed,
+        });
+    }
+}
+
+/// The latest observation for the status payload: `(store_embedder,
+/// reindex_needed)`, defaulting to `(None, false)` before any observation (a
+/// process that has not touched the store claims nothing and raises no flag).
+fn current_space_observation() -> (Option<String>, bool) {
+    match SPACE_OBSERVATION.lock() {
+        Ok(slot) => slot
+            .as_ref()
+            .map(|o| (o.store_embedder.clone(), o.reindex_needed))
+            .unwrap_or((None, false)),
+        Err(_) => (None, false),
+    }
+}
+
+/// Warn ONCE per process that a vector-space mismatch was detected and neural
+/// ranking is suspended (mirrors [`warn_missing_jail_once`]). The condition is
+/// also surfaced persistently: `reindex_needed` rides every `docsearch.status`
+/// tick and the search result itself, so the once-only log never hides it.
+fn warn_space_mismatch_once(store: &str, active: &str) {
+    use std::sync::Once;
+    static WARNED: Once = Once::new();
+    WARNED.call_once(|| {
+        tracing::warn!(
+            target: "docsearch",
+            store_embedder = store,
+            active_embedder = active,
+            "vector-space mismatch: the stored index vectors were produced by a \
+             different embedder than the active one, so neural ranking is suspended \
+             (cosine across embedding spaces is meaningless) and search degrades to \
+             lexical BM25 until a reindex rebuilds the store under the active embedder"
+        );
+    });
+}
 
 // ---------------------------------------------------------------------------
 // Bounds — the finite ceilings on a walk/index, mirrored from [docsearch] config
@@ -630,19 +784,28 @@ pub fn pdfjail_available() -> bool {
 }
 
 /// Build the `docsearch.status` telemetry payload. Pure + total so the exact wire
-/// shape the HUD's `parsePdfJailAvailable` / `parseSpotlightAvailable` read is
+/// shape the HUD's `parsePdfJailAvailable` / `parseSpotlightAvailable` /
+/// `parseDocSearchEmbedder` / `parseDocSearchReindexNeeded` read is
 /// unit-tested without touching the telemetry bus (mirrors `policy::snapshot_payload`).
-fn status_payload(pdfjail_available: bool, spotlight_available: bool) -> serde_json::Value {
+fn status_payload(
+    pdfjail_available: bool,
+    spotlight_available: bool,
+    embedder: Option<&str>,
+    reindex_needed: bool,
+) -> serde_json::Value {
     serde_json::json!({
         "pdfjail_available": pdfjail_available,
         "spotlight_available": spotlight_available,
+        "embedder": embedder,
+        "reindex_needed": reindex_needed,
     })
 }
 
 /// Emit the ambient document-extraction guard status as `docsearch.status`
 /// telemetry for the HUD's DocSearchPanel (system channel, on the audit-snapshot
 /// cadence — see `audit_snapshot_task` in main.rs). READ-ONLY and SECRET-FREE
-/// (two booleans): whether THIS process finds the pdfjail helper next to its
+/// (two booleans + the index's vector-space legs): whether THIS process finds
+/// the pdfjail helper next to its
 /// executable, i.e. whether PDF extraction runs memory-jailed or on the weaker
 /// in-process fallback guard ([`pdf_text_in_process`]'s documented residuals) —
 /// and whether the READ-ONLY Spotlight candidate generator is actually answering
@@ -653,13 +816,29 @@ fn status_payload(pdfjail_available: bool, spotlight_available: bool) -> serde_j
 /// real query succeeded; honest false when docsearch is disabled/rootless, the
 /// flag is off, Spotlight indexing is disabled, or the last attempt failed).
 /// One `stat()` (each) per tick.
+///
+/// The VECTOR-SPACE legs carry this process's MOST RECENT space observation
+/// ([`SPACE_OBSERVATION`], same most-recent-attempt honesty as the Spotlight
+/// leg): `embedder` is the store's resolved space stamp as of the latest
+/// space-observing operation (a reindex, a forget, an absorption that landed
+/// rows or was refused for a space mismatch, or a fully-embedded search whose
+/// query embed answered) — null before any
+/// such operation this process, and null when the store has no vectors (no
+/// space); `reindex_needed` is true iff that latest observation was a MISMATCH
+/// (the store's vectors were produced by a different embedder than the active
+/// one, so searches degrade to lexical BM25 until a reindex re-stamps the
+/// store), and flips back to false on the next matching observation, reindex,
+/// or forget — never a sticky stale claim.
 pub fn emit_status(docsearch_operational: bool, spotlight_enabled: bool) {
+    let (embedder, reindex_needed) = current_space_observation();
     crate::telemetry::emit(
         "system",
         "docsearch.status",
         status_payload(
             pdfjail_available(),
             crate::spotlight::reported_available(spotlight_enabled, docsearch_operational),
+            embedder.as_deref(),
+            reindex_needed,
         ),
     );
 }
@@ -1080,6 +1259,14 @@ struct CachedCorpus {
     /// scores over this slice directly — no per-query clone — and a hit's snippet
     /// is derived from `value`.
     facts: Vec<Fact>,
+    /// The store's RESOLVED vector space as of this corpus generation
+    /// ([`resolve_store_space`]: the `doc_meta` stamp, or the legacy id for
+    /// unstamped vectors, or `None` for a vector-less store). Read once at
+    /// corpus build — every write path invalidates the cache in its own
+    /// critical section, so this can never be stale relative to the vectors
+    /// beside it. The search-time SPACE GUARD compares the ACTIVE embedder id
+    /// against this before any cosine.
+    embedder: Option<String>,
 }
 
 impl CachedCorpus {
@@ -1108,6 +1295,17 @@ pub struct DocHit {
 pub struct DocSearchResult {
     pub hits: Vec<DocHit>,
     pub method: RankMethod,
+    /// True IFF the SPACE GUARD refused neural ranking on THIS search: every
+    /// stored chunk carries a vector and the query embedding answered, but the
+    /// store's vectors were produced by a DIFFERENT embedder than the active
+    /// one — cosine across spaces is meaningless, so ranking degraded to
+    /// lexical BM25 and only a full reindex (re-embed + re-stamp under the
+    /// active embedder) restores neural search. False on every other path,
+    /// including the ordinary embedder-down BM25 fallback (that needs no
+    /// reindex — just the inference server back up) and the mixed-store
+    /// fallback (a reindex helps there too, but no space VERDICT was made).
+    /// The caller surfaces this so the user learns to say "reindex my files".
+    pub reindex_needed: bool,
 }
 
 /// The status of the index, for the HUD telemetry surface: how many files and
@@ -1188,8 +1386,30 @@ impl DocIndex {
                 chunk_text TEXT NOT NULL,
                 vector TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_doc_chunks_file ON doc_chunks(file_path);",
+            CREATE INDEX IF NOT EXISTS idx_doc_chunks_file ON doc_chunks(file_path);
+            CREATE TABLE IF NOT EXISTS doc_meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );",
         )?;
+        // ONE-TIME LEGACY MIGRATION: a store carrying vectors but NO space stamp
+        // predates the stamp itself — and the stamp shipped TOGETHER with the
+        // Core ML backend, so every unstamped persisted vector was necessarily
+        // produced by the legacy 4B mean-pool path (the ONLY embedder that
+        // existed before either; see [`EMBEDDER_ID_LEGACY`]). Stamp that id now
+        // so the search-time space guard always has one honest stamp to compare
+        // against. Idempotent (the stamp exists on every later open); a store
+        // with no vectors is left unstamped (no vectors -> no space).
+        if read_embedder_tag(&conn).is_none() {
+            let has_vectors: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM doc_chunks WHERE vector IS NOT NULL)",
+                [],
+                |r| r.get(0),
+            )?;
+            if has_vectors {
+                write_embedder_tag(&conn, EMBEDDER_ID_LEGACY)?;
+            }
+        }
         Ok(Self {
             state: Mutex::new(StoreState { conn, cache: None }),
         })
@@ -1225,12 +1445,17 @@ impl DocIndex {
         Ok(id)
     }
 
-    /// FORGET: clear the entire index (every stored chunk + vector), returning how
-    /// many chunk rows were removed and VACUUMing so the file actually shrinks. The
-    /// forgettable contract — a user can make DARWIN forget every indexed file.
+    /// FORGET: clear the entire index (every stored chunk + vector, AND the
+    /// vector-space stamp — an empty store lives in no space, and leaving a
+    /// stale stamp would make the next absorption's space guard compare against
+    /// vectors that no longer exist), returning how many chunk rows were
+    /// removed and VACUUMing so the file actually shrinks. The forgettable
+    /// contract — a user can make DARWIN forget every indexed file.
     pub async fn forget(&self) -> Result<u64> {
         let mut st = self.state.lock().await;
         let deleted = st.conn.execute("DELETE FROM doc_chunks", [])?;
+        st.conn
+            .execute("DELETE FROM doc_meta WHERE key = ?1", params![META_EMBEDDER_KEY])?;
         if deleted > 0 {
             st.conn.execute_batch("VACUUM")?;
         }
@@ -1238,7 +1463,27 @@ impl DocIndex {
         // search can serve a citation that FORGET just removed (the forgettable
         // contract must hold for the in-memory corpus, not only the on-disk store).
         st.cache = None;
+        // The store now has no vectors, hence no space and no possible mismatch.
+        record_space_observation(None, false);
         Ok(deleted as u64)
+    }
+
+    /// Stamp the store's ONE vector-space id (upsert), invalidating the search
+    /// cache in the same critical section — the cached corpus carries the
+    /// resolved space, so a stale cache could otherwise mis-key a search.
+    async fn set_embedder_tag(&self, id: &str) -> Result<()> {
+        let mut st = self.state.lock().await;
+        write_embedder_tag(&st.conn, id)?;
+        st.cache = None;
+        Ok(())
+    }
+
+    /// The store's raw vector-space stamp (test seam; production paths read the
+    /// resolved space off the cached corpus / inside the absorb transaction).
+    #[cfg(test)]
+    async fn embedder_tag(&self) -> Option<String> {
+        let st = self.state.lock().await;
+        read_embedder_tag(&st.conn)
     }
 
     /// The current index status (files / chunks / embedded-chunks) for telemetry.
@@ -1317,7 +1562,14 @@ impl DocIndex {
                 value: r.chunk_text,
             });
         }
-        Ok(CachedCorpus { meta, facts })
+        // The store's resolved vector space rides the same generation as the
+        // vectors it describes (same connection, same lock — see the field doc).
+        let embedder = resolve_store_space(conn)?;
+        Ok(CachedCorpus {
+            meta,
+            facts,
+            embedder,
+        })
     }
 
     /// Return the materialized corpus for the search path, building + caching it on
@@ -1361,9 +1613,13 @@ impl DocIndex {
     ///      (text-like = read+decode; PDF/Office = on-device extractor behind the
     ///      panic-safe HONEST-SKIP guard), caps it to `max_file_bytes`, then chunks
     ///      it — a corrupt/encrypted/scanned/image-only/binary file is SKIPPED;
-    ///   4. embeds the chunks ON-DEVICE in one batched call via `embedder`; if that
-    ///      errs (server down / no embed op), stores the chunks WITHOUT vectors so
-    ///      search falls back to BM25 — never failing the index;
+    ///   4. embeds the chunks ON-DEVICE in one batched, SPACE-AWARE call via
+    ///      `embedder` and STAMPS the store with the id of the embedder that
+    ///      produced the vectors (reindex is the ONE path that moves a store to
+    ///      a new vector space — it cleared the old stamp in step 1); if the
+    ///      embed errs (server down / no embed op), stores the chunks WITHOUT
+    ///      vectors — and without a stamp, since a vector-less store lives in
+    ///      no space — so search falls back to BM25, never failing the index;
     ///   5. enforces the `max_chunks` total bound.
     ///      Returns the resulting [`IndexStatus`]. NETWORK: never — embedding is the
     ///      on-device op; file contents + embeddings never leave the device.
@@ -1436,17 +1692,38 @@ impl DocIndex {
         .await
         .context("document gather/extraction task failed")?;
 
-        // Embed all chunk texts ON-DEVICE in one batched call. On ANY error (server
-        // down / no embed op / wrong count), store WITHOUT vectors -> BM25 search.
+        // Embed all chunk texts ON-DEVICE in one batched, SPACE-AWARE call. On
+        // ANY error (server down / no embed op / wrong count), store WITHOUT
+        // vectors -> BM25 search. On success, `space` is the id of the embedder
+        // that ACTUALLY produced the vectors (server-reported; a metadata-less
+        // old server is the legacy 4B mean-pool by construction — see
+        // [`batch_space`]), stamped below so the store is keyed to exactly ONE
+        // vector space.
         let texts: Vec<String> = pending.iter().map(|p| p.text.clone()).collect();
-        let vectors: Option<Vec<Vec<f64>>> = if texts.is_empty() {
-            None
+        let (vectors, space): (Option<Vec<Vec<f64>>>, Option<String>) = if texts.is_empty() {
+            (None, None)
         } else {
-            match embedder.embed(&texts).await {
-                Ok(v) if v.len() == texts.len() && v.iter().all(|x| !x.is_empty()) => Some(v),
-                _ => None,
+            match embedder.embed_with_space(&texts).await {
+                Ok(b) if b.vectors.len() == texts.len() && b.vectors.iter().all(|x| !x.is_empty()) => {
+                    let space = batch_space(&b);
+                    (Some(b.vectors), Some(space))
+                }
+                _ => (None, None),
             }
         };
+
+        // Stamp the store's ONE vector space BEFORE the inserts (forget() above
+        // already cleared the old stamp): a concurrently-committing absorption
+        // then sees the new space immediately and refuses a mismatched batch. A
+        // vector-less rebuild (embedder down / nothing to index) stamps nothing
+        // — no vectors, no space — and search runs BM25 over the unstamped
+        // store. Either way the honest observation feeds `docsearch.status`.
+        if let Some(space) = &space {
+            self.set_embedder_tag(space).await?;
+            record_space_observation(Some(space), false);
+        } else {
+            record_space_observation(None, false);
+        }
 
         for (i, p) in pending.iter().enumerate() {
             let vec = vectors.as_ref().map(|vs| vs[i].as_slice());
@@ -1488,7 +1765,13 @@ impl DocIndex {
     /// successful on-device embed of every gathered chunk — on ANY embed
     /// failure NOTHING is inserted (a transient embedder hiccup during a search
     /// must never downgrade an all-neural store to BM25; reindex keeps its own
-    /// store-vector-less fallback semantics). Already-indexed files are skipped
+    /// store-vector-less fallback semantics). NEVER MIXES VECTOR SPACES: the
+    /// batch's embedder id ([`batch_space`]) is checked against the store's
+    /// space stamp INSIDE the commit transaction — a mismatched batch inserts
+    /// NOTHING (warned once per process + surfaced as `reindex_needed` on
+    /// `docsearch.status`; only a full reindex moves a store to a new space),
+    /// while the first vectors into an unstamped store stamp it. Already-indexed
+    /// files are skipped
     /// (never duplicated). Returns how many NEW files were absorbed. NETWORK:
     /// never — same contract as [`Self::reindex`].
     pub async fn absorb_candidates(
@@ -1603,14 +1886,16 @@ impl DocIndex {
             return Ok(0);
         }
 
-        // OPPORTUNISTIC EMBED (one batched on-device call). Absorption REQUIRES
-        // the vectors: on ANY embed failure it inserts NOTHING, so a transient
-        // embedder hiccup during a search can never store vector-less chunks
-        // and silently downgrade an all-neural store to wholesale BM25 (that
-        // fallback belongs to the explicit reindex path, not to a search).
+        // OPPORTUNISTIC EMBED (one batched on-device, SPACE-AWARE call).
+        // Absorption REQUIRES the vectors: on ANY embed failure it inserts
+        // NOTHING, so a transient embedder hiccup during a search can never
+        // store vector-less chunks and silently downgrade an all-neural store
+        // to wholesale BM25 (that fallback belongs to the explicit reindex
+        // path, not to a search). The batch's space id rides along to the
+        // commit, where the SPACE GUARD compares it against the store's stamp.
         let texts: Vec<String> = pending.iter().map(|p| p.text.clone()).collect();
-        let vectors: Vec<Vec<f64>> = match embedder.embed(&texts).await {
-            Ok(v) if v.len() == texts.len() && v.iter().all(|x| !x.is_empty()) => v,
+        let batch = match embedder.embed_with_space(&texts).await {
+            Ok(b) if b.vectors.len() == texts.len() && b.vectors.iter().all(|x| !x.is_empty()) => b,
             _ => {
                 tracing::debug!(
                     target: "docsearch",
@@ -1619,10 +1904,12 @@ impl DocIndex {
                 return Ok(0);
             }
         };
+        let space = batch_space(&batch);
 
-        // COMMIT under ONE lock + ONE transaction, budgets re-derived inside.
+        // COMMIT under ONE lock + ONE transaction, budgets re-derived inside —
+        // and the space guard enforced at the same write point.
         let mut st = self.state.lock().await;
-        Self::commit_absorbed(&mut st, &pending, &vectors, bounds, None)
+        Self::commit_absorbed(&mut st, &pending, &batch.vectors, bounds, &space, None)
     }
 
     /// The WRITE POINT of absorption: insert the gathered chunks under the
@@ -1635,7 +1922,14 @@ impl DocIndex {
     /// contiguously); a file is inserted with ALL its chunks or skipped whole,
     /// and ANY error rolls the whole transaction back (no path is ever left
     /// half-indexed — it stays absent and retryable). `vectors` is parallel to
-    /// `pending`. The cache is invalidated in the same critical section as the
+    /// `pending`; `space` is the embedder id that produced them. THE SPACE
+    /// GUARD lives HERE, inside the transaction: if the store's resolved space
+    /// ([`resolve_store_space`]) exists and differs from `space`, NOTHING is
+    /// inserted (Ok(0), warned once per process, surfaced as `reindex_needed`)
+    /// — a store never mixes vector spaces; and when rows DO land in a store
+    /// that had no space (no vectors -> no stamp), the batch's id is stamped in
+    /// the SAME transaction, so the vectors and their space key commit
+    /// atomically. The cache is invalidated in the same critical section as the
     /// commit. `fail_after_rows` is a TEST-ONLY failure-injection seam (always
     /// `None` in production): erroring after that many row inserts proves the
     /// rollback leaves zero rows.
@@ -1644,11 +1938,26 @@ impl DocIndex {
         pending: &[PendingChunk],
         vectors: &[Vec<f64>],
         bounds: &IndexBounds,
+        space: &str,
         fail_after_rows: Option<usize>,
     ) -> Result<u64> {
         let tx = st.conn.transaction()?;
         let mut absorbed = 0u64;
         {
+            // THE SPACE GUARD (absorption leg): one vector space per store.
+            // Refusing here — at the write point, inside the transaction — means
+            // no interleaving between plan and commit can ever mix spaces. The
+            // refusal is Ok(0) rather than Err: to the caller it is the same
+            // honest "nothing absorbed" as a budget stop, while the warn + the
+            // `reindex_needed` status leg surface WHY. Nothing was written, so
+            // the dropped transaction rolls back nothing and the cache stays valid.
+            if let Some(store_space) = resolve_store_space(&tx)? {
+                if store_space != space {
+                    warn_space_mismatch_once(&store_space, space);
+                    record_space_observation(Some(&store_space), true);
+                    return Ok(0);
+                }
+            }
             // Re-derive the LIVE footprint inside the transaction: these are
             // the numbers the ceilings must hold against at the write point.
             let live_chunks: i64 =
@@ -1701,19 +2010,40 @@ impl DocIndex {
                 file_count += 1;
                 absorbed += 1;
             }
+            // The first vectors into an unstamped store FIX its space: stamp
+            // the batch's embedder id in the SAME transaction the vectors land
+            // in, so the vectors and their space key commit (or roll back)
+            // atomically. A store that already had a stamp passed the guard
+            // above with EQUALITY, so re-stamping would be a no-op and is
+            // skipped; a batch that absorbed nothing (budgets/duplicates)
+            // stamps nothing — the store still has no vectors, hence no space.
+            if absorbed > 0 && read_embedder_tag(&tx).is_none() {
+                write_embedder_tag(&tx, space)?;
+            }
         }
         tx.commit()?;
         // Invalidate the search cache in the SAME critical section as the
         // commit (the caller holds the state lock), mirroring insert_chunk.
         st.cache = None;
+        if absorbed > 0 {
+            // Rows landed, so the guard/stamp above proved the store's space
+            // EQUALS this batch's: record the honest match for docsearch.status.
+            // (A zero-row budget stop proves nothing about the space and
+            // records nothing.)
+            record_space_observation(Some(space), false);
+        }
         Ok(absorbed)
     }
 
     /// SEARCH: rank the stored chunks against `query` and return at most `k` CITED
     /// hits, most-relevant first, reporting WHICH backend ran. NEURAL when EVERY
-    /// stored chunk carries an on-device vector AND the query embeds — cosine over
+    /// stored chunk carries an on-device vector AND the query embeds AND the
+    /// query embedding lives in the SAME vector space as the store (the SPACE
+    /// GUARD below) — cosine over
     /// the stored vectors; otherwise LEXICAL BM25 over the chunk text (the honest
-    /// fallback, used whenever the embedder is/was unavailable). Zero-score
+    /// fallback, used whenever the embedder is/was unavailable — or, with
+    /// `reindex_needed` raised, when the store was built by a DIFFERENT
+    /// embedder than the active one). Zero-score
     /// (irrelevant) chunks are dropped, so an empty index or a no-match query
     /// returns NOTHING — never a fabricated citation.
     ///
@@ -1733,6 +2063,7 @@ impl DocIndex {
             return DocSearchResult {
                 hits: Vec::new(),
                 method: RankMethod::Lexical,
+                reindex_needed: false,
             };
         };
         if corpus.is_empty() || query.trim().is_empty() {
@@ -1741,38 +2072,91 @@ impl DocIndex {
             return DocSearchResult {
                 hits: Vec::new(),
                 method: RankMethod::Lexical,
+                reindex_needed: false,
             };
         }
 
         // Prefer NEURAL only when every chunk has a stored vector — a mixed store
         // (some embedded, some not) cannot be ranked coherently by cosine, so it
         // falls back to BM25 wholesale (honest: the method names what actually ran).
+        //
+        // `reindex_needed` is raised IFF the SPACE GUARD refuses: the ranking
+        // then proceeds lexically below, and the flag rides the result + the
+        // process observation so the degradation is surfaced, never silent.
+        let mut reindex_needed = false;
         let all_embedded = corpus.meta.iter().all(|m| m.vector.is_some());
         if all_embedded {
-            if let Ok(qvecs) = embedder.embed(&[query.to_string()]).await {
-                if qvecs.len() == 1 && !qvecs[0].is_empty() {
-                    let qvec = &qvecs[0];
-                    let mut scored: Vec<(usize, f64)> = corpus
-                        .meta
-                        .iter()
-                        .enumerate()
-                        .map(|(i, m)| {
-                            let sim = m
-                                .vector
-                                .as_ref()
-                                .map(|v| cosine_similarity(qvec, v))
-                                .unwrap_or(0.0);
-                            // Clamp negatives to 0 (anti-correlated is not a hit).
-                            (i, if sim > 0.0 { sim } else { 0.0 })
-                        })
-                        .collect();
-                    return DocSearchResult {
-                        hits: rank_and_cite(&corpus, &mut scored, k),
-                        method: RankMethod::Embedding,
-                    };
+            if let Ok(batch) = embedder.embed_with_space(&[query.to_string()]).await {
+                if batch.vectors.len() == 1 && !batch.vectors[0].is_empty() {
+                    let active = batch_space(&batch);
+                    // THE SPACE GUARD (search leg). `corpus.embedder` is the
+                    // store's RESOLVED space and is always `Some` on this path
+                    // (all_embedded over a non-empty corpus means vectors
+                    // exist, and [`resolve_store_space`] keys unstamped vectors
+                    // as the legacy id) — the defensive `None` arm still ranks
+                    // neurally, matching the resolver's "no vectors -> no
+                    // space" rule (it cannot be reached with vectors present).
+                    // Cosine runs ONLY in the same space; on a MISMATCH no
+                    // cross-space cosine is ever computed — ranking degrades to
+                    // BM25 below with `reindex_needed` raised.
+                    match corpus.embedder.as_deref() {
+                        Some(store) if store != active => {
+                            warn_space_mismatch_once(store, &active);
+                            record_space_observation(Some(store), true);
+                            reindex_needed = true;
+                        }
+                        _ => {
+                            record_space_observation(corpus.embedder.as_deref(), false);
+                            let qvec = &batch.vectors[0];
+                            // BELT-AND-BRACES dim check: even under a same-space
+                            // stamp, a stored vector whose LENGTH differs from
+                            // the query's scores 0.0 — [`cosine_similarity`]
+                            // already guarantees that (never a partial dot
+                            // product, never a panic); the explicit branch here
+                            // exists to COUNT such pairs so a corrupted store
+                            // is visible in the log, not silently down-ranked.
+                            let mut dim_mismatches = 0usize;
+                            let mut scored: Vec<(usize, f64)> = corpus
+                                .meta
+                                .iter()
+                                .enumerate()
+                                .map(|(i, m)| {
+                                    let sim = m
+                                        .vector
+                                        .as_ref()
+                                        .map(|v| {
+                                            if v.len() != qvec.len() {
+                                                dim_mismatches += 1;
+                                                0.0
+                                            } else {
+                                                cosine_similarity(qvec, v)
+                                            }
+                                        })
+                                        .unwrap_or(0.0);
+                                    // Clamp negatives to 0 (anti-correlated is not a hit).
+                                    (i, if sim > 0.0 { sim } else { 0.0 })
+                                })
+                                .collect();
+                            if dim_mismatches > 0 {
+                                tracing::warn!(
+                                    target: "docsearch",
+                                    count = dim_mismatches,
+                                    "same-space index holds vectors whose length differs \
+                                     from the query embedding; those pairs scored 0 \
+                                     (reindex to repair the store)"
+                                );
+                            }
+                            return DocSearchResult {
+                                hits: rank_and_cite(&corpus, &mut scored, k),
+                                method: RankMethod::Embedding,
+                                reindex_needed: false,
+                            };
+                        }
+                    }
                 }
             }
-            // Query embed failed / degenerate -> fall through to BM25, honestly.
+            // Query embed failed / degenerate -> fall through to BM25, honestly
+            // (no space verdict was possible, so `reindex_needed` stays false).
         }
 
         // LEXICAL BM25 over the chunk text (reusing recall.rs's shipped ranker). The
@@ -1788,6 +2172,7 @@ impl DocIndex {
         DocSearchResult {
             hits: rank_and_cite(&corpus, &mut scored, k),
             method: RankMethod::Lexical,
+            reindex_needed,
         }
     }
 }
@@ -1931,28 +2316,64 @@ mod tests {
 
     // ---- a mock embedder: NEVER touches a socket/MLX/network -----------------
 
-    /// A deterministic mock [`Embedder`]. Each input text maps to a fixed small
-    /// vector by a keyword rule so a test can pin which chunk is "near" a query.
+    /// The deterministic keyword->vector rule shared by the mock embedders:
+    /// axis 0 = "subaru"/"car", axis 1 = "corgi"/"pet", axis 2 = other, so a
+    /// test can pin which chunk is "near" a query.
+    fn keyword_vectors(texts: &[String]) -> Vec<Vec<f64>> {
+        texts
+            .iter()
+            .map(|t| {
+                let l = t.to_lowercase();
+                let car = l.contains("subaru") || l.contains("car") || l.contains("outback");
+                let pet = l.contains("corgi") || l.contains("pet") || l.contains("watson");
+                if car {
+                    vec![1.0, 0.0, 0.0]
+                } else if pet {
+                    vec![0.0, 1.0, 0.0]
+                } else {
+                    vec![0.0, 0.0, 1.0]
+                }
+            })
+            .collect()
+    }
+
+    /// A deterministic mock [`Embedder`] ([`keyword_vectors`]) implementing only
+    /// `embed` — so, via the trait's provided `embed_with_space` default, it
+    /// reports NO space metadata, exactly like an OLD inference server. Store
+    /// writes fed by it are therefore keyed to [`EMBEDDER_ID_LEGACY`].
     struct KeywordEmbedder;
     impl Embedder for KeywordEmbedder {
         fn embed<'a>(&'a self, texts: &'a [String]) -> crate::recall::EmbedFuture<'a> {
-            // axis 0 = "subaru"/"car", axis 1 = "corgi"/"pet", axis 2 = other.
-            let vecs: Vec<Vec<f64>> = texts
-                .iter()
-                .map(|t| {
-                    let l = t.to_lowercase();
-                    let car = l.contains("subaru") || l.contains("car") || l.contains("outback");
-                    let pet = l.contains("corgi") || l.contains("pet") || l.contains("watson");
-                    if car {
-                        vec![1.0, 0.0, 0.0]
-                    } else if pet {
-                        vec![0.0, 1.0, 0.0]
-                    } else {
-                        vec![0.0, 0.0, 1.0]
-                    }
-                })
-                .collect();
+            let vecs = keyword_vectors(texts);
             Box::pin(async move { Ok(vecs) })
+        }
+    }
+
+    /// A SPACE-AWARE mock [`Embedder`]: [`keyword_vectors`]'s vectors, reported
+    /// under a fixed embedder id like the live op=embed wire — so a test can
+    /// pin WHICH vector space produced the store vs. the query and drive the
+    /// space guard both ways (match and mismatch) with same-length vectors
+    /// (the nasty case a dim check alone could never catch).
+    struct SpacedEmbedder(&'static str);
+    impl Embedder for SpacedEmbedder {
+        fn embed<'a>(&'a self, texts: &'a [String]) -> crate::recall::EmbedFuture<'a> {
+            let vecs = keyword_vectors(texts);
+            Box::pin(async move { Ok(vecs) })
+        }
+        fn embed_with_space<'a>(
+            &'a self,
+            texts: &'a [String],
+        ) -> crate::recall::EmbedSpaceFuture<'a> {
+            let vectors = keyword_vectors(texts);
+            let id = self.0;
+            Box::pin(async move {
+                Ok(crate::recall::EmbeddedBatch {
+                    vectors,
+                    embedder: Some(id.to_string()),
+                    dim: Some(3),
+                    fell_back: false,
+                })
+            })
         }
     }
 
@@ -2118,6 +2539,283 @@ mod tests {
             all.iter().all(|c| !c.chunk_text.contains("not a valid pdf")),
             "the skipped PDF's content must not be stored"
         );
+    }
+
+    // =====================================================================
+    // VECTOR-SPACE guard — one embedder per store, cross-space cosine refused
+    // =====================================================================
+
+    /// LEGACY MIGRATION: an existing store with persisted vectors but NO
+    /// `doc_meta` stamp (built before the stamp existed) is keyed to
+    /// [`EMBEDDER_ID_LEGACY`] on first open — sound because the stamp and the
+    /// Core ML backend shipped together, so unstamped vectors can only have
+    /// come from the 4B mean-pool path (the sole embedder before either).
+    /// A vector-less unstamped store is left unstamped (no vectors, no space).
+    #[tokio::test]
+    async fn untagged_store_with_vectors_migrates_to_the_legacy_stamp_on_open() {
+        let t = TempTree::new("space-migrate");
+        // Fabricate a PRE-STAMP store: the old schema (no doc_meta at all) with
+        // one embedded chunk, exactly as a pre-upgrade daemon left it.
+        {
+            let conn = Connection::open(t.db_path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE doc_chunks(
+                    id INTEGER PRIMARY KEY,
+                    root TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    byte_offset INTEGER NOT NULL,
+                    chunk_text TEXT NOT NULL,
+                    vector TEXT
+                );",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO doc_chunks(root, file_path, byte_offset, chunk_text, vector)
+                 VALUES ('/r', '/r/old.md', 0, 'a legacy chunk', '[1.0,0.0,0.0]')",
+                [],
+            )
+            .unwrap();
+        }
+        let idx = DocIndex::open(&t.db_path()).unwrap();
+        assert_eq!(
+            idx.embedder_tag().await.as_deref(),
+            Some(EMBEDDER_ID_LEGACY),
+            "unstamped-with-vectors must migrate to the legacy id on open"
+        );
+
+        // And the no-vectors case: a fresh empty store stays unstamped.
+        let t2 = TempTree::new("space-migrate-empty");
+        let idx2 = DocIndex::open(&t2.db_path()).unwrap();
+        assert_eq!(idx2.embedder_tag().await, None, "no vectors -> no space -> no stamp");
+    }
+
+    /// REINDEX stamps the id of the embedder that ACTUALLY produced the
+    /// vectors, and a later reindex under a DIFFERENT embedder re-stamps —
+    /// after which search ranks NEURALLY again (the reindex path is the
+    /// documented recovery from a space mismatch).
+    #[tokio::test]
+    async fn reindex_stamps_and_restamps_the_producing_embedder() {
+        let t = TempTree::new("space-restamp");
+        t.write("docs/a.md", "the quarterly budget subaru outback notes");
+        let idx = DocIndex::open(&t.db_path()).unwrap();
+        let roots = roots_of(&t, "docs");
+        let bounds = IndexBounds::default();
+
+        idx.reindex(&roots, &bounds, &SpacedEmbedder(EMBEDDER_ID_COREML)).await.unwrap();
+        assert_eq!(idx.embedder_tag().await.as_deref(), Some(EMBEDDER_ID_COREML));
+
+        // The active embedder changed -> a full reindex re-stamps the store...
+        idx.reindex(&roots, &bounds, &SpacedEmbedder(EMBEDDER_ID_LEGACY)).await.unwrap();
+        assert_eq!(
+            idx.embedder_tag().await.as_deref(),
+            Some(EMBEDDER_ID_LEGACY),
+            "reindex under a new embedder must replace the stamp"
+        );
+
+        // ...and search under the (matching) new embedder is neural again.
+        let r = idx.search("subaru car", 5, &SpacedEmbedder(EMBEDDER_ID_LEGACY)).await;
+        assert_eq!(r.method, RankMethod::Embedding, "same space -> neural restored");
+        assert!(!r.reindex_needed, "no mismatch after the re-stamping reindex");
+        assert!(!r.hits.is_empty(), "the reindexed chunk ranks: {r:?}");
+
+        // A reindex with the embedder DOWN stores vector-less chunks and
+        // stamps nothing: a store without vectors lives in no space.
+        idx.reindex(&roots, &bounds, &DownEmbedder).await.unwrap();
+        assert_eq!(idx.embedder_tag().await, None, "vector-less rebuild -> no stamp");
+    }
+
+    /// A metadata-less embedder (one that predates the space wire contract —
+    /// the provided `embed_with_space` default) keys its writes to the LEGACY
+    /// space, and a search through the same metadata-less embedder MATCHES it
+    /// (both resolve to the legacy id), so today's mocks/servers keep ranking
+    /// neurally end-to-end with no behavior change.
+    #[tokio::test]
+    async fn metadata_less_embedder_writes_key_to_the_legacy_space_and_still_rank_neurally() {
+        let t = TempTree::new("space-legacy-default");
+        t.write("docs/a.md", "a corgi named Watson sleeps on the rug");
+        let idx = DocIndex::open(&t.db_path()).unwrap();
+        let bounds = IndexBounds::default();
+        idx.reindex(&roots_of(&t, "docs"), &bounds, &KeywordEmbedder).await.unwrap();
+        assert_eq!(
+            idx.embedder_tag().await.as_deref(),
+            Some(EMBEDDER_ID_LEGACY),
+            "no metadata -> the batch is keyed to the legacy space"
+        );
+        let r = idx.search("my corgi pet", 5, &KeywordEmbedder).await;
+        assert_eq!(r.method, RankMethod::Embedding, "legacy==legacy is a same-space match");
+        assert!(!r.reindex_needed);
+    }
+
+    /// THE SEARCH-LEG SPACE GUARD: a store stamped by one embedder queried
+    /// under ANOTHER never computes a cross-space cosine — it degrades to
+    /// lexical BM25 and raises `reindex_needed`. The mock vectors are the SAME
+    /// LENGTH in both spaces and the query vector is cosine-parallel to every
+    /// stored vector, so a broken guard would rank neurally with full scores —
+    /// the honest result (Lexical + EMPTY hits for a term that matches no
+    /// chunk text) is reachable only by refusing the cosine outright.
+    #[tokio::test]
+    async fn search_refuses_cross_space_cosine_degrades_to_bm25_and_surfaces_reindex_needed() {
+        let t = TempTree::new("space-mismatch");
+        // Neither file mentions the query term below, and both embed to the
+        // "other" axis [0,0,1] — exactly where the query lands too.
+        t.write("docs/a.md", "meeting notes for the launch planning session");
+        t.write("docs/b.md", "grocery list and errands for the weekend");
+        let idx = DocIndex::open(&t.db_path()).unwrap();
+        let bounds = IndexBounds::default();
+        idx.reindex(&roots_of(&t, "docs"), &bounds, &SpacedEmbedder(EMBEDDER_ID_COREML))
+            .await
+            .unwrap();
+
+        // Same-space sanity: under the STORE's embedder the parallel vectors
+        // DO rank neurally (every chunk scores cosine 1.0).
+        let same = idx.search("zzzunindexed", 5, &SpacedEmbedder(EMBEDDER_ID_COREML)).await;
+        assert_eq!(same.method, RankMethod::Embedding);
+        assert!(!same.hits.is_empty(), "parallel vectors score 1.0 in-space: {same:?}");
+
+        // Cross-space: the ACTIVE embedder differs -> BM25 (which honestly
+        // finds nothing for a term absent from every chunk) + reindex_needed.
+        let crossed = idx.search("zzzunindexed", 5, &SpacedEmbedder(EMBEDDER_ID_LEGACY)).await;
+        assert_eq!(
+            crossed.method,
+            RankMethod::Lexical,
+            "a cross-space query must never rank neurally"
+        );
+        assert!(
+            crossed.hits.is_empty(),
+            "BM25 finds nothing for an absent term — had the guard leaked a \
+             cosine, every parallel chunk would have scored 1.0: {crossed:?}"
+        );
+        assert!(crossed.reindex_needed, "the mismatch is surfaced, never silent");
+
+        // The ordinary embedder-DOWN fallback is NOT a mismatch: no space
+        // verdict is possible, so reindex_needed stays false.
+        let down = idx.search("launch planning", 5, &DownEmbedder).await;
+        assert_eq!(down.method, RankMethod::Lexical);
+        assert!(!down.reindex_needed, "embedder-down BM25 needs no reindex");
+    }
+
+    /// THE ABSORB-LEG SPACE GUARD: absorption under a different embedder than
+    /// the store's stamp inserts NOTHING (never a cross-space mix), leaves the
+    /// stamp untouched, and the SAME candidate then absorbs cleanly under the
+    /// matching embedder (proving the space alone blocked it).
+    #[tokio::test]
+    async fn absorb_refuses_to_mix_vector_spaces() {
+        let t = TempTree::new("space-absorb-mix");
+        t.write("docs/walked.md", "a corgi named Watson sleeps on the rug");
+        let idx = DocIndex::open(&t.db_path()).unwrap();
+        let roots = roots_of(&t, "docs");
+        let bounds = IndexBounds::default();
+        idx.reindex(&roots, &bounds, &SpacedEmbedder(EMBEDDER_ID_COREML)).await.unwrap();
+        let before = idx.status().await.unwrap();
+
+        let extra = t.write("docs/spotted.md", "the blue subaru outback service records");
+        let n = idx
+            .absorb_candidates(
+                &roots,
+                vec![discovered(&t, "docs", &extra)],
+                &bounds,
+                &SpacedEmbedder(EMBEDDER_ID_LEGACY),
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 0, "a mismatched batch absorbs NOTHING");
+        assert_eq!(idx.status().await.unwrap(), before, "the store is untouched");
+        assert_eq!(
+            idx.embedder_tag().await.as_deref(),
+            Some(EMBEDDER_ID_COREML),
+            "the stamp never changes outside a reindex"
+        );
+
+        // The same candidate under the MATCHING embedder absorbs fine.
+        let n = idx
+            .absorb_candidates(
+                &roots,
+                vec![discovered(&t, "docs", &extra)],
+                &bounds,
+                &SpacedEmbedder(EMBEDDER_ID_COREML),
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 1, "only the space mismatch blocked the first attempt");
+    }
+
+    /// The FIRST vectors into an unstamped store stamp it with the batch's
+    /// space (in the same commit transaction), so an absorption-born store is
+    /// keyed exactly like a reindex-born one.
+    #[tokio::test]
+    async fn absorb_stamps_an_unstamped_store_with_the_batch_space() {
+        let t = TempTree::new("space-absorb-stamp");
+        let f = t.write("docs/first.md", "a corgi named Watson sleeps on the rug");
+        let idx = DocIndex::open(&t.db_path()).unwrap();
+        assert_eq!(idx.embedder_tag().await, None, "a fresh store has no space");
+        let n = idx
+            .absorb_candidates(
+                &roots_of(&t, "docs"),
+                vec![discovered(&t, "docs", &f)],
+                &IndexBounds::default(),
+                &SpacedEmbedder(EMBEDDER_ID_COREML),
+            )
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            idx.embedder_tag().await.as_deref(),
+            Some(EMBEDDER_ID_COREML),
+            "the first absorbed vectors fix the store's space"
+        );
+    }
+
+    /// FORGET clears the space stamp along with the vectors (the forgettable
+    /// contract covers the space key too: an empty store lives in no space, so
+    /// the next index/absorption starts clean under whatever embedder runs it).
+    #[tokio::test]
+    async fn forget_clears_the_space_stamp() {
+        let t = TempTree::new("space-forget");
+        t.write("docs/a.md", "some indexed content here");
+        let idx = DocIndex::open(&t.db_path()).unwrap();
+        idx.reindex(&roots_of(&t, "docs"), &IndexBounds::default(), &SpacedEmbedder(EMBEDDER_ID_COREML))
+            .await
+            .unwrap();
+        assert!(idx.embedder_tag().await.is_some());
+        idx.forget().await.unwrap();
+        assert_eq!(idx.embedder_tag().await, None, "forget forgets the space too");
+    }
+
+    /// BELT-AND-BRACES: even under a SAME-SPACE stamp, a stored vector whose
+    /// LENGTH differs from the query embedding scores 0 (dropped from the
+    /// hits) — never a partial dot product, never a panic — while the intact
+    /// chunks still rank. Locks [`cosine_similarity`]'s mismatch-is-0 contract
+    /// into the docsearch ranking path end-to-end.
+    #[tokio::test]
+    async fn same_space_length_mismatch_scores_zero_and_never_panics() {
+        let t = TempTree::new("space-dim");
+        t.write("docs/good.md", "the blue subaru outback service records");
+        let idx = DocIndex::open(&t.db_path()).unwrap();
+        let bounds = IndexBounds::default();
+        idx.reindex(&roots_of(&t, "docs"), &bounds, &SpacedEmbedder(EMBEDDER_ID_COREML))
+            .await
+            .unwrap();
+        // Corrupt-in-place: a SECOND chunk claiming the same space but carrying
+        // a 2-dim vector (the store's are 3-dim). Its text keyword-matches the
+        // query, so if the mismatch were scored any other way than 0 it would
+        // surface in the hits.
+        idx.insert_chunk("/r", "/r/bad.md", 0, "subaru subaru subaru", Some(&[0.7, 0.7]))
+            .await
+            .unwrap();
+
+        let r = idx.search("subaru car", 5, &SpacedEmbedder(EMBEDDER_ID_COREML)).await;
+        assert_eq!(r.method, RankMethod::Embedding, "same space -> neural runs");
+        assert!(
+            r.hits.iter().any(|h| h.file_path.ends_with("good.md")),
+            "the intact chunk still ranks: {:?}",
+            r.hits
+        );
+        assert!(
+            !r.hits.iter().any(|h| h.file_path == "/r/bad.md"),
+            "the length-mismatched vector scores 0 and is dropped: {:?}",
+            r.hits
+        );
+        assert!(!r.reindex_needed, "a dim glitch is not a space mismatch");
     }
 
     // =====================================================================
@@ -2670,20 +3368,32 @@ mod tests {
     }
 
     /// The `docsearch.status` wire shape must match the HUD's
-    /// `parsePdfJailAvailable` + `parseSpotlightAvailable` (events.ts): flat
-    /// snake_case booleans, no wrapper. The HUD treats anything but a literal
-    /// `true` as the weaker/absent state (never overclaims a guard or the
-    /// Spotlight integration), so the payloads must be REAL JSON booleans, not
-    /// strings.
+    /// `parsePdfJailAvailable` + `parseSpotlightAvailable` +
+    /// `parseDocSearchEmbedder` + `parseDocSearchReindexNeeded` (events.ts):
+    /// flat snake_case fields, no wrapper — REAL JSON booleans (the HUD treats
+    /// anything but a literal `true` as the weaker/absent state and never
+    /// overclaims a guard, the Spotlight integration, or a space mismatch), a
+    /// REAL JSON string-or-null `embedder` (null = no space observation yet /
+    /// a vector-less store), and a REAL JSON boolean `reindex_needed`.
     #[test]
     fn status_payload_wire_shape_matches_the_hud_parser() {
         assert_eq!(
-            status_payload(true, false),
-            serde_json::json!({ "pdfjail_available": true, "spotlight_available": false })
+            status_payload(true, false, None, false),
+            serde_json::json!({
+                "pdfjail_available": true,
+                "spotlight_available": false,
+                "embedder": null,
+                "reindex_needed": false,
+            })
         );
         assert_eq!(
-            status_payload(false, true),
-            serde_json::json!({ "pdfjail_available": false, "spotlight_available": true })
+            status_payload(false, true, Some(EMBEDDER_ID_COREML), true),
+            serde_json::json!({
+                "pdfjail_available": false,
+                "spotlight_available": true,
+                "embedder": "coreml-bge-small-en-v1.5",
+                "reindex_needed": true,
+            })
         );
     }
 
@@ -3244,7 +3954,14 @@ mod tests {
         // Inject a failure after 2 of the file's 3 chunk inserts.
         {
             let mut st = idx.state.lock().await;
-            let err = DocIndex::commit_absorbed(&mut st, &pending, &vectors, &bounds, Some(2));
+            let err = DocIndex::commit_absorbed(
+                &mut st,
+                &pending,
+                &vectors,
+                &bounds,
+                EMBEDDER_ID_LEGACY,
+                Some(2),
+            );
             assert!(err.is_err(), "the injected failure must surface");
         }
         let all = idx.all_chunks().await.unwrap();
@@ -3256,7 +3973,15 @@ mod tests {
         // The file stayed retryable: the same pending commits cleanly now.
         {
             let mut st = idx.state.lock().await;
-            let n = DocIndex::commit_absorbed(&mut st, &pending, &vectors, &bounds, None).unwrap();
+            let n = DocIndex::commit_absorbed(
+                &mut st,
+                &pending,
+                &vectors,
+                &bounds,
+                EMBEDDER_ID_LEGACY,
+                None,
+            )
+            .unwrap();
             assert_eq!(n, 1, "the retry absorbs the file whole");
         }
         let all = idx.all_chunks().await.unwrap();

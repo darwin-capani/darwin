@@ -447,6 +447,28 @@ pub struct ConsolidateOutcome {
     pub deletes: Vec<String>,
 }
 
+/// One op=embed round trip: the vectors PLUS the vector-space metadata the
+/// server reports alongside them (see the "op=embed WIRE CONTRACT" comment in
+/// inference/server.py). `embedder`/`dim` are `None` on an old server that
+/// predates the metadata — such a server embeds via the only backend that ever
+/// existed (the legacy 4B mean-pool path), which is exactly how docsearch keys
+/// a metadata-less batch.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbedOutcome {
+    /// One L2-normalized vector per input text, in input order.
+    pub vectors: Vec<Vec<f64>>,
+    /// The stable id of the backend that ACTUALLY produced `vectors` — exactly
+    /// "coreml-bge-small-en-v1.5" or "llm-qwen3-4b-meanpool"; `None` on an old
+    /// server (necessarily the legacy mean-pool space).
+    pub embedder: Option<String>,
+    /// The vector dimension (384 or 2560); `None` on an old server, and null on
+    /// the wire only for an empty batch of the legacy path.
+    pub dim: Option<u64>,
+    /// Advisory: the Core ML backend was configured but unavailable, so this is
+    /// the server's honest 4B fallback. `false` when absent (old servers).
+    pub fell_back: bool,
+}
+
 #[derive(Deserialize)]
 #[allow(dead_code)] // id/latency_ms are part of the wire contract even if unused here
 struct Response {
@@ -477,6 +499,28 @@ struct Response {
     /// Absent on old servers (they reject op=embed before producing this).
     #[serde(default)]
     vectors: Option<Vec<Vec<f64>>>,
+    /// embed only: the STABLE id of the backend that ACTUALLY produced
+    /// `vectors` — exactly "coreml-bge-small-en-v1.5" (the Core ML bge
+    /// sentence-embedder path, 384-dim) or "llm-qwen3-4b-meanpool" (the legacy
+    /// 4B mean-pool path, 2560-dim). This is the VECTOR-SPACE key: vectors from
+    /// different backends live in different spaces and must never be
+    /// cosine-compared, so docsearch stamps this id on its persisted index.
+    /// Absent on old servers (they predate the metadata and embed via the only
+    /// backend that ever existed, the 4B mean-pool) — deserializes as None.
+    #[serde(default)]
+    embedder: Option<String>,
+    /// embed only: the integer vector dimension (384 or 2560). Per the server's
+    /// wire contract it is null ONLY on an empty batch of the legacy path
+    /// (nothing to index); also absent on old servers — deserializes as None.
+    #[serde(default)]
+    dim: Option<u64>,
+    /// embed only, ADVISORY: true iff the Core ML embedder was CONFIGURED but
+    /// unavailable, so this response is the honest 4B fallback (`embedder` is
+    /// then "llm-qwen3-4b-meanpool"). Not needed to key the space (`embedder`
+    /// already does); it lets the daemon/HUD surface the degraded state. Absent
+    /// on old servers — deserializes as None.
+    #[serde(default)]
+    fell_back: Option<bool>,
     /// clone_voice / design_voice only: the ElevenLabs voice id minted for the
     /// uploaded sample (clone) or the text DESCRIPTION (design). Absent on old servers
     /// (they reject those ops as unknown) and on every other op — deserializes as None.
@@ -1280,16 +1324,20 @@ impl InferenceClient {
         Ok((dictionary_id, version_id))
     }
 
-    /// On-device retrieval embeddings: hand the server a batch of strings and
-    /// get back one L2-normalized vector per input, in the SAME ORDER. The
-    /// server mean-pools the resident LLM's last hidden states — no new model
-    /// download. MNEMOSYNE's [`crate::recall::NeuralEmbeddingProvider`] calls
-    /// this for cosine-similarity recall ranking. When the inference server is
-    /// down OR predates the embed op, this returns Err (unknown op / socket
-    /// unavailable) and the recall layer falls back to lexical BM25. NOT
-    /// exercised by any test (the call is runtime/MLX-gated); the ranking LOGIC
-    /// is unit-tested with injected vectors.
-    pub async fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f64>>> {
+    /// On-device retrieval embeddings WITH the vector-space metadata: hand the
+    /// server a batch of strings and get back one L2-normalized vector per
+    /// input, in the SAME ORDER, plus WHICH backend produced them. The backend
+    /// is the server's `[inference].embedder` selection — the Core ML bge
+    /// sentence embedder by default (384-dim), or the legacy 4B mean-pool path
+    /// (2560-dim) by choice or on the server's honest fallback — and the
+    /// response names whichever ACTUALLY ran, so a caller that PERSISTS vectors
+    /// (docsearch) can stamp its store's vector space and refuse a meaningless
+    /// cross-space cosine. When the inference server is down OR predates the
+    /// embed op, this returns Err (unknown op / socket unavailable) and the
+    /// caller falls back to lexical BM25. NOT exercised by any test (the call
+    /// is runtime/MLX-gated); the ranking LOGIC is unit-tested with injected
+    /// vectors, and the wire shape is locked by the tests below.
+    pub async fn embed_with_meta(&mut self, texts: &[String]) -> Result<EmbedOutcome> {
         let mut req = Request::new(self.fresh_id(), "embed");
         req.texts = Some(texts);
         let resp = self.request(&req).await?;
@@ -1303,7 +1351,23 @@ impl InferenceClient {
                 texts.len()
             );
         }
-        Ok(vectors)
+        Ok(EmbedOutcome {
+            vectors,
+            embedder: resp.embedder,
+            dim: resp.dim,
+            fell_back: resp.fell_back.unwrap_or(false),
+        })
+    }
+
+    /// Vectors-only convenience over [`Self::embed_with_meta`] for callers that
+    /// NEVER persist vectors: MNEMOSYNE's recall paths embed the query and the
+    /// candidate facts TOGETHER in one call, so every comparison is same-space
+    /// by construction (one op=embed response = one backend for the whole
+    /// batch) and the space metadata is irrelevant to them. A caller that
+    /// PERSISTS vectors (docsearch) must use [`Self::embed_with_meta`] instead
+    /// so it can key the store's vector space.
+    pub async fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f64>>> {
+        Ok(self.embed_with_meta(texts).await?.vectors)
     }
 
     /// ON-DEVICE VISUAL DESCRIPTION (VLM). Hand the server a LOCAL image `path`
@@ -2547,24 +2611,49 @@ mod tests {
     }
 
     /// Backward compat / forward compat: the embed response carries a "vectors"
-    /// array (one L2-normalized vector per input); ops that don't return it
-    /// deserialize with vectors == None, and a present array round-trips.
+    /// array (one L2-normalized vector per input) PLUS the vector-space
+    /// metadata (`embedder` id / `dim` / `fell_back` — the server's op=embed
+    /// WIRE CONTRACT); ops that don't return them deserialize with every field
+    /// == None, and present values round-trip.
     #[test]
     fn embed_response_vectors_round_trip_and_default() {
         let with = serde_json::from_str::<Response>(
-            r#"{"id":"req-9","ok":true,"vectors":[[0.1,0.2],[0.3,0.4]],"latency_ms":7}"#,
+            r#"{"id":"req-9","ok":true,"vectors":[[0.1,0.2],[0.3,0.4]],
+                "embedder":"coreml-bge-small-en-v1.5","dim":2,"fell_back":false,
+                "latency_ms":7}"#,
         )
         .unwrap();
         let vecs = with.vectors.expect("vectors present");
         assert_eq!(vecs.len(), 2);
         assert_eq!(vecs[0], vec![0.1, 0.2]);
+        assert_eq!(with.embedder.as_deref(), Some("coreml-bge-small-en-v1.5"));
+        assert_eq!(with.dim, Some(2));
+        assert_eq!(with.fell_back, Some(false));
 
-        // A non-embed response (or an old server) carries no vectors field.
+        // A non-embed response (or an old server) carries no vectors field —
+        // and no space metadata: an OLD server predates the metadata entirely,
+        // so every field deserializes as None (the daemon then keys the batch
+        // as the legacy mean-pool space, the only backend such a server has).
         let without = serde_json::from_str::<Response>(
             r#"{"id":"req-1","ok":true,"text":"hi","latency_ms":3}"#,
         )
         .unwrap();
         assert!(without.vectors.is_none());
+        assert!(without.embedder.is_none());
+        assert!(without.dim.is_none());
+        assert!(without.fell_back.is_none());
+
+        // The legacy path's honest-fallback shape: mean-pool id + fell_back
+        // true, dim null on an empty batch — all representable.
+        let fallback = serde_json::from_str::<Response>(
+            r#"{"id":"req-2","ok":true,"vectors":[],
+                "embedder":"llm-qwen3-4b-meanpool","dim":null,"fell_back":true,
+                "latency_ms":2}"#,
+        )
+        .unwrap();
+        assert_eq!(fallback.embedder.as_deref(), Some("llm-qwen3-4b-meanpool"));
+        assert!(fallback.dim.is_none());
+        assert_eq!(fallback.fell_back, Some(true));
     }
 
     /// describe_image wire contract — the request carries op="describe_image",

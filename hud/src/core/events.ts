@@ -6201,7 +6201,8 @@ export function parseOptimizerProposal(
  *     transcript). `method` is the backend that ACTUALLY ran, so the panel never *
  *     claims neural when it fell back to BM25. The daemon NEVER fabricates a hit;  *
  *     the parser carries that forward — it surfaces ONLY real returned hits.     *
- *   - `system / docsearch.status` ({pdfjail_available, spotlight_available}) —   *
+ *   - `system / docsearch.status` ({pdfjail_available, spotlight_available,     *
+ *     embedder, reindex_needed}) —                                               *
  *     emitted every audit-snapshot tick (main.rs::audit_snapshot_task ->         *
  *     docsearch::emit_status): whether the daemon found its pdfjail memory-jail  *
  *     helper (PDF extraction jailed vs the weaker in-process fallback guard),    *
@@ -6212,7 +6213,14 @@ export function parseOptimizerProposal(
  *     disabled/rootless, the flag is off, Spotlight indexing is disabled, or     *
  *     the last attempt failed; never a stale "worked once" claim). Flat          *
  *     booleans, so a production install silently degraded on either front is     *
- *     VISIBLE.                                                                   *
+ *     VISIBLE. The VECTOR-SPACE legs ride the same frame: `embedder` is the     *
+ *     store's vector-space stamp (the STABLE id of the embedder that produced   *
+ *     the persisted index vectors) as of the daemon's MOST RECENT space         *
+ *     observation — null before any observation, for a vector-less store, and   *
+ *     on older daemons — and `reindex_needed` is true iff that observation was  *
+ *     a MISMATCH (the index was built by a DIFFERENT embedder than the active   *
+ *     one; searches degrade to lexical BM25 — never a cross-space cosine —      *
+ *     until a reindex rebuilds + re-stamps the store).                          *
  *                                                                                *
  * 100% ON-DEVICE: telemetry is the local 127.0.0.1 broadcast only — file         *
  * contents + embeddings never leave the device. SHIPPED-OFF: the feature is      *
@@ -6334,6 +6342,34 @@ export function parsePdfJailAvailable(data: Record<string, unknown>): boolean {
  *  direction. NEVER throws. */
 export function parseSpotlightAvailable(data: Record<string, unknown>): boolean {
   return bool(data, "spotlight_available") === true;
+}
+
+/** Parse a `docsearch.status` payload's index vector-space stamp: the STABLE id
+ *  of the embedder that produced the store's persisted vectors
+ *  ("coreml-bge-small-en-v1.5" or "llm-qwen3-4b-meanpool"), as of the daemon's
+ *  MOST RECENT space observation. Null honestly covers: an OLDER daemon (the
+ *  field never sent), a malformed/empty value, no space-observing docsearch
+ *  operation yet in this daemon process, and a store with no vectors (which
+ *  lives in no space) — the panel then claims nothing about the space. NEVER
+ *  throws. */
+export function parseDocSearchEmbedder(data: Record<string, unknown>): string | null {
+  const v = str(data, "embedder");
+  return v !== null && v.length > 0 ? v : null;
+}
+
+/** Parse a `docsearch.status` payload's reindex_needed leg: whether the
+ *  daemon's MOST RECENT vector-space comparison found the index built by a
+ *  DIFFERENT embedder than the active one — searches then degrade to lexical
+ *  BM25 (never a cross-space cosine, which would be meaningless) until a
+ *  reindex rebuilds + re-stamps the store. STRICT, the same rule as the
+ *  pdfjail/spotlight parses: only a literal JSON `true` raises the warning.
+ *  Absent (an OLDER daemon — which predates the second embedder entirely, so a
+ *  mismatch is impossible and `false` is CORRECT, not merely conservative),
+ *  malformed, and truthy-but-not-boolean values all coerce to `false`: the
+ *  panel never fabricates a degradation warning the daemon did not send. NEVER
+ *  throws. */
+export function parseDocSearchReindexNeeded(data: Record<string, unknown>): boolean {
+  return bool(data, "reindex_needed") === true;
 }
 
 /* ------------------------------------------------------------------------ *

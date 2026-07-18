@@ -1198,7 +1198,7 @@ fn tool_defs() -> &'static Value {
             },
             {
                 "name": "mnemosyne_recall",
-                "description": "Run MNEMOSYNE's semantic recall: RANK the facts already stored in long-term memory by relevance to a query and return the top matches. READ-ONLY — it retrieves, it stores nothing, sends nothing to the cloud, and changes nothing. Call this when the user asks what they said/told DARWIN before, what DARWIN remembers about a topic, to dig up a past note, or whether something was discussed. HONESTY ABOUT METHOD: ranking is RUNTIME-SELECTED. When the on-device inference server is running, recall is NEURAL — cosine similarity over on-device embedding vectors (the server mean-pools its resident model's hidden states), so it matches on MEANING, not just words. When that server is down, it FALLS BACK to lexical BM25 (term overlap, weighted by word distinctiveness, length-normalized) — keyword-semantic, not vector-semantic. The returned report NAMES whichever method actually ran; report it the same way (neural on-device embeddings, or lexical BM25 on fallback) and never claim neural when it fell back. Neural recall needs the inference server up; never claim measured embedding quality. It NEVER fabricates: when nothing stored is relevant (or memory is empty) it honestly returns that there is nothing on the topic yet — do not invent a memory in that case. Returns the matched facts (key + value) most-relevant first, deduplicated.",
+                "description": "Run MNEMOSYNE's semantic recall: RANK the facts already stored in long-term memory by relevance to a query and return the top matches. READ-ONLY — it retrieves, it stores nothing, sends nothing to the cloud, and changes nothing. Call this when the user asks what they said/told DARWIN before, what DARWIN remembers about a topic, to dig up a past note, or whether something was discussed. HONESTY ABOUT METHOD: ranking is RUNTIME-SELECTED. When the on-device inference server is running, recall is NEURAL — cosine similarity over on-device embedding vectors from the local inference server's embedding backend, so it matches on MEANING, not just words. When that server is down, it FALLS BACK to lexical BM25 (term overlap, weighted by word distinctiveness, length-normalized) — keyword-semantic, not vector-semantic. The returned report NAMES whichever method actually ran; report it the same way (neural on-device embeddings, or lexical BM25 on fallback) and never claim neural when it fell back. Neural recall needs the inference server up; never claim measured embedding quality. It NEVER fabricates: when nothing stored is relevant (or memory is empty) it honestly returns that there is nothing on the topic yet — do not invent a memory in that case. Returns the matched facts (key + value) most-relevant first, deduplicated.",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -9133,8 +9133,9 @@ const MNEMOSYNE_MAX_K: usize = 20;
 
 /// Production embedder for MNEMOSYNE's neural recall: owns the path to the
 /// daemon's `inference.sock` and fetches on-device embeddings via the typed
-/// `embed` op (mean-pooled hidden states of the resident MLX model — no new
-/// model download, never the cloud). Mirrors [`OnDeviceTranslator`]: it wires
+/// `embed` op (the server's `[inference].embedder` backend — the Core ML bge
+/// sentence embedder by default, or the legacy 4B mean-pool path — never the
+/// cloud). Mirrors [`OnDeviceTranslator`]: it wires
 /// only the LIVE on-device model; NOT exercised by any test (the recall tests
 /// inject a mock [`crate::recall::Embedder`]). When the server is down or
 /// predates the embed op, `embed` returns Err and the recall layer falls back
@@ -9163,6 +9164,25 @@ impl crate::recall::Embedder for InferenceEmbedder {
         Box::pin(async move {
             let mut client = crate::inference::InferenceClient::new(self.socket_path.clone());
             client.embed(texts).await
+        })
+    }
+
+    /// The LIVE space-aware embed: the op=embed vectors PLUS the
+    /// server-reported embedder id / dim / fell_back, so docsearch — the one
+    /// caller that PERSISTS vectors — can stamp its store's vector space and
+    /// refuse a meaningless cross-space cosine. (The recall paths keep calling
+    /// `embed`: they batch query + facts in ONE call and persist nothing, so
+    /// every comparison they make is same-space by construction.)
+    fn embed_with_space<'a>(&'a self, texts: &'a [String]) -> crate::recall::EmbedSpaceFuture<'a> {
+        Box::pin(async move {
+            let mut client = crate::inference::InferenceClient::new(self.socket_path.clone());
+            let out = client.embed_with_meta(texts).await?;
+            Ok(crate::recall::EmbeddedBatch {
+                vectors: out.vectors,
+                embedder: out.embedder,
+                dim: out.dim,
+                fell_back: out.fell_back,
+            })
         })
     }
 }
@@ -9526,7 +9546,11 @@ async fn doc_search_tool(
     // absorbed and the search proceeds over the index as it was.
     let ds_cfg = load_docsearch_config();
     crate::spotlight::augment_index(&ds_cfg, &idx, query, embedder).await;
-    let DocSearchResult { hits, method } = idx.search(query, k, embedder).await;
+    let DocSearchResult {
+        hits,
+        method,
+        reindex_needed,
+    } = idx.search(query, k, embedder).await;
     // Spotlight METADATA ENRICHMENT (mdls, READ-ONLY, same gate): optional
     // content-type / last-used / authors per cited hit — absent when unreadable,
     // NEVER fabricated. Parallel to `hits` (one Option per hit, same order).
@@ -9571,6 +9595,19 @@ async fn doc_search_tool(
             }).collect::<Vec<_>>(),
         }),
     );
+    // THE SPACE GUARD's user-facing surface: when the stored index vectors were
+    // produced by a DIFFERENT embedder than the active one, ranking degraded to
+    // keyword BM25 (never a cross-space cosine — it would be meaningless) and
+    // the one fix is a reindex, which re-embeds + re-stamps the store under the
+    // active embedder. Say so plainly, with the exact spoken command.
+    let space_note = if reindex_needed {
+        "\nAlso: your file index was built by a different on-device embedder than \
+         the one now active, so I ranked by keyword (BM25) instead of comparing \
+         vectors across embedding spaces. Say \"index my documents\" to rebuild \
+         the index under the active embedder and restore neural search."
+    } else {
+        ""
+    };
     if hits.is_empty() {
         // Honest empty — never a fabricated file/quote. Point the user at the
         // enable + allowlist step, since an empty result is most often "the index
@@ -9580,7 +9617,7 @@ async fn doc_search_tool(
              add a folder to index — on-device file search is on by default but stays \
              inert until you allowlist a folder, and it indexes only the folders you \
              allowlist — never your whole disk. \
-             Note: this is {method_note}",
+             Note: this is {method_note}{space_note}",
         );
     }
     let lines: Vec<String> = hits
@@ -9613,7 +9650,7 @@ async fn doc_search_tool(
         .collect();
     format!(
         "Here is what your files say on that, most relevant first (each cited to a real \
-         indexed file):\n{}\n(Search method: {method_note})",
+         indexed file):\n{}\n(Search method: {method_note}){space_note}",
         lines.join("\n"),
     )
 }

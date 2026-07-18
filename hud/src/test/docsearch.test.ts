@@ -4,6 +4,8 @@ import { describe, expect, it } from "vitest";
 import DocSearchPanel from "../components/DocSearchPanel";
 import {
   parseDocIndexStatus,
+  parseDocSearchEmbedder,
+  parseDocSearchReindexNeeded,
   parseDocSearchResult,
   parsePdfJailAvailable,
   parseSpotlightAvailable,
@@ -205,6 +207,41 @@ describe("parseSpotlightAvailable (strict, never overclaims the bridge)", () => 
   });
 });
 
+describe("parseDocSearchEmbedder (defensive, claims nothing when absent)", () => {
+  it("parses a present vector-space stamp verbatim", () => {
+    expect(parseDocSearchEmbedder({ embedder: "coreml-bge-small-en-v1.5" })).toBe(
+      "coreml-bge-small-en-v1.5",
+    );
+    expect(parseDocSearchEmbedder({ embedder: "llm-qwen3-4b-meanpool" })).toBe(
+      "llm-qwen3-4b-meanpool",
+    );
+  });
+
+  it("coerces absent/null/empty/malformed to null (an older daemon / no observation / no vectors)", () => {
+    expect(parseDocSearchEmbedder({})).toBeNull();
+    expect(parseDocSearchEmbedder({ embedder: null })).toBeNull();
+    expect(parseDocSearchEmbedder({ embedder: "" })).toBeNull();
+    expect(parseDocSearchEmbedder({ embedder: 42 })).toBeNull();
+  });
+});
+
+describe("parseDocSearchReindexNeeded (strict, never fabricates a warning)", () => {
+  it("raises the warning only on a literal JSON true", () => {
+    expect(parseDocSearchReindexNeeded({ reindex_needed: true })).toBe(true);
+    expect(parseDocSearchReindexNeeded({ reindex_needed: false })).toBe(false);
+  });
+
+  it("coerces absent/malformed/truthy-but-not-boolean to false", () => {
+    // An OLDER daemon predates the second embedder entirely, so its status
+    // frame has no reindex_needed leg AND no mismatch is possible — false is
+    // the CORRECT reading, not merely the conservative one.
+    expect(parseDocSearchReindexNeeded({})).toBe(false);
+    expect(parseDocSearchReindexNeeded({ reindex_needed: "true" })).toBe(false);
+    expect(parseDocSearchReindexNeeded({ reindex_needed: 1 })).toBe(false);
+    expect(parseDocSearchReindexNeeded({ reindex_needed: null })).toBe(false);
+  });
+});
+
 describe("docsearch reducer", () => {
   it("starts with no index, no search, and unknown (null) pdf-jail + spotlight statuses", () => {
     const s = connected();
@@ -212,6 +249,50 @@ describe("docsearch reducer", () => {
     expect(s.docSearch).toBeNull();
     expect(s.pdfJailAvailable).toBeNull();
     expect(s.spotlightAvailable).toBeNull();
+    // The vector-space legs start unclaimed: no stamp known, no warning raised.
+    expect(s.docSearchEmbedder).toBeNull();
+    expect(s.docSearchReindexNeeded).toBe(false);
+  });
+
+  it("sets the vector-space legs from docsearch.status (latest-wins, both directions)", () => {
+    let s = tel(
+      connected(),
+      env(
+        "docsearch.status",
+        {
+          pdfjail_available: true,
+          spotlight_available: false,
+          embedder: "llm-qwen3-4b-meanpool",
+          reindex_needed: true,
+        },
+        "system",
+      ),
+    );
+    expect(s.docSearchEmbedder).toBe("llm-qwen3-4b-meanpool");
+    expect(s.docSearchReindexNeeded).toBe(true);
+    // A reindex under the active embedder clears the mismatch on the next
+    // frame — never a sticky stale warning.
+    s = tel(
+      s,
+      env(
+        "docsearch.status",
+        {
+          pdfjail_available: true,
+          spotlight_available: false,
+          embedder: "coreml-bge-small-en-v1.5",
+          reindex_needed: false,
+        },
+        "system",
+      ),
+    );
+    expect(s.docSearchEmbedder).toBe("coreml-bge-small-en-v1.5");
+    expect(s.docSearchReindexNeeded).toBe(false);
+  });
+
+  it("an OLDER daemon's status frame (no vector-space legs) claims no stamp and raises no warning", () => {
+    const s = tel(connected(), env("docsearch.status", { pdfjail_available: true }, "system"));
+    expect(s.docSearchEmbedder).toBeNull();
+    expect(s.docSearchReindexNeeded).toBe(false);
   });
 
   it("sets the pdf-jail guard status from docsearch.status (system channel)", () => {
@@ -277,9 +358,18 @@ describe("DocSearchPanel (cited, honest, review-only)", () => {
     search: DocSearchResult | null,
     pdfJail: boolean | null = null,
     spotlight: boolean | null = null,
+    reindexNeeded = false,
+    storeEmbedder: string | null = null,
   ) =>
     renderToStaticMarkup(
-      createElement(DocSearchPanel, { index, search, pdfJail, spotlight }),
+      createElement(DocSearchPanel, {
+        index,
+        search,
+        pdfJail,
+        spotlight,
+        reindexNeeded,
+        storeEmbedder,
+      }),
     );
 
   it("shows the green ARMED guard pill when the daemon reports the pdf jail present", () => {
@@ -328,6 +418,36 @@ describe("DocSearchPanel (cited, honest, review-only)", () => {
   it("claims nothing about spotlight before a status frame arrives (older daemons)", () => {
     const html = render(parseDocIndexStatus(indexedNeural), null, null, null);
     expect(html).not.toContain("SPOTLIGHT");
+  });
+
+  it("shows the amber OLD-EMBEDDER pill + reindex note when the daemon reports a space mismatch", () => {
+    const html = render(
+      parseDocIndexStatus(indexedNeural),
+      null,
+      null,
+      null,
+      true,
+      "llm-qwen3-4b-meanpool",
+    );
+    expect(html).toContain("INDEX: OLD EMBEDDER");
+    expect(html).toContain("docsearch-pill stale-space");
+    // The tooltip + note name the stamp, the honest degradation (BM25, never a
+    // cross-space cosine), and the exact spoken recovery command.
+    expect(html).toContain("llm-qwen3-4b-meanpool");
+    expect(html).toMatch(/keyword \(BM25\) ranking/);
+    expect(html).toContain("index my documents");
+  });
+
+  it("the OLD-EMBEDDER pill renders without a stamp too (the mismatch alone is the warning)", () => {
+    const html = render(parseDocIndexStatus(indexedNeural), null, null, null, true, null);
+    expect(html).toContain("INDEX: OLD EMBEDDER");
+    expect(html).not.toContain("(null)");
+  });
+
+  it("raises no OLD-EMBEDDER warning when the daemon reports none (older daemons / matching space)", () => {
+    const html = render(parseDocIndexStatus(indexedNeural), null, null, null, false);
+    expect(html).not.toContain("OLD EMBEDDER");
+    expect(html).not.toContain("stale-space");
   });
 
   it("renders nothing before any index or search", () => {

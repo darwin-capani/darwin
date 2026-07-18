@@ -149,6 +149,8 @@ import {
   PROVENANCE_LEDGER_CAP,
   parseDocIndexStatus,
   parseDocSearchResult,
+  parseDocSearchEmbedder,
+  parseDocSearchReindexNeeded,
   parsePdfJailAvailable,
   parseSpotlightAvailable,
   parseCapabilityMap,
@@ -855,6 +857,22 @@ export interface HudState {
    *  DocSearchPanel pill never overclaims. Null until the first status frame
    *  (an older daemon), in which case claim nothing. */
   spotlightAvailable: boolean | null;
+  /** The index's VECTOR-SPACE stamp (docsearch.status `embedder`): the stable
+   *  id of the embedder that produced the store's persisted vectors, as of the
+   *  daemon's most recent space observation. Null until a status frame carries
+   *  one — an older daemon never sends the field, and the daemon itself sends
+   *  null before any space observation and for a vector-less store — in which
+   *  case the panel claims nothing about the space. */
+  docSearchEmbedder: string | null;
+  /** Whether the daemon's MOST RECENT vector-space comparison found the index
+   *  built by a DIFFERENT embedder than the active one (docsearch.status
+   *  `reindex_needed`): searches then degrade to lexical BM25 (never a
+   *  cross-space cosine) until "index my documents" rebuilds + re-stamps the
+   *  store — the DocSearchPanel shows the amber OLD-EMBEDDER pill so the
+   *  degradation is never silent. STRICT literal-true parse; `false` honestly
+   *  covers an older daemon (single embedder — a mismatch is impossible), no
+   *  comparison yet, and a matching space (no pill in all three). */
+  docSearchReindexNeeded: boolean;
   /** The self-distillation pipeline's honest state (distill.status): armed/
    *  inert, examples ready, last run — and that adapters are NEVER auto-
    *  promoted. Null until the first frame. REVIEW-ONLY. */
@@ -1529,6 +1547,8 @@ export function initialState(): HudState {
     docSearch: null,
     pdfJailAvailable: null,
     spotlightAvailable: null,
+    docSearchEmbedder: null,
+    docSearchReindexNeeded: false,
     distill: null,
     federatedSync: null,
     fleet: null,
@@ -2954,16 +2974,24 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
     case "docsearch.status": {
       // The daemon's periodic document-extraction guard status (main.rs::
       // audit_snapshot_task -> docsearch::emit_status): whether the pdfjail
-      // memory-jail helper sits next to the running darwind, and whether the
-      // READ-ONLY Spotlight candidate bridge is actually answering. Both parses
-      // are STRICT — only a literal JSON `true` claims the stronger/working
-      // state (never overclaim) — so `false` honestly covers "the daemon says
-      // no" and "the payload was malformed". The DocSearchPanel shows the amber
-      // PDF JAIL MISSING pill / the dim SPOTLIGHT IDLE pill on `false`.
+      // memory-jail helper sits next to the running darwind, whether the
+      // READ-ONLY Spotlight candidate bridge is actually answering, and the
+      // index's VECTOR-SPACE legs (which embedder produced the persisted
+      // vectors + whether the daemon's latest space comparison found a
+      // MISMATCH with the active embedder). The boolean parses are STRICT —
+      // only a literal JSON `true` claims the stronger/working state (jail,
+      // spotlight) or raises the warning (reindex_needed; an older daemon has
+      // one embedder, so its absent field correctly reads as no mismatch) —
+      // and `false` honestly covers "the daemon says no" and "the payload was
+      // malformed". The DocSearchPanel shows the amber PDF JAIL MISSING pill /
+      // the dim SPOTLIGHT IDLE pill on `false`, and the amber INDEX: OLD
+      // EMBEDDER pill only on a literal reindex_needed true.
       return {
         ...s,
         pdfJailAvailable: parsePdfJailAvailable(env.data),
         spotlightAvailable: parseSpotlightAvailable(env.data),
+        docSearchEmbedder: parseDocSearchEmbedder(env.data),
+        docSearchReindexNeeded: parseDocSearchReindexNeeded(env.data),
       };
     }
 

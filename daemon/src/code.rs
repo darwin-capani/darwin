@@ -295,7 +295,11 @@ pub async fn code_explain(
     if !code_permitted(cfg.enabled, &cfg.roots) {
         return CodeOutcome::Disabled;
     }
-    let DocSearchResult { hits, method } = index.search(question, CODE_CONTEXT_K, embedder).await;
+    // `reindex_needed` (the docsearch space guard) is deliberately unread here:
+    // grounding quality degrades to BM25 either way, and the guard's state is
+    // surfaced by the doc_search tool + docsearch.status, not per code answer.
+    let DocSearchResult { hits, method, .. } =
+        index.search(question, CODE_CONTEXT_K, embedder).await;
     if hits.is_empty() {
         // Honest: nothing in the index matched — never fabricate code not indexed.
         return CodeOutcome::NotIndexed;
