@@ -37,20 +37,27 @@ import Frame from "./Frame";
  * The reducer only ever sets `docIndex` from a defensively-parsed
  * `docsearch.indexed` (counts only, never a path), `docSearch` from a parsed
  * `docsearch.searched` (only real returned hits, with the honest method), and
- * `pdfJail` / `spotlight` from a STRICT `docsearch.status` parse (only a
+ * `pdfJail` / `spotlight` / `reindexNeeded` from a STRICT `docsearch.status`
+ * parse (only a
  * literal `true` claims the jail is armed / the READ-ONLY Spotlight candidate
- * bridge is answering), so this component can trust the fields it is handed.
+ * bridge is answering / the index needs a reindex because its vectors are
+ * unusable under the active embedder — a different OR unverifiable one), so
+ * this component can trust the fields it is handed.
  */
 export default function DocSearchPanel({
   index,
   search,
   pdfJail,
   spotlight,
+  reindexNeeded = false,
+  storeEmbedder = null,
 }: {
   index: DocIndexStatus | null;
   search: DocSearchResult | null;
   pdfJail: boolean | null;
   spotlight: boolean | null;
+  reindexNeeded?: boolean;
+  storeEmbedder?: string | null;
 }) {
   // Nothing to show until the user has either built an index or run a search —
   // render nothing rather than a placeholder, mirroring the other event-fed
@@ -62,7 +69,13 @@ export default function DocSearchPanel({
     <div className="docsearch-panel">
       <Frame title="FILE SEARCH // ON-DEVICE" tag="PRIVATE · REVIEW ONLY">
         <div className="docsearch-body">
-          <IndexStatusRow index={index} pdfJail={pdfJail} spotlight={spotlight} />
+          <IndexStatusRow
+            index={index}
+            pdfJail={pdfJail}
+            spotlight={spotlight}
+            reindexNeeded={reindexNeeded}
+            storeEmbedder={storeEmbedder}
+          />
           <SearchResults search={search} />
 
           <div className="docsearch-foot dim-note">
@@ -91,10 +104,14 @@ function IndexStatusRow({
   index,
   pdfJail,
   spotlight,
+  reindexNeeded,
+  storeEmbedder,
 }: {
   index: DocIndexStatus | null;
   pdfJail: boolean | null;
   spotlight: boolean | null;
+  reindexNeeded: boolean;
+  storeEmbedder: string | null;
 }) {
   if (index === null || index.chunks === 0) {
     return (
@@ -172,6 +189,28 @@ function IndexStatusRow({
             {spotlight ? "SPOTLIGHT ON" : "SPOTLIGHT IDLE"}
           </span>
         )}
+        {/* The VECTOR-SPACE guard (docsearch.status reindex_needed, same
+            precedent as the pdfjail pill: a degraded state is never silent).
+            Rendered ONLY on a literal daemon-reported `true`: the daemon's most
+            recent space comparison found the stored index vectors UNUSABLE for
+            neural ranking under the active embedder — EITHER the index was built
+            by a DIFFERENT embedder, OR it is a pre-stamp index of unverifiable
+            origin (keyed to a reserved unknown-space sentinel that never matches
+            a live embedder). Either way searches degrade to keyword BM25 — the
+            daemon never computes cosine across embedding spaces (it would be
+            meaningless) — until a reindex rebuilds and re-stamps the store. No
+            pill covers: an older daemon (no space guard at all), no space
+            comparison yet, and a matching space. */}
+        {reindexNeeded && (
+          <span
+            className="docsearch-pill stale-space"
+            title={`the index's stored vectors were produced by a different or unverifiable on-device embedder${
+              storeEmbedder !== null ? ` (${storeEmbedder})` : ""
+            } than the one now active — cosine between different embedders' vector spaces is meaningless, so searches fall back to keyword (BM25) ranking; say "index my documents" to rebuild the index under the active embedder and restore neural search`}
+          >
+            INDEX: OLD EMBEDDER
+          </span>
+        )}
       </div>
       <div className="docsearch-counts">
         <Count label="FILES" value={index.files} />
@@ -183,6 +222,15 @@ function IndexStatusRow({
           {index.embeddedChunks} of {index.chunks} chunks are embedded on-device;
           the rest will be ranked by keyword (BM25). Reindex while the on-device
           model is up to make search fully neural.
+        </div>
+      )}
+      {reindexNeeded && (
+        <div className="docsearch-note dim-note">
+          This index was built by a different or unverifiable on-device embedder
+          than the one now active, so searches use keyword (BM25) ranking —
+          vectors from different embedders are never compared. Say{" "}
+          <b>&ldquo;index my documents&rdquo;</b> to rebuild it under the active
+          embedder and restore neural search.
         </div>
       )}
     </div>

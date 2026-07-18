@@ -11,9 +11,14 @@
 //! is now RUNTIME-SELECTED between two real backends:
 //!   - [`NeuralEmbeddingProvider`] — TRUE on-device neural semantic recall:
 //!     it ranks facts by COSINE similarity over embedding VECTORS produced by
-//!     the inference server's `embed` op, which mean-pools the resident MLX
-//!     model's last hidden states (no new model download). PREFERRED whenever
-//!     the inference server is running and the embed op succeeds.
+//!     the inference server's `embed` op (its `[inference].embedder` backend —
+//!     the Core ML bge sentence embedder by default, or the legacy path that
+//!     mean-pools the resident MLX model's hidden states). PREFERRED whenever
+//!     the inference server is running and the embed op succeeds. Recall embeds
+//!     the query and the facts TOGETHER in one call and never persists a
+//!     vector, so every comparison is same-space by construction whichever
+//!     backend answered (persisting callers — docsearch — key the space via
+//!     [`Embedder::embed_with_space`] instead).
 //!   - [`LexicalProvider`] — the deterministic in-process BM25 ranker over the
 //!     fact text (term overlap, IDF-weighted, length-normalized). It is
 //!     keyword-semantic, NOT vector-semantic. The HONEST FALLBACK whenever the
@@ -67,8 +72,8 @@ pub enum RankMethod {
     /// the on-device embedder is unavailable (inference server down / no op).
     Lexical,
     /// True neural embedding similarity: cosine over the on-device embedding
-    /// vectors the inference server's `embed` op produces by mean-pooling the
-    /// resident MLX model's last hidden states. Active when the embedder is up.
+    /// vectors the inference server's `embed` op produces (its configured
+    /// `[inference].embedder` backend). Active when the embedder is up.
     Embedding,
 }
 
@@ -98,8 +103,8 @@ impl RankMethod {
             RankMethod::Embedding => {
                 "neural (on-device embeddings) recall: I rank your stored facts \
                  by cosine similarity over embedding vectors computed on-device \
-                 — the inference server mean-pools its resident model's hidden \
-                 states. This is true vector-semantic recall (it matches on \
+                 by the local inference server's embedding backend. This is true \
+                 vector-semantic recall (it matches on \
                  meaning, not just words); it needs the inference server running, \
                  and falls back to lexical BM25 when that server is down."
             }
@@ -316,8 +321,8 @@ pub(crate) fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
 
 /// TRUE neural semantic recall: ranks facts by COSINE similarity between the
 /// query embedding and each fact embedding. The embeddings are computed
-/// ON-DEVICE by the inference server's `embed` op (mean-pooled hidden states of
-/// the resident MLX model) and INJECTED into this provider — so the provider
+/// ON-DEVICE by the inference server's `embed` op (its configured
+/// `[inference].embedder` backend) and INJECTED into this provider — so the provider
 /// itself is PURE and DETERMINISTIC, and the (runtime/MLX-gated) embedding call
 /// lives in the caller, not here. That split is what makes the ranking logic
 /// unit-testable with mocked vectors while keeping the real call out of tests.
@@ -496,11 +501,60 @@ pub struct RankedRecall {
 /// the Babel `Translator` and SAGE `Brain` traits).
 pub trait Embedder: Send + Sync {
     fn embed<'a>(&'a self, texts: &'a [String]) -> EmbedFuture<'a>;
+
+    /// SPACE-AWARE embed: the vectors PLUS the OPAQUE space-id of which embedder
+    /// produced them, so a caller that PERSISTS vectors (docsearch) can stamp
+    /// its store's space and refuse a meaningless cross-space cosine. The
+    /// provided default delegates to [`Self::embed`] and reports NO metadata
+    /// (`embedder: None`) — exactly what an old inference server sends. A
+    /// persisting caller keys such a metadata-less batch to its OWN opaque
+    /// placeholder; it does NOT assume the batch is any particular backend
+    /// (ids are opaque + model-derived). The live inference-socket embedder
+    /// (anthropic.rs) overrides this with the real op=embed metadata; mocks
+    /// and callers that only need `embed` keep compiling and behave as before.
+    fn embed_with_space<'a>(&'a self, texts: &'a [String]) -> EmbedSpaceFuture<'a> {
+        Box::pin(async move {
+            let vectors = self.embed(texts).await?;
+            Ok(EmbeddedBatch {
+                vectors,
+                embedder: None,
+                dim: None,
+                fell_back: false,
+            })
+        })
+    }
 }
 
 /// The boxed future [`Embedder::embed`] returns, kept object-safe for `&dyn`.
 pub type EmbedFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<Vec<Vec<f64>>>> + Send + 'a>>;
+
+/// The boxed future [`Embedder::embed_with_space`] returns, kept object-safe
+/// for `&dyn` (same pattern as [`EmbedFuture`]).
+pub type EmbedSpaceFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<EmbeddedBatch>> + Send + 'a>>;
+
+/// One space-aware embed batch: the vectors plus the OPAQUE space-id of which
+/// embedder produced them. Mirrors [`crate::inference::EmbedOutcome`] — kept as
+/// its own struct so trait mocks build it directly without touching the socket
+/// client. `embedder`/`dim` are `None` when the response predates the op=embed
+/// space metadata; a persisting caller keys such a batch to its own opaque
+/// placeholder rather than assuming a backend (ids are opaque + model-derived).
+#[derive(Debug, Clone, PartialEq)]
+pub struct EmbeddedBatch {
+    /// One L2-normalized vector per input text, in input order.
+    pub vectors: Vec<Vec<f64>>,
+    /// The OPAQUE, model-accurate space-id string the backend reports (e.g. the
+    /// Core ML bge id, or a model-derived mean-pool id), or `None` on a
+    /// metadata-less old server. Compared only by equality, never interpreted.
+    pub embedder: Option<String>,
+    /// The vector dimension the backend produces; `None` on an old server or an
+    /// empty batch.
+    pub dim: Option<u64>,
+    /// Advisory: the server fell back to the mean-pool backend although the Core
+    /// ML one was configured. `false` when absent.
+    pub fell_back: bool,
+}
 
 /// Rank `facts` against `query`, RUNTIME-SELECTING the backend: try the neural
 /// on-device embedder FIRST, and FALL BACK to lexical BM25 when it is
@@ -1042,6 +1096,30 @@ mod tests {
                 outcome
             })
         }
+    }
+
+    /// The PROVIDED `embed_with_space` default delegates to `embed` and reports
+    /// NO space metadata (embedder/dim None, fell_back false) — byte-for-byte
+    /// what an old inference server sends, which docsearch keys as the legacy
+    /// mean-pool space. A mock implementing only `embed` therefore behaves as a
+    /// space-unaware (legacy) embedder without any change.
+    #[tokio::test]
+    async fn embed_with_space_default_delegates_and_reports_no_metadata() {
+        let embedder = MockEmbedder::answering(vec![vec![1.0, 0.0]]);
+        let batch = embedder
+            .embed_with_space(&["query".to_string()])
+            .await
+            .expect("delegates to the answering embed");
+        assert_eq!(batch.vectors, vec![vec![1.0, 0.0]]);
+        assert_eq!(batch.embedder, None, "no metadata on the default path");
+        assert_eq!(batch.dim, None);
+        assert!(!batch.fell_back);
+
+        // A down embedder's Err propagates through the default unchanged.
+        assert!(MockEmbedder::down()
+            .embed_with_space(&["query".to_string()])
+            .await
+            .is_err());
     }
 
     #[tokio::test]

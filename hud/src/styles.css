@@ -5745,6 +5745,11 @@ svg.tri circle {
    search still runs over the on-device index). */
 .docsearch-pill.spotlight-on { color: var(--learn-green); }
 .docsearch-pill.spotlight-idle { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
+/* The vector-space guard pill (docsearch.status reindex_needed): amber — the
+   index was built by a DIFFERENT embedder than the active one, so search runs
+   degraded (BM25, never a cross-space cosine) until a reindex re-stamps the
+   store. Same degraded palette as the BM25/unjailed pills. */
+.docsearch-pill.stale-space { color: var(--warn-amber); }
 
 /* Capability map (capability.map): the live "armed by default, gated per action"
    readout. Same ok/degraded/off palette as the docsearch pills. */

@@ -692,6 +692,8 @@ export default function App() {
             search={state.docSearch}
             pdfJail={state.pdfJailAvailable}
             spotlight={state.spotlightAvailable}
+            reindexNeeded={state.docSearchReindexNeeded}
+            storeEmbedder={state.docSearchEmbedder}
           />
           <CodeIntelPanel code={state.codeIntel} />
           <ChangeQueuePanel changeq={state.changeq} />

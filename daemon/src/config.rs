@@ -516,9 +516,14 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // default) — INERT WITHOUT a loadable `draft_model` (ships ""), in which case
     // generate falls back to normal gen + reports speculative=false. SELECTABLE
     // QUANTIZATION (#39): `quant` ships "auto" (== today's behavior; validated against
-    // InferenceConfig::ALLOWED_QUANT, an unknown value falls back to "auto"). Listed
-    // so none reads as a typo.
-    ("inference", &["preload", "speculative", "draft_model", "quant"]),
+    // InferenceConfig::ALLOWED_QUANT, an unknown value falls back to "auto"). op=embed
+    // BACKEND: `embedder` ships "coreml-bge-small-en-v1.5" (the Core ML bge sentence
+    // embedder — faster + higher retrieval quality; honest fallback to a mean-pool
+    // path when it cannot build/load, with the OPAQUE active/fallback space-id
+    // reported on the wire — the daemon compares that id only by equality).
+    // Server-side only (the python server reads it), listed here so a typo under
+    // [inference] is still diagnosed and the config-lockstep test stays green.
+    ("inference", &["preload", "speculative", "draft_model", "quant", "embedder"]),
     ("self_heal", &["enabled", "mode"]),
     // [forge] — Self-Forge (forge.rs). Same shape and contract as [self_heal]:
     // "mode" is "propose"|"auto" and is listed so it never reads as a typo. Note
