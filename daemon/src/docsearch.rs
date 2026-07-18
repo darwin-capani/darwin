@@ -2308,14 +2308,16 @@ impl DocIndex {
 /// stored chunk text.
 /// Sort the scored chunks into the dense order, apply the optional STAGE-TWO
 /// cross-encoder RERANK to the top shortlist (config-gated), and build the cited
-/// top-`k` [`DocHit`]s. When the rerank runs, `base_method` is upgraded to
-/// [`RankMethod::Reranked`] and the top [`crate::recall::DEFAULT_RERANK_K`] hits
-/// are re-ordered by the cross-encoder score (the tail below the shortlist keeps
-/// its dense order); on any honest fallback (reranker off / unavailable / server
-/// down) the dense order + `base_method` stand, never mislabeled. `base_method` is
-/// `Embedding` (neural cosine) or `Lexical` (BM25) — the cross-encoder can sharpen
-/// EITHER shortlist. Each [`DocHit::score`] keeps its DENSE retrieval score (cosine
-/// / BM25); the ORDER reflects the rerank when it ran (the `method` says which).
+/// top-`k` [`DocHit`]s. When the rerank runs, the top [`crate::recall::DEFAULT_RERANK_K`]
+/// hits are re-ordered by the cross-encoder score (the tail below the shortlist
+/// keeps its dense order) and `method` reflects the TRUE stage one: an `Embedding`
+/// base becomes [`RankMethod::Reranked`], a `Lexical` base becomes
+/// [`RankMethod::LexicalReranked`] — the label never claims a neural stage one the
+/// BM25 fallback did not run. On any honest fallback (reranker off / unavailable /
+/// server down) the dense order + `base_method` stand, never mislabeled.
+/// `base_method` is `Embedding` (neural cosine) or `Lexical` (BM25) — the
+/// cross-encoder can sharpen EITHER shortlist. Each [`DocHit::score`] keeps its
+/// DENSE retrieval score (cosine / BM25); the ORDER reflects the rerank when it ran.
 async fn rank_cite_rerank(
     query: &str,
     corpus: &CachedCorpus,

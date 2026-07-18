@@ -1867,9 +1867,13 @@ pub struct InferenceConfig {
     /// op) and re-order by it (`RankMethod::Reranked`). READ by BOTH sides: the
     /// daemon (via `anthropic::init_reranker` -> the `RERANKER_GATE`) decides
     /// whether to CALL op=rerank, and the inference server decides whether to WARM
-    /// the cross-encoder at preload. HONEST FALLBACK: when off, unbuildable, or the
-    /// server is down, the dense order stands and the method stays `Embedding`
-    /// (never mislabeled). `false` disables the second stage (dense-only retrieval).
+    /// the cross-encoder at preload. HONEST FALLBACK: when the reranker is off or
+    /// unbuildable, the dense order stands and the method keeps whatever stage one
+    /// produced — `Embedding` (server up) or `Lexical` (server down: the embed op
+    /// also fails, so stage one is BM25, NOT `Embedding`). When the reranker DOES
+    /// re-score, the label reflects that stage one: `Reranked` over an embedding
+    /// base, `LexicalReranked` over a BM25 base — never mislabeled as neural.
+    /// `false` disables the second stage (dense-only retrieval).
     pub reranker: bool,
 }
 
