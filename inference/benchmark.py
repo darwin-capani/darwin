@@ -218,8 +218,13 @@ METHODOLOGY = {
                       "short synthesized speech clip (audio length reported).",
     "tts_rtf": "real-time factor = synth_seconds / audio_seconds; < 1.0 is "
                "faster than real time (lower is better).",
-    "embed_latency_ms": "wall-clock milliseconds to compute one mean-pooled "
-                        "embedding via the resident LLM forward pass.",
+    "embed_latency_ms": "wall-clock milliseconds to compute one embedding via "
+                        "the ACTIVE op=embed backend ([inference].embedder — the "
+                        "Core ML bge sentence embedder by default, ANE-ELIGIBLE: "
+                        "Core ML schedules ANE/GPU/CPU at its discretion, so this "
+                        "is measured END-TO-END latency, never an ANE-residency "
+                        "claim; else the resident-LLM mean-pool forward). The "
+                        "results carry the embedder id + dim it measured.",
     "speculative": "decode tok/s with the draft model ON vs OFF on the uncached "
                    "path; the persona-cached path is reported unreachable when "
                    "mlx_lm rejects draft_model together with a prompt_cache.",
@@ -580,29 +585,35 @@ _EMBED_BATCH = [
 
 
 def bench_embed(eng, runs, warmup):
-    """Embedding throughput for the resident-LLM mean-pooled path, measured two
-    ways: SINGLE (one embed() call per text — a forward per text) and BATCHED (the
-    whole batch in one embed() call, one padded forward per chunk, the real
-    MNEMOSYNE call shape). per_text_ms lets the two be compared apples-to-apples;
-    the batched path amortizes the per-forward overhead."""
-    text = ("DARWIN keeps its embeddings on device by mean-pooling the resident "
-            "language model's last hidden states.")
+    """Embedding throughput for the ACTIVE op=embed backend ([inference].embedder
+    — the Core ML bge sentence embedder by default, else the legacy 4B mean-pool
+    path), measured two ways: SINGLE (one embed() call per text) and BATCHED (the
+    whole batch in one embed() call, the real MNEMOSYNE call shape). per_text_ms
+    lets the two be compared apples-to-apples; the batched path amortizes the
+    per-forward/per-predict overhead.
+
+    Records the ACTIVE embedder's STABLE id + dim (the op=embed wire contract's
+    vector-SPACE identity) + fell_back (true iff the Core ML backend was
+    configured but unavailable, so these are the honest 4B-fallback numbers) so
+    the committed baseline never mislabels which embedder it measured."""
+    text = ("DARWIN keeps its retrieval embeddings on device via a purpose-built "
+            "Core ML sentence embedder (bge-small), falling back to the resident "
+            "language model's mean-pooled hidden states.")
     batch = _EMBED_BATCH
     n = len(batch)
-    with eng._lock:
-        eng._ensure_llm()
-        # SINGLE-text latency (one forward), unchanged metric for continuity.
-        single = []
-        dim = None
-        for _ in range(runs + warmup):
-            t0 = time.perf_counter()
-            vec = eng._embed_one(_mx(), text)
-            single.append((time.perf_counter() - t0) * 1000.0)
-            dim = len(vec)
-    # The two public-path measurements run OUTSIDE eng._lock: embed() acquires
-    # the engine's NON-REENTRANT threading.Lock itself, so calling it while
-    # holding the lock self-deadlocks the benchmark. Measuring the public entry
-    # point (lock acquisition included) is also the honest end-to-end number.
+    # Warm the ACTIVE backend (Core ML convert-on-first-use / load, or the 4B LLM)
+    # and read its identity BEFORE timing, so the timed runs measure steady-state
+    # prediction — never the one-time conversion. embed_with_meta acquires its own
+    # locks, so it runs OUTSIDE eng._lock (the 4B path's non-reentrant GPU lock).
+    _v, embedder_id, meta_dim, fell_back = eng.embed_with_meta([text])
+    # SINGLE-text latency of the ACTIVE public path (one embed() call).
+    single = []
+    dim = meta_dim
+    for _ in range(runs + warmup):
+        t0 = time.perf_counter()
+        vec = eng.embed([text])[0]
+        single.append((time.perf_counter() - t0) * 1000.0)
+        dim = len(vec)
     # SINGLE path over the batch: one embed() call per text.
     single_batch_ms = []
     for _ in range(runs + warmup):
@@ -627,7 +638,12 @@ def bench_embed(eng, runs, warmup):
     batched_total = summarize_metric(batched_ms, warmup=warmup)
     return {
         "available": True,
-        "model": eng.llm_id,
+        "embedder": embedder_id,
+        "fell_back": fell_back,
+        # `model` = the underlying checkpoint the ACTIVE embedder runs (bge for
+        # the Core ML path, the resident LLM for the mean-pool path).
+        "model": ("BAAI/bge-small-en-v1.5"
+                  if embedder_id == server_embedder_coreml_id() else eng.llm_id),
         "dim": dim,
         "latency_ms": summarize_metric(single, warmup=warmup),
         "batch": {
@@ -641,6 +657,14 @@ def bench_embed(eng, runs, warmup):
             "min_cosine_single_vs_batched": min_cosine,
         },
     }
+
+
+def server_embedder_coreml_id():
+    """The Core ML embedder's stable wire id, read from server (single source of
+    truth) so the benchmark labels never drift from the contract."""
+    sys.path.insert(0, str(HERE))
+    import server
+    return server.EMBEDDER_COREML
 
 
 def _mx():

@@ -71,6 +71,12 @@ state/ipc/inference.sock per the shared contract:
              "upserts"?: [{"key": str, "value": str}], "deletes"?: [str],
              "vectors"?: [[float]] (op=embed: one L2-normalized vector per
              input text, in input order),
+             "embedder"?: str + "dim"?: int + "fell_back"?: bool (op=embed WIRE
+             CONTRACT: the ACTIVE backend's STABLE id — "coreml-bge-small-en-v1.5"
+             (384-dim) or "llm-qwen3-4b-meanpool" (2560-dim) — and its vector
+             dimension, so the daemon/docsearch key the vector SPACE and refuse
+             cross-space comparison; fell_back is true iff the Core ML backend was
+             configured but unavailable, so this is the honest 4B fallback),
              "model"?: str (op=describe_image: the VLM id used; op=generate_image:
              the image model id used),
              "size"?: int, "steps"?: int, "seed"?: int (op=generate_image: the
@@ -1467,6 +1473,61 @@ EMBED_BATCH_CHUNK = 32
 EMBED_CHUNK_TOKEN_BUDGET = 4096
 EMBED_CHUNK_WASTE_FACTOR = 2
 
+# ---- op=embed BACKEND SELECTION ([inference].embedder) ----------------------
+# The op=embed backend is config-selectable. Two vector SPACES exist; the
+# op=embed response carries the ACTIVE backend's id + dim so the daemon/docsearch
+# know which space the vectors live in and refuse cross-space comparison:
+#   * EMBEDDER_COREML — a purpose-built Core ML contrastive sentence embedder
+#     (BAAI/bge-small-en-v1.5, 384-dim; see inference/coreml_embed.py). MEASURED
+#     on this M1 Pro (scratch-bench/ane-probe/eval, synthetic-but-representative):
+#     ~30x faster AND dramatically higher retrieval quality than the 4B path
+#     (recall@1/3/5 0.82/0.92/0.99, MRR 0.96 vs 0.25/0.46/0.56, MRR 0.42). This
+#     is the state-of-the-art choice, so it is the DEFAULT.
+#   * EMBEDDER_LLM_MEANPOOL — the legacy path: mean-pool the resident 4B LLM's
+#     last hidden states (2560-dim). Reuses the already-loaded generate model
+#     (no extra download), but slower and much weaker at retrieval.
+# The ids are STABLE strings — the wire contract the Rust docsearch task stores
+# with its index. Do NOT change them without a coordinated migration.
+EMBEDDER_COREML = "coreml-bge-small-en-v1.5"
+EMBEDDER_LLM_MEANPOOL = "llm-qwen3-4b-meanpool"
+ALLOWED_EMBEDDERS = (EMBEDDER_COREML, EMBEDDER_LLM_MEANPOOL)
+# DEFAULT = the Core ML bge embedder (faster AND higher quality — the SOTA
+# choice). HONEST FALLBACK: if it cannot be built/loaded, op=embed serves the 4B
+# mean-pool path instead and REPORTS the fallback (embedder id + fell_back flag +
+# a log warn) — never silently.
+DEFAULT_EMBEDDER = EMBEDDER_COREML
+# The Core ML embedder's fixed output dimension (bge-small hidden size). Mirrors
+# coreml_embed.DIM; kept here so the pure selection logic needs no heavy import.
+COREML_EMBED_DIM = 384
+
+
+def validate_embedder(value):
+    """PURE. Return `value` if it is a known embedder id, else raise ValueError.
+    Mirrors the daemon's config validation so both sides reject the same values;
+    the config-load seam turns the ValueError into a warn + keep-default."""
+    if value in ALLOWED_EMBEDDERS:
+        return value
+    raise ValueError(
+        f"unknown embedder {value!r}; allowed: {', '.join(ALLOWED_EMBEDDERS)}"
+    )
+
+
+def plan_embedder(choice, coreml_available):
+    """PURE selection/fallback decision for op=embed. Given the configured
+    `choice` and whether the Core ML embedder is usable, return
+    (embedder_id, dim_or_None, fell_back):
+      * choice=coreml + available  -> (EMBEDDER_COREML, COREML_EMBED_DIM, False)
+      * choice=coreml + UNavailable -> (EMBEDDER_LLM_MEANPOOL, None, True)  # honest fallback
+      * choice=llm                  -> (EMBEDDER_LLM_MEANPOOL, None, False)
+    `dim` is None for the 4B path because its true dimension is the resident
+    model's hidden size, known only from a produced vector; the caller fills it
+    from the actual vectors. The Core ML dim is fixed by construction (384)."""
+    if choice == EMBEDDER_COREML:
+        if coreml_available:
+            return (EMBEDDER_COREML, COREML_EMBED_DIM, False)
+        return (EMBEDDER_LLM_MEANPOOL, None, True)
+    return (EMBEDDER_LLM_MEANPOOL, None, False)
+
 
 def _pack_embed_chunks(lengths, row_cap=None, token_budget=None, waste_factor=None):
     """PURE, ORDER-PRESERVING chunker for the batched embed forward: split the
@@ -2189,6 +2250,11 @@ def load_config():
         # matching variant at load; if absent the loader falls back + reports the
         # quant that ACTUALLY loaded. Validated below (unknown -> "auto").
         "quant": "auto",
+        # op=embed BACKEND. DEFAULT = the Core ML bge embedder (faster AND higher
+        # retrieval quality — the SOTA choice). HONEST FALLBACK to the 4B
+        # mean-pool path if it cannot be built/loaded. Validated below (unknown
+        # -> DEFAULT_EMBEDDER + warn), mirroring the daemon's config validation.
+        "embedder": DEFAULT_EMBEDDER,
     }
     try:
         import tomllib  # stdlib on 3.11+
@@ -2387,6 +2453,29 @@ def load_config():
             log.warning(
                 "config key [inference].quant must be a string; got %r; keeping \"auto\"",
                 raw,
+            )
+
+    # op=embed BACKEND: [inference].embedder must be one of ALLOWED_EMBEDDERS
+    # (default = the Core ML bge embedder). An unknown value is a misconfiguration
+    # — keep the DEFAULT + warn rather than pass a bogus id. Mirrors the daemon's
+    # config validation so the two sides reject the same values.
+    if isinstance(inference, dict) and "embedder" in inference:
+        raw = inference["embedder"]
+        if isinstance(raw, str):
+            try:
+                settings["embedder"] = validate_embedder(raw.strip())
+            except ValueError:
+                log.warning(
+                    "config key [inference].embedder = %r is not one of %s; keeping %r",
+                    raw,
+                    ", ".join(ALLOWED_EMBEDDERS),
+                    DEFAULT_EMBEDDER,
+                )
+        else:
+            log.warning(
+                "config key [inference].embedder must be a string; got %r; keeping %r",
+                raw,
+                DEFAULT_EMBEDDER,
             )
 
     return settings
@@ -2631,6 +2720,19 @@ class InferenceEngine:
         # The quant that ACTUALLY loaded (honest report). None until the LLM is
         # loaded; "auto" means the loader picked the on-disk variant as today.
         self._quant_loaded = None
+        # op=embed BACKEND (config-selectable). DEFAULT = the Core ML bge
+        # embedder (faster + higher retrieval quality). The Core ML embedder is
+        # lazy-built/loaded on first embed (convert-on-first-use, cached under the
+        # HF cache root); if it cannot be built/loaded, op=embed falls back to the
+        # 4B mean-pool path and REPORTS the fallback (never silent). Its lifecycle
+        # lock is separate from the MLX GPU lock, so embedding runs independently
+        # of LLM generation.
+        self.embedder_choice = settings.get("embedder", DEFAULT_EMBEDDER)
+        self._coreml_embedder = None
+        # Set once a build/load attempt hard-fails, so we don't retry the
+        # (expensive) conversion on every embed call — we serve the 4B fallback.
+        self._coreml_embed_unavailable = False
+        self._embed_lifecycle_lock = threading.Lock()
         engine = (settings.get("engine") or DEFAULT_TTS_ENGINE).strip().lower()
         if engine not in TTS_ENGINE_DEFAULTS:
             log.warning(
@@ -3784,21 +3886,53 @@ class InferenceEngine:
         one implementation. Caller holds self._lock and the LLM is loaded."""
         return self._embed_batch(mx, [text])[0]
 
-    def embed(self, texts):
-        """Return one L2-normalized embedding VECTOR per input string, computed
-        ON-DEVICE by mean-pooling the resident LLM's last hidden states. This is
-        the retrieval-embedding op MNEMOSYNE's NeuralEmbeddingProvider calls; it
-        reuses the already-loaded generate model so NO new model is downloaded.
+    def _ensure_coreml_embedder(self):
+        """Lazy-construct + return the Core ML bge embedder (convert-on-first-use,
+        cached under the HF cache root). Raises coreml_embed.CoreMLEmbedderUnavailable
+        if the deps/model cannot be built or loaded — the caller catches it, marks
+        the backend unavailable (no retry storm), and falls back to the 4B path.
+        Guarded by _embed_lifecycle_lock so two threads never convert at once."""
+        from coreml_embed import CoreMLEmbedder
 
-        `texts` is a list of strings (the daemon sends the query + the candidate
-        facts in one batch). The batch is capped at EMBED_MAX_BATCH and each input
-        at EMBED_MAX_TOKENS. Returns a list of equal-length float vectors, in the
-        SAME ORDER as the inputs — computed as one padded forward per chunk of
-        EMBED_BATCH_CHUNK rather than a forward per text. Deterministic (a forward
-        pass, no sampling). Holds the GPU lock for the batch like the other LLM
-        ops."""
+        with self._embed_lifecycle_lock:
+            if self._coreml_embedder is None:
+                self._coreml_embedder = CoreMLEmbedder()
+            emb = self._coreml_embedder
+        emb.ensure_loaded()  # convert-on-first-use / load (own lock); may raise
+        return emb
+
+    def _embed_4b(self, texts):
+        """The LEGACY op=embed backend: one L2-normalized VECTOR per input,
+        computed ON-DEVICE by mean-pooling the resident 4B LLM's last hidden
+        states (2560-dim). Reuses the already-loaded generate model so NO new
+        model is downloaded. One padded forward per chunk of EMBED_BATCH_CHUNK;
+        holds the GPU lock for the batch like the other LLM ops. Deterministic."""
         import mlx.core as mx
 
+        with self._lock:
+            self._ensure_llm()
+            return self._embed_batch(mx, texts)
+
+    def embed_with_meta(self, texts):
+        """Return (vectors, embedder_id, dim, fell_back) for op=embed — the batch
+        embedded by the ACTIVE backend, plus which vector SPACE those vectors live
+        in. This is the retrieval-embedding op MNEMOSYNE's NeuralEmbeddingProvider
+        calls; the daemon/docsearch store `embedder_id` + `dim` with the index and
+        refuse cross-space comparison.
+
+        Backend = [inference].embedder. DEFAULT is the Core ml bge embedder
+        (EMBEDDER_COREML, 384-dim — faster AND higher retrieval quality). HONEST
+        FALLBACK: if the Core ML embedder cannot be built/loaded, this serves the
+        4B mean-pool path (EMBEDDER_LLM_MEANPOOL) and reports fell_back=True + a
+        log warn — never silently. When EMBEDDER_LLM_MEANPOOL is configured
+        outright, fell_back is False.
+
+        `texts` is a list of strings; the batch is capped at EMBED_MAX_BATCH and
+        each input at the backend's length cap (SEQ=128 for Core ML,
+        EMBED_MAX_TOKENS for 4B). Returns vectors in input order; empty batch ->
+        []. `dim` is the Core ML fixed dim (384) even for an empty batch; for the
+        4B path it is the produced vector length (None on an empty batch, which
+        indexes nothing). Vectors are finite (NaN/Inf scrubbed to 0.0)."""
         if not isinstance(texts, list):
             raise ValueError("'texts' must be a list of strings for op=embed")
         if len(texts) > EMBED_MAX_BATCH:
@@ -3808,11 +3942,44 @@ class InferenceEngine:
         for t in texts:
             if not isinstance(t, str):
                 raise ValueError("'texts' entries must be strings for op=embed")
+
+        # Try the configured Core ML backend; on unavailability, fall back
+        # HONESTLY to the 4B path and report it.
+        if (
+            self.embedder_choice == EMBEDDER_COREML
+            and not self._coreml_embed_unavailable
+        ):
+            from coreml_embed import CoreMLEmbedderUnavailable
+
+            try:
+                emb = self._ensure_coreml_embedder()
+                vectors = emb.embed(texts)  # already scrubbed + L2-normalized
+                return (vectors, EMBEDDER_COREML, COREML_EMBED_DIM, False)
+            except CoreMLEmbedderUnavailable as e:
+                self._coreml_embed_unavailable = True
+                log.warning(
+                    "Core ML embedder unavailable (%s); falling back to the 4B "
+                    "mean-pool path and reporting embedder=%s",
+                    e,
+                    EMBEDDER_LLM_MEANPOOL,
+                )
+
+        _id, _dim, fell_back = plan_embedder(
+            self.embedder_choice, coreml_available=False
+        )
         if not texts:
-            return []
-        with self._lock:
-            self._ensure_llm()
-            return self._embed_batch(mx, texts)
+            # No work; the 4B path's true dim is unknown without a forward.
+            return ([], EMBEDDER_LLM_MEANPOOL, None, fell_back)
+        vectors = self._embed_4b(texts)
+        dim = len(vectors[0]) if vectors else None
+        return (vectors, EMBEDDER_LLM_MEANPOOL, dim, fell_back)
+
+    def embed(self, texts):
+        """Back-compat wrapper: return just the list of embedding VECTORS for
+        `texts` (the ACTIVE backend, per [inference].embedder). Callers that also
+        need the vector-space identity use [`embed_with_meta`]; op=embed on the
+        wire carries the embedder id + dim from there."""
+        return self.embed_with_meta(texts)[0]
 
     # -- on-device vision-language model (op=describe_image) ------------
     # _ensure_vlm must be called with self._lock held.
@@ -6063,11 +6230,37 @@ class InferenceServer:
                     raise ValueError("'texts' is required for op=embed")
                 if not isinstance(texts, list):
                     raise ValueError("'texts' must be a list of strings for op=embed")
-                vectors = await asyncio.to_thread(self.engine.embed, texts)
+                vectors, embedder_id, dim, fell_back = await asyncio.to_thread(
+                    self.engine.embed_with_meta, texts
+                )
+                # ==== op=embed WIRE CONTRACT (consumed by daemon/docsearch) ====
+                # Alongside `vectors` (unchanged shape: one L2-normalized vector
+                # per input text, in input order), the response carries the
+                # ACTIVE embedder's identity so the daemon/docsearch know which
+                # vector SPACE these vectors live in and refuse cross-space
+                # comparison:
+                #   "embedder": a STABLE string id — exactly
+                #       "coreml-bge-small-en-v1.5" (the Core ML bge path, 384-dim)
+                #       or "llm-qwen3-4b-meanpool" (the legacy 4B mean-pool path,
+                #       2560-dim). This is the id docsearch stores WITH its index.
+                #   "dim": the integer vector dimension (384 or 2560); may be null
+                #       ONLY on an empty batch of the 4B path (nothing to index).
+                #   "fell_back": advisory bool — true iff the Core ML embedder was
+                #       CONFIGURED but unavailable, so this response is the honest
+                #       4B fallback (embedder is then "llm-qwen3-4b-meanpool").
+                #       Not required to key the space (embedder already does), but
+                #       lets the daemon/HUD surface the degraded state.
+                # BACKWARD-SAFE: the daemon's inference Response is
+                # #[serde(default)] with NO deny_unknown_fields, so ADDING these
+                # fields is safe — an old daemon simply ignores them and reads
+                # `vectors` as before.
                 return {
                     "id": rid,
                     "ok": True,
                     "vectors": vectors,
+                    "embedder": embedder_id,
+                    "dim": dim,
+                    "fell_back": fell_back,
                     "latency_ms": latency_ms(),
                 }
 

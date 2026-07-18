@@ -21,7 +21,22 @@ mlx==0.31.2
 mlx-lm==0.31.3    # classifier KV prompt cache uses mlx_lm.models.cache (make/trim_prompt_cache)
 mlx-whisper==0.4.3
 numpy==2.4.6
-coremltools==9.0  # ANE groundwork: Core ML dispatch for Phase-3 aux models (scripts/ane_probe.py)
+coremltools==9.0  # Core ML dispatch. ALSO the runtime for the DEFAULT op=embed backend (inference/coreml_embed.py: BAAI/bge-small-en-v1.5 -> Core ML, ANE-eligible) + Phase-3 aux models (scripts/ane_probe.py)
+
+# op=embed CORE ML SENTENCE EMBEDDER (inference/coreml_embed.py) — the DEFAULT
+# op=embed backend. transformers supplies the tokenizer at RUNTIME (fast /
+# tokenizers-backed for bge's WordPiece — no torch needed to tokenize) and drives
+# the ONE-TIME model conversion. torch is needed ONLY for that one-time
+# convert-on-first-use (jit.trace -> coremltools) + the faithfulness reference;
+# steady-state prediction after conversion uses ONLY coremltools + the tokenizer.
+# HEAVY: torch is a large wheel (~hundreds of MB, the heaviest dep here) — the
+# house otherwise avoids it (see the misaki note below). IMPORT-GUARDED: server.py
+# and coreml_embed.py import fine (py_compile / pyflakes pass) WITHOUT these; if
+# they are absent the Core ML embedder cannot build and op=embed HONESTLY falls
+# back to the resident-4B mean-pool path (embedder="llm-qwen3-4b-meanpool",
+# fell_back=true) instead of breaking. Pinned to the known-good conversion combo.
+transformers==5.11.0
+torch==2.12.0
 
 # TTS ("speak" op): Kokoro-82M on MLX. English G2P comes from misaki — install
 # the pieces below explicitly instead of `misaki[en]`, because that extra pulls
