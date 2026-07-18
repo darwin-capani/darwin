@@ -32,9 +32,11 @@ vad = "silero"          # Per-frame VAD backend: "silero" (the learned Silero VA
                         #   thread (a pure-Rust port of the Silero v5 core, sub-ms
                         #   per 32ms frame; no IPC — a per-frame RPC was MEASURED
                         #   unsafe under load and rejected) and MEASURABLY beats the
-                        #   RMS gate on false-accepts: loud non-speech (fan, keyboard,
-                        #   music) 83% -> 0% flagged as speech, zero false-reject
-                        #   regression (inference/benchmarks/vad_eval/). HONEST
+                        #   RMS gate on false-accepts: loud non-speech (the tested
+                        #   adversaries: synthesized broadband noise + keyboard
+                        #   clicks) 83% -> 0% flagged as speech, zero false-reject
+                        #   regression (inference/benchmarks/vad_eval/, synthetic-
+                        #   but-representative). HONEST
                         #   fallback: its weights (state/models/, exported by the
                         #   inference server at preload) may be absent on a fresh
                         #   install — until then capture runs the RMS gate and SAYS SO
