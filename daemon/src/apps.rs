@@ -1429,6 +1429,31 @@ impl AppRegistry {
             .collect()
     }
 
+    /// Read-only CATALOG snapshot for the HUD App Deck: one entry per registered
+    /// app carrying its manifest name, description, and its first exposed tool
+    /// name (empty when it declares none). SECRET-FREE (manifest metadata only —
+    /// never a path, token, or socket) and sorted by name for a stable readout.
+    /// This is what makes the deck LIVE: the HUD renders the apps the daemon
+    /// ACTUALLY discovered, so a new app auto-appears with no hand-edited list.
+    pub async fn catalog_snapshot(&self) -> Vec<(String, String, String)> {
+        let apps = self.apps.lock().await;
+        let mut cat: Vec<(String, String, String)> = apps
+            .iter()
+            .map(|(name, e)| {
+                let tool = e
+                    .manifest
+                    .tools
+                    .exposes
+                    .first()
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                (name.clone(), e.manifest.app.description.clone(), tool)
+            })
+            .collect();
+        cat.sort_by(|a, b| a.0.cmp(&b.0));
+        cat
+    }
+
     /// Read-only DECLARED-capability inventory: one `(name, capability_summary)`
     /// per registered app, derived purely from each manifest's `[permissions]`.
     /// SECRET-FREE (counts, never paths/hosts). Sorted by name for a stable readout.

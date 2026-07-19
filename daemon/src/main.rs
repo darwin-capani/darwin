@@ -2437,6 +2437,24 @@ async fn main() -> Result<()> {
     // op. Idempotent; the router's explicit threading stays the primary path.
     apps::set_global_registry(app_registry.clone());
 
+    // Emit the LIVE app catalog (name + description + exposed tool per discovered
+    // app) so the HUD's App Deck renders what the daemon ACTUALLY discovered
+    // rather than a hand-maintained list that can drift. SECRET-FREE manifest
+    // metadata only. A new app in apps/ auto-appears on the deck after a restart.
+    {
+        let catalog = app_registry.catalog_snapshot().await;
+        telemetry::emit(
+            "system",
+            "app.registry",
+            json!({
+                "apps": catalog
+                    .iter()
+                    .map(|(name, desc, tool)| json!({"name": name, "description": desc, "tool": tool}))
+                    .collect::<Vec<_>>(),
+            }),
+        );
+    }
+
     // Deferred from Config::load (audit fix): telemetry did not exist yet
     // when the config was parsed, so misconfiguration was a buried log WARN.
     // Emitted once the hub is up so the HUD can surface it.
