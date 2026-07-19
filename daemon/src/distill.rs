@@ -346,11 +346,22 @@ pub fn promotion_decision(
             if improvement > 0.0 && improvement >= min_improvement && min_improvement >= 0.0 {
                 PromotionDecision::Promote { base_loss: b, adapter_loss: a, improvement }
             } else {
+                // The reason must state the TRUE cause of THIS rejection — the
+                // three sub-cases are distinct facts and must not share a line
+                // (a fail-closed negative margin rejects a genuine WIN, so
+                // "did not beat base" would be false beside a positive Δ).
+                let reason = if min_improvement < 0.0 {
+                    "the promotion margin is misconfigured (min_improvement must be >= 0), so I fail closed"
+                } else if improvement <= 0.0 {
+                    "the adapter did not beat the base model on your held-out turns"
+                } else {
+                    "the adapter's win was smaller than the required margin"
+                };
                 PromotionDecision::Reject {
                     base_loss: Some(b),
                     adapter_loss: Some(a),
                     improvement: Some(improvement),
-                    reason: "the adapter did not beat the base model on your held-out turns",
+                    reason,
                 }
             }
         }
@@ -488,12 +499,29 @@ pub fn clear_promotion(root: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The spoken clause for what the generation stack is ACTUALLY serving right
+/// now. A promoted pointer counts as a live ADAPTER only when its `base_model`
+/// matches the CONFIGURED base — the exact condition the inference server's
+/// `_promoted_adapter` applies (a mismatched adapter is refused and base is
+/// served), so this clause and the server agree by construction. Everything
+/// else — no pointer, unreadable manifest, base mismatch — is base.
+fn live_model_clause(cfg: &crate::config::Config, root: &std::path::Path) -> &'static str {
+    match read_promoted_manifest(root) {
+        Some(m) if m.base_model == cfg.distill.base_model => {
+            "the previously promoted adapter stays live"
+        }
+        _ => "the base model stays live",
+    }
+}
+
 /// EVALUATE the last TRAINED run against base on its held-out split and promote
 /// the adapter ONLY on a MEASURED win (>= `[distill].min_improvement`). Reversible
 /// ([`clear_promotion`]). HONEST at every step: no trained run -> says so; an
-/// unmeasurable or losing eval -> base stays live, adapter stays staged, and the
-/// measured (non-)result is recorded in the manifest. `run_eval` is injected so
-/// the whole orchestration is hermetically tested; the live wiring passes
+/// unmeasurable or losing eval -> whatever is CURRENTLY live stays live (base,
+/// or a still-valid previously promoted adapter — reported truthfully via
+/// [`live_model_clause`]), the new adapter stays staged, and the measured
+/// (non-)result is recorded in the manifest. `run_eval` is injected so the whole
+/// orchestration is hermetically tested; the live wiring passes
 /// [`run_real_eval`]. NEVER promotes without a measured win.
 pub async fn promote_last<F, Fut>(
     cfg: &crate::config::Config,
@@ -530,14 +558,11 @@ where
                 manifest.promoted = false;
                 write_manifest(root, &run_dir, &manifest);
                 // Report what is ACTUALLY live: a copy/temp failure leaves any
-                // PREVIOUSLY promoted adapter untouched (still live); only a
-                // failure after promoted/ was removed leaves base live. Check
-                // the pointer rather than assert "base" unconditionally.
-                let still_live = if read_promoted_manifest(root).is_some() {
-                    "the previously promoted adapter stays live"
-                } else {
-                    "the base model stays live"
-                };
+                // PREVIOUSLY promoted adapter untouched (still live IF its base
+                // still matches — live_model_clause mirrors the server's own
+                // validity check); only a failure after promoted/ was removed
+                // leaves base live. Never assert "base" unconditionally.
+                let still_live = live_model_clause(cfg, root);
                 return format!(
                     "The new adapter beat base ({adapter_loss:.3} vs {base_loss:.3}) but I couldn't install it, sir — {e}; {still_live}."
                 );
@@ -553,8 +578,12 @@ where
                 (Some(b), Some(a), Some(d)) => format!(" (adapter {a:.3} vs base {b:.3}, Δ{d:.3})"),
                 _ => String::new(),
             };
+            // The Reject arm never touches promoted/ — so what stays live is
+            // whatever WAS live (base, or a still-valid previously promoted
+            // adapter), reported truthfully, never a hard-coded "base".
+            let still_live = live_model_clause(cfg, root);
             format!(
-                "I did NOT promote the adapter, sir — {reason}{measured}. The base model stays live; the adapter is kept staged."
+                "I did NOT promote the adapter, sir — {reason}{measured}; {still_live}, and the new adapter is kept staged."
             )
         }
     }
@@ -1160,6 +1189,32 @@ mod tests {
         assert!(matches!(promotion_decision(Some(2.5), Some(2.0), -0.1), Reject { .. }));
     }
 
+    /// REVIEW PIN: each Reject sub-case speaks its TRUE cause. A fail-closed
+    /// negative margin rejects a genuine WIN — saying "did not beat base" beside
+    /// a positive Δ would be false; a sub-margin win DID beat base, just not by
+    /// enough. The three distinct facts get three distinct reasons.
+    #[test]
+    fn promotion_reject_reasons_state_the_true_cause() {
+        use PromotionDecision::*;
+        // Negative margin + a clear win: the honest reason is the config.
+        let Reject { reason, .. } = promotion_decision(Some(2.5), Some(2.0), -0.1) else {
+            panic!("negative margin must reject");
+        };
+        assert!(reason.contains("misconfigured"), "true cause is the margin config: {reason}");
+        assert!(!reason.contains("did not beat"), "{reason}");
+        // Sub-margin win: it DID beat base — the margin is the reason.
+        let Reject { reason, .. } = promotion_decision(Some(2.5), Some(2.46), 0.05) else {
+            panic!("sub-margin must reject");
+        };
+        assert!(reason.contains("smaller than the required margin"), "{reason}");
+        assert!(!reason.contains("did not beat"), "{reason}");
+        // A tie / regression: "did not beat" is exactly true.
+        let Reject { reason, .. } = promotion_decision(Some(2.5), Some(2.5), 0.05) else {
+            panic!("tie must reject");
+        };
+        assert!(reason.contains("did not beat"), "{reason}");
+    }
+
     #[tokio::test]
     async fn promote_last_promotes_on_a_measured_win_and_is_reversible() {
         let root = tempdir("promote-win");
@@ -1272,6 +1327,84 @@ mod tests {
         let live = read_promoted_manifest(&root.0).expect("v1 still promoted");
         assert_eq!(live.created, "2026-07-12T09-00-00Z");
         assert_eq!(std::fs::read(promoted.join("adapters.safetensors")).unwrap(), b"v1");
+    }
+
+    /// REVIEW PIN (round 2): the REJECT arm's spoken line reports what is
+    /// ACTUALLY live, exactly like the install-failure arm — never a hard-coded
+    /// "base". With a prior VALID promoted adapter, a losing eval keeps THAT
+    /// adapter live; with a prior adapter whose base_model no longer matches the
+    /// configured base (the server refuses it and serves base), the truth is
+    /// base. live_model_clause mirrors the server's own validity condition.
+    #[tokio::test]
+    async fn promote_reject_reports_the_actual_live_model() {
+        let losing_eval = |_p: String, args: Vec<String>| {
+            let is_adapter = args.windows(2).any(|w| w[0] == "--adapter-path" && !w[1].is_empty());
+            async move {
+                Ok(if is_adapter { "Test loss 2.600".to_string() } else { "Test loss 2.500".to_string() })
+            }
+        };
+        let stage_run = |root: &std::path::Path, base_model: &str| {
+            let run_dir = staging_root(root).join("run-v2");
+            std::fs::create_dir_all(&run_dir).unwrap();
+            std::fs::write(run_dir.join("adapters.safetensors"), b"v2").unwrap();
+            let m = Manifest {
+                created: "2026-07-13T10-00-00Z".into(),
+                base_model: base_model.to_string(),
+                example_count: 80,
+                status: RunStatus::Trained,
+                staging_dir: run_dir.to_string_lossy().to_string(),
+                promoted: false,
+                held_out_base_loss: None,
+                held_out_adapter_loss: None,
+            };
+            write_manifest(root, &run_dir, &m);
+        };
+        let install_v1 = |root: &std::path::Path, base_model: &str| {
+            let v1 = Manifest {
+                created: "2026-07-12T09-00-00Z".into(),
+                base_model: base_model.to_string(),
+                example_count: 40,
+                status: RunStatus::Trained,
+                staging_dir: "state/lora/run-v1".into(),
+                promoted: true,
+                held_out_base_loss: Some(2.9),
+                held_out_adapter_loss: Some(2.6),
+            };
+            let promoted = promoted_dir(root);
+            std::fs::create_dir_all(&promoted).unwrap();
+            std::fs::write(promoted.join("adapters.safetensors"), b"v1").unwrap();
+            std::fs::write(promoted.join("manifest.json"), serde_json::to_vec_pretty(&v1).unwrap())
+                .unwrap();
+        };
+
+        let mut cfg = crate::config::Config::default();
+        cfg.distill.enabled = true;
+
+        // (a) Prior VALID adapter (base matches config) + losing eval: the truth
+        // is the PRIOR ADAPTER stays live, never "base".
+        let root = tempdir("reject-live-adapter");
+        install_v1(&root.0, &cfg.distill.base_model);
+        stage_run(&root.0, &cfg.distill.base_model);
+        let reply = promote_last(&cfg, &root.0, losing_eval).await;
+        assert!(reply.contains("did NOT promote"), "{reply}");
+        assert!(
+            reply.contains("previously promoted adapter stays live"),
+            "a valid prior adapter is what stays live: {reply}"
+        );
+        assert!(!reply.contains("base model stays live"), "{reply}");
+
+        // (b) Prior adapter whose base NO LONGER matches the config (the server
+        // refuses it and serves base) + losing eval: the truth IS base.
+        let root2 = tempdir("reject-live-base");
+        install_v1(&root2.0, "mlx-community/Old-Base-4bit"); // stale base id
+        stage_run(&root2.0, &cfg.distill.base_model);
+        let reply2 = promote_last(&cfg, &root2.0, losing_eval).await;
+        assert!(reply2.contains("did NOT promote"), "{reply2}");
+        assert!(
+            reply2.contains("base model stays live"),
+            "a base-mismatched pointer is NOT live — the server serves base: {reply2}"
+        );
+        assert!(!reply2.contains("previously promoted"), "{reply2}");
     }
 
     #[tokio::test]
