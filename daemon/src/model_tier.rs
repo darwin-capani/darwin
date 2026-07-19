@@ -687,8 +687,8 @@ pub fn select_local_model<'a>(
 
 /// The machine's THERMAL pressure level, mirroring macOS's
 /// `ProcessInfo.thermalState` ladder (Nominal/Fair/Serious/Critical). Read live
-/// ONLY when [power].adaptive is on (device-gated); under the OFF default the
-/// policy is fed `Nominal` so it never throttles. PURE value — no I/O.
+/// ONLY when [power].adaptive is on (the shipped default, device-gated); when
+/// the flag is off the policy is fed `Nominal` so it never throttles. PURE value.
 ///
 /// Fair/Serious/Critical are constructed by the DEVICE-GATED live thermal read
 /// (`ProcessInfo.thermalState`, not wired in this headless build) and by the
@@ -777,8 +777,8 @@ impl ThrottleReason {
 
 impl ThrottlePlan {
     /// The NEUTRAL plan: leave the AUTO sub-choice untouched, defer nothing. This
-    /// is what the OFF default produces and what every "no throttle" branch
-    /// returns, so the OFF state is byte-for-byte today's routing.
+    /// is what the flag-off path produces and what every "no throttle" branch
+    /// returns, so a neutral plan is byte-for-byte today's routing.
     pub fn neutral(reason: ThrottleReason) -> Self {
         ThrottlePlan {
             tier_pref: LocalSubTier::Auto,
@@ -788,7 +788,7 @@ impl ThrottlePlan {
     }
 
     /// Whether this plan actually throttles (prefers Fast or defers heavy work).
-    /// `false` for every neutral plan (incl. the OFF default).
+    /// `false` for every neutral plan (incl. the flag-off path).
     pub fn is_throttled(&self) -> bool {
         self.tier_pref == LocalSubTier::Fast || self.defer_heavy
     }
@@ -821,7 +821,7 @@ pub fn throttle_decision(
     thermal: ThermalState,
     cfg: &Config,
 ) -> ThrottlePlan {
-    // OFF default: never consult the reading; neutral plan == today's routing.
+    // Flag off: never consult the reading; neutral plan == today's routing.
     if !cfg.power.adaptive {
         return ThrottlePlan::neutral(ThrottleReason::Disabled);
     }

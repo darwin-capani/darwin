@@ -1544,8 +1544,8 @@ pub async fn route(
                 tier_payload["local_sub"] = json!(sub);
             }
             // BATTERY/THERMAL THROTTLE (#38) indicator: surface the plan reason +
-            // whether it actually throttled this local turn. Under the OFF default
-            // the plan is neutral (reason "disabled", throttled=false) so the HUD
+            // whether it actually throttled this local turn. When the plan is neutral
+            // (adaptive off, or on AC + nominal thermal) it emits no throttle field so the HUD
             // shows no throttle — honest, never a phantom. Only emitted on local
             // turns (the throttle influences only the on-device sub-choice).
             let plan = power_throttle_plan(cfg).await;
@@ -2178,7 +2178,7 @@ async fn answer_agent_roster(
         if let Some(sub) = local_sub_for_turn(cfg, &roster_class).await {
             tier_payload["local_sub"] = json!(sub);
         }
-        // #38 throttle indicator (neutral/absent under the OFF default).
+        // #38 throttle indicator (absent when the plan is neutral).
         let plan = power_throttle_plan(cfg).await;
         if plan.is_throttled() {
             tier_payload["throttle"] = json!({
@@ -2387,12 +2387,10 @@ async fn local_model_for_turn(cfg: &Config, class: &Classification) -> Option<St
 }
 
 /// The current battery/thermal throttle plan for this turn (#38). DEVICE-GATED:
-/// when [power].adaptive is OFF (the shipped default) this NEVER reads power and
-/// returns the NEUTRAL plan, so routing is byte-for-byte today's. The live
-/// `pmset`/thermal read behind the flag is the only place power is touched; the
-/// headless build feeds the neutral reading (the device read is wired but not
-/// exercised here — the mic-loop/vision-capture precedent). PURE given cfg + the
-/// (neutral, in this build) reading.
+/// when [power].adaptive is ON (the shipped default) this reads the LIVE
+/// (TTL-cached) `pmset`/thermal state and feeds it to the pure throttle policy;
+/// with the flag OFF it returns the NEUTRAL plan, so routing is byte-for-byte
+/// today's. A failed read degrades to neutral (never a fabricated low battery).
 async fn power_throttle_plan(cfg: &Config) -> crate::model_tier::ThrottlePlan {
     // [power].adaptive (ships ON): feed the LIVE (TTL-cached) battery + thermal
     // reading so a real on-battery / thermally-pressured state can actually

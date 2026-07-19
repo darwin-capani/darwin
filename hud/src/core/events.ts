@@ -5237,8 +5237,8 @@ export function localWarmHonest(s: LocalWarmStatus): string {
  *     fp16 loaded. `auto` means "loaded the model as configured" (today's        *
  *     behavior).                                                                 *
  *   - `throttle` {reason, tier_pref, defer_heavy} — present ONLY on a LOCAL turn *
- *     when the plan ACTUALLY throttles. Under the OFF default ([power].adaptive  *
- *     off) the plan is neutral and NO throttle field is emitted — so the HUD     *
+ *     when the plan ACTUALLY throttles. With [power].adaptive off (or on AC +    *
+ *     nominal thermal) the plan is neutral and NO throttle field is emitted — so the HUD     *
  *     shows no throttle indicator, never a phantom one. `reason` ∈               *
  *     disabled/nominal/low_battery/thermal (ThrottleReason::as_str); `tier_pref` *
  *     ∈ fast/capable/auto (LocalSubTier::as_str).                                *
@@ -5256,8 +5256,8 @@ export function localWarmHonest(s: LocalWarmStatus): string {
  * ------------------------------------------------------------------------ */
 
 /** Why the daemon's throttle plan acted this turn (ThrottleReason::as_str).
- *  `disabled` = [power].adaptive off (the OFF default — never reaches the HUD as
- *  a throttle since a neutral plan emits no field); `nominal` = on AC + nominal
+ *  `disabled` = [power].adaptive off (never reaches the HUD as a throttle since a
+ *  neutral plan emits no field); `nominal` = on AC + nominal
  *  thermal (no throttle); `low_battery` = low battery and not on AC; `thermal` =
  *  serious/critical thermal pressure. */
 export type ThrottleReason = "disabled" | "nominal" | "low_battery" | "thermal";
@@ -5516,8 +5516,8 @@ export function quantHonest(s: InferencePerfStatus): string {
 export function throttleHonest(p: ThrottlePlan | null): string {
   if (p === null) {
     return (
-      "No throttle: the plan is neutral (the OFF default — [power].adaptive off, so " +
-      "nothing reads power and the tier is unchanged). The live power read (pmset / " +
+      "No throttle: the plan is neutral (on AC + nominal thermal, or [power].adaptive " +
+      "off, so the tier is unchanged). The live power read (pmset / " +
       "thermal pressure / IOKit) is device-gated and happens ONLY when adaptive is on."
     );
   }

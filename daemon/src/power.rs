@@ -64,7 +64,7 @@ fn power_cache() -> &'static Mutex<Option<(Instant, PowerReading)>> {
 /// read, so a rare concurrent refresh double-reads (harmless — last write wins)
 /// but a turn never stalls behind another turn's 3s-bounded read. A failed read
 /// degrades to neutral inside [`read_power_live`] — NEVER a fabricated low
-/// battery. This is the seam the throttle consumes; the OFF default never calls it.
+/// battery. This is the seam the throttle consumes; the flag-off path never calls it.
 pub async fn read_power_cached() -> PowerReading {
     {
         let guard = power_cache().lock().await;
@@ -95,7 +95,7 @@ pub struct PowerReading {
 }
 
 impl PowerReading {
-    /// The NEUTRAL reading the OFF default (and any failed read) produces: no
+    /// The NEUTRAL reading the flag-off path (and any failed read) produces: no
     /// battery concern, on AC, nominal thermal. Fed through `throttle_decision`
     /// it yields a neutral plan, so routing is byte-for-byte today's behavior.
     pub fn neutral() -> Self {
@@ -108,7 +108,7 @@ impl PowerReading {
 }
 
 /// The current throttle plan for THIS turn. DEVICE-GATED: when [power].adaptive
-/// is OFF (the shipped default) this returns the neutral plan WITHOUT reading any
+/// is OFF this returns the neutral plan WITHOUT reading any
 /// power state — the live `pmset`/thermal read is never reached. When ON, the
 /// caller supplies a `reading` from [`read_power_live`] (device-gated) which is
 /// fed through the PURE [`crate::model_tier::throttle_decision`] policy.
@@ -184,8 +184,9 @@ pub fn parse_pmset(out: &str) -> (Option<u8>, bool) {
 
 /// Read the live power state on-device via `/usr/bin/pmset -g batt` (battery +
 /// AC) + the on-device thermal level. DEVICE-GATED: callers MUST gate this on
-/// [power].adaptive being on — the OFF default never reaches here (it uses
-/// [`PowerReading::neutral`]). Any failure degrades to a neutral-ish reading
+/// [power].adaptive being on (the shipped default); when the flag is off the
+/// callers use [`PowerReading::neutral`] and never reach here. Any failure
+/// degrades to a neutral-ish reading
 /// (no battery concern), NEVER a fabricated low battery.
 ///
 /// Marked `#[cfg(not(test))]`-style by convention via the injected runner in the
@@ -397,7 +398,7 @@ mod tests {
         assert_eq!(plan.tier_pref, crate::model_tier::LocalSubTier::Fast);
     }
 
-    // ACTIVATION INVARIANT (Wave A): the neutral reading — what the OFF default
+    // ACTIVATION INVARIANT (Wave A): the neutral reading — what the flag-off path
     // and any failed live read produce — is NEVER throttled and NEVER sets
     // defer_heavy. This is the guarantee that activating the live read can only
     // ADD throttling under real pressure, never fabricate one from a bad read.

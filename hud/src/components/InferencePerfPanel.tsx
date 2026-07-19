@@ -35,8 +35,9 @@ import Frame from "./Frame";
  *     (throttle) are device/model-dependent; the copy says so and quotes no
  *     number it cannot honestly claim.
  *   - OFF/NEUTRAL DEFAULTS READ AS TODAY'S RUNTIME. Speculative OFF = normal
- *     generation; quant AUTO = loaded as configured; no throttle = the OFF
- *     [power].adaptive default (the live power read is device-gated). No phantom
+ *     generation; quant AUTO = loaded as configured; no throttle = a neutral
+ *     plan (on AC + nominal thermal, or [power].adaptive off — the live power
+ *     read is device-gated). No phantom
  *     throttle indicator is ever shown.
  *   - READ ONLY. No button — this panel only SHOWS the per-turn inference facts
  *     the daemon already reported.
@@ -147,7 +148,8 @@ function SpeculativeRow({ perf }: { perf: InferencePerfStatus }) {
 }
 
 /** THROTTLE — the current battery/thermal throttle plan, or the honest "no
- *  throttle" resting state (the OFF [power].adaptive default). */
+ *  throttle" resting state (a neutral plan: on AC + nominal thermal, or
+ *  [power].adaptive off). */
 function ThrottleRow({ perf }: { perf: InferencePerfStatus }) {
   const plan = perf.throttle;
   const tone = throttleTone(plan);
@@ -159,7 +161,7 @@ function ThrottleRow({ perf }: { perf: InferencePerfStatus }) {
         {plan === null ? (
           <span
             className="infperf-pill throttle-none"
-            title="no throttle — the plan is neutral (the OFF default; the live power read is device-gated)"
+            title="no throttle — the plan is neutral (on AC + nominal thermal, or [power].adaptive off; the live power read is device-gated)"
           >
             NONE
           </span>

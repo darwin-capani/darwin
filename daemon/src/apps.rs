@@ -8,7 +8,8 @@
 //!      manifest declares (see [`generate_sbpl`]),
 //!   3. mints a per-launch HMAC-SHA256 capability token bound to the app's
 //!      name + permission set + a session nonce ([`AppRegistry::mint_token`]),
-//!   4. spawns `/usr/bin/sandbox-exec -f <profile> <interp> <entry...>` with
+//!   4. spawns `/usr/bin/sandbox-exec -p <profile-string> <interp> <entry...>`
+//!      (the profile passed INLINE, immune to on-disk tampering) with
 //!      the token + socket path handed to the app via the launch env, and
 //!   5. accepts the app's connection on a per-app Unix socket
 //!      (`state/ipc/apps/<name>.sock`, JSONL), VERIFIES the token on every
@@ -1393,7 +1394,7 @@ impl AppRegistry {
         }
     }
 
-    /// The argv the sandboxed child runs (after `sandbox-exec -f <profile>`).
+    /// The argv the sandboxed child runs (after `sandbox-exec -p <profile-string>`).
     /// For python/node it is `<interp> <entry>`; for a binary it is the binary
     /// alone (the entry IS the interpreter).
     fn child_argv(&self, manifest: &AppManifest, interp: &Path) -> Vec<String> {
