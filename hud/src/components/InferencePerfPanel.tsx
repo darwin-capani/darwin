@@ -35,8 +35,9 @@ import Frame from "./Frame";
  *     (throttle) are device/model-dependent; the copy says so and quotes no
  *     number it cannot honestly claim.
  *   - OFF/NEUTRAL DEFAULTS READ AS TODAY'S RUNTIME. Speculative OFF = normal
- *     generation; quant AUTO = loaded as configured; no throttle = the OFF
- *     [power].adaptive default (the live power read is device-gated). No phantom
+ *     generation; quant AUTO = loaded as configured; no throttle = a neutral
+ *     plan (on AC + nominal thermal, or [power].adaptive off — the live power
+ *     read is device-gated). No phantom
  *     throttle indicator is ever shown.
  *   - READ ONLY. No button — this panel only SHOWS the per-turn inference facts
  *     the daemon already reported.
@@ -57,25 +58,69 @@ export default function InferencePerfPanel({
   // server that sends neither) leaves all three null/none — render nothing
   // rather than an empty placeholder.
   const hasReadout =
-    perf.speculative !== null || perf.quant !== null || perf.throttle !== null;
+    perf.speculative !== null ||
+    perf.quant !== null ||
+    perf.throttle !== null ||
+    perf.tps !== null ||
+    perf.peakMemGb !== null;
   if (!hasReadout) return null;
 
   return (
     <div className="infperf-panel">
       <Frame title="INFERENCE // PERF" tag="ACTUAL PATH · READ ONLY">
         <div className="infperf-body">
+          <DecodeRow perf={perf} />
           <SpeculativeRow perf={perf} />
           <ThrottleRow perf={perf} />
           <QuantRow perf={perf} />
 
           <div className="infperf-foot dim-note">
-            Reports the path that ACTUALLY ran this turn — never a measured perf
-            number. The real speedup (speculative), RAM/quality tradeoff (quant),
-            and thermal/battery effect (throttle) are device/model-gated and are
-            not measured here. All three ship OFF/neutral (off = today's runtime).
+            DECODE is the throughput + peak memory mlx_lm actually MEASURED for the
+            last on-device turn (real numbers, never estimated — blank when a path
+            reported none). The rest report the path that ran: the device-gated
+            speedup (speculative), RAM/quality tradeoff (quant), and thermal/battery
+            effect (throttle) are not measured here.
           </div>
         </div>
       </Frame>
+    </div>
+  );
+}
+
+/** DECODE — the mlx_lm-MEASURED decode throughput (tok/s) + peak GPU memory
+ *  (GB, decimal — the server's mx.get_peak_memory / 1e9, NOT binary GiB) of the
+ *  last on-device turn that reported them. A real measurement, not
+ *  a device-gated estimate: renders nothing until a measured turn arrives, and
+ *  each figure independently blanks when the server reported none (the
+ *  speculative/uncached single-shot paths measure nothing). */
+function DecodeRow({ perf }: { perf: InferencePerfStatus }) {
+  if (perf.tps === null && perf.peakMemGb === null) return null;
+  return (
+    <div className="infperf-row">
+      <div className="infperf-row-head">
+        <span className="infperf-title">DECODE</span>
+        <span className="dot ok" aria-hidden="true" />
+        {perf.tps !== null && (
+          <span
+            className="infperf-pill decode-tps"
+            title="decode throughput mlx_lm measured on the last on-device turn (tokens/sec) — a real measurement, not an estimate"
+          >
+            {perf.tps.toFixed(1)} tok/s
+          </span>
+        )}
+        {perf.peakMemGb !== null && (
+          <span
+            className="infperf-sub"
+            title="peak GPU memory for the last measured turn (mx.get_peak_memory)"
+          >
+            {perf.peakMemGb.toFixed(2)} GB peak
+          </span>
+        )}
+      </div>
+      <div className="infperf-note dim-note">
+        Measured by mlx_lm on the turn that ran — the honest on-device throughput,
+        not a device-gated estimate.
+      </div>
     </div>
   );
 }
@@ -103,7 +148,8 @@ function SpeculativeRow({ perf }: { perf: InferencePerfStatus }) {
 }
 
 /** THROTTLE — the current battery/thermal throttle plan, or the honest "no
- *  throttle" resting state (the OFF [power].adaptive default). */
+ *  throttle" resting state (a neutral plan: on AC + nominal thermal, or
+ *  [power].adaptive off). */
 function ThrottleRow({ perf }: { perf: InferencePerfStatus }) {
   const plan = perf.throttle;
   const tone = throttleTone(plan);
@@ -115,7 +161,7 @@ function ThrottleRow({ perf }: { perf: InferencePerfStatus }) {
         {plan === null ? (
           <span
             className="infperf-pill throttle-none"
-            title="no throttle — the plan is neutral (the OFF default; the live power read is device-gated)"
+            title="no throttle — the plan is neutral (on AC + nominal thermal, or [power].adaptive off; the live power read is device-gated)"
           >
             NONE
           </span>

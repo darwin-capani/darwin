@@ -687,8 +687,8 @@ pub fn select_local_model<'a>(
 
 /// The machine's THERMAL pressure level, mirroring macOS's
 /// `ProcessInfo.thermalState` ladder (Nominal/Fair/Serious/Critical). Read live
-/// ONLY when [power].adaptive is on (device-gated); under the OFF default the
-/// policy is fed `Nominal` so it never throttles. PURE value — no I/O.
+/// ONLY when [power].adaptive is on (the shipped default, device-gated); when
+/// the flag is off the policy is fed `Nominal` so it never throttles. PURE value.
 ///
 /// Fair/Serious/Critical are constructed by the DEVICE-GATED live thermal read
 /// (`ProcessInfo.thermalState`, not wired in this headless build) and by the
@@ -777,8 +777,8 @@ impl ThrottleReason {
 
 impl ThrottlePlan {
     /// The NEUTRAL plan: leave the AUTO sub-choice untouched, defer nothing. This
-    /// is what the OFF default produces and what every "no throttle" branch
-    /// returns, so the OFF state is byte-for-byte today's routing.
+    /// is what the flag-off path produces and what every "no throttle" branch
+    /// returns, so a neutral plan is byte-for-byte today's routing.
     pub fn neutral(reason: ThrottleReason) -> Self {
         ThrottlePlan {
             tier_pref: LocalSubTier::Auto,
@@ -788,7 +788,7 @@ impl ThrottlePlan {
     }
 
     /// Whether this plan actually throttles (prefers Fast or defers heavy work).
-    /// `false` for every neutral plan (incl. the OFF default).
+    /// `false` for every neutral plan (incl. the flag-off path).
     pub fn is_throttled(&self) -> bool {
         self.tier_pref == LocalSubTier::Fast || self.defer_heavy
     }
@@ -821,7 +821,7 @@ pub fn throttle_decision(
     thermal: ThermalState,
     cfg: &Config,
 ) -> ThrottlePlan {
-    // OFF default: never consult the reading; neutral plan == today's routing.
+    // Flag off: never consult the reading; neutral plan == today's routing.
     if !cfg.power.adaptive {
         return ThrottlePlan::neutral(ThrottleReason::Disabled);
     }
@@ -853,16 +853,37 @@ pub fn throttle_decision(
 }
 
 /// Apply a [`ThrottlePlan`] to the AUTO sub-tier choice for a LOCAL turn. PURE.
-/// A throttled plan that prefers `Fast` OVERRIDES the AUTO-by-difficulty default
-/// to the explicit `Fast` sub-tier (so a low-battery / hot machine answers an
-/// easy turn on the cheaper warm model); a neutral plan leaves it `Auto` so
-/// `select_local_model` keeps today's difficulty-based behavior. It never picks a
-/// MORE expensive tier than AUTO would, and a hard turn still resolves to the
-/// capable base inside `select_local_model` (Fast collapses to base when no extra
-/// is warm), so a throttle can never degrade a genuinely hard offline turn below
-/// the single-resident base.
-pub fn throttled_sub_tier(plan: &ThrottlePlan) -> LocalSubTier {
-    plan.tier_pref
+/// A throttled plan that prefers `Fast` biases an EASY turn to the cheaper warm
+/// model (so a low-battery / hot machine answers a light turn on the fast model);
+/// a neutral plan leaves it `Auto` so `select_local_model` keeps today's
+/// difficulty-based behavior. CRITICAL: on a genuinely HARD (heavy or
+/// low-confidence) turn the `Fast` preference is downgraded to `Auto`, which
+/// keeps the capable base — so a throttle can NEVER degrade a genuinely hard
+/// offline turn to the weaker Fast model (the `Fast`-forces-fast override was a
+/// real regression under a multi-resident warm-set; this guard closes it). It
+/// therefore never picks a MORE expensive tier than AUTO would, and never a
+/// cheaper one than the difficulty warrants.
+pub fn throttled_sub_tier(
+    plan: &ThrottlePlan,
+    complexity: &str,
+    confidence: f64,
+    low_conf_threshold: f64,
+) -> LocalSubTier {
+    // The throttle biases toward the cheaper Fast warm model to save battery/heat
+    // — but ONLY on a turn that is not genuinely hard. A hard/low-confidence turn
+    // keeps AUTO (which keeps the capable base in select_local_model), so a
+    // throttle can NEVER downgrade a genuinely hard offline turn to the weaker
+    // Fast model (the committed contract). Without a throttle the plan's Auto
+    // pref passes through unchanged, so single-resident + no-throttle routing is
+    // byte-for-byte today's. The `Fast`-on-a-hard-turn case is the ONLY one this
+    // guard changes; every other (Capable, Auto, Fast-on-an-easy-turn) is
+    // unchanged.
+    let hard = complexity == "heavy" || confidence < low_conf_threshold;
+    if plan.tier_pref == LocalSubTier::Fast && hard {
+        LocalSubTier::Auto
+    } else {
+        plan.tier_pref
+    }
 }
 
 /// HONEST telemetry shape for the HUD resident-models indicator (mirrors
@@ -1843,24 +1864,41 @@ mod tests {
     fn throttled_sub_tier_biases_easy_turns_only() {
         let cfg = power_cfg(true);
         let throttled = throttle_decision(Some(5), false, ThermalState::Nominal, &cfg);
-        assert_eq!(throttled_sub_tier(&throttled), LocalSubTier::Fast);
         let plan = ids(&["base", "fast"]);
-        // Throttled + easy turn -> the faster warm model.
+        // Throttled + EASY turn -> the faster warm model (Fast pref passes through).
+        assert_eq!(throttled_sub_tier(&throttled, "light", 0.9, 0.6), LocalSubTier::Fast);
         assert_eq!(
-            select_local_model(&plan, throttled_sub_tier(&throttled), "light", 0.9, 0.6),
+            select_local_model(&plan, throttled_sub_tier(&throttled, "light", 0.9, 0.6), "light", 0.9, 0.6),
             "fast"
         );
-        // Even throttled, an explicit Fast sub-tier with no warm extra collapses to
-        // the base (single-resident) — never a crash, never below the base.
+        // REVIEW PIN: throttled + a genuinely HARD (heavy) turn under a
+        // multi-resident warm-set must KEEP the capable base — the throttle's
+        // Fast preference is downgraded to AUTO on a hard turn, never forcing the
+        // weaker model. (Before the fix, throttled_sub_tier returned Fast
+        // unconditionally and select_local_model(Fast,'heavy') returned 'fast',
+        // downgrading the hard turn — the exact contract violation.)
+        assert_eq!(throttled_sub_tier(&throttled, "heavy", 0.9, 0.6), LocalSubTier::Auto);
+        assert_eq!(
+            select_local_model(&plan, throttled_sub_tier(&throttled, "heavy", 0.9, 0.6), "heavy", 0.9, 0.6),
+            "base",
+            "a throttle must NEVER downgrade a hard offline turn"
+        );
+        // Throttled + a LOW-CONFIDENCE light turn is treated as hard -> base too.
+        assert_eq!(
+            select_local_model(&plan, throttled_sub_tier(&throttled, "light", 0.3, 0.6), "light", 0.3, 0.6),
+            "base"
+        );
+        // Even throttled + easy, an explicit Fast sub-tier with no warm extra
+        // collapses to the base (single-resident) — never a crash, never below base.
         let single = ids(&["base"]);
         assert_eq!(
-            select_local_model(&single, throttled_sub_tier(&throttled), "light", 0.9, 0.6),
+            select_local_model(&single, throttled_sub_tier(&throttled, "light", 0.9, 0.6), "light", 0.9, 0.6),
             "base"
         );
         // A neutral plan leaves AUTO -> a hard turn keeps the capable base.
         let neutral = ThrottlePlan::neutral(ThrottleReason::Nominal);
         assert_eq!(
-            select_local_model(&plan, throttled_sub_tier(&neutral), "heavy", 0.9, 0.6),
+            select_local_model(&plan, throttled_sub_tier(&neutral, "heavy", 0.9, 0.6), "heavy", 0.9, 0.6),
             "base"
         );
     }

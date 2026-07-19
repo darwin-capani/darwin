@@ -5237,8 +5237,8 @@ export function localWarmHonest(s: LocalWarmStatus): string {
  *     fp16 loaded. `auto` means "loaded the model as configured" (today's        *
  *     behavior).                                                                 *
  *   - `throttle` {reason, tier_pref, defer_heavy} — present ONLY on a LOCAL turn *
- *     when the plan ACTUALLY throttles. Under the OFF default ([power].adaptive  *
- *     off) the plan is neutral and NO throttle field is emitted — so the HUD     *
+ *     when the plan ACTUALLY throttles. With [power].adaptive off (or on AC +    *
+ *     nominal thermal) the plan is neutral and NO throttle field is emitted — so the HUD     *
  *     shows no throttle indicator, never a phantom one. `reason` ∈               *
  *     disabled/nominal/low_battery/thermal (ThrottleReason::as_str); `tier_pref` *
  *     ∈ fast/capable/auto (LocalSubTier::as_str).                                *
@@ -5256,8 +5256,8 @@ export function localWarmHonest(s: LocalWarmStatus): string {
  * ------------------------------------------------------------------------ */
 
 /** Why the daemon's throttle plan acted this turn (ThrottleReason::as_str).
- *  `disabled` = [power].adaptive off (the OFF default — never reaches the HUD as
- *  a throttle since a neutral plan emits no field); `nominal` = on AC + nominal
+ *  `disabled` = [power].adaptive off (never reaches the HUD as a throttle since a
+ *  neutral plan emits no field); `nominal` = on AC + nominal
  *  thermal (no throttle); `low_battery` = low battery and not on AC; `thermal` =
  *  serious/critical thermal pressure. */
 export type ThrottleReason = "disabled" | "nominal" | "low_battery" | "thermal";
@@ -5304,13 +5304,20 @@ export interface InferencePerfStatus {
   /** The active throttle plan, or null when the last turn carried no throttle
    *  (OFF/neutral default — honest, never a phantom indicator). */
   throttle: ThrottlePlan | null;
+  /** Decode throughput (tokens/sec) mlx_lm MEASURED on the last on-device turn
+   *  that reported it; null before any measured turn. Never estimated — the
+   *  speculative/uncached single-shot paths report nothing and leave this null. */
+  tps: number | null;
+  /** Peak GPU memory (GB, decimal — the server-reported mx.get_peak_memory value) for the last measured on-device turn; null before any.
+   *  The server's mx.get_peak_memory reading, never fabricated. */
+  peakMemGb: number | null;
 }
 
 /** The resting inference-perf status before any answered turn: nothing reported
  *  yet (awaiting), no throttle (the OFF/neutral default). Used as the reducer seed
  *  so the panel renders the honest resting state. */
 export function inferencePerfInitial(): InferencePerfStatus {
-  return { speculative: null, quant: null, throttle: null };
+  return { speculative: null, quant: null, throttle: null, tps: null, peakMemGb: null };
 }
 
 /** Narrow an untrusted string to a known ThrottleReason, or null. */
@@ -5370,7 +5377,26 @@ export function applyInferencePerf(
   // The throttle is a LIVE per-turn plan: replace it every turn so a stale
   // throttle never lingers. Absent => null (the OFF/neutral default).
   const throttle = parseThrottle(data);
-  return { speculative, quant, throttle };
+  return { ...prev, speculative, quant, throttle };
+}
+
+/** Fold an `inference.decode` payload (emitted after a measured on-device turn)
+ *  into the surface: the mlx_lm-measured throughput + peak memory, plus the
+ *  speculative/quant path that actually ran. Keep-prior when a field is absent
+ *  (never blanks a known value from a turn that didn't measure); a present
+ *  finite number/bool/string is taken verbatim. PRESERVES the throttle (that is
+ *  the model.tier surface's to own). Never throws. */
+export function applyInferenceDecode(
+  prev: InferencePerfStatus,
+  data: Record<string, unknown>,
+): InferencePerfStatus {
+  const tpsRaw = data["generation_tps"];
+  const memRaw = data["peak_memory_gb"];
+  const tps = typeof tpsRaw === "number" && Number.isFinite(tpsRaw) ? tpsRaw : prev.tps;
+  const peakMemGb = typeof memRaw === "number" && Number.isFinite(memRaw) ? memRaw : prev.peakMemGb;
+  const speculative = bool(data, "speculative") ?? prev.speculative;
+  const quant = str(data, "quant") ?? prev.quant;
+  return { ...prev, speculative, quant, tps, peakMemGb };
 }
 
 /** Short uppercase label for the speculative-decoding state: ON (it actually ran
@@ -5490,8 +5516,8 @@ export function quantHonest(s: InferencePerfStatus): string {
 export function throttleHonest(p: ThrottlePlan | null): string {
   if (p === null) {
     return (
-      "No throttle: the plan is neutral (the OFF default — [power].adaptive off, so " +
-      "nothing reads power and the tier is unchanged). The live power read (pmset / " +
+      "No throttle: the plan is neutral (on AC + nominal thermal, or [power].adaptive " +
+      "off, so the tier is unchanged). The live power read (pmset / " +
       "thermal pressure / IOKit) is device-gated and happens ONLY when adaptive is on."
     );
   }
