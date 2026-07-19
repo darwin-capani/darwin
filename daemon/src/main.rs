@@ -68,9 +68,10 @@ mod crypto;
 // label-mapper + the on-device honest fallback are hermetically tested in diarize.rs.
 mod diarize;
 // SELF-DISTILLATION (F17): an ARMED-BUT-INERT on-device LoRA pipeline learning a
-// personal adapter from the user's OWN graded interactions. SHIPS OFF; NEVER
-// auto-promotes a trained adapter into the live model; training is inert without
-// Apple Silicon + mlx-lm. Hermetically tested in distill.rs.
+// personal adapter from the user's OWN graded interactions. SHIPS OFF; a trained
+// adapter goes LIVE only through the MEASURED promotion gate (strict held-out win
+// over base; opt-in, reversible); training is inert without Apple Silicon +
+// mlx-lm. Hermetically tested in distill.rs.
 mod distill;
 // DARWIN LANGUAGE SERVER (dls.rs): a READ-ONLY, LOOPBACK-ONLY LSP-style endpoint
 // grounded in the LIVE capability graph — config-key completion (KNOWN_KEYS),
@@ -1171,8 +1172,9 @@ async fn audit_snapshot_task(cfg: Arc<Config>, memory: Arc<Memory>, root: PathBu
         );
         // The HUD's DistillPanel shows the self-distillation pipeline's honest
         // state (distill.rs): armed/inert, how many redacted examples are ready,
-        // the last run, and that adapters are NEVER auto-promoted. READ-ONLY —
-        // counts + reads a manifest, runs no training.
+        // the last run, and the promotion state (an adapter goes live only on
+        // a MEASURED held-out win; adapter_live/adapter_pointer report the
+        // verified truth). READ-ONLY — counts + reads manifests, runs no training.
         distill::emit_status(&live, &memory, &root).await;
         // The HUD's SyncPanel shows the federated-sync pipeline's honest state
         // (sync.rs): armed/inert, syncable-fact count, whether a shared key is

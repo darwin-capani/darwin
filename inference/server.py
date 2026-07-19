@@ -74,7 +74,7 @@ state/ipc/inference.sock per the shared contract:
              "embedder"?: str + "dim"?: int + "fell_back"?: bool (op=embed WIRE
              CONTRACT: the ACTIVE backend's vector-space id — the fixed
              "coreml-bge-small-en-v1.5" (384-dim) for the Core ML path, or the
-             MODEL-DERIVED "llm-meanpool:<llm_id>:<quant>" for the mean-pool path
+             MODEL-DERIVED "llm-meanpool:<llm_id>:<quant>[:<adapter>]" for the mean-pool path
              (so an LLM/quant swap changes the stamp) — and its vector dimension,
              compared by STRING EQUALITY so the daemon/docsearch key the vector
              SPACE and refuse cross-space comparison; fell_back is true iff the
@@ -1513,7 +1513,7 @@ EMBED_CHUNK_WASTE_FACTOR = 2
 #     values (a stable user choice; validated by validate_embedder).
 #   - The id EMITTED on the wire as the vector-space stamp is the CONFIG value
 #     for the Core ML path (one pinned model), but for the mean-pool path it is
-#     MODEL-DERIVED (`_meanpool_space_id`: llm-meanpool:<llm_id>:<quant>), because
+#     MODEL-DERIVED (`_meanpool_space_id`: llm-meanpool:<llm_id>:<quant>[:<adapter>]), because
 #     that path mean-pools WHATEVER [models].llm loads — a fixed string would
 #     keep matching across an LLM/quant swap while the space silently changed, so
 #     the stamp must reflect the resident model.
@@ -2862,6 +2862,15 @@ class InferenceEngine:
         self.persona = persona
         self._model = None
         self._tokenizer = None
+        # SELF-DISTILLATION (distill.rs) — the LIVE personal LoRA adapter, if the
+        # daemon has PROMOTED one (state/lora/promoted/). The resident LLM loads
+        # WITH the adapter when its manifest base_model matches self.llm_id; else
+        # base. HONEST: `_active_adapter` is the loaded adapter's stamp (or None =
+        # base), `_adapter_note` records why an adapter present on disk was NOT
+        # loaded (base mismatch / load failure) so op=generate never claims an
+        # adapter it didn't apply. Both are set in _ensure_llm at load time.
+        self._active_adapter = None
+        self._adapter_note = None
         # Multi-resident LOCAL model manager (task #17). The base [models].llm is
         # ALWAYS warm + the single-resident fallback; the manager additionally
         # keeps the configured extra warm-set resident WHEN the RAM budget allows
@@ -2995,21 +3004,51 @@ class InferenceEngine:
             # when the base loaded instead. The real RAM/speed tradeoff is
             # device-gated; this seam only governs WHICH id is requested.
             load_id, loaded_quant = self._resolve_quant_load(self.llm_id, self.quant)
-            log.info("loading LLM %s (resident after first use)...", load_id)
+            # SELF-DISTILLATION: a PROMOTED personal adapter, loaded ONLY when its
+            # base_model matches the id we're loading (an adapter is invalid for a
+            # different base). A present-but-mismatched or unloadable adapter is
+            # recorded in _adapter_note and generation serves BASE — never a
+            # silently-wrong or falsely-claimed adapter.
+            adapter_path, adapter_stamp, self._adapter_note = self._promoted_adapter(load_id)
+            log.info(
+                "loading LLM %s (resident after first use)%s...",
+                load_id,
+                f" with adapter {adapter_stamp}" if adapter_path else "",
+            )
             t0 = time.perf_counter()
+            self._active_adapter = None
             try:
-                self._model, self._tokenizer = load(load_id)
+                if adapter_path:
+                    try:
+                        self._model, self._tokenizer = load(load_id, adapter_path=adapter_path)
+                        self._active_adapter = adapter_stamp
+                    except Exception as e:
+                        # Adapter failed to fuse — fall back to base HONESTLY.
+                        log.warning("promoted adapter %s failed to load (%s); serving base", adapter_stamp, e)
+                        self._adapter_note = f"adapter load failed: {e}"
+                        self._model, self._tokenizer = load(load_id)
+                else:
+                    self._model, self._tokenizer = load(load_id)
             except Exception:
                 if load_id != self.llm_id:
                     # The requested quant variant is absent/unloadable: fall back
                     # to the configured base id and report the truth (auto = the
-                    # on-disk variant the loader picked).
+                    # on-disk variant the loader picked). Retry the adapter on base.
                     log.warning(
                         "quant variant %r unavailable; falling back to %s and reporting the loaded quant honestly",
                         load_id,
                         self.llm_id,
                     )
-                    self._model, self._tokenizer = load(self.llm_id)
+                    a2, s2, self._adapter_note = self._promoted_adapter(self.llm_id)
+                    if a2:
+                        try:
+                            self._model, self._tokenizer = load(self.llm_id, adapter_path=a2)
+                            self._active_adapter = s2
+                        except Exception as e:
+                            self._adapter_note = f"adapter load failed: {e}"
+                            self._model, self._tokenizer = load(self.llm_id)
+                    else:
+                        self._model, self._tokenizer = load(self.llm_id)
                     loaded_quant = "auto"
                 else:
                     raise
@@ -3031,6 +3070,82 @@ class InferenceEngine:
         if quant == "auto":
             return (base_id, "auto")
         return (quant_variant_id(base_id, quant), quant)
+
+    def _promoted_adapter(self, base_id):
+        """Return (adapter_path, stamp, note) for the daemon-PROMOTED personal
+        LoRA adapter, or (None, None, note). Loads ONLY when state/lora/promoted/
+        holds an adapters.safetensors AND a manifest.json whose base_model equals
+        `base_id` — an adapter is invalid for a different base, and applying it to
+        a mismatched model would silently corrupt output. HONEST: a mismatch, an
+        unreadable manifest, or absence returns (None, None, <human note>); it
+        never fabricates an adapter. No MLX/load here — _ensure_llm does the load
+        + reports self._active_adapter from the returned stamp."""
+        promoted = PROJECT_ROOT / "state" / "lora" / "promoted"
+        weights = promoted / "adapters.safetensors"
+        if not weights.is_file():
+            return (None, None, None)
+        try:
+            with open(promoted / "manifest.json") as f:
+                m = json.load(f)
+        except Exception:
+            return (None, None, "a promoted adapter is staged but its manifest is unreadable; serving base")
+        base_model = m.get("base_model")
+        if base_model != base_id:
+            return (
+                None,
+                None,
+                f"the promoted adapter is for {base_model!r}, not the resident {base_id!r}; serving base",
+            )
+        stamp = "lora:" + str(m.get("created") or "promoted")
+        return (str(promoted), stamp, None)
+
+    def reload_lora(self):
+        """Drop the resident LLM so the NEXT generate reloads with the CURRENT
+        state/lora/promoted/ pointer — fusing a freshly-promoted personal adapter,
+        or serving base after a rollback. Held under the GPU lock; in-flight
+        work is safe either way — ops that hold the lock serialize with this,
+        and the deliberately lock-SLICED consolidate pass captures its own
+        model reference at op start, so it completes coherently on the weights
+        it began with (the reload applies from the next op). The reload itself
+        is lazy (next _ensure_llm), so this call is cheap. The daemon calls it
+        right after a promote/rollback.
+
+        EVERY holder of the old model object is evicted, not just self._model —
+        otherwise converse / the uncached + speculative generate paths keep
+        serving the PRE-reload weights all session (they resolve the model via
+        LocalWarmManager.resident, which returns a HIT without reloading) and
+        the classifier (which aliases the main LLM when no dedicated classifier
+        is configured) pins a second full copy in RAM. Evicting here means the
+        next _ensure_local_llm/_ensure_classifier re-registers the freshly
+        (re)loaded model, so the whole engine swaps atomically-from-the-callers'
+        view and the spoken "it's live now / no longer live" is true for every
+        generation surface."""
+        with self._lock:
+            self._model = None
+            self._tokenizer = None
+            self._active_adapter = None
+            self._adapter_note = None
+            self._gen_cache = None
+            self._gen_cache_len = 0
+            # The warm manager's pinned BASE entry holds the old model object;
+            # pop it so _ensure_local_llm re-seeds from the reloaded self._model
+            # (warm EXTRAS are untouched — the adapter fuses into base only).
+            self.local_manager.resident.pop(self.llm_id, None)
+            self.local_manager.resident.pop(self.local_manager.base_id, None)
+            # AGENT-PERSONA converse KV caches were prefilled by the OLD
+            # weights — decoding the reloaded model against them would condition
+            # every agent-persona reply on pre-reload activations (the tokenizer
+            # is unchanged, so the seam-trim can't catch it). Drop them all;
+            # they rebuild lazily on each agent's next turn.
+            self._agent_gen_caches.clear()
+            # The classifier aliases the main LLM when no dedicated classifier
+            # model is configured — drop the alias (and its prompt cache) so it
+            # rebinds to the reloaded model instead of pinning the old copy.
+            if not self.classifier_id:
+                self._cls_model = None
+                self._cls_tokenizer = None
+                self._cls_cache = None
+                self._cls_cache_len = 0
 
     def _ensure_draft(self):
         """#37: lazy-load the DRAFT model for speculative decoding, behind the
@@ -3821,8 +3936,16 @@ class InferenceEngine:
 
         with self._lock:
             self._ensure_llm()
-            prompt_tokens = self._tokenizer.encode(self._render_chat(user_text, system=system))
-            cache = make_prompt_cache(self._model)
+            # Capture the model/tokenizer refs ONCE: the slices below release
+            # the lock between chunks (fairness), so a concurrent reload_lora
+            # may null self._model mid-pass. Holding our own reference means
+            # this pass completes COHERENTLY on the weights it started with
+            # (never a crash, never a mixed-weight cache); the reload applies
+            # from the next op on.
+            model = self._model
+            tokenizer = self._tokenizer
+            prompt_tokens = tokenizer.encode(self._render_chat(user_text, system=system))
+            cache = make_prompt_cache(model)
         # Chunked prefill of all but the last prompt token; stream_generate
         # below receives that final token as its prompt, so its own internal
         # prefill is a single step.
@@ -3831,7 +3954,7 @@ class InferenceEngine:
         while pos < n:
             stop = min(pos + prefill_chunk, n)
             with self._lock:
-                logits = self._model(mx.array(prompt_tokens[pos:stop])[None], cache=cache)
+                logits = model(mx.array(prompt_tokens[pos:stop])[None], cache=cache)
                 mx.eval(logits)
             pos = stop
             # threading.Lock has no fairness: without this yield the loop
@@ -3841,8 +3964,8 @@ class InferenceEngine:
             time.sleep(0.002)
         pieces = []
         gen = stream_generate(
-            self._model,
-            self._tokenizer,
+            model,
+            tokenizer,
             prompt=prompt_tokens[n:],
             max_tokens=max_tokens,
             prompt_cache=cache,
@@ -3946,6 +4069,11 @@ class InferenceEngine:
             resolved_id, model, tokenizer = self._ensure_local_llm(local_model)
             on_base = resolved_id == self.llm_id
             quant_loaded = self._quant_loaded if on_base else "auto"
+            # SELF-DISTILLATION honesty: the promoted personal adapter is fused
+            # into the BASE resident only — a non-base warm model answers on its
+            # own unadapted weights, so its meta reports adapter=None. The op
+            # reply takes THIS per-turn stamp, never the engine-global one.
+            turn_adapter = self._active_adapter if on_base else None
             messages = self._build_generate_messages(text, history=history, facts=facts, data=data)
             prompt = self._render_chat_messages(messages, tokenizer=tokenizer)
             # #37: decide whether speculative ACTUALLY runs this turn. A draft only
@@ -3963,7 +4091,7 @@ class InferenceEngine:
                     # `metrics` carries the honest decode telemetry (tok/s + peak
                     # mem) mlx_lm measured on this stream_generate run; None only
                     # if nothing was decoded (immediate cancel).
-                    return (out, {"speculative": False, "quant": quant_loaded, "metrics": metrics})
+                    return (out, {"speculative": False, "quant": quant_loaded, "adapter": turn_adapter, "metrics": metrics})
                 except Exception:
                     log.exception("cached generate failed; rebuilding cache and falling back")
                     try:
@@ -3987,7 +4115,7 @@ class InferenceEngine:
                     # per-token GenerationResponse stream to read tok/s from, so
                     # metrics are honestly absent here (never fabricated). The
                     # benchmark harness measures the speculative delta directly.
-                    return (out, {"speculative": True, "quant": quant_loaded, "metrics": None})
+                    return (out, {"speculative": True, "quant": quant_loaded, "adapter": turn_adapter, "metrics": None})
                 except Exception:
                     # A runtime speculative failure (version mismatch, draft
                     # incompatibility) HONESTLY falls back to normal generation and
@@ -4005,7 +4133,7 @@ class InferenceEngine:
             )
             # Uncached normal path: also a single blocking mlx_lm.generate() call
             # with no per-token stream, so metrics are honestly absent.
-            return (out, {"speculative": False, "quant": quant_loaded, "metrics": None})
+            return (out, {"speculative": False, "quant": quant_loaded, "adapter": turn_adapter, "metrics": None})
 
     def _embed_encode(self, text):
         """Encode one input to a capped list of token ids for embedding. An input
@@ -4101,11 +4229,17 @@ class InferenceEngine:
         while the vectors moved to a different space; deriving the id from the
         resident model means any swap changes the stamp, so a store from the old
         model is correctly treated as a different space (never silently cosine-
-        compared). `_quant_loaded` is set once the LLM is loaded; before that it
-        falls back to the requested quant (only reachable on an empty batch,
-        which indexes nothing)."""
+        compared). A FUSED PERSONAL ADAPTER changes the decoder weights too —
+        the very stack the mean-pool forwards through — so the ACTIVE adapter
+        stamp is part of the id: a promote (or rollback) moves the space and the
+        stamp moves with it, exactly like a quant swap. `_quant_loaded` /
+        `_active_adapter` are set once the LLM is loaded; before that they fall
+        back to the requested quant / no adapter (only reachable on an empty
+        batch, which indexes nothing — the returned id for a real batch is read
+        AFTER the forward)."""
         quant = self._quant_loaded or self.quant or "auto"
-        return f"llm-meanpool:{self.llm_id}:{quant}"
+        base = f"llm-meanpool:{self.llm_id}:{quant}"
+        return f"{base}:{self._active_adapter}" if self._active_adapter else base
 
     def embed_with_meta(self, texts):
         """Return (vectors, embedder_id, dim, fell_back) for op=embed — the batch
@@ -6322,6 +6456,36 @@ class InferenceServer:
                     "text": out,
                     "speculative": gen_meta.get("speculative", False),
                     "quant": gen_meta.get("quant", "auto"),
+                    # SELF-DISTILLATION: the personal adapter stamp for THE PATH
+                    # THIS TURN RAN (or None = unadapted). HONEST — from the
+                    # per-turn gen_meta, not the engine-global state: a turn on a
+                    # non-base warm model reports None even while the base
+                    # resident carries an adapter (the adapter fuses into base
+                    # only), and mismatched/failed adapters serve base + None. The
+                    # daemon/HUD never see a personalization that didn't run.
+                    "adapter": gen_meta.get("adapter"),
+                    "latency_ms": latency_ms(),
+                }
+
+            if op == "reload_lora":
+                # SELF-DISTILLATION: the daemon promoted or rolled back a personal
+                # adapter — drop the resident LLM so the NEXT generate reloads with
+                # the current state/lora/promoted/ pointer. Under the GPU lock (via
+                # a thread); lock-holding ops serialize with it, and the
+                # lock-SLICED consolidate pass runs on refs captured at op
+                # start, so a mid-pass reload is safe (applies next op).
+                await asyncio.to_thread(self.engine.reload_lora)
+                return {"id": rid, "ok": True, "reloaded": True, "latency_ms": latency_ms()}
+
+            if op == "lora_status":
+                # Read-only: which personal adapter (if any) is LIVE, plus the
+                # honest note when one staged on disk was NOT loaded (base mismatch
+                # / load failure). Never claims an adapter that isn't running.
+                return {
+                    "id": rid,
+                    "ok": True,
+                    "adapter": self.engine._active_adapter,
+                    "note": self.engine._adapter_note,
                     "latency_ms": latency_ms(),
                 }
 
@@ -6524,7 +6688,7 @@ class InferenceServer:
                 #   "embedder": the vector-space id —
                 #       "coreml-bge-small-en-v1.5" (fixed) for the Core ML bge
                 #       path (384-dim, one pinned model), or the MODEL-DERIVED
-                #       "llm-meanpool:<llm_id>:<quant>" for the mean-pool path (so
+                #       "llm-meanpool:<llm_id>:<quant>[:<adapter>]" for the mean-pool path (so
                 #       swapping [models].llm or the quant changes the stamp — a
                 #       fixed string would falsely keep matching across a space
                 #       change). docsearch stores this WITH its index.
