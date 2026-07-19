@@ -5421,15 +5421,30 @@ fn explicit_screen_vqa(lower: &str, original: &str) -> Option<Option<String>> {
 fn vqa_question(text: &str, path: Option<&str>) -> Option<String> {
     // Remove the path token (first occurrence, case-insensitive) from a working
     // copy; the returned question is built from the ORIGINAL text minus the path.
+    // Remove the image-path token WITHOUT byte-offset math on the original: an
+    // offset from `text.to_lowercase()` desyncs on any char whose lowercase form
+    // has a different byte length (e.g. `İ`), which would panic replace_range on a
+    // char boundary. Instead drop the whitespace token whose punctuation-trimmed
+    // form equals the path (extract_image_path built the path exactly that way),
+    // which is boundary-safe by construction. Also removes any punctuation
+    // attached to the path token — fine for a VLM prompt.
     let stripped: String = match path {
         Some(p) if !p.is_empty() => {
-            if let Some(idx) = text.to_lowercase().find(&p.to_lowercase()) {
-                let mut s = text.to_string();
-                s.replace_range(idx..idx + p.len(), " ");
-                s
-            } else {
-                text.to_string()
-            }
+            let pl = p.to_lowercase();
+            text.split_whitespace()
+                .filter(|tok| {
+                    let trimmed = tok.trim_matches(|c: char| {
+                        !c.is_alphanumeric()
+                            && c != '.'
+                            && c != '/'
+                            && c != '_'
+                            && c != '-'
+                            && c != '~'
+                    });
+                    trimmed.to_lowercase() != pl
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
         }
         _ => text.to_string(),
     };
@@ -8235,6 +8250,28 @@ mod tests {
             vqa_question("what breed is the dog in cat.png", Some("cat.png")),
             Some("what breed is the dog in".to_string())
         );
+    }
+
+    /// PANIC PIN (no-regression): vqa_question / describe_command must NEVER panic
+    /// on an offset-shifting-lowercase utterance — a char like `İ` whose lowercase
+    /// is a different byte length — that also names an image path. The path-strip
+    /// must not index a byte offset derived from a lowercased copy onto the
+    /// original text (that lands mid-char and panics replace_range). Mirrors the
+    /// extract_image_prompt offset-shift panic pin.
+    #[test]
+    fn vqa_and_describe_never_panic_on_offset_shifting_lowercase() {
+        for text in [
+            "İ describe a.png",
+            "describe İcafé.png what İis on it",
+            "İİİ what is in /tmp/İ.png please",
+            "ẞ describe photo.PNG İ",
+            "what İs in \u{0130}\u{0130}.jpeg",
+            "ask my screen İ what İs the error",
+            "ask about my display \u{0130}",
+        ] {
+            let _ = describe_command(text);
+            let _ = vqa_question(text, extract_image_path(text).as_deref());
+        }
     }
 
     /// CONTRACT PIN (no-regression): the OCR read.screen path is NOT poached by
