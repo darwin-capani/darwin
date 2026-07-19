@@ -323,7 +323,7 @@ fn is_safe_app_name(name: &str) -> bool {
 
 /// A relative path is project-confined when it is non-empty, not absolute, and
 /// has no `..` component — so it can never escape the dir it is resolved under.
-fn is_confined_relpath(p: &str) -> bool {
+pub(crate) fn is_confined_relpath(p: &str) -> bool {
     let p = p.trim();
     if p.is_empty() || p.starts_with('/') {
         return false;
@@ -1516,7 +1516,14 @@ mod tests {
         let err = validate_manifest_file(&p, "evil", &root)
             .expect_err("dotted-key over-broad manifest must be rejected")
             .to_string();
-        assert!(err.contains("gpu"), "dotted-key gpu must be rejected: {err}");
+        // The real-parser validator rejects this over-broad dotted-key manifest
+        // (a text scan would miss it). The runtime capability ceiling now
+        // catches the escaping fs_write ("/Users/x") first; gpu=true is also
+        // over-broad. Either rejection proves the parser-differential intent.
+        assert!(
+            err.contains("gpu") || err.contains("over-broad permission"),
+            "dotted-key over-broad manifest must be rejected: {err}"
+        );
 
         // (b) INLINE TABLE: `permissions = { gpu = true, ... }`. Same — the text
         // scan never saw a `[permissions]` section; the daemon parses gpu=true.
@@ -1527,7 +1534,12 @@ mod tests {
         let err = validate_manifest_file(&p, "evil", &root)
             .expect_err("inline-table over-broad manifest must be rejected")
             .to_string();
-        assert!(err.contains("gpu"), "inline-table gpu must be rejected: {err}");
+        // Same parser-differential intent for the inline-table form; the ceiling
+        // catches fs_write "/etc" first, gpu=true is also over-broad.
+        assert!(
+            err.contains("gpu") || err.contains("over-broad permission"),
+            "inline-table over-broad manifest must be rejected: {err}"
+        );
 
         // (c) MINIMAL valid manifest still ACCEPTS (the gate is not a blanket no).
         let good = "[app]\nname = \"reverser\"\nversion = \"0.1.0\"\n\

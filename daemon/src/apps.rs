@@ -260,6 +260,52 @@ impl AppManifest {
         if self.app.entry.trim().is_empty() {
             bail!("manifest [app].entry is empty");
         }
+        self.validate_capability_ceiling()?;
+        Ok(())
+    }
+
+    /// CAPABILITY CEILING (Wave A): bound the STRUCTURAL shape of `[permissions]`
+    /// at discover time, so an over-broad or malformed manifest is rejected
+    /// (fail-closed, surfaced as an install error) BEFORE the app is ever
+    /// registered or launched — the runtime discover/launch path previously had
+    /// no permission bound at all.
+    ///
+    /// Deliberately NOT the forge author-time ban on audio/gpu/camera/screen:
+    /// those are legitimate for first-party apps (vision needs camera/screen,
+    /// nexus needs audio). This bounds the invariants EVERY app must honor:
+    ///   - fs_write / fs_read are CONFINED in-project relative paths (no
+    ///     absolute path, no `..`/root escape) — a manifest can never declare
+    ///     write access to `/` or read access to `../../etc`;
+    ///   - net_hosts are BARE hostnames (never a URL / path / port / space /
+    ///     `..`) and bounded in count.
+    ///
+    /// Every shipped manifest already satisfies this; the ceiling exists to stop
+    /// a NEW/edited manifest from widening the sandbox beyond these invariants.
+    fn validate_capability_ceiling(&self) -> Result<()> {
+        const MAX_APP_NET_HOSTS: usize = 16;
+        let p = &self.permissions;
+        for w in &p.fs_write {
+            if !crate::forge::is_confined_relpath(w) {
+                bail!("over-broad permission: fs_write {w:?} is not a confined in-project relative path");
+            }
+        }
+        for r in &p.fs_read {
+            if !crate::forge::is_confined_relpath(r) {
+                bail!("over-broad permission: fs_read {r:?} is not a confined in-project relative path");
+            }
+        }
+        if p.net_hosts.len() > MAX_APP_NET_HOSTS {
+            bail!(
+                "over-broad permission: net_hosts declares {} hosts (max {MAX_APP_NET_HOSTS})",
+                p.net_hosts.len()
+            );
+        }
+        for h in &p.net_hosts {
+            let h = h.trim();
+            if h.is_empty() || h.contains('/') || h.contains(':') || h.contains(' ') || h.contains("..") {
+                bail!("over-broad permission: net_hosts entry {h:?} is not a bare hostname");
+            }
+        }
         Ok(())
     }
 
@@ -2406,12 +2452,39 @@ fn write_profile(
     profile_path: &Path,
 ) -> Result<()> {
     let profile = generate_sbpl(manifest, project_root, interp, app_dir, socket_path);
-    if let Some(parent) = profile_path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating profile dir {}", parent.display()))?;
+    let parent = profile_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("profile path has no parent dir"))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating profile dir {}", parent.display()))?;
+    // ATOMIC + MODE-RESTRICTED write to close the write->exec TOCTOU: a same-UID
+    // edit of the seatbelt profile between our write and the `sandbox-exec -f`
+    // could previously widen the sandbox in the window between the two. Write to
+    // a sibling temp file created 0600 (owner-only), flush it, then atomically
+    // rename it over the final path. `sandbox-exec` therefore only ever sees a
+    // fully-written, owner-only profile that appeared in one rename step; there
+    // is no partially-written or world-writable intermediate to race.
+    let tmp_path = parent.join(format!(".{}.sb.tmp", manifest.name()));
+    {
+        use std::io::Write;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts
+            .open(&tmp_path)
+            .with_context(|| format!("creating temp profile {}", tmp_path.display()))?;
+        f.write_all(profile.as_bytes())
+            .with_context(|| format!("writing temp profile {}", tmp_path.display()))?;
+        f.flush().ok();
     }
-    std::fs::write(profile_path, &profile)
-        .with_context(|| format!("writing profile {}", profile_path.display()))?;
+    std::fs::rename(&tmp_path, profile_path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp_path); // don't leak the temp on failure
+        anyhow::anyhow!("atomically installing profile {}: {e}", profile_path.display())
+    })?;
     // Record the fingerprint of exactly what we just wrote so the introspect
     // sentinel can detect post-launch tampering of the on-disk profile (a
     // same-UID edit of state/apps/<name>/<name>.sb after the daemon wrote it).
@@ -2504,6 +2577,84 @@ mod tests {
             telemetry_topics = ["feed"]
         "#;
         AppManifest::parse(raw, "global-scan").expect("sample manifest parses")
+    }
+
+    /// A manifest with the given `[permissions]` body, else the sample shape.
+    fn manifest_with_perms(perms: &str) -> Result<AppManifest> {
+        let raw = format!(
+            r#"
+            [app]
+            name        = "probe"
+            version     = "0.1.0"
+            description = "ceiling probe."
+            entry       = "apps/probe/main.py"
+            runtime     = "python"
+
+            [permissions]
+            {perms}
+
+            [ui]
+            surface          = "panel"
+            telemetry_topics = ["feed"]
+        "#
+        );
+        AppManifest::parse(&raw, "probe")
+    }
+
+    // -- capability ceiling (Wave A) ------------------------------------
+    #[test]
+    fn ceiling_rejects_an_escaping_or_absolute_fs_path() {
+        // Absolute fs_write is refused.
+        assert!(manifest_with_perms(
+            "audio=false\ngpu=false\nnet_hosts=[]\nfs_read=[]\nfs_write=[\"/etc\"]"
+        )
+        .is_err());
+        // A `..` escape in fs_read is refused.
+        assert!(manifest_with_perms(
+            "audio=false\ngpu=false\nnet_hosts=[]\nfs_read=[\"../../etc/passwd\"]\nfs_write=[]"
+        )
+        .is_err());
+        // A confined in-project path is allowed (state/tmp + apps/<x>/data shapes
+        // the first-party apps actually use).
+        assert!(manifest_with_perms(
+            "audio=false\ngpu=false\nnet_hosts=[]\nfs_read=[\"state/ipc/inference.sock\"]\nfs_write=[\"state/tmp/probe\"]"
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn ceiling_rejects_a_non_bare_or_overlong_net_hosts() {
+        // A URL / path / port in net_hosts is refused (must be a bare hostname).
+        for bad in ["https://evil.com", "evil.com/path", "host:8080", "a b"] {
+            assert!(
+                manifest_with_perms(&format!(
+                    "audio=false\ngpu=false\nnet_hosts=[\"{bad}\"]\nfs_read=[]\nfs_write=[]"
+                ))
+                .is_err(),
+                "net_host {bad:?} must be rejected"
+            );
+        }
+        // A bare hostname (incl. the .local printer shape fab-link uses) is fine.
+        assert!(manifest_with_perms(
+            "audio=false\ngpu=false\nnet_hosts=[\"octoprint.local\"]\nfs_read=[]\nfs_write=[]"
+        )
+        .is_ok());
+        // Over the count ceiling (>16) is refused.
+        let many = (0..17).map(|i| format!("\"h{i}.example\"")).collect::<Vec<_>>().join(",");
+        assert!(manifest_with_perms(&format!(
+            "audio=false\ngpu=false\nnet_hosts=[{many}]\nfs_read=[]\nfs_write=[]"
+        ))
+        .is_err());
+    }
+
+    #[test]
+    fn ceiling_does_not_ban_first_party_elevated_permissions() {
+        // audio/gpu/camera are LEGITIMATE for first-party apps (nexus/vision) —
+        // the runtime ceiling bounds path/host SHAPE, not these declarations.
+        assert!(manifest_with_perms(
+            "audio=true\ngpu=true\nnet_hosts=[]\nfs_read=[]\nfs_write=[\"state/tmp/probe\"]"
+        )
+        .is_ok());
     }
 
     // -- manifest parse -------------------------------------------------
