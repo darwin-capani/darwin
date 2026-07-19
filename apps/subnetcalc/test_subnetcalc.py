@@ -143,6 +143,18 @@ def main():
         out = compute(payload)
         check("hostile %s is error dict" % label, isinstance(out, dict) and "error" in out)
 
+
+    # REVIEW PIN: a full 65536-way split must FIT the daemon's 1 MiB app-line
+    # budget — the listed subnets are bounded, the full count + flag are honest.
+    import json as _json
+    r = compute({"cidr": "10.0.0.0/8", "split_count": 65536})
+    check("big split count honest", r.get("subnet_count") == 65536)
+    check("big split listing bounded", len(r.get("subnets", [])) == 1024)
+    check("big split flagged truncated", r.get("subnets_truncated") is True)
+    check("big split reply fits the wire budget", len(_json.dumps(r)) < 200_000)
+    r = compute({"cidr": "192.168.0.0/24", "split_count": 4})
+    check("small split not truncated", r.get("subnets_truncated") is False and r.get("subnet_count") == 4)
+
     print("all subnetcalc checks passed")
 
 

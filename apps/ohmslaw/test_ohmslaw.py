@@ -111,6 +111,18 @@ def main():
     check("bool value", is_err(compute({"voltage": True, "current": 1})))
     check("computed negative R", is_err(compute({"voltage": -5, "current": 2})))
 
+
+    # REVIEW PIN: finite inputs whose SOLUTION overflows must return an error
+    # dict — an inf result would serialize as invalid-JSON "Infinity" and the
+    # daemon would silently drop the whole reply.
+    r = compute({"voltage": 1e308, "current": 1e-308})
+    check("inf resistance guarded", "error" in r and "not finite" in r["error"])
+    r = compute({"voltage": 1e308, "current": 1e308})
+    check("inf power guarded", "error" in r)
+    import json as _json
+    ok = compute({"voltage": "12V", "resistance": "2.2kohm"})
+    check("normal result stays JSON-clean", "Infinity" not in _json.dumps(ok))
+
     print("all ohmslaw checks passed")
 
 

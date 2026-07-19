@@ -84,6 +84,18 @@ def _kelvin_to(value_k, unit):
     return value_k  # K
 
 
+def _finite_checked(out):
+    """Reject any non-finite float in a result dict: json.dumps would emit a
+    bare Infinity/NaN token (invalid JSON per RFC 8259), and the daemon's
+    strict parser would DROP the frame — the caller would get silence instead
+    of an answer. An honest error dict is the correct reply. Never raises."""
+    if isinstance(out, dict) and "error" not in out:
+        for k, v in out.items():
+            if isinstance(v, float) and not math.isfinite(v):
+                return {"error": "%s overflows the representable range (result is not finite)" % k}
+    return out
+
+
 def compute(payload):
     """PURE, offline, no I/O, never raises.
 
@@ -122,13 +134,13 @@ def compute(payload):
         else:
             table = _CATEGORIES[category]
             result = value * table[frm] / table[to]
-        return {
+        return _finite_checked({
             "value": value,
             "from": frm,
             "to": to,
             "result": float(result),
             "category": category,
-        }
+        })
     except Exception as e:  # noqa: BLE001 — compute must never raise
         return {"error": "unexpected: %s" % e}
 

@@ -15,6 +15,15 @@ def send(conn, obj):
     conn.sendall((json.dumps(obj) + "\n").encode("utf-8"))
 
 
+# Bounds (measured on an M1 Pro): the pairwise overlap scan is O(n^2) — 10k
+# distinct CIDRs is ~50M subnet_of() calls (~50 s, wedging the single-threaded
+# app), so the DISTINCT input count is capped; 512 distinct = ~131k pairs,
+# well under a second. Listed overlap pairs are separately bounded so the
+# reply always fits the daemon's 1 MiB app-line budget.
+MAX_CIDRS = 512
+MAX_OVERLAPS = 500
+
+
 def compute(payload):
     """PURE, offline, no I/O, never raises.
 
@@ -40,6 +49,8 @@ def compute(payload):
             return {"error": "cidrs must be a list"}
         if len(cidrs) == 0:
             return {"error": "cidrs must be a non-empty list"}
+        if len(cidrs) > MAX_CIDRS:
+            return {"error": "too many cidrs: %d (max %d)" % (len(cidrs), MAX_CIDRS)}
         nets = []
         for x in cidrs:
             if not isinstance(x, str):
@@ -61,29 +72,48 @@ def compute(payload):
         aggregated = [str(n) for n in aggregated_nets]
         ipv4_addresses = sum(n.num_addresses for n in agg4)
         ipv6_addresses = sum(n.num_addresses for n in agg6)
-        # Overlaps are computed over the ORIGINAL parsed inputs (collapse would
-        # otherwise erase every overlap). Only same-family pairs can relate.
+        # Overlaps are computed over the DISTINCT parsed inputs (collapse would
+        # otherwise erase every overlap; duplicates would explode the pair list
+        # quadratically — 4000 copies of one /8 is ~8M "equal" dicts and ~1 GB,
+        # measured — so exact duplicates are collapsed first and reported via
+        # duplicate_count). Only same-family pairs can relate. The listed pairs
+        # are BOUNDED (MAX_OVERLAPS) with the full count reported honestly:
+        # an unbounded list would exceed the daemon's 1 MiB app-line budget and
+        # the whole reply would be dropped.
+        distinct = []
+        seen_keys = set()
+        for n in nets:
+            k = (n.version, int(n.network_address), n.prefixlen)
+            if k not in seen_keys:
+                seen_keys.add(k)
+                distinct.append(n)
+        duplicate_count = len(nets) - len(distinct)
         overlaps = []
-        for i in range(len(nets)):
-            for j in range(i + 1, len(nets)):
-                a = nets[i]
-                b = nets[j]
+        overlap_count = 0
+        for i in range(len(distinct)):
+            for j in range(i + 1, len(distinct)):
+                a = distinct[i]
+                b = distinct[j]
                 if a.version != b.version:
                     continue
-                if a == b:
-                    rel = "equal"
-                elif b.subnet_of(a):
+                if b.subnet_of(a):
                     rel = "a-contains-b"
                 elif a.subnet_of(b):
                     rel = "b-contains-a"
                 else:
                     continue
-                overlaps.append({"a": str(a), "b": str(b), "relation": rel})
+                overlap_count += 1
+                if len(overlaps) < MAX_OVERLAPS:
+                    overlaps.append({"a": str(a), "b": str(b), "relation": rel})
         return {
             "input_count": len(nets),
+            "distinct_count": len(distinct),
+            "duplicate_count": duplicate_count,
             "aggregated": aggregated,
             "aggregated_count": len(aggregated),
             "overlaps": overlaps,
+            "overlap_count": overlap_count,
+            "overlaps_truncated": overlap_count > MAX_OVERLAPS,
             "ipv4_addresses": ipv4_addresses,
             "ipv6_addresses": str(ipv6_addresses),
         }

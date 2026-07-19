@@ -13,92 +13,75 @@ def check(name, cond):
 
 
 def main():
+    # Field-wise assertions (robust to the honest-bookkeeping fields added by
+    # the review fix: distinct_count / duplicate_count / overlap_count /
+    # overlaps_truncated). The meaningful outputs are asserted exactly.
+    def field(name, r, **kw):
+        for k, v in kw.items():
+            check("%s.%s" % (name, k), r.get(k) == v)
+
     # 1. single CIDR — 256 addresses, no overlaps
     r = compute({"cidrs": ["10.0.0.0/24"]})
-    check("single", r == {
-        "input_count": 1, "aggregated": ["10.0.0.0/24"], "aggregated_count": 1,
-        "overlaps": [], "ipv4_addresses": 256, "ipv6_addresses": "0",
-    })
+    field("single", r, input_count=1, aggregated=["10.0.0.0/24"], aggregated_count=1,
+          overlaps=[], overlap_count=0, ipv4_addresses=256, ipv6_addresses="0")
 
     # 2. adjacent halves collapse to /24, but are not subnet/supernet of each other
     r = compute({"cidrs": ["10.0.0.0/25", "10.0.0.128/25"]})
-    check("adjacent-collapse", r == {
-        "input_count": 2, "aggregated": ["10.0.0.0/24"], "aggregated_count": 1,
-        "overlaps": [], "ipv4_addresses": 256, "ipv6_addresses": "0",
-    })
+    field("adjacent-collapse", r, input_count=2, aggregated=["10.0.0.0/24"],
+          aggregated_count=1, overlaps=[], overlap_count=0, ipv4_addresses=256)
 
     # 3. contained subnet — a-contains-b, collapses to the supernet
     r = compute({"cidrs": ["10.0.0.0/8", "10.1.0.0/16"]})
-    check("a-contains-b", r == {
-        "input_count": 2, "aggregated": ["10.0.0.0/8"], "aggregated_count": 1,
-        "overlaps": [{"a": "10.0.0.0/8", "b": "10.1.0.0/16", "relation": "a-contains-b"}],
-        "ipv4_addresses": 16777216, "ipv6_addresses": "0",
-    })
+    field("a-contains-b", r, input_count=2, aggregated=["10.0.0.0/8"], aggregated_count=1,
+          overlaps=[{"a": "10.0.0.0/8", "b": "10.1.0.0/16", "relation": "a-contains-b"}],
+          overlap_count=1, ipv4_addresses=16777216)
 
-    # 4. exact duplicate — relation equal
+    # 4. exact duplicate — the review fix COLLAPSES duplicates: distinct_count 1,
+    # duplicate_count 1, and NO self-overlap (a==b is not a reported relation).
     r = compute({"cidrs": ["192.168.1.0/24", "192.168.1.0/24"]})
-    check("equal", r == {
-        "input_count": 2, "aggregated": ["192.168.1.0/24"], "aggregated_count": 1,
-        "overlaps": [{"a": "192.168.1.0/24", "b": "192.168.1.0/24", "relation": "equal"}],
-        "ipv4_addresses": 256, "ipv6_addresses": "0",
-    })
+    field("dup-collapse", r, input_count=2, distinct_count=1, duplicate_count=1,
+          aggregated=["192.168.1.0/24"], aggregated_count=1, overlaps=[], overlap_count=0)
 
     # 5. bare IP -> /32, exactly one address
     r = compute({"cidrs": ["8.8.8.8"]})
-    check("bare-ip", r == {
-        "input_count": 1, "aggregated": ["8.8.8.8/32"], "aggregated_count": 1,
-        "overlaps": [], "ipv4_addresses": 1, "ipv6_addresses": "0",
-    })
+    field("bare-ip", r, input_count=1, aggregated=["8.8.8.8/32"], aggregated_count=1,
+          overlaps=[], ipv4_addresses=1)
 
     # 6. reversed order — b-contains-a
     r = compute({"cidrs": ["10.1.0.0/16", "10.0.0.0/8"]})
-    check("b-contains-a", r == {
-        "input_count": 2, "aggregated": ["10.0.0.0/8"], "aggregated_count": 1,
-        "overlaps": [{"a": "10.1.0.0/16", "b": "10.0.0.0/8", "relation": "b-contains-a"}],
-        "ipv4_addresses": 16777216, "ipv6_addresses": "0",
-    })
+    field("b-contains-a", r, input_count=2, aggregated=["10.0.0.0/8"], aggregated_count=1,
+          overlaps=[{"a": "10.1.0.0/16", "b": "10.0.0.0/8", "relation": "b-contains-a"}],
+          overlap_count=1, ipv4_addresses=16777216)
 
     # 7. mixed families — v4 sorts before v6, no cross-family overlap
     r = compute({"cidrs": ["10.0.0.0/24", "2001:db8::/32"]})
-    check("mixed-family", r == {
-        "input_count": 2, "aggregated": ["10.0.0.0/24", "2001:db8::/32"], "aggregated_count": 2,
-        "overlaps": [], "ipv4_addresses": 256,
-        "ipv6_addresses": "79228162514264337593543950336",
-    })
+    field("mixed-family", r, input_count=2, aggregated=["10.0.0.0/24", "2001:db8::/32"],
+          aggregated_count=2, overlaps=[], overlap_count=0, ipv4_addresses=256,
+          ipv6_addresses="79228162514264337593543950336")
 
     # 8. IPv6 halves collapse to /32
     r = compute({"cidrs": ["2001:db8::/33", "2001:db8:8000::/33"]})
-    check("ipv6-collapse", r == {
-        "input_count": 2, "aggregated": ["2001:db8::/32"], "aggregated_count": 1,
-        "overlaps": [], "ipv4_addresses": 0,
-        "ipv6_addresses": "79228162514264337593543950336",
-    })
+    field("ipv6-collapse", r, input_count=2, aggregated=["2001:db8::/32"], aggregated_count=1,
+          overlaps=[], ipv4_addresses=0, ipv6_addresses="79228162514264337593543950336")
 
     # 9. disjoint nets stay separate, sorted by address, no overlaps
     r = compute({"cidrs": ["10.0.0.0/24", "192.168.0.0/24"]})
-    check("disjoint", r == {
-        "input_count": 2, "aggregated": ["10.0.0.0/24", "192.168.0.0/24"], "aggregated_count": 2,
-        "overlaps": [], "ipv4_addresses": 512, "ipv6_addresses": "0",
-    })
+    field("disjoint", r, input_count=2, aggregated=["10.0.0.0/24", "192.168.0.0/24"],
+          aggregated_count=2, overlaps=[], overlap_count=0, ipv4_addresses=512)
 
     # 10. host bits set + strict=False -> normalized to the network address
     r = compute({"cidrs": ["10.0.0.5/24"]})
-    check("strict-false-normalize", r == {
-        "input_count": 1, "aggregated": ["10.0.0.0/24"], "aggregated_count": 1,
-        "overlaps": [], "ipv4_addresses": 256, "ipv6_addresses": "0",
-    })
+    field("strict-false-normalize", r, input_count=1, aggregated=["10.0.0.0/24"],
+          aggregated_count=1, overlaps=[], ipv4_addresses=256)
 
     # 11. three nested nets -> three a-contains-b pairs, all collapse to /8
     r = compute({"cidrs": ["10.0.0.0/8", "10.0.0.0/16", "10.0.0.0/24"]})
-    check("nested-triple", r == {
-        "input_count": 3, "aggregated": ["10.0.0.0/8"], "aggregated_count": 1,
-        "overlaps": [
+    field("nested-triple", r, input_count=3, aggregated=["10.0.0.0/8"], aggregated_count=1,
+          overlap_count=3, overlaps=[
             {"a": "10.0.0.0/8", "b": "10.0.0.0/16", "relation": "a-contains-b"},
             {"a": "10.0.0.0/8", "b": "10.0.0.0/24", "relation": "a-contains-b"},
             {"a": "10.0.0.0/16", "b": "10.0.0.0/24", "relation": "a-contains-b"},
-        ],
-        "ipv4_addresses": 16777216, "ipv6_addresses": "0",
-    })
+          ], ipv4_addresses=16777216)
 
     # --- hostile input: each must return an {"error": ...} dict and NOT raise ---
     for bad, label in [
@@ -120,6 +103,22 @@ def main():
     check("err-invalid-msg", compute({"cidrs": ["not an ip"]}) == {"error": "invalid: not an ip"})
     check("err-none-entry-msg", compute({"cidrs": ["10.0.0.0/24", None]}) == {"error": "invalid: None"})
     check("err-empty-msg", compute({"cidrs": []}) == {"error": "cidrs must be a non-empty list"})
+
+
+    # REVIEW PINS: the O(n^2) overlap scan is bounded. (a) the raw input list
+    # is capped; (b) exact duplicates collapse (4000 copies of one /8 was ~8M
+    # "equal" pairs / ~1 GB before the fix); (c) listed overlaps are bounded
+    # with the true count + flag.
+    r = compute({"cidrs": ["10.0.0.0/24"] * 513})
+    check("input cap enforced", "error" in r and "max 512" in r["error"])
+    r = compute({"cidrs": ["10.0.0.0/8"] * 400})
+    check("duplicates collapse", r.get("distinct_count") == 1 and r.get("duplicate_count") == 399)
+    check("no self-overlap from dups", r.get("overlap_count") == 0)
+    big = ["10.0.0.0/8"] + ["10.%d.%d.0/24" % (i // 256, i % 256) for i in range(501)]
+    r = compute({"cidrs": big})
+    check("overlap count honest", r.get("overlap_count") == 501)
+    check("overlaps truncated to cap", len(r.get("overlaps", [])) == 500)
+    check("truncation flagged", r.get("overlaps_truncated") is True)
 
     print("all cidrtool checks passed")
 

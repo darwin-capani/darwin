@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Well-known TCP/UDP port <-> service reference (curated IANA subset). Pure, offline."""
+"""Well-known TCP/UDP port <-> service reference (curated table: IANA registrations plus de-facto conventions). Pure, offline."""
 import json
 import os
 import socket
@@ -14,7 +14,8 @@ def send(conn, obj):
     conn.sendall((json.dumps(obj) + "\n").encode("utf-8"))
 
 
-# Curated IANA subset: port -> list of {service, proto, desc}. Module-level, no I/O.
+# Curated table (IANA registrations + de-facto conventions like 8080/9090):
+# port -> list of {service, proto, desc}. Module-level, no I/O.
 PORTS = {
     20: [{"service": "ftp-data", "proto": "tcp", "desc": "FTP data transfer"}],
     21: [{"service": "ftp", "proto": "tcp", "desc": "FTP control"}],

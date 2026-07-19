@@ -1,7 +1,7 @@
 [app]
 name        = "portref"
 version     = "0.1.0"
-description = "Well-known TCP/UDP port <-> service reference from a curated IANA subset. Pure, offline."
+description = "Well-known TCP/UDP port <-> service reference from a curated table (IANA registrations plus de-facto conventions). Pure, offline."
 entry       = "apps/portref/main.py"
 runtime     = "python"
 

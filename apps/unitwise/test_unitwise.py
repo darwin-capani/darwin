@@ -100,6 +100,14 @@ def main():
     check("m->m identity", compute({"value": 5, "from": "m", "to": "m"})["result"] == 5.0)
     check("K->K identity", close(compute({"value": 42, "from": "K", "to": "K"})["result"], 42.0))
 
+
+    # REVIEW PIN: an overflowing conversion returns an error dict, never inf
+    # (invalid JSON on the wire -> the daemon drops the frame).
+    r = compute({"value": 1e308, "from": "PB", "to": "bit"})
+    check("overflow conversion guarded", "error" in r and "not finite" in r["error"])
+    r = compute({"value": 1e290, "from": "kWh", "to": "eV"})
+    check("kWh->eV overflow guarded", "error" in r)
+
     print("all unitwise checks passed")
 
 

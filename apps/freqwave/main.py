@@ -189,6 +189,18 @@ def _rc(payload):
     return {"time_constant": tau, "cutoff_frequency": 1.0 / (2.0 * math.pi * tau)}
 
 
+def _finite_checked(out):
+    """Reject any non-finite float in a result dict: json.dumps would emit a
+    bare Infinity/NaN token (invalid JSON per RFC 8259), and the daemon's
+    strict parser would DROP the frame — the caller would get silence instead
+    of an answer. An honest error dict is the correct reply. Never raises."""
+    if isinstance(out, dict) and "error" not in out:
+        for k, v in out.items():
+            if isinstance(v, float) and not math.isfinite(v):
+                return {"error": "%s overflows the representable range (result is not finite)" % k}
+    return out
+
+
 def compute(payload):
     """PURE, offline, no I/O, never raises. Wave/RF/resonance solver.
 
@@ -212,11 +224,11 @@ def compute(payload):
             return {"error": "mode must be a string"}
         mode = mode.strip().lower()
         if mode == "em":
-            return _em(payload)
+            return _finite_checked(_em(payload))
         if mode == "lc":
-            return _lc(payload)
+            return _finite_checked(_lc(payload))
         if mode == "rc":
-            return _rc(payload)
+            return _finite_checked(_rc(payload))
         return {"error": "unknown mode: %r" % mode}
     except Exception as e:  # noqa: BLE001 — compute must never raise
         return {"error": "unexpected: %s" % e}

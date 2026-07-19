@@ -15,6 +15,9 @@ def send(conn, obj):
     conn.sendall((json.dumps(obj) + "\n").encode("utf-8"))
 
 
+MAX_PARAMS = 1000  # listed query params; param_count/params_truncated carry the rest
+
+
 def compute(payload):
     """PURE, offline, no I/O, never raises. Dissect an RFC-3986 URL/URI.
 
@@ -45,8 +48,11 @@ def compute(payload):
         try:
             explicit_port = sr.port
         except ValueError:
-            # non-numeric / out-of-range authority port; treat as absent
-            explicit_port = None
+            # The URL DOES carry an explicit port token, but it is non-numeric
+            # or out of 0-65535. Reporting the scheme default here would be a
+            # false answer (and "normalized" would silently rewrite the
+            # authority to a different origin) — refuse honestly instead.
+            return {"error": "invalid explicit port in URL authority (must be 0-65535)"}
 
         if explicit_port is not None:
             port = explicit_port
@@ -55,8 +61,11 @@ def compute(payload):
 
         userinfo_present = sr.username is not None or sr.password is not None
 
-        params = [{"key": k, "value": v}
-                  for k, v in parse_qsl(sr.query, keep_blank_values=True)]
+        pairs = parse_qsl(sr.query, keep_blank_values=True)
+        # Bounded params: an unbounded list can push the reply past the
+        # daemon's 1 MiB app-line budget (measured ~1.44 MB at 40k pairs), so
+        # the full count + a truncation flag carry the honest remainder.
+        params = [{"key": k, "value": v} for k, v in pairs[:MAX_PARAMS]]
 
         is_idn = any(ord(c) > 127 for c in host)
 
@@ -96,6 +105,8 @@ def compute(payload):
             "fragment": sr.fragment,
             "userinfo_present": userinfo_present,
             "params": params,
+            "param_count": len(pairs),
+            "params_truncated": len(pairs) > MAX_PARAMS,
             "is_idn": is_idn,
             "host_punycode": host_punycode,
             "normalized": normalized,

@@ -105,6 +105,15 @@ def main():
     check("hostile bad prefix", is_err(compute({"frequency": "5zzz"})))
     check("hostile bool freq", is_err(compute({"frequency": True})))
 
+
+    # REVIEW PIN: denormal/overflow inputs must yield error dicts, never inf.
+    r = compute({"mode": "em", "frequency": 1e-310})
+    check("denormal frequency guarded", "error" in r and "not finite" in r["error"])
+    r = compute({"mode": "em", "wavelength": 1e-310})
+    check("denormal wavelength guarded", "error" in r)
+    r = compute({"mode": "rc", "resistance": 1e200, "capacitance": 1e200})
+    check("rc tau overflow guarded", "error" in r)
+
     print("all freqwave checks passed")
 
 

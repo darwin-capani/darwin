@@ -9,7 +9,13 @@ import sys
 TOKEN = os.environ.get("DARWIN_APP_TOKEN", "")
 SOCKET_PATH = os.environ.get("DARWIN_APP_SOCKET", "")
 
-MAX_SUBNETS = 1 << 16  # cap materialized split output so a huge split can't OOM
+MAX_SUBNETS = 1 << 16  # cap on the SPLIT ITSELF (finer is refused outright)
+# The LISTED subnets are separately bounded: the daemon drops any app line
+# over 1 MiB (apps.rs MAX_APP_LINE_BYTES), and a fully-listed 65536-way split
+# is ~1.19 MB on the wire (measured) — the reply would vanish and the app
+# connection would be torn down. 1024 listed subnets is ~25 KB; the full
+# count + a truncation flag keep the answer honest.
+MAX_SUBNETS_LISTED = 1 << 10
 
 
 def send(conn, obj):
@@ -155,7 +161,14 @@ def compute(payload):
         count = 1 << (new_prefix - prefixlen)
         if count > MAX_SUBNETS:
             return {"error": "split would produce %d subnets (max %d)" % (count, MAX_SUBNETS)}
-        result["subnets"] = [str(s) for s in net.subnets(new_prefix=new_prefix)]
+        listed = []
+        for sub in net.subnets(new_prefix=new_prefix):
+            if len(listed) >= MAX_SUBNETS_LISTED:
+                break
+            listed.append(str(sub))
+        result["subnet_count"] = count
+        result["subnets"] = listed
+        result["subnets_truncated"] = count > MAX_SUBNETS_LISTED
         return result
     except Exception as e:  # noqa: BLE001 — compute must never raise
         return {"error": "unexpected: %s" % e}

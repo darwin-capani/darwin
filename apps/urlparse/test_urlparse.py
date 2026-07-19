@@ -113,11 +113,10 @@ def main():
     check("r11 normalized", r11["normalized"] == "mailto:darcapalb@gmail.com")
 
     # 12. invalid (non-numeric) authority port -> treated as absent, default inferred, dropped in normalized
+    # 12. explicit-but-invalid port: the review fix makes this an ERROR, not a
+    # silent fall-through to the scheme default (which would rewrite the origin).
     r12 = compute({"url": "http://x:abc/p"})
-    check("r12 host", r12["host"] == "x")
-    check("r12 port falls to default", r12["port"] == 80)
-    check("r12 normalized drops bad port", r12["normalized"] == "http://x/p")
-    check("r12 warnings", r12["warnings"] == ["insecure scheme (http/ws/ftp)"])
+    check("r12 non-numeric port errors", "error" in r12 and "port" in r12["error"])
 
     # 13. opaque URN: no authority, scheme has no default port
     r13 = compute({"url": "urn:isbn:0451450523"})
@@ -156,6 +155,22 @@ def main():
     r_bad = compute({"url": "http://[invalid"})
     check("malformed url -> dict", isinstance(r_bad, dict))
     check("malformed url -> error", "error" in r_bad)
+
+
+    # REVIEW PINS: (a) an explicit-but-invalid port must be an ERROR — before
+    # the fix it silently became the scheme default and "normalized" rewrote
+    # the authority to a different origin; (b) params are bounded with the
+    # honest count + flag (an unbounded list could exceed the daemon's 1 MiB
+    # app-line budget).
+    r = compute({"url": "http://example.com:99999/"})
+    check("out-of-range port is an error", "error" in r and "port" in r["error"])
+    r = compute({"url": "http://example.com:abc/"})
+    check("non-numeric port is an error", "error" in r)
+    huge = "http://example.com/?" + "&".join("k%d=v" % i for i in range(2000))
+    r = compute({"url": huge})
+    check("param count honest", r.get("param_count") == 2000)
+    check("params listing bounded", len(r.get("params", [])) == 1000)
+    check("params truncated flagged", r.get("params_truncated") is True)
 
     print("all urlparse checks passed")
 
