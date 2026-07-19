@@ -4308,12 +4308,19 @@ async fn handle_build_knowledge_graph(memory: &Memory) -> String {
             } else {
                 String::new()
             };
+            let method_note = if extractor.method() == "llm-grounded" {
+                "with the on-device LLM extractor, then STRICTLY filtered to only names \
+                 that appear verbatim in your documents (anything the model invented was \
+                 dropped, and relationships are recorded as honest co-occurrence)"
+            } else {
+                "with a conservative heuristic (it errs toward missing rather than inventing)"
+            };
             format!(
                 "Mapped your documents into the shared world model: {} entit(ies) and {} \
                  relationship(s) from {} indexed chunk(s){}. These were extracted from YOUR \
-                 documents with a conservative heuristic (it errs toward missing rather than \
-                 inventing) and each is tagged with its source file — nothing was fabricated.",
-                stats.entities_written, stats.relationships_written, stats.chunks_scanned, cap_note
+                 documents {} and each is tagged with its source file — nothing ungrounded \
+                 was written.",
+                stats.entities_written, stats.relationships_written, stats.chunks_scanned, cap_note, method_note
             )
         }
         // Unreachable in practice (the gate was checked above), but the gated entry

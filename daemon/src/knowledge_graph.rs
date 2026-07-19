@@ -273,7 +273,6 @@ struct RawEntity {
 #[derive(Debug, Clone)]
 struct RawRel {
     from: String,
-    relation: String,
     to: String,
 }
 
@@ -303,11 +302,13 @@ fn parse_llm_extraction(reply: &str) -> (Vec<RawEntity>, Vec<RawRel>) {
     let mut rels = Vec::new();
     if let Some(arr) = v.get("relationships").and_then(|r| r.as_array()) {
         for item in arr.iter().take(LLM_MAX_RAW) {
-            if let (Some(from), Some(relation), Some(to)) =
-                (s(item, "from"), s(item, "relation"), s(item, "to"))
-            {
+            // The model's `relation` predicate is intentionally NOT read: an
+            // LLM-asserted predicate is not grounded in the text, so the edge is
+            // recorded as honest co-occurrence (see ground_extraction). We keep
+            // only the two endpoints (which ARE grounded).
+            if let (Some(from), Some(to)) = (s(item, "from"), s(item, "to")) {
                 if !from.trim().is_empty() && !to.trim().is_empty() {
-                    rels.push(RawRel { from, relation, to });
+                    rels.push(RawRel { from, to });
                 }
             }
         }
@@ -360,7 +361,6 @@ fn first_json_object(reply: &str) -> Option<String> {
 /// world-model caps on write. PURE + total: this is what makes an LLM extractor
 /// unable to fabricate, and it is exhaustively tested.
 fn ground_extraction(raw_entities: &[RawEntity], raw_rels: &[RawRel], chunk_text: &str) -> Extraction {
-    let hay = chunk_text.to_lowercase();
     let mut entities: Vec<ExtractedEntity> = Vec::new();
     let mut seen: std::collections::HashSet<(EntityType, String)> = std::collections::HashSet::new();
     // Map a grounded lowercased name -> its canonical display name, so a
@@ -374,7 +374,7 @@ fn ground_extraction(raw_entities: &[RawEntity], raw_rels: &[RawRel], chunk_text
         let Some(kind) = entity_type_from_str(&re.kind) else {
             continue; // unknown type -> drop (never a guessed kind)
         };
-        let Some(span) = verbatim_char_span(&hay, chunk_text, name) else {
+        let Some(span) = verbatim_char_span(chunk_text, name) else {
             continue; // NOT in the text -> a hallucination, dropped
         };
         let key = (kind, name.to_lowercase());
@@ -401,10 +401,15 @@ fn ground_extraction(raw_entities: &[RawEntity], raw_rels: &[RawRel], chunk_text
         if from_name == to_name {
             continue; // no self-edge
         }
-        let relation = sanitize_relation(&rr.relation);
+        // HONEST co-occurrence: the model identifies WHICH grounded entities relate,
+        // but the semantic predicate it emits ("reports to") is NOT grounded in the
+        // text, so we label the edge with the weaker TRUE claim "co_mentioned"
+        // (exactly the deterministic extractor's claim) rather than assert an
+        // invented relationship. rr.relation is intentionally not written.
+        let relation = "co_mentioned".to_string();
         // Ground the edge with the covering span of the two endpoints in the text.
         let (Some(fs), Some(ts)) =
-            (verbatim_char_span(&hay, chunk_text, from_name), verbatim_char_span(&hay, chunk_text, to_name))
+            (verbatim_char_span(chunk_text, from_name), verbatim_char_span(chunk_text, to_name))
         else {
             continue;
         };
@@ -419,23 +424,41 @@ fn ground_extraction(raw_entities: &[RawEntity], raw_rels: &[RawRel], chunk_text
     Extraction { entities, relationships }
 }
 
-/// Char span [start, end) of the FIRST verbatim (case-insensitive) occurrence of
-/// `needle` in `haystack_lower` (the lowercased chunk), mapped to CHAR offsets in
-/// the original `chunk_text`. None when `needle` is absent. PURE.
-fn verbatim_char_span(haystack_lower: &str, chunk_text: &str, needle: &str) -> Option<(usize, usize)> {
-    let nl = needle.to_lowercase();
-    let byte_idx = haystack_lower.find(&nl)?;
-    // Convert the byte index in the lowercased string to a CHAR index. Lowercasing
-    // can change byte lengths (rare, e.g. 'İ'); guard by counting chars up to the
-    // byte index in the lowercased text, which shares char boundaries structurally
-    // for the ASCII-dominant document text this mines. A mismatch degrades to a
-    // conservative span over the chunk length, never a panic.
-    let start_char = haystack_lower[..byte_idx].chars().count();
-    let len_chars = nl.chars().count();
-    let total = chunk_text.chars().count();
-    let start = start_char.min(total);
-    let end = (start + len_chars).min(total);
-    Some((start, end))
+/// Char span [start, end) of the FIRST WORD-BOUNDARY-delimited, case-insensitive
+/// occurrence of `needle` in the ORIGINAL `chunk_text`, or None when it is absent.
+///
+/// Two correctness properties that make this a real GROUNDING check (not a loose
+/// substring test — the substring version let a hallucinated "Tom" ground to the
+/// middle of "tomorrow"):
+///   * WORD-BOUNDED: the match must be delimited by a non-alphanumeric char (or a
+///     string edge) on BOTH sides, so a short invented name can never ground to a
+///     fragment of a longer real word. This mirrors the deterministic extractor's
+///     own whole-word grounding.
+///   * ORIGINAL-TEXT OFFSETS: it scans the ORIGINAL char sequence (never a
+///     lowercased copy), so a length-changing lowercasing (e.g. 'İ' -> "i̇") can
+///     never drift the returned span off the real characters.
+///
+/// Case-insensitivity is an ASCII fold (this mines ASCII-dominant document text,
+/// like the deterministic extractor's boundaries); a non-ASCII char matches
+/// exactly. PURE + total (never panics).
+fn verbatim_char_span(chunk_text: &str, needle: &str) -> Option<(usize, usize)> {
+    let hay: Vec<char> = chunk_text.chars().collect();
+    let ndl: Vec<char> = needle.trim().chars().collect();
+    if ndl.is_empty() || ndl.len() > hay.len() {
+        return None;
+    }
+    let n = ndl.len();
+    for i in 0..=(hay.len() - n) {
+        if !(0..n).all(|k| hay[i + k].eq_ignore_ascii_case(&ndl[k])) {
+            continue;
+        }
+        let left_ok = i == 0 || !hay[i - 1].is_alphanumeric();
+        let right_ok = i + n == hay.len() || !hay[i + n].is_alphanumeric();
+        if left_ok && right_ok {
+            return Some((i, i + n));
+        }
+    }
+    None
 }
 
 /// Map a model-emitted type string to a known [`EntityType`], or None (an
@@ -450,24 +473,6 @@ fn entity_type_from_str(kind: &str) -> Option<EntityType> {
         // THREAD is reserved for conversational ingestion, not document mining —
         // never accept it from an LLM over document prose.
         _ => None,
-    }
-}
-
-/// Sanitize an LLM-emitted relation label to a short, safe slug (lowercase,
-/// alnum + underscore, bounded). Empty/garbled -> the honest neutral "related_to".
-fn sanitize_relation(relation: &str) -> String {
-    let cleaned: String = relation
-        .trim()
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
-        .take(32)
-        .collect();
-    let trimmed = cleaned.trim_matches('_');
-    if trimmed.is_empty() {
-        "related_to".to_string()
-    } else {
-        trimmed.to_string()
     }
 }
 
@@ -1537,8 +1542,9 @@ mod tests {
     fn ent(kind: &str, name: &str) -> RawEntity {
         RawEntity { kind: kind.into(), name: name.into() }
     }
-    fn rel(from: &str, r: &str, to: &str) -> RawRel {
-        RawRel { from: from.into(), relation: r.into(), to: to.into() }
+    fn rel(from: &str, _r: &str, to: &str) -> RawRel {
+        // `_r` (the would-be predicate) is ignored — the extractor never reads it.
+        RawRel { from: from.into(), to: to.into() }
     }
 
     #[test]
@@ -1563,6 +1569,49 @@ mod tests {
     }
 
     #[test]
+    fn grounding_requires_a_word_boundary_not_a_substring() {
+        // REVIEW PIN: a short hallucinated name must NOT ground to a fragment of a
+        // longer real word — the exact fabrication the substring version allowed.
+        let chunk = "We will ship the release tomorrow. The team already improved it.";
+        // "Tom" is inside "tomorrow", "Al" inside "already", "Art" inside "started"
+        // (absent here) — none may ground.
+        for bad in ["Tom", "Al", "Ready", "Lease"] {
+            let g = ground_extraction(&[ent("person", bad)], &[], chunk);
+            assert!(g.entities.is_empty(), "{bad:?} must NOT ground to a substring of a word");
+        }
+        // A REAL whole word grounds (and its span covers exactly it).
+        let g = ground_extraction(&[ent("topic", "release")], &[], chunk);
+        assert_eq!(g.entities.len(), 1);
+        let e = &g.entities[0];
+        let sub: String = chunk.chars().skip(e.span.0).take(e.span.1 - e.span.0).collect();
+        assert_eq!(sub, "release");
+    }
+
+    #[test]
+    fn grounding_span_is_correct_under_length_changing_lowercasing() {
+        // REVIEW PIN: 'İ' (U+0130) lowercases to 2 chars — the old byte->char map
+        // drifted the span. Scanning the ORIGINAL text keeps the span exact.
+        let chunk = "İstanbul and Ankara are cities. Xavier lives here.";
+        let g = ground_extraction(&[ent("person", "Xavier")], &[], chunk);
+        assert_eq!(g.entities.len(), 1);
+        let e = &g.entities[0];
+        let sub: String = chunk.chars().skip(e.span.0).take(e.span.1 - e.span.0).collect();
+        assert_eq!(sub, "Xavier", "span must exactly cover the name, not drift");
+    }
+
+    #[test]
+    fn grounding_never_writes_an_invented_relation_predicate() {
+        // REVIEW PIN: the LLM asserting "reports to" between two merely co-mentioned
+        // people must NOT write that claim — only the honest co-occurrence.
+        let chunk = "Alice and Bob both attended the meeting.";
+        let raw = vec![ent("person", "Alice"), ent("person", "Bob")];
+        let rels = vec![rel("Alice", "reports to", "Bob")];
+        let g = ground_extraction(&raw, &rels, chunk);
+        assert_eq!(g.relationships.len(), 1);
+        assert_eq!(g.relationships[0].relation, "co_mentioned", "no invented predicate is written");
+    }
+
+    #[test]
     fn grounding_drops_unknown_types_and_dangling_edges() {
         let chunk = "Alice and Bob shipped Widget.";
         let raw = vec![
@@ -1580,7 +1629,8 @@ mod tests {
         assert_eq!(g.relationships.len(), 1, "only the both-grounded edge survives");
         let r = &g.relationships[0];
         assert_eq!((r.from_name.as_str(), r.to_name.as_str()), ("Alice", "Bob"));
-        assert_eq!(r.relation, "worked_with", "relation is sanitized to a safe slug");
+        // The invented predicate is NOT written — the honest co-occurrence claim is.
+        assert_eq!(r.relation, "co_mentioned", "an ungrounded predicate downgrades to co-occurrence");
     }
 
     #[test]
