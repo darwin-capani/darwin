@@ -1363,12 +1363,18 @@ impl CommandPipeline for LivePipeline {
     }
 
     async fn distill_rollback(&self) -> String {
-        // Clear the live adapter; the next generation load serves base. Idempotent.
+        // Clear the live adapter; the next generation load serves base. Idempotent
+        // — and honest about it: with nothing promoted, say so (and skip the
+        // pointless server reload) rather than imply an adapter had been live.
         match crate::distill::clear_promotion(&self.root) {
-            Ok(()) => {
+            Ok(true) => {
                 // Reverting to base takes effect this session on the server reload.
                 self.reload_inference_lora().await;
                 "Rolled back to the base model, sir — the personal adapter is no longer live."
+                    .to_string()
+            }
+            Ok(false) => {
+                "There was no promoted personal adapter, sir — the base model is already what's live."
                     .to_string()
             }
             Err(e) => format!("I couldn't roll back the adapter, sir — {e}."),

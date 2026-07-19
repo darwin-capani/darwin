@@ -500,13 +500,17 @@ fn install_promotion(
 }
 
 /// Clear the live adapter — roll back to the base model. Removes the `promoted/`
-/// pointer so the next server model-load serves base. Idempotent (absent = ok).
-pub fn clear_promotion(root: &std::path::Path) -> std::io::Result<()> {
+/// pointer so the next server model-load serves base. Idempotent; returns
+/// whether a pointer was actually removed (false = nothing was promoted), so
+/// the caller's spoken line can be true in both states and skip a pointless
+/// server reload when nothing changed.
+pub fn clear_promotion(root: &std::path::Path) -> std::io::Result<bool> {
     let promoted = promoted_dir(root);
     if promoted.exists() {
         std::fs::remove_dir_all(&promoted)?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 /// The daemon-side view of the promoted pointer, mirroring the checks the
@@ -1411,9 +1415,11 @@ mod tests {
         assert_eq!(live.held_out_base_loss, Some(2.5));
         assert_eq!(live.held_out_adapter_loss, Some(2.2));
         assert!(promoted_dir(&root.0).join("adapters.safetensors").exists(), "adapter copied live");
-        // Reversible: rollback removes the live pointer.
-        clear_promotion(&root.0).unwrap();
+        // Reversible: rollback removes the live pointer (and reports it DID).
+        assert!(clear_promotion(&root.0).unwrap(), "a live pointer was removed");
         assert!(read_promoted_manifest(&root.0).is_none(), "rollback reverts to base");
+        // Idempotent + honest: a second rollback reports nothing was promoted.
+        assert!(!clear_promotion(&root.0).unwrap(), "nothing left to remove");
     }
 
     /// REVIEW PIN: when a NEW winning adapter fails to INSTALL while a PREVIOUS
