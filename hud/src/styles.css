@@ -10113,7 +10113,8 @@ body,
 
 /* Self-distillation (distill.status): the armed-but-inert on-device LoRA
    pipeline. OFF (dim) / ARMED (amber — dataset gathering, device gate still
-   separate). A trained adapter is STAGED, never auto-promoted. */
+   separate). A trained adapter goes live ONLY on a measured held-out win
+   (reversible; via a deliberate promote or the ships-OFF auto_promote chain). */
 .distill-body { display: flex; flex-direction: column; gap: 5px; }
 .distill-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .distill-pill {

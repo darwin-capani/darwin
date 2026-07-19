@@ -713,8 +713,9 @@ pub fn status_payload(
         "examples_ready": examples_ready,
         "min_examples": MIN_EXAMPLES,
         "ready_to_train": enabled && examples_ready >= MIN_EXAMPLES,
-        // Promotion is GATED on a measured held-out win — never automatic on a
-        // trained adapter (it stays staged until it beats base).
+        // Promotion is GATED on a measured held-out win — never UNMEASURED
+        // (with [distill].auto_promote it can chain automatically after
+        // training, still only on a strict win; ships OFF).
         "gated_promotion": true,
         "adapter_live": promoted.is_some(),
         "adapter_pointer": adapter_pointer,

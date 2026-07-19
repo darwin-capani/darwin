@@ -74,7 +74,7 @@ state/ipc/inference.sock per the shared contract:
              "embedder"?: str + "dim"?: int + "fell_back"?: bool (op=embed WIRE
              CONTRACT: the ACTIVE backend's vector-space id — the fixed
              "coreml-bge-small-en-v1.5" (384-dim) for the Core ML path, or the
-             MODEL-DERIVED "llm-meanpool:<llm_id>:<quant>" for the mean-pool path
+             MODEL-DERIVED "llm-meanpool:<llm_id>:<quant>[:<adapter>]" for the mean-pool path
              (so an LLM/quant swap changes the stamp) — and its vector dimension,
              compared by STRING EQUALITY so the daemon/docsearch key the vector
              SPACE and refuse cross-space comparison; fell_back is true iff the
@@ -6471,7 +6471,9 @@ class InferenceServer:
                 # SELF-DISTILLATION: the daemon promoted or rolled back a personal
                 # adapter — drop the resident LLM so the NEXT generate reloads with
                 # the current state/lora/promoted/ pointer. Under the GPU lock (via
-                # a thread) so it never races an in-flight decode.
+                # a thread); lock-holding ops serialize with it, and the
+                # lock-SLICED consolidate pass runs on refs captured at op
+                # start, so a mid-pass reload is safe (applies next op).
                 await asyncio.to_thread(self.engine.reload_lora)
                 return {"id": rid, "ok": True, "reloaded": True, "latency_ms": latency_ms()}
 
@@ -6686,7 +6688,7 @@ class InferenceServer:
                 #   "embedder": the vector-space id —
                 #       "coreml-bge-small-en-v1.5" (fixed) for the Core ML bge
                 #       path (384-dim, one pinned model), or the MODEL-DERIVED
-                #       "llm-meanpool:<llm_id>:<quant>" for the mean-pool path (so
+                #       "llm-meanpool:<llm_id>:<quant>[:<adapter>]" for the mean-pool path (so
                 #       swapping [models].llm or the quant changes the stamp — a
                 #       fixed string would falsely keep matching across a space
                 #       change). docsearch stores this WITH its index.
