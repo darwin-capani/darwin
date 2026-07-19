@@ -170,9 +170,9 @@ impl RankMethod {
                 "hybrid two-stage recall: I first retrieve candidates by FUSING \
                  on-device embedding cosine with BM25 keyword relevance \
                  (reciprocal rank fusion — meaning AND exact words), then RE-RANK \
-                 the top few with an on-device cross-encoder that reads each \
-                 candidate together with your query for a sharper order. The \
-                 strongest recall I have; both stages run on the local server."
+                 the top few with an on-device cross-encoder for a sharper order. \
+                 Fusion is a tradeoff (it can lift a complementary hit but also \
+                 demote a strong single-ranker one); both stages run on-device."
             }
         }
     }

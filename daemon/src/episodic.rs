@@ -149,8 +149,9 @@ impl RecallMethod {
             RecallMethod::HybridReranked => {
                 "hybrid two-stage recall: I fused on-device embedding cosine with \
                  BM25 keyword relevance for recall, then re-ranked the top few \
-                 with an on-device cross-encoder for a sharper order — the \
-                 strongest recall I have."
+                 with an on-device cross-encoder for a sharper order (fusion is \
+                 a tradeoff — it can lift a complementary hit or demote a strong \
+                 single-ranker one)."
             }
         }
     }

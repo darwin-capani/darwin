@@ -2256,13 +2256,16 @@ impl DocIndex {
                                      (reindex to repair the store)"
                                 );
                             }
-                            // HYBRID RECALL (config-gated): fuse the dense cosine
-                            // ranking with lexical BM25 over the SAME corpus by
-                            // reciprocal rank fusion, so a chunk BM25 nails but
-                            // cosine buries (below the reranker's cutoff) — or
-                            // vice-versa — reaches the shortlist the cross-encoder
-                            // re-scores. Improves RECALL into stage two; the
-                            // reranker (if on) still decides the final order.
+                            // HYBRID RECALL (config-gated, ships OFF): fuse the
+                            // dense cosine ranking with lexical BM25 over the SAME
+                            // corpus by reciprocal rank fusion, so a chunk BM25
+                            // nails but cosine buries (below the reranker's cutoff)
+                            // — or vice-versa — can reach the shortlist the
+                            // cross-encoder re-scores. RRF is a TRADEOFF, not a
+                            // strict win: it lifts complementary hits but can also
+                            // DEMOTE a strong single-ranker hit out of the
+                            // shortlist, so it is opt-in and unmeasured on a real
+                            // corpus (only the recall MECHANISM is proven).
                             let (candidates, base_method) = if embedder.hybrid_enabled() {
                                 let lexical = LexicalProvider { params: Bm25Params::default() };
                                 use crate::recall::EmbeddingProvider;
@@ -2320,23 +2323,6 @@ impl DocIndex {
     }
 }
 
-/// Sort `(chunk_index, score)` by score DESC then index ASC (deterministic tie
-/// break), drop non-positive (irrelevant) scores, take `k`, and materialize a
-/// CITED [`DocHit`] for each from the real chunk. No-match -> empty (no
-/// fabrication). The snippet is a bounded, char-boundary-safe preview of the
-/// stored chunk text.
-/// Sort the scored chunks into the dense order, apply the optional STAGE-TWO
-/// cross-encoder RERANK to the top shortlist (config-gated), and build the cited
-/// top-`k` [`DocHit`]s. When the rerank runs, the top [`crate::recall::DEFAULT_RERANK_K`]
-/// hits are re-ordered by the cross-encoder score (the tail below the shortlist
-/// keeps its dense order) and `method` reflects the TRUE stage one: an `Embedding`
-/// base becomes [`RankMethod::Reranked`], a `Lexical` base becomes
-/// [`RankMethod::LexicalReranked`] — the label never claims a neural stage one the
-/// BM25 fallback did not run. On any honest fallback (reranker off / unavailable /
-/// server down) the dense order + `base_method` stand, never mislabeled.
-/// `base_method` is `Embedding` (neural cosine) or `Lexical` (BM25) — the
-/// cross-encoder can sharpen EITHER shortlist. Each [`DocHit::score`] keeps its
-/// DENSE retrieval score (cosine / BM25); the ORDER reflects the rerank when it ran.
 /// Reciprocal Rank Fusion constant (Cormack et al. 2009). Dampens the tail so no
 /// single ranker's low positions dominate the fusion; 60 is the standard value.
 const RRF_K: f64 = 60.0;
@@ -2383,6 +2369,24 @@ fn rrf_fuse(dense: &[(usize, f64)], lexical: &[(usize, f64)], k_const: f64) -> V
     out
 }
 
+/// Sort `(chunk_index, score)` by score DESC then index ASC (deterministic tie
+/// break), drop non-positive (irrelevant) scores, take `k`, and materialize a
+/// CITED [`DocHit`] for each from the real chunk. No-match -> empty (no
+/// fabrication). The snippet is a bounded, char-boundary-safe preview of the
+/// stored chunk text.
+/// Sort the scored chunks into the dense order, apply the optional STAGE-TWO
+/// cross-encoder RERANK to the top shortlist (config-gated), and build the cited
+/// top-`k` [`DocHit`]s. When the rerank runs, the top [`crate::recall::DEFAULT_RERANK_K`]
+/// hits are re-ordered by the cross-encoder score (the tail below the shortlist
+/// keeps its dense order) and `method` reflects the TRUE stage one: an `Embedding`
+/// base becomes [`RankMethod::Reranked`], a `Lexical` base becomes
+/// [`RankMethod::LexicalReranked`] — the label never claims a neural stage one the
+/// BM25 fallback did not run. On any honest fallback (reranker off / unavailable /
+/// server down) the dense order + `base_method` stand, never mislabeled.
+/// `base_method` is `Embedding` (neural cosine), `Lexical` (BM25), or `Hybrid`
+/// (the RRF fusion of both) — the cross-encoder can sharpen ANY shortlist. Each
+/// [`DocHit::score`] keeps its RETRIEVAL score (cosine / BM25 / the small RRF
+/// fused score on the hybrid path); the ORDER reflects the rerank when it ran.
 async fn rank_cite_rerank(
     query: &str,
     corpus: &CachedCorpus,
@@ -2598,6 +2602,36 @@ mod tests {
         let dense_recall = usize::from(dense_shortlist.contains(&0));
         let hybrid_recall = usize::from(hybrid_shortlist.contains(&0));
         assert!(hybrid_recall > dense_recall, "measured: hybrid recall > dense-only recall on this case");
+    }
+
+    /// HONEST COUNTER-CASE (review-earned): RRF is a TRADEOFF, not a strict win —
+    /// it can also DEMOTE a strong single-ranker hit. A pure-semantic dense top-1
+    /// with NO keyword overlap (BM25 rank absent) can be pushed BELOW a chunk that
+    /// both rankers rate mid, out of the top-K shortlist the reranker sees. This
+    /// pins that the fusion genuinely has this failure mode, so no surface may
+    /// claim hybrid strictly improves recall — it is opt-in for exactly this
+    /// reason (and unmeasured on a real corpus).
+    #[test]
+    fn rrf_can_demote_a_strong_dense_only_hit() {
+        // Chunk 0 is dense-#1 with NO BM25 overlap -> fused score 1/(60+1)=0.01639.
+        // Chunk 1 is dense-#2 AND BM25-#1 -> 1/(60+2)+1/(60+1)=0.03252 > chunk 0.
+        // Plus 20 chunks that appear in BOTH rankers mid-pack, each fusing two
+        // reciprocal terms > chunk 0's single term -> chunk 0 is evicted past 20.
+        let mut dense: Vec<(usize, f64)> = vec![(0usize, 1.0), (1, 0.99)];
+        let mut lexical: Vec<(usize, f64)> = vec![(1usize, 9.0)];
+        for i in 2..24usize {
+            dense.push((i, 0.98 - (i as f64) * 0.001)); // mid dense
+            lexical.push((i, 5.0 - (i as f64) * 0.1)); // mid BM25 -> both rankers
+        }
+        let fused = rrf_fuse(&dense, &lexical, RRF_K);
+        let pos0 = fused.iter().position(|(i, _)| *i == 0).unwrap();
+        assert!(
+            pos0 >= crate::recall::DEFAULT_RERANK_K,
+            "the dense-only top-1 is demoted OUT of the top-{} shortlist by fusion (pos {}) \
+             — RRF is not monotone; the tradeoff is real",
+            crate::recall::DEFAULT_RERANK_K,
+            pos0
+        );
     }
 
     /// A unique temp dir tree per test, cleaned on drop. All file I/O in these

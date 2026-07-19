@@ -299,7 +299,7 @@ function SearchResults({ search }: { search: DocSearchResult | null }) {
             : search.method === "hybrid"
               ? "retrieved by FUSING on-device embedding cosine with BM25 keyword relevance (reciprocal rank fusion) — meaning AND exact words"
               : search.method === "hybrid-reranked"
-                ? "retrieved by fusing on-device embedding cosine with BM25 (reciprocal rank fusion), then re-ranked by an on-device cross-encoder — the strongest recall"
+                ? "retrieved by fusing on-device embedding cosine with BM25 (reciprocal rank fusion), then re-ranked by an on-device cross-encoder (fusion is a tradeoff — it can lift a complementary hit or demote a strong single-ranker one)"
                 : `ranking method: ${methodLabel}`;
 
   return (
