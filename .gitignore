@@ -229,3 +229,12 @@ out/
 .idea/
 .vscode/
 *.code-workspace
+
+# Eval-harness SCRATCH outputs (the measured results.json IS committed; the
+# training/eval run artifacts — adapters, fixture jsonl — are machine-local).
+inference/benchmarks/lora_eval/run/
+inference/benchmarks/vlm_eval/screenshot_fixture.png
+
+# Measurement scratch from the Apple-Silicon probes (NO-GO probes recorded in
+# the committed benchmarks; the probe scripts themselves are machine-local).
+scratch-bench/
