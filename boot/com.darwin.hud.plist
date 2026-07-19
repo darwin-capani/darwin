@@ -10,8 +10,18 @@
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <!-- The VISIBLE app respects the user's quit: KeepAlive would resurrect
+         DARWIN.app every time they Cmd-Q it (launchd fighting the user).
+         SuccessfulExit=false relaunches ONLY after a crash (non-zero exit) —
+         a normal quit exits 0 and STAYS quit; login still auto-starts it via
+         RunAtLoad. The headless daemon/inference agents keep full KeepAlive
+         (crash recovery is what you want for a backend, and quitting them is
+         an operator act via launchctl, not a window close). -->
     <key>KeepAlive</key>
-    <true/>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
     <!-- A windowed GUI app needs the Aqua (logged-in graphical) session to reach
          the window server. Unlike the daemon/inference agents (headless services),
          the HUD only makes sense once a user is at the desktop, so we constrain it
