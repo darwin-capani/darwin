@@ -4164,8 +4164,10 @@ pub struct DistillConfig {
     /// train -> measure -> promote-only-if-it-beats-base.
     pub auto_promote: bool,
     /// The minimum held-out loss reduction (base - adapter, nats/token) required
-    /// to promote. A positive floor so a tie or a regression never promotes, and
-    /// noise on a tiny personal split doesn't flip the live model. Must be >= 0.
+    /// to promote. The gate ALWAYS requires a strict win (a tie or a regression
+    /// never promotes, even at 0); this margin additionally keeps noise on a tiny
+    /// personal split from flipping the live model. Must be >= 0 — a negative
+    /// value fails closed (nothing promotes).
     pub min_improvement: f64,
 }
 

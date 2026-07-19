@@ -327,10 +327,14 @@ pub enum PromotionDecision {
 }
 
 /// Decide promotion PURELY from the two measured held-out losses. Promote ONLY
-/// when BOTH are finite AND `(base - adapter) >= min_improvement`. A missing or
-/// non-finite measurement REJECTS — the gate never promotes on an unmeasurable
-/// result, and (with a non-negative margin) never on a tie or a regression. This
-/// is the honesty core of self-personalization. PURE + exhaustively tested.
+/// when BOTH are finite AND the improvement `(base - adapter)` is a STRICT win
+/// (`> 0`) AND clears the (non-negative) margin. A missing or non-finite
+/// measurement REJECTS — the gate never promotes on an unmeasurable result, and
+/// never on a tie or a regression, EVEN at `min_improvement = 0` (the strict-win
+/// term is unconditional, not an artifact of a positive margin). A negative
+/// margin also rejects (fail closed on a nonsense config; the field is
+/// documented `>= 0`). This is the honesty core of self-personalization. PURE +
+/// exhaustively tested.
 pub fn promotion_decision(
     base_loss: Option<f64>,
     adapter_loss: Option<f64>,
@@ -339,7 +343,7 @@ pub fn promotion_decision(
     match (base_loss, adapter_loss) {
         (Some(b), Some(a)) if b.is_finite() && a.is_finite() => {
             let improvement = b - a;
-            if improvement >= min_improvement && min_improvement >= 0.0 {
+            if improvement > 0.0 && improvement >= min_improvement && min_improvement >= 0.0 {
                 PromotionDecision::Promote { base_loss: b, adapter_loss: a, improvement }
             } else {
                 PromotionDecision::Reject {
@@ -525,8 +529,17 @@ where
             if let Err(e) = install_promotion(root, &run_dir, &manifest) {
                 manifest.promoted = false;
                 write_manifest(root, &run_dir, &manifest);
+                // Report what is ACTUALLY live: a copy/temp failure leaves any
+                // PREVIOUSLY promoted adapter untouched (still live); only a
+                // failure after promoted/ was removed leaves base live. Check
+                // the pointer rather than assert "base" unconditionally.
+                let still_live = if read_promoted_manifest(root).is_some() {
+                    "the previously promoted adapter stays live"
+                } else {
+                    "the base model stays live"
+                };
                 return format!(
-                    "The adapter beat base ({adapter_loss:.3} vs {base_loss:.3}) but I couldn't install it, sir — {e}. Base stays live."
+                    "The new adapter beat base ({adapter_loss:.3} vs {base_loss:.3}) but I couldn't install it, sir — {e}; {still_live}."
                 );
             }
             write_manifest(root, &run_dir, &manifest);
@@ -1129,6 +1142,24 @@ mod tests {
         assert!(matches!(promotion_decision(Some(f64::NAN), Some(1.0), 0.05), Reject { .. }));
     }
 
+    /// REVIEW PIN: "a tie never promotes" holds UNCONDITIONALLY — even at
+    /// min_improvement = 0 (the strict-win `> 0` term, not a side effect of a
+    /// positive margin). A zero-margin config still requires a strict win; a
+    /// negative margin fails closed (documented `>= 0`).
+    #[test]
+    fn promotion_gate_never_promotes_a_tie_even_at_zero_margin() {
+        use PromotionDecision::*;
+        // Exact tie at margin 0 -> Reject (the review's reachable case).
+        assert!(matches!(promotion_decision(Some(2.5), Some(2.5), 0.0), Reject { .. }));
+        // A strict win at margin 0 -> Promote (zero margin means "any real win").
+        assert!(matches!(promotion_decision(Some(2.5), Some(2.4), 0.0), Promote { .. }));
+        // A regression at margin 0 -> Reject.
+        assert!(matches!(promotion_decision(Some(2.4), Some(2.5), 0.0), Reject { .. }));
+        // A NEGATIVE margin fails closed: even a clear win is rejected rather
+        // than letting a nonsense config authorize anything.
+        assert!(matches!(promotion_decision(Some(2.5), Some(2.0), -0.1), Reject { .. }));
+    }
+
     #[tokio::test]
     async fn promote_last_promotes_on_a_measured_win_and_is_reversible() {
         let root = tempdir("promote-win");
@@ -1170,6 +1201,77 @@ mod tests {
         // Reversible: rollback removes the live pointer.
         clear_promotion(&root.0).unwrap();
         assert!(read_promoted_manifest(&root.0).is_none(), "rollback reverts to base");
+    }
+
+    /// REVIEW PIN: when a NEW winning adapter fails to INSTALL while a PREVIOUS
+    /// adapter is still promoted, the spoken line must report the truth — the
+    /// previously promoted adapter stays live — never a false "base stays live"
+    /// (a copy/temp failure leaves promoted/ untouched). Install failure is forced
+    /// hermetically: a FILE squats on the temp staging path, so create_dir_all
+    /// fails before promoted/ is ever touched.
+    #[tokio::test]
+    async fn promote_install_failure_reports_the_prior_adapter_still_live() {
+        let root = tempdir("promote-install-fail");
+        let mut cfg = crate::config::Config::default();
+        cfg.distill.enabled = true;
+        cfg.distill.min_improvement = 0.05;
+        // A PREVIOUSLY promoted adapter v1 is live.
+        let v1 = Manifest {
+            created: "2026-07-12T09-00-00Z".into(),
+            base_model: cfg.distill.base_model.clone(),
+            example_count: 40,
+            status: RunStatus::Trained,
+            staging_dir: "state/lora/run-v1".into(),
+            promoted: true,
+            held_out_base_loss: Some(2.9),
+            held_out_adapter_loss: Some(2.6),
+        };
+        let promoted = promoted_dir(&root.0);
+        std::fs::create_dir_all(&promoted).unwrap();
+        std::fs::write(promoted.join("adapters.safetensors"), b"v1").unwrap();
+        std::fs::write(promoted.join("manifest.json"), serde_json::to_vec_pretty(&v1).unwrap())
+            .unwrap();
+        // A NEW trained run v2 that will WIN its eval.
+        let run_dir = staging_root(&root.0).join("run-v2");
+        std::fs::create_dir_all(&run_dir).unwrap();
+        std::fs::write(run_dir.join("adapters.safetensors"), b"v2").unwrap();
+        let v2 = Manifest {
+            created: "2026-07-13T10-00-00Z".into(),
+            base_model: cfg.distill.base_model.clone(),
+            example_count: 80,
+            status: RunStatus::Trained,
+            staging_dir: run_dir.to_string_lossy().to_string(),
+            promoted: false,
+            held_out_base_loss: None,
+            held_out_adapter_loss: None,
+        };
+        write_manifest(&root.0, &run_dir, &v2);
+        // Sabotage install: a FILE at the temp staging path ("promoting-<created>")
+        // makes install_promotion's create_dir_all fail BEFORE promoted/ is touched.
+        std::fs::write(
+            staging_root(&root.0).join("promoting-2026-07-13T10-00-00Z"),
+            b"squatter",
+        )
+        .unwrap();
+
+        let reply = promote_last(&cfg, &root.0, |_p, args| {
+            let is_adapter = args.windows(2).any(|w| w[0] == "--adapter-path" && !w[1].is_empty());
+            async move {
+                Ok(if is_adapter { "Test loss 2.200".to_string() } else { "Test loss 2.500".to_string() })
+            }
+        })
+        .await;
+        assert!(reply.contains("couldn't install"), "install must fail: {reply}");
+        // THE PIN: the truth is the v1 adapter is still live — never "base".
+        assert!(
+            reply.contains("previously promoted adapter stays live"),
+            "must report the prior adapter, not base: {reply}"
+        );
+        assert!(!reply.contains("base model stays live"), "{reply}");
+        // And v1 really is untouched.
+        let live = read_promoted_manifest(&root.0).expect("v1 still promoted");
+        assert_eq!(live.created, "2026-07-12T09-00-00Z");
+        assert_eq!(std::fs::read(promoted.join("adapters.safetensors")).unwrap(), b"v1");
     }
 
     #[tokio::test]
