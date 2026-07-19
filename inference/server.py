@@ -4027,6 +4027,11 @@ class InferenceEngine:
             resolved_id, model, tokenizer = self._ensure_local_llm(local_model)
             on_base = resolved_id == self.llm_id
             quant_loaded = self._quant_loaded if on_base else "auto"
+            # SELF-DISTILLATION honesty: the promoted personal adapter is fused
+            # into the BASE resident only — a non-base warm model answers on its
+            # own unadapted weights, so its meta reports adapter=None. The op
+            # reply takes THIS per-turn stamp, never the engine-global one.
+            turn_adapter = self._active_adapter if on_base else None
             messages = self._build_generate_messages(text, history=history, facts=facts, data=data)
             prompt = self._render_chat_messages(messages, tokenizer=tokenizer)
             # #37: decide whether speculative ACTUALLY runs this turn. A draft only
@@ -4044,7 +4049,7 @@ class InferenceEngine:
                     # `metrics` carries the honest decode telemetry (tok/s + peak
                     # mem) mlx_lm measured on this stream_generate run; None only
                     # if nothing was decoded (immediate cancel).
-                    return (out, {"speculative": False, "quant": quant_loaded, "metrics": metrics})
+                    return (out, {"speculative": False, "quant": quant_loaded, "adapter": turn_adapter, "metrics": metrics})
                 except Exception:
                     log.exception("cached generate failed; rebuilding cache and falling back")
                     try:
@@ -4068,7 +4073,7 @@ class InferenceEngine:
                     # per-token GenerationResponse stream to read tok/s from, so
                     # metrics are honestly absent here (never fabricated). The
                     # benchmark harness measures the speculative delta directly.
-                    return (out, {"speculative": True, "quant": quant_loaded, "metrics": None})
+                    return (out, {"speculative": True, "quant": quant_loaded, "adapter": turn_adapter, "metrics": None})
                 except Exception:
                     # A runtime speculative failure (version mismatch, draft
                     # incompatibility) HONESTLY falls back to normal generation and
@@ -4086,7 +4091,7 @@ class InferenceEngine:
             )
             # Uncached normal path: also a single blocking mlx_lm.generate() call
             # with no per-token stream, so metrics are honestly absent.
-            return (out, {"speculative": False, "quant": quant_loaded, "metrics": None})
+            return (out, {"speculative": False, "quant": quant_loaded, "adapter": turn_adapter, "metrics": None})
 
     def _embed_encode(self, text):
         """Encode one input to a capped list of token ids for embedding. An input
@@ -6403,12 +6408,14 @@ class InferenceServer:
                     "text": out,
                     "speculative": gen_meta.get("speculative", False),
                     "quant": gen_meta.get("quant", "auto"),
-                    # SELF-DISTILLATION: the LIVE personal adapter stamp (or None =
-                    # base model). HONEST — set only when an adapter actually fused
-                    # into the resident model (mismatched/failed adapters serve
-                    # base and report None), so the daemon/HUD never claim a
-                    # personalization that isn't running.
-                    "adapter": self.engine._active_adapter,
+                    # SELF-DISTILLATION: the personal adapter stamp for THE PATH
+                    # THIS TURN RAN (or None = unadapted). HONEST — from the
+                    # per-turn gen_meta, not the engine-global state: a turn on a
+                    # non-base warm model reports None even while the base
+                    # resident carries an adapter (the adapter fuses into base
+                    # only), and mismatched/failed adapters serve base + None. The
+                    # daemon/HUD never see a personalization that didn't run.
+                    "adapter": gen_meta.get("adapter"),
                     "latency_ms": latency_ms(),
                 }
 
