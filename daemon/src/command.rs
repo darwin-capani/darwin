@@ -155,9 +155,10 @@ pub enum Command {
     /// Read-only pending + agent state snapshot.
     State,
     /// SELF-DISTILLATION (F17): prepare a redacted dataset from the user's own
-    /// graded turns and run the device-gated LoRA training, staging the adapter
-    /// (NEVER promoting it). Operator-triggered only; off unless
-    /// [distill].enabled. Read-mostly + confined to state/lora/.
+    /// graded turns and run the device-gated LoRA training, staging the adapter.
+    /// With [distill].auto_promote (ships OFF) it chains the MEASURED promotion
+    /// eval — the adapter goes live only on a strict held-out win. Operator-
+    /// triggered only; off unless [distill].enabled. Confined to state/lora/.
     Distill,
     /// SELF-DISTILLATION promotion: measure the last trained adapter against base
     /// on the held-out split and make it the live generation model ONLY on a
@@ -540,8 +541,9 @@ pub trait CommandPipeline: Send + Sync {
     /// Read-only state snapshot (pending + agent state).
     fn state(&self) -> impl std::future::Future<Output = String> + Send;
     /// SELF-DISTILLATION (F17): run one operator-triggered distillation — stage
-    /// a redacted dataset + run the device-gated training, NEVER promoting the
-    /// staged adapter. Off unless [distill].enabled. Returns a spoken-style ack.
+    /// a redacted dataset + run the device-gated training; with the opt-in
+    /// [distill].auto_promote it chains the measured promotion gate (live only
+    /// on a strict held-out win). Off unless [distill].enabled. Spoken ack.
     fn distill(&self) -> impl std::future::Future<Output = String> + Send;
     /// SELF-DISTILLATION promotion: measure the last trained adapter vs base on
     /// the held-out split; make it the live model ONLY on a measured win. Off

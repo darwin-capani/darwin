@@ -151,14 +151,14 @@ pub fn capability_map(cfg: &Config, deps: &CapDeps) -> serde_json::Value {
                 Dep::None
             },
         ),
-        // Self-distillation (F17, propose-only, never auto-promotes): armed by
+        // Self-distillation (F17, measured-gated promotion only): armed by
         // its switch (ships OFF), inert until the on-device training runtime is
         // present. The daemon can't import Python to confirm mlx-lm + Apple
         // Silicon, so the dependency is UNVERIFIED (verified=false) — never a
         // fabricated "ready"; only the on-device run can truthfully know.
         cap(
             "self_distill",
-            "Self-distillation LoRA (staged-only, never auto-promoted)",
+            "Self-distillation LoRA (live only on a measured held-out win)",
             cfg.distill.enabled,
             Dep::Unverified { need: "Apple Silicon + mlx-lm (verified on-device)" },
         ),

@@ -3104,7 +3104,18 @@ class InferenceEngine:
         state/lora/promoted/ pointer — fusing a freshly-promoted personal adapter,
         or serving base after a rollback. Held under the GPU lock so it never
         races an in-flight decode; the reload itself is lazy (next _ensure_llm),
-        so this call is cheap. The daemon calls it right after a promote/rollback."""
+        so this call is cheap. The daemon calls it right after a promote/rollback.
+
+        EVERY holder of the old model object is evicted, not just self._model —
+        otherwise converse / the uncached + speculative generate paths keep
+        serving the PRE-reload weights all session (they resolve the model via
+        LocalWarmManager.resident, which returns a HIT without reloading) and
+        the classifier (which aliases the main LLM when no dedicated classifier
+        is configured) pins a second full copy in RAM. Evicting here means the
+        next _ensure_local_llm/_ensure_classifier re-registers the freshly
+        (re)loaded model, so the whole engine swaps atomically-from-the-callers'
+        view and the spoken "it's live now / no longer live" is true for every
+        generation surface."""
         with self._lock:
             self._model = None
             self._tokenizer = None
@@ -3112,6 +3123,19 @@ class InferenceEngine:
             self._adapter_note = None
             self._gen_cache = None
             self._gen_cache_len = 0
+            # The warm manager's pinned BASE entry holds the old model object;
+            # pop it so _ensure_local_llm re-seeds from the reloaded self._model
+            # (warm EXTRAS are untouched — the adapter fuses into base only).
+            self.local_manager.resident.pop(self.llm_id, None)
+            self.local_manager.resident.pop(self.local_manager.base_id, None)
+            # The classifier aliases the main LLM when no dedicated classifier
+            # model is configured — drop the alias (and its prompt cache) so it
+            # rebinds to the reloaded model instead of pinning the old copy.
+            if not self.classifier_id:
+                self._cls_model = None
+                self._cls_tokenizer = None
+                self._cls_cache = None
+                self._cls_cache_len = 0
 
     def _ensure_draft(self):
         """#37: lazy-load the DRAFT model for speculative decoding, behind the

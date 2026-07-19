@@ -87,7 +87,18 @@ def main():
     improvement = None
     if base_loss is not None and adapter_loss is not None:
         improvement = base_loss - adapter_loss
-        decision = "promote" if improvement >= MIN_IMPROVEMENT else "reject:no-win"
+        # Mirrors distill.rs promotion_decision exactly: a STRICT win that also
+        # clears the (non-negative, non-NaN) margin promotes; each reject names
+        # its TRUE cause (a sub-margin win DID beat base — never call it no-win).
+        import math
+        if math.isnan(MIN_IMPROVEMENT) or MIN_IMPROVEMENT < 0:
+            decision = "reject:misconfigured-margin"
+        elif improvement > 0 and improvement >= MIN_IMPROVEMENT:
+            decision = "promote"
+        elif improvement <= 0:
+            decision = "reject:no-win"
+        else:
+            decision = "reject:sub-margin-win"
 
     res = {
         "available": True, "model": MODEL, "machine": os.uname().machine,

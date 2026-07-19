@@ -6,11 +6,15 @@
 //!      consequential, device-heavy op — so `[distill].enabled` defaults false,
 //!      exactly like `[security].encrypt_memory`. With it off, every entry
 //!      point here is a no-op and the status honestly reports "off".
-//!   2. NEVER AUTO-PROMOTES. A trained adapter is written to a STAGING dir
-//!      under `state/` and recorded in a manifest — and that is where it stops.
-//!      NOTHING here points the inference server at a staged adapter; making an
-//!      adapter live is a separate, deliberate act, never a side effect of
-//!      training. (This mirrors heal.rs: propose/stage, human applies.)
+//!   2. NEVER PROMOTES WITHOUT A MEASURED WIN + AN EXPLICIT OPT-IN. Training
+//!      writes the adapter to a STAGING dir under `state/` and stops — it never
+//!      goes live as a side effect of training alone. Making it live is a
+//!      SEPARATE act ([`promote_last`], reached via the operator's
+//!      `distill_promote` command or the ships-OFF `[distill].auto_promote`
+//!      chain) that measures adapter-vs-base held-out loss and installs the
+//!      `state/lora/promoted/` pointer ONLY on a strict win over
+//!      `[distill].min_improvement` — a tie, a regression, or an unmeasurable
+//!      eval leaves the current model live. Reversible (`distill_rollback`).
 //!   3. DEVICE-GATED TRAINING IS INERT, NEVER FAKED. The actual `mlx_lm.lora`
 //!      run needs Apple Silicon + mlx-lm; the daemon can't import Python to
 //!      verify that, so the capability is reported `verified=false` (Unverified)
@@ -125,7 +129,9 @@ pub fn render_jsonl(examples: &[Example]) -> String {
 /// Where a distillation run stands. `Prepared` = a dataset was assembled and
 /// staged; `Trained` = the device-gated run wrote an adapter to staging;
 /// `Failed` = the run was attempted and did not produce an adapter. There is no
-/// `Promoted` — promotion is deliberately not this module's job.
+/// `Promoted` RUN STATUS — promotion is a separate, measured act recorded by
+/// the manifest's `promoted` flag + the `state/lora/promoted/` pointer
+/// ([`promote_last`]), not a stage of the training run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
@@ -250,7 +256,7 @@ where
 // ---------------------------------------------------------------------------
 // MEASURED PROMOTION — the honest gate: a trained adapter goes LIVE only after
 // it beats the base model on the user's held-out turns. No measured win, no
-// promotion. This is what makes rule #2 (never auto-promote) a MEASURED,
+// promotion. This is what makes rule #2 (no unmeasured promotion) a MEASURED,
 // reversible, opt-in act instead of a permanent refusal.
 // ---------------------------------------------------------------------------
 
@@ -350,7 +356,11 @@ pub fn promotion_decision(
                 // three sub-cases are distinct facts and must not share a line
                 // (a fail-closed negative margin rejects a genuine WIN, so
                 // "did not beat base" would be false beside a positive Δ).
-                let reason = if min_improvement < 0.0 {
+                // NaN is checked explicitly — it fails every comparison, so a
+                // bare `< 0.0` would fall through and misattribute a NaN-margin
+                // rejection to a "sub-margin win". (A +inf margin is NOT routed
+                // here: "smaller than the required margin" is literally true.)
+                let reason = if min_improvement.is_nan() || min_improvement < 0.0 {
                     "the promotion margin is misconfigured (min_improvement must be >= 0), so I fail closed"
                 } else if improvement <= 0.0 {
                     "the adapter did not beat the base model on your held-out turns"
@@ -499,18 +509,63 @@ pub fn clear_promotion(root: &std::path::Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The spoken clause for what the generation stack is ACTUALLY serving right
-/// now. A promoted pointer counts as a live ADAPTER only when its `base_model`
-/// matches the CONFIGURED base — the exact condition the inference server's
-/// `_promoted_adapter` applies (a mismatched adapter is refused and base is
-/// served), so this clause and the server agree by construction. Everything
-/// else — no pointer, unreadable manifest, base mismatch — is base.
+/// The daemon-side view of the promoted pointer, mirroring the checks the
+/// server's `_promoted_adapter` applies at model-load time: the weights file
+/// must exist AND the manifest's `base_model` must equal the id the server
+/// loads. That load id is `[models].llm` when `[inference].quant = "auto"` (the
+/// default) — the daemon can then DETERMINE the outcome. With an explicit
+/// quant, the server resolves the load id at load time (the quant-variant id
+/// if that checkpoint is present, else the plain id), which the daemon cannot
+/// observe — so the state degrades to `Undecidable` rather than risk a false
+/// liveness claim in either direction. Note the comparison is against
+/// `[models].llm` (what the server actually loads), NOT `[distill].base_model`
+/// (what training targeted): if the two are skewed, the server's behavior
+/// follows its resident, and so does this.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromotedPointer {
+    /// No usable pointer (absent dir, unreadable manifest, or missing weights):
+    /// the server serves base, certainly.
+    None,
+    /// Valid pointer whose base matches the resident `[models].llm` under
+    /// quant="auto": the server fuses it, certainly.
+    Live,
+    /// Valid pointer, base mismatch under quant="auto": the server refuses it
+    /// and serves base, certainly.
+    Mismatch,
+    /// Valid pointer but `[inference].quant` is explicit: which load id the
+    /// server resolved is decided server-side; liveness is undecidable here.
+    Undecidable,
+}
+
+fn promoted_pointer_state(cfg: &crate::config::Config, root: &std::path::Path) -> PromotedPointer {
+    let Some(m) = read_promoted_manifest(root) else {
+        return PromotedPointer::None;
+    };
+    if !promoted_dir(root).join("adapters.safetensors").is_file() {
+        return PromotedPointer::None;
+    }
+    if cfg.inference.quant != "auto" {
+        return PromotedPointer::Undecidable;
+    }
+    if m.base_model == cfg.models.llm {
+        PromotedPointer::Live
+    } else {
+        PromotedPointer::Mismatch
+    }
+}
+
+/// The spoken clause for what the generation stack is serving after an op that
+/// did NOT change the pointer. Each arm states only what the daemon can VERIFY
+/// ([`promoted_pointer_state`]): a determinable pointer speaks liveness; an
+/// explicit-quant pointer speaks installed-ness (the server decides at load
+/// time) — never a liveness guess that could be false.
 fn live_model_clause(cfg: &crate::config::Config, root: &std::path::Path) -> &'static str {
-    match read_promoted_manifest(root) {
-        Some(m) if m.base_model == cfg.distill.base_model => {
-            "the previously promoted adapter stays live"
+    match promoted_pointer_state(cfg, root) {
+        PromotedPointer::Live => "the previously promoted adapter stays live",
+        PromotedPointer::None | PromotedPointer::Mismatch => "the base model stays live",
+        PromotedPointer::Undecidable => {
+            "the previously promoted adapter stays installed (with an explicit [inference].quant, the server decides at model load whether it serves)"
         }
-        _ => "the base model stays live",
     }
 }
 
@@ -605,14 +660,23 @@ where
 ///   ready_to_train   — enabled AND examples_ready >= min_examples (the dataset
 ///                      is ready; the DEVICE gate is still separate + unverified)
 ///   last_run         — the most recent manifest summary, or null
-///   promoted         — the LIVE adapter summary (base id + measured held-out
-///                      losses), or null when the base model is live
+///   promoted         — the DAEMON-VERIFIED live adapter summary (valid pointer
+///                      + base match + quant="auto"), or null. Null ALSO covers
+///                      an installed pointer whose liveness the daemon cannot
+///                      verify — `adapter_pointer` carries that distinction.
+///   adapter_pointer  — the pointer state: "none" | "live" |
+///                      "installed-mismatch" (server refuses it; base serves) |
+///                      "installed-quant-undecided" (explicit [inference].quant;
+///                      the server resolves the load id at load time)
+///   adapter_live     — true ONLY for a daemon-VERIFIED live adapter (the
+///                      "live" pointer state); never a guess
 ///   gated_promotion  — always true: an adapter goes live ONLY on a measured win
 pub fn status_payload(
     enabled: bool,
     examples_ready: usize,
     last_run: Option<&Manifest>,
     promoted: Option<&Manifest>,
+    adapter_pointer: &str,
 ) -> Value {
     let summary = |m: &Manifest| json!({
         "created": m.created,
@@ -634,6 +698,7 @@ pub fn status_payload(
         // trained adapter (it stays staged until it beats base).
         "gated_promotion": true,
         "adapter_live": promoted.is_some(),
+        "adapter_pointer": adapter_pointer,
         "last_run": last_run.map(&summary),
         "promoted": promoted.map(&summary),
     })
@@ -688,17 +753,34 @@ pub async fn emit_status(cfg: &crate::config::Config, memory: &crate::memory::Me
         0
     };
     let last = read_last_manifest(root);
-    // adapter_live means the adapter IS the live generation model — the same
-    // validity condition the server applies (base_model must match the
-    // configured base; a mismatched pointer is refused and base is served), so
-    // the status and the server agree by construction. A stale pointer reports
-    // adapter_live=false, never a false "live".
-    let promoted = read_promoted_manifest(root)
-        .filter(|m| m.base_model == cfg.distill.base_model);
+    // adapter_live / "promoted" mean the adapter IS VERIFIABLY the live
+    // generation model — the same checks the server applies (weights present +
+    // base matches the resident [models].llm, determinable only under
+    // quant="auto"). A mismatched or quant-undecidable pointer reports
+    // adapter_live=false with the full state in adapter_pointer — never a
+    // false "live", never a hidden pointer.
+    let state = promoted_pointer_state(cfg, root);
+    let pointer_label = match state {
+        PromotedPointer::None => "none",
+        PromotedPointer::Live => "live",
+        PromotedPointer::Mismatch => "installed-mismatch",
+        PromotedPointer::Undecidable => "installed-quant-undecided",
+    };
+    let promoted = if state == PromotedPointer::Live {
+        read_promoted_manifest(root)
+    } else {
+        None
+    };
     crate::telemetry::emit(
         "system",
         "distill.status",
-        status_payload(cfg.distill.enabled, examples_ready, last.as_ref(), promoted.as_ref()),
+        status_payload(
+            cfg.distill.enabled,
+            examples_ready,
+            last.as_ref(),
+            promoted.as_ref(),
+            pointer_label,
+        ),
     );
 }
 
@@ -732,8 +814,10 @@ pub async fn run_real_training(program: String, args: Vec<String>) -> Result<i32
 /// (authenticated command channel; NEVER a background cadence — training is
 /// heavy and only ever starts from an explicit act). Prepares the redacted
 /// dataset + a manifest, then runs the device-gated training, and STOPS at a
-/// staged adapter: it NEVER promotes. Returns a spoken-style summary. Fail-open
-/// + honest at every step; nothing outside `state/lora/` is touched.
+/// staged adapter: this function itself never promotes (the command layer's
+/// opt-in `[distill].auto_promote` chain runs [`promote_last`] afterwards,
+/// which promotes ONLY on a measured win). Returns a spoken-style summary.
+/// Fail-open + honest at every step; nothing outside `state/lora/` is touched.
 ///
 /// `run` is injected so the whole orchestration is hermetically tested with a
 /// canned runner; the live wiring passes [`run_real_training`].
@@ -807,7 +891,7 @@ where
             manifest.status = RunStatus::Trained;
             write_manifest(root, &run_dir, &manifest);
             format!(
-                "Trained a personal adapter from {} of your redacted turns, sir — it's STAGED under state/lora, not live. Promotion is a separate, deliberate step; I never swap the live model on my own.",
+                "Trained a personal adapter from {} of your redacted turns, sir — it's STAGED under state/lora, not yet live. It only goes live if it MEASURABLY beats the base model on your held-out turns, and that's reversible.",
                 manifest.example_count
             )
         }
@@ -946,7 +1030,7 @@ mod tests {
     #[test]
     fn status_is_honest_about_off_readiness_and_gated_promotion() {
         // Off: not ready, zero examples reported, dep unverified, no live adapter.
-        let off = status_payload(false, 100, None, None);
+        let off = status_payload(false, 100, None, None, "none");
         assert_eq!(off["enabled"], false);
         assert_eq!(off["ready_to_train"], false);
         assert_eq!(off["dep_verified"], false, "the daemon never fabricates device readiness");
@@ -956,10 +1040,10 @@ mod tests {
         assert!(off["promoted"].is_null());
 
         // On + enough examples: dataset ready (device gate still separate).
-        let ready = status_payload(true, MIN_EXAMPLES, None, None);
+        let ready = status_payload(true, MIN_EXAMPLES, None, None, "none");
         assert_eq!(ready["ready_to_train"], true);
         // On but thin: not ready.
-        let thin = status_payload(true, MIN_EXAMPLES - 1, None, None);
+        let thin = status_payload(true, MIN_EXAMPLES - 1, None, None, "none");
         assert_eq!(thin["ready_to_train"], false);
         assert_eq!(thin["min_examples"], MIN_EXAMPLES);
 
@@ -975,7 +1059,7 @@ mod tests {
             held_out_base_loss: None,
             held_out_adapter_loss: None,
         };
-        let with_run = status_payload(true, 200, Some(&m), None);
+        let with_run = status_payload(true, 200, Some(&m), None, "none");
         assert_eq!(with_run["last_run"]["status"], "trained");
         assert_eq!(with_run["last_run"]["example_count"], 120);
         assert_eq!(with_run["last_run"]["promoted"], false);
@@ -990,11 +1074,72 @@ mod tests {
             held_out_adapter_loss: Some(2.2),
             ..m.clone()
         };
-        let with_live = status_payload(true, 200, Some(&m), Some(&live));
+        let with_live = status_payload(true, 200, Some(&m), Some(&live), "live");
         assert_eq!(with_live["adapter_live"], true);
+        assert_eq!(with_live["adapter_pointer"], "live");
         assert_eq!(with_live["promoted"]["promoted"], true);
         assert_eq!(with_live["promoted"]["held_out_adapter_loss"], 2.2);
         assert_eq!(with_live["promoted"]["held_out_base_loss"], 2.5);
+    }
+
+    /// REVIEW PIN (round 3): the STATUS surface applies the same verifiable-
+    /// liveness checks as the spoken clause — a pointer the server would refuse
+    /// (base mismatch vs the resident [models].llm) or cannot be verified
+    /// (explicit quant) NEVER reports adapter_live=true; a weights-less pointer
+    /// is no pointer at all. promoted_pointer_state is the single source.
+    #[test]
+    fn pointer_state_mirrors_the_server_checks() {
+        let root = tempdir("pointer-state");
+        let mut cfg = crate::config::Config::default();
+        // No pointer at all.
+        assert_eq!(promoted_pointer_state(&cfg, &root.0), PromotedPointer::None);
+        // Manifest only, NO weights file -> still None (the server requires the
+        // weights; a manifest-only dir must never read as an installed adapter).
+        let promoted = promoted_dir(&root.0);
+        std::fs::create_dir_all(&promoted).unwrap();
+        let mk = |base: &str| Manifest {
+            created: "2026-07-12T09-00-00Z".into(),
+            base_model: base.to_string(),
+            example_count: 40,
+            status: RunStatus::Trained,
+            staging_dir: "state/lora/run-v1".into(),
+            promoted: true,
+            held_out_base_loss: Some(2.9),
+            held_out_adapter_loss: Some(2.6),
+        };
+        std::fs::write(
+            promoted.join("manifest.json"),
+            serde_json::to_vec_pretty(&mk(&cfg.models.llm)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(promoted_pointer_state(&cfg, &root.0), PromotedPointer::None);
+        // Weights + base matching the RESIDENT [models].llm + quant auto -> Live.
+        std::fs::write(promoted.join("adapters.safetensors"), b"w").unwrap();
+        assert_eq!(cfg.inference.quant, "auto", "precondition: default quant");
+        assert_eq!(promoted_pointer_state(&cfg, &root.0), PromotedPointer::Live);
+        // The comparison is against [models].llm (what the server loads), NOT
+        // [distill].base_model: skewing distill.base_model alone changes nothing.
+        cfg.distill.base_model = "mlx-community/Other-8B".into();
+        assert_eq!(promoted_pointer_state(&cfg, &root.0), PromotedPointer::Live);
+        cfg.distill.base_model = cfg.models.llm.clone();
+        // A base MISMATCH vs the resident -> the server refuses it -> Mismatch.
+        std::fs::write(
+            promoted.join("manifest.json"),
+            serde_json::to_vec_pretty(&mk("mlx-community/Old-Base-4bit")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(promoted_pointer_state(&cfg, &root.0), PromotedPointer::Mismatch);
+        // An explicit quant makes the server's load id unobservable -> Undecidable
+        // (even for a base-matching manifest).
+        std::fs::write(
+            promoted.join("manifest.json"),
+            serde_json::to_vec_pretty(&mk(&cfg.models.llm)).unwrap(),
+        )
+        .unwrap();
+        cfg.inference.quant = "int4".into();
+        assert_eq!(promoted_pointer_state(&cfg, &root.0), PromotedPointer::Undecidable);
+        // And the spoken clause speaks installed-ness, not a liveness guess.
+        assert!(live_model_clause(&cfg, &root.0).contains("stays installed"));
     }
 
     // -- the orchestrator, hermetic: canned runner + temp dirs, no DB, no spawn.
@@ -1208,6 +1353,13 @@ mod tests {
         };
         assert!(reason.contains("misconfigured"), "true cause is the margin config: {reason}");
         assert!(!reason.contains("did not beat"), "{reason}");
+        // A NaN margin is the same misconfiguration (NaN fails every comparison,
+        // so a bare `< 0.0` check would misattribute it to a "sub-margin win").
+        let Reject { reason, .. } = promotion_decision(Some(2.5), Some(2.0), f64::NAN) else {
+            panic!("NaN margin must reject");
+        };
+        assert!(reason.contains("misconfigured"), "NaN margin is misconfigured: {reason}");
+        assert!(!reason.contains("smaller than"), "{reason}");
         // Sub-margin win: it DID beat base — the margin is the reason.
         let Reject { reason, .. } = promotion_decision(Some(2.5), Some(2.46), 0.05) else {
             panic!("sub-margin must reject");

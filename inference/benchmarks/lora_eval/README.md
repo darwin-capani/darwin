@@ -33,7 +33,7 @@ numbers.
 quality claim on real user data.** The improvement is large because the synthetic
 style is trivially learnable and the base essentially never produces it; real
 graded turns would show a far smaller (possibly negative) delta, which the gate
-handles honestly (a NO-GO leaves base live). The Rust tests
+handles honestly (a NO-GO leaves whatever is currently live untouched). The Rust tests
 (`distill::tests::promote_last_*`, `promotion_gate_*`) cover the reject-on-no-win,
 reject-on-regression, reject-on-unmeasurable, and reversible-rollback paths; an
 earlier run of this smoke with a broken base-eval correctly produced

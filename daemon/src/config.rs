@@ -266,8 +266,10 @@ pub struct Config {
     /// [distill] — SELF-DISTILLATION (F17, distill.rs): an on-device LoRA
     /// pipeline that learns a personal adapter from the user's OWN graded
     /// interactions. SHIPS OFF (like [security]) because training MUTATES
-    /// weights and is device-heavy; it NEVER auto-promotes a trained adapter
-    /// into the live model, and the training step is INERT without Apple
+    /// weights and is device-heavy; a trained adapter goes LIVE only through the
+    /// MEASURED promotion gate (a strict held-out win over base; opt-in via
+    /// `distill_promote` or `auto_promote`, reversible), and the training step
+    /// is INERT without Apple
     /// Silicon + mlx-lm (reported honestly, never faked).
     pub distill: DistillConfig,
     /// [sync] — E2E-ENCRYPTED FEDERATED SYNC (F18, sync.rs): sync the user's OWN
@@ -4141,9 +4143,11 @@ impl Default for EnclaveConfig {
 
 /// [distill] — self-distillation (F17). SHIPS OFF: training produces weights (an
 /// adapter), a consequential + device-heavy op, so it is a deliberate operator
-/// opt-in, NOT a full-power feature default. Even ON, it never auto-promotes an
-/// adapter into the live model, and the training run is inert without Apple
-/// Silicon + mlx-lm.
+/// opt-in, NOT a full-power feature default. Even ON, a trained adapter goes
+/// live ONLY through the measured promotion gate (a strict held-out win over
+/// base by `min_improvement`; via `distill_promote` or the ships-OFF
+/// `auto_promote` chain, reversible), and the training run is inert without
+/// Apple Silicon + mlx-lm.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct DistillConfig {
