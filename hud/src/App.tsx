@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import AboutPanel from "./components/AboutPanel";
 import ActionPanel from "./components/ActionPanel";
 import AgentPanel from "./components/AgentPanel";
@@ -13,6 +13,8 @@ import ChartPanel from "./components/ChartPanel";
 import ChangeQueuePanel from "./components/ChangeQueuePanel";
 import CodeIntelPanel from "./components/CodeIntelPanel";
 import CommandDeck from "./components/CommandDeck";
+import CommandPalette from "./components/CommandPalette";
+import { ROSTER } from "./core/agents";
 import ShellPanel from "./components/ShellPanel";
 import UiActuatePanel from "./components/UiActuatePanel";
 import DiagnosticsPanel from "./components/DiagnosticsPanel";
@@ -53,7 +55,7 @@ import PasteboardPanel from "./components/PasteboardPanel";
 import AperturePanel from "./components/AperturePanel";
 import PostureDashboardPanel from "./components/PostureDashboardPanel";
 import AttributionHealthPanel from "./components/AttributionHealthPanel";
-import AppDeckPanel from "./components/AppDeckPanel";
+import AppDeckPanel, { renderApps } from "./components/AppDeckPanel";
 import ConnectorMarketplacePanel from "./components/ConnectorMarketplacePanel";
 import ExtensibilityPanel from "./components/ExtensibilityPanel";
 import MemoryPanel from "./components/MemoryPanel";
@@ -116,6 +118,23 @@ export default function App() {
   const [settingsTab, setSettingsTab] = useState<"credentials" | "system" | null>(null);
   const settingsOpen = settingsTab !== null;
   const [deckOpen, setDeckOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  // Palette sources, memoized on the underlying slices so the child's item
+  // build + filter memos actually cache (an inline object would be a fresh ref
+  // every render — App re-renders on the poll cadence). Apps fall back to the
+  // curated FLEET (same as the App Deck) when the live registry is empty, so the
+  // palette is useful before the daemon reports — genuinely degrading, not blank.
+  const paletteSources = useMemo(
+    () => ({
+      apps: renderApps(state.appRegistry).map((a) => ({
+        id: a.id,
+        description: a.desc,
+        tool: a.tool,
+      })),
+      agents: ROSTER,
+    }),
+    [state.appRegistry],
+  );
 
   // CINEMATIC BOOT / WAKE REVEAL — the one-shot power-on overlay. Plays the
   // FIRST time the telemetry link connects (DARWIN "waking"), never on later
@@ -501,6 +520,22 @@ export default function App() {
         exitTakeover();
         return;
       }
+      // Cmd-K toggles the command palette. Checked BEFORE the typing guard so it
+      // opens from anywhere, including while focused in an input — a palette must
+      // always be reachable. Cmd (metaKey) ONLY, never Ctrl: on macOS Ctrl-K is
+      // the Cocoa "kill line" text-editing shortcut, and stealing it would break
+      // editing in every HUD input.
+      if (ev.metaKey && !ev.ctrlKey && (ev.key === "k" || ev.key === "K")) {
+        ev.preventDefault();
+        setPaletteOpen((v) => !v);
+        return;
+      }
+      // While the palette is open it OWNS the keyboard (its own input handles
+      // Esc / arrows / Enter). Don't let App's other bindings (the 'c' deck
+      // toggle, Esc→deck-close) also fire — else one Esc would close both.
+      if (paletteOpen) {
+        return;
+      }
       if (!typing && (ev.key === "c" || ev.key === "C")) {
         ev.preventDefault();
         setDeckOpen((v) => !v);
@@ -510,7 +545,7 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [takeoverActive, exitTakeover]);
+  }, [takeoverActive, exitTakeover, paletteOpen]);
 
   // FIRST-RUN SETUP gate (pure): show ONLY when in the shell, the backend is
   // KNOWN-not-installed, AND the daemon is not reachable. A connected daemon or a
@@ -746,6 +781,11 @@ export default function App() {
 
       <Toasts toasts={state.toasts} />
       <CommandDeck open={deckOpen} onClose={() => setDeckOpen(false)} />
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        sources={paletteSources}
+      />
 
       {/* CINEMATIC BOOT / WAKE REVEAL — mounts once on first connect, above
           everything (z 9999), and unmounts itself when the sequence ends. */}
