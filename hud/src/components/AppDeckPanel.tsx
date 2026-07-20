@@ -18,7 +18,7 @@ import Frame from "./Frame";
  * An app not yet discovered simply reads IDLE (honest — never a fabricated "live").
  */
 
-type DeckApp = {
+export type DeckApp = {
   /** manifest name = apps/<id>/ dir; the key into runningApps / appFeeds. */
   id: string;
   name: string;
@@ -100,7 +100,7 @@ function blurb(desc: string): string {
  *  app auto-appears), else the curated FLEET (fallback for an old daemon / before
  *  the first frame). A live app keeps its curated card when known, else shows its
  *  real manifest metadata in OTHER. */
-function renderApps(registry: AppRegistryEntry[]): DeckApp[] {
+export function renderApps(registry: AppRegistryEntry[]): DeckApp[] {
   if (registry.length === 0) return FLEET;
   return registry.map((r) => {
     const known = CATALOG_BY_ID.get(r.id);

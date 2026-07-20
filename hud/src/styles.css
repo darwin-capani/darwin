@@ -5057,6 +5057,107 @@ svg.tri circle {
 }
 .cmd-deck-close:hover { border-color: var(--cyan-bright); }
 
+/* ── Command Palette (Cmd-K) ─────────────────────────────────────────────── */
+.palette-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 65; /* above panels + modal (20/30), peer to the deck (60) */
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 12vh;
+  background: rgba(2, 6, 12, 0.62);
+  backdrop-filter: blur(3px);
+}
+.palette {
+  width: min(680px, 92vw);
+  max-height: 70vh;
+}
+.palette-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.palette-agent-chip {
+  flex: none;
+  padding: 3px 8px;
+  border: 1px solid var(--cyan-bright);
+  color: var(--ice, var(--cyan-bright));
+  font: 11px/1 var(--text);
+  white-space: nowrap;
+}
+.palette-input {
+  flex: 1;
+  background: rgba(4, 10, 18, 0.72);
+  border: 1px solid var(--stroke);
+  color: var(--text);
+  font: 14px/1.4 var(--text);
+  padding: 9px 11px;
+  outline: none;
+}
+.palette-input:focus { border-color: var(--cyan-bright); }
+.palette-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 48vh;
+  overflow-y: auto;
+}
+.palette-empty {
+  padding: 12px 10px;
+  color: var(--cyan-dim);
+  font: 12px/1.4 var(--text);
+}
+.palette-item {
+  display: grid;
+  grid-template-columns: 72px minmax(0, 1fr) minmax(0, 42%);
+  align-items: baseline;
+  gap: 10px;
+  padding: 8px 10px;
+  border-left: 2px solid transparent;
+  cursor: pointer;
+}
+.palette-item.active {
+  background: rgba(64, 200, 255, 0.09);
+  border-left-color: var(--cyan-bright);
+}
+.palette-group {
+  font: 10px/1.4 var(--text);
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--cyan-dim);
+}
+.palette-group-command { color: var(--warn-amber); }
+.palette-group-app { color: var(--cyan-bright); }
+.palette-group-agent { color: var(--ice-dim, var(--cyan-bright)); }
+.palette-label {
+  font: 13px/1.4 var(--text);
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.palette-hint {
+  font: 11px/1.4 var(--text);
+  color: var(--cyan-dim);
+  text-align: right;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.palette-foot {
+  display: flex;
+  gap: 16px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--stroke);
+  font: 10px/1.4 var(--text);
+  color: var(--cyan-dim);
+}
+
 /* Pending-actions tray — warn-amber attention chrome. */
 .cmd-tray {
   border: 1px solid var(--warn-amber);
