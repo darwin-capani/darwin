@@ -471,6 +471,44 @@ pub fn hyde_retrieval_enabled() -> bool {
     HYDE_GATE.get().copied().unwrap_or(false)
 }
 
+/// The GraphRAG gate (`[docsearch].graph_expand`). When on, the world-model
+/// RETRIEVAL paths (grounded world feed, unified_search world source, the
+/// world_query tool) expand a term-match result with its 1-hop graph neighbor
+/// entities via [`crate::world_model::query_graph`] — graph context, not just
+/// isolated matches. Falls back to `false` (term-match only, today's behavior)
+/// when init was never called — any test or a pre-startup path — so retrieval
+/// fails safe. The KG-build dedup path is unaffected (it keeps the un-expanded
+/// `query`).
+static GRAPH_EXPAND_GATE: OnceLock<bool> = OnceLock::new();
+
+/// Wire the GraphRAG gate from the loaded config. Called once from `main()`
+/// alongside `init_hyde`. Idempotent.
+pub fn init_graph_expand(enabled: bool) {
+    let _ = GRAPH_EXPAND_GATE.set(enabled);
+}
+
+/// Whether GraphRAG 1-hop neighbor expansion is enabled. Falls back to `false`
+/// (term-match only) when unset, so the retrieval paths fail safe.
+pub fn graph_expand_enabled() -> bool {
+    GRAPH_EXPAND_GATE.get().copied().unwrap_or(false)
+}
+
+/// The world-model retrieval read, honoring the GraphRAG gate: the 1-hop
+/// neighbor-expanded [`crate::world_model::query_graph`] when
+/// [`graph_expand_enabled`], else the term-match-only [`crate::world_model::query`]
+/// (today's behavior byte-for-byte). The single seam the retrieval callers use so
+/// the gate lives in one place.
+async fn world_retrieval_query(
+    memory: &Memory,
+    about: &str,
+) -> anyhow::Result<crate::world_model::WorldState> {
+    if graph_expand_enabled() {
+        crate::world_model::query_graph(memory, about).await
+    } else {
+        crate::world_model::query(memory, about).await
+    }
+}
+
 /// The APPS-AS-AGENT-TOOLS gate (`[apps].agent_tools`, ships ON). When on, every
 /// micro-app's NON-consequential `[[tools.exposes]]` declaration joins the agent
 /// tool list as an `app__<tool>` def, dispatched into the app's sandbox via the
@@ -10203,7 +10241,7 @@ pub async fn grounded_world_live(utterance: &str, memory: &Memory) -> String {
     if crate::threshold::is_guest_turn() {
         return String::new();
     }
-    match crate::world_model::query(memory, utterance).await {
+    match world_retrieval_query(memory, utterance).await {
         Ok(state) => crate::world_model::render(&state),
         Err(e) => {
             warn!(error = %e, "grounded_world_live could not read the world model; prompt carries no world context");
@@ -11623,7 +11661,7 @@ async fn unified_search_tool(
 
     // WORLD: the SHARED structured model, filtered by the query (holds no agent's
     // private notes by construction).
-    let world_input = match crate::world_model::query(memory, query).await {
+    let world_input = match world_retrieval_query(memory, query).await {
         Ok(state) => DeviceInput::searched(world_candidates(
             &state.entities,
             &state.relationships,
@@ -11857,7 +11895,7 @@ fn cloud_summary_candidates(
 /// degrades to an honest message (never a fabricated world). Empty result -> an
 /// honest "nothing recorded yet" line, never an invented entity.
 async fn world_query_tool(memory: &Memory, about: &str) -> String {
-    match crate::world_model::query(memory, about).await {
+    match world_retrieval_query(memory, about).await {
         Ok(state) if state.is_empty() => {
             if about.trim().is_empty() {
                 "The world model is empty — nothing has been recorded yet.".to_string()

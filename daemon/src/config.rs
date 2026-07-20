@@ -864,6 +864,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
             "graph_extractor",
             "hybrid_retrieval",
             "hyde",
+            "graph_expand",
             "spotlight",
             "spotlight_max_candidates",
         ],
@@ -2787,6 +2788,18 @@ pub struct DocSearchConfig {
     /// falls back to the raw query, honestly. Turn it on to expand; measure on
     /// your own corpus.
     pub hyde: bool,
+    /// GraphRAG: when true, the world-model RETRIEVAL paths (grounded world feed,
+    /// unified_search world source, the world_query tool) expand a term-match
+    /// result with its 1-hop graph NEIGHBOR entities — so a query for one entity
+    /// also surfaces the entities it is connected to (e.g. "my car" -> the subaru
+    /// AND the geico it is insured by), grounding on graph context rather than
+    /// isolated matches. Reads only the SHARED user.world.* tier the KG build
+    /// populates. SHIPS OFF (opt-in): it is a TRADEOFF — neighbor context helps a
+    /// relational/exploratory query but adds unrelated entities to a precise
+    /// single-entity lookup, and there is no committed measurement that it wins on
+    /// your graph. INERT WITHOUT A GRAPH (no KG entities -> nothing to expand).
+    /// Turn it on to widen; the KG-build dedup path is unaffected.
+    pub graph_expand: bool,
     /// SPOTLIGHT BRIDGE (spotlight.rs): when true, a file search ALSO asks macOS
     /// Spotlight (READ-ONLY `mdfind`, always `-onlyin` per allowlisted root —
     /// never an unrestricted query) for candidate files, absorbed through the
@@ -2834,6 +2847,7 @@ impl Default for DocSearchConfig {
             graph_extractor: "deterministic".to_string(),
             hybrid_retrieval: false,
             hyde: false,
+            graph_expand: false,
             // SHIPS ON (full-power default) — INERT WITHOUT ROOTS: the Spotlight
             // bridge is READ-ONLY (mdfind/mdls only) and root-confined; with no
             // allowlisted root it never issues a query at all.
