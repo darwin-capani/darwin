@@ -73,6 +73,10 @@ pub const WORLD_READ_WINDOW: usize = 4_000;
 pub const MAX_QUERY_ENTITIES: usize = 24;
 /// Max relationships returned in a single structured `query` result.
 pub const MAX_QUERY_RELATIONS: usize = 48;
+/// Max 1-hop NEIGHBOR entities added by the GraphRAG expansion ([`query_graph`]).
+/// Bounds the extra entities pulled in beyond the direct term matches so the
+/// expanded result stays small enough to ground a prompt.
+pub const MAX_QUERY_NEIGHBORS: usize = 24;
 
 /// The bounded set of entity KINDS the world model recognizes. A free-form type
 /// is rejected so the keyspace stays parseable and the model stays a coherent
@@ -523,6 +527,58 @@ pub async fn query(memory: &Memory, about: &str) -> Result<WorldState> {
     Ok(filter_state(full, about))
 }
 
+/// GraphRAG retrieval: [`query`] PLUS its 1-hop graph neighbors. The term-match
+/// filter surfaces the entities that mention the query and the relationships
+/// touching them — but those relationships REFERENCE neighbor entities (by id)
+/// whose own record (type, name, attributes) the query never named. This pulls
+/// those neighbor entities in (bounded by [`MAX_QUERY_NEIGHBORS`]), so a query
+/// for "my car" that matches `subaru` also gets `geico` when `subaru —insured_by→
+/// geico` exists — graph CONTEXT, not just isolated matches. Opt-in: the
+/// retrieval callers gate this on `[docsearch].graph_expand`; the KG-build dedup
+/// path keeps the un-expanded [`query`]. One snapshot; the clone is bounded.
+pub async fn query_graph(memory: &Memory, about: &str) -> Result<WorldState> {
+    let full = snapshot(memory).await?;
+    let base = filter_state(full.clone(), about);
+    Ok(expand_neighbors(&full, base, MAX_QUERY_NEIGHBORS))
+}
+
+/// PURE 1-hop neighbor expansion: append to `base` the entities that its
+/// relationships reference (from/to endpoints) but which `base` did not already
+/// surface, looked up in the `full` state, up to `cap`. Deterministic
+/// (relationship order); a self-loop or an endpoint with no entity record is
+/// skipped; already-present entities are never duplicated. Exposed for testing.
+///
+/// INHERITED AMBIGUITY (not introduced here): relationship endpoints are bare
+/// TYPE-LESS slug ids (the world-model key scheme), so if two entities of
+/// different types slug the same (a `person` and a `project` both named
+/// "Darwin"), an endpoint resolves to the first by id ordering — the same
+/// ambiguity the un-expanded `query`/`render` path already surfaces on the edge
+/// itself. Disambiguating would require a type on the edge, a world-model
+/// redesign out of scope for this retrieval-only expansion.
+pub fn expand_neighbors(full: &WorldState, base: WorldState, cap: usize) -> WorldState {
+    // Ids already surfaced (owned, so no borrow of `base` outlives the move).
+    let mut seen: std::collections::HashSet<String> =
+        base.entities.iter().map(|e| e.id.clone()).collect();
+    let mut extra: Vec<Entity> = Vec::new();
+    'outer: for r in &base.relationships {
+        for endpoint in [&r.from, &r.to] {
+            if extra.len() >= cap {
+                break 'outer;
+            }
+            // New endpoint (not already surfaced, not already queued) with a
+            // real entity record in the full state -> pull it in.
+            if seen.insert(endpoint.clone()) {
+                if let Some(ent) = full.entities.iter().find(|e| &e.id == endpoint) {
+                    extra.push(ent.clone());
+                }
+            }
+        }
+    }
+    let mut out = base;
+    out.entities.extend(extra);
+    out
+}
+
 /// Pure filter of a [`WorldState`] by the query terms. Exposed for direct testing.
 pub fn filter_state(state: WorldState, about: &str) -> WorldState {
     let terms = query_terms(about);
@@ -662,6 +718,84 @@ mod tests {
                 let _ = std::fs::remove_file(PathBuf::from(p));
             }
         }
+    }
+
+    // -- GraphRAG 1-hop neighbor expansion (pure) ----------------------------
+
+    fn ent(id: &str) -> Entity {
+        Entity {
+            entity_type: EntityType::Topic,
+            id: id.to_string(),
+            name: id.to_string(),
+            attributes: Vec::new(),
+        }
+    }
+    fn rel(from: &str, relation: &str, to: &str) -> Relationship {
+        Relationship {
+            from: from.to_string(),
+            relation: relation.to_string(),
+            to: to.to_string(),
+            value: String::new(),
+        }
+    }
+
+    #[test]
+    fn expand_neighbors_pulls_in_the_1hop_entity_the_query_did_not_name() {
+        // Full graph: subaru --insured_by--> geico ; plus an unrelated pizza.
+        let full = WorldState {
+            entities: vec![ent("subaru"), ent("geico"), ent("pizza")],
+            relationships: vec![rel("subaru", "insured_by", "geico")],
+        };
+        // A term match for "subaru" surfaces subaru + the edge, but NOT geico's
+        // entity record.
+        let base = WorldState {
+            entities: vec![ent("subaru")],
+            relationships: vec![rel("subaru", "insured_by", "geico")],
+        };
+        let out = expand_neighbors(&full, base, MAX_QUERY_NEIGHBORS);
+        assert!(out.entities.iter().any(|e| e.id == "subaru"), "keeps the match");
+        assert!(
+            out.entities.iter().any(|e| e.id == "geico"),
+            "pulls in the 1-hop neighbor entity the query never named"
+        );
+        assert!(
+            !out.entities.iter().any(|e| e.id == "pizza"),
+            "does NOT pull in an entity with no edge to the matched set"
+        );
+    }
+
+    #[test]
+    fn expand_neighbors_no_edges_is_a_noop() {
+        let full = WorldState {
+            entities: vec![ent("a"), ent("b")],
+            relationships: vec![rel("a", "knows", "b")],
+        };
+        let base = WorldState { entities: vec![ent("a")], relationships: Vec::new() };
+        let out = expand_neighbors(&full, base.clone(), MAX_QUERY_NEIGHBORS);
+        assert_eq!(out.entities, base.entities, "no edges in base -> nothing to expand");
+    }
+
+    #[test]
+    fn expand_neighbors_honors_the_cap_and_never_duplicates() {
+        let full = WorldState {
+            entities: vec![ent("x"), ent("n1"), ent("n2"), ent("n3")],
+            relationships: vec![
+                rel("x", "r", "n1"),
+                rel("x", "r", "n2"),
+                rel("x", "r", "n3"),
+            ],
+        };
+        let base = WorldState {
+            entities: vec![ent("x"), ent("n1")], // n1 already surfaced
+            relationships: full.relationships.clone(),
+        };
+        // cap = 1: at most ONE new neighbor added, and n1 (already present) is
+        // never duplicated.
+        let out = expand_neighbors(&full, base, 1);
+        let n1_count = out.entities.iter().filter(|e| e.id == "n1").count();
+        assert_eq!(n1_count, 1, "an already-surfaced entity is never duplicated");
+        // x + n1 + exactly one of {n2, n3}.
+        assert_eq!(out.entities.len(), 3, "cap bounds the added neighbors: {out:?}");
     }
 
     // -- slugging + parsing (pure) -------------------------------------------
