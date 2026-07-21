@@ -128,6 +128,12 @@ struct VisionApp {
         // arrives, and camera/screen remain TCC-gated inside their sources.
         await pipeline.useFrameSourceFactory(CaptureSourceFactory.make)
 
+        // SCREEN GROUNDING: inject the real frontmost app/window reader (AX-free
+        // — NSWorkspace + the capture's own Screen-Recording consent) so screen
+        // reads/context snapshots self-describe which app was frontmost at capture. Same
+        // seam discipline as the factory above: the default is nil-attributing.
+        await pipeline.useFrontmostProvider(FrontmostReader.read)
+
         // Announce we're up (idle) on vision.status.
         await sink.emit(.status(state: .idle, source: nil, sensitivity: 0.5,
                                 cameraAuthorized: nil, screenAuthorized: nil,

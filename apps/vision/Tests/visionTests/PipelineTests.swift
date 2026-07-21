@@ -780,6 +780,127 @@ final class ScreenContextLoopWiringTests: XCTestCase {
                       "the continuous readout must carry the real recognized text; got \(joined)")
     }
 
+    /// SCREEN GROUNDING (1): a SCREEN-source context tick is attributed to the
+    /// frontmost app/window from the injected provider — the snapshot
+    /// self-describes where it came from, and the wire JSON carries the keys.
+    func testContinuousLoopAttributesTheFrontmostAppAndWindow() async throws {
+        guard let img = textImage(["INBOX", "Report"]) else { throw XCTSkip("no text image") }
+        let sink = CollectingSink()
+        let pipe = Pipeline(detector: VisionEngine(), sink: sink)
+        await pipe.setFrameSourceFactory { src in
+            FixedFrameSource(source: src, auth: .notApplicable, images: [img])
+        }
+        await pipe.useFrontmostProvider { FrontmostWindow(app: "TestMail", window: "Inbox — 3 unread") }
+        await pipe.runScreenContextLoop(source: .screen, intervalSeconds: 0, maxTicks: 1)
+
+        let evs = await sink.snapshot()
+        guard case let .screen(_, _, _, _, _, _, meta)? = evs.first(where: {
+            if case .screen = $0 { return true }; return false }) else {
+            return XCTFail("expected a .context readout, got \(evs)")
+        }
+        XCTAssertEqual(meta.sourceApp, "TestMail", "the tick must carry the frontmost app")
+        XCTAssertEqual(meta.sourceWindow, "Inbox — 3 unread", "the tick must carry the window title")
+        // The wire JSON carries the additive keys (what the daemon reads).
+        guard let ev = evs.first(where: { if case .screen = $0 { return true }; return false }) else {
+            return XCTFail("unreachable")
+        }
+        let data = ev.encodeData()
+        XCTAssertEqual(data["source_app"] as? String, "TestMail")
+        XCTAssertEqual(data["source_window"] as? String, "Inbox — 3 unread")
+    }
+
+    /// SCREEN GROUNDING (2): the DEFAULT provider attributes NOTHING (hermetic
+    /// honesty — no injected reader, no fabricated attribution; the wire JSON
+    /// OMITS the keys rather than sending empties).
+    func testContinuousLoopDefaultProviderAttributesNothing() async throws {
+        guard let img = textImage(["INBOX"]) else { throw XCTSkip("no text image") }
+        let sink = CollectingSink()
+        let pipe = Pipeline(detector: VisionEngine(), sink: sink)
+        await pipe.setFrameSourceFactory { src in
+            FixedFrameSource(source: src, auth: .notApplicable, images: [img])
+        }
+        // No useFrontmostProvider — the nil-attributing default.
+        await pipe.runScreenContextLoop(source: .screen, intervalSeconds: 0, maxTicks: 1)
+
+        let evs = await sink.snapshot()
+        guard case let .screen(_, _, _, _, _, _, meta)? = evs.first(where: {
+            if case .screen = $0 { return true }; return false }) else {
+            return XCTFail("expected a .context readout, got \(evs)")
+        }
+        XCTAssertNil(meta.sourceApp, "no provider -> honestly unattributed")
+        XCTAssertNil(meta.sourceWindow)
+        guard let ev = evs.first(where: { if case .screen = $0 { return true }; return false }) else {
+            return XCTFail("unreachable")
+        }
+        let data = ev.encodeData()
+        XCTAssertNil(data["source_app"], "absent attribution must OMIT the key, never fabricate")
+        XCTAssertNil(data["source_window"])
+    }
+
+    /// SCREEN GROUNDING (4): ORDERING PIN (review-caught race) — the frontmost
+    /// provider is consulted BEFORE the slow OCR, so a mid-OCR app switch can
+    /// no longer stamp this frame's pixels with the NEXT app's identity. The
+    /// probe detector flips a flag when OCR runs; the provider answers
+    /// "SwitchedApp" only if OCR already ran. With the fixed ordering the
+    /// emitted attribution MUST be the pre-OCR app. (Reverting the read to
+    /// after detect() makes this fail — mutation-proven.)
+    func testFrontmostIsReadBeforeOcrSoAMidOcrSwitchCannotMislabel() async throws {
+        guard let img = textImage(["INBOX"]) else { throw XCTSkip("no text image") }
+        final class OrderProbeDetector: Detector, @unchecked Sendable {
+            private let lock = NSLock()
+            private var flag = false
+            func detect(in frame: Frame, detectors: DetectorSet, minConfidence: Double) -> [Detection] {
+                lock.lock(); flag = true; lock.unlock()
+                return []
+            }
+            func ocrRan() -> Bool {
+                lock.lock(); defer { lock.unlock() }
+                return flag
+            }
+        }
+        let probe = OrderProbeDetector()
+        let sink = CollectingSink()
+        let pipe = Pipeline(detector: probe, sink: sink)
+        await pipe.setFrameSourceFactory { src in
+            FixedFrameSource(source: src, auth: .notApplicable, images: [img])
+        }
+        await pipe.useFrontmostProvider {
+            FrontmostWindow(app: probe.ocrRan() ? "SwitchedApp" : "OriginalApp", window: nil)
+        }
+        await pipe.runScreenContextLoop(source: .screen, intervalSeconds: 0, maxTicks: 1)
+
+        let evs = await sink.snapshot()
+        guard case let .screen(_, _, _, _, _, _, meta)? = evs.first(where: {
+            if case .screen = $0 { return true }; return false }) else {
+            return XCTFail("expected a .context readout, got \(evs)")
+        }
+        XCTAssertEqual(meta.sourceApp, "OriginalApp",
+                       "attribution must be read BEFORE OCR — a post-OCR read races an app switch")
+    }
+
+    /// SCREEN GROUNDING (3): a NON-screen source (file replay) is NEVER
+    /// attributed to the live frontmost app — a replayed recording is not the
+    /// user's current screen, and stamping it would be a false attribution.
+    func testFileSourceTickIsNeverAttributedToTheLiveFrontmostApp() async throws {
+        guard let img = textImage(["INBOX"]) else { throw XCTSkip("no text image") }
+        let sink = CollectingSink()
+        let pipe = Pipeline(detector: VisionEngine(), sink: sink)
+        await pipe.setFrameSourceFactory { src in
+            FixedFrameSource(source: src, auth: .notApplicable, images: [img])
+        }
+        await pipe.useFrontmostProvider { FrontmostWindow(app: "TestMail", window: "Inbox") }
+        await pipe.runScreenContextLoop(source: .file(path: "replay.png"),
+                                        intervalSeconds: 0, maxTicks: 1)
+
+        let evs = await sink.snapshot()
+        guard case let .screen(_, _, _, _, _, _, meta)? = evs.first(where: {
+            if case .screen = $0 { return true }; return false }) else {
+            return XCTFail("expected a .context readout, got \(evs)")
+        }
+        XCTAssertNil(meta.sourceApp,
+                     "a file-replay tick must NOT be attributed to the live frontmost app")
+    }
+
     /// (2) CONTRAST: the DEFAULT/un-injected Pipeline uses the zero-frame stub, so
     /// the loop captures NOTHING — it still announces WATCHING + exits honestly,
     /// but emits NO .context readout. The production injection is what flips this.
