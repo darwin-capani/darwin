@@ -12,6 +12,7 @@ the __main__ runner, which prints "ALL PASSED" on success. Run either:
     python3.11 test_global_scan.py        # script style
     pytest test_global_scan.py            # pytest style
 """
+import base64
 import io
 import json
 import os
@@ -115,9 +116,15 @@ def test_drain_lines_framing():
     check("drain drops oversized", rem2 == b"" and over2 is True)
 
 
+def _b64(text_or_bytes):
+    raw = text_or_bytes.encode("utf-8") if isinstance(text_or_bytes, str) else text_or_bytes
+    return base64.b64encode(raw).decode("ascii")
+
+
 def test_fetch_client_ok_returns_body_and_wire_shape():
-    body, cap = _run_fetch({"ok": True, "status": 200, "body": _SAMPLE_RSS})
-    check("fetch returns the body", body == _SAMPLE_RSS)
+    # The proxy returns the RAW body base64-encoded; fetch() decodes to bytes.
+    body, cap = _run_fetch({"ok": True, "status": 200, "body_b64": _b64(_SAMPLE_RSS)})
+    check("fetch returns the raw bytes", body == _SAMPLE_RSS.encode("utf-8"))
     check("fetch connected to fetch.sock", str(cap["connected"]).endswith("fetch.sock"))
     sent = json.loads(cap["sent"].decode("utf-8"))
     check("wire op is fetch", sent["op"] == "fetch")
@@ -166,7 +173,7 @@ class _StubClient:
 
 
 def test_fetch_feed_parses_body_from_the_client():
-    items = main.fetch_feed("https://feeds.npr.org/1001/rss.xml", "world", _StubClient(_SAMPLE_RSS))
+    items = main.fetch_feed("https://feeds.npr.org/1001/rss.xml", "world", _StubClient(_SAMPLE_RSS.encode("utf-8")))
     check("one item parsed", len(items) == 1)
     it = items[0]
     check("title parsed", it["title"] == "Test headline")
@@ -176,7 +183,7 @@ def test_fetch_feed_parses_body_from_the_client():
 
 def test_fetch_feed_empty_body_raises():
     try:
-        main.fetch_feed("https://feeds.npr.org/x", "world", _StubClient(""))
+        main.fetch_feed("https://feeds.npr.org/x", "world", _StubClient(b""))
     except ValueError:
         check("empty body -> ValueError (feed failed)", True)
         return
@@ -189,13 +196,32 @@ def test_parse_feed_atom_regression():
     check("atom link parsed", items[0]["url"] == "https://example.com/b")
 
 
+def test_non_utf8_feed_survives_the_base64_round_trip():
+    # REGRESSION (review-caught): the proxy returns RAW bytes base64-encoded, so a
+    # feed served as ISO-8859-1 reaches the app byte-for-byte and parse_feed
+    # honors its encoding declaration — the old lossy-UTF-8 path corrupted 'é'.
+    latin1 = (
+        '<?xml version="1.0" encoding="ISO-8859-1"?>'
+        '<rss version="2.0"><channel><title>Café</title>'
+        "<item><title>Café crash</title>"
+        "<link>https://example.com/c</link>"
+        "<description>Résumé.</description></item>"
+        "</channel></rss>"
+    ).encode("iso-8859-1")  # non-UTF-8 wire bytes (0xE9 for é)
+    # The client decodes base64 -> the exact latin-1 bytes; fetch_feed parses them.
+    body, _ = _run_fetch({"ok": True, "status": 200, "body_b64": _b64(latin1)})
+    check("client yields the exact non-utf-8 bytes", body == latin1)
+    items = main.parse_feed("https://example.com/c", body, "world")
+    check("latin-1 title decoded, not corrupted", items[0]["title"] == "Café crash")
+
+
 def test_run_cycle_uses_the_fetch_proxy_and_falls_back_to_extractive():
     # Swap FeedFetchClient for a stub that returns the sample RSS for every feed,
     # so run_cycle resolves all feeds THROUGH the (stubbed) proxy with no network.
     orig = main.FeedFetchClient
 
     def _factory(sock_path, name, token):
-        return _StubClient(_SAMPLE_RSS)
+        return _StubClient(_SAMPLE_RSS.encode("utf-8"))
 
     main.FeedFetchClient = _factory
     # Ensure no launch token in env, so the LLM enhancement is treated as
@@ -228,6 +254,7 @@ def main_run():
     test_fetch_feed_parses_body_from_the_client()
     test_fetch_feed_empty_body_raises()
     test_parse_feed_atom_regression()
+    test_non_utf8_feed_survives_the_base64_round_trip()
     print("fetch_feed / parse: ok")
     test_run_cycle_uses_the_fetch_proxy_and_falls_back_to_extractive()
     print("run_cycle: ok")

@@ -3,8 +3,9 @@
 # Every URL here was verified to return a parseable feed over HTTPS (root
 # <rss>/<feed>, non-empty item/entry list) from OPEN, reputable, non-paywalled
 # sources. The hostname of every URL MUST also appear in manifest.toml's
-# [permissions].net_hosts — the seatbelt profile allows outbound only to those
-# hosts, so an unlisted host would simply fail to fetch.
+# [permissions].fetch_hosts — the app has NO direct egress; the daemon-mediated
+# fetch proxy authorizes each URL against that exact-host allow-list, so an
+# unlisted host is refused (url_not_permitted). (net_hosts is now empty.)
 #
 # Keep this in lockstep with the manifest. main.py reads this file; if it is
 # missing it falls back to a small built-in default set (the same URLs).

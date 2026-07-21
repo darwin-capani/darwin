@@ -38,7 +38,8 @@
 //!      [`authorize_url`] against the SAME allow-list on every hop (a cross-host
 //!      or unlisted redirect is denied), for at most [`FETCH_MAX_REDIRECTS`] hops.
 //!   6. Streams the body incrementally, capping at [`FETCH_MAX_BYTES`] (never
-//!      buffering more), and returns a lossy-UTF-8 string.
+//!      buffering more), and returns the RAW bytes base64-encoded — no lossy
+//!      transcode, so a non-UTF-8 feed reaches the app byte-for-byte.
 //!   7. Rate-limits to [`FETCH_RATE`] calls / [`FETCH_WINDOW`] per app name.
 //!
 //! Everything before the wire is decided by pure functions the unit tests drive
@@ -53,6 +54,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncWriteExt, BufReader};
@@ -63,6 +65,11 @@ use url::{Host, Url};
 
 use crate::apps::AppRegistry;
 use crate::telemetry;
+
+/// The User-Agent the proxy presents to origin servers — restores the
+/// descriptive UA the app's direct urllib fetch sent before the migration (some
+/// feeds reject an empty UA), and mirrors the daemon's other outward callers.
+const FETCH_USER_AGENT: &str = "DARWIN-fetch/1.0 (+micro-app fetch proxy)";
 
 /// Hard cap on ONE fetched body, streamed incrementally and never buffered past
 /// this. A feed body is small; this dwarfs that while bounding a single fetch's
@@ -197,14 +204,47 @@ fn ip_is_public(ip: IpAddr) -> bool {
             if v6.is_loopback() || v6.is_unspecified() || v6.is_multicast() {
                 return false;
             }
-            // ::ffff:a.b.c.d — judge the embedded v4 (an attacker can otherwise
-            // encode a private v4 as a mapped v6).
-            if let Some(v4) = v6.to_ipv4_mapped() {
+            // Judge ANY embedded IPv4 by the v4 rules. `to_ipv4_mapped` alone
+            // only catches the ::ffff: form; a private/link-local v4 can also be
+            // smuggled as IPv4-compatible (::a.b.c.d), NAT64 (64:ff9b::a.b.c.d),
+            // or 6to4 (2002:a.b.c.d::) — each of which would otherwise fall to
+            // ipv6_is_public and be judged "public" (review-caught: NAT64 could
+            // carry 169.254.169.254, the cloud-metadata IP).
+            if let Some(v4) = embedded_ipv4(v6) {
                 return ipv4_is_public(v4);
             }
             ipv6_is_public(v6)
         }
     }
+}
+
+/// Extract an embedded IPv4 from every IPv6 form that carries one, so a
+/// private/link-local v4 cannot be smuggled past the guard by encoding it in
+/// v6. Covers IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`,
+/// deprecated), NAT64 (`64:ff9b::a.b.c.d`, RFC 6052), and 6to4
+/// (`2002:a.b.c.d::`). Returns None for a native v6 (judged by [`ipv6_is_public`]).
+/// `::`/`::1` are handled by the caller before this runs.
+fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
+    let seg = v6.segments();
+    let last32 = |s: &[u16; 8]| Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
+    // ::ffff:a.b.c.d — IPv4-mapped.
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    // 64:ff9b::a.b.c.d — the well-known NAT64 prefix (RFC 6052).
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+        return Some(last32(&seg));
+    }
+    // 2002:a.b.c.d::/16 — 6to4; the v4 is segments 1..3.
+    if seg[0] == 0x2002 {
+        return Some(Ipv4Addr::new((seg[1] >> 8) as u8, seg[1] as u8, (seg[2] >> 8) as u8, seg[2] as u8));
+    }
+    // ::a.b.c.d — IPv4-compatible (deprecated): all high segments zero, low 32
+    // bits non-zero (`::`/`::1` are already excluded by the caller).
+    if seg[..6].iter().all(|&s| s == 0) && (seg[6] != 0 || seg[7] != 0) {
+        return Some(last32(&seg));
+    }
+    None
 }
 
 fn ipv4_is_public(v4: Ipv4Addr) -> bool {
@@ -256,16 +296,24 @@ fn ipv6_is_public(v6: Ipv6Addr) -> bool {
     if seg[0] == 0x2001 && seg[1] == 0x0db8 {
         return false;
     }
+    // fec0::/10 — deprecated site-local (RFC 3879), still refused defensively.
+    if (seg[0] & 0xffc0) == 0xfec0 {
+        return false;
+    }
     true
 }
 
 /// One completed HTTP round-trip (NO redirect following): the status, the
-/// `Location` header if any, and the (already body-capped) response text.
+/// `Location` header if any, and the (already body-capped) RAW response bytes.
+/// Bytes, not a String: the daemon must not transcode — an RSS feed served as
+/// ISO-8859-1/Windows-1252 declares its own encoding in the XML prolog, and a
+/// lossy UTF-8 conversion here would corrupt it (review-caught). The app gets
+/// the exact bytes urllib gave it and parses per the declaration.
 #[derive(Debug)]
 struct FetchOnce {
     status: u16,
     location: Option<String>,
-    body: String,
+    body: Vec<u8>,
 }
 
 /// The failure kinds a single fetch leg can produce, each mapping to a distinct
@@ -292,11 +340,16 @@ fn is_redirect(status: u16) -> bool {
 /// instead of a live network. Production uses [`ReqwestFetcher`]. Native
 /// `async fn` in traits (Rust 1.75+); the handler is generic over the impl so no
 /// `dyn`/boxing is needed.
-trait UrlFetcher: Send {
+trait UrlFetcher: Send + Sync {
     /// Perform ONE HTTP GET (no redirect following) against an already-authorized
     /// URL, returning the status/location/capped-body or a typed [`FetchError`].
+    /// `&self`: the fetcher holds no per-call state (a fresh reqwest client is
+    /// built per fetch to pin the verified address), so it is shared by `Arc`
+    /// WITHOUT a mutex — independent app fetches run CONCURRENTLY rather than
+    /// serializing one-at-a-time behind a lock held across the 20s network leg
+    /// (review-caught: a single slow origin would otherwise stall every app).
     fn fetch_once(
-        &mut self,
+        &self,
         url: &Url,
     ) -> impl std::future::Future<Output = Result<FetchOnce, FetchError>> + Send;
 }
@@ -308,7 +361,7 @@ trait UrlFetcher: Send {
 struct ReqwestFetcher;
 
 impl UrlFetcher for ReqwestFetcher {
-    async fn fetch_once(&mut self, url: &Url) -> Result<FetchOnce, FetchError> {
+    async fn fetch_once(&self, url: &Url) -> Result<FetchOnce, FetchError> {
         // authorize_url guarantees a DNS-name host; this is defense in depth.
         let host = url.host_str().ok_or(FetchError::Failed)?.to_string();
 
@@ -333,6 +386,7 @@ impl UrlFetcher for ReqwestFetcher {
             .redirect(reqwest::redirect::Policy::none())
             .timeout(FETCH_TIMEOUT)
             .https_only(true)
+            .user_agent(FETCH_USER_AGENT)
             .resolve(&host, chosen)
             .build()
             .map_err(|_| FetchError::Failed)?;
@@ -362,7 +416,7 @@ impl UrlFetcher for ReqwestFetcher {
         Ok(FetchOnce {
             status,
             location,
-            body: String::from_utf8_lossy(&buf).into_owned(),
+            body: buf,
         })
     }
 }
@@ -396,7 +450,10 @@ impl RateLimiter {
 /// on the socket), then accepts micro-app connections and handles each line.
 /// Spawned from main.rs alongside the app host and the generate proxy.
 pub async fn serve(registry: Arc<AppRegistry>, fetch_sock: PathBuf) {
-    let fetcher = Arc::new(Mutex::new(ReqwestFetcher));
+    // The fetcher holds NO per-call state (a fresh client is built per fetch to
+    // pin the verified address), so it is shared by Arc WITHOUT a mutex —
+    // concurrent app fetches never serialize behind a lock.
+    let fetcher = Arc::new(ReqwestFetcher);
     let limiter = Arc::new(Mutex::new(RateLimiter::default()));
 
     let listener = match bind_socket(&fetch_sock) {
@@ -456,7 +513,7 @@ fn set_mode(path: &Path, mode: u32) {
 async fn handle_conn<F: UrlFetcher>(
     stream: UnixStream,
     registry: &Arc<AppRegistry>,
-    fetcher: Arc<Mutex<F>>,
+    fetcher: Arc<F>,
     limiter: Arc<Mutex<RateLimiter>>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
@@ -514,7 +571,7 @@ fn deny(name: &str, reason: &str) -> Option<Value> {
 async fn handle_line<F: UrlFetcher>(
     raw: &str,
     registry: &Arc<AppRegistry>,
-    fetcher: &Arc<Mutex<F>>,
+    fetcher: &Arc<F>,
     limiter: &Arc<Mutex<RateLimiter>>,
 ) -> Option<Value> {
     let (name, token, url_str) = match decide(raw) {
@@ -568,10 +625,9 @@ async fn handle_line<F: UrlFetcher>(
     // against the SAME allow-list, up to FETCH_MAX_REDIRECTS hops.
     let mut hops: u32 = 0;
     loop {
-        let fetched = {
-            let mut f = fetcher.lock().await;
-            f.fetch_once(&current).await
-        };
+        // No lock: fetch_once takes &self, so concurrent app fetches run in
+        // parallel instead of serializing behind a mutex held across the leg.
+        let fetched = fetcher.fetch_once(&current).await;
         let fetched = match fetched {
             Ok(f) => f,
             Err(FetchError::HostResolvesPrivate) => {
@@ -615,9 +671,13 @@ async fn handle_line<F: UrlFetcher>(
             continue;
         }
 
-        // A non-redirect status: success. The app parses the body; a non-2xx
-        // status simply won't parse as a feed and the app tolerates that.
-        return Some(json!({"ok": true, "status": fetched.status, "body": fetched.body}));
+        // A non-redirect status: success. The RAW body is base64-encoded so the
+        // exact served bytes cross the JSON boundary intact — the app decodes and
+        // parses per the feed's own encoding declaration (no lossy transcode).
+        // The app parses the body; a non-2xx status simply won't parse as a feed
+        // and the app tolerates that.
+        let body_b64 = base64::engine::general_purpose::STANDARD.encode(&fetched.body);
+        return Some(json!({"ok": true, "status": fetched.status, "body_b64": body_b64}));
     }
 }
 
@@ -780,6 +840,17 @@ mod tests {
             "0.1.2.3", "240.0.0.1",
             // IPv4-mapped private
             "::ffff:10.0.0.1", "::ffff:192.168.1.1",
+            // IPv4-mapped metadata IP + loopback
+            "::ffff:169.254.169.254", "::ffff:127.0.0.1",
+            // review-caught: NON-mapped embedded-v4 forms carrying an internal v4
+            // NAT64 (64:ff9b::/96) -> metadata IP + loopback
+            "64:ff9b::a9fe:a9fe", "64:ff9b::7f00:1",
+            // IPv4-compatible (::a.b.c.d) -> link-local + private
+            "::169.254.169.254", "::192.168.0.1",
+            // 6to4 (2002:a.b.c.d::) -> metadata IP + private
+            "2002:a9fe:a9fe::", "2002:c0a8:1::",
+            // deprecated site-local fec0::/10
+            "fec0::1",
         ];
         for s in private {
             let ip: IpAddr = s.parse().unwrap();
@@ -820,29 +891,50 @@ mod tests {
     /// A scripted fetcher: pops one canned outcome per `fetch_once` and records
     /// the URLs it was called with (to assert a redirect chain). No real network.
     struct MockFetcher {
-        responses: VecDeque<Result<FetchOnce, FetchError>>,
-        seen: Vec<String>,
+        responses: std::sync::Mutex<VecDeque<Result<FetchOnce, FetchError>>>,
+        seen: std::sync::Mutex<Vec<String>>,
     }
 
     impl UrlFetcher for MockFetcher {
-        async fn fetch_once(&mut self, url: &Url) -> Result<FetchOnce, FetchError> {
-            self.seen.push(url.as_str().to_string());
+        // &self + interior mutability (std Mutex, brief non-await critical
+        // sections), matching the production fetcher's now-lockless `&self`.
+        async fn fetch_once(&self, url: &Url) -> Result<FetchOnce, FetchError> {
+            self.seen.lock().unwrap().push(url.as_str().to_string());
             self.responses
+                .lock()
+                .unwrap()
                 .pop_front()
                 .unwrap_or(Err(FetchError::Failed))
         }
     }
 
+    impl MockFetcher {
+        /// The URLs fetch_once was called with, in order (redirect-chain asserts).
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
     fn ok_body(status: u16, body: &str) -> Result<FetchOnce, FetchError> {
-        Ok(FetchOnce { status, location: None, body: body.to_string() })
+        Ok(FetchOnce { status, location: None, body: body.as_bytes().to_vec() })
     }
 
     fn redirect_to(status: u16, location: &str) -> Result<FetchOnce, FetchError> {
-        Ok(FetchOnce { status, location: Some(location.to_string()), body: String::new() })
+        Ok(FetchOnce { status, location: Some(location.to_string()), body: Vec::new() })
     }
 
-    fn mock(responses: Vec<Result<FetchOnce, FetchError>>) -> Arc<Mutex<MockFetcher>> {
-        Arc::new(Mutex::new(MockFetcher { responses: responses.into(), seen: Vec::new() }))
+    fn mock(responses: Vec<Result<FetchOnce, FetchError>>) -> Arc<MockFetcher> {
+        Arc::new(MockFetcher {
+            responses: std::sync::Mutex::new(responses.into()),
+            seen: std::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Decode the base64 body of a success reply back to a UTF-8 string.
+    fn body_of(reply: &Value) -> String {
+        let b64 = reply["body_b64"].as_str().expect("body_b64 present on ok reply");
+        let bytes = base64::engine::general_purpose::STANDARD.decode(b64).expect("valid base64");
+        String::from_utf8(bytes).expect("utf-8 body in test")
     }
 
     /// Register the shipped global-scan (its manifest now declares the 9
@@ -874,8 +966,8 @@ mod tests {
         let reply = handle_line(&raw, &registry, &fwd, &limiter).await.unwrap();
         assert_eq!(reply["ok"], true);
         assert_eq!(reply["status"], 200);
-        assert_eq!(reply["body"], "<rss>ok</rss>");
-        assert_eq!(fwd.lock().await.seen, vec!["https://feeds.npr.org/1001/rss.xml".to_string()]);
+        assert_eq!(body_of(&reply), "<rss>ok</rss>");
+        assert_eq!(fwd.seen(), vec!["https://feeds.npr.org/1001/rss.xml".to_string()]);
     }
 
     #[tokio::test]
@@ -894,7 +986,7 @@ mod tests {
             assert_eq!(reply["error"], "op_not_permitted", "op {op}");
         }
         // The fetcher was NEVER touched.
-        assert!(fwd.lock().await.seen.is_empty(), "no privileged op reached the fetch");
+        assert!(fwd.seen().is_empty(), "no privileged op reached the fetch");
     }
 
     #[tokio::test]
@@ -934,7 +1026,7 @@ mod tests {
         let r = handle_line(&missing, &registry, &fwd, &limiter).await.unwrap();
         assert_eq!(r["error"], "unauthorized", "missing token");
 
-        assert!(fwd.lock().await.seen.is_empty(), "no unauthorized line reached the fetch");
+        assert!(fwd.seen().is_empty(), "no unauthorized line reached the fetch");
     }
 
     #[tokio::test]
@@ -950,7 +1042,7 @@ mod tests {
         let r = handle_line(&raw, &registry, &fwd, &limiter).await.unwrap();
         assert_eq!(r["ok"], false);
         assert_eq!(r["error"], "url_not_permitted");
-        assert!(fwd.lock().await.seen.is_empty(), "a rejected URL never reaches the fetch");
+        assert!(fwd.seen().is_empty(), "a rejected URL never reaches the fetch");
     }
 
     #[tokio::test]
@@ -984,10 +1076,10 @@ mod tests {
         .to_string();
         let r = handle_line(&raw, &registry, &fwd, &limiter).await.unwrap();
         assert_eq!(r["ok"], true);
-        assert_eq!(r["body"], "<rss>final</rss>");
+        assert_eq!(body_of(&r), "<rss>final</rss>");
         // All four legs were fetched, in order, ending at the final URL.
         assert_eq!(
-            fwd.lock().await.seen,
+            fwd.seen(),
             vec![
                 "https://feeds.npr.org/start".to_string(),
                 "https://feeds.npr.org/step2".to_string(),
@@ -1013,7 +1105,7 @@ mod tests {
         let r = handle_line(&raw, &registry, &fwd, &limiter).await.unwrap();
         assert_eq!(r["ok"], true);
         assert_eq!(
-            fwd.lock().await.seen,
+            fwd.seen(),
             vec![
                 "https://feeds.npr.org/1001/rss.xml".to_string(),
                 "https://feeds.npr.org/moved/rss.xml".to_string(),
@@ -1036,7 +1128,7 @@ mod tests {
         assert_eq!(r["ok"], false);
         assert_eq!(r["error"], "redirect_denied");
         // Only the first leg was fetched; the cross-host target never was.
-        assert_eq!(fwd.lock().await.seen, vec!["https://feeds.npr.org/start".to_string()]);
+        assert_eq!(fwd.seen(), vec!["https://feeds.npr.org/start".to_string()]);
     }
 
     #[tokio::test]
