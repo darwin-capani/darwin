@@ -174,14 +174,19 @@ impl ScreenContextRing {
 // ===========================================================================
 
 /// Build one ranking [`Fact`] per ring entry, carrying the entry's already-redacted
-/// text as the value (the key is a low-signal constant so it never skews the
-/// ranker). PARALLEL to `entries` — a hit's `index` maps straight back to its
-/// entry. Mirrors the semantic pasteboard's `build_recall_facts`.
+/// text as the value. The key is EMPTY — deliberately, not the "screen" constant a
+/// naive mirror of the pasteboard would use: `Fact::searchable()` ranks over
+/// "{key} {value}", so a constant key is a token present in EVERY entry, and this
+/// tool's own natural query vocabulary ("what was on my SCREEN about X") would then
+/// give every entry a positive BM25 score from the injected key alone — defeating
+/// the zero-overlap drop and surfacing unrelated snapshots as "matches". An empty
+/// key means only the entry's OWN text is ever ranked. PARALLEL to `entries` — a
+/// hit's `index` maps straight back to its entry.
 fn build_recall_facts(entries: &[ContextEntry]) -> Vec<Fact> {
     entries
         .iter()
         .map(|e| Fact {
-            key: "screen".to_string(),
+            key: String::new(),
             value: e.redacted_text.clone(),
         })
         .collect()
@@ -678,6 +683,30 @@ mod tests {
     }
 
     #[test]
+    fn the_word_screen_in_a_query_never_resurrects_zero_overlap_entries() {
+        // REGRESSION (review-caught): the ranking facts once carried the constant
+        // key "screen", which Fact::searchable() prepends to EVERY entry — so any
+        // query containing this tool's own natural vocabulary ("what was on my
+        // SCREEN about X") scored every entry positive from the injected key alone
+        // and fabricated matches out of unrelated snapshots. The key is now empty;
+        // this pins that a "screen"-bearing query with zero REAL overlap stays an
+        // honest empty.
+        let mut ring = ScreenContextRing::new(100);
+        ring.push(1, "terminal cargo build succeeded", "screen");
+        ring.push(2, "lunch plans with the team", "screen");
+        ring.push(3, "calendar standup at ten", "screen");
+        assert!(
+            ring.recall_matching("the deployment on my screen", 10).is_empty(),
+            "no entry mentions 'deployment' or 'screen' — the query's 'screen' token \
+             must not match an injected key"
+        );
+        // And with REAL overlap present, only the overlapping entry surfaces.
+        let hits = ring.recall_matching("the cargo build on my screen", 10);
+        assert_eq!(hits.len(), 1, "only the genuinely-overlapping entry: {hits:?}");
+        assert_eq!(hits[0].redacted_text, "terminal cargo build succeeded");
+    }
+
+    #[test]
     fn recall_matching_bounds_to_k_by_relevance() {
         let mut ring = ScreenContextRing::new(100);
         ring.push(1, "cargo build cargo build cargo", "screen"); // most "cargo"
@@ -1031,6 +1060,26 @@ mod tests {
         assert!(
             out.to_lowercase().contains("no recent screen context"),
             "a no-match query is honest, not fabricated: {out}"
+        );
+        global_reset_for_test();
+    }
+
+    #[tokio::test]
+    async fn runtime_recall_screen_in_query_stays_honest_on_the_bm25_fallback() {
+        // REGRESSION (review-caught), tool-path flavor: on the BM25 fallback a
+        // query phrased with this tool's own vocabulary ("what was on my screen
+        // about the deployment") must NOT surface zero-overlap snapshots via a
+        // constant fact key. Honest no-match, never fabricated matches.
+        let _g = serial();
+        global_reset_for_test();
+        global_push(10, 1, "the invoice total is due", "screen");
+        global_push(10, 2, "lunch plans with the team", "screen");
+        let out =
+            global_rank_render_runtime("what was on my screen about the deployment", 5, &DownEmbedder)
+                .await;
+        assert!(
+            out.to_lowercase().contains("no recent screen context"),
+            "zero-overlap entries must not be fabricated into matches: {out}"
         );
         global_reset_for_test();
     }
