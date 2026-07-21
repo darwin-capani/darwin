@@ -607,6 +607,18 @@ public actor Pipeline {
         self.frameSourceFactory = factory
     }
 
+    /// SCREEN GROUNDING seam (mirrors the FrameSource factory discipline): the
+    /// frontmost app/window reader used to ATTRIBUTE screen reads. Defaults to
+    /// nil-returning (hermetic — tests and the un-injected pipeline attribute
+    /// nothing); the production socket path injects `FrontmostReader.read`.
+    public var frontmostProvider: @Sendable () async -> FrontmostWindow? = { nil }
+
+    /// Inject the frontmost reader (actor-isolated var, set from inside the
+    /// actor like `useFrameSourceFactory`).
+    public func useFrontmostProvider(_ provider: @escaping @Sendable () async -> FrontmostWindow?) {
+        self.frontmostProvider = provider
+    }
+
     private func resetRunState() {
         frameIndex = 0
         motion.reset()
@@ -719,9 +731,17 @@ public actor Pipeline {
         let dets = detector.detect(in: frame, detectors: .text, minConfidence: 0.0)
         let readout = ScreenStructurer.structure(dets)
         let located = query.flatMap { ScreenStructurer.locate($0, in: readout) }
+        // SCREEN GROUNDING: attribute a SCREEN read to the frontmost app/window
+        // (AX-free; the injected provider — nil-attributes when hermetic). A
+        // camera/file read carries no attribution (a frontmost app says nothing
+        // about those frames).
+        let front = source.tag == "screen" ? await frontmostProvider() : nil
         await sink.emit(.screen(frameIndex: frame.index, timestamp: frame.timestamp,
                                 source: source.tag, readout: readout,
-                                located: located, query: query, meta: .screen))
+                                located: located, query: query,
+                                meta: ScreenReadMeta(kind: .screen,
+                                                     sourceApp: front?.app,
+                                                     sourceWindow: front?.window)))
     }
 
     // -----------------------------------------------------------------------
@@ -794,12 +814,19 @@ public actor Pipeline {
             if let frame = captured {
                 let dets = detector.detect(in: frame, detectors: .text, minConfidence: 0.0)
                 let readout = ScreenStructurer.structure(dets)
+                // SCREEN GROUNDING: attribute each tick to the frontmost app/
+                // window AT THAT INSTANT (read per tick — the user switches apps
+                // between ticks). nil = honest absence.
+                let front = source.tag == "screen" ? await frontmostProvider() : nil
                 // Tagged `.context` so the daemon routes this into the context ring
                 // (redacted + bounded + transient daemon-side), distinct from a
                 // one-shot read. No locator/query on the continuous path.
                 await sink.emit(.screen(frameIndex: frame.index, timestamp: frame.timestamp,
                                         source: source.tag, readout: readout,
-                                        located: nil, query: nil, meta: .context))
+                                        located: nil, query: nil,
+                                        meta: ScreenReadMeta(kind: .context,
+                                                             sourceApp: front?.app,
+                                                             sourceWindow: front?.window)))
             }
 
             if Task.isCancelled { break }

@@ -48,6 +48,36 @@ pub struct ContextEntry {
     pub ts: u64,
     pub redacted_text: String,
     pub source_tag: String,
+    /// SCREEN GROUNDING: the frontmost APP the snapshot came from ("Terminal"),
+    /// as attributed AX-free by the vision app (NSWorkspace + the capture's own
+    /// Screen-Recording consent). None = honestly unattributed (older wire,
+    /// headless, or unknown) — never fabricated. Bounded at push.
+    pub app: Option<String>,
+    /// The frontmost WINDOW TITLE, REDACTED at push exactly like the OCR text
+    /// (titles carry subject lines/doc names) and bounded. None = unknown.
+    pub window: Option<String>,
+}
+
+/// Hard bounds on the grounding labels — an app name / window title is a short
+/// human label, never a data channel into the ring.
+const MAX_APP_CHARS: usize = 64;
+const MAX_WINDOW_CHARS: usize = 120;
+
+/// Trim + bound a label to `max` characters (char-boundary safe).
+fn bound_label(s: &str, max: usize) -> String {
+    s.trim().chars().take(max).collect()
+}
+
+/// The rendered line for one entry: "[App · Window] text" when the snapshot is
+/// grounded, "[App] text" with no title, else the bare text — attribution is
+/// shown exactly as stored (already redacted + bounded), never invented.
+fn entry_line(e: &ContextEntry) -> String {
+    let text = e.redacted_text.trim();
+    match (&e.app, &e.window) {
+        (Some(a), Some(w)) => format!("[{a} · {w}] {text}"),
+        (Some(a), None) => format!("[{a}] {text}"),
+        _ => text.to_string(),
+    }
 }
 
 // ===========================================================================
@@ -95,15 +125,43 @@ impl ScreenContextRing {
     /// stored entry is TRANSIENT: it lives only in this in-RAM ring (never written
     /// to lifelong memory / optimizer / disk). An empty/whitespace-only snapshot is
     /// dropped (nothing read => nothing stored; never a fabricated entry).
+    /// (The live continuous path routes through [`Self::push_attributed`];
+    /// this unattributed form is the stable API for the unit tests and any
+    /// caller with nothing to attribute.)
+    #[allow(dead_code)]
     pub fn push(&mut self, ts: u64, raw_text: &str, source_tag: &str) {
+        self.push_attributed(ts, raw_text, source_tag, None, None);
+    }
+
+    /// [`Self::push`] with SCREEN-GROUNDING attribution: which frontmost app +
+    /// window the snapshot came from. The app name is length-BOUNDED; the window
+    /// title is REDACTED (same redactor as the text — titles carry subject
+    /// lines/doc names) and bounded. Empty strings normalize to None (absence is
+    /// honest; an empty label is never stored as a fake attribution).
+    pub fn push_attributed(
+        &mut self,
+        ts: u64,
+        raw_text: &str,
+        source_tag: &str,
+        app: Option<&str>,
+        window: Option<&str>,
+    ) {
         let redacted_text = redact(raw_text);
         if redacted_text.trim().is_empty() {
             return;
         }
+        let app = app
+            .map(|a| bound_label(a, MAX_APP_CHARS))
+            .filter(|a| !a.is_empty());
+        let window = window
+            .map(|w| bound_label(&redact(w), MAX_WINDOW_CHARS))
+            .filter(|w| !w.is_empty());
         self.entries.push_back(ContextEntry {
             ts,
             redacted_text,
             source_tag: source_tag.to_string(),
+            app,
+            window,
         });
         // Evict from the FRONT (oldest) until within the hard cap.
         while self.entries.len() > self.cap {
@@ -155,7 +213,7 @@ impl ScreenContextRing {
         for e in &recent {
             out.push('\n');
             out.push_str("• ");
-            out.push_str(e.redacted_text.trim());
+            out.push_str(&entry_line(e));
         }
         out
     }
@@ -187,7 +245,18 @@ fn build_recall_facts(entries: &[ContextEntry]) -> Vec<Fact> {
         .iter()
         .map(|e| Fact {
             key: String::new(),
-            value: e.redacted_text.clone(),
+            // The ranked document is the entry's REAL content: its grounding
+            // labels (app + window — so "what was that in the terminal" matches
+            // Terminal snapshots) followed by the redacted text. These are
+            // PER-ENTRY values, not a constant — a query term matches only the
+            // entries genuinely carrying it (the #115 constant-key lesson: an
+            // all-docs token fabricates matches; per-entry attribution is real
+            // data and does not).
+            value: match (&e.app, &e.window) {
+                (Some(a), Some(w)) => format!("{a} {w} {}", e.redacted_text),
+                (Some(a), None) => format!("{a} {}", e.redacted_text),
+                _ => e.redacted_text.clone(),
+            },
         })
         .collect()
 }
@@ -268,7 +337,23 @@ pub fn is_enabled() -> bool {
 /// frame + OCR) happens DEVICE-side (TCC-gated) in the Vision app; this is the
 /// daemon-side bounded/redacted/transient store of the result. Returns false when
 /// the loop is OFF or the snapshot was empty after redaction.
+/// (The live relay routes through the attributed form below; this is the
+/// stable unattributed API for the unit tests.)
+#[allow(dead_code)]
 pub fn ingest_continuous_snapshot(ts: u64, raw_text: &str, source_tag: &str) -> bool {
+    ingest_continuous_snapshot_attributed(ts, raw_text, source_tag, None, None)
+}
+
+/// [`ingest_continuous_snapshot`] with SCREEN-GROUNDING attribution (frontmost
+/// app + window from the vision app's AX-free reader). Attribution is bounded +
+/// title-redacted inside the push; None = honestly unattributed.
+pub fn ingest_continuous_snapshot_attributed(
+    ts: u64,
+    raw_text: &str,
+    source_tag: &str,
+    app: Option<&str>,
+    window: Option<&str>,
+) -> bool {
     let settings = *SETTINGS.lock().unwrap_or_else(|e| e.into_inner());
     if !settings.enabled {
         // Disabled — never grow the ring. (Ships ON by default but is inert without
@@ -276,7 +361,9 @@ pub fn ingest_continuous_snapshot(ts: u64, raw_text: &str, source_tag: &str) -> 
         return false;
     }
     let before = global_len();
-    global_push(settings.cap, ts, raw_text, source_tag);
+    with_global(settings.cap, |r| {
+        r.push_attributed(ts, raw_text, source_tag, app, window)
+    });
     let after = global_len();
     // Ingested if a new entry landed OR the ring was already at its hard cap (an
     // eviction keeps len stable but still ingested a redacted snapshot).
@@ -302,6 +389,8 @@ fn with_global<R>(cap: usize, f: impl FnOnce(&mut ScreenContextRing) -> R) -> R 
 /// Push a captured-and-OCR'd snapshot into the process-global ring (redacted +
 /// bounded inside `push`). Called by the daemon's continuous-loop push path ONLY
 /// when [screen_context].enabled is on AND a TCC-gated frame produced text.
+/// (Unattributed test-path form; the live path is the attributed ingest.)
+#[allow(dead_code)]
 pub fn global_push(cap: usize, ts: u64, raw_text: &str, source_tag: &str) {
     with_global(cap, |r| r.push(ts, raw_text, source_tag));
 }
@@ -346,7 +435,7 @@ pub fn global_render_recall_matching(query: &str, n: usize) -> String {
     for e in &hits {
         out.push('\n');
         out.push_str("• ");
-        out.push_str(e.redacted_text.trim());
+        out.push_str(&entry_line(e));
     }
     out
 }
@@ -387,7 +476,7 @@ pub async fn global_rank_render_runtime(query: &str, k: usize, embedder: &dyn Em
     let lines: Vec<String> = recall
         .hits
         .iter()
-        .map(|h| format!("• {}", entries[h.index].redacted_text.trim()))
+        .map(|h| format!("• {}", entry_line(&entries[h.index])))
         .collect();
     format!(
         "Here's what I have on your recent screen that bears on that, most relevant \
@@ -720,13 +809,84 @@ mod tests {
     #[test]
     fn build_recall_facts_is_parallel_and_carries_the_redacted_text() {
         let entries = vec![
-            ContextEntry { ts: 1, redacted_text: "alpha one".into(), source_tag: "screen".into() },
-            ContextEntry { ts: 2, redacted_text: "beta two".into(), source_tag: "screen".into() },
+            ContextEntry {
+                ts: 1,
+                redacted_text: "alpha one".into(),
+                source_tag: "screen".into(),
+                app: None,
+                window: None,
+            },
+            ContextEntry {
+                ts: 2,
+                redacted_text: "beta two".into(),
+                source_tag: "screen".into(),
+                app: Some("Mail".into()),
+                window: Some("Inbox".into()),
+            },
         ];
         let facts = build_recall_facts(&entries);
         assert_eq!(facts.len(), entries.len());
         assert_eq!(facts[0].value, "alpha one");
-        assert_eq!(facts[1].value, "beta two");
+        // A grounded entry's ranked document leads with its REAL labels, so a
+        // "mail" query matches the Mail snapshot (per-entry data, not an
+        // all-docs constant — the #115 class does not apply).
+        assert_eq!(facts[1].value, "Mail Inbox beta two");
+    }
+
+    // -- SCREEN GROUNDING: attribution stored/redacted/bounded + rendered ---
+
+    #[test]
+    fn attribution_is_stored_bounded_and_the_window_title_redacted() {
+        let mut ring = ScreenContextRing::new(10);
+        ring.push_attributed(
+            1,
+            "compose window open",
+            "screen",
+            Some("  Mail  "),
+            Some("Re: token sk-LIVE-abc123def456ghi789 from alice@example.com"),
+        );
+        let e = &ring.recall_recent(1)[0];
+        assert_eq!(e.app.as_deref(), Some("Mail"), "app label trimmed + stored");
+        let w = e.window.as_deref().unwrap();
+        assert!(!w.contains("sk-LIVE-abc123def456ghi789"), "title secret leaked: {w}");
+        assert!(!w.contains("alice@example.com"), "title email leaked: {w}");
+        // Over-long labels are bounded, empty labels normalize to None.
+        let long = "x".repeat(500);
+        ring.push_attributed(2, "another", "screen", Some(&long), Some(""));
+        let e2 = &ring.recall_recent(1)[0];
+        assert_eq!(e2.app.as_deref().unwrap().len(), MAX_APP_CHARS);
+        assert!(e2.window.is_none(), "an empty title is honest absence, not a fake label");
+    }
+
+    #[test]
+    fn plain_push_stays_unattributed_and_renders_the_bare_text() {
+        let mut ring = ScreenContextRing::new(10);
+        ring.push(1, "terminal cargo build succeeded", "screen");
+        let e = &ring.recall_recent(1)[0];
+        assert!(e.app.is_none() && e.window.is_none());
+        assert_eq!(entry_line(e), "terminal cargo build succeeded");
+    }
+
+    #[test]
+    fn recall_renders_the_grounding_label_when_present() {
+        let mut ring = ScreenContextRing::new(10);
+        ring.push_attributed(1, "cargo build failed", "screen", Some("Terminal"), Some("darwin — zsh"));
+        ring.push_attributed(2, "lunch plans", "screen", Some("Mail"), None);
+        let rendered = ring.render_recall(5);
+        assert!(rendered.contains("[Terminal · darwin — zsh] cargo build failed"), "{rendered}");
+        assert!(rendered.contains("[Mail] lunch plans"), "{rendered}");
+    }
+
+    #[test]
+    fn a_query_naming_the_app_recalls_that_apps_snapshots() {
+        // The point of grounding: "what was that in the terminal" matches the
+        // Terminal snapshot even when its OCR text never says "terminal".
+        let mut ring = ScreenContextRing::new(10);
+        ring.push_attributed(1, "cargo build failed E0308", "screen", Some("Terminal"), None);
+        ring.push_attributed(2, "budget review meeting", "screen", Some("Mail"), Some("Inbox"));
+        let hits = ring.recall_matching("what was that in the terminal", 10);
+        assert_eq!(hits.len(), 1, "only the Terminal-grounded entry: {hits:?}");
+        assert_eq!(hits[0].redacted_text, "cargo build failed E0308");
     }
 
     #[test]

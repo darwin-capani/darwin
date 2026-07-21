@@ -74,10 +74,23 @@ public struct ScreenReadMeta: Sendable, Equatable {
     /// handwriting reads (document detection does not apply). When the scanner
     /// found NO page this is false and the readout is honestly empty.
     public let documentDetected: Bool?
+    /// SCREEN GROUNDING: the frontmost APP the snapshot came from ("Terminal"),
+    /// read AX-free (NSWorkspace + the capture's own Screen-Recording consent —
+    /// see FrontmostReader). nil = honestly unknown (headless/unattributed),
+    /// NEVER fabricated. Applies to screen reads only; camera/file reads carry
+    /// nil (a frontmost app says nothing about a camera frame).
+    public let sourceApp: String?
+    /// The frontmost window TITLE, when readable. Titles can carry sensitive
+    /// text (subject lines, document names) — the daemon REDACTS before store,
+    /// exactly like the OCR text itself. nil = honestly unknown.
+    public let sourceWindow: String?
 
-    public init(kind: ScreenReadKind, documentDetected: Bool? = nil) {
+    public init(kind: ScreenReadKind, documentDetected: Bool? = nil,
+                sourceApp: String? = nil, sourceWindow: String? = nil) {
         self.kind = kind
         self.documentDetected = documentDetected
+        self.sourceApp = sourceApp
+        self.sourceWindow = sourceWindow
     }
 
     /// The default meta for the plain screen OCR read (read.screen).
@@ -257,6 +270,12 @@ public enum VisionEvent: Sendable {
             if let documentDetected = meta.documentDetected {
                 d["document_detected"] = documentDetected
             }
+            // SCREEN GROUNDING (additive, the sanctioned VisionEvent extension
+            // pattern): which app/window the snapshot came from. Omitted when
+            // unknown — absence is honest, a key is never fabricated. The title
+            // may be sensitive; the daemon redacts before store (like `text`).
+            if let sourceApp = meta.sourceApp { d["source_app"] = sourceApp }
+            if let sourceWindow = meta.sourceWindow { d["source_window"] = sourceWindow }
 
         case let .sound(timestamp, source, classes, classifier, computeUnit):
             d["ts"] = timestamp

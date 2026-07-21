@@ -2471,8 +2471,15 @@ async fn relay_line(
                     .get("source")
                     .and_then(Value::as_str)
                     .unwrap_or("screen");
-                let ingested =
-                    crate::screen_context::ingest_continuous_snapshot(ts, text, src);
+                // SCREEN GROUNDING: which frontmost app/window the snapshot came
+                // from (attributed AX-free by the vision app; absent keys = an
+                // honestly unattributed snapshot — an older app build or a
+                // headless read). The window title is redacted + bounded at push.
+                let src_app = payload.get("source_app").and_then(Value::as_str);
+                let src_window = payload.get("source_window").and_then(Value::as_str);
+                let ingested = crate::screen_context::ingest_continuous_snapshot_attributed(
+                    ts, text, src, src_app, src_window,
+                );
                 telemetry::emit(
                     "system",
                     "screen_context.watching",
