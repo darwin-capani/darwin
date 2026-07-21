@@ -7208,6 +7208,23 @@ svg.tri circle {
    count (a real bound, not an alert — RED stays reserved for alerts). */
 .kg-body { display: flex; flex-direction: column; gap: 10px; padding: 4px 2px; }
 
+/* Spatial node-link view of the extracted graph. */
+.kg-graph { margin: 0; }
+.kg-graph-svg {
+  width: 100%;
+  height: auto;
+  max-height: 46vh;
+  display: block;
+  background: rgba(4, 10, 18, 0.5);
+  border: 1px solid var(--stroke, #2a4a5a);
+}
+.kg-graph-svg .kg-edges line { opacity: 0.55; }
+.kg-graph-svg text {
+  pointer-events: none;
+  font-family: var(--text, monospace);
+}
+.kg-graph-note { margin-top: 6px; font-size: 11px; }
+
 /* Build stats: chunks scanned / entities / relationships / skipped-at-cap. */
 .kg-stats { display: flex; flex-direction: column; gap: 6px; }
 .kg-stats-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
