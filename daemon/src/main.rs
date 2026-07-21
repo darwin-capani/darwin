@@ -253,6 +253,7 @@ mod plugin_sdk;
 mod policy;
 mod presence;
 mod posture;
+mod scaffold;
 mod power;
 mod proactive;
 // PROCESS OBSERVATORY (procwatch.rs): a STRICTLY READ-ONLY poll of the LIVE
@@ -1913,6 +1914,40 @@ async fn main() -> Result<()> {
         println!("FORGE MANIFEST OK: minimal permissions, default-deny SBPL derivable");
         println!("REGISTRY GATE: {} — {}", gate.label(), gate.reason());
         return Ok(());
+    }
+
+    // Operator entrypoint: `darwind --app-new <name>` scaffolds a new sandboxed
+    // micro-app under apps/<name>/ — a correct-by-construction skeleton (imports
+    // the apps/_sdk harness, a manifest that PASSES the plugin-SDK validator, and
+    // green framing/contract tests). It REFUSES an existing dir and validates the
+    // generated manifest BEFORE writing. Instant/offline/deterministic — the
+    // complement to the LLM-driven --forge-goal (which writes a review proposal).
+    if let Some(pos) = std::env::args().position(|a| a == "--app-new") {
+        let name = std::env::args().nth(pos + 1).unwrap_or_default();
+        if name.trim().is_empty() {
+            eprintln!("usage: darwind --app-new <name>   (lowercase letters, digits, hyphens)");
+            std::process::exit(2);
+        }
+        let root = resolve_root();
+        match scaffold::scaffold_app(&root, name.trim()) {
+            Ok(written) => {
+                println!("scaffolded apps/{}/:", name.trim());
+                for p in &written {
+                    println!("  {}", p.display());
+                }
+                println!(
+                    "next: edit apps/{n}/main.py (compute) + manifest.toml (description/params), \
+                     then `cd apps/{n} && python3 test_{m}.py`",
+                    n = name.trim(),
+                    m = name.trim().replace('-', "_"),
+                );
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("scaffold failed: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     // Operator entrypoint: `darwind --forge-goal "<goal>"` runs the GATED,
