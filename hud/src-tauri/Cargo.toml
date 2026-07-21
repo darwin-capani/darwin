@@ -48,7 +48,7 @@ cpal = "0.18"
 # impls in cookie 0.18.1 / older tauri-utils; 0.3.53 + tauri-utils 2.9.3 compile
 # together. Kept as an exact pin so a stray `cargo update` can't reintroduce a
 # conflicting point release; bump deliberately.
-time = "=0.3.53"
+time = "=0.3.54"
 
 # macOS kiosk presentation-options for the DEVICE-GATED takeover (hide Dock /
 # menu bar). These are NOT new heavy deps: tao (Tauri's windowing layer) already
