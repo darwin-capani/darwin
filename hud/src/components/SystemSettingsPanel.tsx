@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useReducer, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import {
   AUTONOMY_OPTIONS,
   CatalogEntry,
@@ -30,6 +30,7 @@ import {
 } from "../tauri/bridge";
 import { sendCommand } from "../tauri/command";
 import { isAutoUpdateOn, setAutoUpdateOn } from "../core/autoUpdate";
+import useModalFocus from "./useModalFocus";
 
 /**
  * The EXACT spoken voice-id management phrases the enrollment controls send over
@@ -1180,9 +1181,27 @@ function ApplyConfirm({
   onConfirm: () => void;
 }) {
   const hasDanger = confirm.dangerous.length > 0;
+  // a11y: trap + autofocus + focus-restore; Escape cancels JUST the confirm,
+  // inert while the apply is in flight. The handler is ALWAYS defined (guard
+  // inside) so the hook always claims Escape here — an undefined-while-busy
+  // handler would let the keydown bubble to SettingsModal's window listener
+  // and tear down the WHOLE settings modal mid-apply.
+  const modalRef = useRef<HTMLDivElement>(null);
+  const busyRef = useRef(busy);
+  busyRef.current = busy;
+  useModalFocus(modalRef, () => {
+    if (!busyRef.current) onCancel();
+  });
   return (
     <div className="syscfg-confirm-backdrop" onClick={busy ? undefined : onCancel}>
-      <div className="syscfg-confirm" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Confirm apply">
+      <div
+        className="syscfg-confirm"
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label="Confirm apply"
+        ref={modalRef}
+      >
         <div className="syscfg-confirm-title">APPLY {confirm.changes.length} CHANGE{confirm.changes.length === 1 ? "" : "S"} // RESTART DARWIN</div>
         <div className="kv-note">
           This writes config/darwin.toml in place (comments + structure preserved) and then runs

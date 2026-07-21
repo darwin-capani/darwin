@@ -16,6 +16,7 @@ import {
   type PendingSnapshot,
 } from "../tauri/command";
 import Frame from "./Frame";
+import useModalFocus from "./useModalFocus";
 
 /**
  * COMMAND DECK — the interactive Iron-Man holotable command surface. The first
@@ -48,6 +49,7 @@ export default function CommandDeck({
   open,
   onClose,
   initialPending,
+  inline = false,
 }: {
   open: boolean;
   onClose: () => void;
@@ -56,6 +58,11 @@ export default function CommandDeck({
    *  under vitest. In the app this is undefined and the tray is populated solely
    *  by the read-only `pending` poll. */
   initialPending?: PendingSnapshot;
+  /** TakeoverStage mounts the deck INLINE in its center column (the CSS
+   *  neutralizes the full-screen overlay). Inline the deck is NOT modal: it
+   *  must not claim aria-modal (that would falsely hide the other live
+   *  takeover panels from a screen reader) and must not trap the keyboard. */
+  inline?: boolean;
 }) {
   const [state, dispatch] = useReducer(deckReduce, undefined, () => {
     const base = initialDeckState();
@@ -64,6 +71,14 @@ export default function CommandDeck({
   const [input, setInput] = useState("");
   const [target, setTarget] = useState<string>(AUTO_ROUTE);
   const logRef = useRef<HTMLDivElement>(null);
+
+  // a11y (modal overlay only): trap + focus-restore, initial focus on the
+  // COMMAND INPUT (the deck's primary control — the DOM-first ✕ close button
+  // would make an immediate Space/Enter close the deck). Escape closes. The
+  // deck stays MOUNTED while closed, so the trap keys off `open`; inline
+  // (takeover) it is NOT a modal and the trap stays disengaged.
+  const deckRef = useRef<HTMLDivElement>(null);
+  useModalFocus(deckRef, onClose, open && !inline, ".cmd-text");
 
   // Auto-scroll the log to the newest line.
   useEffect(() => {
@@ -182,7 +197,16 @@ export default function CommandDeck({
   const trayActive = hasPending(state.pending);
 
   return (
-    <div className="command-deck" role="dialog" aria-label="Command Deck">
+    <div
+      className="command-deck"
+      // Inline (takeover) the deck is one panel among live siblings — a named
+      // region, never a modal dialog (aria-modal there would hide the rest of
+      // the takeover stage from a screen reader, and it would be a lie).
+      role={inline ? "region" : "dialog"}
+      aria-label="Command Deck"
+      aria-modal={inline ? undefined : "true"}
+      ref={deckRef}
+    >
       <Frame className="cmd-deck-frame" title="COMMAND DECK" tag="HOLOTABLE">
         <div className="cmd-deck-body">
           <div className="cmd-deck-head">
