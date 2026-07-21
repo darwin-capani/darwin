@@ -727,15 +727,18 @@ public actor Pipeline {
             return
         }
 
+        // SCREEN GROUNDING: attribute a SCREEN read to the frontmost app/window
+        // (AX-free; the injected provider — nil-attributes when hermetic). Read
+        // IMMEDIATELY after the frame grab and BEFORE the slow OCR — reading
+        // after OCR (hundreds of ms) let a mid-read app switch stamp this
+        // frame's pixels with the NEXT app's identity (review-caught). A
+        // camera/file read carries no attribution (a frontmost app says nothing
+        // about those frames).
+        let front = source.tag == "screen" ? await frontmostProvider() : nil
         // OCR-only over the single frame; floor 0 so we surface everything read.
         let dets = detector.detect(in: frame, detectors: .text, minConfidence: 0.0)
         let readout = ScreenStructurer.structure(dets)
         let located = query.flatMap { ScreenStructurer.locate($0, in: readout) }
-        // SCREEN GROUNDING: attribute a SCREEN read to the frontmost app/window
-        // (AX-free; the injected provider — nil-attributes when hermetic). A
-        // camera/file read carries no attribution (a frontmost app says nothing
-        // about those frames).
-        let front = source.tag == "screen" ? await frontmostProvider() : nil
         await sink.emit(.screen(frameIndex: frame.index, timestamp: frame.timestamp,
                                 source: source.tag, readout: readout,
                                 located: located, query: query,
@@ -812,12 +815,15 @@ public actor Pipeline {
                 break
             }
             if let frame = captured {
+                // SCREEN GROUNDING: attribute this tick to the frontmost app/
+                // window at the CAPTURE instant — read immediately after the
+                // frame grab and BEFORE the slow OCR, so a mid-OCR app switch
+                // cannot stamp these pixels with the next app's identity
+                // (review-caught: the post-OCR read had a hundreds-of-ms race).
+                // nil = honest absence.
+                let front = source.tag == "screen" ? await frontmostProvider() : nil
                 let dets = detector.detect(in: frame, detectors: .text, minConfidence: 0.0)
                 let readout = ScreenStructurer.structure(dets)
-                // SCREEN GROUNDING: attribute each tick to the frontmost app/
-                // window AT THAT INSTANT (read per tick — the user switches apps
-                // between ticks). nil = honest absence.
-                let front = source.tag == "screen" ? await frontmostProvider() : nil
                 // Tagged `.context` so the daemon routes this into the context ring
                 // (redacted + bounded + transient daemon-side), distinct from a
                 // one-shot read. No locator/query on the continuous path.

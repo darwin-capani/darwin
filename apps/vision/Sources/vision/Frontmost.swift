@@ -1,7 +1,11 @@
 // Frontmost.swift — AX-FREE frontmost app/window attribution for screen reads.
 //
 // SCREEN GROUNDING: a screen OCR snapshot is far more useful when it knows
-// WHICH app/window it came from ("what was that error in the terminal"). This
+// which app was FRONTMOST when the frame was grabbed ("what was that error in
+// the terminal"). The capture is the whole display, so the OCR text may carry
+// other visible windows' glyphs too — the attribution names the app IN FRONT
+// at the capture instant (the caller reads this provider right after the frame
+// grab, before the slow OCR), it does not claim every word belongs to it. This
 // reader supplies that attribution WITHOUT any new permission:
 //   * the APP comes from NSWorkspace.frontmostApplication — plain AppKit, no
 //     TCC of any kind;

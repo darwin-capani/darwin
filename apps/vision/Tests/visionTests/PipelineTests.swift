@@ -837,6 +837,47 @@ final class ScreenContextLoopWiringTests: XCTestCase {
         XCTAssertNil(data["source_window"])
     }
 
+    /// SCREEN GROUNDING (4): ORDERING PIN (review-caught race) — the frontmost
+    /// provider is consulted BEFORE the slow OCR, so a mid-OCR app switch can
+    /// no longer stamp this frame's pixels with the NEXT app's identity. The
+    /// probe detector flips a flag when OCR runs; the provider answers
+    /// "SwitchedApp" only if OCR already ran. With the fixed ordering the
+    /// emitted attribution MUST be the pre-OCR app. (Reverting the read to
+    /// after detect() makes this fail — mutation-proven.)
+    func testFrontmostIsReadBeforeOcrSoAMidOcrSwitchCannotMislabel() async throws {
+        guard let img = textImage(["INBOX"]) else { throw XCTSkip("no text image") }
+        final class OrderProbeDetector: Detector, @unchecked Sendable {
+            private let lock = NSLock()
+            private var flag = false
+            func detect(in frame: Frame, detectors: DetectorSet, minConfidence: Double) -> [Detection] {
+                lock.lock(); flag = true; lock.unlock()
+                return []
+            }
+            func ocrRan() -> Bool {
+                lock.lock(); defer { lock.unlock() }
+                return flag
+            }
+        }
+        let probe = OrderProbeDetector()
+        let sink = CollectingSink()
+        let pipe = Pipeline(detector: probe, sink: sink)
+        await pipe.setFrameSourceFactory { src in
+            FixedFrameSource(source: src, auth: .notApplicable, images: [img])
+        }
+        await pipe.useFrontmostProvider {
+            FrontmostWindow(app: probe.ocrRan() ? "SwitchedApp" : "OriginalApp", window: nil)
+        }
+        await pipe.runScreenContextLoop(source: .screen, intervalSeconds: 0, maxTicks: 1)
+
+        let evs = await sink.snapshot()
+        guard case let .screen(_, _, _, _, _, _, meta)? = evs.first(where: {
+            if case .screen = $0 { return true }; return false }) else {
+            return XCTFail("expected a .context readout, got \(evs)")
+        }
+        XCTAssertEqual(meta.sourceApp, "OriginalApp",
+                       "attribution must be read BEFORE OCR — a post-OCR read races an app switch")
+    }
+
     /// SCREEN GROUNDING (3): a NON-screen source (file replay) is NEVER
     /// attributed to the live frontmost app — a replayed recording is not the
     /// user's current screen, and stamping it would be a false attribution.

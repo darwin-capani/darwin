@@ -48,10 +48,13 @@ pub struct ContextEntry {
     pub ts: u64,
     pub redacted_text: String,
     pub source_tag: String,
-    /// SCREEN GROUNDING: the frontmost APP the snapshot came from ("Terminal"),
+    /// SCREEN GROUNDING: the FRONTMOST app at the capture instant ("Terminal"),
     /// as attributed AX-free by the vision app (NSWorkspace + the capture's own
-    /// Screen-Recording consent). None = honestly unattributed (older wire,
-    /// headless, or unknown) — never fabricated. Bounded at push.
+    /// Screen-Recording consent, read right after the frame grab). HONEST
+    /// SCOPE: the capture is the whole display, so the redacted text may
+    /// include OTHER visible windows' glyphs — the label says which app was in
+    /// front, not that every word belongs to it. None = honestly unattributed
+    /// (older wire, headless, or unknown) — never fabricated. Bounded at push.
     pub app: Option<String>,
     /// The frontmost WINDOW TITLE, REDACTED at push exactly like the OCR text
     /// (titles carry subject lines/doc names) and bounded. None = unknown.
