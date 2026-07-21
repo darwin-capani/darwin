@@ -221,9 +221,10 @@ fn ip_is_public(ip: IpAddr) -> bool {
 /// Extract an embedded IPv4 from every IPv6 form that carries one, so a
 /// private/link-local v4 cannot be smuggled past the guard by encoding it in
 /// v6. Covers IPv4-mapped (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`,
-/// deprecated), NAT64 (`64:ff9b::a.b.c.d`, RFC 6052), and 6to4
-/// (`2002:a.b.c.d::`). Returns None for a native v6 (judged by [`ipv6_is_public`]).
-/// `::`/`::1` are handled by the caller before this runs.
+/// deprecated), NAT64 (`64:ff9b::a.b.c.d`, RFC 6052), 6to4 (`2002:a.b.c.d::`),
+/// and IPv4-translated SIIT (`::ffff:0:a.b.c.d`, RFC 2765). Returns None for a
+/// native v6 (judged by [`ipv6_is_public`]). `::`/`::1` are handled by the
+/// caller before this runs.
 fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     let seg = v6.segments();
     let last32 = |s: &[u16; 8]| Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
@@ -238,6 +239,12 @@ fn embedded_ipv4(v6: Ipv6Addr) -> Option<Ipv4Addr> {
     // 2002:a.b.c.d::/16 — 6to4; the v4 is segments 1..3.
     if seg[0] == 0x2002 {
         return Some(Ipv4Addr::new((seg[1] >> 8) as u8, seg[1] as u8, (seg[2] >> 8) as u8, seg[2] as u8));
+    }
+    // ::ffff:0:a.b.c.d — IPv4-translated (RFC 2765 SIIT, ::ffff:0:0/96): high 4
+    // segments zero, seg[4]=0xffff, seg[5]=0. (to_ipv4_mapped only matches the
+    // ::ffff: form where seg[5]=0xffff; this one it misses.)
+    if seg[..4].iter().all(|&s| s == 0) && seg[4] == 0xffff && seg[5] == 0 {
+        return Some(last32(&seg));
     }
     // ::a.b.c.d — IPv4-compatible (deprecated): all high segments zero, low 32
     // bits non-zero (`::`/`::1` are already excluded by the caller).
@@ -849,6 +856,8 @@ mod tests {
             "::169.254.169.254", "::192.168.0.1",
             // 6to4 (2002:a.b.c.d::) -> metadata IP + private
             "2002:a9fe:a9fe::", "2002:c0a8:1::",
+            // IPv4-translated SIIT (::ffff:0:a.b.c.d) -> metadata IP + loopback
+            "::ffff:0:a9fe:a9fe", "::ffff:0:7f00:1",
             // deprecated site-local fec0::/10
             "fec0::1",
         ];
