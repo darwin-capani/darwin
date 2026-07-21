@@ -5,6 +5,7 @@ import type {
   KnowledgeGraphResult,
 } from "../core/events";
 import { KG_ENTITY_TYPES, kgEntityTypeLabel } from "../core/events";
+import { layoutGraph, kgTypeHue } from "../core/kgLayout";
 import Frame from "./Frame";
 
 /**
@@ -57,6 +58,7 @@ export default function KnowledgeGraphPanel({
       <Frame title="KNOWLEDGE GRAPH // FROM YOUR DOCUMENTS" tag="PRIVATE · REVIEW ONLY">
         <div className="kg-body">
           <BuildStats graph={graph} />
+          <GraphView graph={graph} />
           <Entities graph={graph} />
           <Relationships rels={graph.relationships} />
 
@@ -76,6 +78,88 @@ export default function KnowledgeGraphPanel({
         </div>
       </Frame>
     </div>
+  );
+}
+
+/** The SPATIAL node-link view of the SAME grounded graph the lists below show:
+ *  a deterministic radial layout (no physics/animation) rendered as SVG. Nodes
+ *  are the extracted entities (colored + ringed by type, a solid ring = a
+ *  source-cited "grounded" node); edges are the extracted relationships. An edge
+ *  to an entity with no node is DROPPED by the layout (never a phantom node), and
+ *  the count of such gaps is surfaced honestly rather than hidden — the picture
+ *  can only under-draw the data, never over-draw it. Renders nothing when the
+ *  graph has no entities (nothing spatial to show). */
+function GraphView({ graph }: { graph: KnowledgeGraphResult }) {
+  if (graph.entities.length === 0) return null;
+  const { nodes, edges, size, danglingEndpoints } = layoutGraph(
+    graph.entities,
+    graph.relationships,
+  );
+
+  return (
+    <figure className="kg-graph" aria-label="Knowledge graph — spatial view">
+      <svg
+        className="kg-graph-svg"
+        viewBox={`0 0 ${size} ${size}`}
+        role="img"
+        aria-label={`${nodes.length} entities and ${edges.length} relationships, laid out by type`}
+        preserveAspectRatio="xMidYMid meet"
+      >
+        <g className="kg-edges" stroke="var(--stroke, #2a4a5a)" strokeWidth={1}>
+          {edges.map((e) => (
+            <line
+              key={`${e.from}->${e.relation}->${e.to}`}
+              x1={e.x1}
+              y1={e.y1}
+              x2={e.x2}
+              y2={e.y2}
+            >
+              <title>{`${e.from} — ${e.relation} → ${e.to}`}</title>
+            </line>
+          ))}
+        </g>
+        <g className="kg-nodes">
+          {nodes.map((n) => {
+            const hue = kgTypeHue(n.type);
+            const fill = `hsl(${hue} 65% 55%)`;
+            return (
+              <g key={n.id} transform={`translate(${n.x} ${n.y})`}>
+                <circle
+                  r={6}
+                  fill={fill}
+                  stroke={n.grounded ? fill : "transparent"}
+                  strokeWidth={n.grounded ? 3 : 0}
+                  fillOpacity={0.9}
+                >
+                  <title>
+                    {`${n.name} · ${kgEntityTypeLabel(n.type)}${
+                      n.grounded ? "" : " · no citation"
+                    }`}
+                  </title>
+                </circle>
+                <text
+                  x={n.labelSide === "left" ? -9 : 9}
+                  y={3}
+                  fontSize={10}
+                  textAnchor={n.labelSide === "left" ? "end" : "start"}
+                  fill="var(--text, #cfe)"
+                >
+                  {n.name.length > 22 ? `${n.name.slice(0, 21)}…` : n.name}
+                </text>
+              </g>
+            );
+          })}
+        </g>
+      </svg>
+      {danglingEndpoints.length > 0 && (
+        <figcaption className="kg-graph-note dim-note">
+          {danglingEndpoints.length} edge endpoint
+          {danglingEndpoints.length === 1 ? "" : "s"} reference an entity not in
+          the graph — those edges are omitted (the view never draws a node that
+          wasn&rsquo;t extracted).
+        </figcaption>
+      )}
+    </figure>
   );
 }
 

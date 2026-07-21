@@ -279,6 +279,17 @@ describe("KnowledgeGraphPanel (grouped, provenance-tagged, honest, review-only)"
     expect(html).toContain("42");
   });
 
+  it("renders the SPATIAL node-link SVG view of the same grounded graph", () => {
+    const html = render(parseKnowledgeGraphResult(builtRich));
+    // The graph view is an SVG with one <circle> per entity and one <line> per
+    // drawable relationship — the same grounded nodes/edges the lists show.
+    expect(html).toContain('class="kg-graph-svg"');
+    expect(html).toContain("<circle");
+    expect(html).toContain("<line");
+    // Node/edge titles carry the real entity names / relation triples (hover).
+    expect(html).toContain("Project DARWIN");
+  });
+
   it("carries the honest copy: heuristic, conservative, text-grounded, bounded, off", () => {
     const html = render(parseKnowledgeGraphResult(builtRich));
     expect(html).toContain("heuristic");
