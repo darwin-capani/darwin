@@ -341,7 +341,7 @@ pub async fn vitals_task(cfg: Arc<Config>) {
     // and the process-wide secret-free contract (see procwatch.rs) forbids
     // argv/env bytes transiting daemon memory at all.
     let mut sys = sysinfo::System::new_with_specifics(
-        sysinfo::RefreshKind::new()
+        sysinfo::RefreshKind::nothing()
             .with_cpu(sysinfo::CpuRefreshKind::everything())
             .with_memory(sysinfo::MemoryRefreshKind::everything()),
     );
