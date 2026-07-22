@@ -279,7 +279,7 @@ pub async fn system_load_task() {
     // daemon's lifetime — forbidden by the process-wide secret-free contract
     // (see procwatch.rs).
     let mut sys = sysinfo::System::new_with_specifics(
-        sysinfo::RefreshKind::new()
+        sysinfo::RefreshKind::nothing()
             .with_cpu(sysinfo::CpuRefreshKind::everything())
             .with_memory(sysinfo::MemoryRefreshKind::everything()),
     );
