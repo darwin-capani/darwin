@@ -47,9 +47,13 @@
 //!   (ties broken by original index, so it never depends on hashmap iteration).
 //! - DEDUP: near-duplicate facts (same normalized text, or one a token-subset
 //!   of another with the same top relevance) collapse to one hit.
-//! - EMPTY-STORE and NO-MATCH are honest: an empty store, or a query that
-//!   matches no stored term, yields ZERO hits — the caller then says "nothing
-//!   on that yet" and NEVER fabricates a memory.
+//! - EMPTY-STORE and NO-MATCH are honest: an empty store, or a query nothing
+//!   stored is about, yields ZERO hits — the caller then says "nothing on that
+//!   yet" and NEVER fabricates a memory. Under the LEXICAL backend that means
+//!   no shared term; under the NEURAL backend a raw cosine is NOT evidence of a
+//!   match (embedders are anisotropic — unrelated text still scores ~0.25-0.57),
+//!   so [`gate_by_separation`] applies a calibrated absolute + relative gate.
+//!   See that function for the measured trade-off.
 //!
 //! Nothing here speaks, acts, or reaches the network. It reads stored facts and
 //! returns a ranking. A proactive-surface helper ([`relevant_context`]) exists
@@ -417,6 +421,80 @@ impl NeuralEmbeddingProvider {
     }
 }
 
+/// How far above the batch's own floor a cosine must stand to count as a match,
+/// as a fraction of that batch's spread. See [`gate_by_separation`].
+const SEPARATION_FRACTION: f64 = 0.3;
+
+/// Absolute cosine a neural score must ALSO clear. Both gates are required:
+/// relative separation alone leaks on tiny batches, and an absolute floor alone
+/// cannot adapt across embedders.
+///
+/// CALIBRATED from this repo's committed measurement
+/// (`inference/benchmarks/coreml_eval/results.json`, shipped bge-small-en-v1.5):
+/// arbitrary pairs occupy {min 0.2508, mean 0.4618, p95 0.5723}; live probes of
+/// the running embedder put no-match queries at 0.35-0.46. 0.50 sits above that
+/// mass while retaining 62/70 (89%) of the eval's true hits.
+const MIN_NEURAL_SIM: f64 = 0.50;
+
+/// Minimum spread (max - floor) before the RELATIVE gate is meaningful. Below
+/// it the batch is flat — every fact equally (dis)similar, the "nothing here is
+/// about the query" shape — so only the absolute gate applies.
+const MIN_BATCH_SPREAD: f64 = 0.02;
+
+/// PURE relevance gate for neural scores: zero out everything that is not
+/// credibly a match, so [`rank`] drops it and the caller renders the honest
+/// "nothing matched".
+///
+/// WHY THIS EXISTS: the previous gate kept any score `> 0.0`. Modern sentence
+/// embedders are ANISOTROPIC — unrelated text still scores far above zero
+/// (measured: bge never below +0.25; the legacy mean-pool fallback never below
+/// +0.81), so that test NEVER fired and an empty-handed query returned a full
+/// page of unrelated facts presented as genuine recall. The module's contract
+/// ("a query that matches no stored term yields ZERO hits ... NEVER fabricates
+/// a memory") was therefore false on the SHIPPED default path whenever the
+/// inference server was up.
+///
+/// TWO CONDITIONS, BOTH REQUIRED:
+///   1. ABSOLUTE — clear [`MIN_NEURAL_SIM`], above the measured no-match mass;
+///   2. RELATIVE — stand `SEPARATION_FRACTION` of the batch spread above the
+///      batch FLOOR (min, not median: a batch with several genuine hits must not
+///      raise its own bar and self-reject — that regression was caught while
+///      calibrating against the eval's multi-relevant queries).
+///
+/// HONEST TRADE-OFF (measured, not assumed): on the committed eval this keeps
+/// 62/70 (89%) of true hits. The relevant and irrelevant cosine bands genuinely
+/// OVERLAP (lowest relevant 0.4862 < unrelated p95 0.5723), so NO threshold can
+/// separate them perfectly. We take the conservative side deliberately: a missed
+/// recall is recoverable (the user rephrases and the fact is still stored), a
+/// FABRICATED memory is not — the user may act on it. Honesty over completeness
+/// is the module contract.
+fn gate_by_separation(sims: Vec<f64>) -> Vec<f64> {
+    let finite: Vec<f64> = sims.iter().copied().filter(|s| s.is_finite()).collect();
+    if finite.is_empty() {
+        return vec![0.0; sims.len()];
+    }
+    // Relative floor from the batch's own geometry (skipped when flat).
+    let mut sorted = finite;
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let base = sorted[0];
+    let max = sorted[sorted.len() - 1];
+    let spread = max - base;
+    let relative_floor = if sims.len() >= 2 && spread >= MIN_BATCH_SPREAD {
+        base + SEPARATION_FRACTION * spread
+    } else {
+        f64::NEG_INFINITY // flat / single candidate: the absolute gate decides
+    };
+    sims.into_iter()
+        .map(|s| {
+            if s.is_finite() && s >= MIN_NEURAL_SIM && s >= relative_floor {
+                s
+            } else {
+                0.0
+            }
+        })
+        .collect()
+}
+
 impl EmbeddingProvider for NeuralEmbeddingProvider {
     fn score(&self, _query: &str, facts: &[Fact]) -> Vec<f64> {
         // The vectors are precomputed and parallel to `facts`. If the caller
@@ -426,18 +504,12 @@ impl EmbeddingProvider for NeuralEmbeddingProvider {
         if self.fact_vectors.len() != facts.len() || self.query.is_empty() {
             return vec![0.0; facts.len()];
         }
-        self.fact_vectors
+        let sims: Vec<f64> = self
+            .fact_vectors
             .iter()
-            .map(|v| {
-                let sim = cosine_similarity(&self.query, v);
-                // Clamp negatives to 0.0: an anti-correlated fact is not a hit.
-                if sim > 0.0 {
-                    sim
-                } else {
-                    0.0
-                }
-            })
-            .collect()
+            .map(|v| cosine_similarity(&self.query, v))
+            .collect();
+        gate_by_separation(sims)
     }
 
     fn method(&self) -> RankMethod {
@@ -1484,6 +1556,67 @@ mod tests {
         let fv = vec![vec![0.0, 1.0, 0.0], vec![0.0, 0.0, 1.0]];
         let hits = rank("q", &facts, 5, &neural(query, fv));
         assert!(hits.is_empty(), "orthogonal facts are not surfaced: {hits:?}");
+    }
+
+    /// REGRESSION (sweep-caught, HIGH): the old gate kept any score `> 0.0`,
+    /// which NEVER fires under a real anisotropic embedder — an unrelated query
+    /// returned a full page of fabricated "recalls". These vectors are built to
+    /// reproduce the LIVE-MEASURED no-match cosines of the shipped bge embedder
+    /// (0.39 / 0.46 / 0.46 — nowhere near orthogonal), the exact geometry the
+    /// previous orthogonal-mock test could not represent.
+    #[test]
+    fn anisotropic_no_match_is_honestly_empty_not_fabricated() {
+        // Construct unit vectors whose cosine to the query is ~0.39-0.46.
+        let q = vec![1.0, 0.0];
+        let mk = |c: f64| vec![c, (1.0 - c * c).sqrt()];
+        let facts = vec![
+            Fact::new("user.pet", "a corgi named Watson"),
+            Fact::new("user.coffee", "oat-milk flat whites"),
+            Fact::new("user.car", "blue Subaru"),
+        ];
+        let fv = vec![mk(0.3899), mk(0.4623), mk(0.4608)];
+        // Sanity: every cosine is well ABOVE zero, so the old `> 0.0` gate kept
+        // all three and fabricated three recalls.
+        for v in &fv {
+            let c = cosine_similarity(&q, v);
+            assert!(c > 0.3, "the measured no-match geometry is far from orthogonal: {c}");
+        }
+        let hits = rank("gamma-ray burst spectroscopy", &facts, 5, &neural(q, fv));
+        assert!(
+            hits.is_empty(),
+            "an unrelated query must recall NOTHING under the real embedder geometry, got {hits:?}"
+        );
+    }
+
+    /// The gate must not throw away GENUINE hits: a fact that stands clearly
+    /// above the batch (and clears the absolute floor) is still returned, and a
+    /// batch with SEVERAL true hits keeps them all (an earlier median-based
+    /// design self-rejected multi-hit batches — caught during calibration).
+    #[test]
+    fn anisotropic_real_hits_survive_the_gate() {
+        let q = vec![1.0, 0.0];
+        let mk = |c: f64| vec![c, (1.0 - c * c).sqrt()];
+        let facts = vec![
+            Fact::new("user.pet", "a corgi named Watson"),
+            Fact::new("user.pet2", "a cat named Mia"),
+            Fact::new("user.car", "blue Subaru"),
+        ];
+        // Two genuine hits (0.70/0.69) + one unrelated (0.40).
+        let fv = vec![mk(0.7028), mk(0.6900), mk(0.4000)];
+        let hits = rank("what pets do I have", &facts, 5, &neural(q, fv));
+        assert_eq!(hits.len(), 2, "both genuine hits survive: {hits:?}");
+        assert!(hits.iter().all(|h| h.fact.key.starts_with("user.pet")));
+    }
+
+    /// A FLAT batch (everything equally similar, no separation) claims nothing.
+    #[test]
+    fn flat_batch_claims_nothing() {
+        let q = vec![1.0, 0.0];
+        let mk = |c: f64| vec![c, (1.0 - c * c).sqrt()];
+        let facts = vec![Fact::new("a", "x"), Fact::new("b", "y"), Fact::new("c", "z")];
+        let fv = vec![mk(0.46), mk(0.461), mk(0.4605)];
+        let hits = rank("unrelated", &facts, 5, &neural(q, fv));
+        assert!(hits.is_empty(), "a flat batch has no standout — claim nothing: {hits:?}");
     }
 
     #[test]
