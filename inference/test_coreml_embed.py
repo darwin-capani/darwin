@@ -12,7 +12,10 @@ faithfulness + latency are DEVICE/DEP-gated and exercised by the once-run smoke
   Run: .venv/bin/python inference/test_coreml_embed.py   (from the repo root)
 """
 import math
+import os
 import sys
+import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -271,6 +274,78 @@ class FastPathRouting(unittest.TestCase):
 def ce_SEQ():
     import coreml_embed as ce
     return ce.SEQ
+
+
+class FastGraphUpgrade(unittest.TestCase):
+    """A cache published BEFORE the fast graph existed still validate-loads, so without
+    a one-shot upgrade an already-deployed machine would keep it forever and never pick
+    the speedup up. The upgrade must fire exactly once, must never loop on a machine
+    where the fast graph cannot be built, and must never lose a working cache."""
+
+    def _embedder(self, tmp, sequence):
+        """`sequence` is the list of _try_load_final results, consumed in order."""
+        e = ce.CoreMLEmbedder.__new__(ce.CoreMLEmbedder)
+        e._dir = tmp
+        e._lock = threading.Lock()
+        e._loaded = False
+        e._tokenizer = e._model = e._model_fast = None
+        e.converts = 0
+        pending = list(sequence)
+        e._try_load_final = lambda: pending.pop(0) if pending else None
+
+        def convert():
+            e.converts += 1
+        e._convert_atomic = convert
+        return e
+
+    def test_a_cache_without_the_fast_graph_is_rebuilt_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = self._embedder(tmp, [("t", "m", None), ("t", "m", "FAST")])
+            e.ensure_loaded()
+            # MUTATION GUARD: dropping the upgrade branch leaves converts at 0.
+            self.assertEqual(e.converts, 1)
+            self.assertEqual(e._model_fast, "FAST")
+
+    def test_a_cache_that_already_has_the_fast_graph_is_not_rebuilt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = self._embedder(tmp, [("t", "m", "FAST")])
+            e.ensure_loaded()
+            self.assertEqual(e.converts, 0)
+
+    def test_the_sentinel_stops_the_upgrade_from_running_every_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, ce._FAST_ABSENT_MARK), "w").close()
+            e = self._embedder(tmp, [("t", "m", None)])
+            e.ensure_loaded()
+            self.assertEqual(e.converts, 0)
+            self.assertIsNone(e._model_fast)
+
+    def test_a_failed_upgrade_keeps_the_working_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = self._embedder(tmp, [("t", "m", None)])
+
+            def boom():
+                e.converts += 1
+                raise RuntimeError("disk full")
+            e._convert_atomic = boom
+            e.ensure_loaded()  # must NOT raise: the 512 cache still works
+            self.assertEqual(e.converts, 1)
+            self.assertEqual((e._tokenizer, e._model), ("t", "m"))
+            self.assertTrue(e._loaded)
+
+    def test_an_upgrade_that_still_yields_no_fast_graph_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = self._embedder(tmp, [("t", "m", None), ("t", "m", None)])
+            e.ensure_loaded()
+            self.assertEqual(e.converts, 1)  # once, not in a loop
+            self.assertTrue(e._loaded)
+
+    def test_an_upgrade_whose_reload_returns_nothing_keeps_the_first_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            e = self._embedder(tmp, [("t", "m", None)])  # second call -> None
+            e.ensure_loaded()
+            self.assertEqual((e._tokenizer, e._model), ("t", "m"))
+            self.assertTrue(e._loaded)
 
 
 if __name__ == "__main__":

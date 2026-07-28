@@ -14,7 +14,9 @@ inference/benchmarks/coreml_rerank_eval/ probe), NOT here.
   Run: .venv/bin/python inference/test_coreml_rerank.py   (from the repo root)
 """
 import math
+import os
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -265,6 +267,81 @@ class FastPathRouting(unittest.TestCase):
 
     def test_the_fast_seq_is_shorter_than_the_full_seq(self):
         self.assertLess(cr.SEQ_FAST, cr.SEQ)
+
+
+class FastGraphUpgrade(unittest.TestCase):
+    """A cache published BEFORE the short graph existed still validate-loads, so
+    without a one-shot upgrade an already-deployed machine would keep it forever and
+    never pick the speedup up. The upgrade must fire exactly once, must never loop on
+    a machine where the short graph cannot be built, and must never lose a working
+    cache when the rebuild fails."""
+
+    def _reranker(self, tmp, sequence):
+        """`sequence` is the list of _try_load_final results, consumed in order."""
+        r = cr.CoreMLReranker.__new__(cr.CoreMLReranker)
+        r._dir = tmp
+        r._lock = threading.Lock()
+        r._loaded = False
+        r._tokenizer = r._model = r._model_fast = None
+        r.converts = 0
+        pending = list(sequence)
+        r._try_load_final = lambda: pending.pop(0) if pending else None
+
+        def convert():
+            r.converts += 1
+        r._convert_atomic = convert
+        return r
+
+    def test_a_cache_without_the_short_graph_is_rebuilt_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._reranker(tmp, [("t", "m", None), ("t", "m", "FAST")])
+            r.ensure_loaded()
+            # MUTATION GUARD: dropping the upgrade branch leaves converts at 0.
+            self.assertEqual(r.converts, 1)
+            self.assertEqual(r._model_fast, "FAST")
+
+    def test_a_cache_that_already_has_the_short_graph_is_not_rebuilt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._reranker(tmp, [("t", "m", "FAST")])
+            r.ensure_loaded()
+            self.assertEqual(r.converts, 0)
+
+    def test_the_sentinel_stops_the_upgrade_from_running_every_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            open(os.path.join(tmp, cr._FAST_ABSENT_MARK), "w").close()
+            r = self._reranker(tmp, [("t", "m", None)])
+            r.ensure_loaded()
+            # This machine cannot build the short graph; rebuilding again every start
+            # would burn ~11s of conversion for nothing.
+            self.assertEqual(r.converts, 0)
+            self.assertIsNone(r._model_fast)
+
+    def test_a_failed_upgrade_keeps_the_working_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._reranker(tmp, [("t", "m", None)])
+
+            def boom():
+                r.converts += 1
+                raise RuntimeError("disk full")
+            r._convert_atomic = boom
+            r.ensure_loaded()  # must NOT raise: the 512 cache still works
+            self.assertEqual(r.converts, 1)
+            self.assertEqual((r._tokenizer, r._model), ("t", "m"))
+            self.assertTrue(r._loaded)
+
+    def test_an_upgrade_that_still_yields_no_short_graph_is_accepted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._reranker(tmp, [("t", "m", None), ("t", "m", None)])
+            r.ensure_loaded()
+            self.assertEqual(r.converts, 1)  # once, not in a loop
+            self.assertTrue(r._loaded)
+
+    def test_an_upgrade_whose_reload_returns_nothing_keeps_the_first_load(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            r = self._reranker(tmp, [("t", "m", None)])  # second call -> None
+            r.ensure_loaded()
+            self.assertEqual((r._tokenizer, r._model), ("t", "m"))
+            self.assertTrue(r._loaded)
 
 
 if __name__ == "__main__":

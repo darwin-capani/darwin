@@ -158,6 +158,11 @@ _MODEL_NAME = "emb_b1.mlpackage"
 # The fast (1, SEQ_FAST) graph. Converted alongside the main one and validated
 # the same way; a cache missing it simply loses the fast path (never breaks).
 _MODEL_FAST_NAME = "emb_b1_s128.mlpackage"
+# Sentinel written when the fast graph was ATTEMPTED and could not be built here. It
+# lets the one-shot upgrade in `ensure_loaded` distinguish "this cache predates the
+# fast graph" (rebuild it once) from "the fast graph does not build on this machine"
+# (accept and stop), so the upgrade can never become a per-start reconversion.
+_FAST_ABSENT_MARK = "no_fast_graph"
 _TOK_DIRNAME = "tokenizer"
 
 
@@ -323,6 +328,26 @@ class CoreMLEmbedder:
                     if loaded is None:
                         raise CoreMLEmbedderUnavailable(
                             "Core ML embedder cache failed validate-load after conversion"
+                        )
+                elif loaded[2] is None and not os.path.exists(
+                    os.path.join(self._dir, _FAST_ABSENT_MARK)
+                ):
+                    # ONE-SHOT UPGRADE. A cache published before the fast graph existed
+                    # still validate-loads, so without this an already-deployed machine
+                    # would keep the old cache forever and NEVER pick up the speedup.
+                    # Rebuild once; if the fast graph still cannot be built here,
+                    # `_convert_into` leaves the sentinel and we stop trying.
+                    log.info(
+                        "coreml embed: cache predates the fast (seq=%d) graph; "
+                        "rebuilding once to pick up the speedup", SEQ_FAST,
+                    )
+                    try:
+                        self._convert_atomic()
+                        loaded = self._try_load_final() or loaded
+                    except Exception as e:  # keep the working cache; just stay slow
+                        log.warning(
+                            "coreml embed: fast-graph upgrade failed (%s); "
+                            "continuing on the existing cache at seq=%d", e, SEQ,
                         )
                 self._tokenizer, self._model, self._model_fast = loaded
             except CoreMLEmbedderUnavailable:
@@ -540,6 +565,12 @@ class CoreMLEmbedder:
                 "the seq=%d graph still works",
                 SEQ_FAST, e, SEQ,
             )
+            # Record that we TRIED, so the one-shot upgrade in `ensure_loaded` does not
+            # rebuild this cache again on every process start.
+            with open(
+                os.path.join(target_dir, _FAST_ABSENT_MARK), "w", encoding="utf-8"
+            ) as fh:
+                fh.write(f"fast graph did not convert here: {e}\n")
         tok.save_pretrained(os.path.join(target_dir, _TOK_DIRNAME))
 
     def _encode(self, texts):
