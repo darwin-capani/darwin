@@ -105,7 +105,7 @@ url = "2"
 # so the exact served bytes cross the JSON app socket intact (no lossy UTF-8
 # transcode of a non-UTF-8 feed). Already in the lock TRANSITIVELY — direct dep,
 # same locked version, no new download.
-base64 = "0.22"
+base64 = "0.23"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
