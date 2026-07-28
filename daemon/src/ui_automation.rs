@@ -450,6 +450,21 @@ fn parse_actuate_reply(line: &str) -> Result<(), ActuateError> {
     }
 }
 
+/// How long to wait for the HUD to ACCEPT the actuation connection. A listening
+/// HUD accepts immediately; anything slower is a wedged app, not a slow one.
+#[allow(dead_code)] // via-app seam: device-gated, never opened under cargo test
+const ACTUATE_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long to wait for the request bytes to be written + flushed. One short JSON
+/// line into an accepted socket.
+#[allow(dead_code)] // via-app seam: device-gated, never opened under cargo test
+const ACTUATE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How long to wait for the HUD's ONE reply line. An AX/CGEvent post is
+/// sub-second; 10s is generous headroom that still bounds a wedged HUD.
+#[allow(dead_code)] // via-app seam: device-gated, never opened under cargo test
+const ACTUATE_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// (OPT-IN, via_app mode) Send the approved single-action `plan` to the HUD app over
 /// `<root>/state/ipc/actuate.sock` and map the reply. The HUD holds the Accessibility
 /// grant and posts the ONE CGEvent. ONE request = ONE actuation = ONE connection.
@@ -460,7 +475,12 @@ fn parse_actuate_reply(line: &str) -> Result<(), ActuateError> {
 ///   * the socket cannot be reached (the HUD isn't running / not listening) =>
 ///     `AppActuatorUnavailable` with the connect error;
 ///   * the write/flush/read fails, or the reply is malformed / `ok=false` =>
-///     `AppActuatorUnavailable` with the honest detail.
+///     `AppActuatorUnavailable` with the honest detail;
+///   * a leg EXCEEDS its deadline ([`ACTUATE_CONNECT_TIMEOUT`] /
+///     [`ACTUATE_WRITE_TIMEOUT`] / [`ACTUATE_REPLY_TIMEOUT`]) => the same honest
+///     `AppActuatorUnavailable` ("I will not assume it acted"). A connected-but-
+///     silent HUD would otherwise park the daemon's single sequential turn loop
+///     indefinitely.
 ///
 /// DEVICE-gated like the rest of the seam: it opens a REAL socket, so it is BUILT but
 /// NEVER invoked under `cargo test` (the pure encode/parse it relies on ARE tested).
@@ -497,33 +517,65 @@ async fn actuate_via_hud(plan: &ActuationPlan) -> Result<ActuateResult, ActuateE
 
     // ONE connection for ONE actuation. A connect failure (the HUD isn't listening)
     // is reported honestly — never a fabricated success.
-    let stream = match UnixStream::connect(&sock_path).await {
-        Ok(s) => s,
-        Err(e) => {
+    //
+    // EVERY leg is TIMED OUT. WHY: the daemon runs ONE sequential turn loop, and
+    // this await sits inside it. A HUD that ACCEPTS the connection but never writes
+    // a reply line (a stalled main thread, an AX action blocked behind a modal
+    // sheet) is not a connect failure, so without a deadline `read_line` never
+    // returns: the turn never speaks and every later utterance queues behind it,
+    // forever. An AX post is sub-second, so these ceilings are generous.
+    let stream = match tokio::time::timeout(ACTUATE_CONNECT_TIMEOUT, UnixStream::connect(&sock_path))
+        .await
+    {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) => {
             return Err(ActuateError::AppActuatorUnavailable(format!(
                 "I couldn't reach the DARWIN app to post the action ({e}); is DARWIN.app running?"
             )));
+        }
+        Err(_) => {
+            return Err(ActuateError::AppActuatorUnavailable(
+                "the DARWIN app did not accept the connection in time; I will not assume it acted"
+                    .to_string(),
+            ));
         }
     };
 
     let request = encode_actuate_request(&token, plan);
     let (read_half, mut write_half) = stream.into_split();
 
-    if let Err(e) = write_half.write_all(request.as_bytes()).await {
-        return Err(ActuateError::AppActuatorUnavailable(format!(
-            "I couldn't send the action to the DARWIN app ({e})"
-        )));
-    }
-    if let Err(e) = write_half.flush().await {
-        return Err(ActuateError::AppActuatorUnavailable(format!(
-            "I couldn't flush the action to the DARWIN app ({e})"
-        )));
+    match tokio::time::timeout(ACTUATE_WRITE_TIMEOUT, async {
+        write_half.write_all(request.as_bytes()).await?;
+        write_half.flush().await
+    })
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            return Err(ActuateError::AppActuatorUnavailable(format!(
+                "I couldn't send the action to the DARWIN app ({e})"
+            )));
+        }
+        Err(_) => {
+            return Err(ActuateError::AppActuatorUnavailable(
+                "the DARWIN app did not accept the action in time; I will not assume it acted"
+                    .to_string(),
+            ));
+        }
     }
 
     // Read exactly ONE '\n'-terminated reply line, then the connection is done.
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
-    match reader.read_line(&mut line).await {
+    let read = match tokio::time::timeout(ACTUATE_REPLY_TIMEOUT, reader.read_line(&mut line)).await {
+        Ok(r) => r,
+        Err(_) => {
+            return Err(ActuateError::AppActuatorUnavailable(
+                "the DARWIN app did not reply in time; I will not assume it acted".to_string(),
+            ));
+        }
+    };
+    match read {
         Ok(0) => {
             return Err(ActuateError::AppActuatorUnavailable(
                 "the DARWIN app closed the connection without replying; I will not assume it acted"

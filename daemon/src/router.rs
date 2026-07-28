@@ -3676,7 +3676,14 @@ async fn handle_silicon_canvas(
                         "app.op_forwarded",
                         json!({"name": SILICON_CANVAS_APP, "op": op_line}),
                     );
-                    "Done, sir.".to_string()
+                    // DELIVERY-HONEST, not completion-honest. `apps::send_op` is
+                    // fire-and-forget: it returns Ok the moment the line lands on
+                    // the app's UNBOUNDED in-process queue ("send_op can only
+                    // report 'queued'"). No app-side result is awaited or
+                    // correlated, so an op the app cannot parse — or one queued in
+                    // the window before the child dies — is silently dropped. Saying
+                    // "Done" there would claim an action DARWIN never verified.
+                    "Forwarded that to Silicon Canvas, sir — sent to the app; it doesn't report back, so I can't confirm it ran.".to_string()
                 }
                 Err(e) => {
                     warn!(app = SILICON_CANVAS_APP, op = %op_line, error = %e, "silicon canvas op forward failed");
@@ -3752,7 +3759,10 @@ async fn handle_vision(cmd: VisionCommand, app_registry: &Arc<AppRegistry>) -> H
                     // fabricated document).
                     "Scanning the document now, sir — the text will appear on the Vision panel. I'll need your camera consent on-device; if I don't find a page I'll say so rather than guess.".to_string()
                 } else {
-                    "Done, sir.".to_string()
+                    // DELIVERY-HONEST (see handle_silicon_canvas): send_op only
+                    // proves the op was QUEUED — no app-side result is awaited —
+                    // so "Done" would claim an action DARWIN never verified.
+                    "Forwarded that to Vision, sir — sent to the app; it doesn't report back, so I can't confirm it ran.".to_string()
                 }
             }
             Err(e) => {
@@ -3915,7 +3925,10 @@ async fn handle_nexus(cmd: NexusCommand, app_registry: &Arc<AppRegistry>) -> Han
                     "app.op_forwarded",
                     json!({"name": NEXUS_APP, "op": op_line}),
                 );
-                "Done, sir.".to_string()
+                // DELIVERY-HONEST (see handle_silicon_canvas): send_op only proves
+                // the op was QUEUED — no app-side result is awaited — so "Done"
+                // would claim an action DARWIN never verified.
+                "Forwarded that to Nexus, sir — sent to the app; it doesn't report back, so I can't confirm it ran.".to_string()
             }
             Err(e) => {
                 warn!(app = NEXUS_APP, op = %op_line, error = %e, "nexus op forward failed");
@@ -3972,7 +3985,10 @@ async fn handle_mark_forge(
                         "app.op_forwarded",
                         json!({"name": MARK_FORGE_APP, "op": op_line}),
                     );
-                    "Done, sir.".to_string()
+                    // DELIVERY-HONEST (see handle_silicon_canvas): send_op only
+                    // proves the op was QUEUED — no app-side result is awaited —
+                    // so "Done" would claim an action DARWIN never verified.
+                    "Forwarded that to the physics sandbox, sir — sent to the app; it doesn't report back, so I can't confirm it ran.".to_string()
                 }
                 Err(e) => {
                     warn!(app = MARK_FORGE_APP, op = %op_line, error = %e, "mark-forge op forward failed");

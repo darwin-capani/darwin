@@ -73,9 +73,13 @@ the read-only `doc_search` tool owned by Mnemosyne. Honest properties:
   text-like files (markdown / txt / code / json / csv …) plus born-digital PDF +
   Office (`.docx` / `.xlsx` / `.pptx`) text (see below).
 - **On-device + private** — file contents and their embeddings **never leave the
-  device**. Embedding is the on-device MLX `embed` op; when that model is down,
-  search falls back to lexical **BM25** and **reports which method actually ran**
-  (it never claims neural when it fell back).
+  device**. Embedding is the inference server's on-device `embed` op, served by
+  default (`[inference].embedder = "coreml-bge-small-en-v1.5"`) by a **Core ML
+  BAAI/bge-small-en-v1.5** sentence embedder (384-dim, ANE-eligible); the MLX
+  mean-pool path (`llm-qwen3-4b-meanpool`) is the configurable **legacy** backend,
+  and the server **reports which embedder actually served** if it falls back to it.
+  When the embed model is down entirely, search falls back to lexical **BM25** and
+  **reports which method actually ran** (it never claims neural when it fell back).
 - **Cited, never fabricated** — every result cites the **real** indexed chunk
   (file path + byte offset + snippet); an empty index or no match returns
   nothing, never an invented citation.

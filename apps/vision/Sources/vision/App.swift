@@ -259,14 +259,20 @@ struct VisionApp {
             return 3
         }
         let engine = VisionEngine()
-        let dets = engine.recognizeText(image: image, minConfidence: 0.0)
-        let readout = ScreenStructurer.structure(dets)
+        // `readText` over the raw `recognizeText` so the CLI carries the same
+        // honest truncation signal as the live wire (blocks_total /
+        // blocks_truncated) — a capped read must never print as a complete one.
+        let read = engine.readText(image: image, minConfidence: 0.0)
+        let readout = ScreenStructurer.structure(read.detections)
         // Reuse the FROZEN telemetry encoder so the CLI output matches the wire
         // vision.screen shape exactly (text / blocks / controls).
         let event = VisionEvent.screen(
             frameIndex: 0, timestamp: 0,
             source: CaptureSource.file(path: path).tag,
-            readout: readout, located: nil, query: nil, meta: .screen)
+            readout: readout, located: nil, query: nil,
+            meta: ScreenReadMeta(kind: .screen,
+                                 blocksTotal: read.totalObservations,
+                                 blocksTruncated: read.truncated))
         var data = event.encodeData()
         data["compute_unit"] = VisionEngine.computeUnitTag
         data["image_width"] = image.width
@@ -347,7 +353,9 @@ struct VisionApp {
             frameIndex: 0, timestamp: 0,
             source: CaptureSource.file(path: path).tag,
             readout: readout, located: nil, query: nil,
-            meta: ScreenReadMeta(kind: .document, documentDetected: scan.documentDetected))
+            meta: ScreenReadMeta(kind: .document, documentDetected: scan.documentDetected,
+                                 blocksTotal: scan.linesTotal,
+                                 blocksTruncated: scan.linesTruncated))
         var data = event.encodeData()
         data["compute_unit"] = VisionEngine.computeUnitTag
         data["image_width"] = image.width

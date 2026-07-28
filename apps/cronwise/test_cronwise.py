@@ -69,6 +69,35 @@ class TestCronwiseExplain(unittest.TestCase):
         self.assertTrue(r2["valid"])
         self.assertEqual(r2["minute"], "every 10 minutes starting at minute 5")
 
+    def test_step_wider_than_the_field_matches_one_value_not_an_interval(self):
+        # REGRESSION: cron expands the base range and keeps every step'th value, so
+        # a step at/beyond the range width matches exactly ONE value. "*/90" fires
+        # HOURLY (minute 0 only) — describing it as "every 90 minutes" restated an
+        # interval cron never performs, the very misconception this app exists to
+        # correct.
+        r = compute({"cron": "*/90 * * * *"})
+        self.assertTrue(r["valid"])
+        self.assertEqual(r["minute"], "at minute 0")
+        self.assertNotIn("90", r["summary"])
+        # Same on the range form and the single-start form.
+        r2 = compute({"cron": "1-10/20 * * * *"})
+        self.assertEqual(r2["minute"], "at minute 1")
+        r3 = compute({"cron": "5/70 * * * *"})
+        self.assertEqual(r3["minute"], "at minute 5")
+
+    def test_a_step_that_does_not_divide_the_field_enumerates_the_real_set(self):
+        # REGRESSION: "*/25" matches 0, 25, 50 and then WRAPS with a 10-minute gap —
+        # it is not "every 25 minutes". Same for a month step that only matches two
+        # months.
+        r = compute({"cron": "*/25 * * * *"})
+        self.assertTrue(r["valid"])
+        self.assertEqual(r["minute"], "at minutes 0, 25, 50")
+        r2 = compute({"cron": "0 0 * */7 *"})
+        self.assertTrue(r2["valid"])
+        self.assertEqual(r2["month"], "on months January, August")
+        # A step that DOES divide the field evenly keeps the compact phrasing.
+        self.assertEqual(compute({"cron": "*/5 * * * *"})["minute"], "every 5 minutes")
+
     def test_invalid_field_count(self):
         r = compute({"cron": "* * * *"})
         self.assertFalse(r["valid"])

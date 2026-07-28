@@ -676,6 +676,11 @@ mod tests {
     /// they were never shown.
     #[test]
     fn a_background_parker_cannot_hijack_the_spoken_confirm() {
+        // These drive the PROCESS-GLOBAL slot, so they must hold PENDING_TEST_LOCK
+        // like every other slot-touching test. Without it they raced the guarded
+        // tests (their `clear()` emptied the slot a guarded test had just parked),
+        // making `park_then_take_live_round_trips_and_clears` fail intermittently.
+        let _g = store_guard();
         clear();
         // 1. The user is prompted about action A.
         let _prompt = park(sample("gmail_send"));
@@ -701,6 +706,8 @@ mod tests {
     /// The normal path is unaffected: prompt then confirm fires the SAME action.
     #[test]
     fn the_prompted_action_still_confirms_normally() {
+        // Slot-touching -> serialize on PENDING_TEST_LOCK (see above).
+        let _g = store_guard();
         clear();
         let _prompt = park(sample("gmail_send"));
         let taken = take_live(Instant::now()).expect("the prompted action confirms");

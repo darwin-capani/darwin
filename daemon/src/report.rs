@@ -127,8 +127,9 @@ impl SourcedClaim {
 // ---------------------------------------------------------------------------
 
 /// One CITATION the report carries, as the rendered bibliography lists it: the
-/// run-local id, the title, and the real URL — exactly the locator the input claim
-/// carried. NEVER fabricated.
+/// REPORT-LOCAL id (dense + unique across every input run — see [`build_report`]),
+/// the title, and the real URL — exactly the locator the input claim carried.
+/// NEVER fabricated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportCitation {
     pub id: usize,
@@ -137,9 +138,9 @@ pub struct ReportCitation {
 }
 
 /// One section of the report: a heading and an ordered body of cited points, each
-/// carrying the run-local id of the source it cites (so the rendered body can
-/// bracket `[n]`). A section exists ONLY because at least one CITED claim landed
-/// under its heading.
+/// carrying the REPORT-LOCAL id of the source it cites (so the rendered body can
+/// bracket `[n]` and have it resolve to exactly one bibliography entry). A section
+/// exists ONLY because at least one CITED claim landed under its heading.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReportSection {
     /// The section heading.
@@ -179,7 +180,14 @@ pub struct Report {
 ///     synthesized.
 ///   * BOUNDED: at most [`MAX_SECTIONS`] sections (in first-seen heading order), at
 ///     most [`MAX_CLAIMS_PER_SECTION`] points per section, at most [`MAX_CITATIONS`]
-///     distinct citations.
+///     distinct citations. A claim whose source could not be LISTED (past the
+///     citation cap) is bounded out of the BODY too — never a `[n]` marker with no
+///     matching `## Sources` entry.
+///   * REPORT-LOCAL IDS: incoming source ids are RUN-local (each research run
+///     numbers its own sources from 1), so distinct sources collide across runs.
+///     Every distinct `(incoming id, url)` is renumbered to a unique report-local
+///     id used for BOTH the body marker and the bibliography key — so `[n]`
+///     resolves to exactly one source.
 ///   * HONEST-EMPTY: when NO claim carries a usable citation, the result is
 ///     `empty: true` with no sections and no citations — the caller renders a plain
 ///     "no sources to report on", never a fabricated body.
@@ -189,9 +197,18 @@ pub fn build_report(title: &str, sources: &[SourcedClaim], _cfg: &ReportConfig) 
     // citation is dropped here (never reaches a section, never a citation).
     let mut headings: Vec<String> = Vec::new();
     let mut grouped: Vec<Vec<(String, usize)>> = Vec::new();
-    // Distinct citations keyed by (id, url) so the same real source cited twice is
-    // listed once; collected in first-seen order, then sorted by id for the bib.
+    // Distinct citations keyed by (incoming id, url) so the same real source cited
+    // twice is listed once; collected in first-seen order, then sorted by id.
     let mut citations: Vec<ReportCitation> = Vec::new();
+    // (incoming id, url) -> the REPORT-LOCAL id it was renumbered to.
+    //
+    // WHY renumber: incoming ids are RUN-LOCAL (research.rs assigns `sources.len()
+    // + 1` per run, so every saved run numbers its sources 1,2,3…). Folding two
+    // runs into one report therefore produced two different sources both carrying
+    // id 1 — the bibliography listed `[1]` twice and the `[1]` marker under "Run 2"
+    // resolved to run 1's source. Report-local ids are dense and unique, so every
+    // body marker resolves to exactly ONE bibliography entry.
+    let mut id_map: Vec<((usize, String), usize)> = Vec::new();
 
     for claim in sources {
         let Some(cit) = claim.usable_citation() else {
@@ -199,17 +216,29 @@ pub fn build_report(title: &str, sources: &[SourcedClaim], _cfg: &ReportConfig) 
             continue;
         };
 
-        // Record the distinct citation (by id + url) — bounded.
-        let seen = citations
-            .iter()
-            .any(|c| c.id == cit.id && c.url == cit.url);
-        if !seen && citations.len() < MAX_CITATIONS {
-            citations.push(ReportCitation {
-                id: cit.id,
-                title: cit.title.trim().to_string(),
-                url: cit.url.trim().to_string(),
-            });
-        }
+        // Record the distinct citation (by incoming id + url) under its new
+        // report-local id — bounded.
+        let key = (cit.id, cit.url.trim().to_string());
+        let local_id = match id_map.iter().find(|(k, _)| *k == key) {
+            Some((_, id)) => *id,
+            None => {
+                if citations.len() >= MAX_CITATIONS {
+                    // Past the citation cap: this source cannot be LISTED, so its
+                    // claim is bounded out of the BODY too. Emitting the point
+                    // anyway would render a `[n]` marker with no `## Sources` entry
+                    // — a dangling citation pointing at nothing.
+                    continue;
+                }
+                let next = citations.len() + 1;
+                citations.push(ReportCitation {
+                    id: next,
+                    title: cit.title.trim().to_string(),
+                    url: cit.url.trim().to_string(),
+                });
+                id_map.push((key, next));
+                next
+            }
+        };
 
         // Find or create the section for this heading (bounded by MAX_SECTIONS).
         let heading = claim.heading.trim().to_string();
@@ -229,7 +258,9 @@ pub fn build_report(title: &str, sources: &[SourcedClaim], _cfg: &ReportConfig) 
             }
         };
         if grouped[idx].len() < MAX_CLAIMS_PER_SECTION {
-            grouped[idx].push((claim.text.trim().to_string(), cit.id));
+            // The MAPPED id — the marker must name the bibliography entry, not the
+            // input's run-local id.
+            grouped[idx].push((claim.text.trim().to_string(), local_id));
         }
     }
 
@@ -732,6 +763,82 @@ mod tests {
         assert_eq!(r.all_citations.len(), 2);
         let urls: Vec<&str> = r.all_citations.iter().map(|c| c.url.as_str()).collect();
         assert!(urls.contains(&"https://nasa.test") && urls.contains(&"https://esa.test"), "{urls:?}");
+    }
+
+    /// REGRESSION: two saved runs each number their OWN sources from 1, so folding
+    /// them into one report used to emit a bibliography with two `[1]` entries and
+    /// a `[1]` marker under "Run 2" that resolved to run 1's source. Report-local
+    /// renumbering makes every marker resolve to exactly one listed source.
+    #[test]
+    fn citation_ids_are_report_local_so_runs_never_collide() {
+        let entries = vec![
+            entry("X", "run one", vec![(1, "A1", "https://a1.test"), (2, "A2", "https://a2.test")]),
+            entry("X", "run two", vec![(1, "B1", "https://b1.test"), (2, "B2", "https://b2.test")]),
+        ];
+        let claims = sourced_claims_from_entries(&entries);
+        let r = build_report("X", &claims, &cfg());
+
+        // Four distinct real sources -> four DISTINCT ids.
+        assert_eq!(r.all_citations.len(), 4, "{:?}", r.all_citations);
+        let ids: Vec<usize> = r.all_citations.iter().map(|c| c.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 4], "ids are dense + unique: {ids:?}");
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "no duplicate bibliography id: {ids:?}");
+
+        // Run 2's body markers point at run 2's sources, NOT run 1's.
+        let run2 = r.sections.iter().find(|s| s.heading.contains("Run 2")).expect("run 2 section");
+        let run2_ids: Vec<usize> = run2.points.iter().map(|(_, id)| *id).collect();
+        for id in &run2_ids {
+            let cited = r.all_citations.iter().find(|c| c.id == *id).expect("marker resolves");
+            assert!(
+                cited.url.contains("b1.test") || cited.url.contains("b2.test"),
+                "run 2's marker [{id}] must resolve to a run-2 source, got {}",
+                cited.url
+            );
+        }
+
+        // …and every marker in the rendered markdown has exactly one bibliography line.
+        let md = render_markdown(&r);
+        for id in 1..=4 {
+            assert_eq!(
+                md.matches(&format!("\n[{id}] ")).count(),
+                1,
+                "exactly one `## Sources` line for [{id}]: {md}"
+            );
+        }
+    }
+
+    /// REGRESSION: a claim whose citation is refused by [`MAX_CITATIONS`] must be
+    /// bounded out of the BODY too. It used to still emit its `[n]` marker while
+    /// the bibliography stopped at the cap — a dangling marker pointing at nothing.
+    #[test]
+    fn a_claim_past_the_citation_cap_is_bounded_out_of_the_body_too() {
+        let mut sources = Vec::new();
+        for i in 0..(MAX_CITATIONS + 1) {
+            sources.push(SourcedClaim::cited(
+                format!("H{}", i % MAX_SECTIONS),
+                format!("claim {i}"),
+                sref(i + 1, &format!("https://e{i}.test")),
+            ));
+        }
+        let r = build_report("capped", &sources, &cfg());
+        let listed: std::collections::BTreeSet<usize> =
+            r.all_citations.iter().map(|c| c.id).collect();
+        let body: std::collections::BTreeSet<usize> = r
+            .sections
+            .iter()
+            .flat_map(|s| s.points.iter().map(|(_, id)| *id))
+            .collect();
+        let dangling: Vec<usize> = body.difference(&listed).copied().collect();
+        assert!(dangling.is_empty(), "body cites unlisted sources: {dangling:?}");
+        // The claim past the cap never reached the rendered body.
+        let md = render_markdown(&r);
+        assert!(
+            !md.contains(&format!("claim {}", MAX_CITATIONS)),
+            "the over-cap claim must not render: {md}"
+        );
     }
 
     #[test]

@@ -824,6 +824,29 @@ fn sweep_stale_utterances(root: &Path) {
     }
 }
 
+/// Clear out SCRATCH REALMS left behind by a previous run. Each realm verification
+/// materializes `state/realms/<ts>/` — a COW copy of the user's whole repo plus
+/// whatever the build wrote into it — and relies on `realm::RealmTeardown`'s `Drop`
+/// to remove it. `Drop` does NOT run on SIGKILL, a power loss, or
+/// `launchctl kickstart -k`, so every abrupt kill orphaned a full repo copy that
+/// nothing ever swept. At STARTUP nothing under `state/realms` can be live by
+/// construction (a realm exists only for the duration of one in-process
+/// verification), so removing all of them is safe. Mirrors
+/// [`sweep_stale_utterances`].
+fn sweep_stale_realms(root: &Path) {
+    let realms = crate::realm::realms_root(&root.join("state"));
+    let Ok(entries) = std::fs::read_dir(&realms) else { return };
+    let mut swept = 0u32;
+    for entry in entries.flatten() {
+        if std::fs::remove_dir_all(entry.path()).is_ok() {
+            swept += 1;
+        }
+    }
+    if swept > 0 {
+        info!(swept, "removed orphaned scratch realms from state/realms");
+    }
+}
+
 /// Remove a consumed utterance WAV; missing files are fine (already cleaned).
 fn discard_wav(path: &Path) {
     if let Err(e) = std::fs::remove_file(path) {
@@ -1674,6 +1697,11 @@ async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, soc
         let local = chrono::Local::now();
         let local_hour = local.hour() as u8;
         let local_minute = local.minute() as u8;
+        // The DST-AWARE start of today's local calendar day. The Daily due-check
+        // compares last_run against this exact instant rather than deriving
+        // "seconds since midnight" from hour/minute — that derivation is off by an
+        // hour on the 25-hour fall-back day and re-fired daily missions twice.
+        let local_midnight = standing::local_midnight(&local);
 
         let missions = match standing::list(&memory).await {
             Ok(m) => m,
@@ -1691,6 +1719,7 @@ async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, soc
             now,
             local_hour,
             local_minute,
+            local_midnight,
             &signals_present,
             enabled,
         );
@@ -2084,6 +2113,7 @@ async fn main() -> Result<()> {
     }
 
     sweep_stale_utterances(&root);
+    sweep_stale_realms(&root);
     anthropic::init_persona(&root);
 
     let (mut cfg, config_issues) = Config::load(&root.join("config").join("darwin.toml"));
@@ -5268,11 +5298,39 @@ async fn trigger_create_pronunciation(
 mod tests {
     use super::{
         fmt_ms, is_self_echo, is_stale_wait, resolve_explicit_guest, should_learn_turn,
-        RotatingLogWriter, STALE_UTTERANCE_WAIT,
+        sweep_stale_realms, RotatingLogWriter, STALE_UTTERANCE_WAIT,
     };
     use super::{focus, threshold};
     use std::io::Write;
     use std::time::Duration;
+
+    /// REGRESSION: a realm orphaned by an abrupt kill (SIGKILL / power loss —
+    /// `RealmTeardown`'s Drop never runs) is a full COW copy of the user's repo
+    /// under `state/realms/<ts>/`. Nothing swept it, so they accumulated one per
+    /// abrupt kill forever. Startup must clear them (nothing is live at boot).
+    #[test]
+    fn startup_sweeps_orphaned_scratch_realms() {
+        let root = std::env::temp_dir().join(format!("darwin-realm-sweep-{}", std::process::id()));
+        let realms = root.join("state").join("realms");
+        let orphan = realms.join("1700000000").join("src");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("main.rs"), b"fn main() {}").unwrap();
+        // A sibling state dir must survive — the sweep is scoped to state/realms.
+        let keep = root.join("state").join("tmp");
+        std::fs::create_dir_all(&keep).unwrap();
+
+        sweep_stale_realms(&root);
+
+        assert!(
+            std::fs::read_dir(&realms).unwrap().next().is_none(),
+            "every orphaned realm is removed"
+        );
+        assert!(keep.exists(), "the sweep never touches a sibling state dir");
+        // Idempotent + safe when the dir does not exist at all.
+        sweep_stale_realms(&root);
+        sweep_stale_realms(&root.join("nope"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
 
     /// A representative guest scope for the guest-turn assertions below.
     fn guest_scope() -> threshold::Scope {

@@ -57,6 +57,36 @@ public struct DetectorSet: OptionSet, Sendable {
     public static let all: DetectorSet = [.humans, .animals, .classification, .saliency]
 }
 
+/// An OCR read PLUS the honest pre-cap accounting for it.
+///
+/// WHY this type exists: `VisionEngine` caps recognized-text observations at
+/// `maxTextBlocks`, and VNRecognizeTextRequest returns roughly one observation per
+/// text LINE — a normal browser/IDE/settings screen produces hundreds. The wire
+/// only ever carried `block_count`, which is the POST-cap number, so a consumer
+/// could not tell "the screen had N blocks" from "the screen had far more and you
+/// got the first N": a partial read was presented as the screen's complete text,
+/// and the where-is locator (which searches only the returned blocks) answered
+/// "not found" for a control that WAS on screen. Every Python sibling that
+/// truncates reports it; this carries the same signal.
+public struct TextRead: Sendable {
+    /// The `.text` Detections actually returned (post-cap, post-confidence-floor).
+    public let detections: [Detection]
+    /// How many recognized-text observations the recognizer produced BEFORE the
+    /// `maxTextBlocks` cap.
+    public let totalObservations: Int
+    /// True when the cap DROPPED observations (`totalObservations > maxTextBlocks`).
+    public let truncated: Bool
+
+    public init(detections: [Detection], totalObservations: Int, truncated: Bool) {
+        self.detections = detections
+        self.totalObservations = totalObservations
+        self.truncated = truncated
+    }
+
+    /// An honest empty read (no backing pixels / the request failed).
+    public static let empty = TextRead(detections: [], totalObservations: 0, truncated: false)
+}
+
 /// Runs built-in Vision requests on a frame. Errors are recoverable (a bad
 /// frame yields []), so the protocol is non-throwing and total.
 public protocol Detector: Sendable {
@@ -78,6 +108,14 @@ public protocol Detector: Sendable {
     /// -> VNRecognizeTextRequest; the default below finds NO document (honest empty)
     /// so a stub/test detector never fabricates a page. Total + non-throwing.
     func scanDocument(in frame: Frame, minConfidence: Double) -> VisionEngine.DocumentScan
+
+    /// OCR-only read of one frame that ALSO reports how many text observations the
+    /// recognizer produced before any cap — so a caller can say "this readout is
+    /// partial" instead of presenting it as the screen's complete text. The
+    /// production `VisionEngine` reports the real pre-cap total; the default below
+    /// delegates to `detect` and reports no truncation, which is honest for a
+    /// Detector that has no cap of its own (the stubs/tests).
+    func readText(in frame: Frame, minConfidence: Double) -> TextRead
 }
 
 extension Detector {
@@ -90,6 +128,15 @@ extension Detector {
         let dets = detect(in: frame, detectors: detectors, minConfidence: minConfidence)
         let t1 = DispatchTime.now().uptimeNanoseconds
         return (dets, Double(t1 &- t0) / 1_000_000.0)
+    }
+
+    /// Default OCR-with-accounting seam: run the plain `.text` detect and report
+    /// NO truncation. Honest for a Detector with no cap of its own (a stub returns
+    /// exactly what it was given); `VisionEngine` overrides it with the real
+    /// pre-cap observation count.
+    public func readText(in frame: Frame, minConfidence: Double) -> TextRead {
+        let dets = detect(in: frame, detectors: .text, minConfidence: minConfidence)
+        return TextRead(detections: dets, totalObservations: dets.count, truncated: false)
     }
 
     /// Default document-scan seam: find NO document (honest empty). A detector
@@ -149,8 +196,15 @@ public struct VisionEngine: Detector {
     /// OS. Explicit so the OCR is reproducible; extend per locale as needed.
     public static let defaultRecognitionLanguages = ["en-US", "fr-FR", "de-DE", "es-ES", "it-IT", "pt-BR"]
 
+    // `maxTextBlocks` defaults to 512, not 64: VNRecognizeTextRequest returns
+    // roughly one observation per text LINE, and a normal browser/IDE/settings
+    // screen yields hundreds — 64 silently dropped most of a dense screen. These
+    // single-shot reads (read.screen / read.handwriting / scan.document) are ONE
+    // frame, not a per-frame budget, so the cap is a runaway guard rather than a
+    // working limit. Whatever the cap does drop is now REPORTED (`TextRead`
+    // /`blocks_truncated`) instead of passing as a complete read.
     public init(maxClassifications: Int = 5, maxSalientRegions: Int = 8,
-                maxTextBlocks: Int = 64, minimumTextHeight: Float = 0,
+                maxTextBlocks: Int = 512, minimumTextHeight: Float = 0,
                 recognitionLanguages: [String] = VisionEngine.defaultRecognitionLanguages) {
         self.maxClassifications = max(0, maxClassifications)
         self.maxSalientRegions = max(0, maxSalientRegions)
@@ -304,11 +358,20 @@ public struct VisionEngine: Detector {
         /// The detected page quad's confidence (0 when no document). Device-
         /// dependent; reported honestly, never fabricated.
         public let quadConfidence: Double
+        /// Recognized text observations BEFORE the `maxTextBlocks` cap, so a dense
+        /// page is never reported as fully read. Defaults to `lines.count` for the
+        /// paths that do no capping.
+        public let linesTotal: Int
+        /// True when the cap DROPPED lines off this page.
+        public let linesTruncated: Bool
 
-        public init(documentDetected: Bool, lines: [Detection], quadConfidence: Double) {
+        public init(documentDetected: Bool, lines: [Detection], quadConfidence: Double,
+                    linesTotal: Int? = nil, linesTruncated: Bool = false) {
             self.documentDetected = documentDetected
             self.lines = lines
             self.quadConfidence = quadConfidence
+            self.linesTotal = linesTotal ?? lines.count
+            self.linesTruncated = linesTruncated
         }
 
         /// The honest "no document found" result — never a fabricated page.
@@ -380,19 +443,16 @@ public struct VisionEngine: Detector {
 
         // 4. OCR the corrected page with the same .accurate + language-correction
         //    recognizer the screen/handwriting paths use.
-        let textReq = VNRecognizeTextRequest()
-        textReq.recognitionLevel = .accurate
-        textReq.usesLanguageCorrection = true
-        textReq.recognitionLanguages = recognitionLanguages
-        if minimumTextHeight > 0 { textReq.minimumTextHeight = minimumTextHeight }
+        let textReq = makeTextRequest()
         do {
             try ocrSource.perform([textReq])
         } catch {
             // A document WAS detected but OCR failed: honest — detected, no lines.
             return DocumentScan(documentDetected: true, lines: [], quadConfidence: quadConfidence)
         }
-        let lines = mapText(textReq, floor: floor)
-        return DocumentScan(documentDetected: true, lines: lines, quadConfidence: quadConfidence)
+        let (lines, total) = mapText(textReq, floor: floor)
+        return DocumentScan(documentDetected: true, lines: lines, quadConfidence: quadConfidence,
+                            linesTotal: total, linesTruncated: total > maxTextBlocks)
     }
 
     /// Headless document-scan entry from a file path. Returns the honest `.none`
@@ -460,11 +520,7 @@ public struct VisionEngine: Detector {
         // this reads glyphs, NOT a face/identity.
         let textReq: VNRecognizeTextRequest?
         if detectors.contains(.text) {
-            let r = VNRecognizeTextRequest()
-            r.recognitionLevel = .accurate
-            r.usesLanguageCorrection = true
-            r.recognitionLanguages = recognitionLanguages
-            if minimumTextHeight > 0 { r.minimumTextHeight = minimumTextHeight }
+            let r = makeTextRequest()
             textReq = r
             requests.append(r)
         } else { textReq = nil }
@@ -489,8 +545,54 @@ public struct VisionEngine: Detector {
         detections += Self.mapAnimals(animalReq, floor: floor)
         detections += mapClassifications(classifyReq, floor: floor)
         detections += mapSaliency(saliencyReq, floor: floor)
-        detections += mapText(textReq, floor: floor)
+        detections += mapText(textReq, floor: floor).detections
         return (detections, inferenceMs)
+    }
+
+    /// The ONE OCR request configuration the engine uses everywhere (.accurate +
+    /// language correction over the explicit language list — deterministic and
+    /// offline). Factored so `runTimed` and [`readText`] can never drift apart.
+    private func makeTextRequest() -> VNRecognizeTextRequest {
+        let r = VNRecognizeTextRequest()
+        r.recognitionLevel = .accurate
+        r.usesLanguageCorrection = true
+        r.recognitionLanguages = recognitionLanguages
+        if minimumTextHeight > 0 { r.minimumTextHeight = minimumTextHeight }
+        return r
+    }
+
+    /// OCR-only read of one frame WITH the honest pre-cap accounting (the
+    /// [`Detector.readText`] seam). Same recognizer and same cap as the `.text`
+    /// path in `runTimed`; the difference is that the pre-cap observation total
+    /// rides out with the detections, so `read.screen` can report
+    /// `blocks_truncated` instead of presenting the first `maxTextBlocks` lines as
+    /// the screen's complete text. A frame with no backing pixels, or a failed
+    /// perform, is an honest empty read (never a fabricated readout).
+    public func readText(in frame: Frame, minConfidence: Double) -> TextRead {
+        guard let handler = Self.makeHandler(for: frame) else { return .empty }
+        return readText(handler: handler, minConfidence: minConfidence)
+    }
+
+    /// Headless OCR-with-accounting over a CGImage — the same read the live
+    /// `read.screen` path performs, verifiable with NO camera/screen/TCC. Backs
+    /// the `vision ocr` CLI so its JSON carries the same truncation signal the
+    /// wire does.
+    public func readText(image: CGImage, minConfidence: Double = 0.0) -> TextRead {
+        readText(handler: VNImageRequestHandler(cgImage: image, options: [:]),
+                 minConfidence: minConfidence)
+    }
+
+    private func readText(handler: VNImageRequestHandler, minConfidence: Double) -> TextRead {
+        let req = makeTextRequest()
+        do {
+            try handler.perform([req])
+        } catch {
+            return .empty
+        }
+        let (dets, total) = mapText(req, floor: max(0.0, min(1.0, minConfidence)))
+        return TextRead(detections: dets,
+                        totalObservations: total,
+                        truncated: total > maxTextBlocks)
     }
 
     // --- Result mappers (each total; a nil request -> []) ------------------
@@ -565,8 +667,14 @@ public struct VisionEngine: Detector {
     /// never attach an identity. Capped at `maxTextBlocks`. Blocks are returned
     /// in the recognizer's observation order (the structuring stage re-orders for
     /// reading order); empty candidates are dropped.
-    private func mapText(_ req: VNRecognizeTextRequest?, floor: Double) -> [Detection] {
-        guard let observations = req?.results, maxTextBlocks > 0 else { return [] }
+    ///
+    /// Also returns the PRE-CAP observation total so a caller can report an
+    /// honest `blocks_truncated` instead of presenting a capped read as complete.
+    private func mapText(_ req: VNRecognizeTextRequest?, floor: Double)
+        -> (detections: [Detection], total: Int)
+    {
+        guard let observations = req?.results else { return ([], 0) }
+        guard maxTextBlocks > 0 else { return ([], observations.count) }
         var out: [Detection] = []
         for obs in observations.prefix(maxTextBlocks) {
             guard let top = obs.topCandidates(1).first else { continue }
@@ -579,7 +687,7 @@ public struct VisionEngine: Detector {
                                  confidence: conf,
                                  label: string))
         }
-        return out
+        return (out, observations.count)
     }
 
     // --- Frame -> request handler ------------------------------------------

@@ -33,6 +33,19 @@ const BARGE_SETTLE_MS: u64 = 350;
 /// a 60fps HUD waveform that interpolates between samples, while guaranteeing
 /// the WS broadcast channel is never flooded by the audio thread.
 const LEVEL_INTERVAL: Duration = Duration::from_millis(66);
+/// How long the processing loop waits for the next chunk before looking up from
+/// the channel to check whether capture is still alive. A plain `recv()` cannot
+/// wake at all on a dead device (the cpal Stream — and with it the sender — stays
+/// alive), which is exactly how the loop used to block forever; this poll is the
+/// wakeup that lets the checks below run.
+const CAPTURE_POLL: Duration = Duration::from_millis(500);
+/// How long the input device may deliver NOTHING before we call it LOST. A running
+/// CoreAudio input stream delivers callbacks continuously — silence arrives as
+/// zero samples — so a gap this long means the device stopped feeding us (AirPods
+/// dropping off, a USB mic/dock unplugged, a headset swap). Generous on purpose:
+/// the cost of a false positive is a daemon restart, so the window sits well past
+/// any wake-from-sleep device re-acquire.
+const DEVICE_DEAF_AFTER: Duration = Duration::from_secs(15);
 
 pub fn spawn_capture(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) {
     // cpal::Stream is !Send, so the stream must live on the thread that owns
@@ -45,6 +58,73 @@ pub fn spawn_capture(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>
             }
         })
         .expect("spawn audio thread");
+}
+
+/// The reason capture died, published by code that CANNOT return an `Err` itself:
+/// the cpal error callback (it runs on CoreAudio's thread and its only reach into
+/// the daemon used to be a `warn!`) and the app-ingest reader thread.
+/// [`capture_loop`] polls it and turns it into the `Err` that makes
+/// [`spawn_capture`] log the ERROR line `"audio capture stopped"` — heal.rs's
+/// single total-loss trigger — and drop `tx`, which ends main's event loop so the
+/// process is restarted with a fresh device. Without this channel a dead device is
+/// a `warn!` and nothing else: the Stream (and therefore `raw_tx`) stays alive, the
+/// loop blocks in `recv()` forever, and DARWIN is permanently deaf behind a
+/// healthy-looking process, with BOTH designed safety nets silently defeated.
+#[derive(Default)]
+struct CaptureFault(std::sync::Mutex<Option<(String, bool)>>);
+
+impl CaptureFault {
+    /// Record the FIRST reason (later ones are echoes of the same failure). Never
+    /// panics on a poisoned lock — this runs on a realtime-adjacent audio thread.
+    fn record(&self, reason: String, fatal: bool) {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if slot.is_none() {
+            *slot = Some((reason, fatal));
+        }
+    }
+
+    /// A callback reported an error but the stream MAY still be delivering (a
+    /// one-off render error, a device blip). Fatal only if the frames also stop.
+    fn set_suspect(&self, reason: impl Into<String>) {
+        self.record(reason.into(), false);
+    }
+
+    /// The source has STOPPED and cannot come back on its own (the ingest thread
+    /// returned): capture is over whatever the channel still holds.
+    fn set_fatal(&self, reason: impl Into<String>) {
+        self.record(reason.into(), true);
+    }
+
+    /// Take the recorded reason whatever its severity — the caller is ending the
+    /// loop because no frames are arriving any more.
+    fn take(&self) -> Option<String> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .map(|(reason, _)| reason)
+    }
+
+    /// Frames are flowing again: DROP a merely suspected fault (returned so the
+    /// caller can log the recovery) but KEEP a fatal one — a queued chunk captured
+    /// before the source died must never look like proof that it is alive.
+    fn clear_if_suspect(&self) -> Option<String> {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        match slot.take() {
+            Some((reason, false)) => Some(reason),
+            other => {
+                *slot = other;
+                None
+            }
+        }
+    }
+}
+
+/// Has the input device been silent long enough to declare it LOST? PURE (so the
+/// window is unit-tested without a device): `silent_polls` consecutive empty
+/// `poll`-long waits cover at least `limit`.
+fn device_deaf_for(silent_polls: u32, poll: Duration, limit: Duration) -> bool {
+    poll.saturating_mul(silent_polls) >= limit
 }
 
 fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> Result<()> {
@@ -64,6 +144,9 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
     // Either way we end up with the same (raw_rx, sample_rate, channels) and fall
     // through to the UNCHANGED processing loop.
     let (raw_tx, raw_rx) = std_mpsc::channel::<Vec<f32>>();
+    // The one-way channel a callback/reader-thread uses to tell the loop that
+    // capture is DEAD (see `CaptureFault`); polled below on every idle window.
+    let fault = Arc::new(CaptureFault::default());
 
     // Kept alive for the whole loop: in device mode it's the cpal Stream guard; in
     // app mode it stays None (the reader thread owns the socket). Dropping it stops
@@ -71,6 +154,7 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
     let _cpal_stream: Option<cpal::Stream>;
     let sample_rate: u32;
     let channels: usize;
+    let device_mode = !mic_source_is_app(&cfg.voice.mic_source);
 
     if mic_source_is_app(&cfg.voice.mic_source) {
         // APP MODE: route the mic in over state/ipc/audio_in.sock from the HUD.
@@ -79,8 +163,10 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
         // (sample_rate, channels) the HUD declares. A reader thread then decodes
         // length-prefixed f32 frames and pushes each Vec<f32> into raw_tx — the
         // SAME channel the cpal callback feeds. A bind/handshake/token failure is
-        // logged and returns Err cleanly (the loop never panics or wedges).
-        let header = accept_app_audio(&root, raw_tx)?;
+        // logged and returns Err cleanly (the loop never panics or wedges). The
+        // listener stays bound for the life of ingest, so the HUD quitting is a
+        // RECONNECT, not the end of capture.
+        let header = accept_app_audio(&root, raw_tx, Arc::clone(&fault))?;
         sample_rate = header.sample_rate;
         channels = (header.channels as usize).max(1);
         _cpal_stream = None;
@@ -101,12 +187,25 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
         // The cpal callback runs on a realtime audio thread and must not block or
         // allocate heavily: ship raw frames over a std channel and do VAD + WAV
         // writing here instead.
+        // The ERROR callback is the ONLY notice cpal gives that the device died
+        // (AirPods disconnecting, a USB mic/dock unplugged — routine on a personal
+        // Mac). It used to only `warn!`: the Stream stayed alive, so the data
+        // callback's `raw_tx` stayed alive, so the loop below blocked in `recv()`
+        // forever and voice never worked again until a manual restart — while the
+        // process, the HUD and system.load all looked healthy. Publishing the fault
+        // (and letting the loop return `Err`) re-arms both designed safety nets:
+        // the `"audio capture stopped"` total-loss line heal.rs watches for, and
+        // the tx-drop that ends main so launchd restarts with a live device.
+        let err_fault = Arc::clone(&fault);
         let stream = device.build_input_stream(
             &stream_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 let _ = raw_tx.send(data.to_vec());
             },
-            |err| warn!(error = %err, "cpal stream error"),
+            move |err| {
+                error!(error = %err, "cpal stream error");
+                err_fault.set_suspect(format!("input device error: {err}"));
+            },
             None,
         )?;
         stream.play().context("starting input stream")?;
@@ -160,7 +259,51 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
     // the previous run's WAVs, invalidating transcript wav_path references).
     let pid = std::process::id();
 
-    while let Ok(chunk) = raw_rx.recv() {
+    // A plain `recv()` here is what let a dead device wedge capture forever: the
+    // Stream (and its sender) outlive the device, so the channel never closes and
+    // the loop never wakes. We wait in bounded windows instead and, on each idle
+    // window, (a) surface any fault a callback/reader published and (b) in device
+    // mode, treat a long run of empty windows as device loss — a running CoreAudio
+    // input stream delivers frames continuously, silence included. Both exits are
+    // an `Err`, which is what marks the total loss and re-arms the restart path.
+    let mut silent_polls: u32 = 0;
+    loop {
+        let chunk = match raw_rx.recv_timeout(CAPTURE_POLL) {
+            Ok(chunk) => {
+                silent_polls = 0;
+                // Frames are flowing, so a fault a callback recorded did NOT stop
+                // capture (a one-off render error, a device blip that resumed):
+                // clear it rather than tearing the daemon down on stale news. If
+                // the device is in fact dying, the deafness window below still
+                // ends the loop the moment the frames actually stop.
+                if let Some(reason) = fault.clear_if_suspect() {
+                    warn!(reason, "audio: the input stream reported an error but frames resumed; continuing");
+                }
+                chunk
+            }
+            Err(std_mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(reason) = fault.take() {
+                    return Err(capture_death(&reason));
+                }
+                silent_polls = silent_polls.saturating_add(1);
+                if device_mode && device_deaf_for(silent_polls, CAPTURE_POLL, DEVICE_DEAF_AFTER) {
+                    return Err(capture_death(&format!(
+                        "no audio from the input device for {}s",
+                        DEVICE_DEAF_AFTER.as_secs()
+                    )));
+                }
+                continue;
+            }
+            Err(std_mpsc::RecvTimeoutError::Disconnected) => {
+                // Every sender is gone. If someone published WHY, this is a total
+                // loss and must be reported as one; otherwise it is the ordinary
+                // shutdown the old `while let Ok(..)` produced.
+                return match fault.take() {
+                    Some(reason) => Err(capture_death(&reason)),
+                    None => Ok(()),
+                };
+            }
+        };
         // LOCKDOWN OVERLAY (task #12 — THE mic kill). While the emergency stop is
         // engaged the capture loop IGNORES every frame: drop it, reset the VAD so
         // no partial utterance survives, and never emit/segment/transcribe. This
@@ -334,7 +477,16 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
             }
         }
     }
-    Ok(())
+}
+
+/// Build the error that ENDS capture, announcing the total loss on the way out.
+/// The telemetry is the live signal (the HUD sees capture die instead of watching
+/// a waveform that simply never moves again); the returned `Err` is what
+/// `spawn_capture` logs as `"audio capture stopped"` — heal.rs's total-loss
+/// trigger — before the sender drops and main winds down for a restart.
+fn capture_death(reason: &str) -> anyhow::Error {
+    telemetry::emit("audio", "audio.capture_stopped", json!({ "reason": reason }));
+    anyhow!("{reason}")
 }
 
 // ===========================================================================
@@ -449,65 +601,156 @@ fn read_app_handshake<R: std::io::BufRead>(reader: &mut R) -> Result<AppAudioHea
     })
 }
 
-/// Bind the app-audio socket, accept ONE HUD connection, verify the handshake,
-/// and spawn a reader thread that decodes length-prefixed f32 frames into
-/// `raw_tx`. Returns the verified header (sample_rate/channels) so the caller can
-/// run the processing loop. A bind/handshake/token failure is an `Err` (logged by
-/// the caller) — the loop never panics or wedges.
+/// Bind the app-audio socket, accept the FIRST authenticated HUD connection, and
+/// hand the connection + the still-bound listener to a reader thread that decodes
+/// length-prefixed f32 frames into `raw_tx` and RE-ACCEPTS across HUD restarts.
+/// Returns the verified header (sample_rate/channels) so the caller can run the
+/// processing loop. A bind failure is an `Err` (logged by the caller) — the loop
+/// never panics or wedges.
 ///
 /// The accept BLOCKS until the HUD connects (the capture thread has nothing to do
 /// until there is an audio source), mirroring how device mode blocks until cpal
 /// delivers the first frame.
+///
+/// WHY THE LISTENER OUTLIVES THE CONNECTION: it used to be a local, dropped the
+/// moment the first connection was accepted — so quitting DARWIN.app (an ordinary
+/// user action) sent EOF, ended the reader, dropped the only `raw_tx`, and ended
+/// `capture_loop` with `Ok(())`. That closed the Event channel and the whole
+/// DAEMON exited — silently, with no total-loss line — dropping in-flight turns,
+/// leaving a stale socket file with nothing listening, and turning a HUD that
+/// flaps faster than launchd's ThrottleInterval into a restart loop. Keeping the
+/// listener alive makes a HUD restart what it should be: a reconnect.
 fn accept_app_audio(
     root: &std::path::Path,
     raw_tx: std_mpsc::Sender<Vec<f32>>,
+    fault: Arc<CaptureFault>,
 ) -> Result<AppAudioHeader> {
     let sock = audio_in_sock_path(root);
     let listener = bind_audio_socket(&sock)
         .with_context(|| format!("binding app-audio socket {}", sock.display()))?;
     info!(path = %sock.display(), "app-audio ingest listening");
 
-    // Accept the HUD connection. We serve a single audio source at a time (one
-    // mic), so we take the first connection and read it to EOF.
-    let (stream, _peer) = listener.accept().context("accepting app-audio connection")?;
-    // Bound the HANDSHAKE: a same-user client that connects then stalls before
-    // sending its token must not pin the capture thread in read_until forever.
-    // Cleared right after the handshake so continuous frame reads block normally.
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let mut reader = std::io::BufReader::new(stream);
-    let header = read_app_handshake(&mut reader)?;
-    let _ = reader.get_ref().set_read_timeout(None);
+    // The FIRST connection is accepted here because the caller cannot run the
+    // processing loop until it knows the declared capture format.
+    let (reader, header) = accept_one_app_connection(&listener)?;
 
-    // Reader thread: owns the connection + a clone-free move of raw_tx, decodes
-    // frames, pushes each Vec<f32> into the SAME channel the cpal callback feeds.
-    // Ends on EOF / read error / a frame over the cap (logged, then stops ingest).
+    // Reader thread: owns the connection, the LISTENER, and a clone-free move of
+    // raw_tx; decodes frames into the SAME channel the cpal callback feeds and
+    // re-accepts when the HUD goes away.
     std::thread::Builder::new()
         .name("audio-app-ingest".to_string())
-        .spawn(move || {
-            if let Err(e) = read_app_frames(&mut reader, &raw_tx) {
-                info!(error = %e, "app-audio ingest ended");
-            }
-        })
+        .spawn(move || serve_app_audio(listener, reader, header, raw_tx, fault))
         .context("spawning app-audio reader thread")?;
 
     Ok(header)
 }
 
+/// Accept ONE authenticated app-audio connection: block in `accept()`, bound the
+/// handshake read, verify the token, and return the framed reader + the format the
+/// client declared. A connection that fails the handshake is CLOSED and we accept
+/// again — an unauthenticated prober (or a stale HUD with an old boot token) must
+/// never be able to end mic ingest. Only a failure of the LISTENER itself is an
+/// `Err`: at that point no HUD can ever reconnect.
+fn accept_one_app_connection(
+    listener: &std::os::unix::net::UnixListener,
+) -> Result<(
+    std::io::BufReader<std::os::unix::net::UnixStream>,
+    AppAudioHeader,
+)> {
+    loop {
+        let (stream, _peer) = listener.accept().context("accepting app-audio connection")?;
+        // Bound the HANDSHAKE: a same-user client that connects then stalls before
+        // sending its token must not pin the ingest thread in read_until forever.
+        // Cleared right after the handshake so continuous frame reads block normally.
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+        let mut reader = std::io::BufReader::new(stream);
+        match read_app_handshake(&mut reader) {
+            Ok(header) => {
+                let _ = reader.get_ref().set_read_timeout(None);
+                return Ok((reader, header));
+            }
+            // No token value is ever logged — only that this connection was refused.
+            Err(e) => warn!(error = %e, "app-audio handshake refused; waiting for another connection"),
+        }
+    }
+}
+
+/// Serve app-audio ingest for the life of the capture loop: read frames from the
+/// current connection, and when the HUD goes away, wait on the still-bound
+/// listener for it to come back.
+///
+/// HONEST DEGRADE: the processing loop downstream is built around the FIRST
+/// connection's `(sample_rate, channels)`. A HUD that reconnects declaring a
+/// different format cannot be decoded against that pinned rate — the audio would
+/// be silently wrong (mis-pitched, mis-segmented, mis-transcribed), so ingest
+/// STOPS with a recorded fault instead: the capture loop then reports a total loss
+/// and the daemon restarts, coming back up on the new format.
+fn serve_app_audio(
+    listener: std::os::unix::net::UnixListener,
+    first: std::io::BufReader<std::os::unix::net::UnixStream>,
+    format: AppAudioHeader,
+    raw_tx: std_mpsc::Sender<Vec<f32>>,
+    fault: Arc<CaptureFault>,
+) {
+    let mut reader = first;
+    loop {
+        match read_app_frames(&mut reader, &raw_tx) {
+            // The processing loop is gone: there is nothing left to feed.
+            Ok(AppIngestEnd::ReceiverGone) => return,
+            Ok(AppIngestEnd::PeerClosed) => {
+                info!("app-audio: the HUD disconnected; waiting for it to reconnect")
+            }
+            Err(e) => info!(error = %e, "app-audio ingest ended; waiting for a reconnect"),
+        }
+        match accept_one_app_connection(&listener) {
+            Ok((next, header)) => {
+                if header.sample_rate != format.sample_rate || header.channels != format.channels {
+                    fault.set_fatal(format!(
+                        "app audio reconnected with a different capture format \
+                         ({} Hz / {} ch, was {} Hz / {} ch)",
+                        header.sample_rate, header.channels, format.sample_rate, format.channels
+                    ));
+                    return;
+                }
+                info!("app-audio ingest reconnected");
+                reader = next;
+            }
+            Err(e) => {
+                // The listener is gone — no HUD can reconnect, so this IS the end of
+                // capture and must be reported as one, not silently idled through.
+                fault.set_fatal(format!("app-audio listener failed: {e}"));
+                return;
+            }
+        }
+    }
+}
+
+/// Why one connection's ingest ended — the two cases the serve loop must treat
+/// DIFFERENTLY: a HUD that closed is a reconnect, a gone receiver is the end.
+enum AppIngestEnd {
+    /// Clean EOF at a frame boundary: the HUD closed the connection. The listener
+    /// stays bound and we wait for it to come back.
+    PeerClosed,
+    /// The processing loop returned, so the receiver is gone — nothing left to feed.
+    ReceiverGone,
+}
+
 /// Read length-prefixed f32 frames from an authenticated connection until EOF /
 /// error, pushing each decoded `Vec<f32>` into `raw_tx`. Each frame is a 4-byte
 /// LE `u32` sample count `N` (bounded by [`MAX_FRAME_SAMPLES`]) followed by
-/// `N * 4` LE-f32 bytes. A clean EOF (the HUD closed) returns `Ok(())`; a partial
-/// frame / oversized prefix is an `Err`. Stops the moment the receiver is gone
-/// (the processing loop returned).
+/// `N * 4` LE-f32 bytes. A clean EOF (the HUD closed) returns
+/// [`AppIngestEnd::PeerClosed`]; a partial frame / oversized prefix is an `Err`.
+/// Stops with [`AppIngestEnd::ReceiverGone`] the moment the receiver is gone (the
+/// processing loop returned).
 fn read_app_frames<R: std::io::Read>(
     reader: &mut R,
     raw_tx: &std_mpsc::Sender<Vec<f32>>,
-) -> Result<()> {
+) -> Result<AppIngestEnd> {
     loop {
         let mut len_buf = [0u8; 4];
         // A clean EOF exactly at a frame boundary is the normal end of stream.
         match read_full_or_eof(reader, &mut len_buf)? {
-            ReadFrame::Eof => return Ok(()),
+            ReadFrame::Eof => return Ok(AppIngestEnd::PeerClosed),
             ReadFrame::Got => {}
         }
         let n = u32::from_le_bytes(len_buf);
@@ -521,7 +764,7 @@ fn read_app_frames<R: std::io::Read>(
         let frame = decode_frame(&payload);
         // The receiver is gone once the processing loop returns — stop cleanly.
         if raw_tx.send(frame).is_err() {
-            return Ok(());
+            return Ok(AppIngestEnd::ReceiverGone);
         }
     }
 }
@@ -1462,7 +1705,10 @@ mod app_ingest_tests {
         decode_frame, encode_frame, mic_source_is_app, read_app_frames, read_full_or_eof,
         ReadFrame, MAX_FRAME_SAMPLES,
     };
+    use std::path::PathBuf;
     use std::sync::mpsc as std_mpsc;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     /// PURE roundtrip: encode samples into a length-prefixed frame, strip the
     /// 4-byte prefix, and decode the payload back to the EXACT same f32s. This is
@@ -1559,6 +1805,221 @@ mod app_ingest_tests {
         let mut cursor: &[u8] = &wire;
         let (tx, _rx) = std_mpsc::channel::<Vec<f32>>();
         assert!(read_app_frames(&mut cursor, &tx).is_err());
+    }
+
+    // -- capture liveness: device loss must END the loop, not wedge it ----
+
+    /// The deafness window: a running input stream delivers frames continuously,
+    /// so only a LONG run of empty poll windows counts as device loss. The window
+    /// is what stops a wedged-forever capture thread (the AirPods/USB-mic
+    /// disconnect case, where cpal keeps the Stream — and its sender — alive).
+    #[test]
+    fn device_deafness_window_needs_the_full_run_of_silent_polls() {
+        let poll = super::CAPTURE_POLL;
+        let limit = super::DEVICE_DEAF_AFTER;
+        assert!(!super::device_deaf_for(0, poll, limit), "a fresh loop is not deaf");
+        assert!(!super::device_deaf_for(1, poll, limit), "one quiet window is not loss");
+        // One poll short of the window is still alive; the window itself trips it.
+        let exact = (limit.as_millis() / poll.as_millis()) as u32;
+        assert!(!super::device_deaf_for(exact - 1, poll, limit), "just under the window");
+        assert!(super::device_deaf_for(exact, poll, limit), "the full window is device loss");
+        assert!(super::device_deaf_for(exact + 10, poll, limit));
+    }
+
+    /// The fault channel keeps the FIRST reason (a dying device can fire the error
+    /// callback repeatedly) and hands it over exactly once, which is what turns a
+    /// dead device into the `"audio capture stopped"` total-loss `Err` instead of
+    /// a lone `warn!` nobody acts on. A merely SUSPECTED fault is cleared when
+    /// frames resume; a FATAL one (the source already stopped) survives a chunk
+    /// that was queued before it died — otherwise a stale buffer would look like
+    /// proof of life and the loop would idle on deaf.
+    #[test]
+    fn capture_fault_keeps_the_first_reason_and_distinguishes_fatal_from_suspect() {
+        let fault = super::CaptureFault::default();
+        assert!(fault.take().is_none(), "no fault -> ordinary shutdown");
+        fault.set_suspect("input device error: device not available");
+        fault.set_suspect("input device error: a later echo of the same failure");
+        let first = fault.take().expect("a fault was recorded");
+        assert!(first.contains("device not available"), "{first}");
+        assert!(fault.take().is_none(), "taken exactly once");
+
+        // Suspected: frames resuming clears it (no restart on a recovered blip).
+        let fault = super::CaptureFault::default();
+        fault.set_suspect("input device error: transient");
+        assert!(fault.clear_if_suspect().is_some(), "a suspected fault clears");
+        assert!(fault.take().is_none(), "and is gone");
+
+        // Fatal: a queued chunk must NOT clear it.
+        let fault = super::CaptureFault::default();
+        fault.set_fatal("app-audio listener failed");
+        assert!(fault.clear_if_suspect().is_none(), "a fatal fault is not cleared");
+        assert_eq!(
+            fault.take().as_deref(),
+            Some("app-audio listener failed"),
+            "and still ends the loop"
+        );
+    }
+
+    // -- app ingest: a HUD restart is a RECONNECT, not the end of capture -
+
+    /// A clean EOF is the HUD closing (we re-accept); a gone receiver is the
+    /// processing loop returning (nothing left to feed). The serve loop MUST tell
+    /// them apart — conflating them is what made quitting DARWIN.app end ingest.
+    #[test]
+    fn read_app_frames_distinguishes_a_closed_peer_from_a_gone_receiver() {
+        // Clean EOF at a frame boundary -> PeerClosed.
+        let wire = encode_frame(&[0.5f32]);
+        let mut cursor: &[u8] = &wire;
+        let (tx, rx) = std_mpsc::channel::<Vec<f32>>();
+        assert!(matches!(
+            read_app_frames(&mut cursor, &tx),
+            Ok(super::AppIngestEnd::PeerClosed)
+        ));
+        drop(rx);
+        // Receiver gone -> ReceiverGone (the send fails on the next frame).
+        let mut cursor2: &[u8] = &wire;
+        assert!(matches!(
+            read_app_frames(&mut cursor2, &tx),
+            Ok(super::AppIngestEnd::ReceiverGone)
+        ));
+    }
+
+    /// END-TO-END over a REAL Unix socket: the HUD connects, streams a frame, and
+    /// QUITS — and a second HUD then connects and streams another. Both frames
+    /// reach the capture channel, which is only possible if the listener outlived
+    /// the first connection. Before the fix the listener was dropped after the one
+    /// accept, so this reconnect got ECONNREFUSED and the whole daemon had already
+    /// exited on the first disconnect.
+    #[test]
+    fn app_ingest_reaccepts_after_the_hud_disconnects() {
+        use std::io::Write;
+        // /tmp (not env::temp_dir(), which is a long /var/folders path) keeps the
+        // sockaddr_un path under macOS's ~104-byte SUN_LEN cap.
+        let root = PathBuf::from("/tmp").join(format!("dw-ai-{}", std::process::id()));
+        let sock = super::audio_in_sock_path(&root);
+        let token = crate::apps::mint_command_token();
+
+        // A HUD: connect (retrying until the daemon has bound), handshake, stream.
+        let connect_and_send = move |token: String, sock: PathBuf, sample: f32| {
+            let mut stream = None;
+            for _ in 0..200 {
+                match std::os::unix::net::UnixStream::connect(&sock) {
+                    Ok(s) => {
+                        stream = Some(s);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            let mut s = stream.expect("the daemon's app-audio socket must accept a connection");
+            let hs = format!(
+                "{{\"token\":\"{token}\",\"sample_rate\":16000,\"channels\":1}}\n"
+            );
+            s.write_all(hs.as_bytes()).unwrap();
+            s.write_all(&encode_frame(&[sample])).unwrap();
+            s.flush().unwrap();
+            s
+        };
+
+        let (raw_tx, raw_rx) = std_mpsc::channel::<Vec<f32>>();
+        let fault = Arc::new(super::CaptureFault::default());
+        // HUD #1 races the bind; accept_app_audio blocks until it lands.
+        let first = {
+            let (t, p) = (token.clone(), sock.clone());
+            std::thread::spawn(move || connect_and_send(t, p, 0.25))
+        };
+        let header =
+            super::accept_app_audio(&root, raw_tx, Arc::clone(&fault)).expect("ingest starts");
+        assert_eq!(header.sample_rate, 16_000);
+        assert_eq!(
+            raw_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            vec![0.25f32],
+            "the first HUD's audio is ingested"
+        );
+
+        // The HUD QUITS.
+        drop(first.join().expect("hud thread"));
+
+        // A new HUD connects — the listener must still be there.
+        let second = connect_and_send(token, sock.clone(), 0.75);
+        assert_eq!(
+            raw_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            vec![0.75f32],
+            "a reconnecting HUD is served without restarting the daemon"
+        );
+        assert!(fault.take().is_none(), "a HUD restart is not a capture failure");
+        drop(second);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// THE FAULT PLUMBING, END TO END: something publishes a fatal capture fault
+    /// and `capture_loop` RETURNS AN ERROR — which is what makes `spawn_capture`
+    /// log `"audio capture stopped"` (heal.rs's total-loss trigger) and drop the
+    /// Event sender so main winds down for a restart. Before the fix a dead source
+    /// either wedged the loop forever (device mode: the cpal error callback only
+    /// warned) or ended it with `Ok(())` (app mode: a silent whole-daemon exit) —
+    /// both leaving the total-loss marker unwritten. The device path cannot be
+    /// driven headlessly (no CoreAudio in a test), so the SAME fault channel is
+    /// exercised through the app path.
+    #[test]
+    fn a_fatal_fault_ends_the_capture_loop_with_an_error() {
+        use std::io::Write;
+        let root = PathBuf::from("/tmp").join(format!("dw-af-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("state").join("tmp")).ok();
+        let sock = super::audio_in_sock_path(&root);
+        let token = crate::apps::mint_command_token();
+
+        let hud = move |token: &str, rate: u32, sample: f32| {
+            let mut stream = None;
+            for _ in 0..300 {
+                match std::os::unix::net::UnixStream::connect(&sock) {
+                    Ok(s) => {
+                        stream = Some(s);
+                        break;
+                    }
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            let mut s = stream.expect("the capture loop must be listening");
+            s.write_all(
+                format!("{{\"token\":\"{token}\",\"sample_rate\":{rate},\"channels\":1}}\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+            s.write_all(&encode_frame(&[sample])).unwrap();
+            s.flush().unwrap();
+            s
+        };
+
+        let mut cfg = crate::config::Config::default();
+        cfg.voice.mic_source = "app".to_string();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<crate::Event>();
+        // Run the loop off-thread and collect its RESULT, so a regression that
+        // wedges capture fails this test instead of hanging the suite.
+        let (done_tx, done_rx) = std_mpsc::channel::<Result<(), String>>();
+        let loop_root = root.clone();
+        std::thread::spawn(move || {
+            let r = super::capture_loop(loop_root, Arc::new(cfg), tx);
+            let _ = done_tx.send(r.map_err(|e| e.to_string()));
+        });
+
+        // The HUD connects at 16 kHz, then RECONNECTS declaring 48 kHz — audio the
+        // pinned processing loop cannot decode, so ingest stops honestly instead of
+        // feeding wrongly-decoded samples into transcription.
+        let first = hud(&token, 16_000, 0.25);
+        drop(first);
+        let second = hud(&token, 48_000, 0.75);
+
+        let res = done_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("capture_loop must RETURN on a fatal fault, not wedge");
+        let err = res.expect_err("a fatal fault must end the loop with an Err");
+        assert!(
+            err.contains("different capture format"),
+            "the error must name the real reason (it becomes the heal log line): {err}"
+        );
+        drop(second);
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// mic_source_is_app selects the socket ingest ONLY for the exact "app"; the

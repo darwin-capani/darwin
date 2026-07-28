@@ -375,24 +375,30 @@ impl Schedule {
     }
 
     /// PURE due check: given `now` (unix secs), the user's `local_hour`/
-    /// `local_minute` for the daily case, the mission's `last_run` (unix secs, 0 =
-    /// never), and the set of `signals_present` this tick, decide whether this
-    /// schedule is DUE to fire NOW. This is the heart of the scheduler — entirely
-    /// a function of its inputs, so the tests drive it with an injected clock and
-    /// never a live loop.
+    /// `local_minute` and today's `local_midnight` (unix secs) for the daily case,
+    /// the mission's `last_run` (unix secs, 0 = never), and the set of
+    /// `signals_present` this tick, decide whether this schedule is DUE to fire
+    /// NOW. This is the heart of the scheduler — entirely a function of its inputs,
+    /// so the tests drive it with an injected clock and never a live loop.
     ///
     ///   - `Daily`    — due if the local time is at/after hour:minute AND it has
-    ///     not already run today (last_run was before today's
-    ///     fire-time boundary). Never twice in one day.
+    ///     not already run today (`last_run < local_midnight`). Never twice in one
+    ///     local calendar day, INCLUDING the 25-hour DST fall-back day.
     ///   - `Interval` — due if `now - last_run >= secs` (always due the first time,
     ///     last_run == 0).
     ///   - `OnSignal` — due if the named signal is present this tick (debounced by
     ///     the caller's last-run cooldown, see [`MIN_INTERVAL_SECS`]).
+    ///
+    /// `local_midnight` MUST be the unix timestamp of the start of the caller's
+    /// current LOCAL calendar day, from a DST-aware conversion ([`local_midnight`]
+    /// in the live tick) — deriving it from `local_hour`/`local_minute` is exactly
+    /// the bug this parameter exists to close.
     pub fn is_due(
         &self,
         now: u64,
         local_hour: u8,
         local_minute: u8,
+        local_midnight: u64,
         last_run: u64,
         signals_present: &[String],
     ) -> bool {
@@ -405,19 +411,25 @@ impl Schedule {
                     return false;
                 }
                 // Already ran today? First run (last_run == 0) always fires. Else it
-                // fires again only once last_run PREDATES today's local midnight:
-                // more than the seconds-since-local-midnight must have elapsed since
-                // the last run. A 60s margin absorbs the minute-granular
-                // local_minute (seconds-since-midnight can read up to ~59s short), so
-                // a Daily mission fires at most ONCE per local calendar day at any
-                // fire hour. (The old fixed 23h window let a 00:xx-hour mission
-                // re-fire 23h later — the SAME calendar day.)
+                // fires again only once last_run PREDATES today's local midnight —
+                // an EXACT comparison against the caller's real local-midnight
+                // timestamp, so a Daily mission fires at most ONCE per local
+                // calendar day at any fire hour.
+                //
+                // WHY the timestamp and not elapsed-vs-hour/minute: the old check
+                // derived seconds-since-midnight from the wall-clock hour/minute
+                // (`hour*3600 + minute*60`). On the DST FALL-BACK day the local
+                // calendar day is 25 hours long, so that derivation understates the
+                // real elapsed time by up to 3600s: a 00:30 mission fired at 00:30,
+                // and at the SECOND 01:30 the derived 5400s lost to the real 7200s
+                // elapsed — so it fired a second time the same calendar day, running
+                // its autonomous action twice. (Spring forward silently delayed the
+                // fire by an hour.) `local_midnight` comes from a DST-aware date
+                // conversion, so both transitions are exact.
                 if last_run == 0 {
                     return true;
                 }
-                let secs_since_local_midnight =
-                    (local_hour as u64) * 3_600 + (local_minute as u64) * 60;
-                now.saturating_sub(last_run) > secs_since_local_midnight + 60
+                last_run < local_midnight
             }
             Schedule::Interval { secs } => {
                 let secs = clamp_interval(*secs);
@@ -668,7 +680,8 @@ pub async fn mark_ran(memory: &Memory, mission: &StandingMission, now: u64) -> R
 /// present this tick + the subsystem `master_enabled` flag, return the missions
 /// that are DUE to run NOW, in stable order. This is the testable heart of the
 /// scheduler — it touches no store and no clock of its own; the live tick passes
-/// in `now`/`local_hour`/`local_minute` from the injected/system clock.
+/// in `now`/`local_hour`/`local_minute`/`local_midnight` from the injected/system
+/// clock (see [`local_midnight`] for the DST-aware midnight).
 ///
 /// SAFETY: with `master_enabled == false` (the shipped default) NOTHING is ever
 /// due — the master switch gates the whole subsystem on top of each mission's own
@@ -678,6 +691,7 @@ pub fn due_missions<'a>(
     now: u64,
     local_hour: u8,
     local_minute: u8,
+    local_midnight: u64,
     signals_present: &[String],
     master_enabled: bool,
 ) -> Vec<&'a StandingMission> {
@@ -688,10 +702,34 @@ pub fn due_missions<'a>(
         .iter()
         .filter(|m| m.enabled)
         .filter(|m| {
-            m.schedule
-                .is_due(now, local_hour, local_minute, m.last_run, signals_present)
+            m.schedule.is_due(
+                now,
+                local_hour,
+                local_minute,
+                local_midnight,
+                m.last_run,
+                signals_present,
+            )
         })
         .collect()
+}
+
+/// The unix timestamp of the start of `now`'s LOCAL calendar day — the DST-aware
+/// midnight [`Schedule::is_due`] compares `last_run` against. On an AMBIGUOUS or
+/// SKIPPED local midnight (the DST transitions themselves) the EARLIEST valid
+/// instant is taken; if the local date has no representable midnight at all the
+/// caller's own timestamp is returned, which only ever makes a Daily mission wait
+/// (never fire twice). Kept next to the scheduler so the live tick and any test
+/// derive midnight the same way.
+pub fn local_midnight(now: &chrono::DateTime<chrono::Local>) -> u64 {
+    use chrono::TimeZone;
+    let midnight = now
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .and_then(|naive| chrono::Local.from_local_datetime(&naive).earliest())
+        .map(|dt| dt.timestamp())
+        .unwrap_or_else(|| now.timestamp());
+    midnight.max(0) as u64
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,13 +1093,13 @@ mod tests {
         let s = Schedule::Interval { secs: 6 * 3_600 };
         let now = 1_000_000u64;
         // never run -> due.
-        assert!(s.is_due(now, 0, 0, 0, &[]));
+        assert!(s.is_due(now, 0, 0, 0, 0, &[]));
         // ran just now -> not due.
-        assert!(!s.is_due(now, 0, 0, now, &[]));
+        assert!(!s.is_due(now, 0, 0, 0, now, &[]));
         // ran 5h ago -> not due (interval is 6h).
-        assert!(!s.is_due(now, 0, 0, now - 5 * 3_600, &[]));
+        assert!(!s.is_due(now, 0, 0, 0, now - 5 * 3_600, &[]));
         // ran 6h ago -> due.
-        assert!(s.is_due(now, 0, 0, now - 6 * 3_600, &[]));
+        assert!(s.is_due(now, 0, 0, 0, now - 6 * 3_600, &[]));
     }
 
     #[test]
@@ -1070,23 +1108,28 @@ mod tests {
         // floor at due-check time: running 10 minutes ago is NOT due.
         let s = Schedule::Interval { secs: 60 };
         let now = 1_000_000u64;
-        assert!(!s.is_due(now, 0, 0, now - 600, &[]), "sub-hour interval must clamp up");
-        assert!(s.is_due(now, 0, 0, now - MIN_INTERVAL_SECS, &[]));
+        assert!(!s.is_due(now, 0, 0, 0, now - 600, &[]), "sub-hour interval must clamp up");
+        assert!(s.is_due(now, 0, 0, 0, now - MIN_INTERVAL_SECS, &[]));
     }
 
     #[test]
     fn daily_is_due_after_fire_time_and_not_twice_in_a_day() {
         let s = Schedule::Daily { hour: 9, minute: 0 };
-        let now = 1_000_000u64;
+        // `now` is 10:00 local; today's local midnight is 10h earlier.
+        let midnight = 1_000_000u64;
+        let now = midnight + 10 * 3_600;
         // Before 09:00 -> not due.
-        assert!(!s.is_due(now, 8, 59, 0, &[]), "before fire time is not due");
+        assert!(!s.is_due(now, 8, 59, midnight, 0, &[]), "before fire time is not due");
         // At/after 09:00, never run -> due.
-        assert!(s.is_due(now, 9, 0, 0, &[]));
-        assert!(s.is_due(now, 10, 30, 0, &[]));
+        assert!(s.is_due(now, 9, 0, midnight, 0, &[]));
+        assert!(s.is_due(now, 10, 30, midnight, 0, &[]));
         // Already ran an hour ago today -> not due again today.
-        assert!(!s.is_due(now, 10, 0, now - 3_600, &[]), "must not fire twice in a day");
-        // Ran 24h ago -> due again.
-        assert!(s.is_due(now, 9, 0, now - 24 * 3_600, &[]));
+        assert!(
+            !s.is_due(now, 10, 0, midnight, now - 3_600, &[]),
+            "must not fire twice in a day"
+        );
+        // Ran 24h ago (before today's midnight) -> due again.
+        assert!(s.is_due(now, 9, 0, midnight, now - 24 * 3_600, &[]));
     }
 
     /// REGRESSION: a MIDNIGHT-hour Daily mission must not fire twice in one local
@@ -1095,19 +1138,60 @@ mod tests {
     #[test]
     fn daily_midnight_mission_does_not_fire_twice_in_one_local_day() {
         let s = Schedule::Daily { hour: 0, minute: 0 };
-        let t0 = 1_000_000u64;
+        let t0 = 1_000_000u64; // local midnight of day 1
         // 00:00, never run -> fires (last_run becomes t0).
-        assert!(s.is_due(t0, 0, 0, 0, &[]));
+        assert!(s.is_due(t0, 0, 0, t0, 0, &[]));
         // 23:00 the SAME day (23h later): ran at 00:00 -> must NOT fire again today.
         assert!(
-            !s.is_due(t0 + 23 * 3_600, 23, 0, t0, &[]),
+            !s.is_due(t0 + 23 * 3_600, 23, 0, t0, t0, &[]),
             "a midnight Daily mission must not re-fire 23h later the same day"
         );
         // Next local day at 00:00 (~24h later) -> fires again.
         assert!(
-            s.is_due(t0 + 24 * 3_600, 0, 0, t0, &[]),
+            s.is_due(t0 + 24 * 3_600, 0, 0, t0 + 24 * 3_600, t0, &[]),
             "fires again the next local day"
         );
+    }
+
+    /// REGRESSION: on the DST FALL-BACK day the local calendar day is 25 hours
+    /// long. The old check derived "seconds since local midnight" from the wall
+    /// clock hour/minute, which understates the real elapsed time by up to an hour
+    /// once the clock rolls back — so a 00:30 mission fired at 00:30 and AGAIN at
+    /// the second 01:30, running its autonomous action twice the same calendar day.
+    #[test]
+    fn a_daily_mission_does_not_fire_twice_on_the_dst_fall_back_day() {
+        let s = Schedule::Daily { hour: 0, minute: 30 };
+        let midnight = 1_000_000u64; // local midnight of the 25-hour day
+        // 00:30 -> fires; last_run stamped.
+        let first = midnight + 1_800;
+        assert!(s.is_due(first, 0, 30, midnight, 0, &[]), "the first fire of the day");
+        // The clock rolls 02:00 -> 01:00, so the wall clock reads 01:30 a SECOND
+        // time — 9000 real seconds after local midnight, i.e. 7200 after the run.
+        // The old check derived secs-since-midnight from the wall clock (5400) and
+        // saw 7200 > 5460, so it fired the mission a second time the same day.
+        let repeated_hour = first + 7_200; // == midnight + 9_000
+        assert!(
+            !s.is_due(repeated_hour, 1, 30, midnight, first, &[]),
+            "the repeated local hour must NOT re-fire the mission"
+        );
+        // The NEXT local day (25h after this midnight) -> due again.
+        let next_midnight = midnight + 25 * 3_600;
+        assert!(
+            s.is_due(next_midnight + 1_800, 0, 30, next_midnight, first, &[]),
+            "fires again on the next local calendar day"
+        );
+    }
+
+    /// The DST-aware midnight helper the live tick feeds `is_due`: it lands at or
+    /// before `now`, within one local day, and is stable for the same instant.
+    #[test]
+    fn local_midnight_is_at_or_before_now_and_within_one_day() {
+        let now = chrono::Local::now();
+        let m = local_midnight(&now);
+        let now_ts = now.timestamp().max(0) as u64;
+        assert!(m <= now_ts, "midnight must not be in the future");
+        assert!(now_ts - m <= 26 * 3_600, "midnight is within one (DST-stretched) day");
+        assert_eq!(m, local_midnight(&now), "deterministic for the same instant");
     }
 
     #[test]
@@ -1115,13 +1199,13 @@ mod tests {
         let s = Schedule::OnSignal { signal: "mail".into() };
         let now = 1_000_000u64;
         // Not present -> not due.
-        assert!(!s.is_due(now, 0, 0, 0, &["calendar".to_string()]));
+        assert!(!s.is_due(now, 0, 0, 0, 0, &["calendar".to_string()]));
         // Present, never run -> due.
-        assert!(s.is_due(now, 0, 0, 0, &["mail".to_string()]));
+        assert!(s.is_due(now, 0, 0, 0, 0, &["mail".to_string()]));
         // Present but ran 10 minutes ago -> debounced, not due.
-        assert!(!s.is_due(now, 0, 0, now - 600, &["mail".to_string()]));
+        assert!(!s.is_due(now, 0, 0, 0, now - 600, &["mail".to_string()]));
         // Present and cooldown elapsed -> due.
-        assert!(s.is_due(now, 0, 0, now - MIN_INTERVAL_SECS, &["mail".to_string()]));
+        assert!(s.is_due(now, 0, 0, 0, now - MIN_INTERVAL_SECS, &["mail".to_string()]));
     }
 
     #[test]
@@ -1130,10 +1214,10 @@ mod tests {
         let missions = vec![m];
         // Even though the interval mission has never run (would be due), the
         // master switch OFF means NOTHING is due — the core safety property.
-        let due = due_missions(&missions, 1_000_000, 9, 0, &[], false);
+        let due = due_missions(&missions, 1_000_000, 9, 0, 0, &[], false);
         assert!(due.is_empty(), "master switch off must fire nothing");
         // With it on, it IS due.
-        let due = due_missions(&missions, 1_000_000, 9, 0, &[], true);
+        let due = due_missions(&missions, 1_000_000, 9, 0, 0, &[], true);
         assert_eq!(due.len(), 1);
     }
 
@@ -1142,7 +1226,7 @@ mod tests {
         let mut m = StandingMission::new("x", Schedule::Interval { secs: 3_600 });
         m.enabled = false;
         let missions = vec![m];
-        let due = due_missions(&missions, 1_000_000, 9, 0, &[], true);
+        let due = due_missions(&missions, 1_000_000, 9, 0, 0, &[], true);
         assert!(due.is_empty(), "a disabled mission is never due even with master on");
     }
 
@@ -1154,7 +1238,7 @@ mod tests {
         let mut b = StandingMission::new("b — not yet", Schedule::Interval { secs: 6 * 3_600 });
         b.last_run = now - 3_600; // 1h ago, interval 6h -> not due
         let missions = vec![a.clone(), b];
-        let due = due_missions(&missions, now, 9, 0, &[], true);
+        let due = due_missions(&missions, now, 9, 0, 0, &[], true);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].id, a.id);
     }
@@ -1236,16 +1320,16 @@ mod tests {
         let now = 2_000_000u64;
         // Before any run, it is due (last_run == 0).
         let missions = list(&mem).await.unwrap();
-        assert_eq!(due_missions(&missions, now, 9, 0, &[], true).len(), 1);
+        assert_eq!(due_missions(&missions, now, 9, 0, 0, &[], true).len(), 1);
         // Mark it ran now.
         mark_ran(&mem, &m, now).await.unwrap();
         let missions = list(&mem).await.unwrap();
         assert_eq!(missions[0].last_run, now);
         // Now it is NOT due (just ran).
-        assert!(due_missions(&missions, now + 60, 9, 0, &[], true).is_empty());
+        assert!(due_missions(&missions, now + 60, 9, 0, 0, &[], true).is_empty());
         // After the interval, it is due again.
         assert_eq!(
-            due_missions(&missions, now + 6 * 3_600, 9, 0, &[], true).len(),
+            due_missions(&missions, now + 6 * 3_600, 9, 0, 0, &[], true).len(),
             1
         );
     }
@@ -1576,11 +1660,11 @@ mod tests {
     fn condition_schedule_is_never_time_due() {
         let s = Schedule::Condition { cond: Condition::DiskFreePctBelow { pct: 10.0 } };
         // No clock/last_run/signal-token combination makes a tripwire time-due.
-        assert!(!s.is_due(1_000_000, 9, 0, 0, &[]));
-        assert!(!s.is_due(1_000_000, 23, 59, 0, &["disk".to_string()]));
+        assert!(!s.is_due(1_000_000, 9, 0, 0, 0, &[]));
+        assert!(!s.is_due(1_000_000, 23, 59, 0, 0, &["disk".to_string()]));
         // And the TIME scheduler never selects a condition mission, even master-on.
         let missions = vec![StandingMission::new("watch disk", s)];
-        let due = due_missions(&missions, 1_000_000, 9, 0, &[], true);
+        let due = due_missions(&missions, 1_000_000, 9, 0, 0, &[], true);
         assert!(due.is_empty(), "a tripwire must not be selected by the time scheduler");
     }
 

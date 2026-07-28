@@ -793,7 +793,7 @@ mod tests {
         let effective = config_enabled && !is_locked_down();
         assert!(!effective, "locked: the standing master is forced off");
         // due_missions with master=false marks NOTHING due regardless of missions.
-        let due = crate::standing::due_missions(&[], 0, 12, 0, &[], effective);
+        let due = crate::standing::due_missions(&[], 0, 12, 0, 0, &[], effective);
         assert!(due.is_empty(), "locked: no standing mission ever fires");
     }
 

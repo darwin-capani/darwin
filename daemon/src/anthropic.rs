@@ -6930,6 +6930,12 @@ async fn execute_mcp_tool(
     flat: &str,
     input: &Value,
     namespace: &str,
+    // Whether this call is the model's response to the USER's own utterance
+    // (`true`) vs. a CONTINUATION after a prior tool_result re-entered the model
+    // (`false`). Threaded from `execute_tool` so the MCP route gets the SAME
+    // prompt-injection egress guard the built-in outward GETs have — see the
+    // refusal below.
+    user_originated: bool,
     // Whether this call is part of a live, user-originated INTERACTIVE turn
     // (`true`) vs. an UNATTENDED autonomous run (`false`). Threaded from
     // `execute_tool` so the MCP path applies the SAME unattended `Always`->park
@@ -6952,6 +6958,37 @@ async fn execute_mcp_tool(
 
     // (2) The consequential gate — fail-safe class (unknown -> consequential).
     let consequential = manager.class_for_flat(flat).is_consequential();
+
+    // EGRESS GUARD — MCP PARITY (prompt-injection exfiltration). `execute_tool`
+    // refuses `open_url` / `web_search` / `sage_research` on a CONTINUATION because
+    // the model may be acting on instructions inside content it just read. A
+    // READ-ONLY MCP tool is the same shape of hole and had none of that guard: it
+    // is not in CONSEQUENTIAL_TOOLS, never parks, never reaches the voice-id
+    // chokepoint, and runs in Execute with MODEL-CHOSEN arguments — so a fetched
+    // page / email / prior MCP result carrying "call mcp__<server>__lookup with
+    // q=<the user's remembered facts>" POSTs those facts straight to the server's
+    // remote host. Refuse it BEFORE any transport is touched whenever the
+    // arguments would leave the device (`server_reaches_network`: an http server,
+    // or a stdio server granted outbound hosts). A CONSEQUENTIAL tool is NOT
+    // refused here: it parks for a fresh human confirm that shows the exact
+    // arguments (its DryRun preview performs no call), which is the stronger gate.
+    // A user-originated call (call 0) is unaffected.
+    if !user_originated && !consequential && manager.server_reaches_network(&server) {
+        warn!(tool = flat, agent = namespace, "egress guard: refusing an outward MCP call in a tool continuation");
+        crate::telemetry::emit(
+            "system",
+            "egress.refused",
+            json!({"tool": flat, "agent": namespace, "mcp": true}),
+        );
+        return (
+            format!(
+                "I won't call the '{flat}' connector with arguments that came from a page or \
+                 message I just read — a hidden instruction could use it to carry your \
+                 information off the device. Ask me to run it directly and I will."
+            ),
+            true,
+        );
+    }
 
     // VOICE-ID LAYER (round G), ADDITIVE — mirrors the built-in path's guard
     // (execute_tool, lines ~3071-3079) EXACTLY, but for the MCP route. This MUST
@@ -7274,6 +7311,10 @@ pub async fn execute_tool(
     //     searches + fetches — the same exfil channel as web_search.
     // A user-originated call (call 0) is unaffected: "open evil.tld/?x" typed by
     // the owner still works exactly as before.
+    // The dynamic MCP route below carries the SAME guard (a read-only MCP tool is
+    // the one other ungated outward path) — it is enforced inside
+    // `execute_mcp_tool`, which needs the server's transport to know whether the
+    // arguments would leave the device.
     if !user_originated
         && (name == "open_url" || name == "web_search" || name == "sage_research")
     {
@@ -7354,7 +7395,19 @@ pub async fn execute_tool(
     // consequential MCP tool parks; a read-only one runs ungated. Handled BEFORE
     // the static allowlist check below (which keys on built-in names only).
     if crate::mcp::is_mcp_flat_name(name) {
-        return execute_mcp_tool(crate::mcp::global(), name, input, namespace, context_trusted).await;
+        // `user_originated` rides along so the MCP route gets the SAME
+        // continuation egress guard as the built-in outward GETs above (an
+        // ungated read-only MCP tool otherwise POSTs model-chosen arguments to a
+        // remote server on injected instructions).
+        return execute_mcp_tool(
+            crate::mcp::global(),
+            name,
+            input,
+            namespace,
+            user_originated,
+            context_trusted,
+        )
+        .await;
     }
 
     if !agent_may_use(allowed, name) {
@@ -13268,15 +13321,32 @@ impl crate::research::Searcher for SageWebSearcher {
                 .send()
                 .await?
                 .error_for_status()?;
-            let html = resp.text().await?;
+            // Capped like the page fetch: a search-result page is small, and an
+            // unbounded read is an allocation vector.
+            let html = sage_read_capped(resp).await?;
             Ok(parse_ddg_results(&html))
         })
     }
 }
 
+/// Hard cap on redirect hops SAGE follows. Each hop is re-guarded from scratch, so
+/// this only bounds a redirect loop.
+const SAGE_MAX_REDIRECTS: usize = 5;
+
 /// The live web fetcher: retrieves a URL and returns a bounded text excerpt.
-/// NOT exercised by any test. A failed fetch returns an Err, which
-/// `run_research` treats as a skipped source (never fatal).
+/// The network leg is NOT exercised by any test (the guard's pure halves are). A
+/// failed OR REFUSED fetch returns an Err, which `run_research` treats as a
+/// skipped source (never fatal, and never cited) — the honest degrade.
+///
+/// SSRF-GUARDED (this used to be a bare `client().get(url)`). The URLs come from
+/// DuckDuckGo result anchors — i.e. from whoever ranks for the topic — and the
+/// fetched text is placed verbatim into the cloud synthesis prompt. With reqwest's
+/// default redirect policy, a page DARWIN was pointed at could answer `302
+/// Location: http://127.0.0.1:7177/` (the daemon's own telemetry port),
+/// `http://192.168.1.1/admin`, or a metadata address, and the daemon would read
+/// LAN/loopback content and egress it to the cloud. Every hop now goes through the
+/// same guard the micro-app fetch proxy uses ([`crate::fetchproxy`]): https-only,
+/// resolve-and-require-public, pin the verified address, follow redirects manually.
 struct SageWebFetcher;
 impl crate::research::Fetcher for SageWebFetcher {
     fn fetch<'a>(
@@ -13284,17 +13354,118 @@ impl crate::research::Fetcher for SageWebFetcher {
         url: &'a str,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
         Box::pin(async move {
-            let resp = client()
-                .get(url)
-                .timeout(SAGE_FETCH_TIMEOUT)
-                .send()
-                .await?
-                .error_for_status()?;
-            let body = resp.text().await?;
+            let body = sage_guarded_get(url).await?;
             let text = strip_html_to_text(&body);
             Ok(text.chars().take(SAGE_EXCERPT_CHARS).collect())
         })
     }
+}
+
+/// PURE pre-flight on a research-fetch URL: it must be `https://` (a plaintext
+/// hop is both eavesdroppable and the easy way to reach a LAN box), carry no
+/// userinfo (`user:pass@host` is a confusion vector), and name a host. Returns
+/// `(host, port)` to resolve. An IP literal is NOT special-cased here — the
+/// resolve guard judges it by the same public-address rule as a resolved name.
+fn sage_fetch_target(url: &str) -> std::result::Result<(String, u16), &'static str> {
+    let parsed = url::Url::parse(url).map_err(|_| "the URL could not be parsed")?;
+    if parsed.scheme() != "https" {
+        return Err("only https:// pages are fetched");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("the URL carries userinfo");
+    }
+    let host = parsed.host_str().ok_or("the URL has no host")?.to_string();
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    Ok((host, port))
+}
+
+/// Resolve a `Location` header against the URL it came from (a redirect may be
+/// relative), PURE so the hop chain is unit-tested. The result is re-run through
+/// [`sage_fetch_target`] + the address guard before anything is fetched, so a
+/// downgrade to `http://` or a jump to a private host is refused on the next lap.
+fn sage_redirect_target(current: &str, location: &str) -> std::result::Result<String, &'static str> {
+    let base = url::Url::parse(current).map_err(|_| "the URL could not be parsed")?;
+    base.join(location)
+        .map(|u| u.to_string())
+        .map_err(|_| "the redirect target could not be parsed")
+}
+
+/// GET `url` under the SSRF guard, following redirects manually and re-guarding
+/// EVERY hop. Refusals are explicit `Err`s (the source is skipped and never cited)
+/// and are logged + emitted, never silently swallowed into a wrong answer.
+async fn sage_guarded_get(url: &str) -> Result<String> {
+    let mut next = url.to_string();
+    for _hop in 0..=SAGE_MAX_REDIRECTS {
+        let (host, port) = match sage_fetch_target(&next) {
+            Ok(t) => t,
+            Err(reason) => return Err(sage_fetch_refusal(reason)),
+        };
+        // Resolve + require EVERY address public, and pin the verified one so
+        // nothing rebinds between the check and the connect (the shared guard).
+        let addr = match crate::fetchproxy::resolve_pinned_public(&host, port).await {
+            Ok(addr) => addr,
+            Err("host_resolves_private") => {
+                return Err(sage_fetch_refusal("the host resolves to a private/loopback address"))
+            }
+            Err(_) => return Err(anyhow!("the host could not be resolved")),
+        };
+        let client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(SAGE_FETCH_TIMEOUT)
+            .https_only(true)
+            .resolve(&host, addr)
+            .build()?;
+        let resp = client.get(&next).send().await?;
+        let status = resp.status();
+        if status.is_redirection() {
+            let location = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .ok_or_else(|| anyhow!("the page redirected without a target"))?;
+            next = sage_redirect_target(&next, location).map_err(sage_fetch_refusal)?;
+            continue;
+        }
+        return sage_read_capped(resp.error_for_status()?).await;
+    }
+    Err(anyhow!("the page redirected too many times"))
+}
+
+/// Hard cap on a research page body. The fetch proxy already streams its bodies
+/// under a cap; the research fetcher used `resp.text()`, which BUFFERS THE WHOLE
+/// response before anything truncates it — a hostile or merely huge page could
+/// make the daemon allocate the full body (the excerpt cap downstream is applied
+/// far too late to help). Streamed incrementally, never buffering past this.
+const SAGE_MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
+
+/// Read a response body incrementally, stopping at [`SAGE_MAX_BODY_BYTES`].
+/// Returns what was read (lossy UTF-8) — a truncated page still yields a usable
+/// excerpt, and the cap is far above any real article.
+async fn sage_read_capped(resp: reqwest::Response) -> Result<String> {
+    let mut resp = resp;
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        let room = SAGE_MAX_BODY_BYTES.saturating_sub(buf.len());
+        if room == 0 {
+            break;
+        }
+        let take = room.min(chunk.len());
+        buf.extend_from_slice(&chunk[..take]);
+        if buf.len() >= SAGE_MAX_BODY_BYTES {
+            break;
+        }
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Build the Err for a REFUSED research fetch, announcing it on the way out. The
+/// source is dropped from the report (never cited, never summarized) rather than
+/// the daemon quietly reading a LAN/loopback page and shipping it to the cloud —
+/// the honest degrade. The URL is not logged (it can carry a path); the reason is.
+fn sage_fetch_refusal(reason: &'static str) -> anyhow::Error {
+    warn!(reason, "sage: refusing to fetch a research source");
+    crate::telemetry::emit("system", "egress.refused", json!({"tool": "sage_research", "reason": reason}));
+    anyhow!("refused to fetch this source: {reason}")
 }
 
 /// The live synthesis brain: a single cloud Messages completion with the
@@ -13356,7 +13527,10 @@ fn parse_ddg_results(html: &str) -> Vec<crate::research::SearchResult> {
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| raw_url.to_string());
         let url = ddg_unwrap_url(raw_url);
-        if url.starts_with("http") {
+        // https ONLY: a plaintext result is dropped here rather than fetched and
+        // refused later — the fetcher enforces the same rule, this keeps a
+        // never-fetchable URL out of the candidate list (and out of the citations).
+        if url.starts_with("https://") {
             out.push(crate::research::SearchResult::new(title, url));
         }
     }
@@ -16098,6 +16272,96 @@ mod tests {
         cleanup_temp_memory(&mem_path("egress-guard"));
     }
 
+    // ---- SAGE research fetcher: SSRF guard ---------------------------------
+    //
+    // The research fetcher pulls URLs harvested from search-result anchors — i.e.
+    // from whoever ranks for the topic — and feeds the text straight into the cloud
+    // synthesis prompt. It used to be a bare `client().get(url)`: no scheme rule, no
+    // address rule, and reqwest's default redirect policy, so an attacker-ranked
+    // page answering `302 Location: http://127.0.0.1:7177/` made the daemon read a
+    // loopback/LAN page and ship it to the cloud. These pin the pure halves of the
+    // guard (the network leg is runtime-only, exactly like the fetch proxy's).
+
+    /// Only `https://` is fetchable, userinfo is refused, and the port defaults to
+    /// 443. A refusal is an explicit reason, never a silent fallthrough.
+    #[test]
+    fn sage_fetch_target_is_https_only_and_userinfo_free() {
+        let (host, port) = super::sage_fetch_target("https://example.com/a/b?q=1").expect("https ok");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 443, "the https default port");
+        assert_eq!(
+            super::sage_fetch_target("https://example.com:8443/x").map(|(_, p)| p),
+            Ok(8443),
+            "an explicit port is kept (the ADDRESS rule is what guards it)"
+        );
+        // Plaintext, other schemes, userinfo, and hostless URLs are all refused.
+        assert!(super::sage_fetch_target("http://127.0.0.1:7177/").is_err(), "no plaintext");
+        assert!(super::sage_fetch_target("http://192.168.1.1/admin").is_err());
+        assert!(super::sage_fetch_target("file:///etc/passwd").is_err());
+        assert!(super::sage_fetch_target("https://user:pw@example.com/").is_err(), "no userinfo");
+        assert!(super::sage_fetch_target("not a url").is_err());
+    }
+
+    /// A redirect is resolved against the page it came from (they are often
+    /// relative) and then RE-GUARDED: the hostile `302` to loopback/LAN that the
+    /// old fetcher followed blindly is refused on the next lap.
+    #[test]
+    fn sage_redirect_target_is_resolved_then_reguarded() {
+        // Relative hops resolve against the current URL.
+        assert_eq!(
+            super::sage_redirect_target("https://example.com/a/b", "/c"),
+            Ok("https://example.com/c".to_string())
+        );
+        // An absolute hop replaces it — and the classic SSRF targets are refused
+        // by the pre-flight before any connection is attempted.
+        for hostile in [
+            "http://127.0.0.1:7177/",
+            "http://192.168.1.1/admin",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            let next = super::sage_redirect_target("https://example.com/a", hostile)
+                .expect("the location parses");
+            assert!(
+                super::sage_fetch_target(&next).is_err(),
+                "a redirect to {hostile} must be refused, not followed"
+            );
+        }
+    }
+
+    /// The ADDRESS rule is the SHARED one from the micro-app fetch proxy (one
+    /// implementation, no drift): loopback / private / link-local metadata hosts
+    /// are refused, and a public address comes back PINNED so nothing can rebind
+    /// between the check and the connect. IP literals resolve locally — no DNS.
+    #[tokio::test]
+    async fn sage_reuses_the_shared_public_address_guard() {
+        use crate::fetchproxy::resolve_pinned_public;
+        for private in ["127.0.0.1", "192.168.1.1", "169.254.169.254", "10.0.0.1", "::1"] {
+            assert_eq!(
+                resolve_pinned_public(private, 443).await,
+                Err("host_resolves_private"),
+                "{private} must never be fetchable"
+            );
+        }
+        let pinned = resolve_pinned_public("93.184.216.34", 443)
+            .await
+            .expect("a public literal resolves");
+        assert_eq!(pinned.ip().to_string(), "93.184.216.34", "the verified address is pinned");
+    }
+
+    /// Search results that can never be fetched are dropped at parse time, so a
+    /// plaintext URL is neither fetched nor offered as a citation.
+    #[test]
+    fn ddg_results_keep_only_https_urls() {
+        let html = concat!(
+            r#"<a class="result__a" href="https://good.example/page">Good</a>"#,
+            r#"<a class="result__a" href="http://plaintext.example/page">Plain</a>"#,
+            r#"<a class="result__a" href="http://127.0.0.1:7177/">Loopback</a>"#,
+        );
+        let got = super::parse_ddg_results(html);
+        let urls: Vec<&str> = got.iter().map(|r| r.url.as_str()).collect();
+        assert_eq!(urls, vec!["https://good.example/page"], "https only");
+    }
+
     /// WRITE-SIDE NAMESPACE BINDING (MED/LOW): `remember_fact` must not let the
     /// active agent plant a stored fact into ANOTHER agent's private
     /// `agent.<other>.*` namespace (a stored second-stage injection B would later
@@ -16894,6 +17158,28 @@ mod tests {
     // default), so a consequential MCP tool PREVIEWS and never fires — exactly the
     // built-in `master_off_never_parks_still_previews` discipline.
 
+    /// Same server, but configured on the REMOTE `http` transport — the shape whose
+    /// tool arguments leave the device on every call. Still mock-backed (no wire).
+    async fn mcp_manager_remote(agents: Vec<String>) -> crate::mcp::McpManager {
+        let mut mgr = mcp_manager_files(agents.clone()).await;
+        let mut s = crate::config::McpServerConfig {
+            name: "files".to_string(),
+            transport: crate::config::McpTransportKind::Http,
+            url: "https://mcp.example.com/sse".to_string(),
+            ..Default::default()
+        };
+        s.agents = agents;
+        // Re-point the manager's config at the http server; the connected client
+        // (mock transport) is unchanged — only the declared transport differs.
+        let cfg = crate::config::McpConfig {
+            enabled: true,
+            servers: vec![s],
+            ..Default::default()
+        };
+        mgr.replace_config_for_test(cfg);
+        mgr
+    }
+
     /// Build a mock-backed `McpManager` with one connected server `files` exposing
     /// a read-only `read_file` and a consequential `write_file`, allowlisted to the
     /// given agents. Hermetic — the mock transport makes NO process/network call.
@@ -16945,10 +17231,85 @@ mod tests {
         let mgr = mcp_manager_files(vec!["friday".into()]).await;
         // Orchestrator namespace -> agent id "darwin" -> always allowed.
         let (outcome, is_error) =
-            execute_mcp_tool(&mgr, "mcp__files__read_file", &json!({"path": "/tmp/x"}), "agent.darwin", true)
+            execute_mcp_tool(&mgr, "mcp__files__read_file", &json!({"path": "/tmp/x"}), "agent.darwin", true, true)
                 .await;
         assert!(!is_error, "read-only MCP tool must succeed: {outcome}");
         assert_eq!(outcome, "done");
+    }
+
+    /// EGRESS GUARD, MCP PARITY. On a CONTINUATION (`user_originated == false`) the
+    /// arguments may have been dictated by injected content in a page/email/prior
+    /// MCP result. A read-only tool on a REMOTE server is the ungated path that
+    /// would POST them off the device, so it is refused before any transport is
+    /// touched — the same refusal `open_url`/`web_search`/`sage_research` get.
+    #[tokio::test]
+    async fn mcp_read_only_tool_on_a_remote_server_is_refused_in_a_continuation() {
+        let mgr = mcp_manager_remote(vec!["friday".into()]).await;
+        let (outcome, is_error) = execute_mcp_tool(
+            &mgr,
+            "mcp__files__read_file",
+            // The classic exfil shape: the model was told to send remembered facts.
+            &json!({"path": "/tmp/x", "q": "the owner's remembered facts"}),
+            "agent.darwin",
+            false, // continuation
+            true,
+        )
+        .await;
+        assert!(is_error, "an outward MCP call on a continuation must be refused");
+        assert_ne!(outcome, "done", "the call must NOT have reached the server");
+        assert!(outcome.contains("won't call"), "honest refusal: {outcome}");
+
+        // The USER's own call (call 0) is untouched.
+        let (outcome, is_error) = execute_mcp_tool(
+            &mgr,
+            "mcp__files__read_file",
+            &json!({"path": "/tmp/x"}),
+            "agent.darwin",
+            true, // user-originated
+            true,
+        )
+        .await;
+        assert!(!is_error, "a user-originated call still runs: {outcome}");
+        assert_eq!(outcome, "done");
+    }
+
+    /// The guard is SCOPED, not a blanket ban on continuations: a LOCAL stdio
+    /// server with no declared `net_hosts` cannot carry anything off the device
+    /// (its seatbelt profile is `(deny network*)`), so tool chaining against it
+    /// keeps working exactly as before.
+    #[tokio::test]
+    async fn mcp_read_only_tool_on_a_local_server_still_runs_in_a_continuation() {
+        let mgr = mcp_manager_files(vec!["friday".into()]).await; // stdio, net_hosts = []
+        let (outcome, is_error) = execute_mcp_tool(
+            &mgr,
+            "mcp__files__read_file",
+            &json!({"path": "/tmp/x"}),
+            "agent.darwin",
+            false, // continuation
+            true,
+        )
+        .await;
+        assert!(!is_error, "a local read-only MCP tool still chains: {outcome}");
+        assert_eq!(outcome, "done");
+    }
+
+    /// A CONSEQUENTIAL remote tool is NOT swallowed by the egress guard: it takes
+    /// the stronger gate instead (preview under the OFF master switch, a park under
+    /// ON), where the human sees the exact arguments before anything is sent.
+    #[tokio::test]
+    async fn mcp_consequential_remote_tool_in_a_continuation_still_previews() {
+        let mgr = mcp_manager_remote(vec!["friday".into()]).await;
+        let (outcome, is_error) = execute_mcp_tool(
+            &mgr,
+            "mcp__files__write_file",
+            &json!({"path": "/tmp/x", "data": "hi"}),
+            "agent.darwin",
+            false, // continuation
+            true,
+        )
+        .await;
+        assert!(!is_error, "a dry-run preview is not an error: {outcome}");
+        assert!(outcome.contains("[dry run]"), "the gate handles it, not the guard: {outcome}");
     }
 
     /// A non-allowlisted agent is REFUSED an MCP tool BEFORE any call — defense in
@@ -16962,6 +17323,7 @@ mod tests {
             "mcp__files__read_file",
             &json!({"path": "/tmp/x"}),
             "agent.veronica",
+            true,
             true,
         )
         .await;
@@ -16985,6 +17347,7 @@ mod tests {
             "mcp__files__write_file",
             &json!({"path": "/tmp/x", "data": "hi"}),
             "agent.darwin",
+            true,
             true,
         )
         .await;
@@ -17026,7 +17389,7 @@ mod tests {
                 crate::integrations::consequential_allowed(),
                 "the cfg(test) override must report the switch ON"
             );
-            execute_mcp_tool(&mgr, "mcp__files__write_file", &input, "agent.darwin", true).await
+            execute_mcp_tool(&mgr, "mcp__files__write_file", &input, "agent.darwin", true, true).await
         };
         // The override dropped above -> the switch reads OFF again for other tests.
         assert!(
@@ -17086,7 +17449,7 @@ mod tests {
                 verified: false,
                 scope: crate::voiceid::GateScope::Consequential,
             });
-            execute_mcp_tool(&mgr, "mcp__files__write_file", &input, "agent.darwin", true).await
+            execute_mcp_tool(&mgr, "mcp__files__write_file", &input, "agent.darwin", true, true).await
         };
 
         // Refused with the honest voice-id message — NOT a preview, NOT a park.
@@ -17120,7 +17483,7 @@ mod tests {
         // class_for_flat -> Consequential (fail-safe) for an undiscovered tool.
         assert!(mgr.class_for_flat("mcp__files__ghost").is_consequential());
         let (outcome, is_error) =
-            execute_mcp_tool(&mgr, "mcp__files__ghost", &json!({}), "agent.darwin", true).await;
+            execute_mcp_tool(&mgr, "mcp__files__ghost", &json!({}), "agent.darwin", true, true).await;
         // OFF switch -> DryRun path -> the manager rejects the unknown tool.
         assert!(is_error, "unknown MCP tool must surface an error, not run: {outcome}");
     }

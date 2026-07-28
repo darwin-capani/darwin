@@ -243,7 +243,11 @@ pub trait EmbeddingProvider {
 /// Lowercase, split on any non-alphanumeric boundary, drop empties and a small
 /// set of stopwords. Deterministic. Dotted keys split naturally here
 /// (`user.car` -> ["user", "car"]) because `.` is a non-alphanumeric boundary.
-fn tokenize(text: &str) -> Vec<String> {
+///
+/// `pub(crate)` so the world model matches on the SAME tokens (and the SAME
+/// stopword set) the recall ranker does — a second, stopword-free tokenizer over
+/// there let glue words ("do", "is", "my") match inside unrelated identifiers.
+pub(crate) fn tokenize(text: &str) -> Vec<String> {
     text.split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())
         .map(|t| t.to_lowercase())
