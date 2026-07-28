@@ -2,7 +2,10 @@
   "what": "Short-sequence Core ML graph for the cross-encoder reranker (coreml_rerank.py)",
   "machine": "Apple M1 Pro, macOS 15, coremltools 9.0, ComputeUnit.ALL",
   "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
-  "baseline_shipped_graph": {"shape": "1x512", "p50_ms_per_pair": 10.88},
+  "baseline_shipped_graph": {
+    "shape": "1x512",
+    "p50_ms_per_pair": 10.88
+  },
   "sequence_length_sweep_p50_ms_per_pair": {
     "128": 1.12,
     "192": 1.88,
@@ -10,14 +13,19 @@
     "512": 10.88
   },
   "note_on_the_knee": "128 is a knee, not a linear trend: 192 is 1.7x slower than 128 and 256 is 3.9x slower, so SEQ_FAST=128 is chosen on the measurement, not by halving.",
-  "chosen": {"SEQ_FAST": 128, "per_predict_speedup_vs_512": 9.7},
+  "chosen": {
+    "SEQ_FAST": 128,
+    "per_predict_speedup_vs_512": 9.7
+  },
   "real_pair_token_lengths": {
     "measured_over": "8 queries x 12 DARWIN passages",
-    "min": 28, "max": 40,
+    "min": 28,
+    "max": 40,
     "conclusion": "real (query, passage) pairs sit far under 128, so the short graph carries the overwhelming majority of pairs"
   },
   "faithfulness_vs_512_graph": {
-    "queries": 8, "passages_per_query": 12,
+    "queries": 8,
+    "passages_per_query": 12,
     "top1_agreement": "8/8",
     "top3_agreement": "8/8",
     "full_order_agreement": "7/8",
@@ -35,5 +43,18 @@
   "safety": {
     "routing_rule": "a pair uses the short graph ONLY when its tokenized length is already <= SEQ_FAST, so routing can never truncate anything the 512 graph would have kept",
     "optional": "the short graph is optional at every step - an older cache without it, or one where it fails to convert or validate, runs every pair at SEQ exactly as before"
+  },
+  "upgrade_cost_measured_against_the_real_deployed_cache": {
+    "how": "copied the live ~/Library/Application Support/DARWIN cache (which had only rerank_b1.mlpackage + tokenizer) and called ensure_loaded() on it",
+    "first_load_seconds": 43.8,
+    "what_that_covers": "loading the HF checkpoint + converting BOTH graphs + validate-load + atomic publish. An earlier note in this branch disclosed ~11.5 s, which was the CONVERSION step alone and understated what a deployed machine actually pays.",
+    "second_load_seconds": 3.82,
+    "second_load_reconverts": false,
+    "when_it_is_paid": "at server startup via server.preload (the eager warm), not inside a request",
+    "result": "both graphs present afterwards, fast graph loaded, reranking still correct"
+  },
+  "disk_cost": {
+    "per_model_added_mb": 43,
+    "reranker_cache_mb": "43 -> 86"
   }
 }
