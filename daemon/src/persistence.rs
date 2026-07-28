@@ -26,11 +26,11 @@
 //! remediation — not even a gated one. It reports where the user's autostart
 //! surface stands; acting on a finding would be consequential and is out of scope.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -466,19 +466,79 @@ async fn run_real(program: &'static str, args: Vec<String>, timeout: Duration) -
         }
         Err(_) => {
             warn!(program, secs = timeout.as_secs(), "persistence: command timed out");
-            ReadOutput::Unavailable("the check timed out".to_string())
+            ReadOutput::Unavailable(TIMED_OUT_REASON.to_string())
         }
     }
+}
+
+/// How long a path that TIMED OUT during signing assessment is skipped before it
+/// is retried. Gatekeeper assessment (`spctl --assess`) can block well past
+/// [`PERSIST_TIMEOUT`] on some binaries (unnotarized bundles, items whose
+/// assessment touches a slow/offline network path). Without this memo the SAME
+/// slow path is re-assessed on EVERY sentinel tick forever: a real install
+/// logged 2035 `spctl` timeouts in 9 days — each one a wasted 5s block and a
+/// wasted assessment budget slot. Retrying hourly keeps the check honest (a
+/// binary that becomes assessable is picked up) while bounding the waste.
+const ASSESS_TIMEOUT_COOLDOWN: Duration = Duration::from_secs(3600);
+
+/// The exact `ReadOutput::Unavailable` reason a TIMED-OUT command yields, so a
+/// caller can distinguish "this host lacks the tool" (permanent, cheap) from
+/// "this specific path is slow to assess" (transient, expensive) without
+/// widening the ReadOutput enum.
+const TIMED_OUT_REASON: &str = "the check timed out";
+
+/// Paths whose signing assessment timed out, and when. Process-global +
+/// poison-tolerant (a lost memo only costs a retry, never correctness).
+static ASSESS_TIMEOUTS: StdMutex<Option<HashMap<String, Instant>>> = StdMutex::new(None);
+
+/// Whether `path` recently timed out and should be SKIPPED this tick. Expired
+/// entries are evicted as they are seen, so the map cannot grow without bound.
+fn assess_recently_timed_out(path: &str) -> bool {
+    let mut guard = ASSESS_TIMEOUTS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    match map.get(path) {
+        Some(at) if at.elapsed() < ASSESS_TIMEOUT_COOLDOWN => true,
+        Some(_) => {
+            map.remove(path);
+            false
+        }
+        None => false,
+    }
+}
+
+/// Record that `path`'s assessment timed out, starting its cooldown.
+fn note_assess_timeout(path: &str) {
+    let mut guard = ASSESS_TIMEOUTS.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    // Bound the memo: drop expired entries whenever it grows past a sane size,
+    // so a machine with thousands of transiently-slow paths cannot leak memory.
+    if map.len() >= 512 {
+        map.retain(|_, at| at.elapsed() < ASSESS_TIMEOUT_COOLDOWN);
+    }
+    map.insert(path.to_string(), Instant::now());
+}
+
+#[cfg(test)]
+fn reset_assess_timeouts_for_test() {
+    let mut guard = ASSESS_TIMEOUTS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
 }
 
 /// Assess ONE binary's signing/notarization via `codesign -dv` then (only when
 /// codesign didn't already say "unsigned") `spctl --assess`. BOTH are READ-ONLY —
 /// they inspect the signature, they never execute the binary.
+///
+/// A path whose assessment TIMED OUT recently is skipped ([`Signedness::Unknown`],
+/// the same honest verdict a timeout already produced) until
+/// [`ASSESS_TIMEOUT_COOLDOWN`] elapses — see that constant for why.
 async fn assess_program<F, Fut>(run: &F, path: &str) -> Signedness
 where
     F: Fn(&'static str, Vec<String>, Duration) -> Fut,
     Fut: Future<Output = ReadOutput>,
 {
+    if assess_recently_timed_out(path) {
+        return Signedness::Unknown;
+    }
     let cs = match run(
         CODESIGN,
         vec!["-dv".into(), "--verbose=2".into(), path.to_string()],
@@ -487,7 +547,12 @@ where
     .await
     {
         ReadOutput::Text(t) => parse_codesign(&t),
-        ReadOutput::Unavailable(_) => return Signedness::Unknown,
+        ReadOutput::Unavailable(reason) => {
+            if reason == TIMED_OUT_REASON {
+                note_assess_timeout(path);
+            }
+            return Signedness::Unknown;
+        }
     };
     if cs == Signedness::Unsigned {
         return Signedness::Unsigned;
@@ -506,7 +571,14 @@ where
     .await
     {
         ReadOutput::Text(t) => parse_spctl_assess(&t),
-        ReadOutput::Unavailable(_) => Assessment::Unknown,
+        ReadOutput::Unavailable(reason) => {
+            // A TIMEOUT (not a missing tool) means this path is chronically slow
+            // to assess — memo it so later ticks skip it for the cooldown.
+            if reason == TIMED_OUT_REASON {
+                note_assess_timeout(path);
+            }
+            Assessment::Unknown
+        }
     };
     combine_signedness(cs, assess)
 }
@@ -1401,6 +1473,58 @@ mod tests {
 
     fn stub_unavail(m: &mut std::collections::HashMap<String, ReadStub>, key: &str, why: &str) {
         m.insert(key.to_string(), ReadStub::Unavail(why.to_string()));
+    }
+
+    /// A path whose signing assessment TIMES OUT is memoized and SKIPPED on the
+    /// next tick, instead of burning another 5s block + budget slot every tick
+    /// forever (a real install logged 2035 such timeouts in 9 days). The skip is
+    /// honest: it yields the SAME Unknown verdict the timeout itself produced.
+    #[tokio::test]
+    async fn a_timed_out_assessment_is_memoized_and_skipped_next_tick() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        reset_assess_timeouts_for_test();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let c = calls.clone();
+        // Runner: codesign says "signed" (so we reach spctl), spctl always times out.
+        let run = move |program: &'static str, _args: Vec<String>, _t: Duration| {
+            let c = c.clone();
+            async move {
+                c.fetch_add(1, Ordering::SeqCst);
+                if program == CODESIGN {
+                    ReadOutput::Text("Authority=Developer ID Application: Someone".to_string())
+                } else {
+                    ReadOutput::Unavailable(TIMED_OUT_REASON.to_string())
+                }
+            }
+        };
+
+        // Tick 1: both tools run (codesign + the timing-out spctl).
+        // codesign proved it Signed; the spctl TIMEOUT leaves notarization
+        // unconfirmed, so the honest combined verdict is Signed (not Notarized).
+        let v1 = assess_program(&run, "/tmp/slow-to-assess.app").await;
+        assert_eq!(v1, Signedness::Signed, "signed, notarization unconfirmed by the timeout");
+        let after_first = calls.load(Ordering::SeqCst);
+        assert_eq!(after_first, 2, "tick 1 runs codesign + spctl");
+
+        // Tick 2: the path is in cooldown -> SKIPPED entirely, no subprocess at all.
+        // The SKIP is honest-conservative: with no assessment run at all we
+        // cannot claim Signed, so it degrades to Unknown rather than reusing a
+        // stale verdict.
+        let v2 = assess_program(&run, "/tmp/slow-to-assess.app").await;
+        assert_eq!(v2, Signedness::Unknown, "a skipped assessment claims nothing");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            after_first,
+            "tick 2 must run NO command — the memo skipped it"
+        );
+
+        // A DIFFERENT path is unaffected (the memo is per-path, not global).
+        let _ = assess_program(&run, "/tmp/other.app").await;
+        assert!(
+            calls.load(Ordering::SeqCst) > after_first,
+            "an unrelated path is still assessed"
+        );
+        reset_assess_timeouts_for_test();
     }
 
     #[tokio::test]

@@ -20395,6 +20395,45 @@ mod tests {
         assert!(citation_for_tool("open_app", &json!({}), "Opened Safari.").is_none());
     }
 
+    /// TEMP REPRO (refutation harness): the EXACT unified_search zero-hit string
+    /// built the same way the production branch builds it.
+    #[test]
+    fn repro_unified_search_empty_result_citation() {
+        use crate::unified_search::{Coverage, Skipped, Source, SkipReason};
+        // Build the coverage line via the REAL production type, then the REAL
+        // production format! from anthropic.rs:11840-11845.
+        let coverage = Coverage {
+            searched: vec![Source::Docsearch, Source::Facts, Source::Episodic],
+            skipped: vec![Skipped { source: Source::World, reason: SkipReason::NotConnected }],
+        };
+        let coverage_line = coverage.summary();
+        let outcome = format!(
+            "I searched everything available and found nothing on that, sir. {coverage_line} \
+             (Nothing was fabricated — those are the sources I could reach.)"
+        );
+        eprintln!("OUTCOME = {outcome}");
+        eprintln!("is_empty_retrieval = {}", is_empty_retrieval(&outcome));
+        eprintln!("tool_carries_citation = {}", tool_carries_citation("unified_search"));
+        let cit = citation_for_tool("unified_search", &json!({"query": "lunar regolith sintering"}), &outcome);
+        eprintln!("citation_for_tool = {cit:?}");
+        // What the FINDING claims: a zero-hit search is recorded as a real source.
+        assert!(cit.is_some(), "FINDING REFUTED: no citation recorded");
+        let (locator, _snip) = cit.unwrap();
+        assert_eq!(locator, "personal search");
+        // And it then produces a Sources: line instead of from-my-knowledge.
+        let src = AnswerSource {
+            source: "unified_search".to_string(),
+            citation: locator,
+            snippet: first_chars(&outcome, 80),
+        };
+        let line = cite_annotation(&[src.clone()]);
+        eprintln!("cite_annotation = {line}");
+        assert!(line.contains("Sources: personal search (unified_search)"));
+        let tel = answer_annotation_telemetry(true, false, &[src], None);
+        eprintln!("telemetry = {tel}");
+        assert_eq!(tel["from_my_knowledge"], false);
+    }
+
     /// The per-turn accumulator is CLEARED each turn: turn N's sources never
     /// annotate turn N+1 — the no-cross-turn-leak contract, enforced by the guard
     /// in run_pipeline. Here we exercise the underlying clear directly (the
