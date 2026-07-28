@@ -1,0 +1,39 @@
+{
+  "what": "Short-sequence Core ML graph for the cross-encoder reranker (coreml_rerank.py)",
+  "machine": "Apple M1 Pro, macOS 15, coremltools 9.0, ComputeUnit.ALL",
+  "model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+  "baseline_shipped_graph": {"shape": "1x512", "p50_ms_per_pair": 10.88},
+  "sequence_length_sweep_p50_ms_per_pair": {
+    "128": 1.12,
+    "192": 1.88,
+    "256": 4.38,
+    "512": 10.88
+  },
+  "note_on_the_knee": "128 is a knee, not a linear trend: 192 is 1.7x slower than 128 and 256 is 3.9x slower, so SEQ_FAST=128 is chosen on the measurement, not by halving.",
+  "chosen": {"SEQ_FAST": 128, "per_predict_speedup_vs_512": 9.7},
+  "real_pair_token_lengths": {
+    "measured_over": "8 queries x 12 DARWIN passages",
+    "min": 28, "max": 40,
+    "conclusion": "real (query, passage) pairs sit far under 128, so the short graph carries the overwhelming majority of pairs"
+  },
+  "faithfulness_vs_512_graph": {
+    "queries": 8, "passages_per_query": 12,
+    "top1_agreement": "8/8",
+    "top3_agreement": "8/8",
+    "full_order_agreement": "7/8",
+    "max_abs_logit_delta": 0.007812,
+    "the_one_full_order_difference": "ranks 6 and 7 of the tail swapped between two passages whose 512 scores were BIT-IDENTICAL (-11.44531, gap exactly 0.0) - a tie-break, not a semantic disagreement"
+  },
+  "end_to_end_rerank_K20": {
+    "with_short_graph_ms": 34.47,
+    "seq_only_ms": 227.81,
+    "speedup": 6.61,
+    "note": "end-to-end is lower than the 9.70x per-predict figure because it includes tokenization and the Python per-pair loop",
+    "top5_identical": true,
+    "max_abs_delta": 0.007812
+  },
+  "safety": {
+    "routing_rule": "a pair uses the short graph ONLY when its tokenized length is already <= SEQ_FAST, so routing can never truncate anything the 512 graph would have kept",
+    "optional": "the short graph is optional at every step - an older cache without it, or one where it fails to convert or validate, runs every pair at SEQ exactly as before"
+  }
+}

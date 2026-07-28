@@ -15,8 +15,12 @@ inference/benchmarks/coreml_rerank_eval/ probe), NOT here.
 """
 import math
 import sys
+import threading
+import types
 import unittest
 from pathlib import Path
+
+import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -194,6 +198,73 @@ class TruncationSurfacingTests(unittest.TestCase):
         e._encode("q", ["hi", "yo"])
         self.assertFalse(any("cap" in m for m in msgs))
         self.assertEqual(e._trunc_seen, 0)
+
+
+class FastPathRouting(unittest.TestCase):
+    """A pair that already fits in SEQ_FAST is scored on the SHORT graph; anything
+    longer stays on the SEQ graph. Routing is a speed decision ONLY — it must never
+    truncate a pair the SEQ graph would have kept, and it must vanish entirely when
+    the optional short graph is absent. Pure: stub models, no Core ML."""
+
+    def _reranker(self, id_rows, type_rows, fast):
+        r = cr.CoreMLReranker.__new__(cr.CoreMLReranker)
+        r._lock = threading.Lock()
+        r._loaded = True
+        r._trunc_seen = 0
+        r._trunc_warned_at = 0
+        r._tokenizer = lambda qs, ps, **kw: {
+            "input_ids": id_rows, "token_type_ids": type_rows
+        }
+        r.calls = []
+
+        def graph(tag):
+            def predict(d):
+                r.calls.append((tag, d["input_ids"].shape[1]))
+                return {"score": np.array([[1.0]], dtype=np.float32)}
+            return types.SimpleNamespace(predict=predict)
+
+        r._model = graph("seq")
+        r._model_fast = graph("fast") if fast else None
+        r.ensure_loaded = lambda: None
+        return r
+
+    def test_short_pair_routes_to_the_fast_graph_when_present(self):
+        short = [1] * (cr.SEQ_FAST - 4)
+        r = self._reranker([short], [[0] * len(short)], fast=True)
+        r.rerank("q", ["hi"])
+        # MUTATION GUARD: dropping the routing branch makes this ("seq", 512).
+        self.assertEqual(r.calls, [("fast", cr.SEQ_FAST)])
+
+    def test_a_pair_longer_than_the_fast_seq_stays_on_the_full_graph(self):
+        long_row = [1] * (cr.SEQ_FAST + 1)
+        r = self._reranker([long_row], [[0] * len(long_row)], fast=True)
+        r.rerank("q", ["x"])
+        # Routing this to the short graph would silently DROP a real token.
+        self.assertEqual(r.calls, [("seq", cr.SEQ)])
+
+    def test_a_mixed_batch_routes_each_pair_independently(self):
+        rows = [[1] * 30, [1] * (cr.SEQ_FAST + 50), [1] * cr.SEQ_FAST]
+        r = self._reranker(rows, [[0] * len(x) for x in rows], fast=True)
+        r.rerank("q", ["a", "b", "c"])
+        self.assertEqual(
+            r.calls,
+            [("fast", cr.SEQ_FAST), ("seq", cr.SEQ), ("fast", cr.SEQ_FAST)],
+        )
+
+    def test_without_the_short_graph_every_pair_runs_at_seq(self):
+        r = self._reranker([[1] * 10], [[0] * 10], fast=False)
+        r.rerank("q", ["hi"])
+        self.assertEqual(r.calls, [("seq", cr.SEQ)])
+
+    def test_the_boundary_length_still_fits_the_fast_graph(self):
+        exact = [1] * cr.SEQ_FAST
+        r = self._reranker([exact], [[0] * cr.SEQ_FAST], fast=True)
+        r.rerank("q", ["hi"])
+        # <= SEQ_FAST, so pad_pair does not truncate at exactly the boundary.
+        self.assertEqual(r.calls, [("fast", cr.SEQ_FAST)])
+
+    def test_the_fast_seq_is_shorter_than_the_full_seq(self):
+        self.assertLess(cr.SEQ_FAST, cr.SEQ)
 
 
 if __name__ == "__main__":

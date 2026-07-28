@@ -41,6 +41,13 @@ chunks plus a short query comfortably; dense/CJK chunks that run near one token 
 char can still exceed it and lose their tail — lower [docsearch].chunk_chars if that
 matters for your corpus.
 
+TWO GRAPHS (speed, not semantics): alongside the (1, SEQ) graph the cache also holds an
+OPTIONAL (1, SEQ_FAST=128) graph. A pair is scored on the short graph ONLY when its
+tokenized length already fits in 128 — so routing can never truncate anything the 512
+graph would have kept — and MEASURED, that is a 9.70x saving per pair (10.88 -> 1.12 ms
+p50). The short graph is optional at every step: a cache published before it existed,
+or one where it fails to convert or validate, simply runs every pair at SEQ.
+
 CONVERT-ON-FIRST-USE (ATOMIC): identical discipline to coreml_embed.py — the compiled
 model + tokenizer are cached under the SAME model-cache root the rest of the server
 uses ($HF_HOME, falling back to ~/.cache/huggingface), in the shared `darwin-coreml/`
@@ -102,6 +109,18 @@ RERANKER_ID = "coreml-ms-marco-minilm-l6-v2"
 # a full docsearch chunk (~300 tokens) fits without tail loss. Short fact pairs pad to
 # 512 (padding is masked out, so their score is unchanged vs a shorter seq).
 SEQ = 512
+# SECOND, SHORTER graph for the common case. MEASURED on this machine (M1 Pro,
+# ComputeUnit.ALL): one (1, 512) pair predict costs p50 10.88 ms, while (1, 128) costs
+# 1.12 ms -- a 9.70x saving, because the shorter shape stays on the ANE's efficient
+# path (192 -> 1.88 ms and 256 -> 4.38 ms, so 128 is the knee, not a linear trend).
+# REAL (query, passage) pairs measured 28-40 tokens, so the short graph carries the
+# overwhelming majority of pairs. A pair is routed here ONLY when its tokenized length
+# already fits in SEQ_FAST, so the fast path NEVER truncates anything the 512 graph
+# would have kept -- longer pairs fall through to SEQ unchanged. FAITHFULNESS (MEASURED
+# over 8 queries x 12 passages): top-1 and top-3 agree 8/8 with the 512 graph, max
+# |logit delta| 0.0078; the single full-order difference was a tie-break between two
+# passages whose 512 scores were bit-identical (-11.44531, gap exactly 0.0).
+SEQ_FAST = 128
 # Throttle for the truncation warning: log once, then again every N cumulative
 # truncated pairs, so reranking a long-chunk corpus surfaces tail loss without a
 # per-batch log flood.
@@ -121,6 +140,11 @@ MAX_PASSAGES = 256
 
 # Compiled-model / tokenizer artifact names under the per-model cache dir.
 _MODEL_NAME = "rerank_b1.mlpackage"
+# The optional short-sequence companion graph. OPTIONAL by design: an older cache
+# published before this graph existed still validate-loads on _MODEL_NAME alone and
+# simply runs every pair at SEQ, so the fast path degrades to the previous behaviour
+# instead of forcing a reconversion.
+_MODEL_FAST_NAME = "rerank_b1_s128.mlpackage"
 _TOK_DIRNAME = "tokenizer"
 
 
@@ -187,20 +211,23 @@ class CoreMLReranker:
         self._loaded = False
         self._tokenizer = None
         self._model = None  # the (1, SEQ) MLModel, looped per pair
+        self._model_fast = None  # OPTIONAL (1, SEQ_FAST) graph; None -> always SEQ
         self._trunc_seen = 0        # cumulative truncated pairs (for the warn throttle)
         self._trunc_warned_at = 0   # _trunc_seen value at the last warn
 
-    def _validate_predict(self, model):
-        """Run a tiny (1, SEQ) predict to VALIDATE a compiled graph actually runs at
+    def _validate_predict(self, model, seq=None):
+        """Run a tiny (1, seq) predict to VALIDATE a compiled graph actually runs at
         the SHIPPED shape and returns the right output shape. Presence on disk is NOT
         integrity: a truncated / partial-write .mlpackage (crash / disk-full /
         concurrent writer) can load-open yet fail to predict, and an OLD cache compiled
         at a different SEQ fails this shape check — either way this raises so the cache
-        is reconverted."""
-        ids = np.zeros((1, SEQ), dtype=np.int32)
+        is reconverted. `seq` defaults to SEQ; the short companion graph passes
+        SEQ_FAST so it is validated at ITS OWN shape, not the main one."""
+        seq = SEQ if seq is None else seq
+        ids = np.zeros((1, seq), dtype=np.int32)
         ids[:, 0] = 101  # any real token id; content is irrelevant to validation
-        types = np.zeros((1, SEQ), dtype=np.int32)
-        mask = np.zeros((1, SEQ), dtype=np.int32)
+        types = np.zeros((1, seq), dtype=np.int32)
+        mask = np.zeros((1, seq), dtype=np.int32)
         mask[:, 0] = 1
         out = np.asarray(
             model.predict(
@@ -216,8 +243,11 @@ class CoreMLReranker:
     def _load_from(self, d):
         """VALIDATE-LOAD the tokenizer + the compiled model from directory `d`: load
         each, then run `_validate_predict` so a partial/corrupt/wrong-SEQ package is
-        rejected (never trusted on mere presence). Returns (tokenizer, model) on
-        success; raises on any problem."""
+        rejected (never trusted on mere presence). Returns (tokenizer, model, fast) on
+        success; raises on any problem with the REQUIRED pieces. `fast` is the optional
+        short-sequence graph and is None whenever it is absent, corrupt, or fails
+        validation — a bad fast graph must never take the reranker down, it just costs
+        the speedup."""
         import coremltools as ct
         from transformers import AutoTokenizer
 
@@ -226,7 +256,22 @@ class CoreMLReranker:
             os.path.join(d, _MODEL_NAME), compute_units=ct.ComputeUnit.ALL
         )
         self._validate_predict(model)
-        return tok, model
+        fast = None
+        fast_path = os.path.join(d, _MODEL_FAST_NAME)
+        if os.path.isdir(fast_path):
+            try:
+                cand = ct.models.MLModel(
+                    fast_path, compute_units=ct.ComputeUnit.ALL
+                )
+                self._validate_predict(cand, seq=SEQ_FAST)
+                fast = cand
+            except Exception as e:  # optional: degrade to SEQ, never fail the load
+                log.warning(
+                    "op=rerank the short-sequence graph failed to load (%s); "
+                    "every pair will run at seq %d",
+                    e, SEQ,
+                )
+        return tok, model, fast
 
     def ensure_loaded(self):
         """Convert-on-first-use (ATOMIC) then load the compiled model + tokenizer.
@@ -258,7 +303,7 @@ class CoreMLReranker:
                         raise CoreMLRerankerUnavailable(
                             "Core ML reranker cache failed validate-load after conversion"
                         )
-                self._tokenizer, self._model = loaded
+                self._tokenizer, self._model, self._model_fast = loaded
             except CoreMLRerankerUnavailable:
                 raise
             except Exception as e:
@@ -268,7 +313,7 @@ class CoreMLReranker:
             self._loaded = True
 
     def _try_load_final(self):
-        """Validate-load from the FINAL cache dir; return (tok, model) or None
+        """Validate-load from the FINAL cache dir; return (tok, model, fast) or None
         (missing / partial / corrupt / wrong-SEQ) so the caller reconverts."""
         if not os.path.isdir(self._dir):
             return None
@@ -400,11 +445,12 @@ class CoreMLReranker:
                 )
                 return out.logits  # (batch, 1) raw relevance logit
 
-        def trace_and_convert(model, batch, out_path):
-            wrapper = CrossEncoderScore(model, batch, seq).eval()
-            ex_ids = torch.randint(0, 1000, (batch, seq), dtype=torch.int64)
-            ex_mask = torch.ones((batch, seq), dtype=torch.int64)
-            ex_types = torch.zeros((batch, seq), dtype=torch.int64)
+        def trace_and_convert(model, batch, out_path, seq_len=None):
+            seq_len = seq if seq_len is None else seq_len
+            wrapper = CrossEncoderScore(model, batch, seq_len).eval()
+            ex_ids = torch.randint(0, 1000, (batch, seq_len), dtype=torch.int64)
+            ex_mask = torch.ones((batch, seq_len), dtype=torch.int64)
+            ex_types = torch.zeros((batch, seq_len), dtype=torch.int64)
             with torch.no_grad():
                 traced = torch.jit.trace(
                     wrapper, (ex_ids, ex_mask, ex_types), check_trace=False
@@ -413,13 +459,13 @@ class CoreMLReranker:
                 traced,
                 inputs=[
                     ct.TensorType(
-                        name="input_ids", shape=(batch, seq), dtype=np.int32
+                        name="input_ids", shape=(batch, seq_len), dtype=np.int32
                     ),
                     ct.TensorType(
-                        name="attention_mask", shape=(batch, seq), dtype=np.int32
+                        name="attention_mask", shape=(batch, seq_len), dtype=np.int32
                     ),
                     ct.TensorType(
-                        name="token_type_ids", shape=(batch, seq), dtype=np.int32
+                        name="token_type_ids", shape=(batch, seq_len), dtype=np.int32
                     ),
                 ],
                 outputs=[ct.TensorType(name="score")],
@@ -449,6 +495,21 @@ class CoreMLReranker:
                 f"{model.config.max_position_embeddings} < seq {SEQ}"
             )
         trace_and_convert(model, 1, os.path.join(target_dir, _MODEL_NAME))
+        # The short companion graph is a pure OPTIMIZATION: if it fails to convert we
+        # publish the cache without it and every pair runs at SEQ, exactly as before.
+        try:
+            trace_and_convert(
+                model,
+                1,
+                os.path.join(target_dir, _MODEL_FAST_NAME),
+                seq_len=SEQ_FAST,
+            )
+        except Exception as e:
+            log.warning(
+                "op=rerank the short-sequence graph failed to convert (%s); "
+                "every pair will run at seq %d",
+                e, SEQ,
+            )
         tok.save_pretrained(os.path.join(target_dir, _TOK_DIRNAME))
 
     def _encode(self, query, passages):
@@ -494,9 +555,12 @@ class CoreMLReranker:
                 n_capped, total, SEQ, self._trunc_seen,
             )
 
-    def _predict(self, ids, types, mask):
-        """Run one (1, SEQ) predict; returns the scalar relevance logit."""
-        out = self._model.predict(
+    def _predict(self, ids, types, mask, model=None):
+        """Run one (1, seq) predict; returns the scalar relevance logit. `model`
+        defaults to the main SEQ graph; `rerank` passes the short graph for pairs that
+        already fit in SEQ_FAST. The arrays' shape must match the graph's."""
+        m = self._model if model is None else model
+        out = m.predict(
             {"input_ids": ids, "attention_mask": mask, "token_type_ids": types}
         )
         return float(np.asarray(out["score"], dtype=np.float32).ravel()[0])
@@ -520,8 +584,15 @@ class CoreMLReranker:
         out = []
         with self._lock:
             for ids_row, type_row in zip(id_lists, type_lists):
-                ids, types, mask = pad_pair(ids_row, type_row, SEQ)  # (1, SEQ)
-                out.append(scrub_score(self._predict(ids, types, mask)))
+                # Route to the short graph ONLY when the pair already fits in it, so
+                # this can never truncate anything the SEQ graph would have kept.
+                if self._model_fast is not None and len(ids_row) <= SEQ_FAST:
+                    ids, types, mask = pad_pair(ids_row, type_row, SEQ_FAST)
+                    score = self._predict(ids, types, mask, model=self._model_fast)
+                else:
+                    ids, types, mask = pad_pair(ids_row, type_row, SEQ)  # (1, SEQ)
+                    score = self._predict(ids, types, mask)
+                out.append(scrub_score(score))
         return out
 
     def reference_scores(self, query, passages):
