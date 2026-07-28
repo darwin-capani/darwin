@@ -19,7 +19,13 @@ export default function AmbientMode({
   feedCount: number;
 }) {
   return (
-    <div className="ambient-mode" role="status" aria-label="DARWIN at rest">
+    // A11Y (sweep): NOT a live region. This container holds a 1 Hz-updated
+    // clock, so role="status" (implicit aria-live=polite) made a screen reader
+    // announce the time on EVERY minute rollover, forever, with no user action
+    // and no way to stop it — the same double-announce class the #116 pass
+    // deliberately avoided for CaptionBand. The at-rest state is conveyed by
+    // the visible mirror; nothing here needs to interrupt.
+    <div className="ambient-mode" aria-label="DARWIN at rest">
       <div className="ambient-clock">{formatTime(now)}</div>
       <div className="ambient-date">{formatDate(now)}</div>
       <div className="ambient-line dim-note">

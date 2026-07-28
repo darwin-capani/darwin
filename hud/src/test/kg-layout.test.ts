@@ -153,4 +153,41 @@ describe("kgTypeHue", () => {
     expect(h).toBeGreaterThanOrEqual(0);
     expect(h).toBeLessThan(360);
   });
+
+  // REGRESSION (sweep): world_model stores entities as
+  // user.world.entity.<type>.<slug>, so two TYPES can share a slug
+  // ({project,darwin} + {person,darwin}). Keying the layout on the bare id made
+  // one silently overwrite the other (a node vanished from the graph).
+  it("keeps entities that share a slug across types (unique key, no overwrite)", () => {
+    const out = layoutGraph(
+      [
+        { id: "darwin", name: "Project DARWIN", type: "project", source: "notes.md" },
+        { id: "darwin", name: "Darwin Capani", type: "person", source: null },
+      ] as never,
+      [] as never,
+    );
+    expect(out.nodes.length).toBe(2);
+    const keys = out.nodes.map((n) => n.key);
+    expect(new Set(keys).size).toBe(2);
+    expect(keys).toContain("project:darwin");
+    expect(keys).toContain("person:darwin");
+    // Both keep their own position (neither was overwritten).
+    const [a, b] = out.nodes;
+    expect(a.x !== b.x || a.y !== b.y).toBe(true);
+  });
+
+  // An AMBIGUOUS endpoint must be reported dangling, never guessed — drawing a
+  // guessed edge would fabricate a relationship.
+  it("does not guess an edge endpoint whose slug is ambiguous", () => {
+    const out = layoutGraph(
+      [
+        { id: "darwin", name: "Project DARWIN", type: "project", source: null },
+        { id: "darwin", name: "Darwin Capani", type: "person", source: null },
+        { id: "corgi", name: "Watson", type: "pet", source: null },
+      ] as never,
+      [{ from: "darwin", to: "corgi", relation: "owns", value: "" }] as never,
+    );
+    expect(out.edges.length).toBe(0);
+    expect(out.danglingEndpoints.length).toBeGreaterThan(0);
+  });
 });
