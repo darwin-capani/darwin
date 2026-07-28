@@ -267,9 +267,36 @@ pub fn note_active_agent(agent: &str) {
     }
 }
 
-/// The agent to attribute the next spend row to — the last-noted agent, or the
-/// honest default "cloud" before any turn has selected one.
+tokio::task_local! {
+    /// The agent label for cloud calls made inside a BACKGROUND task, scoped to
+    /// that task (and everything it awaits in-line) only.
+    ///
+    /// WHY this exists: [`ACTIVE_AGENT`] is a process-global written from exactly
+    /// ONE place — the INTERACTIVE turn's agent selection. Background cloud work
+    /// (a FURY mission's sub-tasks, incl. the ones a standing mission fires at
+    /// 09:00) runs on its own task and read that global, so its spend rows were
+    /// stamped with whichever agent the last spoken turn happened to select: talk
+    /// to Pepper at 08:55 and a 09:00 mission's six cloud calls all billed to
+    /// "pepper". A TASK-local (not another global) is what makes this exact —
+    /// setting the global from a background task would clobber the label of a
+    /// concurrently-running interactive turn.
+    static SCOPED_AGENT: String;
+}
+
+/// Run `fut` with every cloud spend row it records attributed to `agent` instead
+/// of the interactive turn's [`ACTIVE_AGENT`]. Scoped to this task: a concurrent
+/// interactive turn is unaffected, and the label is gone when `fut` completes.
+pub async fn with_active_agent<F: std::future::Future>(agent: String, fut: F) -> F::Output {
+    SCOPED_AGENT.scope(agent, fut).await
+}
+
+/// The agent to attribute the next spend row to: the enclosing background task's
+/// own label when there is one ([`with_active_agent`]), else the last-noted
+/// interactive agent, else the honest default "cloud".
 fn active_agent() -> String {
+    if let Ok(scoped) = SCOPED_AGENT.try_with(|a| a.clone()) {
+        return scoped;
+    }
     ACTIVE_AGENT
         .read()
         .ok()
@@ -799,6 +826,25 @@ mod tests {
         }
         assert!(led.count().await.unwrap() <= MAX_LEDGER_ROWS as u64);
         assert_eq!(led.count().await.unwrap(), 10);
+    }
+
+    /// REGRESSION: a BACKGROUND cloud call must label its own spend rows. The
+    /// process-global ACTIVE_AGENT is written only by the INTERACTIVE turn, so a
+    /// mission's cloud calls used to be billed to whichever agent last spoke.
+    #[tokio::test]
+    async fn a_scoped_background_agent_labels_its_own_rows_and_restores_after() {
+        // (ACTIVE_AGENT is a process global shared with the other tests, so this
+        // asserts the SCOPE, never a specific global value.)
+        note_active_agent("pepper"); // the last interactive turn
+        let outside = active_agent();
+
+        // A background sub-task runs under its OWN label…
+        let inside = with_active_agent("fury".to_string(), async { active_agent() }).await;
+        assert_eq!(inside, "fury", "a background call bills itself, not the last turn");
+
+        // …and that label does not outlive the task (the interactive global stands).
+        assert_ne!(active_agent(), "fury", "the scoped label leaked past its task");
+        assert!(!outside.is_empty());
     }
 
     // -----------------------------------------------------------------------

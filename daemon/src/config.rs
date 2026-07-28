@@ -1890,17 +1890,23 @@ pub struct InferenceConfig {
     #[allow(dead_code)] // shared contract; read by the inference server
     pub preload: bool,
     /// SPECULATIVE/DRAFT decoding master gate (#37). SHIPS ON (full-power default)
-    /// — INERT WITHOUT a loadable `draft_model` (=> normal gen + speculative=false
-    /// reported, never faked). Read by the inference server's generate path AND by
-    /// the daemon's `should_use_speculative` decision / HUD telemetry. The actual
-    /// speedup is device/model-gated, never claimed headlessly.
+    /// and the SHIPPED config also carries a real `draft_model`, so a default
+    /// install has BOTH halves armed. Without a loadable draft it degrades to
+    /// normal gen + `speculative=false` reported, never faked. Read by the
+    /// inference server's generate path AND by the daemon's
+    /// `should_use_speculative` decision / HUD telemetry. The actual speedup is
+    /// device/model-gated, never claimed headlessly.
     #[allow(dead_code)] // shared contract; read by the inference server + telemetry
     pub speculative: bool,
-    /// Small DRAFT model id mlx_lm uses to propose tokens (#37). "" (default) =>
-    /// no draft, so speculative is inert even when `speculative=true` (honest
-    /// fallback to normal gen). A non-empty id is the checkpoint the server
-    /// lazy-loads; if it cannot load, the server falls back to normal gen and
-    /// reports `speculative=false`.
+    /// Small DRAFT model id mlx_lm uses to propose tokens (#37). A non-empty id is
+    /// the checkpoint the server lazy-loads; if it cannot load, the server falls
+    /// back to normal gen and reports `speculative=false`.
+    ///
+    /// The RUST default is "" only because this field is a PASSTHROUGH the daemon
+    /// never reads — the PYTHON server owns the real default
+    /// (`server.py DEFAULT_DRAFT = "mlx-community/Qwen3-0.6B-4bit"`, the same id
+    /// the installer pre-downloads and `config/darwin.toml` ships). Do NOT read
+    /// this empty default as "speculative decoding ships inert": it does not.
     #[allow(dead_code)] // shared contract; read by the inference server
     pub draft_model: String,
     /// SELECTABLE weight QUANTIZATION for the local model load (#39). "auto"
@@ -1946,14 +1952,16 @@ impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
             preload: true,
-            // SHIPS ON (full-power default) — INERT WITHOUT A DRAFT MODEL: speculative
-            // decoding also needs a loadable `draft_model` (ships empty); absent that,
-            // generate falls back to normal gen and HONESTLY reports speculative=false
-            // (never faked). Set draft_model to a real small checkpoint to engage.
+            // SHIPS ON (full-power default). The shipped config/darwin.toml also
+            // carries a real draft_model, so a default install has BOTH halves
+            // armed; an unloadable draft degrades to normal gen and HONESTLY
+            // reports speculative=false (never faked).
             speculative: true,
-            // SHIPS EMPTY — INERT-UNTIL-MODEL companion to speculative=true. Set e.g.
-            // "mlx-community/Qwen3-0.6B-4bit" (must be downloadable) to
-            // actually engage speculative; unloadable => normal gen + speculative=false.
+            // EMPTY here only because this key is a PASSTHROUGH the daemon never
+            // reads — the PYTHON server owns the real default (server.py
+            // DEFAULT_DRAFT = "mlx-community/Qwen3-0.6B-4bit", the id the installer
+            // pre-downloads and config/darwin.toml ships). NOT evidence that
+            // speculative decoding ships inert.
             draft_model: String::new(),
             // "auto" == today's behavior (load the model as configured); an
             // explicit quant is opt-in and device-gated.
@@ -3433,7 +3441,10 @@ impl Default for ApertureConfig {
             // Floored >= 1.
             retention: 500,
             // A calm cadence — sample the frontmost app every 20s when on. Floored
-            // to >= 1 at use.
+            // to >= 1 at use. LOCKSTEP: config/darwin.toml ships the SAME 20 (it
+            // shipped 5, so deleting the file silently changed the capture rate of
+            // a privacy-sensitive surface 4x — see
+            // `shipped_aperture_config_matches_the_compiled_default`).
             poll_interval_secs: 20,
         }
     }
@@ -4812,8 +4823,11 @@ pub struct McpServerConfig {
     /// no token. The token never appears in config, Debug, argv, or a URL.
     pub uses_token: bool,
     /// The DARWIN agents permitted to use this server's tools. Default: EMPTY —
-    /// no agent may use it until explicitly listed (plus the orchestrator, which
-    /// the manager always admits). NEVER auto-grants all agents.
+    /// which is fully INERT: NO agent may use the server, not even the
+    /// orchestrator, until one is explicitly listed (that is exactly what the
+    /// `connector_add` confirmation promises the user). Once ANY agent is listed
+    /// the orchestrator is admitted alongside it (it is the delegation fallback +
+    /// tool owner). NEVER auto-grants all agents.
     pub agents: Vec<String>,
     /// Default tool classification for this server when a tool is not named in
     /// `read_only_tools`. Defaults to consequential (fail-safe).
@@ -5624,6 +5638,40 @@ mod tests {
         assert!(
             issues.iter().any(|i| i.contains("enable")),
             "a typo'd [aperture] key must be diagnosed: {issues:?}"
+        );
+    }
+
+    /// REGRESSION: config/darwin.toml's header promises the daemon "falls back to
+    /// these EXACT values as hardcoded defaults if this file is missing". It shipped
+    /// `[aperture] poll_interval_secs = 5` against a compiled default of 20 — so
+    /// deleting/renaming the file silently changed the sampling cadence of a
+    /// PRIVACY-SENSITIVE surface (frontmost app + redacted window title) by 4x, with
+    /// no signal to the operator. This parses the COMMITTED file and pins the
+    /// lockstep.
+    ///
+    /// SCOPE (honest): `Config` is Deserialize-only, so there is no cheap
+    /// whole-struct comparison; this covers the section the mismatch was found in.
+    #[test]
+    fn shipped_aperture_config_matches_the_compiled_default() {
+        let shipped = include_str!("../../config/darwin.toml");
+        let (parsed, issues) = Config::parse(shipped);
+        assert!(
+            issues.iter().all(|i| !i.contains("aperture")),
+            "the shipped [aperture] block must parse clean: {issues:?}"
+        );
+        let d = super::ApertureConfig::default();
+        assert_eq!(
+            parsed.aperture.enabled, d.enabled,
+            "shipped [aperture].enabled must equal the compiled default"
+        );
+        assert_eq!(
+            parsed.aperture.retention, d.retention,
+            "shipped [aperture].retention must equal the compiled default"
+        );
+        assert_eq!(
+            parsed.aperture.poll_interval_secs, d.poll_interval_secs,
+            "shipped [aperture].poll_interval_secs must equal the compiled default \
+             (the file's own header promises it)"
         );
     }
 

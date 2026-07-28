@@ -79,6 +79,23 @@ def main():
     check("zero binary", r.get("binary") == "0")
     check("zero hex", r.get("hex") == "0")
 
+    # 8) REGRESSION (sweep HIGH): a huge but VALID value must not produce a
+    # reply that json.dumps() cannot encode. compute() never raises, but
+    # CPython >=3.11 refuses to render an int past 4300 digits — the app then
+    # emitted NO result frame and the agent-tool call hung the full 15s
+    # request timeout. It must refuse honestly instead.
+    import json as _json
+    r = compute({"value": "1" * 14300, "from_base": 2})
+    check("huge value refused honestly", "error" in r)
+    _json.dumps(r)  # must not raise
+    r = compute({"value": "ff" * 3000, "from_base": 16})
+    check("huge hex refused honestly", "error" in r)
+    _json.dumps(r)
+    # A normal conversion is unaffected by the bound.
+    r = compute({"value": "255"})
+    check("normal conversion still works", r.get("binary") == "11111111")
+    _json.dumps(r)
+
     print("ALL PASS")
     sys.exit(0)
 

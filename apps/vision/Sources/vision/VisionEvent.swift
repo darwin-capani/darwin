@@ -85,13 +85,26 @@ public struct ScreenReadMeta: Sendable, Equatable {
     /// text (subject lines, document names) — the daemon REDACTS before store,
     /// exactly like the OCR text itself. nil = honestly unknown.
     public let sourceWindow: String?
+    /// TRUNCATION HONESTY: how many recognized-text observations the recognizer
+    /// produced BEFORE the engine's `maxTextBlocks` cap. `block_count` is the
+    /// POST-cap number, so without this a consumer cannot tell "the screen had N
+    /// blocks" from "the screen had far more and you got the first N" — a partial
+    /// read read as the screen's complete text, and the where-is locator (which
+    /// searches only the returned blocks) reported an on-screen control as absent.
+    /// nil = honestly unknown (a detector that does no counting), NEVER fabricated.
+    public let blocksTotal: Int?
+    /// True when the cap DROPPED blocks from this readout. nil = honestly unknown.
+    public let blocksTruncated: Bool?
 
     public init(kind: ScreenReadKind, documentDetected: Bool? = nil,
-                sourceApp: String? = nil, sourceWindow: String? = nil) {
+                sourceApp: String? = nil, sourceWindow: String? = nil,
+                blocksTotal: Int? = nil, blocksTruncated: Bool? = nil) {
         self.kind = kind
         self.documentDetected = documentDetected
         self.sourceApp = sourceApp
         self.sourceWindow = sourceWindow
+        self.blocksTotal = blocksTotal
+        self.blocksTruncated = blocksTruncated
     }
 
     /// The default meta for the plain screen OCR read (read.screen).
@@ -277,6 +290,13 @@ public enum VisionEvent: Sendable {
             // may be sensitive; the daemon redacts before store (like `text`).
             if let sourceApp = meta.sourceApp { d["source_app"] = sourceApp }
             if let sourceWindow = meta.sourceWindow { d["source_window"] = sourceWindow }
+            // TRUNCATION SIGNAL (additive, same omit-when-unknown pattern): the
+            // PRE-cap observation total + whether the cap dropped anything, so
+            // `block_count` (post-cap) is never mistaken for a complete read of a
+            // dense screen. Omitted when the detector did no counting — absence is
+            // honest; a truncation flag is never fabricated.
+            if let blocksTotal = meta.blocksTotal { d["blocks_total"] = blocksTotal }
+            if let blocksTruncated = meta.blocksTruncated { d["blocks_truncated"] = blocksTruncated }
 
         case let .sound(timestamp, source, classes, classifier, computeUnit):
             d["ts"] = timestamp

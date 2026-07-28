@@ -347,14 +347,61 @@ fn extract_subject(lower: &str) -> Option<String> {
         if let Some(idx) = lower.find(lead) {
             let tail = lower[idx + lead.len()..].trim();
             let phrase = tail.trim_end_matches(|c: char| !c.is_alphanumeric()).trim();
-            // Reject a phrase that is itself only a time cue ("3pm") so "...around
-            // 3pm" is a window, not a subject.
-            if !phrase.is_empty() && phrase.len() <= 64 && !phrase.chars().all(|c| c.is_ascii_digit()) {
+            // Reject a phrase that is itself only a time cue ("3pm", "the last
+            // hour") so "...around 3pm" / "...on the last hour" is a WINDOW, not a
+            // subject. WHY the all-digits test was not enough: every real cue
+            // carries letters ("3pm", "last hour", "past 2 hours"), so it passed the
+            // digit check and became a subject — and `render_recall` then filtered
+            // the timeline on `title/app contains "last hour"`, which no window
+            // title ever does, so a fully populated timeline answered the most
+            // natural phrasing with "I have no record of what you were working on".
+            if !phrase.is_empty() && phrase.len() <= 64 && !looks_like_time_cue(phrase) {
                 return Some(phrase.to_string());
             }
         }
     }
     None
+}
+
+/// True when `phrase` is ITSELF only a time cue ("3pm", "last hour", "past 2
+/// hours", "today") and therefore must NOT be taken as a recall SUBJECT — the
+/// utterance was scoping a window, not naming a topic.
+///
+/// DELIBERATELY conservative: beyond the two real parsers, a phrase is a cue only
+/// when EVERY token is a time word or a bare number. So "the morning briefing"
+/// stays a subject even though it mentions "morning" — rejecting on a mere
+/// contains() would silently drop real subjects.
+fn looks_like_time_cue(phrase: &str) -> bool {
+    let p = phrase.trim();
+    if p.is_empty() {
+        return false;
+    }
+    if p.chars().all(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    // The two cues the window parser itself recognizes ("3pm", "past 2 hours").
+    if parse_clock_hour(p).is_some() || parse_past_n_hours(p).is_some() {
+        return true;
+    }
+    const TIME_WORDS: &[&str] = &[
+        "the", "this", "that", "last", "past", "next", "few", "couple", "recent",
+        "hour", "hours", "minute", "minutes", "day", "days", "week", "weeks",
+        "morning", "afternoon", "evening", "night", "tonight", "today",
+        "yesterday", "noon", "midnight", "earlier", "recently", "just", "now",
+    ];
+    let mut saw_token = false;
+    for tok in p.split_whitespace() {
+        let t = tok.trim_matches(|c: char| !c.is_alphanumeric());
+        if t.is_empty() {
+            continue;
+        }
+        saw_token = true;
+        let is_number = t.chars().all(|c| c.is_ascii_digit());
+        if !is_number && !TIME_WORDS.contains(&t) {
+            return false;
+        }
+    }
+    saw_token
 }
 
 /// Parse an optional TIME WINDOW from a (lowercased) utterance relative to `now`.
@@ -1207,6 +1254,33 @@ mod tests {
         // A bare recall carries neither window nor subject.
         let bare = build_query("what was I working on", &fixed_now());
         assert!(bare.window.is_none() && bare.subject.is_none());
+    }
+
+    /// REGRESSION: a TIME cue that lands after one of the subject leads ("on the "
+    /// / "about ") must stay a WINDOW and never become a subject. It used to: the
+    /// guard only rejected all-digit phrases, so "last hour" / "past 2 hours" /
+    /// "3pm" became subjects, `render_recall` filtered the timeline on
+    /// `title/app contains "last hour"` (nothing ever does), and a fully populated
+    /// timeline answered "I have no record of what you were working on".
+    #[test]
+    fn a_time_cue_after_a_subject_lead_stays_a_window_not_a_subject() {
+        for utterance in [
+            "what was I working on the last hour",
+            "what was I working on the past 2 hours",
+            "what was I working on about 3pm",
+            "what was I working on about 9am",
+        ] {
+            let q = build_query(utterance, &fixed_now());
+            assert!(
+                q.subject.is_none(),
+                "{utterance:?} must carry NO subject, got {:?}",
+                q.subject
+            );
+            assert!(q.window.is_some(), "{utterance:?} must still resolve a window");
+        }
+        // …and a real subject that merely MENTIONS a time word is still a subject.
+        let q = build_query("what was I working on the morning briefing", &fixed_now());
+        assert_eq!(q.subject.as_deref(), Some("morning briefing"));
     }
 
     // -- SUMMARIZE + RENDER (group by app, honest-empty) ---------------------

@@ -65,7 +65,7 @@ instant_opener = false  # master gate for the canned instant acknowledgment. SHI
 
 [inference]
 preload = true          # warm STT, LLM (+classifier prompt cache) and TTS in a background thread at server startup
-speculative = true      # #37 SPECULATIVE/DRAFT DECODING — master gate. SHIPS ON (full-power default) — INERT WITHOUT A DRAFT MODEL: it ALSO needs a loadable draft_model below (ships empty); absent that, generate falls back to NORMAL gen and HONESTLY reports speculative=false (NEVER faked). Set draft_model to engage. The real speedup is device/model-dependent and only on-device.
+speculative = true      # #37 SPECULATIVE/DRAFT DECODING — master gate. SHIPS ON (full-power default). It ALSO needs a loadable draft_model, and one SHIPS POPULATED on the line below (the installer pre-downloads that exact checkpoint), so on a default install BOTH halves are armed — set draft_model = "" to force NORMAL gen. If the checkpoint can't be loaded (or mlx_lm lacks speculative support), generate falls back to NORMAL gen and HONESTLY reports speculative=false (NEVER faked). The real speedup is device/model-dependent and only on-device.
 draft_model = "mlx-community/Qwen3-0.6B-4bit"   # #37 small DRAFT checkpoint mlx_lm uses to propose tokens the main model verifies (canonical id = server.py DEFAULT_DRAFT; bundled by the installer). With speculative=true above + this checkpoint present + mlx_lm speculative support, speculative ENGAGES; the real speedup is device/model-dependent and on-device only. HONEST FALLBACK: if the checkpoint isn't downloaded or mlx_lm lacks speculative support, generate falls back to NORMAL gen and reports speculative=false (NEVER faked). Set back to "" to force normal gen.
 quant = "auto"          # #39 SELECTABLE QUANTIZATION for the local model load. "auto" (default) == today's behavior (load as configured). Allowed: auto/fp16/int8/int4. An explicit value selects a matching variant; if absent the loader falls back + reports the quant that ACTUALLY loaded (never claims int4 when fp16 loaded). Unknown value => reported + kept "auto". Real RAM/speed/quality tradeoff is device-gated.
 embedder = "coreml-bge-small-en-v1.5"   # op=embed BACKEND. DEFAULT = the purpose-built Core ML sentence embedder (BAAI/bge-small-en-v1.5, 384-dim, ANE-ELIGIBLE via Core ML; inputs tokenized to seq=512, bge's native max, covering docsearch's ~1200-char chunks). SEVERAL TIMES faster than the legacy mean-pool path AND much higher retrieval quality: latency ~6x single (19.6 vs 124 ms) / ~3x per text on a K=8 batch (19.0 vs 56.8 ms/text) at seq=512/ComputeUnit.ALL (re-measured in coreml_embed.py's smoke), recall@1/3/5 0.82/0.92/0.99 MRR 0.96 vs 0.25/0.46/0.56 MRR 0.42 (synthetic-but-representative; harness + set + results committed under inference/benchmarks/coreml_eval/). Convert-on-first-use (ATOMIC: validate-load then rename), cached under the HF model cache, warmed EAGERLY at server startup. HONEST FALLBACK: if it cannot be built/loaded (deps/conversion failure) op=embed serves the mean-pool path instead and REPORTS fell_back (embedder id + flag + log warn), never silently. Allowed CONFIG values: coreml-bge-small-en-v1.5 / llm-qwen3-4b-meanpool. The EMITTED wire space id is fixed for Core ML but MODEL-DERIVED for mean-pool (llm-meanpool:<llm_id>:<quant>[:<adapter>]) so an LLM/quant swap OR a promoted-LoRA promote/rollback changes the stamp; docsearch keys the vector SPACE by that id + dim. "ANE-eligible": Core ML schedules ANE/GPU/CPU at its discretion — only end-to-end latency is measured, never ANE residency.
@@ -507,8 +507,9 @@ allow_consequential = true
 #     never auto-send/post/spend/mutate without a spoken yes.
 #   * Unknown/mutating tools default to CONSEQUENTIAL (fail-safe); a tool is only
 #     ungated if its server's config asserts it read-only.
-#   * A per-server `agents` allowlist controls WHICH agents may use it (default:
-#     only the orchestrator + the listed agents — never all 27).
+#   * A per-server `agents` allowlist controls WHICH agents may use it. EMPTY
+#     (`agents = []`) is fully INERT — not even the orchestrator may use it. Grant
+#     an agent and the server admits it + the orchestrator — never all 27.
 #   * stdio servers run under a default-deny seatbelt (sandbox-exec) profile that
 #     grants only the filesystem/network the server's config declares.
 #   * A server's optional token resolves from the Keychain (mcp_<name>_token) and
@@ -529,7 +530,7 @@ max_output_bytes = 262144  # reject any single server response larger than this 
 # command = "/usr/bin/some-mcp-server" # absolute interpreter/binary to spawn
 # args = ["--root", "/Users/you/proj"]
 # uses_token = false                   # true -> resolve mcp_files_token from the Keychain (never inline)
-# agents = ["friday"]                  # which agents may use it (orchestrator always allowed)
+# agents = ["friday"]                  # which agents may use it ([] = nobody, not even the orchestrator; any grant also admits the orchestrator)
 # default_class = "consequential"      # default classification for this server's tools (fail-safe)
 # read_only_tools = ["list", "read"]   # tools this config asserts are safe to call ungated
 # fs_read = ["/Users/you/proj"]        # extra read subpaths granted in the seatbelt profile
@@ -915,7 +916,7 @@ enabled = false                # SHIPS OFF. true = load + enforce the owner-auth
 [aperture]                     # APERTURE (aperture.rs) — a PRIVATE, owner-gated, ON-DEVICE activity timeline ("Recall done right"). Records which app was frontmost + its window TITLE (PII-redacted) + duration into a bounded, TRANSIENT in-RAM ring, recallable by voice ("what was I working on around 3pm"). Records app + title + time ONLY — never screen pixels; NOTHING leaves the box.
 enabled = false                # SHIPS OFF (an activity timeline is privacy-sensitive; with it off nothing is polled or stored). Set true to opt in.
 retention = 500                # evict-oldest cap on the in-RAM timeline ring (bounded memory; floored >= 1).
-poll_interval_secs = 5         # seconds between frontmost-app/window samples (floored >= 1).
+poll_interval_secs = 20        # seconds between frontmost-app/window samples (floored >= 1). MUST match ApertureConfig::default() in daemon/src/config.rs — this file's header promises both fall back to these exact values, and a mismatch silently changed the capture rate of a privacy-sensitive surface 4x depending on whether the file was present.
 
 [handoff]                      # CONTINUITY HANDOFF (handoff.rs) — resume a LIVE cognitive session on ANOTHER of your Macs. A session capsule (transcript window, active agent, mission ref, world-model deltas, draft ids, focus profile) is sealed over the SAME [sync] AES-256-GCM path under a Keychain-paired handoff_shared_key; the receiver restores context and PARKS. AUTHORITY NEVER TRANSFERS: the capsule carries NO credential/bearer (redacted), and every consequential step re-hits the fresh confirm + voice-id + master switch + lockdown on the receiving device.
 enabled = false                # SHIPS OFF (rides [sync], also OFF). Set true (with sync paired) to seal/resume session capsules between your own devices.

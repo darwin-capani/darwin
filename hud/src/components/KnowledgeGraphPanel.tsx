@@ -123,7 +123,7 @@ function GraphView({ graph }: { graph: KnowledgeGraphResult }) {
             const hue = kgTypeHue(n.type);
             const fill = `hsl(${hue} 65% 55%)`;
             return (
-              <g key={n.id} transform={`translate(${n.x} ${n.y})`}>
+              <g key={n.key} transform={`translate(${n.x} ${n.y})`}>
                 <circle
                   r={6}
                   fill={fill}

@@ -1,5 +1,6 @@
 import { useLayoutEffect, useMemo, useRef, useState } from "react";
 import Frame from "./Frame";
+import useModalFocus from "./useModalFocus";
 import { sendCommand } from "../tauri/command";
 import {
   buildPaletteItems,
@@ -91,19 +92,7 @@ export default function CommandPalette({
   };
 
   const onKeyDown = (ev: React.KeyboardEvent<HTMLInputElement>) => {
-    if (ev.key === "Escape") {
-      ev.preventDefault();
-      // Esc clears an agent address first (a reversible step), then closes.
-      if (targetAgent) setTargetAgent(null);
-      else onClose();
-      return;
-    }
-    if (ev.key === "Tab") {
-      // Focus trap: the input is the only focusable control, so keep focus here
-      // instead of tabbing into the obscured HUD behind the modal.
-      ev.preventDefault();
-      return;
-    }
+    // Escape + Tab are owned by useModalFocus (dialog-wide, not input-only).
     if (ev.key === "ArrowDown") {
       ev.preventDefault();
       setSelected((s) => (filtered.length === 0 ? 0 : (s + 1) % filtered.length));
@@ -120,12 +109,32 @@ export default function CommandPalette({
     }
   };
 
+  // A11Y (sweep HIGH): the palette was the ONLY aria-modal dialog in the HUD
+  // without a real focus trap — its Tab/Escape handling lived on the <input>'s
+  // onKeyDown, so clicking any non-focusable part of the dialog (the heading,
+  // the hint footer, an empty row) dropped focus to <body> and BOTH keys died.
+  // Use the same hook the other seven dialogs use: it traps Tab across the whole
+  // dialog, restores focus to the opener, and stops propagation so App's
+  // window-level Cmd-K listener cannot double-fire.
+  const paletteRef = useRef<HTMLDivElement>(null);
+  useModalFocus(
+    paletteRef,
+    () => {
+      // Esc clears an agent address first (a reversible step), then closes.
+      if (targetAgent) setTargetAgent(null);
+      else onClose();
+    },
+    open,
+    ".palette-input",
+  );
+
   const activeId = filtered[selected] ? `palette-opt-${selected}` : undefined;
 
   return (
     <div className="palette-backdrop" onClick={onClose}>
       <div
         className="palette"
+        ref={paletteRef}
         role="dialog"
         aria-label="Command Palette"
         aria-modal="true"

@@ -319,7 +319,8 @@ fn success_report(spec: &Spec) -> String {
     format!(
         "Added MCP connector '{name}' ({transport}) to config/darwin.toml. It is INERT — no agent may use it \
          and every tool on it stays gated. To make it live:{token_step}\n  {grant}. Grant the agents you want in \
-         that block's `agents = []`.\n  {restart}. Restart DARWIN so it connects.",
+         that block's `agents = []` (granting any agent also admits the orchestrator, which holds every tool).\
+         \n  {restart}. Restart DARWIN so it connects.",
         name = spec.name,
         transport = spec.transport.as_str(),
         grant = if spec.uses_token { "2" } else { "1" },

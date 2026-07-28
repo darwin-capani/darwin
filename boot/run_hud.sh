@@ -18,6 +18,17 @@ fi
 
 export DARWIN_ROOT
 
+# Bound state/logs: launchd appends to the StandardOut/ErrorPath forever with no
+# rotation of its own (~5.8 MB/day measured), so rotate at START — the only point
+# where no writer holds the fd. Keeps one previous generation; never fails boot.
+if [ -f "$DARWIN_ROOT/boot/rotate_logs.sh" ]; then
+    # shellcheck disable=SC1091
+    source "$DARWIN_ROOT/boot/rotate_logs.sh"
+    rotate_darwin_log "$DARWIN_ROOT/state/logs/launchd-hud.log"
+    rotate_darwin_log "$DARWIN_ROOT/state/logs/hud.log"
+fi
+
+
 # Locate the built DARWIN.app. Preference order:
 #   1. the bundle built under THIS DARWIN_ROOT (guaranteed to match this tree) —
 #      found the same way install.sh does (find under the Tauri bundle dir);

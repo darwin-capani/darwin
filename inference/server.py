@@ -219,6 +219,7 @@ import asyncio
 import itertools
 import json
 import logging
+import logging.handlers
 import math
 import os
 import re
@@ -232,6 +233,12 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = PROJECT_ROOT / "config" / "darwin.toml"
 SOCKET_PATH = PROJECT_ROOT / "state" / "ipc" / "inference.sock"
 LOG_PATH = PROJECT_ROOT / "state" / "logs" / "inference.log"
+# Cap for state/logs/inference.log before it rotates to inference.log.1 — the SAME
+# 16 MiB / one-previous-generation scheme boot/rotate_logs.sh applies to the
+# launchd logs (DARWIN_MAX_LOG_BYTES), so the two mechanisms agree on the ceiling
+# and on the ".1" name rather than inventing a second convention.
+LOG_MAX_BYTES = 16 * 1024 * 1024
+LOG_BACKUP_COUNT = 1
 TMP_DIR = PROJECT_ROOT / "state" / "tmp"
 OPENERS_DIR = PROJECT_ROOT / "state" / "openers"
 PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "intent_classifier.txt"
@@ -2257,7 +2264,15 @@ log = logging.getLogger("darwin.inference")
 def setup_logging():
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s %(message)s")
-    file_handler = logging.FileHandler(LOG_PATH)
+    # ROTATING, not a plain append. boot/run_inference.sh rotates this path at
+    # START, which bounds growth ACROSS restarts — but this server is a KeepAlive
+    # LaunchAgent that can run for weeks, and a plain FileHandler grew the live
+    # file without any ceiling in between (measured 16.4 MB in 9.4 days on the live
+    # install, and the accept-loop can burst far faster). Same 16 MiB cap and same
+    # single ".1" generation as the boot rotation, so the two never disagree.
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_PATH, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT
+    )
     file_handler.setFormatter(fmt)
     stderr_handler = logging.StreamHandler(sys.stderr)
     stderr_handler.setFormatter(fmt)

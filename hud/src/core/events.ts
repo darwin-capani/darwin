@@ -1901,6 +1901,13 @@ export interface VisionScreen {
   ts: number;
   source: string; // VisionSource on the wire, kept opaque
   blockCount: number;
+  /** Total text blocks the OCR OBSERVED before the per-read cap, when the app
+   *  reports it. `null` = an older payload that predates the signal (unknown,
+   *  never assumed complete). */
+  blocksTotal: number | null;
+  /** True when the readout was CAPPED — the blocks shown are a subset of what
+   *  was on screen. Without this a dense screen was reported as complete. */
+  blocksTruncated: boolean | null;
   text: string;
   blocks: VisionScreenBlock[];
   controls: VisionScreenBlock[];
@@ -2131,6 +2138,11 @@ export function parseVisionScreen(data: Record<string, unknown>): VisionScreen |
     ts: num(data, "ts") ?? 0,
     source: str(data, "source") ?? "",
     blockCount: num(data, "block_count") ?? blocks.length,
+    // TRUNCATION SIGNAL: omitted by the app when unknown, so a missing key is
+    // null (unknown) — NOT false (complete). Claiming completeness we cannot
+    // verify is exactly the dishonesty this signal exists to prevent.
+    blocksTotal: num(data, "blocks_total"),
+    blocksTruncated: bool(data, "blocks_truncated"),
     text,
     blocks,
     controls,

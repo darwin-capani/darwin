@@ -95,7 +95,26 @@ def compute(payload):
             netloc += ("[" + host + "]") if ":" in host else host
         if explicit_port is not None and explicit_port != defaults.get(scheme):
             netloc += ":" + str(explicit_port)
-        normalized = urlunsplit((scheme, netloc, sr.path, sr.query, sr.fragment))
+        if netloc:
+            normalized = urlunsplit((scheme, netloc, sr.path, sr.query, sr.fragment))
+        else:
+            # NO AUTHORITY (e.g. "https:////evil.com/a" -> host "", path
+            # "//evil.com/a"). urlunsplit DROPS the empty-authority marker and then
+            # re-reads the path's leading "//" as an authority, emitting
+            # "https://evil.com/a" — inventing a HOST the URL never had and handing
+            # a different origin to any caller using `normalized` for an origin or
+            # allow-list decision. Assemble it here instead, keeping the EMPTY
+            # authority ("scheme://" + "//path") whenever the path starts with "//"
+            # so the host stays empty on a re-parse. Same refusal-to-rewrite-the-
+            # authority stance as the bad-port branch above.
+            prefix = (scheme + ":") if scheme else ""  # a relative URL has no scheme
+            if sr.path.startswith("//"):
+                prefix += "//"  # keep the EMPTY authority so the host stays empty
+            normalized = prefix + sr.path
+            if sr.query:
+                normalized += "?" + sr.query
+            if sr.fragment:
+                normalized += "#" + sr.fragment
 
         warnings = []
         if userinfo_present:

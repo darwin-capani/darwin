@@ -556,21 +556,31 @@ impl Dispatcher for CloudDispatcher<'_> {
             // The SAME cloud tool loop the direct path uses — per-agent allowlist
             // + gate + recall isolation ride along unchanged. No history/facts
             // threaded here: a sub-task is a fresh, self-contained instruction.
-            crate::anthropic::complete_with_tools(
-                &self.model,
-                self.max_tokens,
-                instruction,
-                &[],
-                &[],
-                self.memory,
-                &scoped,
-                &namespace,
-                agent_persona.as_deref(),
-                &world_context,
-                &personalization,
-                // Inherit the mission's trust: an untrusted mission keeps every
-                // sub-task's egress guard armed on its own call 0.
-                self.context_trusted,
+            //
+            // SPEND ATTRIBUTION: label every cloud row this sub-task records with
+            // the agent that actually ran it. Without this the durable ledger reads
+            // the process-global ACTIVE_AGENT, which only the INTERACTIVE turn ever
+            // writes — so a background mission's cloud cost was billed to whichever
+            // agent the last spoken turn selected. Task-scoped, so a concurrent
+            // interactive turn's label is untouched.
+            crate::obol::with_active_agent(
+                agent.to_string(),
+                crate::anthropic::complete_with_tools(
+                    &self.model,
+                    self.max_tokens,
+                    instruction,
+                    &[],
+                    &[],
+                    self.memory,
+                    &scoped,
+                    &namespace,
+                    agent_persona.as_deref(),
+                    &world_context,
+                    &personalization,
+                    // Inherit the mission's trust: an untrusted mission keeps every
+                    // sub-task's egress guard armed on its own call 0.
+                    self.context_trusted,
+                ),
             )
             .await
         })

@@ -197,7 +197,12 @@ fn authorize_url(url_str: &str, allowed_hosts: &[String]) -> Result<Url, &'stati
 /// (100.64/10), link-local (169.254/16, fe80::/10), unique-local (fc00::/7),
 /// unspecified, multicast, broadcast, and documentation ranges. An IPv4-mapped
 /// IPv6 address is judged by its embedded v4. Exhaustively table-tested.
-fn ip_is_public(ip: IpAddr) -> bool {
+///
+/// `pub(crate)`: this is the daemon's ONE definition of "safe to connect to", and
+/// the daemon's other outward fetcher (the SAGE research fetcher in anthropic.rs)
+/// reuses it rather than growing a second copy that could drift out of step with
+/// the embedded-v4 smuggling cases below.
+pub(crate) fn ip_is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => ipv4_is_public(v4),
         IpAddr::V6(v6) => {
@@ -310,6 +315,37 @@ fn ipv6_is_public(v6: Ipv6Addr) -> bool {
     true
 }
 
+/// Resolve `host:port` and return the address to PIN for the connection, or a
+/// stable reason. THE SSRF / DNS-REBINDING RULE, in one place: there must be at
+/// least one address and EVERY returned address must be [`ip_is_public`] (a host
+/// that resolves to a mix is refused outright), and the caller then connects to
+/// the returned address via `reqwest`'s `.resolve()` so nothing can rebind between
+/// the check and the connect.
+///
+/// `pub(crate)` and shared with the SAGE research fetcher (anthropic.rs): both of
+/// the daemon's outward fetch paths must apply the SAME rule, and one
+/// implementation is how it stays that way. Reasons: `"unresolvable"` (host down /
+/// NXDOMAIN — not an SSRF signal) and `"host_resolves_private"`.
+pub(crate) async fn resolve_pinned_public(host: &str, port: u16) -> Result<SocketAddr, &'static str> {
+    let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host, port)).await {
+        Ok(it) => it.collect(),
+        Err(_) => return Err("unresolvable"),
+    };
+    if !resolution_is_safe(&addrs) {
+        return Err("host_resolves_private");
+    }
+    Ok(addrs[0])
+}
+
+/// PURE half of the rule above (so the ALL-not-ANY property is unit-testable
+/// without DNS): a resolution is safe only if it is non-empty and EVERY address is
+/// public. All-not-any is load-bearing — a hostile name can return a public
+/// address alongside `127.0.0.1`, and connecting to "one of them" is exactly the
+/// rebinding hole. An empty resolution is unsafe too (nothing safe to connect to).
+fn resolution_is_safe(addrs: &[SocketAddr]) -> bool {
+    !addrs.is_empty() && addrs.iter().all(|sa| ip_is_public(sa.ip()))
+}
+
 /// One completed HTTP round-trip (NO redirect following): the status, the
 /// `Location` header if any, and the (already body-capped) RAW response bytes.
 /// Bytes, not a String: the daemon must not transcode — an RSS feed served as
@@ -372,22 +408,17 @@ impl UrlFetcher for ReqwestFetcher {
         // authorize_url guarantees a DNS-name host; this is defense in depth.
         let host = url.host_str().ok_or(FetchError::Failed)?.to_string();
 
-        // Resolve + SSRF/rebinding guard: EVERY returned address must be public,
-        // and there must be at least one. Empty resolution is treated as
-        // "resolves private" (nothing safe to connect to).
-        let addrs: Vec<SocketAddr> = match tokio::net::lookup_host((host.as_str(), 443u16)).await {
-            Ok(it) => it.collect(),
-            // A resolution failure is a plain fetch failure (host may be down /
-            // NXDOMAIN); it is not an SSRF signal.
+        // Resolve + SSRF/rebinding guard (the SHARED rule — see
+        // `resolve_pinned_public`), then pin the VERIFIED address so nothing
+        // rebinds between the check and the connect. reqwest validates TLS against
+        // `host` (SNI + cert) while connecting to this exact IP. A resolution
+        // failure is a plain fetch failure (host may be down / NXDOMAIN); it is
+        // not an SSRF signal.
+        let chosen = match resolve_pinned_public(host.as_str(), 443u16).await {
+            Ok(addr) => addr,
+            Err("host_resolves_private") => return Err(FetchError::HostResolvesPrivate),
             Err(_) => return Err(FetchError::Failed),
         };
-        if addrs.is_empty() || !addrs.iter().all(|sa| ip_is_public(sa.ip())) {
-            return Err(FetchError::HostResolvesPrivate);
-        }
-        // Pin the VERIFIED address so nothing rebinds between the check and the
-        // connect. reqwest validates TLS against `host` (SNI + cert) while
-        // connecting to this exact IP.
-        let chosen = addrs[0];
 
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
@@ -878,6 +909,28 @@ mod tests {
             let ip: IpAddr = s.parse().unwrap();
             assert!(ip_is_public(ip), "{s} must be judged public");
         }
+    }
+
+    /// EVERY resolved address must be public — not merely one of them. A hostile
+    /// name can answer with a public address ALONGSIDE `127.0.0.1` (or the cloud
+    /// metadata IP); picking "one that looks fine" is precisely the DNS-rebinding
+    /// hole. Empty resolves to nothing safe, so it is refused too. This is the pure
+    /// half of `resolve_pinned_public`, shared with the SAGE research fetcher.
+    #[test]
+    fn resolution_is_safe_requires_every_address_to_be_public() {
+        let sa = |s: &str| -> SocketAddr { format!("{s}:443").parse().unwrap() };
+        assert!(resolution_is_safe(&[sa("93.184.216.34")]), "a public address is fetchable");
+        assert!(resolution_is_safe(&[sa("8.8.8.8"), sa("1.1.1.1")]));
+        assert!(!resolution_is_safe(&[]), "an empty resolution is not safe");
+        assert!(!resolution_is_safe(&[sa("127.0.0.1")]));
+        assert!(
+            !resolution_is_safe(&[sa("93.184.216.34"), sa("127.0.0.1")]),
+            "a mixed resolution must be refused whole (rebinding)"
+        );
+        assert!(
+            !resolution_is_safe(&[sa("8.8.8.8"), sa("169.254.169.254")]),
+            "a public address must not launder a metadata-IP answer"
+        );
     }
 
     // -- rate limiter --------------------------------------------------------

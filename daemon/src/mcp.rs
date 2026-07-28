@@ -20,7 +20,10 @@
 //!     a spoken yes routed through the existing confirmation gate.
 //!
 //!   * PER-AGENT ALLOWLISTED. Each server config lists which DARWIN agents may
-//!     use it; the orchestrator is always admitted, every other agent only if
+//!     use it. An EMPTY list (`agents = []`, what `connector_add` writes) is
+//!     INERT — NO agent may use it, not even the orchestrator, which is what the
+//!     confirmation the user approves promises. Once the user grants agents, the
+//!     orchestrator is admitted alongside them and every other agent only if
 //!     explicitly listed — NEVER an auto-grant of all agents.
 //!
 //!   * BOUNDED. Per-call timeout, output-size cap, max servers, max tools/server.
@@ -75,9 +78,11 @@ use crate::integrations::{self, mcp_token_account, ActionMode};
 /// versions are date-stamped; this is the revision the lifecycle below targets.
 pub const PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// The orchestrator agent id. Always admitted to every configured server (it is
-/// the delegation fallback + tool owner); every OTHER agent must be on a server's
-/// `agents` allowlist. Kept in lockstep with agents.rs by a test.
+/// The orchestrator agent id. Admitted to every server the user has GRANTED (it
+/// is the delegation fallback + tool owner); every OTHER agent must be on that
+/// server's `agents` allowlist. A server with an EMPTY allowlist grants nobody,
+/// orchestrator included ([`McpManager::agent_may_use`]). Kept in lockstep with
+/// agents.rs by a test.
 const ORCHESTRATOR: &str = "darwin";
 
 // ===========================================================================
@@ -226,6 +231,40 @@ fn parse_rpc_result(resp: &Value) -> McpResult<Value> {
         .ok_or_else(|| anyhow!("server reply has neither result nor error"))
 }
 
+/// Does `resp` answer the request we sent as `want`? PURE, and checked by
+/// [`McpClient`] on EVERY round-trip — defense in depth behind the transports'
+/// own correlation ([`read_correlated`] for stdio, [`extract_rpc_response`] for
+/// an SSE reply; the http single-JSON reply mode has no id check of its own).
+/// [`parse_rpc_result`] validates only the JSON-RPC envelope, so without this a
+/// reply to a DIFFERENT request would be rendered as this call's result — a
+/// mis-attributed tool result the model (and the user) would be told is the
+/// answer to what they asked. A reply with no/mismatched id fails honestly.
+fn check_reply_id(resp: &Value, want: i64) -> McpResult<()> {
+    match resp.get("id") {
+        Some(id) if rpc_id_matches(id, &json!(want)) => Ok(()),
+        _ => bail!("the MCP server's reply does not answer the request that was sent"),
+    }
+}
+
+/// Do two JSON-RPC ids denote the SAME request? PURE. Exact value equality, plus
+/// the one liberal case a real-world server produces: echoing our NUMERIC id back
+/// as its decimal STRING ("5" for 5). That is still an exact correspondence — it
+/// can never make one request's reply pass for another's — so accepting it keeps a
+/// slightly-off-spec server usable without weakening the correlation.
+fn rpc_id_matches(a: &Value, b: &Value) -> bool {
+    if a == b {
+        return true;
+    }
+    let as_num = |v: &Value| -> Option<i64> {
+        v.as_i64()
+            .or_else(|| v.as_str().and_then(|s| s.parse::<i64>().ok()))
+    };
+    match (as_num(a), as_num(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 // ===========================================================================
 // Transport seam
 // ===========================================================================
@@ -263,6 +302,15 @@ use tokio::sync::Mutex as AsyncMutex;
 /// newline-delimited JSON-RPC. Holds the child + framed handles behind an async
 /// mutex so concurrent calls serialize on the single pipe pair.
 ///
+/// CANCELLATION-SAFE FRAMING. ONE transport serves every call for the daemon's
+/// life, and the per-call timeout ([`bounded`]) cancels a request by DROPPING its
+/// future — mid-write or mid-read — after the request line already went out. Two
+/// invariants keep that from silently corrupting later calls: every reply is
+/// matched to the id it answers ([`read_correlated`], so a late/stale reply is
+/// discarded rather than handed to the wrong caller), and a write that did not
+/// fully land POISONS the connection ([`StdioInner::write_incomplete`], so we fail
+/// honestly instead of appending to a partial line).
+///
 /// SPAWNING IS RUNTIME-GATED: [`spawn`] is the ONLY path that launches a real
 /// process, it is never reached from a test (tests use the mock), and the daemon
 /// only reaches it when `[mcp].enabled` is true AND a server is configured. The
@@ -277,7 +325,26 @@ struct StdioInner {
     child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
+    /// DESYNC POISON. Raised immediately BEFORE a message's bytes start going out
+    /// and lowered only once the WHOLE line has flushed. The per-call timeout
+    /// ([`bounded`]) DROPS the in-flight request future, which can cancel us
+    /// mid-`write_line` and leave a PARTIAL JSON line in the child's stdin — every
+    /// later message would then be appended to that fragment and the server would
+    /// read garbage forever. A connection that starts a request with this still
+    /// raised is poisoned: we fail fast and honestly instead of talking into a
+    /// corrupt pipe. (A timeout during the READ half does NOT poison — the
+    /// id-correlated read below simply discards the abandoned call's late reply.)
+    write_incomplete: bool,
 }
+
+/// Hard ceiling on how many NON-MATCHING stdout lines one `request` will discard
+/// while looking for its own reply. Two spec-legal cases produce them: a server
+/// that interleaves `notifications/*` lines with responses, and the late reply to
+/// a call whose future the per-call timeout already abandoned. Skipping is what
+/// keeps the pipe from staying permanently off-by-one; the cap (alongside the
+/// per-call timeout) stops a server that emits an endless notification stream
+/// from spinning the read loop. Mirrors [`SSE_MAX_EVENTS`] on the http side.
+const STDIO_MAX_SKIPPED_LINES: usize = 64;
 
 impl StdioTransport {
     /// Spawn `command argv...` (already wrapped in sandbox-exec by the manager),
@@ -304,21 +371,26 @@ impl StdioTransport {
                 child,
                 stdin,
                 stdout: BufReader::new(stdout),
+                write_incomplete: false,
             }),
             max_output_bytes,
         })
     }
 
-    /// Write one newline-delimited JSON message to the child's stdin.
-    async fn write_line(inner: &mut StdioInner, message: &Value) -> McpResult<()> {
+    /// Write one newline-delimited JSON message to the child's stdin. Generic over
+    /// the writer so the framing + the poison sequencing around it are unit-tested
+    /// with an in-memory writer — no subprocess is ever spawned by a test.
+    async fn write_line<W: tokio::io::AsyncWrite + Unpin>(
+        stdin: &mut W,
+        message: &Value,
+    ) -> McpResult<()> {
         let mut line = serde_json::to_string(message).context("serializing JSON-RPC message")?;
         line.push('\n');
-        inner
-            .stdin
+        stdin
             .write_all(line.as_bytes())
             .await
             .context("writing to MCP server stdin")?;
-        inner.stdin.flush().await.context("flushing MCP server stdin")?;
+        stdin.flush().await.context("flushing MCP server stdin")?;
         Ok(())
     }
 
@@ -327,11 +399,13 @@ impl StdioTransport {
     /// never make the daemon buffer unbounded data. Pulls from the `BufReader`'s
     /// filled buffer in chunks and stops the instant the accumulated line would
     /// exceed the cap — we never allocate past `max + 1` bytes for one line.
-    async fn read_line(inner: &mut StdioInner, max: usize) -> McpResult<Value> {
+    async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
+        stdout: &mut R,
+        max: usize,
+    ) -> McpResult<Value> {
         let mut buf: Vec<u8> = Vec::new();
         loop {
-            let available = inner
-                .stdout
+            let available = stdout
                 .fill_buf()
                 .await
                 .context("reading from MCP server stdout")?;
@@ -353,7 +427,7 @@ impl StdioTransport {
                 bail!("MCP server response exceeded the output-size cap");
             }
             buf.extend_from_slice(chunk);
-            inner.stdout.consume(take);
+            stdout.consume(take);
             if found_newline {
                 break;
             }
@@ -362,19 +436,90 @@ impl StdioTransport {
     }
 }
 
+/// Write one message under the DESYNC POISON (see [`StdioInner::write_incomplete`]).
+/// The flag is raised before the first byte and lowered only after the whole line
+/// has flushed, so BOTH a cancelled future (the per-call timeout dropping us
+/// mid-write) and a write error leave it raised — and the next request on that
+/// connection fails fast instead of appending to a half-written JSON line. Free +
+/// generic over the writer so the sequencing is unit-tested with an in-memory
+/// writer (including a cancellation), never a real subprocess.
+async fn guarded_write<W: tokio::io::AsyncWrite + Unpin>(
+    stdin: &mut W,
+    write_incomplete: &mut bool,
+    message: &Value,
+) -> McpResult<()> {
+    if *write_incomplete {
+        bail!(
+            "the MCP server connection is out of sync after an interrupted write; \
+             restart DARWIN to reconnect it"
+        );
+    }
+    *write_incomplete = true;
+    // `?` deliberately returns with the flag still raised — a failed write may
+    // have left a partial line on the wire.
+    StdioTransport::write_line(stdin, message).await?;
+    *write_incomplete = false;
+    Ok(())
+}
+
+/// Read stdout lines until one ANSWERS `want_id`, discarding anything else (up to
+/// [`STDIO_MAX_SKIPPED_LINES`]).
+///
+/// WHY: `read_line` returns whatever line arrives next, and [`parse_rpc_result`]
+/// only validates the JSON-RPC envelope — it never compares ids. Without this
+/// correlation, one call that outran the per-call timeout (its future dropped
+/// AFTER the write landed) leaves its late reply in the pipe, and the NEXT call
+/// reads it as its own: `render_call_result` then reports the PREVIOUS tool's
+/// output as this tool's result, and the pipe stays off-by-one for the rest of the
+/// daemon's uptime. A spec-legal `notifications/*` line desynchronizes it
+/// identically. Matching by id is what the http sibling already does
+/// ([`extract_rpc_response`]); this gives the stdio pipe the same guarantee and
+/// lets it RESYNC on the next call instead of mis-attributing results forever.
+async fn read_correlated<R: tokio::io::AsyncBufRead + Unpin>(
+    stdout: &mut R,
+    max: usize,
+    want_id: &Value,
+) -> McpResult<Value> {
+    let mut skipped = 0usize;
+    loop {
+        let line = StdioTransport::read_line(stdout, max).await?;
+        if line.get("id").is_some_and(|id| rpc_id_matches(id, want_id)) {
+            return Ok(line);
+        }
+        skipped += 1;
+        if skipped > STDIO_MAX_SKIPPED_LINES {
+            bail!("the MCP server did not answer the request it was sent");
+        }
+        // The line's CONTENT is never logged (a server could put anything there).
+        warn!(skipped, "mcp: discarding a stdio line that is not this request's reply");
+    }
+}
+
 impl McpTransport for StdioTransport {
     fn request<'a>(&'a self, message: Value) -> BoxFuture<'a, McpResult<Value>> {
         Box::pin(async move {
+            let want_id = message.get("id").cloned().unwrap_or(Value::Null);
             let mut inner = self.inner.lock().await;
-            Self::write_line(&mut inner, &message).await?;
-            Self::read_line(&mut inner, self.max_output_bytes).await
+            let StdioInner {
+                stdin,
+                stdout,
+                write_incomplete,
+                ..
+            } = &mut *inner;
+            guarded_write(stdin, write_incomplete, &message).await?;
+            read_correlated(stdout, self.max_output_bytes, &want_id).await
         })
     }
 
     fn notify<'a>(&'a self, message: Value) -> BoxFuture<'a, McpResult<()>> {
         Box::pin(async move {
             let mut inner = self.inner.lock().await;
-            Self::write_line(&mut inner, &message).await
+            let StdioInner {
+                stdin,
+                write_incomplete,
+                ..
+            } = &mut *inner;
+            guarded_write(stdin, write_incomplete, &message).await
         })
     }
 }
@@ -784,6 +929,8 @@ impl McpClient {
         let reply = bounded(timeout, transport.request(init))
             .await
             .context("MCP initialize")?;
+        // The reply must answer THIS request (never a stale/other id).
+        check_reply_id(&reply, init_id).context("MCP initialize reply")?;
         // We don't pin the server's protocolVersion (servers may negotiate down);
         // we only require the reply is a well-formed JSON-RPC result.
         let _server_caps = parse_rpc_result(&reply).context("MCP initialize reply")?;
@@ -817,6 +964,7 @@ impl McpClient {
         let reply = bounded(self.timeout, self.transport.request(rpc_request(id, "tools/list", json!({}))))
             .await
             .context("MCP tools/list")?;
+        check_reply_id(&reply, id).context("MCP tools/list reply")?;
         let result = parse_rpc_result(&reply).context("MCP tools/list reply")?;
         let raw = result
             .get("tools")
@@ -918,6 +1066,11 @@ impl McpClient {
         let reply = bounded(self.timeout, self.transport.request(req))
             .await
             .context("MCP tools/call")?;
+        // A reply that does not answer THIS call is a hard Err, never a rendered
+        // result: handing back another call's output as this tool's outcome is the
+        // one failure the agent loop cannot detect (it would report an action
+        // succeeded on the strength of a different call's reply).
+        check_reply_id(&reply, id).context("MCP tools/call reply")?;
         // A JSON-RPC error object -> a friendly tool error (not a hard Err, so the
         // loop can surface it to the user as a result).
         let result = match parse_rpc_result(&reply) {
@@ -1043,6 +1196,17 @@ impl McpManager {
         let targets: Vec<McpServerConfig> =
             self.connectable_servers().into_iter().cloned().collect();
         for s in targets {
+            // HONEST VISIBILITY: a server with an empty `agents` list connects (so
+            // the HUD can show it and its tool list is discovered) but NO agent may
+            // call it — `agent_may_use` refuses everyone, orchestrator included.
+            // Say so once at boot rather than leaving the user to wonder why a
+            // configured connector never appears to the model.
+            if s.agents.is_empty() {
+                warn!(
+                    server = %s.name,
+                    "mcp: server has `agents = []` — it is INERT (no agent may use its tools); grant agents in config to make it usable"
+                );
+            }
             match Self::connect_one(&s, project_root, timeout, max_tools, max_out).await {
                 Ok(client) => {
                     info!(server = %s.name, tools = client.tools().len(), "mcp: server connected");
@@ -1135,6 +1299,14 @@ impl McpManager {
         self.clients.insert(client.name().to_string(), Arc::new(client));
     }
 
+    /// TEST seam: swap the CONFIG (transport kind, allowlist, declared hosts) while
+    /// keeping the already-connected mock client — so a caller can exercise the
+    /// remote-vs-local policy split (`server_reaches_network`) without a wire.
+    #[cfg(test)]
+    pub fn replace_config_for_test(&mut self, cfg: McpConfig) {
+        self.cfg = cfg;
+    }
+
     /// Every tool across every connected server, namespaced. Empty when disabled.
     pub fn tools(&self) -> Vec<DiscoveredTool> {
         self.clients
@@ -1143,19 +1315,51 @@ impl McpManager {
             .collect()
     }
 
-    /// May `agent` use `server`? The orchestrator always may; every other agent
-    /// only if the server's `agents` allowlist names it. A server that does not
-    /// exist (not connected, or not configured) is never usable. Pure.
+    /// May `agent` use `server`? An EMPTY `agents` list means NO agent may — not
+    /// even the orchestrator; on a server the user HAS granted (a non-empty list)
+    /// the orchestrator is admitted alongside the listed agents, and every other
+    /// agent only if the list names it. A server that does not exist (not
+    /// connected, or not configured) is never usable. Pure.
+    ///
+    /// WHY the empty case is special-cased: `connector_add` writes `agents = []`
+    /// and the user confirms a preview that says the connector is added "INERT —
+    /// no agent may use it … until you grant agents and restart" (connector.rs).
+    /// The old unconditional orchestrator bypass made that statement FALSE: the
+    /// freshly-added server's tools were offered to `darwin` — the agent that runs
+    /// virtually every turn — so the remote endpoint's tool names/descriptions
+    /// entered the orchestrator's context and each tool sat one spoken "confirm"
+    /// from executing. A capability the user was told was not granted must not be.
     pub fn agent_may_use(&self, agent: &str, server: &str) -> bool {
-        if agent == ORCHESTRATOR {
-            // Even the orchestrator can only use a server that is configured.
-            return self.cfg.servers.iter().any(|s| s.name == server);
-        }
         self.cfg
             .servers
             .iter()
             .find(|s| s.name == server)
-            .is_some_and(|s| s.agents.iter().any(|a| a == agent))
+            .is_some_and(|s| {
+                // `agents = []` is INERT for everyone (the connector_add contract).
+                !s.agents.is_empty()
+                    && (agent == ORCHESTRATOR || s.agents.iter().any(|a| a == agent))
+            })
+    }
+
+    /// Do this server's tool ARGUMENTS leave the device when it is called? TRUE for
+    /// an `http` server (they are POSTed to the remote endpoint) and for a stdio
+    /// server whose sandbox profile grants outbound hosts (`net_hosts`); FALSE only
+    /// for a local subprocess with `(deny network*)`. FAIL-SAFE: an unknown server
+    /// counts as reaching the network.
+    ///
+    /// The prompt-injection egress guard uses this: on a tool CONTINUATION the
+    /// model may be acting on instructions inside fetched/MCP/email content, and a
+    /// read-only MCP tool is the one route that runs UNGATED with model-chosen
+    /// arguments — the same exfiltration channel the guard already closes for
+    /// `open_url` / `web_search` / `sage_research`. Pure.
+    pub fn server_reaches_network(&self, server: &str) -> bool {
+        match self.cfg.servers.iter().find(|s| s.name == server) {
+            Some(s) => match s.transport {
+                McpTransportKind::Http => true,
+                McpTransportKind::Stdio => !s.net_hosts.is_empty(),
+            },
+            None => true,
+        }
     }
 
     /// Resolve the classification of a discovered tool on a server (for the loop /
@@ -1972,6 +2176,146 @@ mod tests {
         assert_eq!(tools.len(), 5, "tools/list must truncate at max_tools");
     }
 
+    // -- stdio framing: id correlation + desync poison -------------------
+    //
+    // These drive the REAL stdio read/write halves over in-memory IO (a byte
+    // slice / a Vec writer / a never-ready writer) — no subprocess is spawned,
+    // preserving the module's "no test ever spawns a real process" invariant.
+
+    /// A stale reply left in the pipe by an ABANDONED call (its future dropped by
+    /// the per-call timeout after the write landed) must NOT be handed to the next
+    /// call: the reader skips lines until the id it actually sent. Without the
+    /// correlation, `render_call_result` reports the PREVIOUS tool's output as this
+    /// tool's result, and the pipe stays off-by-one for the daemon's lifetime.
+    #[tokio::test]
+    async fn stdio_read_skips_a_stale_reply_and_returns_the_matching_one() {
+        // id=5 is the abandoned call's late reply; id=6 is ours.
+        let canned = concat!(
+            "{\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"T1\"}]}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":6,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"T2\"}]}}\n",
+        );
+        let mut r = BufReader::new(canned.as_bytes());
+        let got = read_correlated(&mut r, 64 * 1024, &json!(6))
+            .await
+            .expect("the id=6 reply");
+        assert_eq!(got["id"], json!(6), "must return OUR reply, not the stale one");
+        assert_eq!(
+            got["result"]["content"][0]["text"], "T2",
+            "T1's output must never be attributed to the id=6 call"
+        );
+    }
+
+    /// A spec-legal server may interleave notifications (no id) with responses;
+    /// they are discarded, not mistaken for the reply.
+    #[tokio::test]
+    async fn stdio_read_skips_a_notification_line() {
+        let canned = concat!(
+            "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"ok\":true}}\n",
+        );
+        let mut r = BufReader::new(canned.as_bytes());
+        let got = read_correlated(&mut r, 64 * 1024, &json!(2)).await.expect("reply");
+        assert_eq!(got["result"]["ok"], json!(true));
+    }
+
+    /// The skip is BOUNDED: a server that only ever emits other ids cannot spin
+    /// the read loop forever (the per-call timeout is the other bound).
+    #[tokio::test]
+    async fn stdio_read_gives_up_after_the_skip_cap() {
+        let mut canned = String::new();
+        for i in 0..(STDIO_MAX_SKIPPED_LINES + 5) {
+            canned.push_str(&format!("{{\"jsonrpc\":\"2.0\",\"id\":{i},\"result\":{{}}}}\n"));
+        }
+        let mut r = BufReader::new(canned.as_bytes());
+        let err = read_correlated(&mut r, 64 * 1024, &json!(9_999))
+            .await
+            .expect_err("never matches");
+        assert!(err.to_string().contains("did not answer"), "{err}");
+    }
+
+    /// A CANCELLED write (the per-call timeout dropping the request future
+    /// mid-`write_line`) can leave a partial JSON line in the child's stdin. The
+    /// connection is poisoned so the next call fails HONESTLY instead of appending
+    /// to that fragment and corrupting every later message on the pipe.
+    #[tokio::test]
+    async fn stdio_write_poisons_the_connection_when_cancelled_mid_write() {
+        /// A writer that never accepts a byte — stands in for a child whose stdin
+        /// pipe is full/blocked when the timeout fires.
+        struct StuckWriter;
+        impl tokio::io::AsyncWrite for StuckWriter {
+            fn poll_write(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &[u8],
+            ) -> std::task::Poll<std::io::Result<usize>> {
+                std::task::Poll::Pending
+            }
+            fn poll_flush(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+            fn poll_shutdown(
+                self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Pending
+            }
+        }
+        let mut poisoned = false;
+        let mut stuck = StuckWriter;
+        // Exactly what `bounded` does to a slow call: drop the in-flight future.
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(20),
+            guarded_write(&mut stuck, &mut poisoned, &json!({"id": 1})),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the write must be cancelled mid-flight");
+        assert!(poisoned, "a cancelled write must leave the connection poisoned");
+
+        // The NEXT call on that connection fails fast, writing nothing.
+        let mut out: Vec<u8> = Vec::new();
+        let err = guarded_write(&mut out, &mut poisoned, &json!({"id": 2}))
+            .await
+            .expect_err("a poisoned connection must refuse further writes");
+        assert!(err.to_string().contains("out of sync"), "{err}");
+        assert!(out.is_empty(), "nothing may be written into a poisoned pipe");
+    }
+
+    /// The happy path leaves the flag DOWN (the poison is not a one-way latch for
+    /// ordinary traffic), and the framing is one newline-terminated JSON line.
+    #[tokio::test]
+    async fn stdio_write_clears_the_poison_once_the_line_has_flushed() {
+        let mut poisoned = false;
+        let mut out: Vec<u8> = Vec::new();
+        guarded_write(&mut out, &mut poisoned, &json!({"jsonrpc": "2.0", "id": 7}))
+            .await
+            .expect("write");
+        assert!(!poisoned, "a completed write must not poison the connection");
+        let line = String::from_utf8(out).unwrap();
+        assert!(line.ends_with('\n'), "newline-delimited framing: {line}");
+        assert_eq!(line.matches('\n').count(), 1);
+    }
+
+    /// Defense in depth ABOVE the transports: a reply whose id is not the one the
+    /// client sent is a hard error, never a rendered tool result. (The http
+    /// single-JSON reply mode has no id check of its own.)
+    #[test]
+    fn client_rejects_a_reply_that_answers_a_different_request() {
+        assert!(check_reply_id(&json!({"jsonrpc": "2.0", "id": 4, "result": {}}), 4).is_ok());
+        let mismatched = check_reply_id(&json!({"jsonrpc": "2.0", "id": 3, "result": {}}), 4);
+        assert!(mismatched.is_err(), "another request's reply must be refused");
+        let missing = check_reply_id(&json!({"jsonrpc": "2.0", "result": {}}), 4);
+        assert!(missing.is_err(), "an id-less reply must be refused");
+        // A server that echoes our numeric id as its decimal string still answers
+        // THIS request — accepted; anything else is not.
+        assert!(check_reply_id(&json!({"jsonrpc": "2.0", "id": "4", "result": {}}), 4).is_ok());
+        assert!(check_reply_id(&json!({"jsonrpc": "2.0", "id": "3", "result": {}}), 4).is_err());
+        assert!(check_reply_id(&json!({"jsonrpc": "2.0", "id": null, "result": {}}), 4).is_err());
+        assert!(!rpc_id_matches(&json!("abc"), &json!(4)));
+    }
+
     // -- manager: enabled=false is inert ---------------------------------
 
     #[test]
@@ -2049,10 +2393,52 @@ mod tests {
             ..Default::default()
         };
         let mgr = McpManager::new(cfg);
-        assert!(mgr.agent_may_use("darwin", "files"), "orchestrator always");
+        assert!(mgr.agent_may_use("darwin", "files"), "orchestrator, on a GRANTED server");
         assert!(mgr.agent_may_use("friday", "files"), "listed agent");
         assert!(!mgr.agent_may_use("veronica", "files"), "unlisted agent denied");
         assert!(!mgr.agent_may_use("darwin", "nope"), "unknown server denied");
+    }
+
+    /// `agents = []` — what `connector_add` writes, and what the user confirms as
+    /// "INERT: no agent may use it" — must admit NOBODY, orchestrator included.
+    /// The old unconditional bypass handed a freshly-added connector's tools to
+    /// `darwin`, the agent that runs virtually every turn: its remote tool
+    /// names/descriptions entered the orchestrator's context and each tool was one
+    /// spoken "confirm" from executing, on the strength of a confirmation that
+    /// said the opposite.
+    #[tokio::test]
+    async fn empty_agents_list_is_inert_even_for_the_orchestrator() {
+        let s = server("files"); // agents defaults to []
+        assert!(s.agents.is_empty(), "the connector_add default shape");
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![s],
+            ..Default::default()
+        };
+        let mut mgr = McpManager::new(cfg);
+        let (client, mock) = connected_client(
+            ToolClass::ReadOnly,
+            vec!["read_file".into()],
+            json!({ "tools": [{ "name": "read_file" }] }),
+        )
+        .await;
+        mgr.insert_client(client);
+
+        assert!(!mgr.agent_may_use("darwin", "files"), "orchestrator is NOT auto-granted");
+        assert!(!mgr.agent_may_use("friday", "files"), "no agent is granted");
+        // The model is never even offered the tools.
+        assert!(
+            mgr.tool_defs_for_agent("darwin").is_empty(),
+            "an ungranted server must offer the orchestrator nothing"
+        );
+        // And a fabricated call is refused before any transport is touched.
+        let before = mock.methods().iter().filter(|m| *m == "tools/call").count();
+        let refused = mgr
+            .call_tool("darwin", "files", "read_file", json!({}), ActionMode::Execute)
+            .await;
+        assert!(refused.is_err(), "the call must be refused");
+        let after = mock.methods().iter().filter(|m| *m == "tools/call").count();
+        assert_eq!(before, after, "no tools/call may reach the server");
     }
 
     #[tokio::test]
@@ -2492,7 +2878,7 @@ data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"mine\":true}}\n\
         .await;
         mgr.insert_client(client);
 
-        assert!(mgr.agent_may_use("darwin", "ops"), "orchestrator always");
+        assert!(mgr.agent_may_use("darwin", "ops"), "orchestrator, on a GRANTED server");
         assert!(mgr.agent_may_use("friday", "ops"), "listed agent");
         assert!(!mgr.agent_may_use("veronica", "ops"), "unlisted denied");
 

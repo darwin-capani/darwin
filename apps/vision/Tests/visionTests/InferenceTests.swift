@@ -276,6 +276,46 @@ final class InferenceTests: XCTestCase {
                       "real Vision OCR must read 'DARWIN' from the synthesized image; got: \(joined)")
     }
 
+    /// REGRESSION (truncation honesty): `read.screen` capped OCR at `maxTextBlocks`
+    /// and emitted only the POST-cap `block_count`, so a dense screen was reported
+    /// as a COMPLETE read and the where-is locator answered "not found" for a
+    /// control that was on screen. `readText` must report the PRE-cap total and
+    /// flag truncation.
+    func testReadTextReportsThePreCapTotalAndFlagsTruncation() throws {
+        let lines = ["ONE", "TWO", "THREE", "FOUR"]
+        guard let img = makeTextImage(lines, width: 600, height: 420, fontSize: 44) else {
+            throw XCTSkip("could not render a text CGImage in this environment")
+        }
+        // Uncapped read: the ground truth for how many observations this image has.
+        let full = VisionEngine().readText(image: img, minConfidence: 0.0)
+        guard full.totalObservations >= 2 else {
+            throw XCTSkip("VNRecognizeTextRequest read < 2 blocks in this build env (device-gated)")
+        }
+        XCTAssertFalse(full.truncated, "an uncapped read is not truncated")
+        XCTAssertEqual(full.totalObservations, full.detections.count,
+                       "with no cap the pre-cap total equals what was returned")
+
+        // The SAME image through an engine capped to ONE block: the returned
+        // blocks shrink, the reported TOTAL does not, and truncated flips true.
+        let capped = VisionEngine(maxTextBlocks: 1).readText(image: img, minConfidence: 0.0)
+        XCTAssertEqual(capped.totalObservations, full.totalObservations,
+                       "the pre-cap total must NOT shrink with the cap — that is the whole signal")
+        XCTAssertLessThanOrEqual(capped.detections.count, 1, "the cap really drops blocks")
+        XCTAssertTrue(capped.truncated, "a capped read must report itself truncated")
+    }
+
+    /// The default `Detector.readText` seam (a detector with no cap of its own)
+    /// reports no truncation and a total equal to what it returned — honest, never
+    /// a fabricated flag.
+    func testDefaultDetectorReadTextReportsNoTruncation() {
+        let stub = StubDetector()
+        let frame = Frame(cgImage: makeSolidImage(), timestamp: 0, source: .file(path: "synth"), index: 0)
+        let read = stub.readText(in: frame, minConfidence: 0.0)
+        XCTAssertTrue(read.detections.isEmpty)
+        XCTAssertEqual(read.totalObservations, 0)
+        XCTAssertFalse(read.truncated, "a detector with no cap never claims truncation")
+    }
+
     func testOCRBoxesAreNormalizedAndConfidenceInRange() throws {
         guard let img = makeTextImage(["Settings"]) else {
             throw XCTSkip("could not render a text CGImage")

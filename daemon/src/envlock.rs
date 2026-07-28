@@ -754,7 +754,16 @@ async fn materialize_closure(project_root: &Path, lock: &EnvLock) -> Result<()> 
 /// build; never touched by `cargo test`.
 async fn fetch_bounded(url: &str) -> Result<Vec<u8>> {
     use futures_util::StreamExt;
-    let resp = reqwest::Client::new()
+    // BOUND TIME, not just SIZE. `MAX_ARTIFACT_BYTES` below caps how MUCH we read;
+    // it says nothing about how LONG. A server that completes the handshake and
+    // then trickles or stalls the body held this await forever, so `env_build`
+    // never returned and never reported a failure. Matches sync.rs's client.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .build()
+        .context("building the artifact fetch client")?;
+    let resp = client
         .get(url)
         .send()
         .await

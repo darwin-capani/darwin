@@ -78,8 +78,36 @@ def _pretty_value(unit, val):
     return str(val)
 
 
+def _single_phrase(unit, val):
+    """The phrase for a field that matches EXACTLY ONE value."""
+    if unit == "minute":
+        return "at minute %d" % val
+    if unit == "hour":
+        return "at hour %d" % val
+    return "on %s %s" % (unit, _pretty_value(unit, val))
+
+
+def _set_phrase(unit, vals):
+    """The phrase ENUMERATING the values a field actually matches."""
+    if len(vals) == 1:
+        return _single_phrase(unit, vals[0])
+    listed = ", ".join(_pretty_value(unit, v) for v in vals)
+    if unit in ("minute", "hour"):
+        return "at %s %s" % (_UNIT_PLURAL[unit], listed)
+    return "on %s %s" % (_UNIT_PLURAL[unit], listed)
+
+
 def _describe_field(label, unit, lo, hi, names, raw):
-    """Return a plain-English phrase for one cron field. Raises ValueError on invalid syntax."""
+    """Return a plain-English phrase for one cron field. Raises ValueError on invalid syntax.
+
+    STEP FORMS describe the set cron ACTUALLY matches, not the step number. Real
+    cron expands the base range and keeps every step'th value, so a step at or
+    beyond the range's width matches exactly ONE value: `*/90` on minutes fires
+    ONLY at minute 0 — hourly — yet this read "every 90 minutes", which is the
+    single most common cron misconception and the reason an explainer exists.
+    Likewise `*/25` matches 0, 25, 50 with a 10-minute wrap gap, so "every 25
+    minutes" overstates a uniform cadence the job never has.
+    """
     raw = raw.strip()
     if raw == "":
         raise ValueError("empty field")
@@ -101,6 +129,13 @@ def _describe_field(label, unit, lo, hi, names, raw):
         if base == "*":
             if step == 1:
                 return "every %s" % unit
+            vals = list(range(lo, hi + 1, step))
+            # ONE match (step >= the field's width, e.g. */90 on minutes), or a
+            # step that does NOT divide the field evenly (*/25 -> 0,25,50 then a
+            # 10-minute gap at the wrap): enumerate the real firing set instead of
+            # restating a cadence cron does not perform.
+            if len(vals) == 1 or (hi - lo + 1) % step != 0:
+                return _set_phrase(unit, vals)
             return "every %d %s" % (step, plural)
         if "-" in base:
             a_s, _, b_s = base.partition("-")
@@ -108,10 +143,18 @@ def _describe_field(label, unit, lo, hi, names, raw):
             b = _resolve(b_s, names, lo, hi)
             if a > b:
                 raise ValueError("range start > end")
+            vals = list(range(a, b + 1, step))
+            if len(vals) == 1:
+                # e.g. 1-10/20 -> matches ONLY minute 1, never "every 20 minutes".
+                return _single_phrase(unit, vals[0])
             return "every %d %s from %s through %s" % (
                 step, plural, _pretty_value(unit, a), _pretty_value(unit, b))
         # base is a single value: e.g. 5/10 -> every 10 <unit> starting at <value>
         start = _resolve(base, names, lo, hi)
+        vals = list(range(start, hi + 1, step))
+        if len(vals) == 1:
+            # e.g. 5/70 -> matches ONLY minute 5, never "every 70 minutes".
+            return _single_phrase(unit, vals[0])
         return "every %d %s starting at %s %s" % (
             step, plural, unit, _pretty_value(unit, start))
 
@@ -130,12 +173,7 @@ def _describe_field(label, unit, lo, hi, names, raw):
             unit, _pretty_value(unit, a), _pretty_value(unit, b))
 
     # Single value.
-    val = _resolve(raw, names, lo, hi)
-    if unit == "minute":
-        return "at minute %d" % val
-    if unit == "hour":
-        return "at hour %d" % val
-    return "on %s %s" % (unit, _pretty_value(unit, val))
+    return _single_phrase(unit, _resolve(raw, names, lo, hi))
 
 
 def compute(payload):

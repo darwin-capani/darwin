@@ -448,6 +448,45 @@ final class VisionEventWireTests: XCTestCase {
         XCTAssertNotNil(loc["score"])
     }
 
+    /// REGRESSION (truncation honesty): `block_count` is the POST-cap number, so a
+    /// consumer could not tell "the screen had N blocks" from "the screen had far
+    /// more and you got the first N" — a partial read passed as the screen's
+    /// complete text, and the where-is locator's "not found" masked the cap as an
+    /// absence. The readout must carry the PRE-cap total + a truncation flag, and
+    /// must OMIT both when the detector did no counting (absence is honest; a flag
+    /// is never fabricated).
+    func testScreenEventCarriesTheTruncationSignal() throws {
+        let readout = ScreenStructurer.structure(
+            [Detection(kind: .text, boundingBox: .full, confidence: 0.9, label: "hi")])
+
+        // Counted + truncated.
+        let truncated = VisionEvent.screen(
+            frameIndex: 0, timestamp: 0, source: "screen", readout: readout,
+            located: nil, query: nil,
+            meta: ScreenReadMeta(kind: .screen, blocksTotal: 412, blocksTruncated: true))
+        let tData = truncated.encodeData()
+        XCTAssertEqual(tData["block_count"] as? Int, 1, "block_count stays the POST-cap count")
+        XCTAssertEqual(tData["blocks_total"] as? Int, 412, "the PRE-cap total is reported")
+        XCTAssertEqual(tData["blocks_truncated"] as? Bool, true)
+
+        // Counted + complete.
+        let complete = VisionEvent.screen(
+            frameIndex: 0, timestamp: 0, source: "screen", readout: readout,
+            located: nil, query: nil,
+            meta: ScreenReadMeta(kind: .screen, blocksTotal: 1, blocksTruncated: false))
+        let cData = complete.encodeData()
+        XCTAssertEqual(cData["blocks_total"] as? Int, 1)
+        XCTAssertEqual(cData["blocks_truncated"] as? Bool, false)
+
+        // Uncounted -> the keys are ABSENT, never a fabricated "not truncated".
+        let unknown = VisionEvent.screen(
+            frameIndex: 0, timestamp: 0, source: "screen", readout: readout,
+            located: nil, query: nil, meta: .screen)
+        let uData = unknown.encodeData()
+        XCTAssertNil(uData["blocks_total"], "unknown total is omitted, never fabricated")
+        XCTAssertNil(uData["blocks_truncated"], "unknown truncation is omitted, never fabricated")
+    }
+
     func testScreenEventOmitsLocatedWhenNoQuery() throws {
         let readout = ScreenStructurer.structure(
             [Detection(kind: .text, boundingBox: .full, confidence: 0.9, label: "hi")])

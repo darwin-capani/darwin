@@ -17,6 +17,13 @@
 
 /** A laid-out node: the entity plus its position in the viewBox. */
 export interface KgNode {
+  /** UNIQUE render/layout key: `${type}:${id}`. The bare `id` is only a slug and
+   *  is NOT unique — world_model stores entities as
+   *  `user.world.entity.<type>.<slug>`, so {project,darwin} and {person,darwin}
+   *  share the slug "darwin". Keying the layout/React list on the bare id made
+   *  one silently overwrite the other (sweep). The text list already keyed rows
+   *  `${type}:${id}`; this brings the spatial view in line. */
+  key: string;
   id: string;
   name: string;
   type: string;
@@ -105,6 +112,9 @@ export function layoutGraph(
 
   const nodes: KgNode[] = [];
   const pos = new Map<string, { x: number; y: number }>();
+  // slug -> the unique keys sharing it, so an edge endpoint that is ambiguous
+  // (two types, same slug) is reported as dangling rather than guessed.
+  const bySlug = new Map<string, string[]>();
   // Spread the type rings evenly across [INNER_R, OUTER_R] so each type gets a
   // DISTINCT radius no matter how many types there are (a single type sits on
   // the inner ring).
@@ -120,7 +130,9 @@ export function layoutGraph(
       const angle = (2 * Math.PI * i) / Math.max(n, 1) + bandIdx * 0.4;
       const x = CENTER + r * Math.cos(angle);
       const y = CENTER + r * Math.sin(angle);
+      const key = `${e.type}:${e.id}`;
       const node: KgNode = {
+        key,
         id: e.id,
         name: e.name,
         type: e.type,
@@ -132,15 +144,26 @@ export function layoutGraph(
         labelSide: x > CENTER ? "left" : "right",
       };
       nodes.push(node);
-      pos.set(e.id, { x, y });
+      pos.set(key, { x, y });
+      const seen = bySlug.get(e.id);
+      if (seen) seen.push(key);
+      else bySlug.set(e.id, [key]);
     });
   });
 
   const edges: KgEdge[] = [];
   const dangling = new Set<string>();
   for (const r of rels) {
-    const a = pos.get(r.from);
-    const b = pos.get(r.to);
+    // Relationships name endpoints by bare slug. Resolve one ONLY when exactly
+    // one entity carries that slug; an ambiguous slug (same name, two types) is
+    // recorded as dangling — the panel already surfaces that count honestly,
+    // and drawing a guessed edge would be a fabricated relationship.
+    const resolve = (slug: string) => {
+      const keys = bySlug.get(slug);
+      return keys && keys.length === 1 ? pos.get(keys[0]) : undefined;
+    };
+    const a = resolve(r.from);
+    const b = resolve(r.to);
     if (!a || !b) {
       if (!a) dangling.add(r.from);
       if (!b) dangling.add(r.to);

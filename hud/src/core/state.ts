@@ -344,6 +344,10 @@ export interface FeedItem {
  *  `running` flag) is what flips a panel out of its OFFLINE placeholder. */
 export interface AppFeed {
   running: boolean;
+  /** True once the daemon reported app.crashed (terminal: the crash-loop
+   *  governor gave up). Distinguishes a CRASHED surface from a cleanly stopped
+   *  one so a panel can say so instead of the softer idle placeholder. */
+  crashed?: boolean;
   brief: string;
   items: FeedItem[];
   fetchedAt: string | null;
@@ -1698,6 +1702,40 @@ function pushCaption(state: HudState, line: CaptionLine): HudState {
 
 /* micro-app feed helpers ---------------------------------------------------- */
 
+/** PURE: do two app feeds carry the same OBSERVABLE content? Compares every
+ *  field a panel can render, and the per-topic payloads by identity-then-JSON
+ *  (payloads are small, and identity short-circuits the common republish).
+ *  Deliberately IGNORES `updatedAt` (a freshness stamp, not rendered content) —
+ *  see the no-churn bailout in the `app.data` case. */
+function sameAppFeedContent(a: AppFeed, b: AppFeed): boolean {
+  if (
+    a.running !== b.running ||
+    a.brief !== b.brief ||
+    a.fetchedAt !== b.fetchedAt ||
+    a.feedsOk !== b.feedsOk ||
+    a.feedsFailed !== b.feedsFailed ||
+    a.crashed !== b.crashed ||
+    a.items.length !== b.items.length
+  ) {
+    return false;
+  }
+  for (let i = 0; i < a.items.length; i += 1) {
+    // Items are rebuilt each envelope, so compare by value.
+    if (JSON.stringify(a.items[i]) !== JSON.stringify(b.items[i])) return false;
+  }
+  const ka = Object.keys(a.topics);
+  const kb = Object.keys(b.topics);
+  if (ka.length !== kb.length) return false;
+  for (const k of ka) {
+    const va = a.topics[k];
+    const vb = b.topics[k];
+    if (va === vb) continue; // identity: the untouched-topic fast path
+    if (vb === undefined) return false;
+    if (JSON.stringify(va) !== JSON.stringify(vb)) return false;
+  }
+  return true;
+}
+
 function emptyAppFeed(running: boolean): AppFeed {
   return {
     running,
@@ -1751,8 +1789,33 @@ export function reduce(state: HudState, action: HudAction): HudState {
       // is process memory, so a link drop / daemon restart orphans it — the
       // panel must not keep claiming an action awaits a confirm that can no
       // longer be given (same phantom-state class as activeAgent above).
+      // Same phantom-state class, extended to the LIVE-SAMPLE surfaces (sweep):
+      // gauges/vitals/processes are only ever written by their telemetry frames,
+      // so a dead daemon left the tactical overlay rendering its LAST sample as
+      // if current — a filled CPU arc, a frozen uptime, live-looking thermals,
+      // and ReticleDial still announcing "CPU dial: 47 percent" to a screen
+      // reader, hours later. CoreHud's own contract is the opposite: "null
+      // (offline / pre-first-sample) renders '——', never a fake number". Reset
+      // them to the honest null shape the panels already handle.
       return setCore(
-        { ...state, connected: false, activeAgent: null, consensusAdvisory: null, consensusAdvisoryAt: 0, planDiff: null, planDiffAt: 0 },
+        {
+          ...state,
+          connected: false,
+          activeAgent: null,
+          consensusAdvisory: null,
+          consensusAdvisoryAt: 0,
+          planDiff: null,
+          planDiffAt: 0,
+          gauges: {
+            cpuPercent: null,
+            memUsedBytes: null,
+            memTotalBytes: null,
+            diskFreeBytes: null,
+            uptimeSecs: null,
+          },
+          vitals: null,
+          processes: null,
+        },
         "offline",
         action.at,
       );
@@ -3677,6 +3740,25 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
             return next;
           })();
 
+      // NO-CHURN BAILOUT (sweep HIGH): a high-rate app republishes the SAME
+      // payload many times a second (nexus alone emits audio.levels +
+      // audio.spectrum at 30 Hz each = 60 envelopes/s, and in silence the
+      // levels frame never changes). Allocating a fresh state object per
+      // envelope re-rendered the entire ~90-panel tree at 60 Hz, since only 4
+      // components are memoized. When nothing an observer can see has changed,
+      // return the SAME state reference so React bails out of the re-render.
+      // `updatedAt` is deliberately excluded from the comparison: it is a
+      // freshness stamp no panel renders on its own, so letting it force a
+      // re-render would defeat the whole bailout. It still advances whenever
+      // any real field changes (below).
+      if (
+        runningApps === s.runningApps &&
+        prev.running === true &&
+        sameAppFeedContent(prev, feed)
+      ) {
+        return s;
+      }
+
       return { ...s, runningApps, appFeeds: { ...s.appFeeds, [name]: feed } };
     }
 
@@ -3845,9 +3927,29 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       return { ...s, actionSurface: { ...s.actionSurface, macros } };
     }
 
+    case "app.crashed": {
+      // TERMINAL in the daemon: on the crash-loop give-up path apps.rs sets
+      // running=false, cleans the socket, emits app.crashed and RETURNS — no
+      // app.stopped ever follows. Treating this as non-state-bearing left the
+      // dead app showing a green "LIVE" pill forever (sweep HIGH), so clear it
+      // exactly like app.stopped and mark the feed crashed.
+      const name = str(env.data, "name");
+      if (name === null) return s;
+      if (!s.runningApps.has(name) && !(s.appFeeds[name]?.running)) return s;
+      const runningApps = new Set(s.runningApps);
+      runningApps.delete(name);
+      const existing = s.appFeeds[name];
+      return {
+        ...s,
+        runningApps,
+        appFeeds: existing
+          ? { ...s.appFeeds, [name]: { ...existing, running: false, crashed: true } }
+          : s.appFeeds,
+      };
+    }
+
     case "app.log":
     case "app.auth_failed":
-    case "app.crashed":
       // Surfaced via telemetry/console only; not panel-state-bearing.
       return s;
 

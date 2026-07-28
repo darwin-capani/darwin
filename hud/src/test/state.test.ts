@@ -1084,11 +1084,59 @@ describe("micro-app: app.data feed relay", () => {
     expect(s.runningApps.has("algo-core")).toBe(true);
   });
 
-  it("app.log / app.auth_failed / app.crashed are not panel-state-bearing (same reference)", () => {
+  it("app.log / app.auth_failed are not panel-state-bearing (same reference)", () => {
     const s = tel(connected(), appData(GS, { items: [gsItem()] }));
     expect(tel(s, env("app.log", { name: GS, line: "polling" }))).toBe(s);
     expect(tel(s, env("app.auth_failed", { name: GS }))).toBe(s);
-    expect(tel(s, env("app.crashed", { name: GS, restarts: 3 }))).toBe(s);
+  });
+
+  // REGRESSION (sweep HIGH): app.crashed IS terminal in the daemon — the
+  // crash-loop governor gives up, sets running=false and returns, so no
+  // app.stopped ever follows. Treating it as non-state-bearing left the dead
+  // app showing a green "LIVE" pill forever.
+  // REGRESSION (sweep HIGH): a 60 Hz app (nexus emits audio.levels +
+  // audio.spectrum at 30 Hz each) allocated a fresh state object per envelope,
+  // re-rendering the whole ~90-panel tree since only 4 components are memoized.
+  // An identical republish must return the SAME reference so React bails out.
+  // REGRESSION (sweep): a dead daemon must not leave live-sample surfaces
+  // rendering their last value as if current — CoreHud's contract is that null
+  // renders "——", never a fake number.
+  it("ws.disconnected clears gauges/vitals/processes so nothing stale looks live", () => {
+    let s = tel(connected(), env("system.load", { cpu_percent: 47, mem_used_bytes: 1000, mem_total_bytes: 2000 }, "system"));
+    expect(s.gauges.cpuPercent).toBe(47);
+    s = reduce(s, { type: "ws.disconnected", at: 9_000 });
+    expect(s.gauges.cpuPercent).toBeNull();
+    expect(s.gauges.uptimeSecs).toBeNull();
+    expect(s.vitals).toBeNull();
+    expect(s.processes).toBeNull();
+  });
+
+  it("app.data returns the same state reference when the payload is unchanged", () => {
+    // gsItem() randomizes its url, so build ONE stable item and republish it
+    // verbatim — the real 60 Hz case (nexus resending an identical levels
+    // frame during silence).
+    const item = gsItem({ url: "https://npr.org/stable" });
+    const first = tel(connected(), appData(GS, { items: [item] }));
+    const second = tel(first, appData(GS, { items: [item] }));
+    expect(second).toBe(first);
+  });
+
+  it("app.data still updates when the payload genuinely changes", () => {
+    const first = tel(connected(), appData(GS, { items: [gsItem()] }));
+    const changed = tel(first, appData(GS, { brief: "now with a brief" }));
+    expect(changed).not.toBe(first);
+    expect(changed.appFeeds[GS]?.brief).toBe("now with a brief");
+  });
+
+  it("app.crashed clears the app from runningApps and marks the feed crashed", () => {
+    const s = tel(connected(), appData(GS, { items: [gsItem()] }));
+    expect(s.runningApps.has(GS)).toBe(true);
+    const after = tel(s, env("app.crashed", { name: GS, restarts: 3 }));
+    expect(after.runningApps.has(GS)).toBe(false);
+    expect(after.appFeeds[GS]?.running).toBe(false);
+    expect(after.appFeeds[GS]?.crashed).toBe(true);
+    // The last items stay visible (context is not lost on the crash).
+    expect(after.appFeeds[GS]?.items.length).toBeGreaterThan(0);
   });
 
   it("app feed events never decay the core state (orthogonal to the voice pipeline)", () => {

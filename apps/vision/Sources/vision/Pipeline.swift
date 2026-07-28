@@ -736,15 +736,22 @@ public actor Pipeline {
         // about those frames).
         let front = source.tag == "screen" ? await frontmostProvider() : nil
         // OCR-only over the single frame; floor 0 so we surface everything read.
-        let dets = detector.detect(in: frame, detectors: .text, minConfidence: 0.0)
-        let readout = ScreenStructurer.structure(dets)
+        // `readText` (not the bare `detect`) so the PRE-cap observation total rides
+        // out with the blocks: a dense screen whose lines exceeded the cap must be
+        // reported as TRUNCATED, never presented as the screen's complete text —
+        // and `locate` searching a truncated block list must not read as "the
+        // control isn't on screen".
+        let read = detector.readText(in: frame, minConfidence: 0.0)
+        let readout = ScreenStructurer.structure(read.detections)
         let located = query.flatMap { ScreenStructurer.locate($0, in: readout) }
         await sink.emit(.screen(frameIndex: frame.index, timestamp: frame.timestamp,
                                 source: source.tag, readout: readout,
                                 located: located, query: query,
                                 meta: ScreenReadMeta(kind: .screen,
                                                      sourceApp: front?.app,
-                                                     sourceWindow: front?.window)))
+                                                     sourceWindow: front?.window,
+                                                     blocksTotal: read.totalObservations,
+                                                     blocksTruncated: read.truncated)))
     }
 
     // -----------------------------------------------------------------------
@@ -822,17 +829,21 @@ public actor Pipeline {
                 // (review-caught: the post-OCR read had a hundreds-of-ms race).
                 // nil = honest absence.
                 let front = source.tag == "screen" ? await frontmostProvider() : nil
-                let dets = detector.detect(in: frame, detectors: .text, minConfidence: 0.0)
-                let readout = ScreenStructurer.structure(dets)
+                let read = detector.readText(in: frame, minConfidence: 0.0)
+                let readout = ScreenStructurer.structure(read.detections)
                 // Tagged `.context` so the daemon routes this into the context ring
                 // (redacted + bounded + transient daemon-side), distinct from a
-                // one-shot read. No locator/query on the continuous path.
+                // one-shot read. No locator/query on the continuous path. The
+                // truncation signal rides along so a capped snapshot never enters
+                // the ring as a complete picture of the screen.
                 await sink.emit(.screen(frameIndex: frame.index, timestamp: frame.timestamp,
                                         source: source.tag, readout: readout,
                                         located: nil, query: nil,
                                         meta: ScreenReadMeta(kind: .context,
                                                              sourceApp: front?.app,
-                                                             sourceWindow: front?.window)))
+                                                             sourceWindow: front?.window,
+                                                             blocksTotal: read.totalObservations,
+                                                             blocksTruncated: read.truncated)))
             }
 
             if Task.isCancelled { break }
@@ -930,12 +941,14 @@ public actor Pipeline {
         // The handwriting recognizer IS the .text recognizer (.accurate +
         // language correction); floor 0 so we surface everything read. An empty
         // readout (a scrawl that did not read) is honest, never fabricated.
-        let dets = detector.detect(in: frame, detectors: .text, minConfidence: 0.0)
-        let readout = ScreenStructurer.structure(dets)
+        let read = detector.readText(in: frame, minConfidence: 0.0)
+        let readout = ScreenStructurer.structure(read.detections)
         await sink.emit(.screen(frameIndex: frame.index, timestamp: frame.timestamp,
                                 source: source.tag, readout: readout,
                                 located: nil, query: nil,
-                                meta: ScreenReadMeta(kind: .handwriting)))
+                                meta: ScreenReadMeta(kind: .handwriting,
+                                                     blocksTotal: read.totalObservations,
+                                                     blocksTruncated: read.truncated)))
     }
 
     // -----------------------------------------------------------------------
@@ -994,7 +1007,9 @@ public actor Pipeline {
                                 source: source.tag, readout: readout,
                                 located: nil, query: nil,
                                 meta: ScreenReadMeta(kind: .document,
-                                                     documentDetected: scan.documentDetected)))
+                                                     documentDetected: scan.documentDetected,
+                                                     blocksTotal: scan.linesTotal,
+                                                     blocksTruncated: scan.linesTruncated)))
     }
 
     // -----------------------------------------------------------------------

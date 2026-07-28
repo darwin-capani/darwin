@@ -518,10 +518,13 @@ pub fn structure_rows(rows: Vec<(String, String)>) -> WorldState {
 /// read half of `world_query`. Bounded ([`MAX_QUERY_ENTITIES`] /
 /// [`MAX_QUERY_RELATIONS`]) and read-only. Reads ONLY the shared tier.
 ///
-/// Matching is lexical-token overlap (the same tokenization spirit as recall):
-/// an entity matches when any query token appears in its id, name, or any
-/// attribute value/name. An EMPTY query returns the whole (bounded) model — "tell
-/// me about my world".
+/// Matching is lexical-token overlap through the SHARED [`crate::recall::tokenize`]
+/// (same stopword set as the recall ranker): an entity matches when a query token
+/// EQUALS one of the tokens of its id, name, or any attribute name/value — never a
+/// substring, so a glue word cannot match inside an unrelated identifier. A query
+/// made only of stopwords therefore has NO terms and matches NOTHING (honest
+/// silence, not an arbitrary sample). An EMPTY query returns the whole (bounded)
+/// model — "tell me about my world".
 pub async fn query(memory: &Memory, about: &str) -> Result<WorldState> {
     let full = snapshot(memory).await?;
     Ok(filter_state(full, about))
@@ -580,10 +583,18 @@ pub fn expand_neighbors(full: &WorldState, base: WorldState, cap: usize) -> Worl
 }
 
 /// Pure filter of a [`WorldState`] by the query terms. Exposed for direct testing.
+///
+/// "NO QUESTION ASKED" and "asked, but nothing matched" are DIFFERENT: only a
+/// blank `about` means "tell me about my world" and returns the whole bounded
+/// model. A non-blank utterance that tokenizes to NO terms (all stopwords, e.g.
+/// "what do you know?") matches NOTHING — returning the whole model there would
+/// hand the prompt an arbitrary sample of entities under the header "relevant to
+/// this request", which is exactly the over-claim this filter exists to avoid.
 pub fn filter_state(state: WorldState, about: &str) -> WorldState {
     let terms = query_terms(about);
+    let whole_model = about.trim().is_empty();
 
-    let matched: Vec<Entity> = if terms.is_empty() {
+    let matched: Vec<Entity> = if whole_model {
         state.entities.iter().take(MAX_QUERY_ENTITIES).cloned().collect()
     } else {
         state
@@ -597,7 +608,7 @@ pub fn filter_state(state: WorldState, about: &str) -> WorldState {
 
     // The set of entity ids we surfaced, so we can pull relationships touching them.
     let ids: Vec<&str> = matched.iter().map(|e| e.id.as_str()).collect();
-    let relationships: Vec<Relationship> = if terms.is_empty() {
+    let relationships: Vec<Relationship> = if whole_model {
         state
             .relationships
             .iter()
@@ -610,12 +621,7 @@ pub fn filter_state(state: WorldState, about: &str) -> WorldState {
             .iter()
             .filter(|r| {
                 ids.iter().any(|id| *id == r.from || *id == r.to)
-                    || terms.iter().any(|t| {
-                        r.from.contains(t.as_str())
-                            || r.to.contains(t.as_str())
-                            || r.relation.contains(t.as_str())
-                            || r.value.to_lowercase().contains(t.as_str())
-                    })
+                    || relationship_matches(r, &terms)
             })
             .take(MAX_QUERY_RELATIONS)
             .cloned()
@@ -628,28 +634,54 @@ pub fn filter_state(state: WorldState, about: &str) -> WorldState {
     }
 }
 
-/// True if any query term appears in the entity's id, display name, or any
-/// attribute name/value (case-insensitive substring, since ids/attrs are slugs).
-fn entity_matches(e: &Entity, terms: &[String]) -> bool {
-    let name_l = e.name.to_lowercase();
-    terms.iter().any(|t| {
-        e.id.contains(t.as_str())
-            || name_l.contains(t.as_str())
-            || e.attributes.iter().any(|(a, v)| {
-                a.contains(t.as_str()) || v.to_lowercase().contains(t.as_str())
-            })
-    })
+/// Every lexical TOKEN of an entity's id, display name, and attribute
+/// names/values — the surface a query term is compared against.
+fn entity_tokens(e: &Entity) -> Vec<String> {
+    let mut tokens = crate::recall::tokenize(&e.id);
+    tokens.extend(crate::recall::tokenize(&e.name));
+    for (a, v) in &e.attributes {
+        tokens.extend(crate::recall::tokenize(a));
+        tokens.extend(crate::recall::tokenize(v));
+    }
+    tokens
 }
 
-/// Tokenize the query the same way the recall ranker does (lowercase, split on
-/// non-alphanumeric, drop empties) — but keep it dependency-free and local so the
-/// world model owns its own bounded matching. Short (1-char) tokens are dropped so
-/// a stray letter doesn't match everything.
+/// True if any query term EQUALS a token of the entity's id, display name, or any
+/// attribute name/value.
+///
+/// TOKEN EQUALITY, never substring. WHY: substring containment let a two/four
+/// letter glue word match inside an unrelated identifier — `"london-office"
+/// .contains("do")` is true, so "what do you know about my car?" surfaced
+/// `london-office`. Those entities are injected into the prompt under the header
+/// "…relevant to this request", inviting the model to answer about things the
+/// query never named, and making the honest "I have nothing in the world model
+/// about X" branch near-unreachable for any conversational phrasing.
+fn entity_matches(e: &Entity, terms: &[String]) -> bool {
+    let tokens = entity_tokens(e);
+    terms.iter().any(|t| tokens.iter().any(|tok| tok == t))
+}
+
+/// True if any query term EQUALS a token of the relationship's endpoints, its
+/// relation slug, or its value. Same token-equality rule (and same reason) as
+/// [`entity_matches`]: substring containment pulled unrelated edges in on a
+/// stopword.
+fn relationship_matches(r: &Relationship, terms: &[String]) -> bool {
+    let mut tokens = crate::recall::tokenize(&r.from);
+    tokens.extend(crate::recall::tokenize(&r.to));
+    tokens.extend(crate::recall::tokenize(&r.relation));
+    tokens.extend(crate::recall::tokenize(&r.value));
+    terms.iter().any(|t| tokens.iter().any(|tok| tok == t))
+}
+
+/// Tokenize the query with the SHARED recall tokenizer ([`crate::recall::tokenize`]):
+/// lowercase, split on non-alphanumeric, drop empties AND the stopword set. Single-
+/// source-of-truth matters here — the old local tokenizer applied NO stopword list,
+/// so "what/do/you/know/my/is/in/on" were live query terms. Short (1-char) tokens
+/// are dropped on top so a stray letter can't become a term.
 fn query_terms(about: &str) -> Vec<String> {
-    about
-        .split(|c: char| !c.is_alphanumeric())
-        .filter(|t| t.len() > 1)
-        .map(|t| t.to_lowercase())
+    crate::recall::tokenize(about)
+        .into_iter()
+        .filter(|t| t.chars().count() > 1)
         .collect()
 }
 
@@ -938,6 +970,54 @@ mod tests {
         let state = query(&mem, "quantum chromodynamics").await.unwrap();
         assert!(state.is_empty(), "no match -> empty state, got {state:?}");
         assert_eq!(render(&state), "", "empty state renders nothing");
+    }
+
+    /// REGRESSION (honesty): a glue word must not match INSIDE an unrelated
+    /// identifier. `"london-office".contains("do")` is true ("lonDOn"), so the old
+    /// substring filter surfaced `london-office` for "what do you know about my
+    /// car?" — an entity the question never named, injected into the prompt under
+    /// "…relevant to this request".
+    #[test]
+    fn stopword_substrings_do_not_pull_in_unrelated_entities() {
+        let state = WorldState {
+            entities: vec![
+                ent("london-office"),
+                ent("this-list"),   // "is" is a substring of "thIS"/"lIst"
+                ent("meeting-room"), // "in" is a substring of "meetING"
+                ent("car"),
+            ],
+            relationships: vec![rel("london-office", "located_in", "meeting-room")],
+        };
+        let out = filter_state(state, "what do you know about my car?");
+        let ids: Vec<&str> = out.entities.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, vec!["car"], "only the entity the query NAMED, got {ids:?}");
+        assert!(
+            out.relationships.is_empty(),
+            "no edge matches on a stopword substring either, got {:?}",
+            out.relationships
+        );
+    }
+
+    /// REGRESSION (honesty): an utterance made ENTIRELY of stopwords carries no
+    /// query terms — that is NOT the same as "no question asked", so it must match
+    /// NOTHING rather than fall through to the whole-model branch and hand the
+    /// prompt an arbitrary sample labeled "relevant to this request". Only a BLANK
+    /// `about` means "tell me about my world".
+    #[test]
+    fn all_stopword_query_matches_nothing_but_blank_returns_the_model() {
+        let state = || WorldState {
+            entities: vec![ent("london-office"), ent("car")],
+            relationships: vec![],
+        };
+        assert!(
+            filter_state(state(), "what do you know?").is_empty(),
+            "an all-stopword question surfaces nothing"
+        );
+        assert_eq!(
+            filter_state(state(), "   ").entities.len(),
+            2,
+            "a blank query is still 'tell me about my world'"
+        );
     }
 
     // -- BOUNDS --------------------------------------------------------------

@@ -172,6 +172,38 @@ def main():
     check("params listing bounded", len(r.get("params", [])) == 1000)
     check("params truncated flagged", r.get("params_truncated") is True)
 
+    # REGRESSION: a URL with an EMPTY authority must never have a host invented
+    # for it. "https:////evil.com/a" parses as host "" + path "//evil.com/a";
+    # urlunsplit drops the empty-authority marker and re-reads the path's leading
+    # "//" as an authority, so `normalized` used to read "https://evil.com/a" — a
+    # completely different origin handed to any caller using it for an allow-list
+    # decision. `normalized` must round-trip to the SAME host/path it reported.
+    from urllib.parse import urlsplit as _urlsplit
+    for u in [
+        "https:////evil.com/a",
+        "http:////foo",
+        "http:////attacker.example/steal?x=1",
+        "file:////server/share",
+        "https:////[::1]/p",
+        # …and the ordinary shapes must be unchanged by the fix.
+        "https://USER:PASS@Example.COM:8443/Path?y=2#frag",
+        "http://example.com:80/",
+        "mailto:x@y.z",
+        "/just/a/path",
+        "//host/path",
+    ]:
+        r = compute({"url": u})
+        check("normalized present for %s" % u, "normalized" in r)
+        rt = _urlsplit(r["normalized"])
+        check(
+            "normalized keeps the host for %s (got %r)" % (u, r["normalized"]),
+            (rt.hostname or "") == r["host"],
+        )
+        check(
+            "normalized keeps the path for %s (got %r)" % (u, r["normalized"]),
+            rt.path == r["path"],
+        )
+
     print("all urlparse checks passed")
 
 
