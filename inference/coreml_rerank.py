@@ -153,6 +153,22 @@ _FAST_ABSENT_MARK = "no_fast_graph"
 _TOK_DIRNAME = "tokenizer"
 
 
+def mark_fast_absent(d, why):
+    """BEST-EFFORT: record in cache dir `d` that the short graph was attempted and is
+    not usable here, so the one-shot upgrade stops retrying. Returns True if the note
+    landed. NEVER raises: every caller is on a path where the short graph is already a
+    write-off, and the conditions that make this write fail (full disk, read-only cache
+    root) are the same ones that made the graph fail - turning that into an exception
+    would trade an optional optimization for the whole backend."""
+    try:
+        with open(os.path.join(d, _FAST_ABSENT_MARK), "w", encoding="utf-8") as fh:
+            fh.write(f"{why}\n")
+        return True
+    except Exception as e:  # noqa: BLE001 - advisory only
+        log.warning("op=rerank could not record the short-graph sentinel (%s)", e)
+        return False
+
+
 # ---- PURE helpers (no model / no tokenizer / no I/O — unit-tested) ----------
 
 
@@ -217,6 +233,7 @@ class CoreMLReranker:
         self._tokenizer = None
         self._model = None  # the (1, SEQ) MLModel, looped per pair
         self._model_fast = None  # OPTIONAL (1, SEQ_FAST) graph; None -> always SEQ
+        self._upgrade_started = False  # at most ONE background rebuild per process
         self._trunc_seen = 0        # cumulative truncated pairs (for the warn throttle)
         self._trunc_warned_at = 0   # _trunc_seen value at the last warn
 
@@ -299,6 +316,7 @@ class CoreMLReranker:
                 raise CoreMLRerankerUnavailable(
                     f"Core ML reranker deps unavailable: {', '.join(missing)} not installed"
                 )
+            just_converted = False
             try:
                 loaded = self._try_load_final()
                 if loaded is None:
@@ -308,27 +326,7 @@ class CoreMLReranker:
                         raise CoreMLRerankerUnavailable(
                             "Core ML reranker cache failed validate-load after conversion"
                         )
-                elif loaded[2] is None and not os.path.exists(
-                    os.path.join(self._dir, _FAST_ABSENT_MARK)
-                ):
-                    # ONE-SHOT UPGRADE. A cache published before the short graph
-                    # existed still validate-loads, so without this an already-deployed
-                    # machine would keep the old cache forever and NEVER pick up the
-                    # speedup. Rebuild it once; if the short graph still cannot be
-                    # built here, `_convert_into` leaves the sentinel and we stop
-                    # trying (so this never becomes a per-start reconversion).
-                    log.info(
-                        "op=rerank cache predates the short-sequence graph; "
-                        "rebuilding once to pick up the speedup"
-                    )
-                    try:
-                        self._convert_atomic()
-                        loaded = self._try_load_final() or loaded
-                    except Exception as e:  # keep the working cache; just stay slow
-                        log.warning(
-                            "op=rerank short-graph upgrade failed (%s); "
-                            "continuing on the existing cache at seq %d", e, SEQ,
-                        )
+                    just_converted = True
                 self._tokenizer, self._model, self._model_fast = loaded
             except CoreMLRerankerUnavailable:
                 raise
@@ -337,6 +335,71 @@ class CoreMLReranker:
                     f"Core ML reranker build/load failed: {e}"
                 ) from e
             self._loaded = True
+            if self._model_fast is None:
+                if just_converted:
+                    # We just built this cache and it STILL has no usable short graph,
+                    # so rebuilding would produce the same result. Record that and stop.
+                    # (`_convert_into` only leaves a note when the conversion itself
+                    # raised; a graph that converts but fails to VALIDATE lands here,
+                    # and without this note every later start would rebuild.)
+                    mark_fast_absent(
+                        self._dir,
+                        f"a fresh conversion produced no usable seq={SEQ_FAST} graph",
+                    )
+                elif not os.path.exists(
+                    os.path.join(self._dir, _FAST_ABSENT_MARK)
+                ):
+                    self._schedule_fast_upgrade()
+
+    def _schedule_fast_upgrade(self):
+        """Start the ONE-SHOT cache upgrade in the BACKGROUND (at most once per
+        process). A cache published before the short graph existed still validate-
+        loads, so without an upgrade an already-deployed machine would keep it forever
+        and never pick the speedup up.
+
+        It runs on a thread rather than inline because inline is not survivable: the
+        rebuild was MEASURED at 43.8 s while `ensure_loaded` holds `self._lock`, the
+        daemon's inference REQUEST_TIMEOUT is 30 s, and its timeout arm returns an
+        error WITHOUT retrying - so an inline upgrade would fail the first op after a
+        deploy plus everything queued behind the lock. On this thread the caller keeps
+        reranking at SEQ and simply gets faster once the swap lands."""
+        if self._upgrade_started:
+            return
+        self._upgrade_started = True
+        log.info(
+            "op=rerank cache predates the short-sequence graph; rebuilding once in "
+            "the background (serving at seq %d meanwhile)", SEQ,
+        )
+        threading.Thread(
+            target=self._upgrade_fast_graph,
+            name="coreml-rerank-fast-upgrade",
+            daemon=True,
+        ).start()
+
+    def _upgrade_fast_graph(self):
+        """The background rebuild. NEVER raises (it is a daemon thread) and never
+        leaves the reranker worse than it found it: the freshly-built models are
+        swapped in ONLY once they carry a usable short graph, so a failed rebuild
+        keeps the already-loaded ones."""
+        try:
+            self._convert_atomic()
+            loaded = self._try_load_final()
+        except Exception as e:  # noqa: BLE001 - keep the working cache, stay slow
+            log.warning(
+                "op=rerank background short-graph upgrade failed (%s); "
+                "continuing at seq %d", e, SEQ,
+            )
+            loaded = None
+        if loaded is not None and loaded[2] is not None:
+            with self._lock:
+                self._tokenizer, self._model, self._model_fast = loaded
+            log.info("op=rerank the short-sequence graph is live")
+            return
+        # The rebuild did not yield a usable short graph. Note it so the next process
+        # start does not repeat a 43.8 s rebuild that we now know cannot help.
+        mark_fast_absent(
+            self._dir, f"a rebuild produced no usable seq={SEQ_FAST} graph"
+        )
 
     def _try_load_final(self):
         """Validate-load from the FINAL cache dir; return (tok, model, fast) or None
@@ -521,6 +584,12 @@ class CoreMLReranker:
                 f"{model.config.max_position_embeddings} < seq {SEQ}"
             )
         trace_and_convert(model, 1, os.path.join(target_dir, _MODEL_NAME))
+        # The tokenizer is written BEFORE the optional short graph is attempted, so the
+        # parts of the cache that are REQUIRED become complete as early as possible.
+        # Ordering it after the short attempt made an "optional" failure able to abort
+        # the whole conversion and leave a cache with no tokenizer at all - which is not
+        # a slower reranker, it is no reranker.
+        tok.save_pretrained(os.path.join(target_dir, _TOK_DIRNAME))
         # The short companion graph is a pure OPTIMIZATION: if it fails to convert we
         # publish the cache without it and every pair runs at SEQ, exactly as before.
         try:
@@ -536,13 +605,10 @@ class CoreMLReranker:
                 "every pair will run at seq %d",
                 e, SEQ,
             )
-            # Record that we TRIED, so the one-shot upgrade in `ensure_loaded` does not
-            # rebuild this cache again on every process start.
-            with open(
-                os.path.join(target_dir, _FAST_ABSENT_MARK), "w", encoding="utf-8"
-            ) as fh:
-                fh.write(f"short-sequence graph did not convert here: {e}\n")
-        tok.save_pretrained(os.path.join(target_dir, _TOK_DIRNAME))
+            # Record that we TRIED. BEST-EFFORT - see mark_fast_absent.
+            mark_fast_absent(
+                target_dir, f"short-sequence graph did not convert here: {e}"
+            )
 
     def _encode(self, query, passages):
         """Tokenize (query, passage) PAIRS to lists of (input_ids, token_type_ids),

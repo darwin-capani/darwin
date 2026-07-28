@@ -13,6 +13,9 @@ faithfulness + latency are DEVICE/DEP-gated and exercised by the once-run smoke
 """
 import math
 import os
+import time
+import inspect
+import importlib.util
 import sys
 import tempfile
 import threading
@@ -197,9 +200,14 @@ class FastPathRouting(unittest.TestCase):
     MEASURED on an M1 Pro (2026-07-28) and recorded here so a regression is
     visible: the (1,512) graph costs ~19.65 ms per text no matter how few real
     tokens it carries (masking padding saves nothing), while the (1,128) graph
-    costs ~1.84 ms — and its output matches the 512 graph to cosine 0.999097,
-    which is EXACTLY the 512 graph's own run-to-run FP16/ANE noise floor
-    (measured: 512-vs-itself is also 0.999097). Rankings are identical."""
+    costs ~1.84 ms. EQUIVALENCE, re-measured over 22 texts (3..122 tokens): 20 of
+    22 come out BIT-identical between the two graphs and the worst normalized
+    cosine is 0.999999. In the mixed case production actually hits — a corpus
+    already stored from the 512 graph, queried on the 128 graph — that is 0/8
+    top-5 order flips and 0/176 changes to the MIN_NEURAL_SIM=0.50 gate decision.
+    (An earlier draft here cited 0.999097 as "the 512 graph's own run-to-run
+    noise floor". Both halves were wrong: that was an UNNORMALIZED dot product,
+    and the 512 graph is exactly deterministic — its run-to-run delta is 0.)"""
 
     def test_short_text_takes_the_fast_graph_long_text_does_not(self):
         import coreml_embed as ce
@@ -276,76 +284,164 @@ def ce_SEQ():
     return ce.SEQ
 
 
+@unittest.skipUnless(
+    importlib.util.find_spec("coremltools") is not None,
+    "drives ensure_loaded(), which requires coremltools",
+)
 class FastGraphUpgrade(unittest.TestCase):
-    """A cache published BEFORE the fast graph existed still validate-loads, so without
-    a one-shot upgrade an already-deployed machine would keep it forever and never pick
-    the speedup up. The upgrade must fire exactly once, must never loop on a machine
-    where the fast graph cannot be built, and must never lose a working cache."""
+    """A cache published BEFORE the fast graph existed still validate-loads, so
+    without an upgrade an already-deployed machine would keep it forever and never
+    pick the speedup up. The upgrade must therefore fire - but it must fire in the
+    BACKGROUND (a rebuild measured 43.8 s and the daemon's inference timeout is 30 s
+    with no retry), exactly once per process, and it must leave a sentinel on EVERY
+    outcome that yields no usable fast graph, or the next start rebuilds again."""
 
-    def _embedder(self, tmp, sequence):
+    def _obj(self, tmp, sequence):
         """`sequence` is the list of _try_load_final results, consumed in order."""
-        e = ce.CoreMLEmbedder.__new__(ce.CoreMLEmbedder)
-        e._dir = tmp
-        e._lock = threading.Lock()
-        e._loaded = False
-        e._tokenizer = e._model = e._model_fast = None
-        e.converts = 0
+        o = ce.CoreMLEmbedder.__new__(ce.CoreMLEmbedder)
+        o._dir = tmp
+        o._lock = threading.Lock()
+        o._loaded = False
+        o._upgrade_started = False
+        o._tokenizer = o._model = o._model_fast = None
+        o.converts = 0
         pending = list(sequence)
-        e._try_load_final = lambda: pending.pop(0) if pending else None
+        o._try_load_final = lambda: pending.pop(0) if pending else None
 
         def convert():
-            e.converts += 1
-        e._convert_atomic = convert
-        return e
+            o.converts += 1
+        o._convert_atomic = convert
+        return o
 
-    def test_a_cache_without_the_fast_graph_is_rebuilt_once(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            e = self._embedder(tmp, [("t", "m", None), ("t", "m", "FAST")])
-            e.ensure_loaded()
-            # MUTATION GUARD: dropping the upgrade branch leaves converts at 0.
-            self.assertEqual(e.converts, 1)
-            self.assertEqual(e._model_fast, "FAST")
+    def _load_and_settle(self, o):
+        """ensure_loaded() plus a bounded wait for the background rebuild, so the
+        assertions below see the finished state rather than a race."""
+        o.ensure_loaded()
+        for _ in range(400):
+            if not o._upgrade_started or o.converts:
+                break
+            time.sleep(0.005)
+        for t in threading.enumerate():
+            if t.name.endswith("-fast-upgrade") and t is not threading.current_thread():
+                t.join(timeout=5)
 
-    def test_a_cache_that_already_has_the_fast_graph_is_not_rebuilt(self):
+    def _sentinel(self, tmp):
+        return os.path.exists(os.path.join(tmp, ce._FAST_ABSENT_MARK))
+
+    def test_a_cache_without_the_short_graph_is_rebuilt(self):
         with tempfile.TemporaryDirectory() as tmp:
-            e = self._embedder(tmp, [("t", "m", "FAST")])
-            e.ensure_loaded()
-            self.assertEqual(e.converts, 0)
+            o = self._obj(tmp, [("t", "m", None), ("t", "m", "FAST")])
+            self._load_and_settle(o)
+            # MUTATION GUARD: dropping the upgrade leaves converts at 0.
+            self.assertEqual(o.converts, 1)
+            self.assertEqual(o._model_fast, "FAST")
+
+    def test_the_rebuild_does_not_block_the_caller(self):
+        """The whole point of the thread: ensure_loaded must RETURN while the rebuild
+        is still running, or the first op after a deploy blows the 30 s timeout."""
+        with tempfile.TemporaryDirectory() as tmp:
+            o = self._obj(tmp, [("t", "m", None), ("t", "m", "FAST")])
+            release = threading.Event()
+
+            def slow_convert():
+                release.wait(timeout=5)
+                o.converts += 1
+            o._convert_atomic = slow_convert
+            started = time.perf_counter()
+            o.ensure_loaded()
+            elapsed = time.perf_counter() - started
+            self.assertLess(elapsed, 1.0, "ensure_loaded blocked on the rebuild")
+            self.assertEqual(o.converts, 0)   # still in flight
+            self.assertEqual(o._model, "m")   # and already serving
+            release.set()
+
+    def test_a_cache_that_already_has_the_short_graph_is_not_rebuilt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            o = self._obj(tmp, [("t", "m", "FAST")])
+            self._load_and_settle(o)
+            self.assertEqual(o.converts, 0)
 
     def test_the_sentinel_stops_the_upgrade_from_running_every_start(self):
         with tempfile.TemporaryDirectory() as tmp:
             open(os.path.join(tmp, ce._FAST_ABSENT_MARK), "w").close()
-            e = self._embedder(tmp, [("t", "m", None)])
-            e.ensure_loaded()
-            self.assertEqual(e.converts, 0)
-            self.assertIsNone(e._model_fast)
+            o = self._obj(tmp, [("t", "m", None)])
+            self._load_and_settle(o)
+            self.assertEqual(o.converts, 0)
+            self.assertIsNone(o._model_fast)
 
-    def test_a_failed_upgrade_keeps_the_working_cache(self):
+    def test_a_rebuild_that_still_yields_no_short_graph_is_not_repeated_next_start(self):
+        """THE REGRESSION THIS EXISTS FOR. A fast graph that CONVERTS but fails to
+        validate leaves _load_from returning fast=None with no sentinel. Before the
+        fix that meant four process starts cost four full rebuilds - measured 43.8 s
+        each - forever. One instance cannot show this: `_loaded` latches, so a single
+        ensure_loaded() calls convert once no matter what. It takes FRESH instances
+        against the SAME on-disk state, which is what a process restart is."""
         with tempfile.TemporaryDirectory() as tmp:
-            e = self._embedder(tmp, [("t", "m", None)])
+            total = 0
+            for start in range(4):
+                o = self._obj(tmp, [("t", "m", None), ("t", "m", None)])
+                self._load_and_settle(o)
+                total += o.converts
+            self.assertTrue(self._sentinel(tmp), "no sentinel was ever written")
+            self.assertEqual(
+                total, 1, f"{{total}} rebuilds across 4 starts; expected exactly 1"
+            )
+
+    def test_a_fresh_conversion_with_no_short_graph_also_leaves_a_sentinel(self):
+        """The other uncovered path: the cache did not exist at all, we converted it,
+        and the fast graph still is not usable. Rebuilding cannot help, so the next
+        start must not try."""
+        with tempfile.TemporaryDirectory() as tmp:
+            o = self._obj(tmp, [None, ("t", "m", None)])
+            self._load_and_settle(o)
+            self.assertEqual(o.converts, 1)
+            self.assertTrue(self._sentinel(tmp))
+            o2 = self._obj(tmp, [("t", "m", None)])
+            self._load_and_settle(o2)
+            self.assertEqual(o2.converts, 0, "the sentinel did not stop the retry")
+
+    def test_a_failed_rebuild_keeps_the_working_cache(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            o = self._obj(tmp, [("t", "m", None)])
 
             def boom():
-                e.converts += 1
+                o.converts += 1
                 raise RuntimeError("disk full")
-            e._convert_atomic = boom
-            e.ensure_loaded()  # must NOT raise: the 512 cache still works
-            self.assertEqual(e.converts, 1)
-            self.assertEqual((e._tokenizer, e._model), ("t", "m"))
-            self.assertTrue(e._loaded)
+            o._convert_atomic = boom
+            self._load_and_settle(o)   # must NOT raise: the SEQ cache still works
+            self.assertEqual(o.converts, 1)
+            self.assertEqual((o._tokenizer, o._model), ("t", "m"))
+            self.assertTrue(o._loaded)
+            self.assertTrue(self._sentinel(tmp))
 
-    def test_an_upgrade_that_still_yields_no_fast_graph_is_accepted(self):
+    def test_the_upgrade_starts_at_most_once_per_process(self):
         with tempfile.TemporaryDirectory() as tmp:
-            e = self._embedder(tmp, [("t", "m", None), ("t", "m", None)])
-            e.ensure_loaded()
-            self.assertEqual(e.converts, 1)  # once, not in a loop
-            self.assertTrue(e._loaded)
+            o = self._obj(tmp, [("t", "m", None), ("t", "m", None)])
+            self._load_and_settle(o)
+            before = o.converts
+            o._schedule_fast_upgrade()   # a second call must be inert
+            self.assertEqual(o.converts, before)
 
-    def test_an_upgrade_whose_reload_returns_nothing_keeps_the_first_load(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            e = self._embedder(tmp, [("t", "m", None)])  # second call -> None
-            e.ensure_loaded()
-            self.assertEqual((e._tokenizer, e._model), ("t", "m"))
-            self.assertTrue(e._loaded)
+    def test_the_sentinel_write_never_raises(self):
+        """mark_fast_absent runs where the fast graph is already lost; if it could
+        throw (a full or read-only cache root) it would take the whole backend with
+        it - which is how the optional optimization became fatal once already."""
+        self.assertFalse(ce.mark_fast_absent("/nonexistent/read-only/path", "why"))
+
+
+class SentinelWriteIsNeverFatal(unittest.TestCase):
+    """An OPTIONAL fast-graph failure must never cost the REQUIRED artifacts. The
+    tokenizer is written before the optional graph is attempted, so a cache can never
+    be published complete-but-tokenizer-less."""
+
+    def test_the_tokenizer_is_saved_before_the_optional_graph_is_attempted(self):
+        src = inspect.getsource(ce.CoreMLEmbedder._convert_into)
+        tok_at = src.index("tok.save_pretrained")
+        fast_at = src.index("_MODEL_FAST_NAME")
+        self.assertLess(
+            tok_at, fast_at,
+            "the tokenizer must be written BEFORE the optional graph is attempted",
+        )
 
 
 if __name__ == "__main__":

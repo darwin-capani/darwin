@@ -56,5 +56,18 @@
   "disk_cost": {
     "per_model_added_mb": 43,
     "reranker_cache_mb": "43 -> 86"
+  },
+  "ane_utilization": {
+    "note": "Same check for the reranker: identical placement between the two graphs.",
+    "seq512": {
+      "compute_ops": 165,
+      "on_neural_engine": 152,
+      "ane_share": 0.921
+    },
+    "seq128": {
+      "compute_ops": 165,
+      "on_neural_engine": 152,
+      "ane_share": 0.921
+    }
   }
 }

@@ -8,11 +8,14 @@ backend, in place of mean-pooling the resident 4B LLM's hidden states.
 WHY: retrieval QUALITY (recall@k / MRR) measured on a synthetic-but-
 representative MNEMOSYNE-style set of short user facts (the eval harness +
 labeled set + results are committed under inference/benchmarks/coreml_eval/),
-plus LATENCY re-measured on this M1 Pro at the SHIPPED seq=512 / compute_units=
-ALL config (the device-gated smoke in this file, `_smoke`):
+plus LATENCY re-measured on this M1 Pro under compute_units=ALL (the device-gated
+smoke in this file, `_smoke`). NOTE the shipped config is now TWO graphs, not one:
+text that fits SEQ_FAST runs the (1, 128) graph at ~1.84 ms and anything longer
+runs the (1, 512) graph at ~19.65 ms, so the single "seq=512" figure below is the
+LONG-input cost, not the typical one:
 
-    embedder                     recall@1  recall@3  recall@5   MRR    latency (seq=512, ComputeUnit.ALL)
-    bge-small (this module,384d)  0.8241    0.9213    0.9861   0.9606  ~19.6ms/text (single OR K=8, looped)
+    embedder                     recall@1  recall@3  recall@5   MRR    latency (ComputeUnit.ALL)
+    bge-small (this module,384d)  0.8241    0.9213    0.9861   0.9606  ~1.84ms/text short, ~19.6ms long
     Qwen3-4B mean-pool (2560d)    0.2454    0.4630    0.5556   0.4235  ~124ms single / ~56.8ms/text batched
 
     Dramatically higher retrieval quality, and still faster than the 4B path:
@@ -101,8 +104,15 @@ MODEL_ID = "BAAI/bge-small-en-v1.5"
 # STABLE wire id for this embedder's vector space (op=embed `embedder` field).
 # The daemon/docsearch store this with the index and compare it by STRING
 # EQUALITY only (opaque space id); a store stamped with a different id is a
-# different space and forces reindex. This backend pins ONE model at ONE seq, so
-# the id is a fixed string. MUST match server.py EMBEDDER_COREML.
+# different space and forces reindex. This backend pins ONE model, and the id is a
+# fixed string. It now covers TWO graphs (SEQ and SEQ_FAST) rather than one seq, so
+# that is worth stating plainly: the id is safe to keep fixed only because the two
+# graphs were MEASURED to occupy the same space — 20 of 22 texts bit-identical,
+# worst normalized cosine 0.999999, and 0/176 changes to the recall gate decision
+# when 128-embedded queries are scored against 512-stored vectors. If a future graph
+# ever fails that bar, this id MUST gain a component (as the LoRA path did with
+# [:adapter]) rather than silently mixing spaces. MUST match server.py
+# EMBEDDER_COREML.
 EMBEDDER_ID = "coreml-bge-small-en-v1.5"
 # Output dimension (bge-small hidden size). Fixed by the checkpoint.
 DIM = 384
@@ -130,8 +140,11 @@ SEQ = 512
 #     seq=192  ->  3.52 ms   (5.6x)
 #     seq=256  ->  5.60 ms   (3.5x)
 # 128 is not merely "shorter is faster" — it is a distinct optimum (96 and 160
-# are both ~2.5x SLOWER than it), i.e. that shape lands on an efficient Core ML
-# / ANE path the neighbours miss.
+# are both ~2.5x SLOWER than it). The CAUSE is NOT visible in the compute plan and
+# this module does not claim one: MLComputePlan reports the 128 and 512 graphs as
+# IDENTICALLY placed (292 Neural Engine / 21 CPU of 313 ops each), so the win is
+# not extra ANE residency — the ANE was already carrying 93% of the graph. What is
+# measured is the wall clock; the scheduling reason for the knee is unexplained.
 #
 # EQUIVALENT, not just fast — MEASURED over 22 texts (3..122 tokens): 20 of 22
 # come out BIT-identical between the two graphs, and the worst normalized cosine
@@ -172,6 +185,22 @@ _MODEL_FAST_NAME = "emb_b1_s128.mlpackage"
 # (accept and stop), so the upgrade can never become a per-start reconversion.
 _FAST_ABSENT_MARK = "no_fast_graph"
 _TOK_DIRNAME = "tokenizer"
+
+
+def mark_fast_absent(d, why):
+    """BEST-EFFORT: record in cache dir `d` that the fast graph was attempted and is
+    not usable here, so the one-shot upgrade stops retrying. Returns True if the note
+    landed. NEVER raises: every caller is on a path where the fast graph is already
+    a write-off, and the conditions that make this write fail (full disk, read-only
+    cache root) are the same ones that made the graph fail — turning that into an
+    exception would trade an optional optimization for the whole backend."""
+    try:
+        with open(os.path.join(d, _FAST_ABSENT_MARK), "w", encoding="utf-8") as fh:
+            fh.write(f"{why}\n")
+        return True
+    except Exception as e:  # noqa: BLE001 - advisory only
+        log.warning("coreml embed: could not record the fast-graph sentinel (%s)", e)
+        return False
 
 
 def hf_cache_root():
@@ -258,6 +287,7 @@ class CoreMLEmbedder:
         self._tokenizer = None
         self._model = None  # the (1, SEQ) MLModel, looped per text
         self._model_fast = None  # the (1, SEQ_FAST) MLModel; None = no fast path
+        self._upgrade_started = False  # at most ONE background rebuild per process
         self._trunc_seen = 0        # cumulative truncated inputs (for the warn throttle)
         self._trunc_warned_at = 0   # _trunc_seen value at the last warn
 
@@ -328,6 +358,7 @@ class CoreMLEmbedder:
                 raise CoreMLEmbedderUnavailable(
                     f"Core ML embedder deps unavailable: {', '.join(missing)} not installed"
                 )
+            just_converted = False
             try:
                 loaded = self._try_load_final()
                 if loaded is None:
@@ -337,26 +368,7 @@ class CoreMLEmbedder:
                         raise CoreMLEmbedderUnavailable(
                             "Core ML embedder cache failed validate-load after conversion"
                         )
-                elif loaded[2] is None and not os.path.exists(
-                    os.path.join(self._dir, _FAST_ABSENT_MARK)
-                ):
-                    # ONE-SHOT UPGRADE. A cache published before the fast graph existed
-                    # still validate-loads, so without this an already-deployed machine
-                    # would keep the old cache forever and NEVER pick up the speedup.
-                    # Rebuild once; if the fast graph still cannot be built here,
-                    # `_convert_into` leaves the sentinel and we stop trying.
-                    log.info(
-                        "coreml embed: cache predates the fast (seq=%d) graph; "
-                        "rebuilding once to pick up the speedup", SEQ_FAST,
-                    )
-                    try:
-                        self._convert_atomic()
-                        loaded = self._try_load_final() or loaded
-                    except Exception as e:  # keep the working cache; just stay slow
-                        log.warning(
-                            "coreml embed: fast-graph upgrade failed (%s); "
-                            "continuing on the existing cache at seq=%d", e, SEQ,
-                        )
+                    just_converted = True
                 self._tokenizer, self._model, self._model_fast = loaded
             except CoreMLEmbedderUnavailable:
                 raise
@@ -365,6 +377,74 @@ class CoreMLEmbedder:
                     f"Core ML embedder build/load failed: {e}"
                 ) from e
             self._loaded = True
+            if self._model_fast is None:
+                if just_converted:
+                    # We just built this cache and it STILL has no usable fast graph,
+                    # so rebuilding it again would produce the same result. Record that
+                    # and stop. (`_convert_into` only leaves a note when the conversion
+                    # itself raised; a graph that converts but fails to VALIDATE lands
+                    # here, and without this note every later start would rebuild.)
+                    mark_fast_absent(
+                        self._dir,
+                        f"a fresh conversion produced no usable seq={SEQ_FAST} graph",
+                    )
+                elif not os.path.exists(
+                    os.path.join(self._dir, _FAST_ABSENT_MARK)
+                ):
+                    self._schedule_fast_upgrade()
+
+    def _schedule_fast_upgrade(self):
+        """Start the ONE-SHOT cache upgrade in the BACKGROUND (at most once per
+        process). A cache published before the fast graph existed still validate-loads,
+        so without an upgrade an already-deployed machine would keep it forever and
+        never pick the speedup up.
+
+        It runs on a thread rather than inline because inline is not survivable: the
+        rebuild was MEASURED at 43.8 s while `ensure_loaded` holds `self._lock`, the
+        daemon's inference REQUEST_TIMEOUT is 30 s, and its timeout arm returns an
+        error WITHOUT retrying — so an inline upgrade would fail the first op after a
+        deploy plus everything queued behind the lock. On this thread the caller keeps
+        serving from the seq=%d graph at the old speed and simply gets faster once the
+        swap lands.""" % SEQ
+        if self._upgrade_started:
+            return
+        self._upgrade_started = True
+        log.info(
+            "coreml embed: cache predates the fast (seq=%d) graph; rebuilding once "
+            "in the background (serving at seq=%d meanwhile)", SEQ_FAST, SEQ,
+        )
+        threading.Thread(
+            target=self._upgrade_fast_graph,
+            name="coreml-embed-fast-upgrade",
+            daemon=True,
+        ).start()
+
+    def _upgrade_fast_graph(self):
+        """The background rebuild. NEVER raises (it is a daemon thread; an escaping
+        exception would only print a traceback) and never leaves the embedder worse
+        than it found it: the freshly-built models are swapped in ONLY once they carry
+        a usable fast graph, so a failed rebuild keeps the already-loaded ones."""
+        try:
+            self._convert_atomic()
+            loaded = self._try_load_final()
+        except Exception as e:  # noqa: BLE001 - keep the working cache, stay slow
+            log.warning(
+                "coreml embed: background fast-graph upgrade failed (%s); "
+                "continuing at seq=%d", e, SEQ,
+            )
+            loaded = None
+        if loaded is not None and loaded[2] is not None:
+            with self._lock:
+                self._tokenizer, self._model, self._model_fast = loaded
+            log.info("coreml embed: fast (seq=%d) graph is live", SEQ_FAST)
+            return
+        # The rebuild did not yield a usable fast graph. Note it so the next process
+        # start does not repeat a 43.8 s rebuild that we now know cannot help. If the
+        # note cannot be written either (a read-only cache root fails both), the retry
+        # is at least confined to this background thread and off the request path.
+        mark_fast_absent(
+            self._dir, f"a rebuild produced no usable seq={SEQ_FAST} graph"
+        )
 
     def _try_load_final(self):
         """Validate-load from the FINAL cache dir; return (tok, model, fast) or
@@ -559,6 +639,13 @@ class CoreMLEmbedder:
                 f"{enc.config.max_position_embeddings} < seq {SEQ}"
             )
         trace_and_convert(enc, 1, os.path.join(target_dir, _MODEL_NAME))
+        # The tokenizer is written BEFORE the optional fast graph is attempted, so a
+        # cache that is REQUIRED to be complete becomes complete as early as possible.
+        # Ordering it after the fast attempt made an "optional" failure able to abort
+        # the whole conversion and leave a cache with no tokenizer at all — which is
+        # not a degraded embedder, it is no embedder (the server latches unavailable
+        # and falls back to mean-pool, a DIFFERENT vector space).
+        tok.save_pretrained(os.path.join(target_dir, _TOK_DIRNAME))
         # The FAST graph (see SEQ_FAST): same recipe, shorter fixed shape. Built
         # here so the cache carries both; a conversion failure here is NOT fatal
         # — the 512 graph above is already written and fully functional, so we
@@ -573,13 +660,11 @@ class CoreMLEmbedder:
                 "the seq=%d graph still works",
                 SEQ_FAST, e, SEQ,
             )
-            # Record that we TRIED, so the one-shot upgrade in `ensure_loaded` does not
-            # rebuild this cache again on every process start.
-            with open(
-                os.path.join(target_dir, _FAST_ABSENT_MARK), "w", encoding="utf-8"
-            ) as fh:
-                fh.write(f"fast graph did not convert here: {e}\n")
-        tok.save_pretrained(os.path.join(target_dir, _TOK_DIRNAME))
+            # Record that we TRIED. BEST-EFFORT: the usual reason the conversion just
+            # failed is a full or read-only cache root, which is also the reason this
+            # write would fail — and losing the whole embedder because an optional
+            # optimization could not leave a note would invert the entire point.
+            mark_fast_absent(target_dir, f"fast graph did not convert here: {e}")
 
     def _encode(self, texts):
         """Tokenize a list of strings to a list of token-id lists, truncated to

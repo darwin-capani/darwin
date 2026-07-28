@@ -4,12 +4,30 @@
   "model": "BAAI/bge-small-en-v1.5, FP16 mlprogram, compute_units=ALL",
   "finding_1_padding_does_not_help": {
     "note": "The (1,512) graph costs the same regardless of how many REAL tokens it holds - masking padding saves nothing, because the graph always computes 512 positions.",
-    "p50_ms_by_real_tokens": {"8": 19.73, "16": 19.64, "64": 19.38, "512": 19.55}
+    "p50_ms_by_real_tokens": {
+      "8": 19.73,
+      "16": 19.64,
+      "64": 19.38,
+      "512": 19.55
+    }
   },
   "finding_2_sequence_sweep": {
     "note": "Each length converted fresh, 60 iterations, p50 ms. 128 is a distinct OPTIMUM, not merely 'shorter is faster' - 96 and 160 are both ~2.5x slower than it.",
-    "p50_ms": {"96": 4.66, "128": 1.84, "160": 3.17, "192": 3.52, "256": 5.60, "512": 19.65},
-    "speedup_vs_512": {"96": 4.21, "128": 10.66, "160": 6.19, "192": 5.58, "256": 3.51}
+    "p50_ms": {
+      "96": 4.66,
+      "128": 1.84,
+      "160": 3.17,
+      "192": 3.52,
+      "256": 5.6,
+      "512": 19.65
+    },
+    "speedup_vs_512": {
+      "96": 4.21,
+      "128": 10.66,
+      "160": 6.19,
+      "192": 5.58,
+      "256": 3.51
+    }
   },
   "finding_3_equivalence": {
     "note": "CORRECTED. An earlier version of this file reported cos_128_vs_512 = 0.999097 and called that the 512 graph's own run-to-run noise floor. Both halves of that were wrong: 0.999097 was an UNNORMALIZED dot product (these vectors are not exactly unit-norm in FP16, so a raw dot understates agreement), and the 512 graph is not noisy at all - two identical runs are BIT-identical, so its noise floor is exactly 0. Re-measured properly, the real result is stronger than the claim it replaces.",
@@ -18,7 +36,10 @@
     "texts_measured": 22,
     "token_lengths": "3..122 (all within SEQ_FAST)",
     "bit_identical_vectors_128_vs_512": "20/22",
-    "normalized_cosine_128_vs_512": {"min": 0.999999043, "mean": 0.999999932},
+    "normalized_cosine_128_vs_512": {
+      "min": 0.999999043,
+      "mean": 0.999999932
+    },
     "mixed_space_check": {
       "why": "the decisive production case: a corpus already STORED from the 512 graph, queried with vectors freshly embedded on the 128 graph",
       "queries": 8,
@@ -35,17 +56,48 @@
     "speedup_on_common_path": 8.75
   },
   "workload_justification": {
-    "real_query_tokens": [7, 7, 4, 9, 9, 3, 9],
-    "stored_fact_tokens": [11, 11, 13, 9, 15],
+    "real_query_tokens": [
+      7,
+      7,
+      4,
+      9,
+      9,
+      3,
+      9
+    ],
+    "stored_fact_tokens": [
+      11,
+      11,
+      13,
+      9,
+      15
+    ],
     "docsearch_chunk_tokens": 242,
     "conclusion": "Queries and facts fit 128 comfortably; document chunks (1200 chars) do NOT, so the fast graph is used ONLY when the tokenized text genuinely fits. No input is ever truncated by this optimization."
   },
   "ane_utilization": {
-    "note": "Core ML compute plan for the shipped graph, excluding const (weight) ops.",
-    "compute_ops": 313,
-    "on_neural_engine": 292,
-    "on_cpu": 21,
-    "ane_share": 0.933,
-    "cpu_residue": "input-embedding stage (gather, first layer_norm, casts) - a known Core ML pattern, not a defect"
+    "note": "Core ML compute plan (MLComputePlan), const/weight ops excluded. Measured for BOTH graphs, because the speedup is easy to misread as 'more of the work moved onto the ANE'. It did not: placement is IDENTICAL between the two graphs. The ANE was already carrying 93% of this model, so there was no idle accelerator to unlock - the win is that the short graph asks it to do far less work.",
+    "seq512": {
+      "compute_ops": 313,
+      "on_neural_engine": 292,
+      "on_cpu": 21,
+      "ane_share": 0.933
+    },
+    "seq128": {
+      "compute_ops": 313,
+      "on_neural_engine": 292,
+      "on_cpu": 21,
+      "ane_share": 0.933
+    },
+    "cpu_residue": "input-embedding stage (gather, first layer_norm, casts) - a known Core ML pattern, not a defect",
+    "honesty": "the wall-clock knee at 128 is measured; the SCHEDULING reason for it is not visible in the compute plan and is not claimed here"
+  },
+  "disk_cost": {
+    "measured_package_sizes_mb": {
+      "emb_b1.mlpackage": 64,
+      "emb_b1_s128.mlpackage": 64
+    },
+    "embedder_cache_mb": "64 -> 128",
+    "note": "the reranker adds a further 43 MB (43 -> 86, see rerank_results.json), so the total added across both models is ~107 MB, not the ~43 MB an earlier single-model note implied"
   }
 }
