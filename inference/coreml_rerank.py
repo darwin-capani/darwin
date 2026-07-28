@@ -335,21 +335,40 @@ class CoreMLReranker:
                     f"Core ML reranker build/load failed: {e}"
                 ) from e
             self._loaded = True
-            if self._model_fast is None:
-                if just_converted:
-                    # We just built this cache and it STILL has no usable short graph,
-                    # so rebuilding would produce the same result. Record that and stop.
-                    # (`_convert_into` only leaves a note when the conversion itself
-                    # raised; a graph that converts but fails to VALIDATE lands here,
-                    # and without this note every later start would rebuild.)
-                    mark_fast_absent(
-                        self._dir,
-                        f"a fresh conversion produced no usable seq={SEQ_FAST} graph",
-                    )
-                elif not os.path.exists(
-                    os.path.join(self._dir, _FAST_ABSENT_MARK)
-                ):
-                    self._schedule_fast_upgrade()
+            # EVERYTHING BELOW IS OPTIONAL and sits OUTSIDE the funnel above that turns
+            # failures into CoreMLRerankerUnavailable. The backend is already fully built and
+            # usable at this point, so nothing here may be allowed to escape: an
+            # unguarded raise (threading.Thread.start() raises RuntimeError when the
+            # per-task thread ceiling is reached) would surface as a non-Unavailable
+            # error that the server's preload catches with a bare `except Exception`,
+            # latching op=rerank onto a DIFFERENT vector space for the whole
+            # process life -- because an optimization could not spawn a thread.
+            try:
+                self._maybe_upgrade_fast_graph(just_converted)
+            except Exception as e:  # noqa: BLE001 - optional; never fatal
+                log.warning(
+                    "op=rerank: could not schedule the fast-graph upgrade (%s); "
+                    "continuing without it", e,
+                )
+
+    def _maybe_upgrade_fast_graph(self, just_converted):
+        """Decide what to do about a missing fast graph. Split out of `ensure_loaded`
+        purely so the whole optional decision sits inside ONE guard there."""
+        if self._model_fast is None:
+            if just_converted:
+                # We just built this cache and it STILL has no usable short graph,
+                # so rebuilding would produce the same result. Record that and stop.
+                # (`_convert_into` only leaves a note when the conversion itself
+                # raised; a graph that converts but fails to VALIDATE lands here,
+                # and without this note every later start would rebuild.)
+                mark_fast_absent(
+                    self._dir,
+                    f"a fresh conversion produced no usable seq={SEQ_FAST} graph",
+                )
+            elif not os.path.exists(
+                os.path.join(self._dir, _FAST_ABSENT_MARK)
+            ):
+                self._schedule_fast_upgrade()
 
     def _schedule_fast_upgrade(self):
         """Start the ONE-SHOT cache upgrade in the BACKGROUND (at most once per
@@ -358,7 +377,8 @@ class CoreMLReranker:
         and never pick the speedup up.
 
         It runs on a thread rather than inline because inline is not survivable: the
-        rebuild was MEASURED at 43.8 s while `ensure_loaded` holds `self._lock`, the
+        rebuild was MEASURED at 43.8 s for THIS model while `ensure_loaded` holds
+        `self._lock`, the
         daemon's inference REQUEST_TIMEOUT is 30 s, and its timeout arm returns an
         error WITHOUT retrying - so an inline upgrade would fail the first op after a
         deploy plus everything queued behind the lock. On this thread the caller keeps
@@ -392,7 +412,12 @@ class CoreMLReranker:
             loaded = None
         if loaded is not None and loaded[2] is not None:
             with self._lock:
-                self._tokenizer, self._model, self._model_fast = loaded
+                # Swap the MODELS only - `_encode` reads self._tokenizer OUTSIDE this
+                # lock, so rebinding it here would be observable mid-call. The rebuilt
+                # tokenizer is byte-identical anyway (same MODEL_ID, same
+                # save_pretrained), so there is nothing to gain and a mixed-generation
+                # read to lose.
+                self._model, self._model_fast = loaded[1], loaded[2]
             log.info("op=rerank the short-sequence graph is live")
             return
         # The rebuild did not yield a usable short graph. Note it so the next process

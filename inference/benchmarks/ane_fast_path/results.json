@@ -99,5 +99,12 @@
     },
     "embedder_cache_mb": "64 -> 128",
     "note": "the reranker adds a further 43 MB (43 -> 86, see rerank_results.json), so the total added across both models is ~107 MB, not the ~43 MB an earlier single-model note implied"
+  },
+  "upgrade_cost_measured_against_the_real_deployed_cache": {
+    "how": "copied the live cache (emb_b1.mlpackage + tokenizer only, exactly as a deployed machine has) and called ensure_loaded() on it",
+    "ensure_loaded_returns_seconds": 7.99,
+    "background_rebuild_total_seconds": 37.2,
+    "why_two_numbers": "the rebuild runs on a background thread, so the caller is only blocked for the first figure. Inline it would have been the second, against a daemon REQUEST_TIMEOUT of 30 s that does not retry.",
+    "note": "37.2 s is THIS model's number. The reranker's own rebuild is 43.8 s and is recorded in rerank_results.json - an earlier draft cited the reranker's figure in both modules."
   }
 }

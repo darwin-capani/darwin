@@ -10,12 +10,13 @@ representative MNEMOSYNE-style set of short user facts (the eval harness +
 labeled set + results are committed under inference/benchmarks/coreml_eval/),
 plus LATENCY re-measured on this M1 Pro under compute_units=ALL (the device-gated
 smoke in this file, `_smoke`). NOTE the shipped config is now TWO graphs, not one:
-text that fits SEQ_FAST runs the (1, 128) graph at ~1.84 ms and anything longer
-runs the (1, 512) graph at ~19.65 ms, so the single "seq=512" figure below is the
-LONG-input cost, not the typical one:
+text that fits SEQ_FAST runs the (1, 128) graph and anything longer runs the
+(1, 512) graph, so the figures below are END-TO-END through embed() for each case
+(2.22 vs 19.45 ms/text) - the per-predict graph costs are 1.84 and 19.65 ms and are
+recorded separately in inference/benchmarks/ane_fast_path/results.json:
 
     embedder                     recall@1  recall@3  recall@5   MRR    latency (ComputeUnit.ALL)
-    bge-small (this module,384d)  0.8241    0.9213    0.9861   0.9606  ~1.84ms/text short, ~19.6ms long
+    bge-small (this module,384d)  0.8241    0.9213    0.9861   0.9606  ~2.22ms/text short, ~19.5ms long
     Qwen3-4B mean-pool (2560d)    0.2454    0.4630    0.5556   0.4235  ~124ms single / ~56.8ms/text batched
 
     Dramatically higher retrieval quality, and still faster than the 4B path:
@@ -377,21 +378,40 @@ class CoreMLEmbedder:
                     f"Core ML embedder build/load failed: {e}"
                 ) from e
             self._loaded = True
-            if self._model_fast is None:
-                if just_converted:
-                    # We just built this cache and it STILL has no usable fast graph,
-                    # so rebuilding it again would produce the same result. Record that
-                    # and stop. (`_convert_into` only leaves a note when the conversion
-                    # itself raised; a graph that converts but fails to VALIDATE lands
-                    # here, and without this note every later start would rebuild.)
-                    mark_fast_absent(
-                        self._dir,
-                        f"a fresh conversion produced no usable seq={SEQ_FAST} graph",
-                    )
-                elif not os.path.exists(
-                    os.path.join(self._dir, _FAST_ABSENT_MARK)
-                ):
-                    self._schedule_fast_upgrade()
+            # EVERYTHING BELOW IS OPTIONAL and sits OUTSIDE the funnel above that turns
+            # failures into CoreMLEmbedderUnavailable. The backend is already fully built and
+            # usable at this point, so nothing here may be allowed to escape: an
+            # unguarded raise (threading.Thread.start() raises RuntimeError when the
+            # per-task thread ceiling is reached) would surface as a non-Unavailable
+            # error that the server's preload catches with a bare `except Exception`,
+            # latching op=embed onto a DIFFERENT vector space for the whole
+            # process life -- because an optimization could not spawn a thread.
+            try:
+                self._maybe_upgrade_fast_graph(just_converted)
+            except Exception as e:  # noqa: BLE001 - optional; never fatal
+                log.warning(
+                    "coreml embed: could not schedule the fast-graph upgrade (%s); "
+                    "continuing without it", e,
+                )
+
+    def _maybe_upgrade_fast_graph(self, just_converted):
+        """Decide what to do about a missing fast graph. Split out of `ensure_loaded`
+        purely so the whole optional decision sits inside ONE guard there."""
+        if self._model_fast is None:
+            if just_converted:
+                # We just built this cache and it STILL has no usable fast graph,
+                # so rebuilding it again would produce the same result. Record that
+                # and stop. (`_convert_into` only leaves a note when the conversion
+                # itself raised; a graph that converts but fails to VALIDATE lands
+                # here, and without this note every later start would rebuild.)
+                mark_fast_absent(
+                    self._dir,
+                    f"a fresh conversion produced no usable seq={SEQ_FAST} graph",
+                )
+            elif not os.path.exists(
+                os.path.join(self._dir, _FAST_ABSENT_MARK)
+            ):
+                self._schedule_fast_upgrade()
 
     def _schedule_fast_upgrade(self):
         """Start the ONE-SHOT cache upgrade in the BACKGROUND (at most once per
@@ -400,12 +420,14 @@ class CoreMLEmbedder:
         never pick the speedup up.
 
         It runs on a thread rather than inline because inline is not survivable: the
-        rebuild was MEASURED at 43.8 s while `ensure_loaded` holds `self._lock`, the
+        rebuild was MEASURED at 37.2 s for THIS model while `ensure_loaded` holds
+        `self._lock` (the reranker's own rebuild is 43.8 s - each module cites its own
+        number), the
         daemon's inference REQUEST_TIMEOUT is 30 s, and its timeout arm returns an
         error WITHOUT retrying — so an inline upgrade would fail the first op after a
         deploy plus everything queued behind the lock. On this thread the caller keeps
-        serving from the seq=%d graph at the old speed and simply gets faster once the
-        swap lands.""" % SEQ
+        serving from the long graph at the old speed and simply gets faster once the
+        swap lands."""
         if self._upgrade_started:
             return
         self._upgrade_started = True
@@ -435,11 +457,16 @@ class CoreMLEmbedder:
             loaded = None
         if loaded is not None and loaded[2] is not None:
             with self._lock:
-                self._tokenizer, self._model, self._model_fast = loaded
+                # Swap the MODELS only. `_encode` reads self._tokenizer OUTSIDE this
+                # lock, so rebinding it here would be observable mid-call; the models
+                # are read strictly inside it. The rebuilt tokenizer is byte-identical
+                # anyway (same MODEL_ID, same save_pretrained), so there is nothing to
+                # gain by swapping it and a mixed-generation read to lose.
+                self._model, self._model_fast = loaded[1], loaded[2]
             log.info("coreml embed: fast (seq=%d) graph is live", SEQ_FAST)
             return
         # The rebuild did not yield a usable fast graph. Note it so the next process
-        # start does not repeat a 43.8 s rebuild that we now know cannot help. If the
+        # start does not repeat a 37.2 s rebuild that we now know cannot help. If the
         # note cannot be written either (a read-only cache root fails both), the retry
         # is at least confined to this background thread and off the request path.
         mark_fast_absent(
@@ -718,7 +745,7 @@ class CoreMLEmbedder:
         vectors, in input order. Empty batch -> []. Each text is ONE predict,
         looped (measured faster than a batched graph at seq=512 — see the module
         SEQ note), routed to the (1, SEQ_FAST) graph when its real tokens fit
-        (~10.7x faster, cosine 1.000000 — never truncating) and to the
+        (~10.7x faster, and measured equivalent — never truncating) and to the
         (1, SEQ) graph otherwise. Vectors are scrubbed so no NaN/Inf reaches the
         wire. The batch/length caps are enforced by the caller (batch) and
         tokenization (length). Thread-safe."""
@@ -732,9 +759,10 @@ class CoreMLEmbedder:
                 # FAST PATH: route to the (1, SEQ_FAST) graph ONLY when this
                 # text's real tokens fit it — so nothing is ever truncated by
                 # the optimization (a doc chunk at ~242 tokens takes the 512
-                # graph exactly as before). Measured ~10.7x faster at seq=128
-                # with cosine 1.000000 vs the 512 graph, so the vector — and
-                # therefore every ranking — is unchanged. See SEQ_FAST.
+                # graph exactly as before). Measured ~10.7x faster at seq=128,
+                # and equivalent: 20 of 22 probe texts come out BIT-identical and
+                # the worst normalized cosine is 0.999999, with 0/176 changes to
+                # the recall gate decision. See SEQ_FAST.
                 if self._model_fast is not None and len(ids_row) <= SEQ_FAST:
                     ids, mask = pad_batch([ids_row], SEQ_FAST)
                     vec = self._predict(ids, mask, model=self._model_fast)[0]

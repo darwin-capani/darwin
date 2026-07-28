@@ -372,7 +372,7 @@ class FastGraphUpgrade(unittest.TestCase):
                 total += o.converts
             self.assertTrue(self._sentinel(tmp), "no sentinel was ever written")
             self.assertEqual(
-                total, 1, f"{{total}} rebuilds across 4 starts; expected exactly 1"
+                total, 1, f"{total} rebuilds across 4 starts; expected exactly 1"
             )
 
     def test_a_fresh_conversion_with_no_short_graph_also_leaves_a_sentinel(self):
@@ -409,6 +409,37 @@ class FastGraphUpgrade(unittest.TestCase):
             before = o.converts
             o._schedule_fast_upgrade()   # a second call must be inert
             self.assertEqual(o.converts, before)
+
+    def test_a_thread_that_cannot_start_never_reaches_the_caller(self):
+        """The optional block sits OUTSIDE ensure_loaded's exception funnel, so an
+        unguarded raise there escapes as a NON-Unavailable error. The server's preload
+        catches that with a bare `except Exception` and latches the backend onto a
+        DIFFERENT vector space for the whole process life - an optimization that could
+        not spawn a thread costing the real embedder. threading.Thread.start() raises
+        RuntimeError once the per-task thread ceiling is reached, so this is reachable."""
+        with tempfile.TemporaryDirectory() as tmp:
+            o = self._obj(tmp, [("t", "m", None)])
+            real = threading.Thread.start
+            threading.Thread.start = lambda s: (_ for _ in ()).throw(
+                RuntimeError("can't start new thread")
+            )
+            try:
+                o.ensure_loaded()   # MUTATION GUARD: unguarded, this raises
+            finally:
+                threading.Thread.start = real
+            self.assertTrue(o._loaded)
+            self.assertEqual((o._tokenizer, o._model), ("t", "m"))
+
+    def test_the_live_swap_leaves_the_tokenizer_alone(self):
+        """`_encode` reads self._tokenizer OUTSIDE the load lock while the models are
+        read inside it, so rebinding the tokenizer in the background swap would be
+        observable mid-call. It is byte-identical across generations anyway."""
+        with tempfile.TemporaryDirectory() as tmp:
+            o = self._obj(tmp, [("OLD_TOK", "OLD_M", None), ("NEW_TOK", "NEW_M", "FAST")])
+            self._load_and_settle(o)
+            self.assertEqual(o._model, "NEW_M")
+            self.assertEqual(o._model_fast, "FAST")
+            self.assertEqual(o._tokenizer, "OLD_TOK", "the swap rebound the tokenizer")
 
     def test_the_sentinel_write_never_raises(self):
         """mark_fast_absent runs where the fast graph is already lost; if it could
