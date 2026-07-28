@@ -344,6 +344,10 @@ export interface FeedItem {
  *  `running` flag) is what flips a panel out of its OFFLINE placeholder. */
 export interface AppFeed {
   running: boolean;
+  /** True once the daemon reported app.crashed (terminal: the crash-loop
+   *  governor gave up). Distinguishes a CRASHED surface from a cleanly stopped
+   *  one so a panel can say so instead of the softer idle placeholder. */
+  crashed?: boolean;
   brief: string;
   items: FeedItem[];
   fetchedAt: string | null;
@@ -3845,9 +3849,29 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       return { ...s, actionSurface: { ...s.actionSurface, macros } };
     }
 
+    case "app.crashed": {
+      // TERMINAL in the daemon: on the crash-loop give-up path apps.rs sets
+      // running=false, cleans the socket, emits app.crashed and RETURNS — no
+      // app.stopped ever follows. Treating this as non-state-bearing left the
+      // dead app showing a green "LIVE" pill forever (sweep HIGH), so clear it
+      // exactly like app.stopped and mark the feed crashed.
+      const name = str(env.data, "name");
+      if (name === null) return s;
+      if (!s.runningApps.has(name) && !(s.appFeeds[name]?.running)) return s;
+      const runningApps = new Set(s.runningApps);
+      runningApps.delete(name);
+      const existing = s.appFeeds[name];
+      return {
+        ...s,
+        runningApps,
+        appFeeds: existing
+          ? { ...s.appFeeds, [name]: { ...existing, running: false, crashed: true } }
+          : s.appFeeds,
+      };
+    }
+
     case "app.log":
     case "app.auth_failed":
-    case "app.crashed":
       // Surfaced via telemetry/console only; not panel-state-bearing.
       return s;
 

@@ -52,7 +52,7 @@
 //!   yet" and NEVER fabricates a memory. Under the LEXICAL backend that means
 //!   no shared term; under the NEURAL backend a raw cosine is NOT evidence of a
 //!   match (embedders are anisotropic — unrelated text still scores ~0.25-0.57),
-//!   so [`gate_by_separation`] applies a calibrated absolute + relative gate.
+//!   so [`gate_neural_scores`] applies a calibrated absolute + relative gate.
 //!   See that function for the measured trade-off.
 //!
 //! Nothing here speaks, acts, or reaches the network. It reads stored facts and
@@ -422,7 +422,7 @@ impl NeuralEmbeddingProvider {
 }
 
 /// How far above the batch's own floor a cosine must stand to count as a match,
-/// as a fraction of that batch's spread. See [`gate_by_separation`].
+/// as a fraction of that batch's spread. See [`gate_neural_scores`].
 const SEPARATION_FRACTION: f64 = 0.3;
 
 /// Absolute cosine a neural score must ALSO clear. Both gates are required:
@@ -468,7 +468,7 @@ const MIN_BATCH_SPREAD: f64 = 0.02;
 /// recall is recoverable (the user rephrases and the fact is still stored), a
 /// FABRICATED memory is not — the user may act on it. Honesty over completeness
 /// is the module contract.
-fn gate_by_separation(sims: Vec<f64>) -> Vec<f64> {
+pub fn gate_neural_scores(sims: Vec<f64>) -> Vec<f64> {
     let finite: Vec<f64> = sims.iter().copied().filter(|s| s.is_finite()).collect();
     if finite.is_empty() {
         return vec![0.0; sims.len()];
@@ -509,7 +509,7 @@ impl EmbeddingProvider for NeuralEmbeddingProvider {
             .iter()
             .map(|v| cosine_similarity(&self.query, v))
             .collect();
-        gate_by_separation(sims)
+        gate_neural_scores(sims)
     }
 
     fn method(&self) -> RankMethod {

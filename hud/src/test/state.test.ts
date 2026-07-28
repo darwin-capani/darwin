@@ -1084,11 +1084,25 @@ describe("micro-app: app.data feed relay", () => {
     expect(s.runningApps.has("algo-core")).toBe(true);
   });
 
-  it("app.log / app.auth_failed / app.crashed are not panel-state-bearing (same reference)", () => {
+  it("app.log / app.auth_failed are not panel-state-bearing (same reference)", () => {
     const s = tel(connected(), appData(GS, { items: [gsItem()] }));
     expect(tel(s, env("app.log", { name: GS, line: "polling" }))).toBe(s);
     expect(tel(s, env("app.auth_failed", { name: GS }))).toBe(s);
-    expect(tel(s, env("app.crashed", { name: GS, restarts: 3 }))).toBe(s);
+  });
+
+  // REGRESSION (sweep HIGH): app.crashed IS terminal in the daemon — the
+  // crash-loop governor gives up, sets running=false and returns, so no
+  // app.stopped ever follows. Treating it as non-state-bearing left the dead
+  // app showing a green "LIVE" pill forever.
+  it("app.crashed clears the app from runningApps and marks the feed crashed", () => {
+    const s = tel(connected(), appData(GS, { items: [gsItem()] }));
+    expect(s.runningApps.has(GS)).toBe(true);
+    const after = tel(s, env("app.crashed", { name: GS, restarts: 3 }));
+    expect(after.runningApps.has(GS)).toBe(false);
+    expect(after.appFeeds[GS]?.running).toBe(false);
+    expect(after.appFeeds[GS]?.crashed).toBe(true);
+    // The last items stay visible (context is not lost on the crash).
+    expect(after.appFeeds[GS]?.items.length).toBeGreaterThan(0);
   });
 
   it("app feed events never decay the core state (orthogonal to the voice pipeline)", () => {

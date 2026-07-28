@@ -6217,7 +6217,11 @@ fn is_empty_retrieval(outcome: &str) -> bool {
         "i have no activity recorded", // aperture_recall empty / no-match subject
         "i have no record of", // aperture_recall no activity in the asked-about window
         "i have no recent screen context", // screen_recall empty (un-fed) / no-match
-        "tell me what to search",  // unified_search empty query
+        "tell me what to search",  // unified_search empty QUERY
+        // unified_search empty RESULT — distinct from the empty-query guard
+        // above. Without this a search that legitimately found NOTHING was
+        // recorded as a real citation (sweep HIGH).
+        "i searched everything available and found nothing",
         "no comms surfaces were available", // karen_triage all-disconnected
     ];
     MISS_LEADS.iter().any(|m| lead.starts_with(m))
@@ -10371,7 +10375,7 @@ pub async fn world_query_live(memory: &Memory, about: &str) -> String {
 /// (neural on-device embeddings, or lexical BM25 on fallback) — never claiming
 /// neural when it fell back — and when nothing relevant is stored, or the
 /// visible store is empty, it says so plainly rather than inventing a memory
-/// (the ranker returns zero hits for a no-match query under either backend (neural scores pass recall::gate_by_separation, not a bare > 0 test), so
+/// (the ranker returns zero hits for a no-match query under either backend (neural scores pass recall::gate_neural_scores, not a bare > 0 test), so
 /// this can only ever surface facts actually stored and visible to this agent).
 /// Hard safety cap on the WHOLE scoped-store load (whole-store recall on). The
 /// `facts` table is never pruned, so this bounds the SQL result set + the cheap

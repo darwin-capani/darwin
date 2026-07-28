@@ -3,6 +3,11 @@
 import os
 import sys
 
+# Hard ceiling on a converted value's magnitude. json.dumps() renders an int in
+# base 10 and CPython >=3.11 raises past 4300 digits (~14285 bits), which would
+# leave the request unanswered; 8192 bits is far beyond any real base conversion
+# while staying safely under that limit.
+MAX_VALUE_BITS = 8192
 # Shared host-link plumbing (socket loop, token stamping, frame bound, the
 # agent-tool id echo) from apps/_sdk — fs_read-granted. The path is resolved
 # relative to THIS file (apps/<app>/main.py -> ../_sdk), so it works both when
@@ -61,6 +66,18 @@ def compute(payload):
             decimal = int(value, from_base)
         except (ValueError, TypeError):
             return {"error": "cannot parse value in base %d" % from_base}
+
+        # BOUND THE MAGNITUDE before building the reply. compute() never raises,
+        # but a huge int is still a live failure: json.dumps() must render it in
+        # base 10 and CPython >=3.11 refuses past 4300 digits, so the app would
+        # emit NO result frame and the agent-tool call would hang the full 15s
+        # request timeout with no answer. Refusing honestly is the correct
+        # outcome (a 8192-bit ceiling still covers every realistic conversion).
+        if decimal.bit_length() > MAX_VALUE_BITS:
+            return {
+                "error": "value too large (max %d bits); got %d bits"
+                % (MAX_VALUE_BITS, decimal.bit_length())
+            }
 
         # Render without Python's 0b/0o/0x prefixes; preserve sign for negatives.
         sign = "-" if decimal < 0 else ""

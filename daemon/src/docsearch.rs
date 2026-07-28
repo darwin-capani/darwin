@@ -2298,10 +2298,28 @@ impl DocIndex {
                                             }
                                         })
                                         .unwrap_or(0.0);
-                                    // Clamp negatives to 0 (anti-correlated is not a hit).
-                                    (i, if sim > 0.0 { sim } else { 0.0 })
+                                    (i, sim)
                                 })
                                 .collect();
+                            // RELEVANCE GATE (sweep HIGH): a raw cosine is NOT
+                            // evidence of a match — the shipped embedder is
+                            // anisotropic and never scores unrelated text at or
+                            // below 0 (measured min +0.2508), so the old
+                            // `> 0.0` clamp never fired and a no-match query
+                            // fabricated FILE CITATIONS from arbitrary chunks.
+                            // Reuse the calibrated gate recall.rs applies to the
+                            // identical geometry, so both paths stay honest
+                            // together.
+                            let scored: Vec<(usize, f64)> = {
+                                let gated = crate::recall::gate_neural_scores(
+                                    scored.iter().map(|(_, s)| *s).collect(),
+                                );
+                                scored
+                                    .into_iter()
+                                    .zip(gated)
+                                    .map(|((i, _), s)| (i, s))
+                                    .collect()
+                            };
                             if dim_mismatches > 0 {
                                 tracing::warn!(
                                     target: "docsearch",
