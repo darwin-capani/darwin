@@ -131,9 +131,17 @@ SEQ = 512
 #     seq=256  ->  5.60 ms   (3.5x)
 # 128 is not merely "shorter is faster" — it is a distinct optimum (96 and 160
 # are both ~2.5x SLOWER than it), i.e. that shape lands on an efficient Core ML
-# / ANE path the neighbours miss. Verified EQUIVALENT, not just fast: the
-# seq=128 and seq=512 embeddings of the same text have cosine 1.000000 across
-# every probe text, so routing short text here changes no ranking.
+# / ANE path the neighbours miss.
+#
+# EQUIVALENT, not just fast — MEASURED over 22 texts (3..122 tokens): 20 of 22
+# come out BIT-identical between the two graphs, and the worst normalized cosine
+# is 0.999999. The decisive check is the mixed case, because it is the one
+# production actually hits: a corpus ALREADY STORED from the 512 graph, queried
+# with vectors freshly embedded on the 128 graph. Over 8 queries that produced
+# 0/8 top-5 order flips, 0/176 changes to the MIN_NEURAL_SIM=0.50 gate decision,
+# and a worst absolute score delta of 0.0 — so an existing index needs no
+# reindex and no vector-space bump. (An earlier draft of this comment claimed a
+# flat "cosine 1.000000"; the real numbers are above.)
 #
 # WHY BOTH GRAPHS: docsearch chunks are ~1200 chars (~242 WordPiece tokens).
 # Sending those through a 128 graph would TRUNCATE ~half of every chunk — the

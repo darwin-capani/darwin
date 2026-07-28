@@ -12,9 +12,20 @@
     "speedup_vs_512": {"96": 4.21, "128": 10.66, "160": 6.19, "192": 5.58, "256": 3.51}
   },
   "finding_3_equivalence": {
-    "note": "The fast graph is not merely fast - it is FAITHFUL. Its cosine to the 512 graph equals the 512 graph's OWN run-to-run FP16/ANE noise floor, i.e. it differs from the shipped graph no more than the shipped graph differs from itself. Rankings identical.",
-    "cos_128_vs_512": 0.999097,
-    "cos_512_vs_itself_noise_floor": 0.999097,
+    "note": "CORRECTED. An earlier version of this file reported cos_128_vs_512 = 0.999097 and called that the 512 graph's own run-to-run noise floor. Both halves of that were wrong: 0.999097 was an UNNORMALIZED dot product (these vectors are not exactly unit-norm in FP16, so a raw dot understates agreement), and the 512 graph is not noisy at all - two identical runs are BIT-identical, so its noise floor is exactly 0. Re-measured properly, the real result is stronger than the claim it replaces.",
+    "seq512_run_to_run_max_elementwise_delta": 0.0,
+    "seq512_is_deterministic": true,
+    "texts_measured": 22,
+    "token_lengths": "3..122 (all within SEQ_FAST)",
+    "bit_identical_vectors_128_vs_512": "20/22",
+    "normalized_cosine_128_vs_512": {"min": 0.999999043, "mean": 0.999999932},
+    "mixed_space_check": {
+      "why": "the decisive production case: a corpus already STORED from the 512 graph, queried with vectors freshly embedded on the 128 graph",
+      "queries": 8,
+      "top5_order_flips": "0/8",
+      "min_neural_sim_0_50_gate_crossings_changed": "0/176",
+      "worst_abs_cosine_score_delta": 0.0
+    },
     "ranking_identical": true
   },
   "finding_4_end_to_end": {
