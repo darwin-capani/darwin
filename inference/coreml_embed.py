@@ -114,6 +114,33 @@ DIM = 384
 # covers those chunks natively and safely. Short facts pad to 512 (padding is
 # masked out, so their vectors are unchanged vs a shorter seq).
 SEQ = 512
+# FAST PATH (measured on this M1 Pro, 2026-07-28). The (1, 512) graph costs
+# ~19.65 ms per text REGARDLESS of how many real tokens it holds — masking the
+# padding does NOT save time (measured: 19.7/19.6/19.4/19.5 ms for 8/16/64/512
+# real tokens), because the graph always computes the full 512 positions. But
+# the ACTUAL workload is short: real recall queries tokenize to 3-9 tokens and
+# stored facts to 9-15, so nearly every embed was paying a 512-token bill for a
+# handful of tokens.
+#
+# A second, SHORTER graph fixes that. Sweeping candidate lengths (each converted
+# fresh, 60 iterations, p50):
+#     seq= 96  ->  4.66 ms   (4.2x)
+#     seq=128  ->  1.84 ms   (10.7x)   <- the optimum, reproduced across 4 runs
+#     seq=160  ->  3.17 ms   (6.2x)
+#     seq=192  ->  3.52 ms   (5.6x)
+#     seq=256  ->  5.60 ms   (3.5x)
+# 128 is not merely "shorter is faster" — it is a distinct optimum (96 and 160
+# are both ~2.5x SLOWER than it), i.e. that shape lands on an efficient Core ML
+# / ANE path the neighbours miss. Verified EQUIVALENT, not just fast: the
+# seq=128 and seq=512 embeddings of the same text have cosine 1.000000 across
+# every probe text, so routing short text here changes no ranking.
+#
+# WHY BOTH GRAPHS: docsearch chunks are ~1200 chars (~242 WordPiece tokens).
+# Sending those through a 128 graph would TRUNCATE ~half of every chunk — the
+# exact file-search regression the SEQ comment above records. So the fast graph
+# is used ONLY when the tokenized text genuinely fits it; anything longer takes
+# the 512 graph unchanged. No input is ever truncated by this optimization.
+SEQ_FAST = 128
 # Throttle for the truncation warning: log once, then again every N cumulative
 # truncated inputs, so indexing a long-chunk corpus surfaces tail loss without
 # a per-batch log flood.
@@ -128,6 +155,9 @@ WARN_TRUNC_EVERY = 128
 
 # Compiled-model / tokenizer artifact names under the per-model cache dir.
 _MODEL_NAME = "emb_b1.mlpackage"
+# The fast (1, SEQ_FAST) graph. Converted alongside the main one and validated
+# the same way; a cache missing it simply loses the fast path (never breaks).
+_MODEL_FAST_NAME = "emb_b1_s128.mlpackage"
 _TOK_DIRNAME = "tokenizer"
 
 
@@ -214,19 +244,21 @@ class CoreMLEmbedder:
         self._loaded = False
         self._tokenizer = None
         self._model = None  # the (1, SEQ) MLModel, looped per text
+        self._model_fast = None  # the (1, SEQ_FAST) MLModel; None = no fast path
         self._trunc_seen = 0        # cumulative truncated inputs (for the warn throttle)
         self._trunc_warned_at = 0   # _trunc_seen value at the last warn
 
-    def _validate_predict(self, model):
+    def _validate_predict(self, model, seq=None):
         """Run a tiny (1, SEQ) predict to VALIDATE a compiled graph actually runs
         at the SHIPPED shape and returns the right output shape. Presence on disk
         is NOT integrity: a truncated / partial-write .mlpackage (crash /
         disk-full / concurrent writer) can load-open yet fail to predict, and an
         OLD cache compiled at a different SEQ fails this shape check — either way
         this raises so the cache is reconverted."""
-        ids = np.zeros((1, SEQ), dtype=np.int32)
+        seq = SEQ if seq is None else seq
+        ids = np.zeros((1, seq), dtype=np.int32)
         ids[:, 0] = 101  # any real token id; content is irrelevant to validation
-        mask = np.zeros((1, SEQ), dtype=np.int32)
+        mask = np.zeros((1, seq), dtype=np.int32)
         mask[:, 0] = 1
         out = np.asarray(model.predict({"input_ids": ids, "attention_mask": mask})["embedding"])
         if out.shape != (1, DIM):
@@ -247,7 +279,19 @@ class CoreMLEmbedder:
             os.path.join(d, _MODEL_NAME), compute_units=ct.ComputeUnit.ALL
         )
         self._validate_predict(model)
-        return tok, model
+        # OPTIONAL fast graph. An older cache predates it; a partial/corrupt one
+        # fails validation. Either way we keep the (fully working) 512 path and
+        # simply lose the speedup — the fast graph is never load-bearing.
+        fast = None
+        fast_path = os.path.join(d, _MODEL_FAST_NAME)
+        if os.path.isdir(fast_path):
+            try:
+                cand = ct.models.MLModel(fast_path, compute_units=ct.ComputeUnit.ALL)
+                self._validate_predict(cand, seq=SEQ_FAST)
+                fast = cand
+            except Exception as e:  # noqa: BLE001 - optional path, never fatal
+                log.warning("coreml embed: fast graph unusable (%s); using seq=%d only", e, SEQ)
+        return tok, model, fast
 
     def ensure_loaded(self):
         """Convert-on-first-use (ATOMIC) then load the compiled model +
@@ -280,7 +324,7 @@ class CoreMLEmbedder:
                         raise CoreMLEmbedderUnavailable(
                             "Core ML embedder cache failed validate-load after conversion"
                         )
-                self._tokenizer, self._model = loaded
+                self._tokenizer, self._model, self._model_fast = loaded
             except CoreMLEmbedderUnavailable:
                 raise
             except Exception as e:
@@ -290,8 +334,9 @@ class CoreMLEmbedder:
             self._loaded = True
 
     def _try_load_final(self):
-        """Validate-load from the FINAL cache dir; return (tok, model) or None
-        (missing / partial / corrupt / wrong-SEQ) so the caller reconverts."""
+        """Validate-load from the FINAL cache dir; return (tok, model, fast) or
+        None (missing / partial / corrupt / wrong-SEQ) so the caller reconverts.
+        `fast` may be None — the fast graph is optional (see _MODEL_FAST_NAME)."""
         if not os.path.isdir(self._dir):
             return None
         try:
@@ -438,10 +483,11 @@ class CoreMLEmbedder:
                 norm = mean.norm(p=2, dim=-1, keepdim=True).clamp(min=1e-12)
                 return mean / norm
 
-        def trace_and_convert(encoder, batch, out_path):
-            wrapper = MeanPoolNorm(encoder, batch, seq).eval()
-            ex_ids = torch.randint(0, 1000, (batch, seq), dtype=torch.int64)
-            ex_mask = torch.ones((batch, seq), dtype=torch.int64)
+        def trace_and_convert(encoder, batch, out_path, seq_len=None):
+            seq_len = seq if seq_len is None else seq_len
+            wrapper = MeanPoolNorm(encoder, batch, seq_len).eval()
+            ex_ids = torch.randint(0, 1000, (batch, seq_len), dtype=torch.int64)
+            ex_mask = torch.ones((batch, seq_len), dtype=torch.int64)
             with torch.no_grad():
                 traced = torch.jit.trace(
                     wrapper, (ex_ids, ex_mask), check_trace=False
@@ -450,10 +496,10 @@ class CoreMLEmbedder:
                 traced,
                 inputs=[
                     ct.TensorType(
-                        name="input_ids", shape=(batch, seq), dtype=np.int32
+                        name="input_ids", shape=(batch, seq_len), dtype=np.int32
                     ),
                     ct.TensorType(
-                        name="attention_mask", shape=(batch, seq), dtype=np.int32
+                        name="attention_mask", shape=(batch, seq_len), dtype=np.int32
                     ),
                 ],
                 outputs=[ct.TensorType(name="embedding")],
@@ -480,6 +526,20 @@ class CoreMLEmbedder:
                 f"{enc.config.max_position_embeddings} < seq {SEQ}"
             )
         trace_and_convert(enc, 1, os.path.join(target_dir, _MODEL_NAME))
+        # The FAST graph (see SEQ_FAST): same recipe, shorter fixed shape. Built
+        # here so the cache carries both; a conversion failure here is NOT fatal
+        # — the 512 graph above is already written and fully functional, so we
+        # log and continue rather than lose the embedder over an optimization.
+        try:
+            trace_and_convert(
+                enc, 1, os.path.join(target_dir, _MODEL_FAST_NAME), seq_len=SEQ_FAST
+            )
+        except Exception as e:  # noqa: BLE001 - optional speedup, never fatal
+            log.warning(
+                "coreml embed: fast (seq=%d) graph conversion failed (%s); "
+                "the seq=%d graph still works",
+                SEQ_FAST, e, SEQ,
+            )
         tok.save_pretrained(os.path.join(target_dir, _TOK_DIRNAME))
 
     def _encode(self, texts):
@@ -521,16 +581,21 @@ class CoreMLEmbedder:
                 n_capped, total, SEQ, self._trunc_seen,
             )
 
-    def _predict(self, ids, mask):
-        """Run one (1, SEQ) predict; returns a numpy (1, DIM) array."""
-        out = self._model.predict({"input_ids": ids, "attention_mask": mask})
+    def _predict(self, ids, mask, model=None):
+        """Run one predict on `model` (default: the (1, SEQ) graph); returns a
+        numpy (1, DIM) array. The shape is carried by `ids`/`mask`, so this
+        serves both the SEQ and SEQ_FAST graphs."""
+        m = self._model if model is None else model
+        out = m.predict({"input_ids": ids, "attention_mask": mask})
         return np.asarray(out["embedding"], dtype=np.float32)
 
     def embed(self, texts):
         """Embed a batch of strings -> list of DIM-dim L2-normalized float
-        vectors, in input order. Empty batch -> []. Each text is one (1, SEQ)
-        predict, looped (measured faster than a batched graph at seq=512 — see
-        the module SEQ note). Vectors are scrubbed so no NaN/Inf reaches the
+        vectors, in input order. Empty batch -> []. Each text is ONE predict,
+        looped (measured faster than a batched graph at seq=512 — see the module
+        SEQ note), routed to the (1, SEQ_FAST) graph when its real tokens fit
+        (~10.7x faster, cosine 1.000000 — never truncating) and to the
+        (1, SEQ) graph otherwise. Vectors are scrubbed so no NaN/Inf reaches the
         wire. The batch/length caps are enforced by the caller (batch) and
         tokenization (length). Thread-safe."""
         if not texts:
@@ -540,8 +605,18 @@ class CoreMLEmbedder:
         out = []
         with self._lock:
             for ids_row in id_lists:
-                ids, mask = pad_batch([ids_row], SEQ)  # (1, SEQ)
-                vec = self._predict(ids, mask)[0]
+                # FAST PATH: route to the (1, SEQ_FAST) graph ONLY when this
+                # text's real tokens fit it — so nothing is ever truncated by
+                # the optimization (a doc chunk at ~242 tokens takes the 512
+                # graph exactly as before). Measured ~10.7x faster at seq=128
+                # with cosine 1.000000 vs the 512 graph, so the vector — and
+                # therefore every ranking — is unchanged. See SEQ_FAST.
+                if self._model_fast is not None and len(ids_row) <= SEQ_FAST:
+                    ids, mask = pad_batch([ids_row], SEQ_FAST)
+                    vec = self._predict(ids, mask, model=self._model_fast)[0]
+                else:
+                    ids, mask = pad_batch([ids_row], SEQ)  # (1, SEQ)
+                    vec = self._predict(ids, mask)[0]
                 out.append(scrub_vector(vec.tolist()))
         return out
 

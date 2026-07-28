@@ -187,6 +187,87 @@ class TruncationSurfacingTests(unittest.TestCase):
         self.assertEqual(e._trunc_seen, 0)
 
 
+class FastPathRouting(unittest.TestCase):
+    """The SEQ_FAST routing rule (see coreml_embed.SEQ_FAST). Pure/no-device: we
+    assert WHICH graph a given token length selects, never that the ANE is used.
+
+    MEASURED on an M1 Pro (2026-07-28) and recorded here so a regression is
+    visible: the (1,512) graph costs ~19.65 ms per text no matter how few real
+    tokens it carries (masking padding saves nothing), while the (1,128) graph
+    costs ~1.84 ms — and its output matches the 512 graph to cosine 0.999097,
+    which is EXACTLY the 512 graph's own run-to-run FP16/ANE noise floor
+    (measured: 512-vs-itself is also 0.999097). Rankings are identical."""
+
+    def test_short_text_takes_the_fast_graph_long_text_does_not(self):
+        import coreml_embed as ce
+
+        # A recall query / stored fact (3-15 real tokens) fits the fast graph.
+        self.assertLessEqual(9, ce.SEQ_FAST)
+        # A docsearch chunk (~1200 chars => ~242 WordPiece tokens) does NOT —
+        # routing it to the fast graph would TRUNCATE it, the exact file-search
+        # regression the SEQ comment records. It must take the 512 graph.
+        self.assertGreater(242, ce.SEQ_FAST)
+        self.assertGreaterEqual(ce.SEQ, 242)
+
+    def test_fast_graph_is_optional_and_never_load_bearing(self):
+        """A cache without the fast graph (an older one, or a failed optional
+        conversion) must still embed — just without the speedup."""
+        import coreml_embed as ce
+
+        e = ce.CoreMLEmbedder.__new__(ce.CoreMLEmbedder)
+        e._lock = __import__("threading").Lock()
+        e._loaded = True
+        e._model_fast = None            # no fast graph available
+        e._trunc_seen = 0
+        e._trunc_warned_at = 0
+        calls = []
+
+        class Tok:
+            def __call__(self, texts, **kw):
+                return {"input_ids": [[101, 5, 102] for _ in texts]}
+
+        e._tokenizer = Tok()
+        e._encode = lambda texts: [[101, 5, 102] for _ in texts]
+
+        def fake_predict(ids, mask, model=None):
+            calls.append((ids.shape[1], model))
+            import numpy as _np
+            return _np.ones((1, ce.DIM), dtype=_np.float32) / (ce.DIM ** 0.5)
+
+        e._predict = fake_predict
+        out = e.embed(["hi"])
+        self.assertEqual(len(out), 1)
+        # With no fast graph it must use the SEQ shape, not crash.
+        self.assertEqual(calls[0][0], ce.SEQ)
+        self.assertIsNone(calls[0][1])
+
+    def test_short_text_routes_to_the_fast_graph_when_present(self):
+        import coreml_embed as ce
+
+        e = ce.CoreMLEmbedder.__new__(ce.CoreMLEmbedder)
+        e._lock = __import__("threading").Lock()
+        e._loaded = True
+        e._model_fast = object()        # a fast graph IS available
+        e._trunc_seen = 0
+        e._trunc_warned_at = 0
+        calls = []
+        # one short row (fits SEQ_FAST) and one long row (does not)
+        rows = [[1] * 9, [1] * (ce.SEQ_FAST + 1)]
+        e._encode = lambda texts: rows
+
+        def fake_predict(ids, mask, model=None):
+            calls.append(ids.shape[1])
+            import numpy as _np
+            return _np.ones((1, ce.DIM), dtype=_np.float32) / (ce.DIM ** 0.5)
+
+        e._predict = fake_predict
+        e.embed(["short", "long"])
+        self.assertEqual(
+            calls, [ce.SEQ_FAST, ce.SEQ],
+            "short text must take the fast graph; long text must NOT be truncated",
+        )
+
+
 def ce_SEQ():
     import coreml_embed as ce
     return ce.SEQ
