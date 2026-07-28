@@ -257,10 +257,11 @@ pub fn build_report(title: &str, sources: &[SourcedClaim], _cfg: &ReportConfig) 
                 headings.len() - 1
             }
         };
+        let text = claim.text.trim().to_string();
         if grouped[idx].len() < MAX_CLAIMS_PER_SECTION {
             // The MAPPED id — the marker must name the bibliography entry, not the
             // input's run-local id.
-            grouped[idx].push((claim.text.trim().to_string(), local_id));
+            grouped[idx].push((text, local_id));
         }
     }
 
@@ -458,19 +459,81 @@ pub fn sourced_claims_from_entries(
         } else {
             format!("Run {} — {}", i + 1, entry.topic.trim())
         };
-        let body = entry.synthesized.trim();
-        for cit in &entry.citations {
-            // A persisted citation already carries a real fetched URL; map it
-            // straight to a SourceRef. (A blank-url one — never produced by the
-            // notebook path — would be dropped by build_report anyway.)
+        // STRIP the run's OWN citation apparatus before the body becomes a
+        // report claim (sweep residual). `synthesized` is a rendered cited
+        // answer: it carries RUN-LOCAL "[n]" markers and may carry an inline
+        // "Sources: [1] Title — url" tail. build_report renumbers citations
+        // REPORT-locally, so those embedded markers would point at the wrong
+        // bibliography row — the exact collision the renumbering fixed at the
+        // report level, leaking back in through the body text. The structured
+        // citations below carry the real provenance, so the prose does not
+        // need (and must not keep) its own stale numbering.
+        let body = strip_run_local_citations(entry.synthesized.trim());
+        if body.trim().is_empty() {
+            continue;
+        }
+        // ONE claim per citation (build_report lists only citations a body point
+        // actually references, so a textless claim would silently drop its
+        // source from the bibliography). The prose is emitted with the FIRST
+        // citation; the rest carry a short pointer instead of repeating the
+        // whole paragraph — before this a 4-source run printed the same
+        // paragraph four times.
+        for (n, cit) in entry.citations.iter().enumerate() {
+            let text = if n == 0 {
+                body.clone()
+            } else {
+                // A short, DISTINCT pointer — not a copy of the prose. It exists
+                // only so build_report references (and therefore lists) this
+                // run's remaining real sources; repeating the paragraph per
+                // citation is what this fix removes.
+                format!("Additional source for this run: {}.", cit.title.trim())
+            };
             out.push(SourcedClaim::cited(
                 heading.clone(),
-                body.to_string(),
+                text,
                 SourceRef::new(cit.source_id.max(0) as usize, cit.title.clone(), cit.url.clone()),
             ));
         }
     }
     out
+}
+
+
+/// PURE: strip a synthesized answer's OWN citation apparatus — the trailing
+/// "Sources: [1] … ; [2] …" tail and any inline "[n]" markers — so the prose can
+/// be renumbered report-locally without carrying stale run-local ids. Text that
+/// has no apparatus is returned unchanged (minus surrounding whitespace).
+fn strip_run_local_citations(body: &str) -> String {
+    // Drop the inline bibliography tail the notebook renderer appends.
+    let cut = body
+        .rfind("Sources: [")
+        .or_else(|| body.rfind("Sources:["))
+        .unwrap_or(body.len());
+    let head = &body[..cut];
+    // Drop bare "[n]" markers (digits only — never touches "[TODO]" or a real
+    // bracketed phrase), then tidy the doubled spaces they leave behind.
+    let mut out = String::with_capacity(head.len());
+    let bytes = head.as_bytes();
+    let mut i = 0;
+    while i < head.len() {
+        if bytes[i] == b'[' {
+            if let Some(close) = head[i..].find(']') {
+                let inner = &head[i + 1..i + close];
+                if !inner.is_empty() && inner.bytes().all(|b| b.is_ascii_digit()) {
+                    i += close + 1;
+                    continue;
+                }
+            }
+        }
+        out.push(head[i..].chars().next().unwrap());
+        i += head[i..].chars().next().unwrap().len_utf8();
+    }
+    // Collapse the whitespace the removals leave (" ,", "  ", " .").
+    let collapsed = out
+        .replace(" ,", ",")
+        .replace(" .", ".")
+        .replace("  ", " ");
+    collapsed.trim().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -763,6 +826,36 @@ mod tests {
         assert_eq!(r.all_citations.len(), 2);
         let urls: Vec<&str> = r.all_citations.iter().map(|c| c.url.as_str()).collect();
         assert!(urls.contains(&"https://nasa.test") && urls.contains(&"https://esa.test"), "{urls:?}");
+    }
+
+    /// REGRESSION (sweep residual): a saved run's `synthesized` text carries its
+    /// OWN run-local "[n]" markers and may end with an inline
+    /// "Sources: [1] Title — url" tail. build_report renumbers citations
+    /// REPORT-locally, so those embedded markers would point at the wrong
+    /// bibliography row — the collision the renumbering fixed, leaking back in
+    /// through the prose. They must be stripped before the body becomes a claim.
+    #[test]
+    fn a_runs_own_citation_markers_are_stripped_from_the_report_body() {
+        let entries = vec![entry(
+            "X",
+            "JWST saw early galaxies [1] and confirmed the redshift [2]. Sources: [1] NASA — https://nasa.test; [2] ESA — https://esa.test.",
+            vec![(1, "NASA", "https://nasa.test"), (2, "ESA", "https://esa.test")],
+        )];
+        let claims = sourced_claims_from_entries(&entries);
+        let r = build_report("X", &claims, &cfg());
+        let md = render_markdown(&r);
+        // The run's own inline bibliography is gone from the BODY...
+        let body_end = md.find("## Sources").unwrap_or(md.len());
+        let body = &md[..body_end];
+        assert!(!body.contains("Sources: ["), "the run's inline tail leaked: {body}");
+        assert!(!body.contains("[1] NASA"), "the run's own bibliography leaked: {body}");
+        // ...and both real sources are still listed, renumbered report-locally.
+        assert_eq!(r.all_citations.len(), 2, "{:?}", r.all_citations);
+        let urls: Vec<&str> = r.all_citations.iter().map(|c| c.url.as_str()).collect();
+        assert!(urls.contains(&"https://nasa.test") && urls.contains(&"https://esa.test"));
+        // The prose is not repeated once per citation.
+        let occurrences = body.matches("saw early galaxies").count();
+        assert_eq!(occurrences, 1, "the paragraph must appear once, got {occurrences}: {body}");
     }
 
     /// REGRESSION: two saved runs each number their OWN sources from 1, so folding

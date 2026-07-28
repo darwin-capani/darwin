@@ -342,6 +342,10 @@ describe("parseVisionScreen (vision.screen — OCR screen read, READ ON REQUEST)
       ts: 0,
       source: "",
       blockCount: 0,
+      // The truncation signal is UNKNOWN on an older payload — null, never
+      // false (claiming a completeness we did not verify).
+      blocksTotal: null,
+      blocksTruncated: null,
       text: "",
       blocks: [],
       controls: [],
@@ -1528,5 +1532,26 @@ describe("VisionPanel SCREEN CONTEXT readout (#42 — prominent WATCHING, honest
     expect(html).toContain("NOT WATCHING");
     expect(html.toLowerCase()).toContain("nothing is being read");
     expect(html.toLowerCase()).toContain("tcc-device-gated");
+  });
+
+  // REGRESSION (sweep residual): read.screen caps OCR blocks; without a
+  // truncation signal a DENSE screen was reported as complete. An older payload
+  // that omits the keys must read as UNKNOWN (null), never as "complete".
+  it("carries the OCR truncation signal, and unknown stays unknown", () => {
+    const capped = parseVisionScreen({
+      frame: 1, ts: 2, source: "screen", block_count: 64, text: "x",
+      blocks: [], controls: [], read_kind: "screen",
+      blocks_total: 512, blocks_truncated: true,
+    } as never);
+    expect(capped?.blocksTruncated).toBe(true);
+    expect(capped?.blocksTotal).toBe(512);
+
+    const older = parseVisionScreen({
+      frame: 1, ts: 2, source: "screen", block_count: 12, text: "x",
+      blocks: [], controls: [], read_kind: "screen",
+    } as never);
+    // NOT false — we cannot claim completeness we did not verify.
+    expect(older?.blocksTruncated).toBeNull();
+    expect(older?.blocksTotal).toBeNull();
   });
 });

@@ -163,7 +163,7 @@ export default function VisionPanel({
         : detections
           ? `${detections.count} DET`
           : screen
-            ? `${screen.blockCount} BLOCKS`
+            ? `${screen.blockCount}${screen.blocksTruncated ? "+" : ""} BLOCKS`
             : sound
               ? `${sound.count} SOUND`
               : status
@@ -423,7 +423,22 @@ export default function VisionPanel({
                         : "SCREEN READ"}
                 </span>
                 <span className="vi-screen-tag">READ ON REQUEST · TRANSIENT</span>
-                <span className="vi-screen-count">{screen.blockCount} BLK</span>
+                {/* HONEST TRUNCATION (sweep): a CAPPED read shows "N of M BLK"
+                    so a dense screen is never reported as complete. The signal
+                    is omitted by older payloads -> null -> unchanged display
+                    (unknown, not "complete"). */}
+                <span
+                  className="vi-screen-count"
+                  title={
+                    screen.blocksTruncated
+                      ? `capped: showing ${screen.blockCount} of ${screen.blocksTotal ?? "?"} observed text blocks`
+                      : undefined
+                  }
+                >
+                  {screen.blocksTruncated && screen.blocksTotal !== null
+                    ? `${screen.blockCount} of ${screen.blocksTotal} BLK`
+                    : `${screen.blockCount} BLK`}
+                </span>
               </div>
               {/* NON-RAW-TEXT signal: read length + (for #29) the HONEST
                   document-detected bool. Shows "read N chars" / "no document
