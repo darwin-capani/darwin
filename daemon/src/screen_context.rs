@@ -1161,6 +1161,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // SERIAL serializes the global-ring tests (crate convention)
     async fn runtime_recall_empty_ring_is_honest_never_fabricated() {
         let _g = serial();
         global_reset_for_test();
@@ -1173,6 +1174,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // SERIAL serializes the global-ring tests (crate convention)
     async fn runtime_recall_ranks_neurally_and_names_the_method() {
         let _g = serial();
         global_reset_for_test();
@@ -1192,6 +1194,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // SERIAL serializes the global-ring tests (crate convention)
     async fn runtime_recall_falls_back_to_bm25_and_names_it() {
         let _g = serial();
         global_reset_for_test();
@@ -1214,6 +1217,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // SERIAL serializes the global-ring tests (crate convention)
     async fn runtime_recall_no_match_is_honest() {
         let _g = serial();
         global_reset_for_test();
@@ -1228,6 +1232,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // SERIAL serializes the global-ring tests (crate convention)
     async fn runtime_recall_screen_in_query_stays_honest_on_the_bm25_fallback() {
         // REGRESSION (review-caught), tool-path flavor: on the BM25 fallback a
         // query phrased with this tool's own vocabulary ("what was on my screen
