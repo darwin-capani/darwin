@@ -151,6 +151,16 @@ fn lock() -> std::sync::MutexGuard<'static, Option<PendingConfirmation>> {
     PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The id of the action whose prompt was last handed to a turn — i.e. the one
+/// the user was actually asked about. Kept separate from [`PENDING`] so a
+/// background parker overwriting the slot cannot also rewrite what the user was
+/// shown. Poison-tolerant like the slot itself.
+static PROMPTED: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+fn prompted_lock() -> std::sync::MutexGuard<'static, Option<String>> {
+    PROMPTED.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// The complete set of CONSEQUENTIAL (side-effecting) tools — every tool whose
 /// `execute_tool` arm routes through `integrations::gate(confirm)`. This is the
 /// single source of truth for "does this invocation need a spoken yes"; the
@@ -245,6 +255,24 @@ pub fn is_consequential_tool(name: &str) -> bool {
 pub fn park(mut pending: PendingConfirmation) -> String {
     pending.id = derive_pending_id(&pending.agent, &pending.tool, &pending.input);
     let prompt = confirmation_prompt(&pending.preview);
+    // Remember WHICH action this prompt describes. The spoken "yes" is matched
+    // against this id (see `take_live`), so a LATER parker — a standing order,
+    // an overnight agent, any background turn — that overwrites the slot after
+    // the user was prompted can never be fired by that "yes". Before this, the
+    // single global slot was taken unconditionally and the user could confirm
+    // an action they were never shown (sweep HIGH).
+    *prompted_lock() = Some(pending.id.clone());
+    *lock() = Some(pending);
+    prompt
+}
+
+
+/// TEST-ONLY: park an action WITHOUT recording it as the prompted one — models a
+/// background turn whose prompt never reached the user.
+#[cfg(test)]
+pub fn park_background_for_test(mut pending: PendingConfirmation) -> String {
+    pending.id = derive_pending_id(&pending.agent, &pending.tool, &pending.input);
+    let prompt = confirmation_prompt(&pending.preview);
     *lock() = Some(pending);
     prompt
 }
@@ -299,8 +327,24 @@ pub fn is_live(now: Instant) -> bool {
 /// classified reply — but whatever the reply, the slot is now empty, so a stale
 /// action can never be confirmed twice or linger. `now` is injectable.
 pub fn take_live(now: Instant) -> Option<PendingConfirmation> {
+    // The id the user was actually prompted with. A slot holding a DIFFERENT
+    // action (parked by a background turn after the prompt) is left INTACT and
+    // not confirmed — the spoken "yes" answers the question that was asked, and
+    // the background action keeps waiting for its own confirmation.
+    let prompted = prompted_lock().clone();
     let mut guard = lock();
+    let matches_prompt = match (guard.as_ref(), prompted.as_deref()) {
+        (Some(p), Some(id)) => p.id == id,
+        // No prompt on record (e.g. a pre-existing park): fall back to the old
+        // take-whatever behavior rather than silently refusing every confirm.
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if !matches_prompt {
+        return None;
+    }
     let taken = guard.take();
+    *prompted_lock() = None;
     match taken {
         Some(p) if now.duration_since(p.created_at) <= PENDING_TTL => Some(p),
         // expired (or none): slot already cleared by `take()`.
@@ -313,6 +357,7 @@ pub fn take_live(now: Instant) -> Option<PendingConfirmation> {
 /// action armed.
 pub fn clear() {
     *lock() = None;
+    *prompted_lock() = None;
 }
 
 /// A faithful, read-only snapshot of the live pending action for the command
@@ -622,6 +667,46 @@ fn contains_phrase(tokens: &[&str], needle: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (sweep HIGH): the spoken "yes" must answer the question the
+    /// user was ACTUALLY asked. `PENDING` is a single process-global slot and
+    /// `park()` overwrites it unconditionally, so a background parker (a
+    /// standing order, an overnight agent, any concurrent turn) landing between
+    /// the prompt and the reply used to make the user's "yes" fire an action
+    /// they were never shown.
+    #[test]
+    fn a_background_parker_cannot_hijack_the_spoken_confirm() {
+        clear();
+        // 1. The user is prompted about action A.
+        let _prompt = park(sample("gmail_send"));
+        // 2. A BACKGROUND turn parks a DIFFERENT action B, clobbering the slot
+        //    without the user ever being prompted about it.
+        let mut b = sample("x_post");
+        b.input = json!({"text": "public post"});
+        let _ = park_background_for_test(b);
+        // 3. The user says "yes" — answering the prompt about A. B must NOT fire.
+        let taken = take_live(Instant::now());
+        assert!(
+            taken.is_none(),
+            "a spoken yes must never confirm an action the user was not shown: {taken:?}"
+        );
+        // B is still parked, awaiting its own confirmation — not silently lost.
+        assert!(
+            peek_pending(Instant::now()).is_some(),
+            "the background action stays parked"
+        );
+        clear();
+    }
+
+    /// The normal path is unaffected: prompt then confirm fires the SAME action.
+    #[test]
+    fn the_prompted_action_still_confirms_normally() {
+        clear();
+        let _prompt = park(sample("gmail_send"));
+        let taken = take_live(Instant::now()).expect("the prompted action confirms");
+        assert_eq!(taken.tool, "gmail_send");
+        clear();
+    }
     use super::*;
     use serde_json::json;
 
