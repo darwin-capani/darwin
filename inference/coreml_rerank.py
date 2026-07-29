@@ -94,6 +94,9 @@ import threading
 
 import numpy as np
 
+import coreml_shared
+from coreml_shared import CONVERT_LOCK
+
 from coreml_embed import cache_dir  # shared <hf-cache>/darwin-coreml/ subtree
 
 log = logging.getLogger("darwin.coreml_rerank")
@@ -145,28 +148,9 @@ _MODEL_NAME = "rerank_b1.mlpackage"
 # simply runs every pair at SEQ, so the fast path degrades to the previous behaviour
 # instead of forcing a reconversion.
 _MODEL_FAST_NAME = "rerank_b1_s128.mlpackage"
-# Sentinel written into the cache when the short graph was ATTEMPTED and could not be
-# built on this machine. Without it, the one-shot upgrade below could not tell "this
-# cache predates the short graph" (rebuild it) from "the short graph does not build
-# here" (accept and stop trying), and would reconvert on every process start.
-_FAST_ABSENT_MARK = "no_fast_graph"
 _TOK_DIRNAME = "tokenizer"
 
 
-def mark_fast_absent(d, why):
-    """BEST-EFFORT: record in cache dir `d` that the short graph was attempted and is
-    not usable here, so the one-shot upgrade stops retrying. Returns True if the note
-    landed. NEVER raises: every caller is on a path where the short graph is already a
-    write-off, and the conditions that make this write fail (full disk, read-only cache
-    root) are the same ones that made the graph fail - turning that into an exception
-    would trade an optional optimization for the whole backend."""
-    try:
-        with open(os.path.join(d, _FAST_ABSENT_MARK), "w", encoding="utf-8") as fh:
-            fh.write(f"{why}\n")
-        return True
-    except Exception as e:  # noqa: BLE001 - advisory only
-        log.warning("op=rerank could not record the short-graph sentinel (%s)", e)
-        return False
 
 
 # ---- PURE helpers (no model / no tokenizer / no I/O — unit-tested) ----------
@@ -356,18 +340,15 @@ class CoreMLReranker:
         purely so the whole optional decision sits inside ONE guard there."""
         if self._model_fast is None:
             if just_converted:
-                # We just built this cache and it STILL has no usable short graph,
-                # so rebuilding would produce the same result. Record that and stop.
-                # (`_convert_into` only leaves a note when the conversion itself
-                # raised; a graph that converts but fails to VALIDATE lands here,
-                # and without this note every later start would rebuild.)
-                mark_fast_absent(
+                # We just built this cache and it STILL has no usable short graph.
+                # Charge the attempt budget: `_convert_into` only records one when the
+                # conversion itself raised, so a graph that converts but fails to
+                # VALIDATE lands here, and without this every later start would rebuild.
+                coreml_shared.note_fast_attempt(
                     self._dir,
                     f"a fresh conversion produced no usable seq={SEQ_FAST} graph",
                 )
-            elif not os.path.exists(
-                os.path.join(self._dir, _FAST_ABSENT_MARK)
-            ):
+            elif not coreml_shared.fast_upgrade_exhausted(self._dir):
                 self._schedule_fast_upgrade()
 
     def _schedule_fast_upgrade(self):
@@ -422,7 +403,7 @@ class CoreMLReranker:
             return
         # The rebuild did not yield a usable short graph. Note it so the next process
         # start does not repeat a 43.8 s rebuild that we now know cannot help.
-        mark_fast_absent(
+        coreml_shared.note_fast_attempt(
             self._dir, f"a rebuild produced no usable seq={SEQ_FAST} graph"
         )
 
@@ -452,7 +433,10 @@ class CoreMLReranker:
         tmp = tempfile.mkdtemp(prefix=".convert-", dir=parent)
         trash = None  # bound BEFORE the try: the finally below references it
         try:
-            self._convert_into(tmp)
+            # coremltools keeps global MIL state, so two overlapping conversions
+            # corrupt each other. See coreml_shared.CONVERT_LOCK.
+            with CONVERT_LOCK:
+                self._convert_into(tmp)
             # VALIDATE-LOAD in the temp dir BEFORE publishing: a partial/corrupt write
             # is caught here and never becomes the trusted cache.
             self._load_from(tmp)
@@ -631,7 +615,7 @@ class CoreMLReranker:
                 e, SEQ,
             )
             # Record that we TRIED. BEST-EFFORT - see mark_fast_absent.
-            mark_fast_absent(
+            coreml_shared.note_fast_attempt(
                 target_dir, f"short-sequence graph did not convert here: {e}"
             )
 

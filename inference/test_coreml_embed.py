@@ -25,6 +25,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import coreml_embed as ce  # noqa: E402
+import coreml_shared  # noqa: E402
 import server  # noqa: E402
 
 
@@ -326,7 +327,7 @@ class FastGraphUpgrade(unittest.TestCase):
                 t.join(timeout=5)
 
     def _sentinel(self, tmp):
-        return os.path.exists(os.path.join(tmp, ce._FAST_ABSENT_MARK))
+        return os.path.exists(os.path.join(tmp, coreml_shared.FAST_ABSENT_MARK))
 
     def test_a_cache_without_the_short_graph_is_rebuilt(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -363,31 +364,14 @@ class FastGraphUpgrade(unittest.TestCase):
 
     def test_the_sentinel_stops_the_upgrade_from_running_every_start(self):
         with tempfile.TemporaryDirectory() as tmp:
-            open(os.path.join(tmp, ce._FAST_ABSENT_MARK), "w").close()
+            for _ in range(coreml_shared.MAX_FAST_ATTEMPTS):
+                coreml_shared.note_fast_attempt(tmp, "exhausted in the test")
             o = self._obj(tmp, [("t", "m", None)])
             self._load_and_settle(o)
             self.assertEqual(o.converts, 0)
             self.assertIsNone(o._model_fast)
 
-    def test_a_rebuild_that_still_yields_no_short_graph_is_not_repeated_next_start(self):
-        """THE REGRESSION THIS EXISTS FOR. A fast graph that CONVERTS but fails to
-        validate leaves _load_from returning fast=None with no sentinel. Before the
-        fix that meant four process starts cost four full rebuilds - measured 43.8 s
-        each - forever. One instance cannot show this: `_loaded` latches, so a single
-        ensure_loaded() calls convert once no matter what. It takes FRESH instances
-        against the SAME on-disk state, which is what a process restart is."""
-        with tempfile.TemporaryDirectory() as tmp:
-            total = 0
-            for start in range(4):
-                o = self._obj(tmp, [("t", "m", None), ("t", "m", None)])
-                self._load_and_settle(o)
-                total += o.converts
-            self.assertTrue(self._sentinel(tmp), "no sentinel was ever written")
-            self.assertEqual(
-                total, 1, f"{total} rebuilds across 4 starts; expected exactly 1"
-            )
-
-    def test_a_fresh_conversion_with_no_short_graph_also_leaves_a_sentinel(self):
+    def test_a_fresh_conversion_with_no_short_graph_charges_the_budget(self):
         """The other uncovered path: the cache did not exist at all, we converted it,
         and the fast graph still is not usable. Rebuilding cannot help, so the next
         start must not try."""
@@ -395,10 +379,13 @@ class FastGraphUpgrade(unittest.TestCase):
             o = self._obj(tmp, [None, ("t", "m", None)])
             self._load_and_settle(o)
             self.assertEqual(o.converts, 1)
-            self.assertTrue(self._sentinel(tmp))
+            self.assertEqual(coreml_shared.fast_attempts(tmp), 1, "budget not charged")
+            # Spend the rest of the budget, then the retry must stop.
+            while not coreml_shared.fast_upgrade_exhausted(tmp):
+                coreml_shared.note_fast_attempt(tmp, "spending the budget")
             o2 = self._obj(tmp, [("t", "m", None)])
             self._load_and_settle(o2)
-            self.assertEqual(o2.converts, 0, "the sentinel did not stop the retry")
+            self.assertEqual(o2.converts, 0, "an exhausted budget did not stop the retry")
 
     def test_a_failed_rebuild_keeps_the_working_cache(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -453,11 +440,84 @@ class FastGraphUpgrade(unittest.TestCase):
             self.assertEqual(o._model_fast, "FAST")
             self.assertEqual(o._tokenizer, "OLD_TOK", "the swap rebound the tokenizer")
 
+    def test_the_budget_allows_at_least_one_retry(self):
+        """MUTATION GUARD. Every other budget test reads MAX_FAST_ATTEMPTS
+        symbolically, so they all still pass at a budget of 1 - which IS the broken
+        permanent-sentinel behaviour this replaced. The point of a budget is that a
+        transient failure gets another go, so it must exceed 1."""
+        self.assertGreater(
+            coreml_shared.MAX_FAST_ATTEMPTS, 1,
+            "a budget of 1 is the permanent sentinel that pinned a machine to the "
+            "slow path over a transient concurrency fault",
+        )
+
+    def test_a_transient_failure_is_retried_not_recorded_as_permanent(self):
+        """THE REGRESSION THIS EXISTS FOR. The first real deploy hit a TRANSIENT
+        failure - two Core ML conversions ran concurrently and corrupted each other -
+        and a single binary sentinel recorded it as PERMANENT, pinning the machine to
+        the slow path for good. A retry budget lets a transient fault heal on the next
+        start while still capping a deterministic one."""
+        with tempfile.TemporaryDirectory() as tmp:
+            attempts = 0
+            for start in range(coreml_shared.MAX_FAST_ATTEMPTS - 1):
+                o = self._obj(tmp, [("t", "m", None), ("t", "m", None)])
+                self._load_and_settle(o)
+                attempts += o.converts
+            # Budget not spent yet, so a transient failure still gets another go.
+            self.assertEqual(attempts, coreml_shared.MAX_FAST_ATTEMPTS - 1)
+            self.assertFalse(coreml_shared.fast_upgrade_exhausted(tmp))
+            # And a start that finally succeeds picks the speedup up.
+            o = self._obj(tmp, [("t", "m", None), ("t", "m", "FAST")])
+            self._load_and_settle(o)
+            self.assertEqual(o._model_fast, "FAST")
+
+    def test_the_budget_stops_a_deterministic_failure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            total = 0
+            for start in range(coreml_shared.MAX_FAST_ATTEMPTS + 3):
+                o = self._obj(tmp, [("t", "m", None), ("t", "m", None)])
+                self._load_and_settle(o)
+                total += o.converts
+            self.assertEqual(
+                total, coreml_shared.MAX_FAST_ATTEMPTS,
+                f"{{total}} rebuilds; the budget is coreml_shared.MAX_FAST_ATTEMPTS",
+            )
+            self.assertTrue(coreml_shared.fast_upgrade_exhausted(tmp))
+
+    def test_conversions_are_serialized_process_wide(self):
+        """coremltools keeps global MIL state, so two overlapping conversions corrupt
+        each other - reproduced on the real converters, and it is what broke the first
+        deploy. Every backend must take the SAME lock."""
+        self.assertIs(ce.CONVERT_LOCK, coreml_shared.CONVERT_LOCK)
+        # Behavioural, not textual: a COMMENT naming CONVERT_LOCK must not satisfy
+        # this. Hold the lock, then prove _convert_atomic actually blocks on it.
+        entered = threading.Event()
+        o = ce.CoreMLEmbedder.__new__(ce.CoreMLEmbedder)
+        with tempfile.TemporaryDirectory() as tmp:
+            o._dir = tmp
+            o._convert_into = lambda d: entered.set()
+            coreml_shared.CONVERT_LOCK.acquire()
+            try:
+                t = threading.Thread(target=lambda: o._convert_atomic(), daemon=True)
+                t.start()
+                t.join(timeout=0.5)
+                self.assertFalse(
+                    entered.is_set(),
+                    "_convert_atomic converted while CONVERT_LOCK was held - "
+                    "concurrent coremltools conversions corrupt each other",
+                )
+            finally:
+                coreml_shared.CONVERT_LOCK.release()
+            t.join(timeout=5)
+            self.assertTrue(entered.is_set(), "it never converted after release")
+
     def test_the_sentinel_write_never_raises(self):
-        """mark_fast_absent runs where the fast graph is already lost; if it could
+        """note_fast_attempt runs where the short graph is already lost; if it could
         throw (a full or read-only cache root) it would take the whole backend with
         it - which is how the optional optimization became fatal once already."""
-        self.assertFalse(ce.mark_fast_absent("/nonexistent/read-only/path", "why"))
+        self.assertEqual(
+            coreml_shared.note_fast_attempt("/nonexistent/read-only/path", "why"), 0
+        )
 
 
 class SentinelWriteIsNeverFatal(unittest.TestCase):
