@@ -3532,8 +3532,11 @@ class InferenceEngine:
                 f"prompt cache for {self.classifier_id or self.llm_id} is not trimmable"
             )
         t0 = time.perf_counter()
-        logits = self._cls_model(mx.array(prefix_tokens)[None], cache=cache)
-        mx.eval(logits)
+        # Same as the persona prefill: eval the CACHE, not the logits, so the tied
+        # lm_head projection to vocab_size never enters the graph (264.1 MB of
+        # throwaway arrays for these 869 tokens).
+        self._cls_model(mx.array(prefix_tokens)[None], cache=cache)
+        mx.eval([c.state for c in cache])
         self._cls_prefix_str = prefix_str
         self._cls_suffix_str = suffix_str
         self._cls_prefix_tokens = list(prefix_tokens)
@@ -3640,8 +3643,15 @@ class InferenceEngine:
         if not can_trim_prompt_cache(cache):
             raise ValueError(f"prompt cache for {self.llm_id} is not trimmable")
         t0 = time.perf_counter()
-        logits = self._model(mx.array(prefix_tokens)[None], cache=cache)
-        mx.eval(logits)
+        # Evaluate the CACHE, never the logits. This prefill exists only for the KV
+        # side effect, but `mx.eval(logits)` used to force the tied lm_head projection
+        # of every position to vocab_size (151,936 for Qwen3-4B) -- 626.9 MB of arrays
+        # for these 2063 tokens, 59x the 10.6 MB of hidden states actually wanted, all
+        # discarded on the next line. MLX is lazy, so evaluating only the cache state
+        # leaves that projection out of the graph entirely; the cache is identical.
+        # This is mlx_lm's own prefill pattern (generate.py: mx.eval([c.state ...])).
+        self._model(mx.array(prefix_tokens)[None], cache=cache)
+        mx.eval([c.state for c in cache])
         log.info(
             "persona prompt cache prefilled: %d tokens in %dms",
             len(prefix_tokens),
