@@ -172,7 +172,11 @@ FALLBACK_VLM="mlx-community/Qwen2-VL-2B-Instruct-4bit"
 # Dirs that are BUILT or FETCHED fresh in the install home and must NOT be copied
 # from the source tree (so we never ship a stale daemon binary, a wrong-path
 # venv, someone else's state DB, or gigabytes of model weights).
-EXCLUDE_DIRS=(target .venv node_modules .build .git state models dist gen)
+# scratch-bench is gitignored probe scratch (zero tracked files) that the runtime
+# never reads, but it was being rsynced into the install home on every deploy:
+# 2.5 GB, almost all of it an ane-probe/ tree carrying its OWN hf-cache with a
+# SECOND full copy of the 4B checkpoint. Excluded so a redeploy stops copying it.
+EXCLUDE_DIRS=(target .venv node_modules .build .git state models dist gen scratch-bench)
 
 # ----------------------------------------------------------------------------
 # Flag parsing.
