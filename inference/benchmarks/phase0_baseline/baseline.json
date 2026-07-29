@@ -1,0 +1,67 @@
+{
+  "about": "Phase 0 baseline for the performance campaign, measured on the LIVE deployed install (M1 Pro, 17 GB, 2026-07-29). Every later claim in this campaign must diff against this file. Read-only measurements plus one lightweight socket round-trip each; no benchmark loops (see the hazard note).",
+  "hazard_note": "Generating load on this machine CRASHES the inference server. Two concurrent Core ML conversions and, separately, one op=generate each triggered a Metal command-buffer timeout (kIOGPUCommandBufferCallbackErrorTimeout, exit -6, launchd restart). Five such timeouts in this log, one of them timestamped 2026-07-28 17:17 which PREDATES this session's changes. Mechanism is memory pressure, see below. CONSEQUENCE: benchmark-heavy phases must not run against the live install.",
+  "memory": {
+    "why_this_is_first": "This reordered the whole campaign. Shaving milliseconds off IPC is meaningless while 93% of the inference server's writable memory is swapped out.",
+    "machine_total_gb": 17,
+    "swap_used_gb_at_measurement": 12.8,
+    "inference_phys_footprint_mb": 5352,
+    "inference_phys_footprint_peak_mb": 7694,
+    "inference_metal_unified_gb": 4.3,
+    "inference_writable_swapped_out_pct": 93,
+    "ane_peak_mb": 142,
+    "honesty": "DARWIN is NOT the only pressure. Top RSS at measurement time was Comet (1.6 GB) and Claude helpers (~1.7 GB combined), plus this session's own subagents and cargo builds. DARWIN's share is the 5.35 GB footprint above.",
+    "ATTRIBUTION_CORRECTION": "Re-measured after killing this session's leftover subagent processes: swap went UP (12.8 -> 13.4 GB) while DARWIN's footprint held steady at 5208 MB / peak 6979 MB. So the swap pressure is substantially THIS SESSION'S OWN TOOLING (Claude helpers ~1.9 GB plus concurrent audit agents), not DARWIN. HONEST CONSEQUENCE: 'the machine is swapping' is NOT on its own a justification for reclaiming memory from DARWIN - 5.2 GB for a 4B LLM plus STT, TTS and a retrieval stack is not obviously wrong on a 17 GB machine. Memory work here has to be justified as GENUINE WASTE (the spec-decode draft model was: a measured loss AND unreachable), not as relief for pressure an outside process is causing."
+  },
+  "startup": {
+    "CORRECTION": "An earlier draft of this file said TTS dominates startup at 37.3 s of 63 s. That was measured on a CONTENDED boot - the Core ML fast-graph rebuild was converting in the background during it, and its MIL progress bars are interleaved in that very log line. On a clean boot TTS preload is 4.7 s and the TTS WEIGHT load is 0.3-0.5 s. The real dominator is the KV prompt-cache prefills.",
+    "total_seconds_wall": 63,
+    "clean_boot_stages_seconds": {
+      "stt_whisper_small": 1.4,
+      "llm_total": 19.6,
+      "llm_weights_only": 4.5,
+      "llm_persona_prompt_cache_prefill": 15.1,
+      "classifier_total": 18.0,
+      "coreml_embedder": 13.2,
+      "coreml_reranker": 3.9,
+      "tts_total": 4.7,
+      "tts_weights_only": 0.5,
+      "learned_vad": 0,
+      "openers_bank": 0.56,
+      "draft_model": 2.2
+    },
+    "finding": "The two KV prompt-cache prefills (persona 2063 tokens, classifier 869 tokens) are ~33 s of the ~63 s. TTS weights are 0.5 s, which makes TTS a CHEAP parking candidate rather than a startup problem. The draft model's 2.2 s goes with speculative decoding.",
+    "lesson": "Measure on an UNCONTENDED boot. A background conversion inflated one stage 8x and I recorded it as the headline finding."
+  },
+  "ipc_overhead": {
+    "why": "The ANE work made the graph fast enough that framing now dominates short ops.",
+    "embed_short_graph_ms": 1.84,
+    "embed_short_through_socket_ms": 6.61,
+    "embed_long_through_socket_ms": 21.83,
+    "rerank_through_socket_ms_per_pair": 1.84,
+    "rerank_baseline_ms_per_pair": 10.88,
+    "finding": "A short embed costs 1.84 ms at the graph and 6.61 ms over the unix socket with JSON framing - the framing costs more than the model. Rerank shows 5.9x through the wire vs 9.70x at the graph, same dilution."
+  },
+  "speculative_decoding": {
+    "verdict": "REMOVED - it was a measured loss AND unreachable",
+    "source": "inference/benchmarks/baseline_m1_pro.json, results.speculative (already committed; this phase only had to read it)",
+    "uncached_decode_tps_off": 60.87,
+    "uncached_decode_tps_on": 44.45,
+    "ratio": 0.73,
+    "cached_path_reachable": false,
+    "cached_path_reason": "mlx_lm rejects a draft_model together with a prompt_cache (IndexError); DARWIN's persona and classifier paths are KV-cached, so the production path always ran normal decode",
+    "cost_removed_mb": 335,
+    "note": "It shipped ON with the draft checkpoint pre-downloaded by the installer, so a 16 GB machine that swaps was holding a 335 MB model the generate path could never use."
+  },
+  "next": "Memory work first (idle model parking, TTS residency given the opener bank, and whether the GPU-timeout crash class is a memory-pressure symptom), then re-measure before touching IPC or models.",
+  "kv_prompt_caches": {
+    "computed_from": "Qwen3-4B-Instruct-2507-4bit config.json: 36 layers, 8 kv heads, head_dim 128, fp16 K+V",
+    "bytes_per_token_kb": 144.0,
+    "persona_2063_tokens_mb": 304.2,
+    "classifier_869_tokens_mb": 128.1,
+    "both_mb": 432.3,
+    "prefill_cost_seconds": "~33 of the ~63 s startup",
+    "capability": "mlx_lm 0.31.3 exposes save_prompt_cache / load_prompt_cache / trim_prompt_cache, so these COULD be persisted to disk and loaded instead of re-prefilled each boot",
+    "unresolved": "persisting saves STARTUP, not memory (the cache is resident either way). Its real safety argument is that it removes ~33 s of GPU prefill at boot - the most fragile moment, and where the Metal command-buffer timeouts occur. A stale cache silently paired with a changed persona would be a correctness hazard, so it would need a strict fingerprint (model id + quant + prompt hash + mlx_lm version)."
+  }
+}

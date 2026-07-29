@@ -1867,12 +1867,15 @@ pub struct CaptionsConfig {
 ///
 /// SPECULATIVE DECODING (#37) joins `preload` and SELECTABLE QUANTIZATION (#39)
 /// as PERF/RUNTIME knobs:
-///   - `speculative` (SHIPS ON, full-power default): the master gate for draft/
-///     speculative decoding in the inference server's generate path. INERT WITHOUT
-///     A DRAFT MODEL — it ALSO requires a loadable `draft_model` (ships empty);
-///     absent that the server honestly falls back to NORMAL generation and reports
-///     `speculative=false` (never faked). The real speedup is device/model-dependent
-///     and is NEVER measured headlessly.
+///   - `speculative` (SHIPS OFF, on our own MEASUREMENT): the master gate for
+///     draft/speculative decoding in the inference server's generate path. It ships
+///     off because inference/benchmarks/baseline_m1_pro.json records two independent
+///     reasons: where it runs at all it is a LOSS on this hardware (uncached decode
+///     60.87 tok/s off vs 44.45 on — 27% SLOWER), and it is UNREACHABLE on the path
+///     DARWIN actually generates on (mlx_lm rejects a draft_model together with a
+///     prompt_cache, and the persona/classifier paths are KV-cached). Set true with
+///     a real `draft_model` to re-enable; an unloadable draft still degrades to
+///     NORMAL generation and honestly reports `speculative=false` (never faked).
 ///   - `draft_model` (ships ""): the small DRAFT checkpoint mlx_lm uses to
 ///     propose tokens the main model verifies. Empty => speculative is inert
 ///     even though `speculative=true` (honest: no draft, normal gen). Set a real
@@ -1902,11 +1905,12 @@ pub struct InferenceConfig {
     /// the checkpoint the server lazy-loads; if it cannot load, the server falls
     /// back to normal gen and reports `speculative=false`.
     ///
-    /// The RUST default is "" only because this field is a PASSTHROUGH the daemon
-    /// never reads — the PYTHON server owns the real default
-    /// (`server.py DEFAULT_DRAFT = "mlx-community/Qwen3-0.6B-4bit"`, the same id
-    /// the installer pre-downloads and `config/darwin.toml` ships). Do NOT read
-    /// this empty default as "speculative decoding ships inert": it does not.
+    /// Ships EMPTY, and now that IS the whole story: `config/darwin.toml` also ships
+    /// it empty because speculative decoding measured as a loss and is unreachable on
+    /// the KV-cached generate path (see `speculative` above), so nothing pre-downloads
+    /// a draft checkpoint any more. This field stays a PASSTHROUGH the daemon never
+    /// reads; the PYTHON server owns the canonical id (`server.py DEFAULT_DRAFT`) for
+    /// anyone re-enabling it.
     #[allow(dead_code)] // shared contract; read by the inference server
     pub draft_model: String,
     /// SELECTABLE weight QUANTIZATION for the local model load (#39). "auto"
@@ -1952,11 +1956,11 @@ impl Default for InferenceConfig {
     fn default() -> Self {
         Self {
             preload: true,
-            // SHIPS ON (full-power default). The shipped config/darwin.toml also
-            // carries a real draft_model, so a default install has BOTH halves
-            // armed; an unloadable draft degrades to normal gen and HONESTLY
-            // reports speculative=false (never faked).
-            speculative: true,
+            // SHIPS OFF on our own measurement: a 27% decode LOSS where it runs,
+            // and unreachable entirely on the KV-cached path DARWIN generates on
+            // (baseline_m1_pro.json, results.speculative). An unloadable draft still
+            // degrades to normal gen and HONESTLY reports speculative=false.
+            speculative: false,
             // EMPTY here only because this key is a PASSTHROUGH the daemon never
             // reads — the PYTHON server owns the real default (server.py
             // DEFAULT_DRAFT = "mlx-community/Qwen3-0.6B-4bit", the id the installer
@@ -5164,22 +5168,24 @@ mod tests {
 
     // --- #37 SPECULATIVE DECODING + #39 QUANTIZATION defaults (OFF/neutral) ----
 
-    /// #37 + #39: speculative SHIPS ON (full-power default) but is INERT WITHOUT a
-    /// loadable `draft_model` (ships ""), and `quant` ships "auto" (neutral). This
-    /// PINS the new ON default for speculative + the empty draft_model (so it stays
-    /// honestly inert until a model is supplied) + the neutral quant default.
+    /// #37 + #39: speculative SHIPS OFF and `draft_model` ships "", because our own
+    /// baseline measured speculative as a 27% decode LOSS where it runs and
+    /// UNREACHABLE on the KV-cached generate path. `quant` ships "auto" (neutral).
+    /// This PINS that measured-off default so a future "full-power defaults" sweep
+    /// cannot silently turn a known loss back on.
     #[test]
-    fn inference_speculative_and_quant_default_on_inert_until_model() {
+    fn inference_speculative_and_quant_default_off_on_the_measurement() {
         let (cfg, issues) = Config::parse("");
         assert!(issues.is_empty(), "{issues:?}");
         assert!(cfg.inference.preload, "preload stays today's default (true)");
         assert!(
-            cfg.inference.speculative,
-            "speculative SHIPS ON (full-power default; inert without a draft model)"
+            !cfg.inference.speculative,
+            "speculative MUST ship OFF: our own baseline measured it a 27% decode \
+             loss where it runs, and unreachable on the KV-cached generate path"
         );
         assert!(
             cfg.inference.draft_model.is_empty(),
-            "draft_model MUST ship empty (no draft => speculative honestly inert, reports speculative=false)"
+            "draft_model MUST ship empty (no draft => normal gen, reports speculative=false)"
         );
         assert_eq!(
             cfg.inference.quant, "auto",
