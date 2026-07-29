@@ -98,6 +98,9 @@ import threading
 
 import numpy as np
 
+import coreml_shared
+from coreml_shared import CONVERT_LOCK
+
 log = logging.getLogger("darwin.coreml_embed")
 
 # Stable HF checkpoint this backend embeds with.
@@ -180,28 +183,9 @@ _MODEL_NAME = "emb_b1.mlpackage"
 # The fast (1, SEQ_FAST) graph. Converted alongside the main one and validated
 # the same way; a cache missing it simply loses the fast path (never breaks).
 _MODEL_FAST_NAME = "emb_b1_s128.mlpackage"
-# Sentinel written when the fast graph was ATTEMPTED and could not be built here. It
-# lets the one-shot upgrade in `ensure_loaded` distinguish "this cache predates the
-# fast graph" (rebuild it once) from "the fast graph does not build on this machine"
-# (accept and stop), so the upgrade can never become a per-start reconversion.
-_FAST_ABSENT_MARK = "no_fast_graph"
 _TOK_DIRNAME = "tokenizer"
 
 
-def mark_fast_absent(d, why):
-    """BEST-EFFORT: record in cache dir `d` that the fast graph was attempted and is
-    not usable here, so the one-shot upgrade stops retrying. Returns True if the note
-    landed. NEVER raises: every caller is on a path where the fast graph is already
-    a write-off, and the conditions that make this write fail (full disk, read-only
-    cache root) are the same ones that made the graph fail — turning that into an
-    exception would trade an optional optimization for the whole backend."""
-    try:
-        with open(os.path.join(d, _FAST_ABSENT_MARK), "w", encoding="utf-8") as fh:
-            fh.write(f"{why}\n")
-        return True
-    except Exception as e:  # noqa: BLE001 - advisory only
-        log.warning("coreml embed: could not record the fast-graph sentinel (%s)", e)
-        return False
 
 
 def hf_cache_root():
@@ -399,18 +383,15 @@ class CoreMLEmbedder:
         purely so the whole optional decision sits inside ONE guard there."""
         if self._model_fast is None:
             if just_converted:
-                # We just built this cache and it STILL has no usable fast graph,
-                # so rebuilding it again would produce the same result. Record that
-                # and stop. (`_convert_into` only leaves a note when the conversion
-                # itself raised; a graph that converts but fails to VALIDATE lands
-                # here, and without this note every later start would rebuild.)
-                mark_fast_absent(
+                # We just built this cache and it STILL has no usable fast graph.
+                # Charge the attempt budget: `_convert_into` only records one when the
+                # conversion itself raised, so a graph that converts but fails to
+                # VALIDATE lands here, and without this every later start would rebuild.
+                coreml_shared.note_fast_attempt(
                     self._dir,
                     f"a fresh conversion produced no usable seq={SEQ_FAST} graph",
                 )
-            elif not os.path.exists(
-                os.path.join(self._dir, _FAST_ABSENT_MARK)
-            ):
+            elif not coreml_shared.fast_upgrade_exhausted(self._dir):
                 self._schedule_fast_upgrade()
 
     def _schedule_fast_upgrade(self):
@@ -469,7 +450,7 @@ class CoreMLEmbedder:
         # start does not repeat a 37.2 s rebuild that we now know cannot help. If the
         # note cannot be written either (a read-only cache root fails both), the retry
         # is at least confined to this background thread and off the request path.
-        mark_fast_absent(
+        coreml_shared.note_fast_attempt(
             self._dir, f"a rebuild produced no usable seq={SEQ_FAST} graph"
         )
 
@@ -498,7 +479,10 @@ class CoreMLEmbedder:
         tmp = tempfile.mkdtemp(prefix=".convert-", dir=parent)
         trash = None  # bound BEFORE the try: the finally below references it
         try:
-            self._convert_into(tmp)
+            # coremltools keeps global MIL state, so two overlapping conversions
+            # corrupt each other. See coreml_shared.CONVERT_LOCK.
+            with CONVERT_LOCK:
+                self._convert_into(tmp)
             # VALIDATE-LOAD in the temp dir BEFORE publishing: a partial/corrupt
             # write is caught here and never becomes the trusted cache.
             self._load_from(tmp)
@@ -691,7 +675,7 @@ class CoreMLEmbedder:
             # failed is a full or read-only cache root, which is also the reason this
             # write would fail — and losing the whole embedder because an optional
             # optimization could not leave a note would invert the entire point.
-            mark_fast_absent(target_dir, f"fast graph did not convert here: {e}")
+            coreml_shared.note_fast_attempt(target_dir, f"fast graph did not convert here: {e}")
 
     def _encode(self, texts):
         """Tokenize a list of strings to a list of token-id lists, truncated to
