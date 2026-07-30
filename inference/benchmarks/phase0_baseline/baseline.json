@@ -222,5 +222,37 @@
     "disk_cost_mb": 214,
     "disk_note": "the .mlmodelc is the same size as its .mlpackage (64/64/43/43 MB). Both are kept so a corrupt compiled model falls back to a slow load rather than a 40 s reconversion.",
     "process_note": "the temp destination must ALSO end in .mlmodelc - compile_model validates the extension. That shipped wrong once and only the fallback hid it, which is the SECOND extension-validating API to catch me in this session after mx.save_safetensors."
+  },
+  "boot_after_compiled_model_cache": {
+    "measured": "2026-07-29 on the deployed install, quiet machine, all four .mlmodelc warm",
+    "stages_seconds": {
+      "stt": 0.9,
+      "llm_total": 4.2,
+      "persona_restore": 0.007,
+      "classifier_total": 0.0,
+      "coreml_embedder": 0.5,
+      "coreml_reranker": 0.1,
+      "tts": 2.7,
+      "openers": 0.56,
+      "learned_vad": 0
+    },
+    "total_seconds": 8.96,
+    "trajectory": {
+      "original": 63,
+      "after_logits_and_specdecode": 31.1,
+      "after_persisted_prompt_caches": 18.9,
+      "after_compiled_model_cache": 8.96,
+      "overall": "7.0x"
+    },
+    "coreml_before_after": "11.5 s -> 0.6 s on the real boot",
+    "BETTER_THAN_MY_OWN_ESTIMATE": "my synthetic harness measured 2.5 s for both models and I recorded that as the expected result. The real boot is 0.6 s. The harness was pessimistic because it rebuilt objects in a loop and I had stray test copies of the compiled models competing for Core ML's specialization cache at the time. Reporting the real boot as the number, and the discrepancy as a caution about trusting a harness over the thing itself.",
+    "coreml_cache_disk_mb": 429,
+    "largest_remaining": {
+      "llm_weights_s": 4.2,
+      "tts_s": 2.7,
+      "stt_s": 0.9,
+      "openers_s": 0.56,
+      "tts_note": "TTS weights load in 0.2 s, so ~2.5 s of that stage is the throwaway 'Ready.' synthesis that compiles Metal kernels. The opener bank is synthesized immediately afterwards and has to run anyway - so the throwaway may be duplicate work. UNVERIFIED; needs checking before touching."
+    }
   }
 }
