@@ -425,10 +425,6 @@ impl NeuralEmbeddingProvider {
     }
 }
 
-/// How far above the batch's own floor a cosine must stand to count as a match,
-/// as a fraction of that batch's spread. See [`gate_neural_scores`].
-const SEPARATION_FRACTION: f64 = 0.3;
-
 /// Absolute cosine a neural score must ALSO clear. Both gates are required:
 /// relative separation alone leaks on tiny batches, and an absolute floor alone
 /// cannot adapt across embedders.
@@ -440,10 +436,33 @@ const SEPARATION_FRACTION: f64 = 0.3;
 /// mass while retaining 62/70 (89%) of the eval's true hits.
 const MIN_NEURAL_SIM: f64 = 0.50;
 
-/// Minimum spread (max - floor) before the RELATIVE gate is meaningful. Below
-/// it the batch is flat — every fact equally (dis)similar, the "nothing here is
-/// about the query" shape — so only the absolute gate applies.
-const MIN_BATCH_SPREAD: f64 = 0.02;
+/// Relaxed floor used ONLY when the strict gate would return NOTHING AT ALL.
+///
+/// WHY: the strict floor made the module deny facts it was holding. MEASURED on
+/// the committed eval with live vectors, "what pets do I have?" scored its two
+/// stored pet facts at 0.4867 and 0.4590 — both under 0.50 — so the query
+/// returned zero hits and the caller said "I have nothing stored on that yet".
+/// That is the module's own contract violated from the other side: not a
+/// FABRICATED memory, a DENIED one, and the user cannot rephrase their way out
+/// of a confident denial because nothing tells them there is anything to find.
+///
+/// WHY ONLY-WHEN-EMPTY, rather than simply lowering MIN_NEURAL_SIM: because it
+/// is measurably better. On the committed eval (100 facts, 36 queries, live
+/// vectors) a flat 0.45 floor retains 45/46 true hits but admits 190/3554
+/// (5.3%) irrelevant, while relaxing ONLY on otherwise-empty queries retains the
+/// same 45/46 and admits 61/3554 (1.7%) — identical to the strict floor. The
+/// relaxation cannot add noise to a query that already had hits, because it
+/// never runs for one.
+///
+/// WHY 0.48 SPECIFICALLY: it has to sit ABOVE the measured unrelated mass, or
+/// the fallback just readmits the anisotropy this module exists to gate. The
+/// committed eval puts arbitrary pairs at mean 0.4618, and a first attempt at
+/// 0.45 was caught by this module's OWN no-match tests (fixtures at 0.46/0.4623)
+/// suddenly returning everything. 0.48 clears that mass and still recovers the
+/// denied fact at 0.4867. Note what it CANNOT recover: the second pet fact sits
+/// at 0.4590, BELOW the unrelated mean, so no threshold retrieves it without
+/// readmitting noise. That is the overlap this module documents, not a bug.
+const MIN_NEURAL_SIM_FALLBACK: f64 = 0.48;
 
 /// PURE relevance gate for neural scores: zero out everything that is not
 /// credibly a match, so [`rank`] drops it and the caller renders the honest
@@ -458,45 +477,50 @@ const MIN_BATCH_SPREAD: f64 = 0.02;
 /// a memory") was therefore false on the SHIPPED default path whenever the
 /// inference server was up.
 ///
-/// TWO CONDITIONS, BOTH REQUIRED:
-///   1. ABSOLUTE — clear [`MIN_NEURAL_SIM`], above the measured no-match mass;
-///   2. RELATIVE — stand `SEPARATION_FRACTION` of the batch spread above the
-///      batch FLOOR (min, not median: a batch with several genuine hits must not
-///      raise its own bar and self-reject — that regression was caught while
-///      calibrating against the eval's multi-relevant queries).
+/// HOW IT WORKS: clear [`MIN_NEURAL_SIM`]. If NOTHING clears it, retry the whole
+/// batch at [`MIN_NEURAL_SIM_FALLBACK`] rather than telling the user their store
+/// is empty when it is not.
 ///
-/// HONEST TRADE-OFF (measured, not assumed): on the committed eval this keeps
-/// 62/70 (89%) of true hits. The relevant and irrelevant cosine bands genuinely
-/// OVERLAP (lowest relevant 0.4862 < unrelated p95 0.5723), so NO threshold can
-/// separate them perfectly. We take the conservative side deliberately: a missed
-/// recall is recoverable (the user rephrases and the fact is still stored), a
-/// FABRICATED memory is not — the user may act on it. Honesty over completeness
-/// is the module contract.
+/// A RELATIVE FLOOR USED TO SIT HERE AND WAS REMOVED, because measuring it
+/// showed it did harm and no good:
+///   * It was calibrated on the 100-fact eval, where it is INERT — with live
+///     vectors it changed nothing at all (43/46 relevant, 61/3554 irrelevant,
+///     identical with it and without it). Its documented justification was
+///     therefore evidence for the absolute floor only.
+///   * It bound only on SMALL or topically homogeneous batches, which is exactly
+///     what memory recall actually passes (this machine's live store held ONE
+///     fact), and there it dropped true hits: at batch=2 it took 34/38 where the
+///     absolute floor alone took 36/38.
+///   * Its shape guaranteed that: the floor was `batch_min + 0.3 * spread`, so
+///     the LOWEST-scoring candidate could never clear it unless the whole batch
+///     was within 0.02. A two-candidate batch was structurally incapable of
+///     returning both, however relevant both were. Asked "what do you know about
+///     my car?", a store holding "The user drives a blue Subaru Outback."
+///     (cos 0.5049, above the absolute floor) and an oil-change fact returned
+///     only the oil change.
+///
+/// HONEST TRADE-OFF (measured, not assumed): the relevant and irrelevant cosine
+/// bands genuinely OVERLAP, so NO threshold separates them perfectly. On the
+/// committed eval with live vectors this keeps 45/46 true hits at 61/3554 (1.7%)
+/// irrelevant and leaves ZERO queries falsely empty. Both failure directions are
+/// honesty failures: a FABRICATED memory the user may act on, and a DENIED one
+/// the user cannot rephrase their way past because nothing hints it is there.
+/// The earlier version of this gate optimized only against the first.
 pub fn gate_neural_scores(sims: Vec<f64>) -> Vec<f64> {
-    let finite: Vec<f64> = sims.iter().copied().filter(|s| s.is_finite()).collect();
-    if finite.is_empty() {
-        return vec![0.0; sims.len()];
-    }
-    // Relative floor from the batch's own geometry (skipped when flat).
-    let mut sorted = finite;
-    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let base = sorted[0];
-    let max = sorted[sorted.len() - 1];
-    let spread = max - base;
-    let relative_floor = if sims.len() >= 2 && spread >= MIN_BATCH_SPREAD {
-        base + SEPARATION_FRACTION * spread
-    } else {
-        f64::NEG_INFINITY // flat / single candidate: the absolute gate decides
+    let apply = |floor: f64| -> Vec<f64> {
+        sims.iter()
+            .map(|&s| if s.is_finite() && s >= floor { s } else { 0.0 })
+            .collect::<Vec<f64>>()
     };
-    sims.into_iter()
-        .map(|s| {
-            if s.is_finite() && s >= MIN_NEURAL_SIM && s >= relative_floor {
-                s
-            } else {
-                0.0
-            }
-        })
-        .collect()
+    let strict = apply(MIN_NEURAL_SIM);
+    if strict.iter().any(|&s| s > 0.0) {
+        return strict;
+    }
+    // Nothing cleared the strict floor. Before reporting an empty store, look
+    // again at the relaxed floor — a real stored fact sitting just under 0.50 is
+    // a denial, not an absence. When nothing clears this either, the zeros ARE
+    // the honest answer.
+    apply(MIN_NEURAL_SIM_FALLBACK)
 }
 
 impl EmbeddingProvider for NeuralEmbeddingProvider {
@@ -1610,6 +1634,71 @@ mod tests {
         let hits = rank("what pets do I have", &facts, 5, &neural(q, fv));
         assert_eq!(hits.len(), 2, "both genuine hits survive: {hits:?}");
         assert!(hits.iter().all(|h| h.fact.key.starts_with("user.pet")));
+    }
+
+    /// REGRESSION: a two-candidate batch must be able to return BOTH.
+    ///
+    /// The removed relative floor was `batch_min + 0.3 * spread`, so the LOWEST
+    /// scorer could never clear it unless the batch was within 0.02. Measured
+    /// live, asking "what do you know about my car?" of a store holding "The
+    /// user drives a blue Subaru Outback." (cos 0.5049, above the absolute
+    /// floor) and an oil-change fact returned ONLY the oil change.
+    #[test]
+    fn a_two_fact_batch_can_return_both_facts() {
+        let q = vec![1.0, 0.0];
+        let mk = |c: f64| vec![c, (1.0 - c * c).sqrt()];
+        let facts = vec![
+            Fact::new("user.car", "the user drives a blue Subaru Outback"),
+            Fact::new("user.car.service", "the Subaru is due for an oil change"),
+        ];
+        // Both clear the absolute floor; the old relative floor dropped the lower.
+        let fv = vec![mk(0.5049), mk(0.5270)];
+        let hits = rank("what do you know about my car", &facts, 5, &neural(q, fv));
+        assert_eq!(
+            hits.len(), 2,
+            "both stored facts clear the absolute floor and must both surface: {hits:?}"
+        );
+    }
+
+    /// REGRESSION: the gate must not DENY a fact the store is holding.
+    ///
+    /// Measured live, "what pets do I have?" scored a stored pet fact at 0.4867 —
+    /// under the 0.50 floor — so the query returned nothing and the caller said
+    /// "I have nothing stored on that yet". A denied memory is as much an honesty
+    /// failure as a fabricated one, and worse in one way: the user cannot rephrase
+    /// their way past a confident denial, because nothing hints there is anything
+    /// to find.
+    #[test]
+    fn a_fact_just_under_the_strict_floor_is_not_denied() {
+        let q = vec![1.0, 0.0];
+        let mk = |c: f64| vec![c, (1.0 - c * c).sqrt()];
+        let facts = vec![
+            Fact::new("user.pet", "the user's cat is named Pixel and is a gray tabby"),
+            Fact::new("user.car", "the user drives a blue Subaru"),
+        ];
+        // The pet fact is the live-measured 0.4867; the car fact is unrelated mass.
+        let fv = vec![mk(0.4867), mk(0.3100)];
+        let hits = rank("what pets do I have", &facts, 5, &neural(q, fv));
+        assert_eq!(hits.len(), 1, "the stored pet fact must not be denied: {hits:?}");
+        assert_eq!(hits[0].fact.key, "user.pet");
+    }
+
+    /// The fallback must NOT become a back door for the anisotropic mass. It only
+    /// runs when the strict floor returned nothing, and it still sits above the
+    /// measured unrelated mean (0.4618) — a first attempt at 0.45 readmitted the
+    /// no-match fixtures wholesale and was caught by the tests above.
+    #[test]
+    fn the_fallback_still_refuses_the_unrelated_mass() {
+        let q = vec![1.0, 0.0];
+        let mk = |c: f64| vec![c, (1.0 - c * c).sqrt()];
+        let facts = vec![Fact::new("a", "x"), Fact::new("b", "y"), Fact::new("c", "z")];
+        // Right at the measured unrelated mean: nothing here is about the query.
+        let fv = vec![mk(0.4618), mk(0.4700), mk(0.4550)];
+        let hits = rank("something entirely unrelated", &facts, 5, &neural(q, fv));
+        assert!(
+            hits.is_empty(),
+            "the fallback must stay above the unrelated mass: {hits:?}"
+        );
     }
 
     /// A FLAT batch (everything equally similar, no separation) claims nothing.
