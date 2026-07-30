@@ -169,5 +169,37 @@
       "persona_prefill_s": 7.3,
       "note": "the Core ML embedder cost includes loading TWO graphs (the ANE fast path); the persona prefill is 2063 tokens of KV recomputed from scratch on every boot and mlx_lm 0.31.3 can persist it"
     }
+  },
+  "steady_state_boot_with_persisted_caches": {
+    "measured": "2026-07-29, quiet machine, second and later boots (the first boot after deploy still prefills and saves)",
+    "stages_seconds": {
+      "stt": 0.7,
+      "llm_total": 3.5,
+      "persona_restore": 0.001,
+      "classifier_total": 0.0,
+      "classifier_restore": 0.0,
+      "coreml_embedder": 7.7,
+      "coreml_reranker": 3.8,
+      "tts": 2.7,
+      "openers": 0.54
+    },
+    "total_seconds": 18.9,
+    "trajectory": {
+      "original_baseline_s": 63,
+      "after_logits_and_specdecode_s": 31.1,
+      "with_persisted_caches_s": 18.9,
+      "overall": "3.3x"
+    },
+    "prefill_before_after": {
+      "persona": "7742 ms -> 1 ms",
+      "classifier": "3254 ms -> 0 ms"
+    },
+    "correctness_verified_not_assumed": {
+      "method": "captured classify labels for 8 real utterances against the RESTORED cache, then moved the cache aside, forced a fresh prefill, and re-ran the same 8",
+      "result": "8/8 identical",
+      "also": "the classifier survived 4 consecutive turns, which exercises the trim_prompt_cache reuse path a restored cache could plausibly have broken"
+    },
+    "disk_cost_mb": 412,
+    "NEW_DOMINANT_ITEM": "Core ML is now 11.5 s of the 18.9 s (embedder 7.7 + reranker 3.8) - 61% of startup. Part of that is the ANE fast path deliberately loading TWO graphs per model. It is the obvious next target, but note coremltools CONVERSION is not thread-safe (that bug cost a deploy tonight); whether LOADING can be parallelized is unmeasured and must not be assumed."
   }
 }
