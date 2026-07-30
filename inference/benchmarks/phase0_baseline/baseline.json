@@ -254,5 +254,23 @@
       "openers_s": 0.56,
       "tts_note": "TTS weights load in 0.2 s, so ~2.5 s of that stage is the throwaway 'Ready.' synthesis that compiles Metal kernels. The opener bank is synthesized immediately afterwards and has to run anyway - so the throwaway may be duplicate work. UNVERIFIED; needs checking before touching."
     }
+  },
+  "tts_warmup_hypothesis": {
+    "the_hypothesis": "TTS preload is 2.7 s of which weights are only 0.2 s, so ~2.5 s is a throwaway 'Ready.' synthesis compiling Metal kernels - and since the opener bank synthesizes 5 lines immediately afterwards and has to run anyway, the throwaway looked like duplicate work worth ~2.5 s.",
+    "verdict": "WRONG - measured NO-GO",
+    "why": "the opener bank really does synthesize (it deletes stale WAVs and calls _synthesize_to_wav per line), but it is FAST precisely because the throwaway already compiled the kernels. Measured directly: weights 133 ms, FIRST synthesis 2386 ms, and the 5 openers take 562 ms total (~112 ms each) only because they run after it. Removing the throwaway moves the 2.4 s compile onto the first opener; it does not remove it. Net saving ~0.1 s.",
+    "the_only_real_lever_and_why_it_is_shut": "the 2.4 s is MLX's Metal kernel JIT. mx.metal exposes clear_cache / get_cache_memory / set_cache_limit - all IN-PROCESS - and there is no persistent kernel cache API, so the compile cannot be carried across boots with what is exposed today.",
+    "lesson": "this is the third assumption of this shape I have had to retract by measuring (after the IPC fast path and the 2.5 s Core ML estimate). Reasoning about where time goes has been wrong more often than not; measuring has been right every time."
+  },
+  "startup_work_status": {
+    "conclusion": "startup optimization has reached diminishing returns at 8.96 s, 7.0x off the baseline",
+    "remaining_and_why_each_is_closed": {
+      "llm_weights_4.2s": "loading a 4B checkpoint; only a smaller model would move it, which is Phase 3 evaluation territory rather than a fix",
+      "tts_2.4s": "Metal kernel JIT, no persistent cache API - measured NO-GO above",
+      "stt_0.9s": "small",
+      "openers_0.56s": "5 real syntheses, already warm-path",
+      "coreml_0.6s": "was 11.5 s; done"
+    },
+    "where_the_remaining_campaign_value_is": "Phase 2 (retrieval quality) and Phase 3 (model refresh) - being SMARTER rather than faster. Startup is no longer where the wins are."
   }
 }
