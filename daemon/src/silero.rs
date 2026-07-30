@@ -288,6 +288,38 @@ fn sigmoid(v: f32) -> f32 {
 /// the headless tests (here and in `vad.rs`) drive the full pipeline with, no
 /// real 1.2 MB weights needed.
 #[cfg(test)]
+/// DETERMINISTIC NON-ZERO weights, for tests that need the network to actually
+/// compute something.
+///
+/// `synthetic_weights` zeroes every tensor but `dec_b`, which collapses the whole
+/// network to a constant: sigmoid(dec_b) whatever the input. That is useful for
+/// pinning the plumbing, but it means a defect ANYWHERE in the STFT, encoder or
+/// LSTM multiplies to zero and the test still passes — an audit injected four port
+/// defects and all four went undetected. These weights are small, non-zero and
+/// varied, so the output genuinely depends on the input and on each stage being
+/// wired correctly.
+#[cfg(test)]
+pub(crate) fn synthetic_weights_varied(seed: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(MAGIC);
+    out.extend_from_slice(&(WEIGHT_SPEC.len() as u32).to_le_bytes());
+    // A tiny LCG: deterministic across runs and platforms, no rand dependency.
+    let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(1);
+    let mut next = || {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        // Small magnitudes keep the LSTM in a sane range rather than saturating.
+        ((state >> 8) as f32 / (1u32 << 24) as f32 - 0.5) * 0.2
+    };
+    for (_name, n) in WEIGHT_SPEC {
+        out.extend_from_slice(&(*n as u32).to_le_bytes());
+        for _ in 0..*n {
+            out.extend_from_slice(&next().to_le_bytes());
+        }
+    }
+    out
+}
+
+#[cfg(test)]
 pub(crate) fn synthetic_weights(dec_bias: f32) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
@@ -323,6 +355,122 @@ mod tests {
         wrong_count[MAGIC.len()..MAGIC.len() + 4].copy_from_slice(&99u32.to_le_bytes());
         assert!(SileroModel::parse(&wrong_count).is_err(), "wrong tensor count");
         assert!(SileroModel::parse(&good).is_ok(), "valid blob parses");
+    }
+
+    /// THE TEST THE ZERO-WEIGHT ONE CANNOT BE.
+    ///
+    /// With every tensor zeroed the network returns sigmoid(dec_b) for ANY input, so
+    /// a defect anywhere upstream — a wrong STFT window, a transposed encoder matrix,
+    /// swapped LSTM gates — produces exactly the same number and passes. An audit
+    /// injected four port defects into this file and all four survived the suite.
+    ///
+    /// With varied weights the output must actually DEPEND on the audio.
+    /// CHARACTERIZATION GOLDENS for the full forward pass.
+    ///
+    /// The property tests above catch a network that is not reading its input or not
+    /// carrying its state, but they cannot tell a CORRECT stage from a subtly wrong
+    /// one: injecting a reflect-pad off-by-one, or swapping the LSTM output gate for
+    /// the forget gate, leaves every property intact. Both were injected and both
+    /// passed. A numeric golden is what catches them.
+    ///
+    /// HONEST ABOUT WHAT THIS IS: these values were produced by THIS implementation,
+    /// so they pin it against REGRESSION. They do not independently verify the port
+    /// against upstream Silero — that needs the real checkpoint and reference
+    /// outputs, which is the device-gated smoke's job, not a unit test's.
+    #[test]
+    fn the_forward_pass_matches_its_recorded_goldens() {
+        // seed, first-step prob, second-step prob (state carried between them)
+        const GOLDENS: [(u32, f32, f32); 3] = [
+            (7, 0.508_774_2, 0.509_088_5),
+            (11, 0.514_272_1, 0.513_937_2),
+            (3, 0.500_069_3, 0.499_664_8),
+        ];
+        for (seed, want1, want2) in GOLDENS {
+            let mut m = SileroModel::parse(&synthetic_weights_varied(seed)).unwrap();
+            let mut st = [0.0f32; STATE_LEN];
+            let mut xs = [0.0f32; MODEL_INPUT];
+            for (i, v) in xs.iter_mut().enumerate() {
+                *v = ((i % 17) as f32 / 17.0 - 0.5) * 0.8;
+            }
+            let p1 = m.step(&xs, &mut st);
+            let p2 = m.step(&xs, &mut st);
+            assert!(
+                (p1 - want1).abs() < 1e-6,
+                "seed {seed}: first step {p1} != golden {want1} — the forward pass changed"
+            );
+            assert!(
+                (p2 - want2).abs() < 1e-6,
+                "seed {seed}: second step {p2} != golden {want2} — the forward pass changed"
+            );
+        }
+    }
+
+    #[test]
+    fn with_real_weights_the_output_depends_on_the_input() {
+        let mut m = SileroModel::parse(&synthetic_weights_varied(7)).unwrap();
+        let mut probs = Vec::new();
+        for (label, x) in [
+            ("silence", [0.0f32; MODEL_INPUT]),
+            ("dc", [0.5f32; MODEL_INPUT]),
+            ("alternating", {
+                let mut v = [0.0f32; MODEL_INPUT];
+                for (i, s) in v.iter_mut().enumerate() {
+                    *s = if i % 2 == 0 { 0.6 } else { -0.6 };
+                }
+                v
+            }),
+        ] {
+            let mut state = [0.0f32; STATE_LEN];
+            let p = m.step(&x, &mut state);
+            assert!(p.is_finite(), "{label}: non-finite probability {p}");
+            assert!((0.0..=1.0).contains(&p), "{label}: probability out of range {p}");
+            probs.push((label, p));
+        }
+        let spread = probs
+            .iter()
+            .map(|(_, p)| *p)
+            .fold(f32::NEG_INFINITY, f32::max)
+            - probs.iter().map(|(_, p)| *p).fold(f32::INFINITY, f32::min);
+        assert!(
+            spread > 1e-6,
+            "the network returned effectively the same probability for silence, DC and \
+             an alternating signal ({probs:?}) — it is not reading the input at all"
+        );
+    }
+
+    /// The recurrent state must actually carry between steps. A port that dropped or
+    /// zeroed the state would still look fine to any single-step test.
+    #[test]
+    fn with_real_weights_the_recurrent_state_evolves_and_matters() {
+        let mut m = SileroModel::parse(&synthetic_weights_varied(11)).unwrap();
+        let x = [0.3f32; MODEL_INPUT];
+        let mut state = [0.0f32; STATE_LEN];
+        let first = m.step(&x, &mut state);
+        assert!(
+            state.iter().any(|v| v.abs() > 1e-9),
+            "the recurrent state is still all zeros after a step"
+        );
+        let carried = m.step(&x, &mut state);
+        let mut fresh_state = [0.0f32; STATE_LEN];
+        let restarted = m.step(&x, &mut fresh_state);
+        assert!(
+            (carried - restarted).abs() > 1e-9,
+            "the SAME input gave the same probability with a carried state ({carried}) \
+             and a fresh one ({restarted}) — the state is not affecting the output"
+        );
+        assert!(first.is_finite() && carried.is_finite());
+    }
+
+    /// Determinism: the same weights, input and starting state give the same answer.
+    #[test]
+    fn with_real_weights_the_forward_pass_is_deterministic() {
+        let x = [0.42f32; MODEL_INPUT];
+        let run = || {
+            let mut m = SileroModel::parse(&synthetic_weights_varied(3)).unwrap();
+            let mut st = [0.0f32; STATE_LEN];
+            (m.step(&x, &mut st), m.step(&x, &mut st))
+        };
+        assert_eq!(run(), run(), "the forward pass is not deterministic");
     }
 
     #[test]
