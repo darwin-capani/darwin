@@ -141,5 +141,33 @@
       "verdict": "NO-GO, not a defer. The entire IPC + dispatch + framing path is 0.22 ms of a 4.08 ms request (5%). Binary framing would target the 0.105 ms of JSON; connection pooling already exists in daemon/src/inference.rs. There is no prize here.",
       "what_this_retires": "the 'IPC fast path' half of Phase 1. The remaining Phase 1 items (TTS first-audio streaming, an ANE-native STT evaluation) are untouched by this and still stand on their own."
     }
+  },
+  "clean_boot_2026_07_29_quiet_machine": {
+    "conditions": "load ~4, swap 3.46 GB, runaway browser closed - the first genuinely uncontended measurement of this session",
+    "stages_seconds": {
+      "stt": 0.8,
+      "llm_weights": 1.3,
+      "persona_prefill": 7.3,
+      "llm_total": 11.0,
+      "classifier_prefill": 3.1,
+      "classifier_total": 3.5,
+      "coreml_embedder": 8.0,
+      "coreml_reranker": 3.7,
+      "tts_weights": 0.2,
+      "tts_total": 3.1,
+      "openers": 1.0,
+      "draft_model": 0
+    },
+    "total_seconds": 31.1,
+    "vs_baseline_63s": "about 2x faster",
+    "ATTRIBUTION_HONESTY": "the 63 s baseline was itself taken with the browser running, so this 2x is my fixes AND the machine getting quiet, and I cannot cleanly separate them from these two numbers alone. What IS separately attributable: the draft model went 2.2 s -> 0 by config, and the classifier stage went 18.0 -> 4.2 s while contention was STILL present, so that 4.3x is the logits-elision fix rather than the browser.",
+    "peak_footprint_mb": 6203,
+    "peak_vs_baseline_7694": "-1491 MB",
+    "steady_footprint_mb": 5094,
+    "largest_remaining_startup_items": {
+      "coreml_embedder_s": 8.0,
+      "persona_prefill_s": 7.3,
+      "note": "the Core ML embedder cost includes loading TWO graphs (the ANE fast path); the persona prefill is 2063 tokens of KV recomputed from scratch on every boot and mlx_lm 0.31.3 can persist it"
+    }
   }
 }
