@@ -15,5 +15,35 @@
     8.17
   ],
   "warm_median_s": 8.17,
-  "peak_gpu_gib": 2.44
+  "peak_gpu_gib": 2.44,
+  "VISUAL_TOKEN_BUDGET_FINDING": {
+    "when": "2026-07-30, quiet machine",
+    "what_the_old_eval_missed": "this file measured ONE fixture with unusually large text and judged quality by eyeballing a single answer string. That never surfaced the defect below.",
+    "the_defect": "a 1512x982 screen is ~1890 Qwen2-VL visual tokens, and feeding that many drives this checkpoint into REPETITION COLLAPSE on ordinary screenshots. Asked for the IPv4 address on a legible settings dialog it answered 'The The The The The ...'; asked what a button said on a code-editor screenshot it did the same; asked for an error code it regurgitated the source.",
+    "the_fix": "cap the image at DESCRIBE_IMAGE_MAX_PIXELS = 380000 (~764x496, ~459 visual tokens) before generating. Aspect-ratio preserving; images already under the cap are untouched; any failure returns the original path so it costs the speedup and never the answer.",
+    "before_after_single_samples": {
+      "settings_ipv4_before": "7919 ms, DEGENERATE repetition",
+      "settings_ipv4_after": "1632 ms, exact: 192.168.1.47",
+      "dense_code_button_before": "7424 ms, wrong (answered 'The main.rs')",
+      "dense_code_button_after": "1588 ms, correct: Run Tests",
+      "orig_error_code_before": "7945 ms, describes the borrow error but gives no code",
+      "orig_error_code_after": "1600 ms, hallucinates 'error code 500' - WRONG"
+    },
+    "latency": {
+      "median_before_s": 8.08,
+      "median_after_s": 1.62,
+      "speedup": "5x",
+      "across": "three fixtures"
+    },
+    "the_working_band": {
+      "ceiling": "~1890 visual tokens - repetition collapse",
+      "floor": "~216 visual tokens (0.35 scale) - accuracy 0/8, text unreadable",
+      "chosen": "~459 visual tokens"
+    },
+    "WHAT_THIS_DOES_NOT_FIX": "screen-VQA is still not reliable. Across three fixtures and four checkable facts the model scored 2/12 to 4/12 at EVERY resolution, and even after the cap it hallucinated an error code that is not on screen. The cap removes a failure MODE and 5x of latency; it does not make this 2B checkpoint good at reading screens. A better VLM is the real answer and remains unevaluated.",
+    "fixtures_added": [
+      "fixture_dense_code_13px.png (code editor, 13px text, E0308 banner, Run Tests button)",
+      "fixture_settings_12px.png (settings dialog, 12px labels, IP addresses, Renew Lease button)"
+    ]
+  }
 }
