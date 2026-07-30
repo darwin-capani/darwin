@@ -19,31 +19,59 @@ def test_empty_string():
 
 
 def test_lowercase_only():
-    # 8 lowercase letters -> charset 26, bits = 8*log2(26) ~= 37.6 -> fair
+    # 8 lowercase letters -> keyspace 8*log2(26) ~= 37.6. `bits` is now the WEAKER
+    # of the keyspace bound and the string's own Shannon entropy, so it reports the
+    # keyspace only when the characters are actually varied.
     r = compute({"text": "password"})
     assert r["length"] == 8
     assert r["charset_size"] == 26
-    assert approx(r["bits"], round(8 * math.log2(26), 2))
-    assert r["strength"] == "fair"
+    assert approx(r["keyspace_bits"], round(8 * math.log2(26), 2))
+    assert r["bits"] <= r["keyspace_bits"]
+    # "password" repeats 's' — 7 distinct characters over 8, so its observed entropy
+    # (~22.5 bits) is below the 37.6-bit keyspace bound and it rates WEAK rather than
+    # the "fair" the keyspace-only metric gave it. Which is the right answer for the
+    # most common password on earth.
+    # "password" repeats 's' (7 distinct over 8), so the repetition ratio discounts
+    # it slightly below its 37.6-bit keyspace and it rates WEAK rather than the
+    # "fair" the keyspace-only metric gave the most common password on earth.
+    assert r["distinct_chars"] == 7
+    assert r["bits"] < r["keyspace_bits"]
+    assert r["strength"] == "weak", r
 
 
 def test_all_classes_strong():
-    # 20 chars mixing all four classes -> charset 94
-    text = "Ab1!" * 5  # 20 chars, lower+upper+digit+symbol
+    # 20 chars mixing all four classes -> charset 94.
+    #
+    # NOTE the fixture: "Ab1!" * 5 uses all four character classes but only FOUR
+    # distinct characters. The old metric called it 131 bits and "very strong",
+    # which is the exact misconception this app was reporting - a repeated pattern
+    # is not made strong by the variety of the pattern. Its real entropy is
+    # 20*log2(4) = 40 bits.
+    text = "Ab1!" * 5  # 20 chars, lower+upper+digit+symbol, only 4 distinct
     r = compute({"text": text})
     assert r["length"] == 20
     assert r["charset_size"] == 94  # 26+26+10+32
     expected_bits = round(20 * math.log2(94), 2)
-    assert approx(r["bits"], expected_bits)
-    # 20*log2(94) ~= 131 bits -> very strong
-    assert r["strength"] == "very strong"
+    assert approx(r["keyspace_bits"], expected_bits)
+    assert r["distinct_chars"] == 4
+    assert approx(r["observed_bits"], round(20 * math.log2(4), 2))
+    assert r["bits"] < r["keyspace_bits"], "a repeated pattern must not score its keyspace"
+    assert r["strength"] != "very strong", r
+    # Discounted to log2(4)/log2(20) of the keyspace - not zero, because four
+    # classes over twenty characters is not nothing, just far from 131 bits.
+    assert 55 < r["bits"] < 70, r
+
+    # A genuinely varied 20-char string from the same alphabet DOES rate highly.
+    varied = compute({"text": "Kq7#zL2$mV9!pX4&nR6@"})
+    assert varied["distinct_chars"] == 20
+    assert varied["strength"] in ("strong", "very strong"), varied
 
 
 def test_boundary_classes():
     # digits only: charset 10
     r = compute({"text": "1234"})
     assert r["charset_size"] == 10
-    assert approx(r["bits"], round(4 * math.log2(10), 2))
+    assert approx(r["keyspace_bits"], round(4 * math.log2(10), 2))
     # uppercase only: charset 26
     r2 = compute({"text": "ABC"})
     assert r2["charset_size"] == 26
@@ -56,7 +84,10 @@ def test_does_not_echo_input():
     secret = "hunter2SECRET!"
     r = compute({"text": secret})
     # Result must contain only aggregate stats, never the raw secret.
-    assert set(r.keys()) == {"length", "charset_size", "bits", "strength"}
+    assert set(r.keys()) == {
+        "length", "charset_size", "bits", "strength",
+        "keyspace_bits", "observed_bits", "distinct_chars",
+    }
     for v in r.values():
         assert secret != v
         assert secret not in str(v)
@@ -172,3 +203,41 @@ if __name__ == "__main__":
     for fn in fns:
         fn()
     print(f"ok: {len(fns)} tests passed")
+
+
+def test_repetitive_input_is_not_called_strong():
+    """THE REGRESSION THIS EXISTS FOR. `length * log2(charset)` is the size of the
+    keyspace a RANDOM password of this shape would come from - it is not the entropy
+    of THIS string. Reporting it alone rated "aaaaaaaaaaaaaaaa" at 75.21 bits and
+    "strong": confidently wrong about the single question this tool answers, and
+    wrong in the unsafe direction."""
+    r = compute({"text": "a" * 16})
+    assert r["distinct_chars"] == 1
+    assert r["keyspace_bits"] > 70, "the keyspace bound is unchanged"
+    assert r["observed_bits"] == 0.0, "one repeated character carries no information"
+    assert r["bits"] == 0.0
+    assert r["strength"] == "very weak", r
+
+    r2 = compute({"text": "ab" * 8})
+    assert r2["bits"] < 20, r2
+    assert r2["strength"] == "very weak", r2
+
+
+def test_an_all_distinct_string_keeps_its_full_keyspace():
+    """The repetition discount must not punish genuinely random passwords. An
+    earlier version of this fix used min(keyspace, observed), which collapsed every
+    all-distinct string to length*log2(length) and scored a random 20-char password
+    at 86 bits instead of 131."""
+    r = compute({"text": "Kq7#zL2$mV9!pX4&nR6@"})
+    assert r["distinct_chars"] == 20
+    assert approx(r["bits"], r["keyspace_bits"]), r
+    assert r["strength"] == "very strong", r
+
+
+def test_a_varied_passphrase_is_still_rated_well():
+    """The fix must not make everything weak - a genuinely varied string keeps a
+    high rating."""
+    r = compute({"text": "correct horse battery staple"})
+    assert r["distinct_chars"] > 10
+    assert r["bits"] > 60, r
+    assert r["strength"] in ("strong", "very strong"), r

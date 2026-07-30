@@ -217,7 +217,25 @@ def compute(payload):
         phrases.append(phrase)
 
     out["valid"] = True
-    out["summary"] = ", ".join(phrases)
+    # DAY-OF-MONTH and DAY-OF-WEEK are OR'd, not AND'd, whenever BOTH are
+    # restricted. This is cron's most surprising rule (POSIX / Vixie cron), and
+    # joining the field phrases with commas described "0 0 1 * 1" as "on
+    # day-of-month 1 ... on day-of-week Monday" — which every reader takes as
+    # "the 1st, if it is a Monday". It actually fires on the 1st OR on ANY Monday,
+    # roughly five times more often. Explaining exactly this is what the tool is
+    # for, so it is called out rather than left to the comma.
+    dom_raw, dow_raw = fields[2], fields[4]
+    dom_restricted = dom_raw not in ("*", "?")
+    dow_restricted = dow_raw not in ("*", "?")
+    out["dom_dow_or"] = dom_restricted and dow_restricted
+    if out["dom_dow_or"]:
+        out["summary"] = "%s, and runs when EITHER %s OR %s matches (cron ORs these two fields when both are restricted)" % (
+            ", ".join(phrases[:2] + phrases[3:4]),
+            out.get("day_of_month", "day-of-month " + dom_raw),
+            out.get("day_of_week", "day-of-week " + dow_raw),
+        )
+    else:
+        out["summary"] = ", ".join(phrases)
     return out
 
 

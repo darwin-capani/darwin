@@ -2806,7 +2806,7 @@ def _split_complete_sentences(buffer, final=False):
 PROMPT_CACHE_DIRNAME = "darwin-promptcache"
 
 
-def _prompt_cache_fingerprint(model_id, quant, prefix_str, cache):
+def _prompt_cache_fingerprint(model_id, quant, prefix_str, cache, adapter_stamp=None):
     """Every input that can change the persisted KV bytes. Values are strings because
     safetensors metadata is str->str."""
     import hashlib
@@ -2820,6 +2820,11 @@ def _prompt_cache_fingerprint(model_id, quant, prefix_str, cache):
         "model_id": str(model_id),
         "quant": str(quant),
         "prefix_sha256": hashlib.sha256(prefix_str.encode("utf-8")).hexdigest(),
+        # A promoted LoRA adapter changes the weights the KV state was computed
+        # against. Omitting it meant a cache built on the base model could be
+        # restored while an adapter was live (or vice versa), decoding a persona
+        # against KV state from a DIFFERENT model with nothing to signal it.
+        "adapter": str(adapter_stamp or ""),
         "prefix_chars": str(len(prefix_str)),
         "mlx_lm": str(mlx_lm_version),
         "cache_classes": ",".join(type(c).__name__ for c in cache),
@@ -2840,7 +2845,7 @@ def _prompt_cache_path(root, name):
     return os.path.join(root, PROMPT_CACHE_DIRNAME, f"{name}.safetensors")
 
 
-def save_prompt_cache_fingerprinted(root, name, cache, model_id, quant, prefix_str):
+def save_prompt_cache_fingerprinted(root, name, cache, model_id, quant, prefix_str, adapter_stamp=None):
     """BEST-EFFORT persist. Returns True if written. NEVER raises: a cache we could
     not save just means the next boot prefills as it always did, and losing the
     backend over a failed optimization is the exact mistake this file has already
@@ -2849,7 +2854,7 @@ def save_prompt_cache_fingerprinted(root, name, cache, model_id, quant, prefix_s
         from mlx_lm.models.cache import save_prompt_cache
         path = _prompt_cache_path(root, name)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        meta = _prompt_cache_fingerprint(model_id, quant, prefix_str, cache)
+        meta = _prompt_cache_fingerprint(model_id, quant, prefix_str, cache, adapter_stamp)
         # Write to a temp sibling and rename, so a crash mid-write cannot leave a
         # truncated file that a later boot would try to load. The temp name must still
         # end in .safetensors - mx.save_safetensors validates the extension.
@@ -2866,7 +2871,7 @@ def save_prompt_cache_fingerprinted(root, name, cache, model_id, quant, prefix_s
         return False
 
 
-def load_prompt_cache_fingerprinted(root, name, model_id, quant, prefix_str, expect_cache):
+def load_prompt_cache_fingerprinted(root, name, model_id, quant, prefix_str, expect_cache, adapter_stamp=None):
     """Load a persisted cache ONLY if its fingerprint matches exactly. Returns the
     cache, or None for every other outcome (absent, unreadable, truncated, stale) so
     the caller prefills normally. NEVER raises."""
@@ -2876,7 +2881,7 @@ def load_prompt_cache_fingerprinted(root, name, model_id, quant, prefix_str, exp
     try:
         from mlx_lm.models.cache import load_prompt_cache
         loaded, meta = load_prompt_cache(path, return_metadata=True)
-        want = _prompt_cache_fingerprint(model_id, quant, prefix_str, expect_cache)
+        want = _prompt_cache_fingerprint(model_id, quant, prefix_str, expect_cache, adapter_stamp)
         if meta != want:
             differing = sorted(
                 k for k in set(want) | set(meta or {})
@@ -2911,9 +2916,17 @@ def downscale_for_vlm(path, max_pixels=None, out_dir=None):
                 return path
             factor = (cap / float(w * h)) ** 0.5
             nw, nh = max(1, int(w * factor)), max(1, int(h * factor))
-            target = out_dir or tempfile.mkdtemp(prefix="darwin-vlm-")
+            if out_dir is None:
+                # NO mkdtemp here. This file is a COPY OF THE USER'S SCREEN, and a
+                # fresh unmanaged temp dir per call left 38 of them on disk within an
+                # hour of shipping. One reused path inside DARWIN's own state dir,
+                # overwritten each call and deleted by the caller, bounds it to a
+                # single file that never escapes into /tmp.
+                target = os.path.join(prompt_cache_root(), "darwin-vlm-scratch")
+            else:
+                target = out_dir
             os.makedirs(target, exist_ok=True)
-            dest = os.path.join(target, f"scaled-{nw}x{nh}.png")
+            dest = os.path.join(target, "scaled.png")
             im.convert("RGB").resize((nw, nh), Image.LANCZOS).save(dest)
         log.info(
             "op=describe_image: %dx%d exceeds the %d-pixel visual budget; "
@@ -3042,6 +3055,7 @@ class InferenceEngine:
         # adapter it didn't apply. Both are set in _ensure_llm at load time.
         self._active_adapter = None
         self._adapter_note = None
+        self._adapter_stamp = None
         # Multi-resident LOCAL model manager (task #17). The base [models].llm is
         # ALWAYS warm + the single-resident fallback; the manager additionally
         # keeps the configured extra warm-set resident WHEN the RAM budget allows
@@ -3181,6 +3195,7 @@ class InferenceEngine:
             # recorded in _adapter_note and generation serves BASE — never a
             # silently-wrong or falsely-claimed adapter.
             adapter_path, adapter_stamp, self._adapter_note = self._promoted_adapter(load_id)
+            self._adapter_stamp = adapter_stamp
             log.info(
                 "loading LLM %s (resident after first use)%s...",
                 load_id,
@@ -3691,7 +3706,8 @@ class InferenceEngine:
         cache_id = self.classifier_id or self.llm_id
         restored = load_prompt_cache_fingerprinted(
             prompt_cache_root(), "classifier", cache_id,
-            self._quant_loaded or self.quant, prefix_str, cache
+            self._quant_loaded or self.quant, prefix_str, cache,
+            getattr(self, "_adapter_stamp", None),
         )
         if restored is not None:
             cache = restored
@@ -3709,6 +3725,7 @@ class InferenceEngine:
             save_prompt_cache_fingerprinted(
                 prompt_cache_root(), "classifier", cache, cache_id,
                 self._quant_loaded or self.quant, prefix_str,
+                getattr(self, "_adapter_stamp", None),
             )
             log.info(
                 "classifier prompt cache prefilled: %d tokens in %dms",
@@ -3825,6 +3842,7 @@ class InferenceEngine:
         restored = load_prompt_cache_fingerprinted(
             prompt_cache_root(), "persona", self.llm_id,
             self._quant_loaded or self.quant, prefix_str, cache,
+            getattr(self, "_adapter_stamp", None),
         )
         if restored is not None:
             cache = restored
@@ -3842,6 +3860,7 @@ class InferenceEngine:
             save_prompt_cache_fingerprinted(
                 prompt_cache_root(), "persona", cache, self.llm_id,
                 self._quant_loaded or self.quant, prefix_str,
+                getattr(self, "_adapter_stamp", None),
             )
             log.info(
                 "persona prompt cache prefilled: %d tokens in %dms",
@@ -4734,14 +4753,24 @@ class InferenceEngine:
                 # screen (~1890 visual tokens) drives this model into repetition
                 # collapse on real screenshots - see DESCRIBE_IMAGE_MAX_PIXELS.
                 vlm_path = downscale_for_vlm(path)
-                text = vlm["generate"](
-                    vlm["model"],
-                    vlm["processor"],
-                    formatted,
-                    [vlm_path],
-                    max_tokens=max_tokens,
-                    verbose=False,
-                )
+                try:
+                    text = vlm["generate"](
+                        vlm["model"],
+                        vlm["processor"],
+                        formatted,
+                        [vlm_path],
+                        max_tokens=max_tokens,
+                        verbose=False,
+                    )
+                finally:
+                    # The scaled copy is the user's SCREEN. It exists only for the
+                    # duration of this call and is removed whether or not generation
+                    # succeeded. (Never touch `path` itself - that is the caller's.)
+                    if vlm_path != path:
+                        try:
+                            os.unlink(vlm_path)
+                        except OSError:
+                            pass
             except Exception as exc:
                 # A runtime failure on a loaded model (decode error, unsupported
                 # image, OOM): report unavailable so the daemon falls back

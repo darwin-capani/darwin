@@ -196,6 +196,41 @@ class FingerprintCoversEveryInput(unittest.TestCase):
         for k, v in fp.items():
             self.assertIsInstance(v, str, f"{k} is {type(v).__name__}, not str")
 
+    def test_a_promoted_lora_adapter_invalidates_the_cache(self):
+        """A promoted LoRA adapter changes the weights the KV state was computed
+        against. Omitting it from the fingerprint meant a cache built on the base
+        model could be restored while an adapter was live - decoding a persona
+        against KV state from a DIFFERENT model, with nothing to signal it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = _cache()
+            server.save_prompt_cache_fingerprinted(
+                tmp, "persona", cache, "m/x", "4bit", "p", "adapter-v1"
+            )
+            same = server.load_prompt_cache_fingerprinted(
+                tmp, "persona", "m/x", "4bit", "p", cache, "adapter-v1"
+            )
+            self.assertIsNotNone(same, "the same adapter must still load")
+            for other in ("adapter-v2", None, ""):
+                self.assertIsNone(
+                    server.load_prompt_cache_fingerprinted(
+                        tmp, "persona", "m/x", "4bit", "p", cache, other
+                    ),
+                    f"a cache built under adapter-v1 must be refused for {other!r}",
+                )
+
+    def test_a_base_model_cache_is_refused_once_an_adapter_is_promoted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache = _cache()
+            server.save_prompt_cache_fingerprinted(
+                tmp, "persona", cache, "m/x", "4bit", "p", None
+            )
+            self.assertIsNone(
+                server.load_prompt_cache_fingerprinted(
+                    tmp, "persona", "m/x", "4bit", "p", cache, "adapter-v1"
+                ),
+                "a base-model cache must not be used under a promoted adapter",
+            )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

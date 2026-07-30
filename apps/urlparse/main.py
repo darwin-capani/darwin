@@ -76,13 +76,47 @@ def compute(payload):
 
         is_idn = any(ord(c) > 127 for c in host)
 
-        if host:
+        # IDNA2008 via the `idna` package, NOT str.encode("idna").
+        #
+        # The stdlib codec implements IDNA2003, whose mapping is LOSSY in a way that
+        # changes which site you reach: it folds U+00DF to "ss", so faß.de came back
+        # as "fass.de" — a DIFFERENT, separately-registrable domain. Reporting that
+        # as the punycode form of what the user typed is a wrong answer with a
+        # phishing shape, since confusable pairs are exactly what an attacker picks.
+        # Under IDNA2008 faß.de is xn--fa-hia.de and stays distinct.
+        host_punycode = None
+        host_idna_note = None
+        # An IP literal is not a domain name and must never go through IDNA - an
+        # IPv6 host like 2001:db8::1 is not a valid IDNA label and would come back
+        # as None with a spurious "not valid IDNA2008" note.
+        _is_ip_literal = (
+            ":" in host
+            or (host.replace(".", "").isdigit() and host.count(".") == 3)
+        )
+        if host and _is_ip_literal:
+            host_punycode = host
+        elif host:
             try:
-                host_punycode = host.encode("idna").decode("ascii")
-            except Exception:  # noqa: BLE001 — idna is strict; N/A on failure
+                import idna as _idna
+
+                host_punycode = _idna.encode(host, uts46=True, std3_rules=False).decode("ascii")
+            except ImportError:
+                # No IDNA2008 available: fall back to the stdlib codec, but VERIFY the
+                # round trip and refuse to report a mapping that does not survive it.
+                try:
+                    cand = host.encode("idna").decode("ascii")
+                    if cand.encode("ascii").decode("idna") == host:
+                        host_punycode = cand
+                    else:
+                        host_idna_note = (
+                            "punycode omitted: the available IDNA2003 codec maps this "
+                            "host to a different name that does not round-trip"
+                        )
+                except Exception:  # noqa: BLE001
+                    host_punycode = None
+            except Exception as exc:  # noqa: BLE001 — idna is strict by design
                 host_punycode = None
-        else:
-            host_punycode = None
+                host_idna_note = f"host is not valid IDNA2008: {exc}"
 
         # normalized: scheme + host lowercased (already lower), default port dropped
         netloc = ""
@@ -135,6 +169,7 @@ def compute(payload):
             "params_truncated": len(pairs) > MAX_PARAMS,
             "is_idn": is_idn,
             "host_punycode": host_punycode,
+        "host_idna_note": host_idna_note,
             "normalized": normalized,
             "warnings": warnings,
         }
