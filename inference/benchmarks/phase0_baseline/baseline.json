@@ -116,5 +116,16 @@
       "net": "the startup saving is real but smaller than the prefill numbers alone suggest, because the Core ML stages grew"
     },
     "what_did_it": "removing the discarded vocab projection from all three prefills (891 MB at boot plus ~1.2 GB per large consolidate), and dropping the speculative draft model that was both a measured 27% decode loss and unreachable on the KV-cached path"
+  },
+  "phase1_ipc_premise": {
+    "the_claim_i_made": "a short embed costs 6.61 ms over the wire vs 1.84 ms at the graph, so ~4.8 ms is IPC overhead worth optimizing (connection pooling + binary framing)",
+    "what_was_wrong_with_it": [
+      "The 6.61 ms was measured with a FRESH socket per call. I assumed the daemon did the same. It does not - daemon/src/inference.rs caches `conn` and ensure_connected() only connects when it is None. So connection pooling was already there and could not be the win.",
+      "Re-measured properly: POOLED p50 8.48 ms vs FRESH p50 8.65 ms - statistically the same. Unix-socket connect is not the cost.",
+      "The remaining figure is not trustworthy either. p50 8.48 ms with min 4.03 and p90 11.78 is contention variance, not a fixed cost, and it was taken at machine load ~14 with a runaway browser holding ~2.7 cores. The 1.84 ms graph number it is being differenced against was measured on a quiet machine."
+    ],
+    "what_can_be_said": "best-case overhead is about 2.2 ms (min 4.03 minus the 1.84 graph cost), part of which is tokenization - real work, not overhead. That is a far smaller prize than 4.8 ms.",
+    "verdict": "DEFER, not a NO-GO. The IPC premise cannot be validated on this machine in its current state; the measurement is dominated by contention rather than by the thing the optimization would remove. Re-measure on a quiet machine before building anything.",
+    "meta": "This is the THIRD measurement this session corrupted by machine contention (after the 37.3 s TTS figure and the 43 s startup stage). Every remaining campaign phase - retrieval tuning, model-refresh evals - is measurement-dependent, so the machine's load is the blocking issue for the campaign, not any code."
   }
 }
