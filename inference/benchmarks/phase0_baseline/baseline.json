@@ -89,5 +89,32 @@
       "what": "7.32 GiB of candidate models that were downloaded, LOST their eval, and were never cleaned up - TTS candidates rejected by the RTF gate (csm-1b-8bit, orpheus variants, snac vocoder), classifier candidates rejected by the accuracy gate (Qwen3-0.6B, Qwen2.5-0.5B, Llama-3.2-1B), and whisper-large-v3-turbo rejected by the STT comparison",
       "status": "REPORTED ONLY - deleting user files is destructive and was not done without asking"
     }
+  },
+  "after_phase0_fixes": {
+    "measured": "2026-07-29 boot, machine load ~14 (a runaway browser was holding ~2.7 cores; the BEFORE column was taken under comparable contention)",
+    "stages_seconds": {
+      "stt": 1.8,
+      "llm_total": 16.7,
+      "llm_weights": 3.2,
+      "persona_prefill": 7.4,
+      "classifier_total": 3.0,
+      "classifier_prefill": 3.0,
+      "coreml_embedder": 14.8,
+      "coreml_reranker": 6.9,
+      "tts": 5.3,
+      "draft_model": 0
+    },
+    "before_after": {
+      "classifier_total": "18.0 -> 3.0 s (6.0x)",
+      "persona_prefill": "15.1 -> 7.4 s (2.0x)",
+      "llm_total": "19.6 -> 16.7 s",
+      "draft_model": "2.2 s + 335 MB -> gone",
+      "total_startup": "~63 -> ~49 s (about 22% faster)"
+    },
+    "honest_cost": {
+      "coreml_embedder": "13.2 -> 14.8 s and reranker 3.9 -> 6.9 s. This is the ANE fast path loading TWO graphs instead of one - a real startup cost paid for a 10.7x/9.70x per-predict win, and it belongs in the ledger.",
+      "net": "the startup saving is real but smaller than the prefill numbers alone suggest, because the Core ML stages grew"
+    },
+    "what_did_it": "removing the discarded vocab projection from all three prefills (891 MB at boot plus ~1.2 GB per large consolidate), and dropping the speculative draft model that was both a measured 27% decode loss and unreachable on the KV-cached path"
   }
 }
