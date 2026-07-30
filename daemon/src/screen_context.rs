@@ -61,6 +61,48 @@ pub struct ContextEntry {
     pub window: Option<String>,
 }
 
+/// Total character budget for a rendered recall. A recall is SPOKEN and also fed to
+/// the model, so an unbounded render is both an unlistenable answer and a large
+/// prompt cost. Ten near-identical snapshots measured 27,699 characters.
+const RECALL_RENDER_BUDGET_CHARS: usize = 2_000;
+
+/// The token set of a snapshot, for near-duplicate suppression.
+///
+/// Exact string matching is not enough: a timer-driven capture of a STATIC window
+/// still differs between frames — a clock digit, a blinking cursor, an unread count.
+/// Those frames are the same screen to a user and must collapse to one bullet, so
+/// snapshots are compared by token overlap instead.
+fn dedup_tokens(text: &str) -> Vec<String> {
+    let mut t: Vec<String> = text
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
+        .filter(|w| !w.is_empty())
+        .take(400)
+        .collect();
+    t.sort();
+    t.dedup();
+    t
+}
+
+/// How much token overlap makes two snapshots "the same screen". 0.9 means a frame
+/// may differ by a tenth of its distinct tokens — a clock, a cursor, a counter — and
+/// still be suppressed, while a genuinely different window survives.
+const DEDUP_SIMILARITY: f64 = 0.9;
+
+/// Jaccard overlap of two token sets. Both empty counts as identical (two blank
+/// snapshots are not two different screens).
+fn near_duplicate(a: &[String], b: &[String]) -> bool {
+    if a.is_empty() && b.is_empty() {
+        return true;
+    }
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let inter = a.iter().filter(|w| b.binary_search(w).is_ok()).count();
+    let union = a.len() + b.len() - inter;
+    union > 0 && (inter as f64 / union as f64) >= DEDUP_SIMILARITY
+}
+
 /// Hard bounds on the grounding labels — an app name / window title is a short
 /// human label, never a data channel into the ring.
 const MAX_APP_CHARS: usize = 64;
@@ -212,11 +254,56 @@ impl ScreenContextRing {
                     nothing's been captured."
                 .to_string();
         }
+        Self::render_entries(&recent)
+    }
+
+    /// Shared renderer for every recall surface: NEAR-DUPLICATE SUPPRESSED and
+    /// BUDGETED, newest kept.
+    ///
+    /// The capture loop samples the screen on a timer, so a user reading one
+    /// document produces a ring of near-identical snapshots. Rendering one bullet
+    /// per entry then answered "what was I working on" with ten copies of the same
+    /// screen — measured at 27,699 characters, all of it the same paragraph. That is
+    /// not a recall, it is the same answer ten times, and it is what a continuous
+    /// capture loop over any static window produces by default.
+    ///
+    /// The budget keeps the NEWEST entries rather than the first ones. `recall_recent`
+    /// returns oldest-first for reading order, so any downstream clip that takes a
+    /// prefix would read out the OLDEST snapshots and never reach what the user is
+    /// looking at now — the opposite of what "what was I working on" asks.
+    fn render_entries(entries: &[ContextEntry]) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        let mut used = 0usize;
+        let mut seen: Vec<Vec<String>> = Vec::new();
+        let mut suppressed = 0usize;
+        // Walk NEWEST first so the budget spends itself on what is on screen now.
+        for e in entries.iter().rev() {
+            let key = dedup_tokens(&e.redacted_text);
+            if seen.iter().any(|k| near_duplicate(k, &key)) {
+                suppressed += 1;
+                continue;
+            }
+            let line = entry_line(e);
+            if used + line.chars().count() > RECALL_RENDER_BUDGET_CHARS && !lines.is_empty() {
+                break;
+            }
+            used += line.chars().count();
+            seen.push(key);
+            lines.push(line);
+        }
+        // Restore reading order (oldest first) for the spoken answer.
+        lines.reverse();
         let mut out = String::from("Here's your recent screen context, sir:");
-        for e in &recent {
+        for l in &lines {
             out.push('\n');
             out.push_str("• ");
-            out.push_str(&entry_line(e));
+            out.push_str(l);
+        }
+        if suppressed > 0 {
+            out.push_str(&format!(
+                "\n({suppressed} near-identical snapshot{} omitted.)",
+                if suppressed == 1 { "" } else { "s" }
+            ));
         }
         out
     }
@@ -430,16 +517,18 @@ pub fn global_render_recall_matching(query: &str, n: usize) -> String {
             query.trim()
         );
     }
-    let mut out = if query.trim().is_empty() {
+    let header = if query.trim().is_empty() {
         String::from("Here's your recent screen context, sir:")
     } else {
         format!("Here's what I have on \"{}\", sir:", query.trim())
     };
-    for e in &hits {
-        out.push('\n');
-        out.push_str("• ");
-        out.push_str(&entry_line(e));
-    }
+    // Same suppression + budget as render_recall: a ranked hit list over a static
+    // window is just as capable of returning the same snapshot repeatedly.
+    let body = ScreenContextRing::render_entries(&hits);
+    let out = match body.split_once('\n') {
+        Some((_, rest)) => format!("{header}\n{rest}"),
+        None => header,
+    };
     out
 }
 
@@ -476,14 +565,40 @@ pub async fn global_rank_render_runtime(query: &str, k: usize, embedder: &dyn Em
             query.trim()
         );
     }
-    let lines: Vec<String> = recall
-        .hits
-        .iter()
-        .map(|h| format!("• {}", entry_line(&entries[h.index])))
-        .collect();
+    // Suppress near-duplicates and hold a budget here too. This path is ranked
+    // most-relevant-first rather than chronological, so it is if anything MORE prone
+    // to returning the same static window repeatedly: every copy of it scores the
+    // same, so they cluster at the top and crowd out everything else.
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: Vec<Vec<String>> = Vec::new();
+    let mut used = 0usize;
+    let mut suppressed = 0usize;
+    for h in recall.hits.iter() {
+        let e = &entries[h.index];
+        let key = dedup_tokens(&e.redacted_text);
+        if seen.iter().any(|k| near_duplicate(k, &key)) {
+            suppressed += 1;
+            continue;
+        }
+        let line = format!("• {}", entry_line(e));
+        if used + line.chars().count() > RECALL_RENDER_BUDGET_CHARS && !lines.is_empty() {
+            break;
+        }
+        used += line.chars().count();
+        seen.push(key);
+        lines.push(line);
+    }
+    let omitted = if suppressed > 0 {
+        format!(
+            "\n({suppressed} near-identical snapshot{} omitted.)",
+            if suppressed == 1 { "" } else { "s" }
+        )
+    } else {
+        String::new()
+    };
     format!(
         "Here's what I have on your recent screen that bears on that, most relevant \
-         first:\n{}\n(Recall method: {method})",
+         first:\n{}{omitted}\n(Recall method: {method})",
         lines.join("\n")
     )
 }
@@ -1158,6 +1273,71 @@ mod tests {
         fn embed<'a>(&'a self, _texts: &'a [String]) -> crate::recall::EmbedFuture<'a> {
             Box::pin(async move { Err(anyhow::anyhow!("inference socket down")) })
         }
+    }
+
+    /// REGRESSION: a continuous capture loop over ONE unchanged window must not
+    /// answer "what was I working on" with N copies of the same screen.
+    ///
+    /// The loop samples on a timer, so a user reading one document produces a ring
+    /// of near-identical snapshots. One bullet per entry rendered ten copies of the
+    /// same paragraph — measured at 27,699 characters, which is not a recall, it is
+    /// the same answer ten times.
+    #[test]
+    fn repeated_captures_of_one_window_render_once() {
+        let mut ring = ScreenContextRing::new(32);
+        // A REAL capture is a whole-screen OCR dump — hundreds of tokens — of which a
+        // timer-driven recapture of a static window changes one or two (a clock, an
+        // unread count). The fixture has to be that shape: with only six tokens, one
+        // changing digit is a sixth of the content and SHOULD survive suppression.
+        let body: String = (0..60)
+            .map(|w| format!("line{w} of the document being read "))
+            .collect();
+        for i in 0..10 {
+            ring.push(
+                1_700_000_000 + i,
+                &format!("Inbox — 12 unread {i}:04 PM {body}"),
+                "screen",
+            );
+        }
+        let out = ring.render_recall(10);
+        let bullets = out.matches('•').count();
+        assert_eq!(bullets, 1, "ten captures of one window rendered {bullets} bullets:\n{out}");
+        assert!(out.contains("omitted"), "the suppression must be disclosed: {out}");
+        // One realistic snapshot is legitimately long; what matters is that TEN of
+        // them did not become ten times as long. The contract is the budget.
+        assert!(
+            out.chars().count() <= RECALL_RENDER_BUDGET_CHARS + 400,
+            "render is {} chars", out.chars().count()
+        );
+    }
+
+    /// GENUINELY DIFFERENT screens must all survive — suppression must not eat real
+    /// history.
+    #[test]
+    fn distinct_screens_all_survive_suppression() {
+        let mut ring = ScreenContextRing::new(32);
+        for (i, t) in ["Inbox — 12 unread", "main.rs — cargo build failed",
+                       "Calendar — standup at 10", "Slack — #deploys"].iter().enumerate() {
+            ring.push(1_700_000_000 + i as u64, t, "screen");
+        }
+        let out = ring.render_recall(10);
+        assert_eq!(out.matches('•').count(), 4, "{out}");
+        assert!(!out.contains("omitted"), "nothing was a duplicate: {out}");
+    }
+
+    /// The budget must keep the NEWEST snapshots. `recall_recent` returns oldest
+    /// first for reading order, so a naive prefix clip would read out the oldest and
+    /// never reach what the user is actually looking at.
+    #[test]
+    fn the_render_budget_keeps_the_newest_snapshots() {
+        let mut ring = ScreenContextRing::new(64);
+        for i in 0..40 {
+            ring.push(1_700_000_000 + i, &format!("distinct window number {i} {}", "x".repeat(120)), "screen");
+        }
+        let out = ring.render_recall(40);
+        assert!(out.chars().count() <= 2_400, "unbounded render: {} chars", out.chars().count());
+        assert!(out.contains("number 39"), "the NEWEST snapshot must survive the budget:\n{out}");
+        assert!(!out.contains("number 0 "), "the oldest should have been dropped first:\n{out}");
     }
 
     #[tokio::test]
