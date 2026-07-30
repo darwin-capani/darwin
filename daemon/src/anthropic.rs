@@ -6122,10 +6122,24 @@ pub use debate::current_outcome as debate_current_outcome;
 /// tool result whose outcome maps to a real on-device/cloud item the user could
 /// inspect: doc_search (file path + offset), unified_search (mixed cited hits),
 /// mnemosyne_recall (stored fact keys), episodic_recall (episode ids),
-/// web_search/open_url (urls), and the gated integration READS (the karen
-/// triage + the read-only provider lists). A NON-citation tool (an actuator like
-/// open_app, a pure compute like cassandra) is deliberately absent — its outcome
-/// is not a retrieval the answer cites. Pure, so the membership is unit-testable.
+/// and the gated integration READS (the karen triage + the read-only provider
+/// lists). A NON-citation tool (an actuator like open_app, a pure compute like
+/// cassandra) is deliberately absent — its outcome is not a retrieval the answer
+/// cites. Pure, so the membership is unit-testable.
+///
+/// web_search AND open_url WERE HERE AND HAD TO GO. Both are browser ACTUATORS:
+/// open_url "opens a website in the user's browser" and web_search "opens a Google
+/// search in the user's default browser". Neither reads a single byte back — the
+/// page is rendered for the USER, and nothing about it ever reaches the model. So
+/// an answer that followed one of those calls came from the model's own knowledge
+/// while being stamped "Sources: <that url>", which is a fabricated grounding
+/// claim: it points the user at a page that was never read and implies the answer
+/// was checked against it. That is precisely backwards from what a citation is for,
+/// and worse than no citation at all, because a wrong answer arrives wearing
+/// evidence.
+///
+/// sage_research is different and stays: it FETCHES page bodies through the
+/// fetchproxy (bounded by SAGE_MAX_BODY_BYTES) and cites what it actually read.
 ///
 /// HONESTY: this only marks which tools COULD carry a citation; the accumulator
 /// records a source ONLY when such a tool actually returned a NON-error result
@@ -6145,8 +6159,6 @@ fn tool_carries_citation(name: &str) -> bool {
             | "pasteboard_recall"
             | "aperture_recall"
             | "screen_recall"
-            | "web_search"
-            | "open_url"
             | "karen_triage"
     )
 }
@@ -6164,7 +6176,7 @@ fn tool_carries_citation(name: &str) -> bool {
 ///     An outcome that is an honest empty/miss (the tool's own "nothing found" /
 ///     "nothing recorded" / "not connected" copy) yields `None` — there is no real
 ///     source to cite, so the accumulator stays untouched. Pure + unit-testable.
-fn citation_for_tool(name: &str, input: &Value, outcome: &str) -> Option<(String, String)> {
+fn citation_for_tool(name: &str, _input: &Value, outcome: &str) -> Option<(String, String)> {
     // An honest empty/miss from any retrieval tool carries no real source.
     if is_empty_retrieval(outcome) {
         return None;
@@ -6179,13 +6191,11 @@ fn citation_for_tool(name: &str, input: &Value, outcome: &str) -> Option<(String
         "aperture_recall" => "activity timeline".to_string(),
         "screen_recall" => "recent screen context".to_string(),
         "karen_triage" => "comms triage".to_string(),
-        "web_search" | "open_url" => input
-            .get("url")
-            .and_then(Value::as_str)
-            .or_else(|| input.get("query").and_then(Value::as_str))
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "the web".to_string()),
+        // web_search and open_url deliberately have NO arm here. They are browser
+        // actuators that read nothing back, so there is no source to name — see
+        // tool_carries_citation. Keeping the two in agreement matters: the gate is
+        // upstream, but a locator arm surviving here would hand a citation to any
+        // future caller that reached this directly.
         _ => return None,
     };
     Some((locator, outcome.to_string()))
@@ -20760,6 +20770,33 @@ mod tests {
         assert!(!tool_carries_citation("open_app"));
         assert!(!tool_carries_citation("cassandra_whatif"));
         assert!(citation_for_tool("open_app", &json!({}), "Opened Safari.").is_none());
+
+        // REGRESSION: a browser ACTUATOR must never carry a citation. open_url
+        // "opens a website in the user's browser" and web_search "opens a Google
+        // search in the user's default browser" — neither reads a byte back, so the
+        // page never reaches the model. Marking them citation-carrying stamped
+        // answers that came from the model's own knowledge with "Sources: <url>",
+        // pointing the user at a page nobody read and implying the answer had been
+        // checked against it. A wrong answer wearing evidence is worse than a wrong
+        // answer.
+        assert!(!tool_carries_citation("web_search"));
+        assert!(!tool_carries_citation("open_url"));
+        assert!(citation_for_tool(
+            "open_url",
+            &json!({"url": "apple.com"}),
+            "Opened apple.com in Safari."
+        )
+        .is_none());
+        assert!(citation_for_tool(
+            "web_search",
+            &json!({"query": "rust borrow checker"}),
+            "Searched the web."
+        )
+        .is_none());
+        // For contrast: sage_research genuinely FETCHES page bodies through the
+        // fetchproxy and does cite them — but through its own report path, not this
+        // table, which is why it is absent here too.
+        assert!(!tool_carries_citation("sage_research"));
     }
 
     /// The per-turn accumulator is CLEARED each turn: turn N's sources never
