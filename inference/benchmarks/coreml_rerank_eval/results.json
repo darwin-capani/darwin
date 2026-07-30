@@ -41,9 +41,9 @@
       "name": "bge top-20 + cross-encoder rerank",
       "dense_recall@K": 1.0,
       "rerank_latency": {
-        "median_ms": 220.65,
-        "p90_ms": 222.68,
-        "per_pair_ms": 11.03
+        "median_ms": 37.12,
+        "p90_ms": 43.36,
+        "per_pair_ms": 1.86
       },
       "summary": {
         "recall@1": 0.8657,
@@ -60,9 +60,9 @@
       "name": "bge top-50 + cross-encoder rerank",
       "dense_recall@K": 1.0,
       "rerank_latency": {
-        "median_ms": 550.07,
-        "p90_ms": 553.91,
-        "per_pair_ms": 11.0
+        "median_ms": 93.84,
+        "p90_ms": 101.28,
+        "per_pair_ms": 1.88
       },
       "summary": {
         "recall@1": 0.8657,
@@ -88,5 +88,38 @@
     },
     "call": "GO: the cross-encoder rerank MEASURABLY improves ranking (best at K=20); ship it config-gated on top of the bge bi-encoder as the standard two-stage stack.",
     "honesty": "SYNTHETIC-but-representative eval, directional evidence not a production guarantee. recall@k (k<=K) after rerank is bounded by dense_recall@K. Latency is measured end-to-end under ComputeUnit.ALL; ANE-eligible, never claimed to run on the ANE."
+  },
+  "REFRESHED_ON_THE_SHIPPED_CONFIG": {
+    "when": "2026-07-30, quiet machine, HF_HOME pointed at the DEPLOYED cache",
+    "why": "the committed latency figures predate the ANE short-graph fast path and understated the shipped system by ~6x",
+    "latency_then_vs_now": {
+      "top20_median_ms": {
+        "before": 220.65,
+        "after": 37.1
+      },
+      "top20_per_pair_ms": {
+        "before": 11.03,
+        "after": 1.86
+      },
+      "top50_median_ms": {
+        "before": 550.07,
+        "after": 93.8
+      },
+      "speedup": "5.9x"
+    },
+    "quality_unchanged": {
+      "nDCG@10": 0.9841,
+      "recall@1": 0.8657,
+      "recall@3": 0.9815,
+      "recall@5": 0.9907,
+      "MRR": 0.9861,
+      "note": "IDENTICAL to the committed run at four decimals on every metric - independent confirmation, on the real retrieval harness rather than a synthetic probe, that the short graph changes speed and not results"
+    },
+    "METHODOLOGY_TRAP_WORTH_KNOWING": "running this eval WITHOUT HF_HOME set measures the DEV cache (~/.cache/huggingface), which does not carry the short graph and is a DIFFERENT configuration from what ships. The first re-run reported 11.04 ms/pair - unchanged from the old committed figure - and looked like the fast path did nothing."
+  },
+  "PHASE2_HEADROOM_FINDING": {
+    "observation": "this eval set is SATURATED. Dense alone reaches success@5 = 1.0; with reranking success@3 = 1.0, MRR 0.9861 and nDCG@10 0.9841. The only metric with visible room is recall@1 at 0.8657, over 36 queries.",
+    "consequence": "tuning retrieval against this set would be optimizing a benchmark at its ceiling, where movement is noise on 36 synthetic authored queries. Phase 2 as scoped - fusion weights, candidate K, query rewriting - has no measurable headroom HERE.",
+    "what_would_be_needed": "a larger and harder eval set, ideally from real usage rather than authored labels. That is real work in its own right and should not be smuggled in as a tuning pass."
   }
 }
