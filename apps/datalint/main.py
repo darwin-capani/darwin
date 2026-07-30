@@ -73,7 +73,20 @@ def compute(payload):
     if not isinstance(raw, str):
         raw = ""
     try:
-        decoded = json.loads(raw)
+
+        # RFC 8259 has no NaN or Infinity. Python accepts them by default, so
+
+        # datalint was calling {"a": NaN} valid JSON - a document every other
+
+        # conformant parser rejects. parse_constant fires on exactly those three
+
+        # tokens, so they become the parse error they already are elsewhere.
+
+        def _reject_json_constant(tok):
+
+            raise ValueError(f"{tok} is not valid JSON (RFC 8259)")
+
+        decoded = json.loads(raw, parse_constant=_reject_json_constant)
     except Exception as e:  # noqa: BLE001 — surface parse failure as data, never raise
         return {"valid": False, "error": str(e)}
 
