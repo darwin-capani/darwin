@@ -2769,6 +2769,111 @@ def _split_complete_sentences(buffer, final=False):
     return sentences, remainder
 
 
+# ---------------------------------------------------------------------------
+# PERSISTED PROMPT CACHES
+# ---------------------------------------------------------------------------
+# The persona and classifier KV prefixes are recomputed from scratch on every boot:
+# MEASURED at 7.3 s and 3.1 s on a quiet M1 Pro, i.e. a third of a 31 s startup spent
+# reproducing a result that is a pure function of (model, quant, prefix text,
+# mlx_lm version). mlx_lm 0.31.3 can persist a prompt cache, and a loaded cache is
+# still trimmable, which the classifier's turn-to-turn reuse depends on.
+#
+# THE HAZARD, and why the fingerprint is strict: a cache silently paired with a
+# CHANGED persona would make the assistant behave as the old persona with no error
+# and no log line. That is a correctness failure dressed as a performance win, and it
+# is strictly worse than being slow. So the fingerprint covers every input that can
+# change the KV bytes, and ANY mismatch (or any unreadable file) falls back to a real
+# prefill. There is no "close enough".
+PROMPT_CACHE_DIRNAME = "darwin-promptcache"
+
+
+def _prompt_cache_fingerprint(model_id, quant, prefix_str, cache):
+    """Every input that can change the persisted KV bytes. Values are strings because
+    safetensors metadata is str->str."""
+    import hashlib
+    try:
+        import mlx_lm
+        mlx_lm_version = getattr(mlx_lm, "__version__", "unknown")
+    except Exception:  # noqa: BLE001
+        mlx_lm_version = "unknown"
+    return {
+        "schema": "1",
+        "model_id": str(model_id),
+        "quant": str(quant),
+        "prefix_sha256": hashlib.sha256(prefix_str.encode("utf-8")).hexdigest(),
+        "prefix_chars": str(len(prefix_str)),
+        "mlx_lm": str(mlx_lm_version),
+        "cache_classes": ",".join(type(c).__name__ for c in cache),
+        "layers": str(len(cache)),
+    }
+
+
+def prompt_cache_root():
+    """The prompt caches live in a subtree of the SAME model-cache root the Core ML
+    artifacts use, so they share the one cache the installer manages. Imported from
+    coreml_embed rather than reimplemented, so the $HF_HOME resolution cannot drift
+    between the two."""
+    from coreml_embed import hf_cache_root
+    return hf_cache_root()
+
+
+def _prompt_cache_path(root, name):
+    return os.path.join(root, PROMPT_CACHE_DIRNAME, f"{name}.safetensors")
+
+
+def save_prompt_cache_fingerprinted(root, name, cache, model_id, quant, prefix_str):
+    """BEST-EFFORT persist. Returns True if written. NEVER raises: a cache we could
+    not save just means the next boot prefills as it always did, and losing the
+    backend over a failed optimization is the exact mistake this file has already
+    made twice tonight."""
+    try:
+        from mlx_lm.models.cache import save_prompt_cache
+        path = _prompt_cache_path(root, name)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        meta = _prompt_cache_fingerprint(model_id, quant, prefix_str, cache)
+        # Write to a temp sibling and rename, so a crash mid-write cannot leave a
+        # truncated file that a later boot would try to load. The temp name must still
+        # end in .safetensors - mx.save_safetensors validates the extension.
+        tmp = f"{path[:-len('.safetensors')]}.{os.getpid()}.tmp.safetensors"
+        save_prompt_cache(tmp, cache, meta)
+        os.replace(tmp, path)
+        return True
+    except Exception as e:  # noqa: BLE001 - advisory only
+        log.warning("prompt cache %s: could not persist (%s)", name, e)
+        try:
+            os.unlink(tmp)  # noqa: F821 - guarded; may be unbound if we failed early
+        except Exception:  # noqa: BLE001 - includes NameError when tmp never got set
+            pass
+        return False
+
+
+def load_prompt_cache_fingerprinted(root, name, model_id, quant, prefix_str, expect_cache):
+    """Load a persisted cache ONLY if its fingerprint matches exactly. Returns the
+    cache, or None for every other outcome (absent, unreadable, truncated, stale) so
+    the caller prefills normally. NEVER raises."""
+    path = _prompt_cache_path(root, name)
+    if not os.path.isfile(path):
+        return None
+    try:
+        from mlx_lm.models.cache import load_prompt_cache
+        loaded, meta = load_prompt_cache(path, return_metadata=True)
+        want = _prompt_cache_fingerprint(model_id, quant, prefix_str, expect_cache)
+        if meta != want:
+            differing = sorted(
+                k for k in set(want) | set(meta or {})
+                if (meta or {}).get(k) != want.get(k)
+            )
+            log.info(
+                "prompt cache %s: fingerprint changed (%s); prefilling fresh",
+                name, ", ".join(differing),
+            )
+            return None
+        return loaded
+    except Exception as e:  # noqa: BLE001 - a bad file must never be fatal
+        log.warning("prompt cache %s: not usable (%s); prefilling fresh", name, e)
+        return None
+
+
 class InferenceEngine:
     """Lazy-loading, resident MLX models. All methods are blocking; callers
     run them in a worker thread. A lock serializes GPU work."""
@@ -3532,22 +3637,37 @@ class InferenceEngine:
                 f"prompt cache for {self.classifier_id or self.llm_id} is not trimmable"
             )
         t0 = time.perf_counter()
-        # Same as the persona prefill: eval the CACHE, not the logits, so the tied
-        # lm_head projection to vocab_size never enters the graph (264.1 MB of
-        # throwaway arrays for these 869 tokens).
-        self._cls_model(mx.array(prefix_tokens)[None], cache=cache)
-        mx.eval([c.state for c in cache])
-        mx.clear_cache()
+        cache_id = self.classifier_id or self.llm_id
+        restored = load_prompt_cache_fingerprinted(
+            prompt_cache_root(), "classifier", cache_id,
+            self._quant_loaded or self.quant, prefix_str, cache
+        )
+        if restored is not None:
+            cache = restored
+            log.info(
+                "classifier prompt cache restored from disk: %d tokens in %dms",
+                len(prefix_tokens), int((time.perf_counter() - t0) * 1000),
+            )
+        else:
+            # Same as the persona prefill: eval the CACHE, not the logits, so the tied
+            # lm_head projection to vocab_size never enters the graph (264.1 MB of
+            # throwaway arrays for these 869 tokens).
+            self._cls_model(mx.array(prefix_tokens)[None], cache=cache)
+            mx.eval([c.state for c in cache])
+            mx.clear_cache()
+            save_prompt_cache_fingerprinted(
+                prompt_cache_root(), "classifier", cache, cache_id,
+                self._quant_loaded or self.quant, prefix_str,
+            )
+            log.info(
+                "classifier prompt cache prefilled: %d tokens in %dms",
+                len(prefix_tokens), int((time.perf_counter() - t0) * 1000),
+            )
         self._cls_prefix_str = prefix_str
         self._cls_suffix_str = suffix_str
         self._cls_prefix_tokens = list(prefix_tokens)
         self._cls_cache = cache
         self._cls_cache_len = len(prefix_tokens)
-        log.info(
-            "classifier prompt cache prefilled: %d tokens in %dms",
-            len(prefix_tokens),
-            int((time.perf_counter() - t0) * 1000),
-        )
 
     def _classify_cached(self, text):
         """Generate a classification using the prefilled prefix cache on the
@@ -3651,17 +3771,32 @@ class InferenceEngine:
         # discarded on the next line. MLX is lazy, so evaluating only the cache state
         # leaves that projection out of the graph entirely; the cache is identical.
         # This is mlx_lm's own prefill pattern (generate.py: mx.eval([c.state ...])).
-        self._model(mx.array(prefix_tokens)[None], cache=cache)
-        mx.eval([c.state for c in cache])
-        # Return the prefill's transients to the OS. mlx_lm pairs its state eval with
-        # this at every occurrence and we had adopted only half the pattern, leaving
-        # tens of MB per prefill sitting in MLX's buffer pool past boot.
-        mx.clear_cache()
-        log.info(
-            "persona prompt cache prefilled: %d tokens in %dms",
-            len(prefix_tokens),
-            int((time.perf_counter() - t0) * 1000),
+        restored = load_prompt_cache_fingerprinted(
+            prompt_cache_root(), "persona", self.llm_id,
+            self._quant_loaded or self.quant, prefix_str, cache,
         )
+        if restored is not None:
+            cache = restored
+            log.info(
+                "persona prompt cache restored from disk: %d tokens in %dms",
+                len(prefix_tokens), int((time.perf_counter() - t0) * 1000),
+            )
+        else:
+            self._model(mx.array(prefix_tokens)[None], cache=cache)
+            mx.eval([c.state for c in cache])
+            # Return the prefill's transients to the OS. mlx_lm pairs its state eval
+            # with this at every occurrence and we had adopted only half the pattern,
+            # leaving tens of MB per prefill sitting in MLX's buffer pool past boot.
+            mx.clear_cache()
+            save_prompt_cache_fingerprinted(
+                prompt_cache_root(), "persona", cache, self.llm_id,
+                self._quant_loaded or self.quant, prefix_str,
+            )
+            log.info(
+                "persona prompt cache prefilled: %d tokens in %dms",
+                len(prefix_tokens),
+                int((time.perf_counter() - t0) * 1000),
+            )
         return {
             "cache": cache,
             "cache_len": len(prefix_tokens),

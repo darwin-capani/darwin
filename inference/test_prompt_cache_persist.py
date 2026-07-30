@@ -1,0 +1,201 @@
+"""Persisted prompt caches: fast when valid, and NEVER wrong.
+
+The persona and classifier KV prefixes were recomputed from scratch on every boot --
+MEASURED at 7.3 s and 3.1 s on a quiet M1 Pro, a third of a 31 s startup spent
+reproducing a pure function of (model, quant, prefix text, mlx_lm version). mlx_lm
+0.31.3 can persist a prompt cache and a loaded one is still trimmable, which the
+classifier's turn-to-turn reuse depends on.
+
+THE HAZARD these tests exist for: a cache silently paired with a CHANGED persona would
+make the assistant behave as the OLD persona, with no error and no log line. That is a
+correctness failure wearing a performance win's clothes, and it is strictly worse than
+being slow. So every test below is about the fingerprint REFUSING a cache, not about
+the happy path.
+
+  Run: .venv/bin/python inference/test_prompt_cache_persist.py   (from the repo root)
+"""
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import server  # noqa: E402
+
+try:
+    import mlx.core as mx
+    from mlx_lm.models.cache import KVCache, can_trim_prompt_cache, trim_prompt_cache
+    HAVE_MLX = True
+except Exception:  # noqa: BLE001
+    HAVE_MLX = False
+
+
+def _cache(layers=3, tokens=17, dim=8):
+    cache = [KVCache() for _ in range(layers)]
+    for c in cache:
+        k = mx.random.normal((1, 2, tokens, dim))
+        c.update_and_fetch(k, k)
+    mx.eval([c.state for c in cache])
+    return cache
+
+
+@unittest.skipUnless(HAVE_MLX, "needs mlx + mlx_lm")
+class FingerprintRefusesAStaleCache(unittest.TestCase):
+    """Each test changes exactly ONE fingerprint input and asserts the cache is
+    refused. A cache accepted after any of these changes would be silently wrong."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp()
+        self.args = ("m/x", "4bit", "PERSONA TEXT v1")
+        cache = _cache()
+        ok = server.save_prompt_cache_fingerprinted(
+            self.root, "persona", cache, *self.args
+        )
+        self.assertTrue(ok, "setUp could not persist a cache")
+        self.cache = cache
+
+    def _load(self, model_id=None, quant=None, prefix=None, expect=None):
+        return server.load_prompt_cache_fingerprinted(
+            self.root, "persona",
+            model_id if model_id is not None else self.args[0],
+            quant if quant is not None else self.args[1],
+            prefix if prefix is not None else self.args[2],
+            expect if expect is not None else self.cache,
+        )
+
+    def test_an_unchanged_fingerprint_loads(self):
+        got = self._load()
+        self.assertIsNotNone(got, "an identical fingerprint must load")
+        self.assertEqual([c.offset for c in got], [c.offset for c in self.cache])
+
+    def test_a_changed_prefix_is_refused(self):
+        """THE ONE THAT MATTERS. Editing the persona must invalidate the cache, or the
+        assistant keeps answering as the persona you replaced."""
+        self.assertIsNone(self._load(prefix="PERSONA TEXT v2"))
+
+    def test_a_prefix_of_the_same_length_is_still_refused(self):
+        """The fingerprint hashes the text; it must not be fooled by an edit that
+        preserves the character count."""
+        same_len = "PERSONA TEXT v9"
+        self.assertEqual(len(same_len), len(self.args[2]))
+        self.assertIsNone(self._load(prefix=same_len))
+
+    def test_a_changed_model_is_refused(self):
+        self.assertIsNone(self._load(model_id="other/model"))
+
+    def test_a_changed_quant_is_refused(self):
+        self.assertIsNone(self._load(quant="8bit"))
+
+    def test_a_changed_layer_count_is_refused(self):
+        self.assertIsNone(self._load(expect=_cache(layers=5)))
+
+    def test_an_absent_file_is_refused_not_raised(self):
+        self.assertIsNone(
+            server.load_prompt_cache_fingerprinted(
+                tempfile.mkdtemp(), "persona", *self.args, self.cache
+            )
+        )
+
+    def test_a_truncated_file_is_refused_not_raised(self):
+        """A crash mid-write, a disk-full, a concurrent writer: presence is not
+        integrity, and a corrupt file must fall back to a real prefill."""
+        path = server._prompt_cache_path(self.root, "persona")
+        with open(path, "r+b") as fh:
+            fh.truncate(os.path.getsize(path) // 3)
+        self.assertIsNone(self._load())
+
+    def test_a_garbage_file_is_refused_not_raised(self):
+        path = server._prompt_cache_path(self.root, "persona")
+        with open(path, "wb") as fh:
+            fh.write(b"not a safetensors file at all")
+        self.assertIsNone(self._load())
+
+
+@unittest.skipUnless(HAVE_MLX, "needs mlx + mlx_lm")
+class PersistenceIsNeverFatal(unittest.TestCase):
+    """Saving is an optimization. It has already cost this codebase the whole backend
+    twice by being allowed to raise, so it must not be able to."""
+
+    def test_saving_to_an_unwritable_root_returns_false(self):
+        ok = server.save_prompt_cache_fingerprinted(
+            "/nonexistent/read-only/path", "persona", _cache(), "m/x", "4bit", "p"
+        )
+        self.assertFalse(ok)
+
+    def test_saving_leaves_no_temp_file_behind_on_failure(self):
+        root = tempfile.mkdtemp()
+        # A cache containing something unserializable makes save_prompt_cache raise
+        # AFTER the temp path is chosen.
+        server.save_prompt_cache_fingerprinted(
+            root, "persona", ["not a cache object"], "m/x", "4bit", "p"
+        )
+        d = os.path.join(root, server.PROMPT_CACHE_DIRNAME)
+        strays = [f for f in os.listdir(d)] if os.path.isdir(d) else []
+        self.assertEqual(
+            [f for f in strays if f.endswith(".tmp")], [],
+            f"a failed save left a temp file behind: {strays}",
+        )
+
+    def test_a_loaded_cache_is_still_trimmable(self):
+        """The classifier reuses its cache across turns via trim_prompt_cache. A
+        restored cache that cannot be trimmed would break every classify after the
+        first."""
+        root = tempfile.mkdtemp()
+        cache = _cache(tokens=20)
+        server.save_prompt_cache_fingerprinted(
+            root, "classifier", cache, "m/x", "4bit", "p"
+        )
+        got = server.load_prompt_cache_fingerprinted(
+            root, "classifier", "m/x", "4bit", "p", cache
+        )
+        self.assertIsNotNone(got)
+        self.assertTrue(can_trim_prompt_cache(got))
+        trim_prompt_cache(got, 4)
+        self.assertEqual([c.offset for c in got], [16, 16, 16])
+
+    def test_the_restored_cache_is_bit_identical(self):
+        """The saving is only free if the KV bytes survive the round trip."""
+        root = tempfile.mkdtemp()
+        cache = _cache()
+        server.save_prompt_cache_fingerprinted(
+            root, "persona", cache, "m/x", "4bit", "p"
+        )
+        got = server.load_prompt_cache_fingerprinted(
+            root, "persona", "m/x", "4bit", "p", cache
+        )
+        for a, b in zip(cache, got):
+            n = a.offset
+            self.assertTrue(
+                mx.array_equal(a.keys[:, :, :n, :], b.keys[:, :, :n, :]).item(),
+                "restored keys differ from what was saved",
+            )
+            self.assertTrue(
+                mx.array_equal(a.values[:, :, :n, :], b.values[:, :, :n, :]).item(),
+                "restored values differ from what was saved",
+            )
+
+
+class FingerprintCoversEveryInput(unittest.TestCase):
+    """A fingerprint that omits an input silently accepts a stale cache, so pin the
+    field set. Adding a field is fine; SILENTLY DROPPING one is the bug."""
+
+    def test_required_fields(self):
+        fp = server._prompt_cache_fingerprint("m/x", "4bit", "text", [object()])
+        for field in (
+            "schema", "model_id", "quant", "prefix_sha256",
+            "prefix_chars", "mlx_lm", "cache_classes", "layers",
+        ):
+            self.assertIn(field, fp, f"fingerprint lost {field!r}")
+
+    def test_every_value_is_a_string(self):
+        """safetensors metadata is str->str; a non-string would raise at save time on
+        a path that is supposed to be non-fatal."""
+        fp = server._prompt_cache_fingerprint("m/x", "4bit", "text", [object()])
+        for k, v in fp.items():
+            self.assertIsInstance(v, str, f"{k} is {type(v).__name__}, not str")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
