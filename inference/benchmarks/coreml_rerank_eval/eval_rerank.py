@@ -1,4 +1,13 @@
 #!/usr/bin/env python
+# NOTE ON HOW TO RUN THIS SO IT MEASURES WHAT SHIPS:
+#
+#   HF_HOME="$HOME/Library/Application Support/DARWIN/models" .venv/bin/python eval_rerank.py
+#
+# Without HF_HOME this resolves to the DEV cache (~/.cache/huggingface), a DIFFERENT
+# configuration from the installed one - it does not necessarily carry the
+# short-sequence ANE graph. Not hypothetical: a re-run without HF_HOME reported
+# 11.04 ms/pair, identical to the pre-ANE committed figure, and looked exactly like the
+# fast path having no effect. With HF_HOME set it is 1.86 ms/pair at identical quality.
 """
 Two-stage retrieval MEASURE-FIRST probe: does adding a Core ML cross-encoder RERANK
 stage on top of the shipped bge bi-encoder MEASURABLY improve ranking?
