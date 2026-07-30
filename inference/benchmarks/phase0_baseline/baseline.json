@@ -201,5 +201,26 @@
     },
     "disk_cost_mb": 412,
     "NEW_DOMINANT_ITEM": "Core ML is now 11.5 s of the 18.9 s (embedder 7.7 + reranker 3.8) - 61% of startup. Part of that is the ANE fast path deliberately loading TWO graphs per model. It is the obvious next target, but note coremltools CONVERSION is not thread-safe (that bug cost a deploy tonight); whether LOADING can be parallelized is unmeasured and must not be assumed."
+  },
+  "compiled_model_cache": {
+    "the_finding": "ct.models.MLModel(<dir>.mlpackage) pays a FULL Core ML program specialization on every load. It is not the mlpackage->mlmodelc compilation (that is ~104 ms); it is the specialization, which Core ML caches per COMPILED model - and MLModel compiles the package into a throwaway temp .mlmodelc each time, so it never hits that cache.",
+    "per_graph_load_ms_from_mlpackage": {
+      "emb_b1": 4606,
+      "emb_b1_s128": 2914,
+      "rerank_b1": 2258,
+      "rerank_b1_s128": 1465
+    },
+    "validate_predicts_ms_total": 77,
+    "note": "11.24 s of the 11.5 s Core ML startup was MLModel loads; the validate-predicts were 77 ms",
+    "fix": "persist the .mlmodelc beside the .mlpackage and load it with CompiledMLModel, compiling once on first use; fall back to the .mlpackage on any problem",
+    "measured_after": {
+      "both_models_across_fresh_processes_s": 2.5,
+      "before_s": 11.24,
+      "speedup": "4.5x"
+    },
+    "HONEST_LIMIT": "an isolated single-graph test showed 4400 ms -> 65 ms (68x) and I initially expected ~0.3 s total. The settled cross-process figure is 2.5 s, not 0.3 s: the largest graph (the 64 MB 512 embedder) does not stay warm in Core ML's cross-process specialization cache, and repeatedly loading four graphs plus stray test copies caused visible eviction churn. The 8.7 s saving is real; the 11x I first inferred from one graph in isolation was not.",
+    "disk_cost_mb": 214,
+    "disk_note": "the .mlmodelc is the same size as its .mlpackage (64/64/43/43 MB). Both are kept so a corrupt compiled model falls back to a slow load rather than a 40 s reconversion.",
+    "process_note": "the temp destination must ALSO end in .mlmodelc - compile_model validates the extension. That shipped wrong once and only the fallback hid it, which is the SECOND extension-validating API to catch me in this session after mx.save_safetensors."
   }
 }
