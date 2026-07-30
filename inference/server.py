@@ -222,6 +222,7 @@ import logging
 import logging.handlers
 import math
 import os
+import tempfile
 import re
 import signal
 import sys
@@ -1707,6 +1708,24 @@ DESCRIBE_IMAGE_UNAVAILABLE_REASON = "vlm_unavailable"
 # scene description or a VQA answer; bounds a pathological generation from
 # holding the GPU lock. The daemon may not override it past this hard cap.
 DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS = 256
+# VISUAL-TOKEN BUDGET for op=describe_image.
+#
+# Qwen2-VL turns each 28x28 block of the image into one visual token, so a 1512x982
+# screen becomes ~1890 of them. MEASURED on this machine, feeding that many DEGRADES
+# THE MODEL INTO REPETITION COLLAPSE: asked "what does the blue button say?" about a
+# perfectly legible code-editor screenshot it answered "The The The The The ..." and,
+# asked for an error code, regurgitated the source instead. Downscaling the SAME
+# screenshot to half size (~460 visual tokens) produced "The blue button in the image
+# says 'Run Tests.'" - coherent and correct.
+#
+# So this cap is a CORRECTNESS fix that happens to also be a speed one: median
+# describe latency went 8.08 s -> 1.62 s (5x) across three fixtures.
+#
+# The working band has a floor as well as a ceiling. At ~216 visual tokens (0.35 scale)
+# accuracy collapsed to 0/8 - the text is simply too small to read. The default below
+# sits at the measured-good point; going much under it trades the degenerate regime for
+# an illegible one.
+DESCRIBE_IMAGE_MAX_PIXELS = 380_000  # ~756x491, the measured-good point
 DESCRIBE_IMAGE_MAX_TOKENS_CAP = 1024
 # Default instruction when the caller asks for a plain description (no question).
 DESCRIBE_IMAGE_DEFAULT_PROMPT = (
@@ -2873,6 +2892,38 @@ def load_prompt_cache_fingerprinted(root, name, model_id, quant, prefix_str, exp
         log.warning("prompt cache %s: not usable (%s); prefilling fresh", name, e)
         return None
 
+
+
+def downscale_for_vlm(path, max_pixels=None, out_dir=None):
+    """Return a path to an image whose pixel count is at most `max_pixels`, preserving
+    aspect ratio. Returns the ORIGINAL path when it already fits, or when anything goes
+    wrong - a failure here must cost the caller nothing but the speedup, never the
+    answer. See DESCRIBE_IMAGE_MAX_PIXELS for why the cap exists."""
+    cap = DESCRIBE_IMAGE_MAX_PIXELS if max_pixels is None else max_pixels
+    if not cap or cap <= 0:
+        return path
+    try:
+        from PIL import Image
+
+        with Image.open(path) as im:
+            w, h = im.size
+            if w * h <= cap:
+                return path
+            factor = (cap / float(w * h)) ** 0.5
+            nw, nh = max(1, int(w * factor)), max(1, int(h * factor))
+            target = out_dir or tempfile.mkdtemp(prefix="darwin-vlm-")
+            os.makedirs(target, exist_ok=True)
+            dest = os.path.join(target, f"scaled-{nw}x{nh}.png")
+            im.convert("RGB").resize((nw, nh), Image.LANCZOS).save(dest)
+        log.info(
+            "op=describe_image: %dx%d exceeds the %d-pixel visual budget; "
+            "describing at %dx%d", w, h, cap, nw, nh,
+        )
+        return dest
+    except Exception as e:  # noqa: BLE001 - optional; never costs the answer
+        log.warning("op=describe_image: could not downscale %s (%s); using it as-is",
+                    os.path.basename(str(path)), e)
+        return path
 
 class InferenceEngine:
     """Lazy-loading, resident MLX models. All methods are blocking; callers
@@ -4679,11 +4730,15 @@ class InferenceEngine:
                 formatted = vlm["apply_chat_template"](
                     vlm["processor"], vlm["config"], prompt, num_images=1
                 )
+                # Cap the visual-token count BEFORE generating. Feeding a full
+                # screen (~1890 visual tokens) drives this model into repetition
+                # collapse on real screenshots - see DESCRIBE_IMAGE_MAX_PIXELS.
+                vlm_path = downscale_for_vlm(path)
                 text = vlm["generate"](
                     vlm["model"],
                     vlm["processor"],
                     formatted,
-                    [path],
+                    [vlm_path],
                     max_tokens=max_tokens,
                     verbose=False,
                 )
