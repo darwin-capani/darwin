@@ -258,17 +258,13 @@ class CoreMLReranker:
         from transformers import AutoTokenizer
 
         tok = AutoTokenizer.from_pretrained(os.path.join(d, _TOK_DIRNAME))
-        model = ct.models.MLModel(
-            os.path.join(d, _MODEL_NAME), compute_units=ct.ComputeUnit.ALL
-        )
+        model = coreml_shared.load_model_fast(os.path.join(d, _MODEL_NAME))
         self._validate_predict(model)
         fast = None
         fast_path = os.path.join(d, _MODEL_FAST_NAME)
         if os.path.isdir(fast_path):
             try:
-                cand = ct.models.MLModel(
-                    fast_path, compute_units=ct.ComputeUnit.ALL
-                )
+                cand = coreml_shared.load_model_fast(fast_path)
                 self._validate_predict(cand, seq=SEQ_FAST)
                 fast = cand
             except Exception as e:  # optional: degrade to SEQ, never fail the load
