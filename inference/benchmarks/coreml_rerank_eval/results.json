@@ -41,9 +41,9 @@
       "name": "bge top-20 + cross-encoder rerank",
       "dense_recall@K": 1.0,
       "rerank_latency": {
-        "median_ms": 220.65,
-        "p90_ms": 222.68,
-        "per_pair_ms": 11.03
+        "median_ms": 37.12,
+        "p90_ms": 43.36,
+        "per_pair_ms": 1.86
       },
       "summary": {
         "recall@1": 0.8657,
@@ -60,9 +60,9 @@
       "name": "bge top-50 + cross-encoder rerank",
       "dense_recall@K": 1.0,
       "rerank_latency": {
-        "median_ms": 550.07,
-        "p90_ms": 553.91,
-        "per_pair_ms": 11.0
+        "median_ms": 93.84,
+        "p90_ms": 101.28,
+        "per_pair_ms": 1.88
       },
       "summary": {
         "recall@1": 0.8657,
