@@ -3537,6 +3537,7 @@ class InferenceEngine:
         # throwaway arrays for these 869 tokens).
         self._cls_model(mx.array(prefix_tokens)[None], cache=cache)
         mx.eval([c.state for c in cache])
+        mx.clear_cache()
         self._cls_prefix_str = prefix_str
         self._cls_suffix_str = suffix_str
         self._cls_prefix_tokens = list(prefix_tokens)
@@ -3652,6 +3653,10 @@ class InferenceEngine:
         # This is mlx_lm's own prefill pattern (generate.py: mx.eval([c.state ...])).
         self._model(mx.array(prefix_tokens)[None], cache=cache)
         mx.eval([c.state for c in cache])
+        # Return the prefill's transients to the OS. mlx_lm pairs its state eval with
+        # this at every occurrence and we had adopted only half the pattern, leaving
+        # tens of MB per prefill sitting in MLX's buffer pool past boot.
+        mx.clear_cache()
         log.info(
             "persona prompt cache prefilled: %d tokens in %dms",
             len(prefix_tokens),
@@ -3979,8 +3984,17 @@ class InferenceEngine:
         while pos < n:
             stop = min(pos + prefill_chunk, n)
             with self._lock:
-                logits = model(mx.array(prompt_tokens[pos:stop])[None], cache=cache)
-                mx.eval(logits)
+                # Eval the CACHE, not the logits - same reason as the persona and
+                # classifier prefills, but this one runs at STEADY STATE rather than
+                # boot. Each 256-token slice used to materialize the tied lm_head
+                # projection to vocab_size 151,936 = 77.8 MB of arrays it never reads,
+                # under this lock; a 4000-token consolidate prompt aggregated ~1.2 GB.
+                # Evaluating the cache still forces this slice's whole forward pass
+                # before the lock is released, so the interruptibility contract above
+                # is unchanged.
+                model(mx.array(prompt_tokens[pos:stop])[None], cache=cache)
+                mx.eval([c.state for c in cache])
+                mx.clear_cache()
             pos = stop
             # threading.Lock has no fairness: without this yield the loop
             # re-acquires before a queued interactive op ever wakes (measured

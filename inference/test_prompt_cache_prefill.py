@@ -20,6 +20,7 @@ comment, which is a trap this repo has already been caught by once.
 
   Run: .venv/bin/python inference/test_prompt_cache_prefill.py   (from the repo root)
 """
+import time
 import unittest
 
 try:
@@ -91,8 +92,41 @@ class PrefillEvaluatesTheCacheNotTheLogits(unittest.TestCase):
             f"{cache_peak:.1f} MB with eval(cache); the head alone is {logits_mb:.1f} MB",
         )
 
-    def test_the_cache_is_identical_either_way(self):
-        """The saving must be free: same KV cache, only the transient differs."""
+    def test_the_cache_is_actually_materialized_not_left_lazy(self):
+        """THE PROPERTY THAT MATTERS, and the one the first version of this file
+        missed. Every assertion here used to pass when the prefill evaluated NOTHING
+        at all: the identity test called .tolist(), which forces the graph in both
+        branches, and the memory test was a one-sided assertLess that evaluating LESS
+        always satisfies. A prefill that leaves the cache lazy is a real regression -
+        the ~33 s of GPU work migrates into the first user request while the engine
+        lock is held, and the "prefilled: N tokens in Xms" log reports a time that is
+        a lie. So: after the prefill, forcing the raw K/V must be nearly FREE."""
+        m = self._model()
+        cache = [KVCache() for _ in range(LAYERS)]
+        x = mx.random.normal((1, TOKENS, HIDDEN))
+        mx.eval(x)
+        m(x, cache)
+        mx.eval([c.state for c in cache])          # the shipped strategy
+        t0 = time.perf_counter()
+        mx.eval([(c.keys, c.values) for c in cache])
+        forced_after = time.perf_counter() - t0
+
+        m2 = self._model()
+        cache2 = [KVCache() for _ in range(LAYERS)]
+        m2(x, cache2)                               # evaluate NOTHING (the mutant)
+        t0 = time.perf_counter()
+        mx.eval([(c.keys, c.values) for c in cache2])
+        forced_lazy = time.perf_counter() - t0
+
+        self.assertLess(
+            forced_after, forced_lazy * 0.5,
+            f"the cache was left LAZY: forcing K/V after the prefill took "
+            f"{forced_after*1000:.1f} ms vs {forced_lazy*1000:.1f} ms with no eval at "
+            "all - the prefill's GPU work would land on the first real request",
+        )
+
+    def test_the_cache_contents_are_unchanged_by_the_strategy(self):
+        """The saving must be free: same KV values, only the transient differs."""
         results = []
         for eval_logits in (True, False):
             mx.random.seed(1234)
@@ -106,26 +140,50 @@ class PrefillEvaluatesTheCacheNotTheLogits(unittest.TestCase):
             else:
                 mx.eval([c.state for c in cache])
             results.append([mx.array(c.keys).tolist() for c in cache])
+        self.assertEqual(results[0], results[1])
+
+    def test_every_prefill_site_evaluates_the_cache(self):
+        """Tie the property to the REAL call sites. The two previous versions of this
+        guard both failed the mutant that matters: replacing the eval with `pass`
+        leaves a prefill that evaluates NOTHING, and neither a "does not bind logits"
+        check nor a self-contained behavioural test (which builds its own model, so
+        server.py cannot affect it) notices. So: find every model call made for its
+        KV side effect, and require a cache-state eval right after it."""
+        import pathlib
+        import re
+        src = pathlib.Path(__file__).resolve().parent / "server.py"
+        lines = src.read_text(encoding="utf-8").splitlines()
+        # A prefill-for-side-effect call: any model invocation passing cache=cache.
+        call = re.compile(r"^\s*(?:\w+\s*=\s*)?[\w.]*model\(.*cache=cache\)", re.IGNORECASE)
+        bad = []
+        for i, line in enumerate(lines):
+            if not call.match(line):
+                continue
+            window = "\n".join(lines[i + 1:i + 4])
+            if "mx.eval([c.state for c in cache])" not in window:
+                bad.append(f"line {i + 1}: {line.strip()}")
         self.assertEqual(
-            results[0], results[1],
-            "the KV cache differs between the two eval strategies - the saving is "
-            "only free if the cache is untouched",
+            bad, [],
+            "a prefill runs the model for its KV side effect but does not evaluate "
+            "the cache right after. Either it evaluates the logits (materializing the "
+            "tied vocab projection it throws away) or it evaluates NOTHING (leaving "
+            "the cache lazy, so the prefill's GPU work lands on the first real request "
+            f"while the engine lock is held). Sites: {bad}",
         )
 
-    def test_the_real_prefills_do_not_bind_logits(self):
-        """Guard the actual call sites. Deliberately NOT a substring check for the
-        fix (a comment would satisfy that); this asserts the ABSENCE of the old
-        binding, which no comment introduces."""
+    def test_every_state_eval_is_paired_with_clear_cache(self):
+        """mlx_lm pairs its prefill state-eval with mx.clear_cache() at every
+        occurrence; we shipped only half the pattern once already, leaving tens of MB
+        per prefill in MLX's buffer pool past boot."""
         import pathlib
         src = pathlib.Path(__file__).resolve().parent / "server.py"
         text = src.read_text(encoding="utf-8")
-        for bad in ("logits = self._model(", "logits = self._cls_model("):
-            self.assertNotIn(
-                bad, text,
-                f"{bad!r} is back: the prefill binds and evaluates logits again, "
-                "materializing the vocab projection it throws away",
-            )
-
+        evals = text.count("mx.eval([c.state for c in cache])")
+        clears = text.count("mx.clear_cache()")
+        self.assertGreaterEqual(
+            clears, evals,
+            f"{evals} cache-state evals but only {clears} mx.clear_cache() calls",
+        )
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
