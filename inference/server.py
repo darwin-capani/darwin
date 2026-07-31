@@ -3725,47 +3725,6 @@ class InferenceEngine:
                     "preload: Core ML reranker warm failed; op=rerank will report "
                     "fell_back and the daemon will keep dense order",
                 )
-        # OCR (op=describe_image, OCR-first screen reading). Warmed in the BACKGROUND,
-        # not inline, and the distinction is the whole point:
-        #
-        #   Loaded lazily inside the request, the load runs while the engine lock is
-        #   held — measured on the live server at 19,536 ms against 2,952 ms warm. Every
-        #   other op (classify, converse, speak, transcribe) blocks on that same lock,
-        #   so one screen question made DARWIN deaf for twenty seconds and blew the
-        #   daemon's 30 s timeout.
-        #
-        #   Loaded inline HERE, that same ~16 s lands on boot instead — against a
-        #   startup this campaign just brought from 63 s to 8.96 s. Trading a 3x boot
-        #   regression for a rare op is not a fix.
-        #
-        # So: a background thread takes the lock and pays the load while nothing is
-        # asking. Boot is unblocked, and by the time a screen question arrives the
-        # model is resident. A question in the first ~16 s simply waits for the warm
-        # already in flight instead of starting a second one — which is the other
-        # reason to do it here rather than leaving it lazy.
-        if self.ocr_model_id:
-            def _warm_ocr():
-                try:
-                    t0 = time.perf_counter()
-                    with self._lock:
-                        ok = self._ensure_ocr() is not None
-                    log.info(
-                        "preload: OCR %s %s (%.1fs)", self.ocr_model_id,
-                        "ready" if ok else "unavailable; op=describe_image will ask the "
-                        "VLM directly", time.perf_counter() - t0,
-                    )
-                except Exception:
-                    # A warm thread that raises must never take the server with it; the
-                    # request path falls back to the VLM and says which path it took.
-                    log.exception(
-                        "preload: OCR warm failed; op=describe_image will ask the VLM")
-            try:
-                threading.Thread(
-                    target=_warm_ocr, name="ocr-warm", daemon=True).start()
-            except Exception:
-                # GUARDED START. An unguarded Thread.start() that fails here would
-                # abort the rest of preload, leaving the VAD weights unexported.
-                log.exception("preload: could not start the OCR warm thread")
         # LEARNED VAD native weights (inference/coreml_vad.py, task: replace the
         # RMS-gate VAD). The daemon runs the learned Silero VAD IN-PROCESS on its
         # realtime audio thread (daemon/src/silero.rs) — an RPC-per-frame design
@@ -3813,6 +3772,53 @@ class InferenceEngine:
             self.generate_openers()
         except Exception:
             log.exception("preload: opener bank generation failed; daemon will run without openers")
+        # OCR (op=describe_image, OCR-first screen reading). Warmed in the BACKGROUND,
+        # not inline, and the distinction is the whole point:
+        #
+        #   Loaded lazily inside the request, the load runs while the engine lock is
+        #   held — measured on the live server at 19,536 ms against 2,952 ms warm. Every
+        #   other op (classify, converse, speak, transcribe) blocks on that same lock,
+        #   so one screen question made DARWIN deaf for twenty seconds and blew the
+        #   daemon's 30 s timeout.
+        #
+        #   Loaded inline HERE, that same ~16 s lands on boot instead — against a
+        #   startup this campaign just brought from 63 s to 8.96 s. Trading a 3x boot
+        #   regression for a rare op is not a fix.
+        #
+        # Started LAST, after every other warm and the opener bank. The warm still
+        # contends for the same GPU lock, and started early it slowed the models that
+        # matter more: measured on the live server, moving it ahead of TTS pushed the
+        # TTS warm 3.1s -> 4.3s and the whole preload 12s -> 19s. describe_image is
+        # the rarest op here, so it queues behind speak, listen and think.
+        #
+        # So: a background thread takes the lock and pays the load while nothing is
+        # asking. Boot is unblocked, and by the time a screen question arrives the
+        # model is resident. A question in the first ~16 s simply waits for the warm
+        # already in flight instead of starting a second one — which is the other
+        # reason to do it here rather than leaving it lazy.
+        if self.ocr_model_id:
+            def _warm_ocr():
+                try:
+                    t0 = time.perf_counter()
+                    with self._lock:
+                        ok = self._ensure_ocr() is not None
+                    log.info(
+                        "preload: OCR %s %s (%.1fs)", self.ocr_model_id,
+                        "ready" if ok else "unavailable; op=describe_image will ask the "
+                        "VLM directly", time.perf_counter() - t0,
+                    )
+                except Exception:
+                    # A warm thread that raises must never take the server with it; the
+                    # request path falls back to the VLM and says which path it took.
+                    log.exception(
+                        "preload: OCR warm failed; op=describe_image will ask the VLM")
+            try:
+                threading.Thread(
+                    target=_warm_ocr, name="ocr-warm", daemon=True).start()
+            except Exception:
+                # GUARDED START. An unguarded Thread.start() that fails here would
+                # abort the rest of preload, leaving the VAD weights unexported.
+                log.exception("preload: could not start the OCR warm thread")
 
     # -- classifier prompt cache ----------------------------------------
 
