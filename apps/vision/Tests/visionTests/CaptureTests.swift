@@ -244,4 +244,50 @@ final class CaptureAuthAndFactoryTests: XCTestCase {
         for await _ in stub.frames() { n += 1 }
         XCTAssertEqual(n, 0)
     }
+
+    // MARK: - the authorization probe must be BOUNDED
+
+    /// Under the seatbelt profile the daemon generates from apps/vision/manifest.toml,
+    /// SCShareableContent's continuation is never resumed: the child prints
+    /// SWIFT TASK CONTINUATION MISUSE and hangs forever, emitting no vision.error and
+    /// no status, with every later op — including `stop` — ignored because the actor
+    /// is still inside that await.
+    ///
+    /// A probe that NEVER returns is exactly what the sandbox produces: the
+    /// continuation is dropped and the task hangs forever. The call must still return.
+    func testAuthorizationReturnsEvenWhenTheProbeNeverDoes() async throws {
+        let src = ScreenSource()
+        src.authorizationTimeoutOverride = 200_000_000  // 0.2s
+        src.probeShareableContent = {
+            // Never resumes — the seatbelt case, without needing the seatbelt.
+            try await Task.sleep(nanoseconds: 60_000_000_000)
+        }
+        let started = Date()
+        let auth = await src.authorization()
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(auth, .restricted,
+                       "a probe that cannot complete must report .restricted")
+        XCTAssertLessThan(elapsed, 5.0,
+                          "authorization() did not honour its deadline (\(elapsed)s) - an unbounded await wedges the whole app")
+    }
+
+    func testAuthorizationStillReportsAuthorizedWhenTheProbeSucceeds() async throws {
+        let src = ScreenSource()
+        src.authorizationTimeoutOverride = 5_000_000_000
+        src.probeShareableContent = { }
+        let auth = await src.authorization()
+        XCTAssertEqual(auth, .authorized)
+    }
+
+    func testAuthorizationReportsDeniedWhenTheProbeThrows() async throws {
+        struct Nope: Error {}
+        let src = ScreenSource()
+        src.authorizationTimeoutOverride = 5_000_000_000
+        src.probeShareableContent = { throw Nope() }
+        let auth = await src.authorization()
+        XCTAssertEqual(auth, .denied,
+                       "a real TCC refusal must stay .denied, distinct from .restricted")
+    }
+
 }
