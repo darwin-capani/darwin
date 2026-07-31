@@ -931,7 +931,16 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // The image is read ON-DEVICE by the inference server (pixels never leave the
     // device); DISTINCT from OCR (read.screen = text glyphs; VLM = visual
     // understanding). Listed here so neither key reads as a typo.
-    ("vision", &["enabled", "model"]),
+    //   - `ocr_model` (OCR-FIRST screen reading): when set, op=describe_image
+    //     TRANSCRIBES the screen with this model and answers from the transcript with
+    //     the already-resident LLM, rather than asking the VLM to answer directly.
+    //     MEASURED 11/12 checkable facts against the VLM's 9/12 — the VQA failure was
+    //     never blindness, the model would emit the single token "The" and stop on a
+    //     screen whose text it could plainly resolve. A first question about a screen
+    //     costs more (~1.6s -> ~7.4s); transcripts are cached by image CONTENT so a
+    //     follow-up is FASTER than the VLM path. EMPTY disables it and the VLM answers
+    //     directly, exactly as before.
+    ("vision", &["enabled", "model", "ocr_model"]),
     // [image] — the OPTIONAL on-device TEXT->IMAGE generation path (task #18):
     // the inference `generate_image` op (MLX diffusion) plus the daemon
     // "generate/make/draw an image of X" intent. `enabled` SHIPS ON (full-power
@@ -3183,6 +3192,8 @@ impl Default for UiAutomationConfig {
 pub struct VisionConfig {
     pub enabled: bool,
     pub model: String,
+    /// OCR-first screen reading (see the key list above). Empty disables it.
+    pub ocr_model: String,
 }
 
 impl Default for VisionConfig {
@@ -3196,6 +3207,10 @@ impl Default for VisionConfig {
             // SHIPS EMPTY — no VLM is loaded until the operator names one (and
             // downloads it). Empty => the op honestly reports unavailable.
             model: String::new(),
+            // SHIPS EMPTY for the same reason: the OCR checkpoint is a multi-GB
+            // download. The shipped config/darwin.toml names one; an operator who has
+            // not fetched it gets the VLM path unchanged rather than a failure.
+            ocr_model: String::new(),
         }
     }
 }
