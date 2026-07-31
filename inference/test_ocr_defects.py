@@ -231,6 +231,20 @@ class TheOcrModelIsWarmedNotLoadedInsideARequest(unittest.TestCase):
             "threading.Thread(target=_warm_ocr).start() must sit inside a try/except",
         )
 
+    def test_the_warm_starts_after_the_other_models(self):
+        """The warm contends for the same GPU lock as every other preload step, so
+        starting it early slows the models that matter more. Measured on the live
+        server: ahead of TTS it pushed the TTS warm 3.1s -> 4.3s and the whole preload
+        12s -> 19s. describe_image is the rarest op, so it goes last."""
+        pre = self._preload_src()
+        start = pre.index("threading.Thread(")
+        for earlier in ("_ensure_llm", "_ensure_classifier", "_ensure_tts", "generate_openers"):
+            self.assertLess(
+                pre.index(earlier), start,
+                f"the OCR warm thread starts before {earlier}(), so it competes for the "
+                "GPU lock with a model the user is far more likely to need first",
+            )
+
     def test_the_warm_takes_the_engine_lock(self):
         """_ensure_vlm's contract ("must be called with self._lock held") applies to
         the OCR load too -- it is the same GPU. A warm racing a request would run two
