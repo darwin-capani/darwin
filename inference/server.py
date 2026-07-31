@@ -2406,11 +2406,19 @@ def load_config():
     speech = cfg.get("speech", {})
     inference = cfg.get("inference", {})
     image = cfg.get("image", {})
+    vision = cfg.get("vision", {})
     sources = (
         ("llm", models, "llm", str),
         ("stt", models, "stt", str),
         ("classifier", models, "classifier", str),
         ("vlm", models, "vlm", str),
+        # [vision].ocr_model — OCR-first screen reading. This was DOCUMENTED as an
+        # off-switch ("empty string disables OCR") and never read, so setting it
+        # did nothing and OCR could not be turned off at all. The unit tests
+        # construct the engine directly with ocr_model="" and so never touched
+        # load_config, which is why they passed while production could not reach
+        # that state.
+        ("ocr_model", vision, "ocr_model", str),
         ("engine", speech, "engine", str),
         ("tts_model", speech, "model", str),
         ("voice", speech, "voice", str),
@@ -2968,25 +2976,57 @@ def downscale_for_vlm(path, max_pixels=None, out_dir=None):
 
 
 def _transcript_answer_is_a_refusal(text):
-    """True when the LLM said the transcript does not contain the answer.
+    """True when the LLM said THE TRANSCRIPT does not contain the answer.
 
-    Deliberately NARROW. A false positive costs one extra VLM call; a false negative
-    returns a refusal to the user for something plainly on their screen. The phrasings
-    are the ones the grounding prompt itself invites."""
-    t = (text or "").lower()
-    return any(
-        p in t
-        for p in (
-            "does not contain",
-            "doesn't contain",
-            "not contain the answer",
-            "no information about",
-            "not mentioned in the transcript",
-            "not present in the transcript",
-            "cannot be determined from the transcript",
-            "transcript does not",
-        )
+    The first version matched bare substrings like "does not contain" anywhere in the
+    reply, which is ordinary English that appears in real screen text. It fired on
+    correct ANSWERS -- "The dialog says: the certificate does not contain a valid
+    signature" is exactly the answer the user wanted, and it was thrown away and
+    replaced with the weaker VLM path (measured 9/12 against this path's 11/12).
+
+    A false positive is therefore NOT free, as that docstring wrongly claimed: it
+    discards a correct answer. So the match now requires the negation to be ABOUT THE
+    SOURCE -- the transcript or the screen -- rather than merely to appear somewhere in
+    the reply. That alone clears every observed false positive: an answer quoting screen
+    text names the dialog, the log or the error, not the transcript.
+
+    The errors are NOT symmetric, so the remaining bias is deliberate. A false positive
+    costs one VLM call and the VLM still answers correctly most of the time (measured
+    9/12 on this task against 11/12 here). A false NEGATIVE hands the user "the
+    transcript does not contain that" as the final answer and never asks the VLM at
+    all -- a guaranteed miss. So when the two conflict, flag it.
+
+    A length cap was tried here and removed for exactly that reason: it let a 167-char
+    refusal through to the user while protecting no real answer, since none of them
+    name the transcript in the first place."""
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    subject = ("transcript", "screen", "text provided", "text above")
+    negation = (
+        "does not contain",
+        "doesn't contain",
+        "does not include",
+        "no information",
+        "not mentioned",
+        "not present",
+        "cannot be determined",
+        "can't be determined",
+        "not specified",
+        "unable to determine",
+        # The "says/shows" family. The first list omitted these, so "the transcript
+        # doesn't say anything about the battery" was returned to the user verbatim
+        # as the answer -- the expensive direction of this classifier's error.
+        "does not say",
+        "doesn't say",
+        "does not show",
+        "doesn't show",
+        "no mention",
     )
+    if not any(n in t for n in negation):
+        return False
+    # The negation has to be about the SOURCE, not about something on the screen.
+    return any(sub in t for sub in subject)
 
 class InferenceEngine:
     """Lazy-loading, resident MLX models. All methods are blocking; callers
@@ -3007,6 +3047,11 @@ class InferenceEngine:
         self._ocr_processor = None
         self._ocr_config = None
         self._ocr_transcripts = {}  # sha256(image bytes) -> transcript
+        # LATCHED after a failed load. Without it every describe_image retried the
+        # load - which for a missing checkpoint means re-attempting a 1.2 GB
+        # snapshot_download, under the engine lock, on every question. The Core ML
+        # backends latch the same way (_coreml_embed_unavailable).
+        self._ocr_unavailable = False
         # OPTIONAL on-device text->image model id (op=generate_image). Empty
         # string disables the op entirely (honest "unavailable"); a non-empty id
         # is the checkpoint the MLX diffusion engine will lazy-load on first use.
@@ -3680,6 +3725,47 @@ class InferenceEngine:
                     "preload: Core ML reranker warm failed; op=rerank will report "
                     "fell_back and the daemon will keep dense order",
                 )
+        # OCR (op=describe_image, OCR-first screen reading). Warmed in the BACKGROUND,
+        # not inline, and the distinction is the whole point:
+        #
+        #   Loaded lazily inside the request, the load runs while the engine lock is
+        #   held — measured on the live server at 19,536 ms against 2,952 ms warm. Every
+        #   other op (classify, converse, speak, transcribe) blocks on that same lock,
+        #   so one screen question made DARWIN deaf for twenty seconds and blew the
+        #   daemon's 30 s timeout.
+        #
+        #   Loaded inline HERE, that same ~16 s lands on boot instead — against a
+        #   startup this campaign just brought from 63 s to 8.96 s. Trading a 3x boot
+        #   regression for a rare op is not a fix.
+        #
+        # So: a background thread takes the lock and pays the load while nothing is
+        # asking. Boot is unblocked, and by the time a screen question arrives the
+        # model is resident. A question in the first ~16 s simply waits for the warm
+        # already in flight instead of starting a second one — which is the other
+        # reason to do it here rather than leaving it lazy.
+        if self.ocr_model_id:
+            def _warm_ocr():
+                try:
+                    t0 = time.perf_counter()
+                    with self._lock:
+                        ok = self._ensure_ocr() is not None
+                    log.info(
+                        "preload: OCR %s %s (%.1fs)", self.ocr_model_id,
+                        "ready" if ok else "unavailable; op=describe_image will ask the "
+                        "VLM directly", time.perf_counter() - t0,
+                    )
+                except Exception:
+                    # A warm thread that raises must never take the server with it; the
+                    # request path falls back to the VLM and says which path it took.
+                    log.exception(
+                        "preload: OCR warm failed; op=describe_image will ask the VLM")
+            try:
+                threading.Thread(
+                    target=_warm_ocr, name="ocr-warm", daemon=True).start()
+            except Exception:
+                # GUARDED START. An unguarded Thread.start() that fails here would
+                # abort the rest of preload, leaving the VAD weights unexported.
+                log.exception("preload: could not start the OCR warm thread")
         # LEARNED VAD native weights (inference/coreml_vad.py, task: replace the
         # RMS-gate VAD). The daemon runs the learned Silero VAD IN-PROCESS on its
         # realtime audio thread (daemon/src/silero.rs) — an RPC-per-frame design
@@ -3692,6 +3778,7 @@ class InferenceEngine:
         # file is absent and carries capture on its RMS gate until then,
         # surfaced). Failure is non-fatal: the daemon simply stays on the RMS
         # gate and says so.
+
         try:
             from coreml_vad import NATIVE_WEIGHTS_NAME, export_native_weights
 
@@ -4704,7 +4791,7 @@ class InferenceEngine:
         empty, mlx-vlm absent, checkpoint missing/corrupt). None is never fatal —
         `describe_image` falls back to asking the VLM directly and says which path
         it took."""
-        if not self.ocr_model_id:
+        if not self.ocr_model_id or self._ocr_unavailable:
             return None
         vlm = _load_mlx_vlm()
         if vlm is None:
@@ -4724,6 +4811,9 @@ class InferenceEngine:
                 self._ocr_model = None
                 self._ocr_processor = None
                 self._ocr_config = None
+                # LATCH. A missing checkpoint means the failure was a 1.2 GB download
+                # attempt; retrying it per-request would freeze the server repeatedly.
+                self._ocr_unavailable = True
                 return None
         return {
             "generate": vlm["generate"],

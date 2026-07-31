@@ -167,6 +167,7 @@ FALLBACK_LLM="mlx-community/Qwen3-4B-Instruct-2507-4bit"
 FALLBACK_STT="mlx-community/whisper-small-mlx"
 FALLBACK_TTS="mlx-community/Kokoro-82M-bf16"
 FALLBACK_VLM="mlx-community/Qwen2-VL-2B-Instruct-4bit"
+FALLBACK_OCR="mlx-community/GLM-OCR-4bit"
 # (no FALLBACK_DRAFT: the speculative draft model is not pre-downloaded — see MODELS below)
 
 # Dirs that are BUILT or FETCHED fresh in the install home and must NOT be copied
@@ -1036,7 +1037,12 @@ VLM_ID="$(read_model_id DEFAULT_VLM "$FALLBACK_VLM")"
 # first generate. This is the LARGEST download by far (multi-GB diffusion weights).
 IMG_ID="black-forest-labs/FLUX.1-schnell"
 
-MODELS=("$LLM_ID" "$STT_ID" "$TTS_ID" "$VLM_ID" "$IMG_ID")
+# OCR_ID is fetched here for the same reason as the rest: without it the FIRST
+# op=describe_image on a deployed machine performs a 1.2 GB snapshot_download while
+# holding the inference server's GPU lock, which blocks every other op and blows the
+# daemon's 30 s request timeout.
+OCR_ID="$(read_model_id DEFAULT_OCR_MODEL "$FALLBACK_OCR")"
+MODELS=("$LLM_ID" "$STT_ID" "$TTS_ID" "$VLM_ID" "$IMG_ID" "$OCR_ID")
 
 ui_info "HF_HOME -> $HF_HOME_DIR (ONE cache for installer + runtime, via state/env.sh; never the repo)"
 
