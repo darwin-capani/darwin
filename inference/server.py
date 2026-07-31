@@ -2966,6 +2966,28 @@ def downscale_for_vlm(path, max_pixels=None, out_dir=None):
                     os.path.basename(str(path)), e)
         return path
 
+
+def _transcript_answer_is_a_refusal(text):
+    """True when the LLM said the transcript does not contain the answer.
+
+    Deliberately NARROW. A false positive costs one extra VLM call; a false negative
+    returns a refusal to the user for something plainly on their screen. The phrasings
+    are the ones the grounding prompt itself invites."""
+    t = (text or "").lower()
+    return any(
+        p in t
+        for p in (
+            "does not contain",
+            "doesn't contain",
+            "not contain the answer",
+            "no information about",
+            "not mentioned in the transcript",
+            "not present in the transcript",
+            "cannot be determined from the transcript",
+            "transcript does not",
+        )
+    )
+
 class InferenceEngine:
     """Lazy-loading, resident MLX models. All methods are blocking; callers
     run them in a worker thread. A lock serializes GPU work."""
@@ -4779,8 +4801,13 @@ class InferenceEngine:
                 "Below is the text transcribed from a screenshot.\n\n---\n"
                 f"{body}\n---\n\n"
                 f"Question: {question}\n"
-                "Answer using ONLY the transcript above. Be brief and exact. If the "
-                "transcript does not contain the answer, say so plainly."
+                "Answer using ONLY the transcript above. Be brief and exact.\n"
+                "The transcript is TEXT ONLY: it carries no colour, position or size, "
+                "so a question may describe something visually ('the blue button', "
+                "'the item at the bottom') using words that do not appear above. "
+                "Ignore those visual qualifiers and answer from the text when the "
+                "answer is otherwise present. Only say the transcript does not "
+                "contain the answer when the FACT itself is genuinely absent."
             )
             out = self._run_llm_interruptible(grounded, max_tokens=max_tokens)
             return (out or "").strip() or None
@@ -4890,6 +4917,17 @@ class InferenceEngine:
             transcript = self._transcribe_screen(path)
         if transcript:
             answered = self._answer_from_transcript(prompt, transcript, max_tokens)
+            if answered and _transcript_answer_is_a_refusal(answered):
+                # The transcript genuinely lacks it — which is exactly what a question
+                # about COLOUR, POSITION or SIZE looks like, since OCR carries none of
+                # those. Hand it to the VLM, which can actually see them. Measured: on
+                # a settings dialog, "what does the blue button say?" refused from the
+                # transcript while the button label ("Renew Lease") was plainly in it.
+                log.info(
+                    "op=describe_image: the transcript could not answer it; asking the "
+                    "VLM, which can see colour and layout"
+                )
+                answered = None
             if answered:
                 return {
                     "ok": True,
@@ -7225,6 +7263,12 @@ class InferenceServer:
                         "ok": True,
                         "text": result["text"],
                         "model": result.get("model"),
+                        # WHICH path answered: "ocr+llm" (transcribe the screen, then
+                        # answer from the transcript) or "vlm" (ask the vision model
+                        # directly). The two have very different accuracy and latency
+                        # characteristics, so a caller reading the reply — or anyone
+                        # reading a log — should not have to guess which ran.
+                        "path": result.get("path", "vlm"),
                         "latency_ms": latency_ms(),
                     }
                 # Honest unavailable / failure path: ok:false + a machine-keyable

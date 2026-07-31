@@ -529,5 +529,70 @@ class OcrFirstScreenReading(unittest.TestCase):
             restore()
 
 
+class TranscriptRefusalFallsBackToTheVlm(unittest.TestCase):
+    """OCR carries TEXT, not colour, position or size. A question like "what does the
+    BLUE button say?" is unanswerable from a transcript even when the button's label is
+    plainly in it — measured on a settings dialog, the transcript contained "Renew
+    Lease" and the LLM still refused, because nothing in it is described as blue.
+
+    So a refusal is not a final answer: it is the signal to ask the VLM, which can
+    actually see what the question is describing."""
+
+    def setUp(self):
+        self.path = _make_image_file()
+
+    def test_the_refusal_detector_matches_the_phrasings_the_prompt_invites(self):
+        for t in (
+            "The transcript does not contain the answer.",
+            "The transcript doesn't contain that information.",
+            "There is no information about a printer in the transcript.",
+            "That is not mentioned in the transcript.",
+            "It cannot be determined from the transcript.",
+        ):
+            self.assertTrue(server._transcript_answer_is_a_refusal(t), t)
+
+    def test_a_real_answer_is_not_mistaken_for_a_refusal(self):
+        for t in (
+            "The IPv4 address shown is 192.168.1.47.",
+            "Renew Lease",
+            "The error code is E0308.",
+            "cargo build --release",
+        ):
+            self.assertFalse(server._transcript_answer_is_a_refusal(t), t)
+
+    def test_a_refusal_hands_the_question_to_the_vlm(self):
+        """MUTATION GUARD: without this, a question about colour or position returns
+        'the transcript does not contain the answer' for something plainly on screen."""
+        fake = _FakeVLM()
+        restore = _patch_loader(fake.as_seam())
+        try:
+            eng = _make_engine(ocr_model="stub-ocr-repo")
+            eng._transcribe_screen = lambda p: "Network Preferences\nRenew Lease"
+            eng._run_llm_interruptible = lambda *a, **k: "The transcript does not contain the answer."
+            out = eng.describe_image(self.path, question="What does the blue button say?")
+            self.assertTrue(out["ok"], out)
+            self.assertNotEqual(out.get("path"), "ocr+llm",
+                                "a refusal must not be returned as the OCR answer")
+            self.assertGreaterEqual(fake.generate_calls, 1,
+                                    "the VLM must have been asked instead")
+        finally:
+            restore()
+
+    def test_a_genuine_answer_does_not_wake_the_vlm(self):
+        """The fallback must not fire on every question — that would cost the VLM's
+        latency on top of the OCR path's for no gain."""
+        fake = _FakeVLM()
+        restore = _patch_loader(fake.as_seam())
+        try:
+            eng = _make_engine(ocr_model="stub-ocr-repo")
+            eng._transcribe_screen = lambda p: "IPv4 Address 192.168.1.47"
+            eng._run_llm_interruptible = lambda *a, **k: "The IPv4 address shown is 192.168.1.47."
+            out = eng.describe_image(self.path, question="What is the IPv4 address?")
+            self.assertEqual(out["path"], "ocr+llm")
+            self.assertEqual(fake.generate_calls, 0, "the VLM should not have been touched")
+        finally:
+            restore()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
