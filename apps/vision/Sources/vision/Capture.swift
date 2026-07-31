@@ -402,19 +402,73 @@ public final class ScreenSource: NSObject, FrameSource, @unchecked Sendable {
         super.init()
     }
 
+    /// Deadline for the window-server probe. Screen enumeration is fast when it works
+    /// at all; anything past this is not slow, it is never coming back.
+    static let defaultAuthorizationTimeout: UInt64 = 4_000_000_000  // 4s
+
+    /// Per-instance override so the DEADLINE itself is testable.
+    var authorizationTimeoutOverride: UInt64?
+
+    /// The probe, injectable for the same reason. Without this seam the hang is only
+    /// observable under the seatbelt, so a test written against the real probe passes
+    /// identically with and without the timeout — the green-but-blind shape that has
+    /// already let two broken features ship in this project.
+    var probeShareableContent: @Sendable () async throws -> Void = {
+        // excludingDesktopWindows:false is the cheapest enumeration; a throw here
+        // means the user has not granted Screen Recording.
+        _ = try await SCShareableContent.excludingDesktopWindows(
+            false, onScreenWindowsOnly: true)
+    }
+
     /// Probe Screen Recording authorization WITHOUT capturing. SCShareableContent
-    /// succeeds only when authorized (or prompts on first use), so we treat a
-    /// successful enumeration as `.authorized` and a failure as `.denied`. There
-    /// is no synchronous status API equivalent to AVCaptureDevice's.
+    /// succeeds only when authorized (or prompts on first use), so a successful
+    /// enumeration is `.authorized` and a failure is `.denied`. There is no
+    /// synchronous status API equivalent to AVCaptureDevice's.
+    ///
+    /// BOUNDED, because the unbounded version wedged the whole app. Under the seatbelt
+    /// profile the daemon generates from apps/vision/manifest.toml, the mach lookup
+    /// this needs is denied and the continuation is NEVER RESUMED — the child prints
+    /// SWIFT TASK CONTINUATION MISUSE and hangs forever. It emitted no vision.error,
+    /// no status, and every later op INCLUDING `stop` was ignored, because the actor
+    /// was still inside this await.
+    ///
+    /// A hung continuation cannot be cancelled, so the leaked probe task is
+    /// unavoidable — but it must not take the CALLER with it. The result is whichever
+    /// of the probe and the deadline lands first, resumed exactly once.
     public func authorization() async -> CaptureAuthorization {
-        do {
-            // excludingDesktopWindows:false is the cheapest enumeration; a
-            // throw here means the user has not granted Screen Recording.
-            _ = try await SCShareableContent.excludingDesktopWindows(false,
-                                                                     onScreenWindowsOnly: true)
-            return .authorized
-        } catch {
-            return .denied
+        final class Once: @unchecked Sendable {
+            private let lock = NSLock()
+            private var cont: CheckedContinuation<CaptureAuthorization, Never>?
+            init(_ c: CheckedContinuation<CaptureAuthorization, Never>) { cont = c }
+            func resume(_ v: CaptureAuthorization) {
+                lock.lock()
+                let c = cont
+                cont = nil
+                lock.unlock()
+                c?.resume(returning: v)
+            }
+        }
+
+        let probe = probeShareableContent
+        let deadline = authorizationTimeoutOverride ?? Self.defaultAuthorizationTimeout
+        return await withCheckedContinuation { (cont: CheckedContinuation<CaptureAuthorization, Never>) in
+            let once = Once(cont)
+            Task {
+                do {
+                    try await probe()
+                    once.resume(.authorized)
+                } catch {
+                    once.resume(.denied)
+                }
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: deadline)
+                // Not `.denied`: the user may well have granted consent and the window
+                // server is simply unreachable from inside the sandbox. `.restricted`
+                // says "the platform will not let me do this" — the truth, and it reads
+                // very differently to an operator than "you said no".
+                once.resume(.restricted)
+            }
         }
     }
 
