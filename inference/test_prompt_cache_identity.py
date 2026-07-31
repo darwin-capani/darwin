@@ -31,8 +31,10 @@ prompt cache was keyed on something that is not what the cache actually contains
 
   Run: .venv/bin/python inference/test_prompt_cache_identity.py   (from the repo root)
 """
+import os
 import pathlib
 import re
+import tempfile
 import unittest
 
 import server as S
@@ -106,6 +108,80 @@ class EveryPersonaGetsItsOwnSlot(unittest.TestCase):
             "slot=_persona_cache_slot(name)", SRC,
             "the per-agent caller must pass its own slot",
         )
+
+
+class ThePerAgentSlotsAreBoundedOnDisk(unittest.TestCase):
+    """Giving every persona its own slot fixed real clobbering and created an unbounded
+    store: ~44 MB per agent for this model, 27 shipped personas, and nothing ever
+    deleted them. The in-memory AGENT_PERSONA_CACHE_MAX bounded the RESIDENT caches and
+    said nothing about disk. Measured on the live machine mid-fix: the cache directory
+    was already 495 MB with one agent slot written."""
+
+    def _seed(self, root, n_agents):
+        d = os.path.join(root, S.PROMPT_CACHE_DIRNAME)
+        os.makedirs(d, exist_ok=True)
+        for name in ("persona.safetensors", "classifier.safetensors"):
+            open(os.path.join(d, name), "w").write("x")
+        for i in range(n_agents):
+            p = os.path.join(d, f"persona-agent{i}-{i:012x}.safetensors")
+            open(p, "w").write("x")
+            os.utime(p, (1_000 + i, 1_000 + i))   # deterministic recency
+        return d
+
+    def test_only_the_most_recent_agent_slots_survive(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = self._seed(root, 9)
+            S._prune_agent_persona_caches(root)
+            agents = [n for n in os.listdir(d) if n.startswith("persona-")]
+            self.assertEqual(
+                len(agents), S.PERSONA_DISK_CACHE_MAX,
+                f"per-agent caches are unbounded on disk: {sorted(agents)}",
+            )
+            self.assertEqual(
+                sorted(agents),
+                sorted(f"persona-agent{i}-{i:012x}.safetensors" for i in range(5, 9)),
+                "the pruner kept the wrong ones; it must keep the most RECENT",
+            )
+
+    def test_the_base_persona_and_classifier_are_never_pruned(self):
+        """Both are used every session; evicting them costs a full prefill at boot."""
+        with tempfile.TemporaryDirectory() as root:
+            d = self._seed(root, 9)
+            S._prune_agent_persona_caches(root)
+            left = os.listdir(d)
+            self.assertIn("persona.safetensors", left,
+                          "the BASE persona cache was pruned as if it were an agent")
+            self.assertIn("classifier.safetensors", left)
+
+    def test_pruning_under_the_cap_removes_nothing(self):
+        with tempfile.TemporaryDirectory() as root:
+            d = self._seed(root, 2)
+            self.assertEqual(S._prune_agent_persona_caches(root), 0)
+            self.assertEqual(len(os.listdir(d)), 4)
+
+    def test_a_missing_directory_is_not_an_error(self):
+        """Disk hygiene must never raise into a reply path."""
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(S._prune_agent_persona_caches(root), 0)
+
+    def test_the_disk_bound_tracks_the_memory_bound(self):
+        self.assertEqual(
+            S.PERSONA_DISK_CACHE_MAX, S.AGENT_PERSONA_CACHE_MAX,
+            "the disk and memory bounds have drifted apart; one of them is then a lie",
+        )
+
+    def test_the_save_path_prunes_after_writing_an_agent_slot(self):
+        body = SRC[SRC.index("def _prefill_persona_cache("):]
+        body = body[:body.index("\n    def ")]
+        save = body.index("save_prompt_cache_fingerprinted(")
+        prune = body.index("_prune_agent_persona_caches(")
+        self.assertLess(
+            save, prune,
+            "pruning must happen AFTER the save, or the cache just written is the one "
+            "evicted",
+        )
+        self.assertIn('if slot != "persona"', body,
+                      "the base slot must be exempt from the per-agent bound")
 
 
 class TheFingerprintNamesTheAdapterThatActuallyFused(unittest.TestCase):
