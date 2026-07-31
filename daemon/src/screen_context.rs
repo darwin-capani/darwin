@@ -73,15 +73,42 @@ const RECALL_RENDER_BUDGET_CHARS: usize = 2_000;
 /// Those frames are the same screen to a user and must collapse to one bullet, so
 /// snapshots are compared by token overlap instead.
 fn dedup_tokens(text: &str) -> Vec<String> {
+    // NO PREFIX CAP. This used to `.take(400)` BEFORE sorting, so everything past word
+    // 400 of a snapshot was invisible to `near_duplicate`. Reading-order OCR of any app
+    // with a persistent list, sidebar or nav — a Mail message list, a Slack channel
+    // rail, a file tree — emits that chrome first, so two genuinely different screens
+    // in the same app shared their first 400 words and collapsed into one bullet. The
+    // user asks what they were working on and one of the two windows is simply gone.
+    //
+    // The cap bounded work, not memory: the set is deduped immediately below, and the
+    // number of DISTINCT tokens on a screen is small. Bounding the distinct set after
+    // dedup keeps the same guarantee without blinding the comparison to the content
+    // that actually distinguishes two screens.
     let mut t: Vec<String> = text
         .split_whitespace()
         .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_lowercase())
         .filter(|w| !w.is_empty())
-        .take(400)
         .collect();
     t.sort();
     t.dedup();
+    t.truncate(DEDUP_MAX_DISTINCT_TOKENS);
     t
+}
+
+/// Ceiling on the DISTINCT tokens compared per snapshot. Applied after dedup, so it
+/// bounds work without hiding a screen's tail from the comparison the way a prefix cap
+/// did. Real screens carry far fewer distinct words than this.
+const DEDUP_MAX_DISTINCT_TOKENS: usize = 4000;
+
+/// What a slice handed to `render_entries` is ordered BY. Passing the wrong one does
+/// not fail loudly — it quietly answers with the least relevant screens — so it is a
+/// required argument rather than an inferred default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EntryOrder {
+    /// Oldest first (what `recall_recent` returns).
+    Chronological,
+    /// Most relevant first (what `recall_matching` returns).
+    ByRelevance,
 }
 
 /// How much token overlap makes two snapshots "the same screen". 0.9 means a frame
@@ -254,7 +281,7 @@ impl ScreenContextRing {
                     nothing's been captured."
                 .to_string();
         }
-        Self::render_entries(&recent)
+        Self::render_entries(&recent, EntryOrder::Chronological)
     }
 
     /// Shared renderer for every recall surface: NEAR-DUPLICATE SUPPRESSED and
@@ -267,17 +294,34 @@ impl ScreenContextRing {
     /// not a recall, it is the same answer ten times, and it is what a continuous
     /// capture loop over any static window produces by default.
     ///
-    /// The budget keeps the NEWEST entries rather than the first ones. `recall_recent`
-    /// returns oldest-first for reading order, so any downstream clip that takes a
-    /// prefix would read out the OLDEST snapshots and never reach what the user is
-    /// looking at now — the opposite of what "what was I working on" asks.
-    fn render_entries(entries: &[ContextEntry]) -> String {
+    /// The budget must be spent on the entries that MATTER MOST, and which those are
+    /// depends on how the caller ordered the slice — which is why `order` is not
+    /// optional.
+    ///
+    /// This used to assume every caller passed chronological oldest-first and walked
+    /// `.rev()` unconditionally. `global_render_recall_matching` passes the output of
+    /// `recall_matching`, which is ranked MOST-RELEVANT-FIRST. Reversing that walks
+    /// from the least relevant snapshot, spends the whole 2000-char budget on the
+    /// worst hits, and `break`s before ever reaching the best one — so "what did I
+    /// see about X" answered with the least relevant screens and silently dropped the
+    /// top match. The final `lines.reverse()` then made the result look ordered and
+    /// deliberate.
+    ///
+    /// So: iterate in priority order, and let the caller say what that is.
+    fn render_entries(entries: &[ContextEntry], order: EntryOrder) -> String {
         let mut lines: Vec<String> = Vec::new();
         let mut used = 0usize;
         let mut seen: Vec<Vec<String>> = Vec::new();
         let mut suppressed = 0usize;
-        // Walk NEWEST first so the budget spends itself on what is on screen now.
-        for e in entries.iter().rev() {
+        // Highest-priority first, so the budget is spent before it can run out on
+        // things the user did not ask about.
+        let ordered: Vec<&ContextEntry> = match order {
+            // Chronological input: newest is what the user is looking at now.
+            EntryOrder::Chronological => entries.iter().rev().collect(),
+            // Already ranked: the front IS the priority.
+            EntryOrder::ByRelevance => entries.iter().collect(),
+        };
+        for e in ordered {
             let key = dedup_tokens(&e.redacted_text);
             if seen.iter().any(|k| near_duplicate(k, &key)) {
                 suppressed += 1;
@@ -291,8 +335,12 @@ impl ScreenContextRing {
             seen.push(key);
             lines.push(line);
         }
-        // Restore reading order (oldest first) for the spoken answer.
-        lines.reverse();
+        // Chronological input was consumed newest-first, so flip back to reading
+        // order. A relevance-ranked answer is already in the order that answers the
+        // question — best match first — and must NOT be flipped.
+        if matches!(order, EntryOrder::Chronological) {
+            lines.reverse();
+        }
         let mut out = String::from("Here's your recent screen context, sir:");
         for l in &lines {
             out.push('\n');
@@ -564,7 +612,7 @@ pub fn global_render_recall_matching(query: &str, n: usize) -> String {
     };
     // Same suppression + budget as render_recall: a ranked hit list over a static
     // window is just as capable of returning the same snapshot repeatedly.
-    let body = ScreenContextRing::render_entries(&hits);
+    let body = ScreenContextRing::render_entries(&hits, EntryOrder::ByRelevance);
     let out = match body.split_once('\n') {
         Some((_, rest)) => format!("{header}\n{rest}"),
         None => header,
@@ -1563,5 +1611,199 @@ mod tests {
             "zero-overlap entries must not be fabricated into matches: {out}"
         );
         global_reset_for_test();
+    }
+
+    // ---- render_entries must spend its budget on what the caller ranked highest ----
+
+    #[test]
+    fn relevance_ranked_recall_renders_the_best_hit_not_the_worst() {
+        // THE SHIPPED BUG. render_entries walked .rev() unconditionally, so a
+        // most-relevant-first slice was consumed from its WORST end: the budget was
+        // spent on the weakest matches and it broke before reaching the top hit, which
+        // then never appeared in the answer at all.
+        //
+        // For this to be a real test the hit list must (a) contain SEVERAL entries so
+        // ordering exists, and (b) overflow RECALL_RENDER_BUDGET_CHARS so something is
+        // actually dropped. Every entry therefore shares the weak term and only one
+        // carries both, and each is padded past the budget on its own.
+        let pad = |tag: &str| {
+            let mut s = String::new();
+            for i in 0..300 {
+                s.push_str(&format!(" {tag}{i}"));
+            }
+            s
+        };
+        let mut ring = ScreenContextRing::new(32);
+        for i in 0..6u64 {
+            // weak: shares only "logs"
+            ring.push(100 + i, &format!("logs viewer{}", pad(&format!("weak{i}"))), "screen");
+        }
+        // strong: shares BOTH terms, so recall_matching ranks it first.
+        ring.push(200, &format!("kubernetes logs{}", pad("strong")), "screen");
+
+        let hits = ring.recall_matching("kubernetes logs", 10);
+        assert!(hits.len() > 3, "precondition: need a ranked list, got {}", hits.len());
+        assert!(
+            hits[0].redacted_text.contains("kubernetes"),
+            "precondition: recall_matching must rank the both-terms entry first"
+        );
+
+        let out = ScreenContextRing::render_entries(&hits, EntryOrder::ByRelevance);
+        assert!(
+            out.contains("strong") || out.contains("kubernetes"),
+            "the BEST match was dropped by the render budget while weaker matches were \
+             kept — the budget was spent from the wrong end of a ranked list. \
+             Rendered:\n{out}"
+        );
+    }
+
+    #[test]
+    fn a_relevance_ranked_render_leads_with_the_top_hit() {
+        // Ordering of the OUTPUT, independent of the budget: a query-ranked answer
+        // must read best-match-first, not end with it.
+        let mut ring = ScreenContextRing::new(32);
+        ring.push(1, "alpha cargo notes", "screen");
+        ring.push(2, "beta cargo build trait bound error", "screen");
+        ring.push(3, "gamma cargo notes", "screen");
+
+        let hits = ring.recall_matching("cargo build trait", 5);
+        assert!(hits.len() >= 2, "precondition: need several hits");
+        assert!(hits[0].redacted_text.contains("trait"), "precondition: ranking");
+
+        let out = ScreenContextRing::render_entries(&hits, EntryOrder::ByRelevance);
+        let bullets: Vec<&str> = out.lines().filter(|l| l.starts_with("• ")).collect();
+        assert!(bullets.len() >= 2, "precondition: several bullets, got {bullets:?}");
+        assert!(
+            bullets[0].contains("trait"),
+            "a query-ranked answer must LEAD with the best match; it was last. \
+             Bullets: {bullets:?}"
+        );
+    }
+
+    #[test]
+    fn chronological_recall_reads_oldest_first() {
+        // SHORT entries so several survive the budget and the ORDER is observable.
+        // (An earlier version of this test used padded entries; only one fitted, so
+        // its ordering assertion sat behind an `if let` that never bound and the test
+        // passed against a mutant that removed the reverse entirely.)
+        let mut ring = ScreenContextRing::new(16);
+        for i in 0..5u64 {
+            ring.push(i, &format!("snapshot{i} short"), "screen");
+        }
+        let out = ring.render_recall(5);
+        let pos: Vec<usize> = (0..5)
+            .filter_map(|i| out.find(&format!("snapshot{i}")))
+            .collect();
+        assert_eq!(pos.len(), 5, "all five short entries should fit:\n{out}");
+        assert!(
+            pos.windows(2).all(|w| w[0] < w[1]),
+            "chronological output must read OLDEST first; positions {pos:?}\n{out}"
+        );
+    }
+
+    #[test]
+    fn chronological_recall_spends_its_budget_on_the_newest() {
+        // The property the .rev() walk exists for: when the budget cannot hold
+        // everything, what survives is what is on screen NOW.
+        let pad = |tag: &str| {
+            let mut s = String::new();
+            for i in 0..300 {
+                s.push_str(&format!(" {tag}{i}"));
+            }
+            s
+        };
+        let mut ring = ScreenContextRing::new(16);
+        for i in 0..6u64 {
+            ring.push(i, &format!("screen{i}{}", pad(&format!("p{i}"))), "screen");
+        }
+        let out = ring.render_recall(6);
+        assert!(
+            out.contains("screen5"),
+            "the NEWEST snapshot must survive the budget:\n{out}"
+        );
+        assert!(
+            !out.contains("screen0"),
+            "the oldest snapshot should have been dropped by the budget, not kept:\n{out}"
+        );
+    }
+
+    // ---- dedup must see the whole snapshot, not just its first 400 words ----
+
+    #[test]
+    fn two_screens_sharing_a_long_sidebar_do_not_collapse() {
+        // THE SHIPPED BUG: dedup_tokens took the first 400 words BEFORE sorting, so an
+        // app's persistent chrome (a Mail list, a Slack rail, a file tree) — which
+        // reading-order OCR emits FIRST — could BE the entire comparison key. Two
+        // genuinely different windows in the same app became one bullet and one of
+        // them vanished from "what was I working on".
+        //
+        // Sizes here are deliberate. Jaccard is a RATIO, so the cap only decides the
+        // outcome when the content past it is a real share of the screen — which is
+        // the normal case, since a screen carries hundreds of words. With 400 words of
+        // chrome and ~400 of content each: capped, the keys are identical (1.0);
+        // uncapped, overlap is 400/1200 = 0.33 and they stay distinct. When chrome
+        // genuinely dominates a screen the two ARE mostly the same pixels and
+        // DEDUP_SIMILARITY, not this function, is what decides — as intended.
+        let mut chrome = String::new();
+        for i in 0..400 {
+            chrome.push_str(&format!("sidebaritem{i} "));
+        }
+        let mut body_a = String::new();
+        let mut body_b = String::new();
+        for i in 0..400 {
+            body_a.push_str(&format!("revenue{i} "));
+            body_b.push_str(&format!("puppy{i} "));
+        }
+        let a = format!("{chrome}{body_a}");
+        let b = format!("{chrome}{body_b}");
+
+        let (ka, kb) = (dedup_tokens(&a), dedup_tokens(&b));
+        assert!(
+            !near_duplicate(&ka, &kb),
+            "two different screens collapsed into one because they share an app's \
+             chrome; the distinguishing content sits past the old 400-word prefix cap"
+        );
+    }
+
+    #[test]
+    fn the_dedup_key_reaches_past_the_old_cap() {
+        // Directly: a token beyond word 400 must appear in the key at all.
+        let mut text = String::new();
+        for i in 0..600 {
+            text.push_str(&format!("w{i} "));
+        }
+        text.push_str("distinctivetailtoken");
+        assert!(
+            dedup_tokens(&text).iter().any(|t| t == "distinctivetailtoken"),
+            "content past the old 400-word cap is still invisible to dedup"
+        );
+    }
+
+    #[test]
+    fn a_static_window_that_only_ticks_still_collapses() {
+        // The property the cap was protecting must survive: near-identical frames
+        // differing by a clock digit are still one screen.
+        let mut base = String::new();
+        for i in 0..500 {
+            base.push_str(&format!("word{i} "));
+        }
+        let a = format!("{base} 14:32");
+        let b = format!("{base} 14:33");
+        assert!(
+            near_duplicate(&dedup_tokens(&a), &dedup_tokens(&b)),
+            "a timer-driven recapture of the SAME window must still be suppressed"
+        );
+    }
+
+    #[test]
+    fn dedup_key_stays_bounded() {
+        let mut huge = String::new();
+        for i in 0..50_000 {
+            huge.push_str(&format!("tok{i} "));
+        }
+        assert!(
+            dedup_tokens(&huge).len() <= DEDUP_MAX_DISTINCT_TOKENS,
+            "the distinct-token set must stay bounded"
+        );
     }
 }
