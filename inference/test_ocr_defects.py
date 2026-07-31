@@ -101,6 +101,12 @@ class RefusalDetectorMatchesTheSourceNotAnyNegation(unittest.TestCase):
         "That is not mentioned in the transcript.",
         "It cannot be determined from the transcript.",
         "The transcript does not include any information about the battery level.",
+        # LONG refusals matter most: a length cap was tried here and let this one
+        # through to the user verbatim. A missed refusal is the WORSE error -- the
+        # user gets a guaranteed non-answer and the VLM is never asked.
+        "The transcript provided does not contain any information about the current "
+        "battery percentage; it only shows a Finder window listing the files in the "
+        "Downloads folder.",
         "",
     )
 

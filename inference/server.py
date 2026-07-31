@@ -2985,16 +2985,23 @@ def _transcript_answer_is_a_refusal(text):
     replaced with the weaker VLM path (measured 9/12 against this path's 11/12).
 
     A false positive is therefore NOT free, as that docstring wrongly claimed: it
-    discards a correct answer. So the match now requires the sentence to be ABOUT the
-    transcript or the screen rather than merely to contain a negation, and requires the
-    reply to be short -- a refusal is a single clause, while an answer that happens to
-    quote a negation carries the content around it."""
+    discards a correct answer. So the match now requires the negation to be ABOUT THE
+    SOURCE -- the transcript or the screen -- rather than merely to appear somewhere in
+    the reply. That alone clears every observed false positive: an answer quoting screen
+    text names the dialog, the log or the error, not the transcript.
+
+    The errors are NOT symmetric, so the remaining bias is deliberate. A false positive
+    costs one VLM call and the VLM still answers correctly most of the time (measured
+    9/12 on this task against 11/12 here). A false NEGATIVE hands the user "the
+    transcript does not contain that" as the final answer and never asks the VLM at
+    all -- a guaranteed miss. So when the two conflict, flag it.
+
+    A length cap was tried here and removed for exactly that reason: it let a 167-char
+    refusal through to the user while protecting no real answer, since none of them
+    name the transcript in the first place."""
     t = (text or "").strip().lower()
     if not t:
         return True
-    # An answer that quotes screen content is longer than a refusal ever is.
-    if len(t) > 160:
-        return False
     subject = ("transcript", "screen", "text provided", "text above")
     negation = (
         "does not contain",
