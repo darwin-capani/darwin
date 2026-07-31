@@ -60,6 +60,16 @@ struct Stat {
 
 impl Stat {
     /// Turns with a definite signal (success/corrected/failed) — the rate's base.
+    ///
+    /// WHAT THE LIVE PATH ACTUALLY PRODUCES: `Success` and `CorrectedNextTurn` only.
+    /// A turn is recorded provisionally successful (calibrate::record / the optimize
+    /// trace store) and re-labelled `CorrectedNextTurn` when the FOLLOWING turn looks
+    /// like a correction. Nothing in production ever writes `Failed` or `Unknown` —
+    /// they exist for the wire format and for tests. So `graded()` is in practice
+    /// successes + corrected, and the ratio below is "turns the user did not visibly
+    /// correct", NOT "turns that went well". A turn where the user gave up, rephrased
+    /// in a later session, or simply accepted a wrong answer counts on the good side.
+    /// The rendered label says so.
     fn graded(&self) -> usize {
         self.successes + self.corrected + self.failed
     }
@@ -68,7 +78,9 @@ impl Stat {
         self.graded() + self.unknown
     }
 
-    /// Success fraction of the GRADED turns, or None when nothing is graded yet.
+    /// Fraction of GRADED turns that were not re-labelled as corrected, or None when
+    /// nothing is graded yet. See `graded` for why this is an UNCORRECTED rate rather
+    /// than a success rate.
     fn rate(&self) -> Option<f64> {
         let g = self.graded();
         (g > 0).then(|| self.successes as f64 / g as f64)
@@ -137,7 +149,10 @@ fn format_section(title: &str, rows: &[(String, Stat)]) -> String {
     let mut out = format!("{title}\n");
     for (name, s) in rows.iter().take(MAX_ROWS_SHOWN) {
         let rate = match s.rate() {
-            Some(r) => format!("{:.0}% success", r * 100.0),
+            // "uncorrected", not "success": the live path only ever observes
+            // whether the NEXT turn looked like a correction. Calling that success
+            // would count a silently-wrong answer as a win.
+            Some(r) => format!("{:.0}% uncorrected", r * 100.0),
             None => "unrated".to_string(),
         };
         out.push_str(&format!(
@@ -313,7 +328,8 @@ fn format_promotions(cands: &[CapFlag], eval_total: usize) -> String {
     if cands.is_empty() {
         return format!(
             "No skill has earned promotion yet. A candidate must be eval-verified AND have >= {} \
-             graded turns at >= {:.0}% success. ({eval_total} skills are eval-verified.)",
+             graded turns at >= {:.0}% uncorrected. ({eval_total} skills are \
+             eval-verified.)",
             MIN_SAMPLE,
             PROMOTE_RATE * 100.0
         );
@@ -325,7 +341,9 @@ fn format_promotions(cands: &[CapFlag], eval_total: usize) -> String {
         MIN_SAMPLE
     );
     for c in cands {
-        out.push_str(&format!("  {} — {} turns, {}% success\n", c.name, c.turns, c.rate_pct));
+        out.push_str(&format!(
+            "  {} — {} turns, {}% uncorrected\n", c.name, c.turns, c.rate_pct
+        ));
     }
     out.push_str(
         "\n(PROPOSE-ONLY: these have earned first-class treatment — promote them yourself; I change \
@@ -393,6 +411,30 @@ mod tests {
     /// Build a trace with a given (agent, tool, outcome); other fields are inert.
     fn t(agent: &str, tool: &str, outcome: Outcome) -> Trace {
         Trace::new("hello", "action", agent, "standard", tool, outcome, 100, 0)
+    }
+
+    /// REGRESSION: the rendered rate must not call itself "success".
+    ///
+    /// The live path records every turn as provisionally successful and only ever
+    /// re-labels it CorrectedNextTurn when the FOLLOWING turn looks like a
+    /// correction. Nothing in production writes Failed or Unknown. So the ratio is
+    /// "turns the user did not visibly correct" — a turn where they gave up,
+    /// rephrased in a later session, or accepted a wrong answer lands on the good
+    /// side of it. Labelling that "% success" claims a judgement the system never
+    /// makes.
+    #[test]
+    fn the_rendered_rate_does_not_claim_success() {
+        let mut s = Stat::default();
+        for _ in 0..9 {
+            s.add(&Outcome::Success);
+        }
+        s.add(&Outcome::CorrectedNextTurn);
+        let out = format_section("Agents", &[("darwin".to_string(), s)]);
+        assert!(out.contains("90% uncorrected"), "got: {out}");
+        assert!(
+            !out.contains("success"),
+            "the rate must not present itself as a success rate: {out}"
+        );
     }
 
     #[test]
@@ -484,9 +526,9 @@ mod tests {
         traces.push(t("darwin", "shell_run", Outcome::Failed));
 
         let out = analyze(&traces);
-        assert!(out.contains("pepper — 6 turns, 83% success [reliable]"), "got:\n{out}");
-        assert!(out.contains("darwin — 2 turns, 0% success [insufficient data]"), "got:\n{out}");
-        assert!(out.contains("gcal_create — 6 turns, 83% success [reliable]"), "got:\n{out}");
+        assert!(out.contains("pepper — 6 turns, 83% uncorrected [reliable]"), "got:\n{out}");
+        assert!(out.contains("darwin — 2 turns, 0% uncorrected [insufficient data]"), "got:\n{out}");
+        assert!(out.contains("gcal_create — 6 turns, 83% uncorrected [reliable]"), "got:\n{out}");
         assert!(out.contains("changed nothing"));
     }
 
@@ -585,7 +627,7 @@ mod tests {
         assert!(format_promotions(&[], 5).contains("No skill has earned promotion"));
         let cand = vec![CapFlag { kind: "skill", name: "base64_encode".into(), turns: 10, rate_pct: 95 }];
         let out = format_promotions(&cand, 5);
-        assert!(out.contains("base64_encode — 10 turns, 95% success"));
+        assert!(out.contains("base64_encode — 10 turns, 95% uncorrected"));
         assert!(out.contains("PROPOSE-ONLY"));
     }
 }

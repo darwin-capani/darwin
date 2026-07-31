@@ -35,6 +35,27 @@ def make_screenshot_like(path):
     img.save(path)
     return path
 
+
+def _shipped_path(img_path):
+    """Apply the SAME visual-token cap the server applies, so this harness measures
+    the shipped configuration. Falls back to the original path if the server module
+    is not importable, and says so rather than silently measuring something else."""
+    try:
+        import sys as _sys
+        from pathlib import Path as _Path
+
+        _sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
+        import server as _server
+
+        out = _server.downscale_for_vlm(img_path)
+        if out != img_path:
+            log(f"applied the shipped visual-token cap: {img_path} -> {out}")
+        return out
+    except Exception as e:  # noqa: BLE001
+        log(f"WARNING: could not apply the shipped cap ({e}); measuring UNCAPPED, "
+            "which is NOT the shipped configuration")
+        return img_path
+
 def main():
     out = {"model": MODEL, "resolution": [W, H], "machine": os.uname().machine}
     try:
@@ -71,7 +92,15 @@ def main():
         t = time.time()
         try:
             formatted = apply_chat_template(processor, cfg, question, num_images=1)
-            res = generate(model, processor, formatted, [img_path], max_tokens=128, verbose=False)
+            # Measure what SHIPS. op=describe_image caps the image at
+            # DESCRIBE_IMAGE_MAX_PIXELS before generating, and without doing the same
+            # here this harness reproduces the PRE-CAP number (~8.2 s and the
+            # repetition-collapse regime) and reports it as current — which is exactly
+            # how a stale figure gets re-committed.
+            res = generate(
+                model, processor, formatted, [_shipped_path(img_path)],
+                max_tokens=128, verbose=False,
+            )
             text = res.text if hasattr(res, "text") else str(res)
         except Exception as e:
             log(f"NO-GO: generate {i} failed: {e}")

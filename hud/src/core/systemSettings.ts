@@ -702,7 +702,7 @@ export const CATALOG: CatalogEntry[] = [
     label: "Speculative decoding",
     control: "toggle",
     hint:
-      "Master gate for speculative/draft decoding. INERT WITHOUT A DRAFT MODEL — also needs a loadable draft_model (ships empty); absent that, generate falls back to normal gen and honestly reports speculative=false (never faked).",
+      "Master gate for speculative/draft decoding. MEASURED A LOSS ON THIS HARDWARE — the committed baseline records uncached decode at 60.87 tok/s with it OFF versus 44.45 tok/s ON (27% slower), and it is unreachable on the KV-cached production path anyway because mlx_lm rejects a draft model together with a prompt cache. Ships OFF for that reason. INERT WITHOUT A DRAFT MODEL — also needs a loadable draft_model (ships empty); absent that, generate falls back to normal gen and honestly reports speculative=false (never faked).",
   },
   {
     id: "inference.draft_model",

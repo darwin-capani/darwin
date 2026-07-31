@@ -114,8 +114,11 @@ RERANKER_ID = "coreml-ms-marco-minilm-l6-v2"
 SEQ = 512
 # SECOND, SHORTER graph for the common case. MEASURED on this machine (M1 Pro,
 # ComputeUnit.ALL): one (1, 512) pair predict costs p50 10.88 ms, while (1, 128) costs
-# 1.12 ms -- a 9.70x saving, because the shorter shape stays on the ANE's efficient
-# path (192 -> 1.88 ms and 256 -> 4.38 ms, so 128 is the knee, not a linear trend).
+# 1.12 ms -- a 9.70x saving. 128 is a KNEE rather than a linear trend (192 -> 1.88 ms,
+# 256 -> 4.38 ms), but the CAUSE is not claimed: MLComputePlan reports the 128 and 512
+# graphs as IDENTICALLY placed (152 of 165 ops on the Neural Engine for both), so the
+# win is not extra ANE residency and this module does not assert a scheduling reason
+# it has not measured. coreml_embed.py carries the same disclaimer.
 # REAL (query, passage) pairs measured 28-40 tokens, so the short graph carries the
 # overwhelming majority of pairs. A pair is routed here ONLY when its tokenized length
 # already fits in SEQ_FAST, so the fast path NEVER truncates anything the 512 graph
