@@ -45,5 +45,36 @@
       "fixture_dense_code_13px.png (code editor, 13px text, E0308 banner, Run Tests button)",
       "fixture_settings_12px.png (settings dialog, 12px labels, IP addresses, Renew Lease button)"
     ]
+  },
+  "MODEL_COMPARISON_2026_07_31": {
+    "question": "is there a better VLM than the pinned Qwen2-VL-2B for reading screens?",
+    "method": "12 checkable facts (error codes, an IP address, a DNS server, button labels, a source filename, a security type) across three fixtures with 12px/13px/large text, 6 samples each = 72 evaluations per model, at the SHIPPED visual-token cap. Harness committed as compare_models.py.",
+    "results": {
+      "mlx-community/Qwen2-VL-2B-Instruct-4bit": {
+        "accuracy": "54/72 (75.0%)",
+        "median_s": 1.63,
+        "peak_gib": 2.29,
+        "per_fixture": "18/24 on all three"
+      },
+      "mlx-community/Qwen3-VL-2B-Instruct-4bit": {
+        "accuracy": "18/72 (25.0%)",
+        "median_s": 1.72,
+        "peak_gib": 2.71
+      },
+      "mlx-community/Qwen3-VL-4B-Instruct-4bit": {
+        "accuracy": "30/72 (41.7%)",
+        "median_s": 3.98,
+        "peak_gib": 3.94
+      }
+    },
+    "verdict": "NO-GO on a swap. The incumbent wins on EVERY axis - accuracy, latency and memory - against both newer-generation candidates, including the most-downloaded mlx-community VLM.",
+    "prompting_was_checked_first": "a bare question versus one with an answer-shape suffix changed a single case from 2/3 to 3/3 and a third phrasing collapsed to '111111...', so phrasing genuinely matters. But re-running both candidates WITH the suffix left them at 25% and 33% - prompting does not explain the gap.",
+    "CORRECTION_TO_AN_EARLIER_CLAIM": "PR #157 and its commit stated screen-VQA scores '2/12 to 4/12 at every resolution' and is 'still not reliable'. That figure came from a run spanning UNCAPPED resolutions - the regime where the model collapses into repetition - and a harder question set. Measured properly at the shipped cap it is 75%, evenly 18/24 across all three fixtures. The cap fix was right; the characterisation of what remains was too harsh.",
+    "what_this_does_not_settle": [
+      "three synthetic fixtures and twelve facts is a small set; it measures SCREEN TEXT reading, not general vision",
+      "mlx-vlm 0.6.4's Qwen3-VL support may itself be immature - this cannot distinguish 'the model is worse' from 'the port is worse' without a reference implementation",
+      "the OCR-specialised architectures mlx-vlm now supports (dots_ocr, deepseekocr, paddleocr_vl and four others) were NOT evaluated; transcribe-then-ask with the resident 4B LLM is a different design worth measuring separately"
+    ],
+    "housekeeping": "both losing checkpoints (4,685 MB) were deleted immediately rather than left to accumulate, which is how 7.3 GB of rejected candidates built up before."
   }
 }
