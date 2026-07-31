@@ -7171,4 +7171,41 @@ mod tests {
         assert!(issues.is_empty(), "plugin_sdk.enabled must be a known key: {issues:?}");
         assert!(!cfg.plugin_sdk.enabled, "the operator can turn the launch handshake off");
     }
+
+#[cfg(test)]
+mod lifelog_switch_tests {
+    /// [lifelog].enabled must be HONOURED, not merely declared.
+    ///
+    /// It was in KNOWN_KEYS, defaulted, typo-validated, DLS-autocompleted and
+    /// documented as "with it false the digest intent returns an honest 'the life log
+    /// is off'" — and nothing outside this file read it. Setting it false produced no
+    /// warning (the parser accepts it happily) and a full digest anyway.
+    #[test]
+    fn the_router_gates_the_digest_on_the_switch() {
+        let router = include_str!("router.rs");
+        let i = router
+            .find("classify_lifelog_intent(text)")
+            .expect("the lifelog dispatch moved; re-point this guard");
+        let window = &router[i..(i + 1200).min(router.len())];
+        assert!(
+            window.contains("!cfg.lifelog.enabled"),
+            "the life-log digest dispatches without consulting its master switch"
+        );
+        let gate = window.find("!cfg.lifelog.enabled").unwrap();
+        let build = window.find("build_digest").unwrap_or(window.len());
+        assert!(
+            gate < build,
+            "the switch is checked AFTER the digest is built, which is not a gate"
+        );
+    }
+
+    #[test]
+    fn the_off_reply_is_honest_about_why() {
+        let router = include_str!("router.rs");
+        assert!(
+            router.contains("The life log is off, sir"),
+            "an operator who turned it off must be told that is why, not given silence"
+        );
+    }
+}
 }

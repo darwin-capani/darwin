@@ -59,6 +59,29 @@ class OcrModelIdIsConfigurable(unittest.TestCase):
         cfg = self._load('[vision]\nocr_model = "some/other-ocr"\n')
         self.assertEqual(cfg.get("ocr_model"), "some/other-ocr")
 
+    def test_the_vision_model_key_is_also_read(self):
+        """[vision].ocr_model's SIBLING had the identical defect. [vision].model is
+        what the shipped config documents as "canonical on-device VLM repo id" and
+        what the HUD's "Vision model id" field writes to, and load_config read
+        [models].vlm instead — a key that is not in the shipped config at all. So the
+        VLM id was effectively hard-coded and both routes to change it did nothing."""
+        self.assertEqual(
+            self._load('[vision]\nmodel = "org/my-vlm"\n').get("vlm"), "org/my-vlm")
+        self.assertEqual(
+            self._load('[vision]\nmodel = ""\n').get("vlm"), "",
+            "an empty [vision].model must disable the VLM, as the config documents")
+
+    def test_the_legacy_models_vlm_key_still_works(self):
+        self.assertEqual(
+            self._load('[models]\nvlm = "org/legacy"\n').get("vlm"), "org/legacy")
+
+    def test_vision_model_wins_over_the_legacy_key(self):
+        self.assertEqual(
+            self._load('[models]\nvlm = "org/legacy"\n[vision]\nmodel = "org/new"\n')
+            .get("vlm"), "org/new",
+            "[vision].model is the documented and HUD-editable location, so it must "
+            "take precedence when both are present")
+
     def test_absent_falls_back_to_the_default(self):
         cfg = self._load('')
         self.assertEqual(cfg.get("ocr_model"), S.DEFAULT_OCR_MODEL)
