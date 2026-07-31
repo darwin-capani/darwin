@@ -198,6 +198,23 @@ else
     fail "uninstall.sh claims complete removal but leaves HUD support data behind"
 fi
 
+
+# --- every capability offered to the model must actually get built ------------
+# share_guard_scrub is declared unconditionally in the Anthropic tool schema and
+# granted to the mnemosyne agent, but apps/share-guard is a SWIFT package and the
+# installer hard-coded apps/vision as the only Swift build. The tool was permanently
+# dead on every install.
+if grep -q 'for swiftpkg in "\$DARWIN_HOME"/apps/\*/Package.swift' "$ROOT/install.sh"; then
+    ok "install.sh builds every Swift micro-app, not just vision"
+else
+    fail "install.sh builds only some Swift apps; a model-exposed tool has no binary"
+fi
+for pkg in "$ROOT"/apps/*/Package.swift; do
+    [ -e "$pkg" ] || continue
+    name="$(basename "$(dirname "$pkg")")"
+    ok "  covered: apps/$name"
+done
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "ALL PASS"
