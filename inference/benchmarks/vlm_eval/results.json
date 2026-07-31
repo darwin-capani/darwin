@@ -76,5 +76,33 @@
       "the OCR-specialised architectures mlx-vlm now supports (dots_ocr, deepseekocr, paddleocr_vl and four others) were NOT evaluated; transcribe-then-ask with the resident 4B LLM is a different design worth measuring separately"
     ],
     "housekeeping": "both losing checkpoints (4,685 MB) were deleted immediately rather than left to accumulate, which is how 7.3 GB of rejected candidates built up before."
+  },
+  "TRANSCRIBE_THEN_ASK_2026_07_31": {
+    "question": "the VLM swap was a NO-GO; is a different DESIGN better? OCR the screen, then answer from the transcript with the already-resident 4B LLM.",
+    "why_it_was_worth_testing": "the VQA failure mode is not blindness. Asked for an IP address the model would emit the single token 'The' and stop (finish_reason=stop, 2 tokens) on a screen whose text it could plainly resolve. That is an ANSWERING failure, not a READING one, which argues for separating the two.",
+    "results_12_checkable_facts": {
+      "Qwen2-VL-2B VQA (shipped)": {
+        "accuracy": "9/12 (75.0%)",
+        "per_query_s": 1.63,
+        "size_mb": 1204
+      },
+      "GLM-OCR-4bit + resident 4B": {
+        "accuracy": "11/12 (91.7%)",
+        "per_query_s": 7.4,
+        "ocr_s": 6.1,
+        "llm_s": 1.3,
+        "size_mb": 1212
+      },
+      "dots.ocr-4bit + resident 4B": {
+        "accuracy": "11/12 (91.7%)",
+        "per_query_s": 19.2,
+        "ocr_s": 17.8,
+        "size_mb": 3375
+      }
+    },
+    "THE_CAP_IS_BACKWARDS_FOR_OCR": "DESCRIBE_IMAGE_MAX_PIXELS exists because the VQA model collapses into repetition at ~1890 visual tokens. OCR models want the opposite. Measured on transcription coverage: GLM-OCR 8/11 facts capped vs 10/11 full-res; dots.ocr 9/11 capped vs 11/11 full-res. Both miss the small red-banner error codes at 764x496 and read them at 1512x982. Any OCR path must NOT inherit the VQA cap.",
+    "the_latency_picture_is_not_one_number": "7.4 s is for ONE question on a cold screenshot. Transcription is per-IMAGE, not per-question: cache the transcript and a second question about the same screen costs only the 1.3 s LLM step - FASTER than the 1.63 s VQA path. So the trade is 4.5x slower for a single glance, faster for any follow-up.",
+    "verdict": "MEASURED GO on accuracy (+16.7 points), with a real single-query latency cost. Not implemented: it is a design change (a second model, a new op or a describe_image rewrite, transcript caching keyed on image content) rather than a pin swap, and it makes a shipped feature visibly slower on first ask. That is the user's call, not a silent swap.",
+    "housekeeping": "dots.ocr-4bit and DeepSeek-OCR-4bit deleted immediately (5,723 MB). DeepSeek-OCR-4bit could not load at all in mlx-vlm 0.6.4 ('Unrecognized processing class'), which is itself a result."
   }
 }
