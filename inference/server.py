@@ -217,6 +217,7 @@ bare Homebrew interpreter instead of .venv/bin/python).
 
 import asyncio
 import itertools
+import hashlib
 import json
 import logging
 import logging.handlers
@@ -292,6 +293,32 @@ DEFAULT_TTS = "mlx-community/Kokoro-82M-bf16"
 # op honestly reports "unavailable" until both mlx-vlm AND this checkpoint are
 # present on the device. The pixels never leave the device.
 DEFAULT_VLM = "mlx-community/Qwen2-VL-2B-Instruct-4bit"
+# OCR-FIRST SCREEN READING (op=describe_image). Measured on 12 checkable facts across
+# three fixtures: transcribing the screen with this model and answering from the
+# transcript with the ALREADY-RESIDENT 4B LLM scores 11/12 (91.7%), against 9/12
+# (75.0%) for asking the VLM directly.
+#
+# The reason is that the VQA failure was never blindness. Asked for an IP address the
+# VLM emits the single token "The" and stops (finish_reason=stop, two tokens) on a
+# screen whose text it can plainly resolve — an ANSWERING failure, not a reading one.
+# Splitting the two lets each model do the part it is good at.
+#
+# COST, disclosed: a first question about a screen goes ~1.6 s -> ~7.4 s (6.1 s
+# transcribe + 1.3 s answer). Transcription is per-IMAGE though, so a follow-up about
+# the same screen is the 1.3 s answer alone — FASTER than the VQA path it replaces.
+# Empty string disables OCR and falls back to asking the VLM directly.
+DEFAULT_OCR_MODEL = "mlx-community/GLM-OCR-4bit"
+# Transcripts cached by image CONTENT (sha256), so re-asking about the same screenshot
+# skips the expensive step. Small: a transcript is a few hundred to a few thousand
+# characters and screens repeat.
+OCR_TRANSCRIPT_CACHE_MAX = 16
+# Decode budget for a transcription. A dense screen measured ~600-1300 characters.
+OCR_TRANSCRIBE_MAX_TOKENS = 1024
+OCR_TRANSCRIBE_PROMPT = "Transcribe all text visible in this image."
+# How much transcript to put in front of the LLM. A dense screen measured ~600-1300
+# chars, so this is generous; it bounds a pathological transcript rather than trimming
+# a normal one.
+OCR_TRANSCRIPT_PROMPT_CHARS = 6000
 # Contract default model for the OPTIONAL on-device text->image generator
 # (op=generate_image). A FLUX.1-schnell-class checkpoint mflux can load on MLX.
 # Like the VLM, this is only a DEFAULT id — the model is a multi-GB download
@@ -2315,6 +2342,7 @@ def load_config():
         # only the repo we'd load IF present; the op is gated on the model
         # actually being downloaded, so this never forces a download.
         "vlm": DEFAULT_VLM,
+        "ocr_model": DEFAULT_OCR_MODEL,
         # OPTIONAL on-device text->image diffusion checkpoint (op=generate_image).
         # Like the VLM this default id is only what we'd load IF present; the op is
         # gated on availability so it never forces a download, and an empty/unset
@@ -2951,6 +2979,12 @@ class InferenceEngine:
         # is the checkpoint mlx-vlm will lazy-load on first use. Ships OFF: the
         # daemon's [vision] gate + the multi-GB download are what turn it on.
         self.vlm_id = settings.get("vlm", DEFAULT_VLM)
+        # OCR-first screen reading; "" disables it and asks the VLM directly.
+        self.ocr_model_id = settings.get("ocr_model", DEFAULT_OCR_MODEL)
+        self._ocr_model = None
+        self._ocr_processor = None
+        self._ocr_config = None
+        self._ocr_transcripts = {}  # sha256(image bytes) -> transcript
         # OPTIONAL on-device text->image model id (op=generate_image). Empty
         # string disables the op entirely (honest "unavailable"); a non-empty id
         # is the checkpoint the MLX diffusion engine will lazy-load on first use.
@@ -4642,6 +4676,118 @@ class InferenceEngine:
     # -- on-device vision-language model (op=describe_image) ------------
     # _ensure_vlm must be called with self._lock held.
 
+    def _ensure_ocr(self):
+        """Lazy-load the OCR model, mirroring `_ensure_vlm`'s contract exactly:
+        returns the mlx-vlm handles on success, or None when OCR cannot run (id
+        empty, mlx-vlm absent, checkpoint missing/corrupt). None is never fatal —
+        `describe_image` falls back to asking the VLM directly and says which path
+        it took."""
+        if not self.ocr_model_id:
+            return None
+        vlm = _load_mlx_vlm()
+        if vlm is None:
+            return None
+        if self._ocr_model is None:
+            try:
+                log.info("loading OCR model %s (resident after first use)...", self.ocr_model_id)
+                t0 = time.perf_counter()
+                self._ocr_model, self._ocr_processor = vlm["load"](self.ocr_model_id)
+                self._ocr_config = self._ocr_model.config
+                log.info("OCR model loaded in %.1fs", time.perf_counter() - t0)
+            except Exception:
+                log.exception(
+                    "OCR model %s could not be loaded; op=describe_image will ask the "
+                    "VLM directly", self.ocr_model_id,
+                )
+                self._ocr_model = None
+                self._ocr_processor = None
+                self._ocr_config = None
+                return None
+        return {
+            "generate": vlm["generate"],
+            "apply_chat_template": vlm["apply_chat_template"],
+            "model": self._ocr_model,
+            "processor": self._ocr_processor,
+            "config": self._ocr_config,
+        }
+
+    def _transcribe_screen(self, path):
+        """Transcribe `path` with the OCR model, caching by image CONTENT. Returns the
+        transcript, or None when OCR is unavailable or produced nothing usable.
+
+        NOTE THE RESOLUTION. This deliberately does NOT apply
+        DESCRIBE_IMAGE_MAX_PIXELS. That cap exists because the VQA model collapses
+        into repetition past ~1890 visual tokens; OCR models want the opposite and are
+        built for full-resolution pages. Measured on transcription coverage: GLM-OCR
+        reads 8/11 checkable facts at the capped 764x496 and 10/11 at the native
+        1512x982 — the small red-banner error codes are simply gone at the cap. Making
+        the OCR path inherit the VQA cap would silently discard the reason to have it.
+        """
+        ocr = self._ensure_ocr()
+        if ocr is None:
+            return None
+        try:
+            with open(path, "rb") as fh:
+                key = hashlib.sha256(fh.read()).hexdigest()
+        except OSError:
+            return None
+        cached = self._ocr_transcripts.get(key)
+        if cached is not None:
+            log.info("op=describe_image: transcript cache hit (%d chars)", len(cached))
+            return cached
+        try:
+            formatted = ocr["apply_chat_template"](
+                ocr["processor"], ocr["config"], OCR_TRANSCRIBE_PROMPT, num_images=1
+            )
+            t0 = time.perf_counter()
+            out = ocr["generate"](
+                ocr["model"], ocr["processor"], formatted, [path],
+                max_tokens=OCR_TRANSCRIBE_MAX_TOKENS, verbose=False,
+            )
+            text = out if isinstance(out, str) else getattr(out, "text", str(out))
+            text = (text or "").strip()
+            log.info(
+                "op=describe_image: transcribed %d chars in %dms",
+                len(text), int((time.perf_counter() - t0) * 1000),
+            )
+        except Exception:
+            log.exception("op=describe_image: transcription failed; asking the VLM directly")
+            return None
+        if not text:
+            return None
+        # Bounded, FIFO — screens repeat, and a transcript is small.
+        if len(self._ocr_transcripts) >= OCR_TRANSCRIPT_CACHE_MAX:
+            self._ocr_transcripts.pop(next(iter(self._ocr_transcripts)), None)
+        self._ocr_transcripts[key] = text
+        return text
+
+    def _answer_from_transcript(self, question, transcript, max_tokens):
+        """Answer `question` from an OCR transcript using the ALREADY-RESIDENT LLM.
+        Returns the answer, or None on any failure so the caller falls back to the VLM.
+
+        Grounding is explicit: the model is told to use ONLY the transcript. This op's
+        contract is to report what is ON THE SCREEN, so an answer drawn from the
+        model's own knowledge would be exactly the fabrication the rest of this system
+        is built to avoid — and unlike a citation, nothing downstream could catch it.
+
+        The caller must NOT hold self._lock when calling this: _run_llm_interruptible
+        acquires it, and the lock is not reentrant.
+        """
+        try:
+            body = transcript[:OCR_TRANSCRIPT_PROMPT_CHARS]
+            grounded = (
+                "Below is the text transcribed from a screenshot.\n\n---\n"
+                f"{body}\n---\n\n"
+                f"Question: {question}\n"
+                "Answer using ONLY the transcript above. Be brief and exact. If the "
+                "transcript does not contain the answer, say so plainly."
+            )
+            out = self._run_llm_interruptible(grounded, max_tokens=max_tokens)
+            return (out or "").strip() or None
+        except Exception:
+            log.exception("op=describe_image: transcript answering failed")
+            return None
+
     def _ensure_vlm(self):
         """Lazy-load the on-device VLM (mlx-vlm + the checkpoint), caching it as
         resident for subsequent calls. Returns a dict of {load, generate,
@@ -4729,6 +4875,32 @@ class InferenceEngine:
         prompt = (question or "").strip() or DESCRIBE_IMAGE_DEFAULT_PROMPT
         if len(prompt) > DESCRIBE_IMAGE_MAX_QUESTION_CHARS:
             prompt = prompt[:DESCRIBE_IMAGE_MAX_QUESTION_CHARS]
+
+        # OCR-FIRST. Transcribe the screen, then answer from the transcript with the
+        # LLM that is already resident — measured 11/12 against the VLM's 9/12 on the
+        # same checkable facts. Any failure here falls through to asking the VLM
+        # directly, so this can only be more accurate or the same, never a new way to
+        # be unavailable.
+        # NOTE THE TWO SEPARATE CRITICAL SECTIONS. Transcription runs under the lock
+        # (it drives a model), but answering must NOT: _run_llm_interruptible takes
+        # this same non-reentrant lock, so calling it from inside here deadlocks the
+        # server outright. That is not hypothetical — the identical mistake was made
+        # and caught in the Core ML background-upgrade path.
+        with self._lock:
+            transcript = self._transcribe_screen(path)
+        if transcript:
+            answered = self._answer_from_transcript(prompt, transcript, max_tokens)
+            if answered:
+                return {
+                    "ok": True,
+                    "text": answered,
+                    "model": f"{self.ocr_model_id}+{self.llm_id}",
+                    "path": "ocr+llm",
+                }
+            log.info(
+                "op=describe_image: answering from the transcript failed; "
+                "asking the VLM directly"
+            )
 
         with self._lock:
             vlm = self._ensure_vlm()

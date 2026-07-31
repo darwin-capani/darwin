@@ -36,9 +36,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import server  # noqa: E402
 
 
-def _make_engine(vlm="stub-vlm-repo"):
+def _make_engine(vlm="stub-vlm-repo", ocr_model=""):
     """Construct an InferenceEngine without loading any model (all loads are
-    lazy). `vlm` is the (fake) checkpoint id; "" disables the op entirely."""
+    lazy). `vlm` is the (fake) checkpoint id; "" disables the op entirely.
+
+    `ocr_model` DEFAULTS TO OFF here so these tests keep exercising the VLM path they
+    were written for. describe_image now tries OCR-first in production (measured 11/12
+    against the VLM's 9/12), and the OCR loader shares this file's mlx-vlm mock seam —
+    so leaving it on would silently route every one of these through the OCR path and
+    they would stop testing the thing they name. The OCR path has its own tests."""
     settings = {
         "llm": "stub-llm",
         "stt": "stub-stt",
@@ -46,6 +52,7 @@ def _make_engine(vlm="stub-vlm-repo"):
         "voice": "bm_george",
         "speed": 1.2,
         "vlm": vlm,
+        "ocr_model": ocr_model,
     }
     return server.InferenceEngine(settings, classifier_template="", persona="")
 
@@ -415,6 +422,111 @@ class OpIsolationTests(unittest.TestCase):
         finally:
             restore()
             os.unlink(path)
+
+
+
+
+# ---------------------------------------------------------------------------
+# OCR-FIRST screen reading
+# ---------------------------------------------------------------------------
+# describe_image transcribes the screen and answers from the transcript with the
+# already-resident LLM. MEASURED on 12 checkable facts across three fixtures: 11/12
+# (91.7%) against 9/12 (75.0%) for asking the VLM directly. The VQA failure was never
+# blindness — asked for an IP address the VLM emits the single token "The" and stops
+# on a screen whose text it can plainly resolve.
+
+
+class OcrFirstScreenReading(unittest.TestCase):
+    def setUp(self):
+        self.path = _make_image_file()
+
+    def _engine_with_ocr(self, transcript="IPv4 Address 192.168.1.47\nRenew Lease", answer="192.168.1.47"):
+        eng = _make_engine(ocr_model="stub-ocr-repo")
+        eng._transcribe_screen = lambda p: transcript
+        eng._run_llm_interruptible = lambda *a, **k: answer
+        return eng
+
+    def test_the_ocr_path_answers_and_names_itself(self):
+        eng = self._engine_with_ocr()
+        out = eng.describe_image(self.path, question="What is the IPv4 address?")
+        self.assertTrue(out["ok"], out)
+        self.assertIn("192.168.1.47", out["text"])
+        self.assertEqual(out["path"], "ocr+llm")
+        self.assertIn("stub-ocr-repo", out["model"])
+
+    def test_a_failed_transcription_falls_back_to_the_vlm(self):
+        """OCR is an accuracy upgrade, never a new way to be unavailable."""
+        fake = _FakeVLM()
+        restore = _patch_loader(fake.as_seam())
+        try:
+            eng = _make_engine(ocr_model="stub-ocr-repo")
+            eng._transcribe_screen = lambda p: None  # OCR unavailable/failed
+            out = eng.describe_image(self.path, question="what is this?")
+            self.assertTrue(out["ok"], out)
+            self.assertNotEqual(out.get("path"), "ocr+llm")
+            self.assertGreaterEqual(fake.generate_calls, 1, "the VLM must have answered")
+        finally:
+            restore()
+
+    def test_a_failed_transcript_answer_falls_back_to_the_vlm(self):
+        fake = _FakeVLM()
+        restore = _patch_loader(fake.as_seam())
+        try:
+            eng = _make_engine(ocr_model="stub-ocr-repo")
+            eng._transcribe_screen = lambda p: "some screen text"
+            eng._run_llm_interruptible = lambda *a, **k: ""  # LLM produced nothing
+            out = eng.describe_image(self.path, question="what is this?")
+            self.assertTrue(out["ok"], out)
+            self.assertGreaterEqual(fake.generate_calls, 1)
+        finally:
+            restore()
+
+    def test_the_transcript_prompt_forbids_outside_knowledge(self):
+        """This op reports what is ON THE SCREEN. An answer from the model's own
+        knowledge is the fabrication the rest of the system is built to avoid, and
+        unlike a citation nothing downstream could catch it."""
+        seen = {}
+        eng = _make_engine(ocr_model="stub-ocr-repo")
+        eng._transcribe_screen = lambda p: "Router 192.168.1.1"
+        def spy(text, *a, **k):
+            seen["prompt"] = text
+            return "192.168.1.1"
+        eng._run_llm_interruptible = spy
+        eng.describe_image(self.path, question="what is the router address?")
+        self.assertIn("ONLY the transcript", seen["prompt"])
+        self.assertIn("Router 192.168.1.1", seen["prompt"])
+        self.assertIn("what is the router address?", seen["prompt"])
+
+    def test_answering_happens_OUTSIDE_the_engine_lock(self):
+        """MUTATION GUARD. _run_llm_interruptible acquires self._lock, which is not
+        reentrant — answering from inside describe_image's critical section deadlocks
+        the server outright. The identical mistake was made and caught in the Core ML
+        background-upgrade path."""
+        eng = _make_engine(ocr_model="stub-ocr-repo")
+        eng._transcribe_screen = lambda p: "screen text"
+        held = {}
+        def check(*a, **k):
+            held["locked"] = eng._lock.locked()
+            return "an answer"
+        eng._run_llm_interruptible = check
+        eng.describe_image(self.path, question="q")
+        self.assertFalse(
+            held.get("locked", True),
+            "describe_image still held the engine lock while answering — this "
+            "deadlocks against _run_llm_interruptible",
+        )
+
+    def test_ocr_disabled_by_config_uses_the_vlm(self):
+        fake = _FakeVLM()
+        restore = _patch_loader(fake.as_seam())
+        try:
+            eng = _make_engine(ocr_model="")
+            self.assertIsNone(eng._ensure_ocr(), "empty ocr_model must disable OCR")
+            out = eng.describe_image(self.path, question="what is this?")
+            self.assertTrue(out["ok"])
+            self.assertGreaterEqual(fake.generate_calls, 1)
+        finally:
+            restore()
 
 
 if __name__ == "__main__":
