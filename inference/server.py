@@ -3058,6 +3058,21 @@ def _answer_is_contentless(text):
     return not any(w and w not in _FUNCTION_WORDS for w in words)
 
 
+def _persona_cache_slot(name):
+    """Disk-cache slot for a per-agent persona.
+
+    Agent names reach here from the daemon and end up in a FILENAME, so this cannot
+    be an f-string: "../../etc/x" or a name with a slash would escape the cache root,
+    and two names differing only by an unsafe character would collide onto one slot --
+    reintroducing, per-agent, exactly the clobbering this slot exists to end.
+
+    So the readable part is sanitised for humans reading the directory, and a short
+    hash of the ORIGINAL name carries the identity."""
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "-", (name or "")).strip("-")[:40] or "agent"
+    digest = hashlib.sha256((name or "").encode("utf-8")).hexdigest()[:12]
+    return f"persona-{safe}-{digest}"
+
+
 def _transcript_answer_is_a_refusal(text):
     """True when the LLM said THE TRANSCRIPT does not contain the answer.
 
@@ -3957,7 +3972,7 @@ class InferenceEngine:
         restored = load_prompt_cache_fingerprinted(
             prompt_cache_root(), "classifier", cache_id,
             self._quant_loaded or self.quant, prefix_str, cache,
-            getattr(self, "_adapter_stamp", None),
+            getattr(self, "_active_adapter", None),
         )
         if restored is not None:
             cache = restored
@@ -3975,7 +3990,7 @@ class InferenceEngine:
             save_prompt_cache_fingerprinted(
                 prompt_cache_root(), "classifier", cache, cache_id,
                 self._quant_loaded or self.quant, prefix_str,
-                getattr(self, "_adapter_stamp", None),
+                getattr(self, "_active_adapter", None),
             )
             log.info(
                 "classifier prompt cache prefilled: %d tokens in %dms",
@@ -4066,9 +4081,20 @@ class InferenceEngine:
         `_persona_prefix_str`)."""
         return self._persona_prefix_str(self.persona)
 
-    def _prefill_persona_cache(self, persona_text):
+    def _prefill_persona_cache(self, persona_text, slot="persona"):
         """Prefill a fresh KV cache with `persona_text`'s static prefix and
-        return {cache, cache_len, prefix_tokens, prefix_str}. Caller holds
+        return {cache, cache_len, prefix_tokens, prefix_str}.
+
+        `slot` names the ON-DISK cache file. It used to be hard-coded "persona" for
+        every caller, so the base persona and all 27 agent personas wrote to ONE file
+        (persona.safetensors) and each overwrote the last. The fingerprint kept that
+        from corrupting anything -- a mismatched prefix is rejected and re-prefilled --
+        so the symptom was not a wrong answer but a cache that never hit: this very
+        machine logged "prompt cache persona: fingerprint changed (prefix_chars,
+        prefix_sha256); prefilling fresh" at boot, paying the full persona prefill
+        every start for a cache that existed and was simply about a different persona.
+
+        Caller holds
         self._lock and self._model is loaded. Same make_prompt_cache +
         trim-back-on-reuse pattern as the classifier cache; raises if the
         model's cache is not trimmable (so the caller can fall back to uncached
@@ -4090,15 +4116,15 @@ class InferenceEngine:
         # leaves that projection out of the graph entirely; the cache is identical.
         # This is mlx_lm's own prefill pattern (generate.py: mx.eval([c.state ...])).
         restored = load_prompt_cache_fingerprinted(
-            prompt_cache_root(), "persona", self.llm_id,
+            prompt_cache_root(), slot, self.llm_id,
             self._quant_loaded or self.quant, prefix_str, cache,
-            getattr(self, "_adapter_stamp", None),
+            getattr(self, "_active_adapter", None),
         )
         if restored is not None:
             cache = restored
             log.info(
-                "persona prompt cache restored from disk: %d tokens in %dms",
-                len(prefix_tokens), int((time.perf_counter() - t0) * 1000),
+                "prompt cache %s restored from disk: %d tokens in %dms",
+                slot, len(prefix_tokens), int((time.perf_counter() - t0) * 1000),
             )
         else:
             self._model(mx.array(prefix_tokens)[None], cache=cache)
@@ -4108,13 +4134,13 @@ class InferenceEngine:
             # leaving tens of MB per prefill sitting in MLX's buffer pool past boot.
             mx.clear_cache()
             save_prompt_cache_fingerprinted(
-                prompt_cache_root(), "persona", cache, self.llm_id,
+                prompt_cache_root(), slot, cache, self.llm_id,
                 self._quant_loaded or self.quant, prefix_str,
-                getattr(self, "_adapter_stamp", None),
+                getattr(self, "_active_adapter", None),
             )
             log.info(
-                "persona prompt cache prefilled: %d tokens in %dms",
-                len(prefix_tokens),
+                "prompt cache %s prefilled: %d tokens in %dms",
+                slot, len(prefix_tokens),
                 int((time.perf_counter() - t0) * 1000),
             )
         return {
@@ -4147,7 +4173,9 @@ class InferenceEngine:
             self._agent_gen_caches.move_to_end(name)
             return cached
         try:
-            state = self._prefill_persona_cache(persona_text)
+            state = self._prefill_persona_cache(
+                persona_text, slot=_persona_cache_slot(name)
+            )
         except Exception:
             log.exception(
                 "per-agent persona cache prefill failed for %r; running this turn uncached",
