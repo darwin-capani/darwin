@@ -26,12 +26,29 @@ honest NO-GO and exits non-zero (never fabricates a number).
 | peak GPU memory | 2.44 GiB |
 | resolution | capped at 380,000 px (~764×496, ~459 visual tokens); 128 max tokens |
 
-**Verdict: QUALIFIED.** The latency is fine on-demand, but this checkpoint is NOT
-reliable at reading screens — across three fixtures and four checkable facts it scored
-2/12 to 4/12 at EVERY resolution, and after the cap it still invented an error code
-that was not on screen. Feeding a FULL-resolution screen was actively worse: ~1890
-visual tokens drove it into repetition collapse ("The The The The ..."), which the cap
-now prevents. Treat an answer as a hint, not a reading. Original verdict follows:
+**Verdict: GO, with the visual-token cap.** Measured at the SHIPPED configuration over
+12 checkable facts x 3 fixtures x 6 samples (72 evaluations, harness in
+`compare_models.py`): **54/72 = 75.0%**, 1.63 s median, 2.29 GiB peak, and an even
+18/24 on each of the three fixtures. Full numbers and the two losing candidates are in
+`results.json` under `MODEL_COMPARISON_2026_07_31`.
+
+> **This paragraph previously said the opposite** — "NOT reliable at reading screens
+> ... 2/12 to 4/12 at EVERY resolution" — and was left standing after `results.json`
+> had already recorded the correction, so two committed artifacts in this directory
+> disagreed about the same shipped configuration. That figure came from an early
+> ad-hoc probe at resolutions the server does not use, before the visual-token cap
+> existed; it was never a measurement of what ships. Re-measured properly at the cap,
+> the number is 75%.
+
+Feeding a FULL-resolution screen IS actively worse and that finding stands: ~1890
+visual tokens drive this checkpoint into repetition collapse ("The The The The ..."),
+which `DESCRIBE_IMAGE_MAX_PIXELS` now prevents. Two newer candidates were measured
+against it on the same harness and both lost on every axis — Qwen3-VL-2B at 25.0% and
+Qwen3-VL-4B at 41.7%, the latter also slower and heavier — so the pin stays.
+
+Note also that describe_image no longer asks this model first: an OCR transcript is
+read and answered by the resident LLM, and the VLM is consulted only when the
+transcript genuinely cannot answer (colour, position, size). Original verdict follows:
 
 ~~GO for an ON-DEMAND screen question~~ (a deliberate voice query),
 NOT for a continuous/real-time loop. The model answered correctly — it read the
