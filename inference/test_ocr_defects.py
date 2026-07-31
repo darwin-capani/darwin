@@ -74,6 +74,12 @@ class OcrModelIdIsConfigurable(unittest.TestCase):
                          "a bad ocr_model must not take the rest of the config with it")
         self.assertIsInstance(cfg.get("ocr_model"), str)
 
+    def test_a_scalar_vision_block_does_not_crash_boot(self):
+        """Hand-edited configs are the norm. `vision = "on"` is a scalar, not a table;
+        the sources loop skips non-dict sections, so this must fall back, not raise."""
+        self.assertEqual(self._load('vision = "on"\n').get("ocr_model"),
+                         S.DEFAULT_OCR_MODEL)
+
     def test_a_boolean_is_rejected_rather_than_stringified(self):
         """load_config specifically guards this: str(True) == "True" would convert
         silently, so `ocr_model = false` (a plausible way to try to turn OCR off)
@@ -107,6 +113,10 @@ class RefusalDetectorMatchesTheSourceNotAnyNegation(unittest.TestCase):
         "The transcript provided does not contain any information about the current "
         "battery percentage; it only shows a Finder window listing the files in the "
         "Downloads folder.",
+        # The "says/shows" family, missing from the first list.
+        "The transcript doesn't say anything about the battery.",
+        "There is no mention of the printer in the screen text provided.",
+        "The screen text does not show a version number.",
         "",
     )
 

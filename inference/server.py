@@ -2406,7 +2406,7 @@ def load_config():
     speech = cfg.get("speech", {})
     inference = cfg.get("inference", {})
     image = cfg.get("image", {})
-    vision = cfg.get("vision", {}) if isinstance(cfg.get("vision"), dict) else {}
+    vision = cfg.get("vision", {})
     sources = (
         ("llm", models, "llm", str),
         ("stt", models, "stt", str),
@@ -3014,6 +3014,14 @@ def _transcript_answer_is_a_refusal(text):
         "can't be determined",
         "not specified",
         "unable to determine",
+        # The "says/shows" family. The first list omitted these, so "the transcript
+        # doesn't say anything about the battery" was returned to the user verbatim
+        # as the answer -- the expensive direction of this classifier's error.
+        "does not say",
+        "doesn't say",
+        "does not show",
+        "doesn't show",
+        "no mention",
     )
     if not any(n in t for n in negation):
         return False
