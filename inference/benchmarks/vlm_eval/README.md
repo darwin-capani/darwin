@@ -22,11 +22,18 @@ honest NO-GO and exits non-zero (never fabricates a number).
 | metric | value |
 |---|---|
 | cold model load | 17.29 s |
-| warm latency / query | ~8.2 s median (runs: 9.69, 8.13, 8.17 s) |
+| warm latency / query | **~1.6 s median** (was ~8.2 s before the visual-token cap) |
 | peak GPU memory | 2.44 GiB |
-| resolution | 1512×982, 128 max tokens |
+| resolution | capped at 380,000 px (~764×496, ~459 visual tokens); 128 max tokens |
 
-**Verdict: GO for an ON-DEMAND screen question** (a deliberate voice query),
+**Verdict: QUALIFIED.** The latency is fine on-demand, but this checkpoint is NOT
+reliable at reading screens — across three fixtures and four checkable facts it scored
+2/12 to 4/12 at EVERY resolution, and after the cap it still invented an error code
+that was not on screen. Feeding a FULL-resolution screen was actively worse: ~1890
+visual tokens drove it into repetition collapse ("The The The The ..."), which the cap
+now prevents. Treat an answer as a hint, not a reading. Original verdict follows:
+
+~~GO for an ON-DEMAND screen question~~ (a deliberate voice query),
 NOT for a continuous/real-time loop. The model answered correctly — it read the
 error banner *and* located the Rebuild button (see `results.json:first_answer`),
 which is genuine visual reasoning, not OCR. Answer QUALITY is not formally scored
