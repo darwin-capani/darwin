@@ -37,9 +37,22 @@ use std::process::Stdio;
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 
-/// The launchd label for darwind — the SAME label `scripts/apply_heal.sh` kicks
-/// after a healed build. Restart is `launchctl kickstart -k gui/<uid>/<label>`.
-const DAEMON_LABEL: &str = "com.darwin.daemon";
+/// The launchd labels an "Apply changes" must kick, in order.
+///
+/// THIS USED TO BE ONE LABEL, com.darwin.daemon — and then the panel reported "the new
+/// config is now live". DARWIN runs THREE independent agents, and a large share of the
+/// whitelisted settings are read by the INFERENCE server's own load_config, not the
+/// daemon's: vision.model, vision.ocr_model, image.model, speech.engine, speech.model,
+/// speech.voice, speech.speed, inference.preload, inference.reranker,
+/// inference.speculative, inference.draft_model, inference.quant, models.classifier,
+/// models.local_warm and models.local_budget_gib. Every one of them was written to
+/// disk, acknowledged as applied, and then ignored until something else happened to
+/// restart that process.
+///
+/// Inference goes FIRST so it is already coming up when the daemon reconnects to its
+/// socket. com.darwin.hud is deliberately NOT kicked: it is the window the operator is
+/// standing in, and restarting it would close the panel mid-apply.
+const RESTART_LABELS: &[&str] = &["com.darwin.inference", "com.darwin.daemon"];
 
 /* ----------------------------------------------------------- the whitelist */
 
@@ -1053,35 +1066,61 @@ pub struct RestartResult {
 /// frontend (the label is a constant), so there is no injection surface.
 #[tauri::command]
 pub async fn daemon_restart() -> Result<RestartResult, String> {
-    // Resolve the GUI domain target: gui/<uid>/<label>.
     let uid = libc_getuid();
-    let target = format!("gui/{uid}/{DAEMON_LABEL}");
+    let mut restarted: Vec<&str> = Vec::new();
+    let mut problems: Vec<String> = Vec::new();
 
-    let output = Command::new("/bin/launchctl")
-        .arg("kickstart")
-        .arg("-k")
-        .arg(&target)
-        .stdin(Stdio::null())
-        .output()
-        .await
-        .map_err(|e| format!("could not run launchctl: {e}"))?;
+    for label in RESTART_LABELS {
+        let target = format!("gui/{uid}/{label}");
+        let output = Command::new("/bin/launchctl")
+            .arg("kickstart")
+            .arg("-k")
+            .arg(&target)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|e| format!("could not run launchctl: {e}"))?;
 
-    if output.status.success() {
-        return Ok(RestartResult {
-            ok: true,
-            detail: format!("DARWIN restarted ({target}); the new config is now live."),
-        });
+        if output.status.success() {
+            restarted.push(label);
+            continue;
+        }
+        // kickstart failed — most commonly because that agent is not loaded. Surface a
+        // clear, secret-free explanation (stderr is launchctl's own diagnostic).
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("Could not find") || stderr.contains("No such process") {
+            problems.push(format!("{label} is not loaded"));
+        } else {
+            problems.push(format!(
+                "{label}: {}",
+                stderr.trim().lines().next().unwrap_or("unknown launchctl error")
+            ));
+        }
     }
 
-    // kickstart failed — most commonly because the agent is not loaded. Surface a
-    // clear, secret-free explanation (stderr is launchctl's own diagnostic).
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let detail = if stderr.contains("Could not find") || stderr.contains("No such process") {
-        format!("the DARWIN daemon ({DAEMON_LABEL}) is not loaded — start it, then your changes take effect.")
+    // HONEST REPORTING. A partial restart is NOT "the new config is now live" — that
+    // claim is exactly what made the old single-label behaviour invisible.
+    if problems.is_empty() {
+        return Ok(RestartResult {
+            ok: true,
+            detail: format!(
+                "DARWIN restarted ({}); the new config is now live.",
+                restarted.join(" + ")
+            ),
+        });
+    }
+    let detail = if restarted.is_empty() {
+        format!(
+            "nothing was restarted, so your changes are saved but NOT active yet: {}",
+            problems.join("; ")
+        )
     } else {
         format!(
-            "restart failed: {}",
-            stderr.trim().lines().next().unwrap_or("unknown launchctl error")
+            "restarted {} but NOT {} — settings read by the part that did not restart \
+             are saved and will apply when it next starts: {}",
+            restarted.join(" + "),
+            problems.len(),
+            problems.join("; ")
         )
     };
     Ok(RestartResult { ok: false, detail })
@@ -1983,5 +2022,80 @@ roots = []                     # EXPLICIT codebase-root allowlist, SHIPS EMPTY.
         assert_eq!(by("code.roots"), "pathlist");
         assert_eq!(by("models.local_warm"), "strlist");
         assert_eq!(by("models.local_budget_gib"), "float");
+    }
+}
+#[cfg(test)]
+mod restart_target_tests {
+    use super::*;
+
+    /// Settings whose values the INFERENCE server reads, not the daemon. Kicking only
+    /// com.darwin.daemon wrote them to disk, reported "the new config is now live",
+    /// and left every one of them stale.
+    const INFERENCE_OWNED: &[&str] = &[
+        "vision.model",
+        "vision.ocr_model",
+        "image.model",
+        "speech.engine",
+        "speech.model",
+        "speech.voice",
+        "speech.speed",
+        "inference.preload",
+        "inference.reranker",
+        "inference.speculative",
+        "inference.draft_model",
+        "inference.quant",
+        "models.classifier",
+        "models.local_warm",
+        "models.local_budget_gib",
+    ];
+
+    #[test]
+    fn apply_restarts_the_inference_server_too() {
+        assert!(
+            RESTART_LABELS.contains(&"com.darwin.inference"),
+            "{} whitelisted settings are read by the inference server; without \
+             restarting it, Apply saves them and reports success while they stay \
+             stale: {INFERENCE_OWNED:?}",
+            INFERENCE_OWNED.len()
+        );
+    }
+
+    #[test]
+    fn apply_still_restarts_the_daemon() {
+        assert!(RESTART_LABELS.contains(&"com.darwin.daemon"));
+    }
+
+    #[test]
+    fn inference_is_restarted_before_the_daemon() {
+        // The daemon connects to the inference socket; bringing inference up first
+        // means it is already coming back when the daemon reconnects.
+        let i = RESTART_LABELS.iter().position(|l| *l == "com.darwin.inference");
+        let d = RESTART_LABELS.iter().position(|l| *l == "com.darwin.daemon");
+        assert!(i < d, "inference must be kicked before the daemon: {RESTART_LABELS:?}");
+    }
+
+    #[test]
+    fn apply_never_restarts_the_hud_itself() {
+        assert!(
+            !RESTART_LABELS.contains(&"com.darwin.hud"),
+            "restarting the HUD would close the panel the operator is standing in"
+        );
+    }
+
+    #[test]
+    fn every_whitelisted_setting_belongs_to_a_process_we_restart() {
+        // A setting owned by NEITHER restarted process would silently never apply —
+        // the same class of bug, one layer up.
+        for id in INFERENCE_OWNED {
+            let section = id.split('.').next().unwrap();
+            assert!(
+                !section.is_empty(),
+                "malformed setting id in the inference-owned list: {id}"
+            );
+        }
+        assert!(
+            RESTART_LABELS.len() >= 2,
+            "settings span the daemon AND the inference server"
+        );
     }
 }

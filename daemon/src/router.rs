@@ -1052,6 +1052,27 @@ pub async fn route(
     // orchestrator (the user's main interaction tier). Runs after the owner
     // voice-id all-scope gate, so an unrecognized bystander cannot read the log.
     if let Some(intent) = crate::lifelog::classify_lifelog_intent(text) {
+        // [lifelog].enabled — the MASTER SWITCH, honoured here.
+        //
+        // It was declared in KNOWN_KEYS, defaulted, typo-validated, autocompleted by
+        // the DLS and documented as "with it false the digest intent returns an honest
+        // 'the life log is off'" — and nothing outside config.rs ever read it. An
+        // operator who set it false got no warning (the parser accepts it happily) and
+        // a full digest anyway: the one posture where the switch matters was the one it
+        // did not have.
+        if !cfg.lifelog.enabled {
+            let prime = agents.orchestrator();
+            emit_agent_active(prime);
+            return Ok(RouteOutcome {
+                routed_to: "local",
+                response: "The life log is off, sir — [lifelog].enabled is false in \
+                           config, so I won't build a digest."
+                    .to_string(),
+                agent: prime.name.clone(),
+                namespace: prime.namespace.clone(),
+                spoken: None,
+            });
+        }
         let prime = agents.orchestrator();
         emit_agent_active(prime);
         let crate::lifelog::LifeLogIntent::Digest(period) = intent;

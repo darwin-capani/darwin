@@ -2469,7 +2469,18 @@ def load_config():
         ("llm", models, "llm", str),
         ("stt", models, "stt", str),
         ("classifier", models, "classifier", str),
+        # [models].vlm is the LEGACY location and is not present in the shipped
+        # config at all. [vision].model is the one that ships, that the config
+        # documents as "canonical on-device VLM repo id", and that the HUD's
+        # Settings field "Vision model id" writes to — and nothing read it, so
+        # pointing DARWIN at a different VLM by either route silently did nothing
+        # and the id was effectively hard-coded to DEFAULT_VLM.
+        #
+        # Order matters: the loop applies these in sequence, so listing [vision]
+        # second lets it win when both are present, while an old config carrying
+        # only [models].vlm still works.
         ("vlm", models, "vlm", str),
+        ("vlm", vision, "model", str),
         # [vision].ocr_model — OCR-first screen reading. This was DOCUMENTED as an
         # off-switch ("empty string disables OCR") and never read, so setting it
         # did nothing and OCR could not be turned off at all. The unit tests
