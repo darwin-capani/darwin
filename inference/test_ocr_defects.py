@@ -180,17 +180,56 @@ class AFailedOcrLoadLatches(unittest.TestCase):
 class TheOcrModelIsWarmedNotLoadedInsideARequest(unittest.TestCase):
     """DEFECT 4: a cold load inside the request held the engine lock for 19.5 s."""
 
-    def test_preload_warms_ocr(self):
-        self.assertIsNotNone(
-            re.search(r"def preload\(", SRC), "preload() vanished")
+    @staticmethod
+    def _preload_src():
         pre = SRC[SRC.index("def preload("):]
-        pre = pre[:pre.index("\n    def ")] if "\n    def " in pre else pre
+        return pre[:pre.index("\n    def ")] if "\n    def " in pre else pre
+
+    def test_preload_warms_ocr(self):
         self.assertIn(
-            "self._ensure_ocr()", pre,
+            "self._ensure_ocr()", self._preload_src(),
             "preload() must warm the OCR model. Loaded lazily it runs INSIDE the "
             "request while the engine lock is held -- measured at 19,536 ms against "
             "2,952 ms warm -- which blocks classify/speak/transcribe and exceeds the "
             "daemon's 30 s timeout",
+        )
+
+    def test_the_warm_does_not_block_boot(self):
+        """The warm must be BACKGROUND. Inline, the same ~16 s load lands on startup
+        instead -- against a boot this campaign brought from 63 s to 8.96 s. preload
+        does not warm the VLM either, for the same reason."""
+        pre = self._preload_src()
+        warm = pre[pre.index("def _warm_ocr"):]
+        self.assertIn(
+            "self._ensure_ocr()", warm[:warm.index("threading.Thread")],
+            "the _ensure_ocr call must live inside the thread target, not run inline",
+        )
+        self.assertRegex(
+            warm, r"threading\.Thread\(\s*target=_warm_ocr",
+            "the OCR warm must run on its own thread",
+        )
+
+    def test_the_warm_thread_start_is_guarded(self):
+        """An unguarded Thread.start() that fails would abort the rest of preload,
+        leaving the learned-VAD weights unexported. This repo has shipped that exact
+        bug before, in the Core ML fast-graph upgrade."""
+        pre = self._preload_src()
+        start = pre.index("threading.Thread(")
+        head = pre[:start]
+        self.assertRegex(
+            head[-200:], r"try:\s*$|try:\s*\n[^\n]*$",
+            "threading.Thread(target=_warm_ocr).start() must sit inside a try/except",
+        )
+
+    def test_the_warm_takes_the_engine_lock(self):
+        """_ensure_vlm's contract ("must be called with self._lock held") applies to
+        the OCR load too -- it is the same GPU. A warm racing a request would run two
+        model loads on the Metal queue at once."""
+        pre = self._preload_src()
+        warm = pre[pre.index("def _warm_ocr"):pre.index("threading.Thread")]
+        self.assertRegex(
+            warm, r"with self\._lock:\s*\n\s*ok = self\._ensure_ocr\(\)",
+            "the background warm must hold the engine lock across the load",
         )
 
     def test_the_installer_pre_fetches_the_ocr_weights(self):
