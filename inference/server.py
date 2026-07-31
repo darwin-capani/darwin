@@ -2976,6 +2976,31 @@ def downscale_for_vlm(path, max_pixels=None, out_dir=None):
         return path
 
 
+# Words that carry no answer on their own. A reply made only of these is not an
+# answer, however grammatical it looks.
+_FUNCTION_WORDS = frozenset(
+    "a an and are as at be been by for from has have in is it its of on or that the "
+    "there these this to was were will with".split()
+)
+
+
+def _answer_is_contentless(text):
+    """True when a reply contains no content word at all.
+
+    Qwen2-VL-2B, asked something its image cannot answer, sometimes emits a single
+    determiner and then EOS -- measured on a network-settings screenshot, "What is the
+    battery percentage?" returned exactly "The" (2 generated tokens, the second being
+    EOS). That is not an answer, and the empty-string check above it does not catch it.
+
+    Deliberately narrow: a short reply is NOT contentless if any token carries meaning,
+    because the best answers this op produces are short. "192.168.1.47", "WPA3
+    Personal" and "Connected" must all pass."""
+    # Keep dots/colons/percent INSIDE a token ("192.168.1.47", "12:04", "80%") but
+    # strip them at the edges, or a trailing full stop makes "the." a content word.
+    words = [w.strip(".:%-") for w in re.findall(r"[\w.:%-]+", (text or "").lower())]
+    return not any(w and w not in _FUNCTION_WORDS for w in words)
+
+
 def _transcript_answer_is_a_refusal(text):
     """True when the LLM said THE TRANSCRIPT does not contain the answer.
 
@@ -5040,6 +5065,7 @@ class InferenceEngine:
         # this same non-reentrant lock, so calling it from inside here deadlocks the
         # server outright. That is not hypothetical — the identical mistake was made
         # and caught in the Core ML background-upgrade path.
+        refusal = None  # an honest "the screen does not show that", kept as a floor
         with self._lock:
             transcript = self._on_vlm_worker(self._transcribe_screen, path)
         if transcript:
@@ -5054,6 +5080,7 @@ class InferenceEngine:
                     "op=describe_image: the transcript could not answer it; asking the "
                     "VLM, which can see colour and layout"
                 )
+                refusal = answered
                 answered = None
             if answered:
                 return {
@@ -5129,11 +5156,32 @@ class InferenceEngine:
         if not isinstance(text, str):
             text = getattr(text, "text", str(text))
         text = text.strip()
-        if not text:
+        if not text or _answer_is_contentless(text):
+            # We only got here because the transcript could not answer it. If the VLM
+            # then produces nothing usable, the transcript's own "the screen does not
+            # show that" is STRICTLY better than what we have: it is true, it is
+            # informative, and it is what the user would otherwise never see, because
+            # this path had already discarded it. Measured: "What is the battery
+            # percentage?" on a network screen -> the VLM answered "The".
+            if refusal:
+                log.info(
+                    "op=describe_image: the VLM produced no usable answer (%r); "
+                    "returning the transcript's honest refusal instead", text[:40],
+                )
+                return {
+                    "ok": True,
+                    "text": refusal,
+                    "model": f"{self.ocr_model_id}+{self.llm_id}",
+                    "path": "ocr+llm",
+                }
             return {
                 "ok": False,
                 "reason": DESCRIBE_IMAGE_UNAVAILABLE_REASON,
-                "error": "vision-language model returned an empty description",
+                "error": (
+                    "vision-language model returned an empty description"
+                    if not text else
+                    "vision-language model returned no usable answer"
+                ),
             }
         return {"ok": True, "text": text, "model": self.vlm_id}
 

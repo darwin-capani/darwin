@@ -141,6 +141,40 @@ class RefusalDetectorMatchesTheSourceNotAnyNegation(unittest.TestCase):
             "The transcript shows the Wi-Fi network is 'Fios-8821'."))
 
 
+class AContentlessVlmReplyLosesToTheHonestRefusal(unittest.TestCase):
+    """Measured on the deployed server: OCR correctly refused "What is the battery
+    percentage?" on a network-settings screen, the VLM was asked instead, and it
+    answered "The" (2 generated tokens, the second EOS). The user saw "The", because
+    this path had already discarded the transcript's honest refusal."""
+
+    CONTENTLESS = ("The", "the", "It is", "", "  The.  ", "The, and the.", "This is it.")
+    REAL_ANSWERS = ("192.168.1.47", "WPA3 Personal", "Connected", "5", "12:04", "80%",
+                    "The battery is at 80%.", "Renew Lease")
+
+    def test_a_determiner_only_reply_is_contentless(self):
+        wrong = [t for t in self.CONTENTLESS if not S._answer_is_contentless(t)]
+        self.assertEqual(wrong, [], f"these carry no answer at all: {wrong}")
+
+    def test_short_real_answers_are_not_contentless(self):
+        """The best answers this op gives are SHORT. A length rule would eat them."""
+        wrong = [t for t in self.REAL_ANSWERS if S._answer_is_contentless(t)]
+        self.assertEqual(
+            wrong, [], f"these are correct answers and must be returned as-is: {wrong}")
+
+    def test_describe_image_falls_back_to_the_refusal(self):
+        """The wiring, not just the predicate: a contentless VLM reply must return the
+        kept refusal, with the path relabelled so the caller is not misled."""
+        d = SRC[SRC.index("def describe_image("):]
+        d = d[:d.index("\n    def ")]
+        self.assertIn("_answer_is_contentless(text)", d,
+                      "the VLM reply must be checked for content, not only emptiness")
+        self.assertIn("refusal = answered", d,
+                      "the transcript's refusal must be kept, not discarded")
+        tail = d[d.index("_answer_is_contentless(text)"):]
+        self.assertIn('"text": refusal', tail,
+                      "a contentless VLM reply must yield the honest refusal instead")
+
+
 class AFailedOcrLoadLatches(unittest.TestCase):
     """DEFECT 2: retrying a failed load re-attempts a 1.2 GB download per request."""
 
