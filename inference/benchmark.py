@@ -303,13 +303,49 @@ def detect_unavailable():
 
         return importlib.util.find_spec(mod) is not None
 
+    # PRESENCE IS NOT USABILITY, AND "AVAILABLE" IS NOT "MEASURED".
+    #
+    # This function's contract is that the reason is recorded so the baseline never
+    # silently omits a capability. It broke that contract twice over:
+    #
+    #   1. find_spec() only proves a directory exists on sys.path. mflux was installed
+    #      and importable here for months while op=generate_image was 100% DEAD,
+    #      because server.py imported Flux1/Config from a top level that no longer
+    #      exports them. This probe called it available.
+    #   2. This harness has NO measurement path for either capability -- grep it. So
+    #      whenever both packages were installed (the normal deployed state) the probe
+    #      returned {}, nothing measured them, and both simply vanished from the
+    #      baseline. A reason was recorded ONLY in the state nobody deploys.
+    #
+    # So an entry is emitted in EVERY state; only the reason changes.
     if not _installed("mflux"):
         unavailable["image_generation"] = (
             "mflux not installed — op=generate_image ships unavailable; not benchmarked."
         )
+    else:
+        try:
+            import server as _server
+
+            usable = isinstance(_server._load_mlx_diffusion(), dict)
+        except Exception as exc:  # noqa: BLE001 - probing must never fail the run
+            usable, note = False, f"probe raised {type(exc).__name__}"
+        else:
+            note = "package-version mismatch: its API is not where server.py looks"
+        unavailable["image_generation"] = (
+            "mflux is installed and usable — but this harness has no image-generation "
+            "measurement, so op=generate_image is NOT benchmarked."
+            if usable else
+            f"mflux is installed but unusable ({note}) — op=generate_image reports "
+            "unavailable; not benchmarked."
+        )
     if not _installed("mlx_vlm"):
         unavailable["vlm_describe_image"] = (
             "mlx-vlm not installed — op=describe_image ships unavailable; not benchmarked."
+        )
+    else:
+        unavailable["vlm_describe_image"] = (
+            "mlx-vlm is installed — but this harness has no describe_image measurement, "
+            "so op=describe_image is NOT benchmarked."
         )
     return unavailable
 

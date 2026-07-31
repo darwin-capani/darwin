@@ -216,6 +216,8 @@ bare Homebrew interpreter instead of .venv/bin/python).
 """
 
 import asyncio
+import importlib
+import inspect
 import itertools
 import hashlib
 import json
@@ -1409,21 +1411,76 @@ def _load_mlx_diffusion():
 
     Import-guarded: a missing diffusion package is the NORMAL ships-OFF state,
     not an error — the caller turns a None return into an honest structured
-    "unavailable" response. We import from mflux (a FLUX/Stable-Diffusion-class
-    on-device MLX text->image engine) and tolerate minor version layout
-    differences. NEVER falls back to a cloud image API: absent package == honest
-    unavailable, full stop."""
+    "unavailable" response. NEVER falls back to a cloud image API: absent package
+    == honest unavailable, full stop.
+
+    THE PREVIOUS VERSION CLAIMED IT TOLERATED "minor version layout differences"
+    AND DID NOT: it had exactly one import path, `from mflux import Config, Flux1`.
+    mflux moved both out of the top level (Flux1 -> mflux.models.flux.variants
+    .txt2img.flux, Config -> mflux.models.common.config.config) and its __init__
+    now exports nothing, so on every version the installer resolves (it pins only
+    `mflux>=0.4`; 0.18.0 is what lands today) that import raised ImportError, the
+    bare `except` swallowed it, and op=generate_image was 100% DEAD — while the
+    shipped config had [image].enabled = true and the installer had walked the
+    operator through Hugging Face's gate to fetch multi-GB FLUX weights.
+
+    So the layouts are now genuinely tried in turn, and — the part that would have
+    surfaced this years earlier — a package that IS installed but whose API we
+    cannot find is LOGGED AND REPORTED SEPARATELY from "not installed". An
+    optional path that fails silently is indistinguishable from an optional path
+    that is switched off, which is exactly how this hid."""
     try:
-        from mflux import Config as _Config
-        from mflux import Flux1 as _Flux1
+        import mflux  # noqa: F401
     except Exception:
-        # ImportError (not installed) OR any layout error in an unexpected
-        # version: treat as unavailable rather than crashing the op.
-        return None
-    return {
-        "Flux1": _Flux1,
-        "Config": _Config,
-    }
+        return None  # genuinely not installed: the normal ships-OFF state, silent.
+
+    # (module, attribute) candidates, newest layout first.
+    layouts = (
+        (
+            ("mflux.models.flux.variants.txt2img.flux", "Flux1"),
+            ("mflux.models.common.config.config", "Config"),
+        ),
+        (("mflux", "Flux1"), ("mflux", "Config")),
+    )
+    for (flux_mod, flux_attr), (cfg_mod, cfg_attr) in layouts:
+        try:
+            flux = getattr(importlib.import_module(flux_mod), flux_attr)
+            conf = getattr(importlib.import_module(cfg_mod), cfg_attr)
+        except Exception:
+            continue
+        # THE CALL CONVENTION MOVED TOO, not just the import path, so locating the
+        # symbols is not enough. Old: Flux1(model_name="schnell") and
+        # generate_image(seed, prompt, config=Config(steps, height, width)).
+        # New: Flux1(model_config=ModelConfig.from_name("schnell")) and
+        # generate_image(seed, prompt, num_inference_steps=..., height=..., width=...).
+        # `model_config` in the constructor signature is the discriminator.
+        try:
+            modern = "model_config" in inspect.signature(flux.__init__).parameters
+        except (TypeError, ValueError):
+            modern = False
+        model_config = None
+        if modern:
+            try:
+                model_config = importlib.import_module(
+                    "mflux.models.common.config.model_config"
+                ).ModelConfig
+            except Exception:
+                continue
+        return {"Flux1": flux, "Config": conf, "modern": modern,
+                "ModelConfig": model_config}
+
+    log.warning(
+        "mflux is INSTALLED but neither known API layout exposes Flux1/Config; "
+        "op=generate_image will report unavailable. This is a package-version "
+        "mismatch, NOT the ships-off state — the checkpoint and config are "
+        "irrelevant to it.",
+    )
+    return _MFLUX_API_MISMATCH
+
+
+# Sentinel distinguishing "mflux installed but its API moved" from "not installed".
+# Both make the op unavailable; only one is worth an operator's time to chase.
+_MFLUX_API_MISMATCH = "mflux-api-mismatch"
 
 
 # Opener bank ([speech].openers fallback): short acknowledgement lines
@@ -5205,8 +5262,10 @@ class InferenceEngine:
         if not self.image_model_id:
             return None
         diff = _load_mlx_diffusion()
-        if diff is None:
-            # the diffusion package is not installed: the normal ships-OFF state.
+        if diff is None or diff is _MFLUX_API_MISMATCH:
+            # None = the diffusion package is not installed: the normal ships-OFF
+            # state. The sentinel = installed but its API moved, which is a real
+            # defect an operator can act on and is already logged at WARNING.
             return None
         if self._image_model is None:
             try:
@@ -5215,7 +5274,12 @@ class InferenceEngine:
                     self.image_model_id,
                 )
                 t0 = time.perf_counter()
-                model = diff["Flux1"](model_name=self.image_model_id)
+                if diff.get("modern"):
+                    model = diff["Flux1"](
+                        model_config=diff["ModelConfig"].from_name(self.image_model_id)
+                    )
+                else:
+                    model = diff["Flux1"](model_name=self.image_model_id)
                 log.info("image model loaded in %.1fs", time.perf_counter() - t0)
                 self._image_model = model
             except Exception:
@@ -5297,16 +5361,27 @@ class InferenceEngine:
                 # Build the diffusion config and run generation entirely
                 # on-device. The prompt is handed ONLY to the local MLX model;
                 # nothing is sent to the cloud.
-                config = diff["Config"](
-                    num_inference_steps=steps,
-                    height=size,
-                    width=size,
-                )
-                generated = diff["model"].generate_image(
-                    seed=seed,
-                    prompt=prompt,
-                    config=config,
-                )
+                if diff.get("modern"):
+                    # Steps/size are passed directly; there is no Config object in
+                    # this generation of the API.
+                    generated = diff["model"].generate_image(
+                        seed=seed,
+                        prompt=prompt,
+                        num_inference_steps=steps,
+                        height=size,
+                        width=size,
+                    )
+                else:
+                    config = diff["Config"](
+                        num_inference_steps=steps,
+                        height=size,
+                        width=size,
+                    )
+                    generated = diff["model"].generate_image(
+                        seed=seed,
+                        prompt=prompt,
+                        config=config,
+                    )
                 # Save the image to an on-device path under state/images/. The
                 # generator returns an object with a .save(path); we never send
                 # the pixels anywhere.
