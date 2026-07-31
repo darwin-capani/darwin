@@ -1193,7 +1193,10 @@ if [ "$MODE" = "check" ]; then
     for mf in "${CARGO_MANIFESTS[@]}"; do
         plan "$CARGO build --release --manifest-path \"$DARWIN_HOME/$mf\""
     done
-    plan "swift build -c release --package-path \"$DARWIN_HOME/apps/vision\""
+    for swiftpkg in "$SRC_ROOT"/apps/*/Package.swift; do
+        [ -e "$swiftpkg" ] || continue
+        plan "swift build -c release --package-path \"$DARWIN_HOME/apps/$(basename "$(dirname "$swiftpkg")")\""
+    done
     plan "(cd \"$DARWIN_HOME/hud\" && npm ci && npm run tauri build)   # -> DARWIN.app"
     plan "ditto <built DARWIN.app> /Applications/DARWIN.app   # install the app (left alone if a SIGNED copy is already there)"
     ui_note "every artifact is built FRESH in the install home (never shipped prebuilt)."
@@ -1222,11 +1225,20 @@ else
     else
         ui_warn "pdfjail helper not produced — PDF extraction will use the weaker in-process guard"
     fi
-    # Swift vision app.
-    if [ -f "$DARWIN_HOME/apps/vision/Package.swift" ]; then
-        ui_spin "swift build -c release (apps/vision)" -- \
-            swift build -c release --package-path "$DARWIN_HOME/apps/vision"
-    fi
+    # EVERY Swift micro-app, not just vision.
+    #
+    # This used to hard-code apps/vision, and apps/share-guard is also a Swift package.
+    # So share_guard_scrub — declared unconditionally in the Anthropic tool schema and
+    # granted to the mnemosyne agent — had no binary on any install: a user asking
+    # DARWIN to scrub a report before sharing it got a tool call that could never
+    # start. A capability offered to the model must exist on disk.
+    for swiftpkg in "$DARWIN_HOME"/apps/*/Package.swift; do
+        [ -e "$swiftpkg" ] || continue
+        _swiftdir="$(dirname "$swiftpkg")"
+        _swiftname="$(basename "$_swiftdir")"
+        ui_spin "swift build -c release (apps/$_swiftname)" -- \
+            swift build -c release --package-path "$_swiftdir"
+    done
     # HUD / Tauri release .app.
     if [ -f "$DARWIN_HOME/hud/package.json" ]; then
         ui_spin "npm ci (HUD deps)" -- bash -c "cd '$DARWIN_HOME/hud' && NPM_CONFIG_UPDATE_NOTIFIER=false npm ci --no-fund --no-audit --loglevel=error"

@@ -603,13 +603,21 @@ fn resolve_root() -> PathBuf {
 
 /// The four sensitive SQLite stores that whole-file SQLCipher encryption covers,
 /// as paths under `state/`. The migration on enable re-keys each existing one.
-fn sensitive_db_paths(state_dir: &Path) -> [PathBuf; 5] {
+fn sensitive_db_paths(state_dir: &Path) -> [PathBuf; 7] {
     [
         state_dir.join("darwin.db"),            // memory.rs main Db
         state_dir.join("docsearch.db"),         // docsearch.rs
         state_dir.join("audit.db"),             // audit.rs
         state_dir.join("optimize").join("optimize.db"), // optimize.rs trace store
         state_dir.join("obol").join("obol.db"), // obol.rs spend ledger (secret-free, custody-consistent)
+        // THESE TWO WERE MISSING, and their absence made [security].encrypt_memory a
+        // PERMANENT CRASH LOOP rather than a feature. Both are opened WITH the master
+        // key below (main.rs open_tcc_baseline / open_persistence_baseline), so on the
+        // first enable SQLCipher met a still-PLAINTEXT file, the open failed, `?`
+        // propagated out of main, and launchd restarted the daemon straight back into
+        // the same failure. Every path opened with the key must also be migrated by it.
+        state_dir.join("tcc_baseline.db"),        // tcc.rs ambient sentinel baseline
+        state_dir.join("persistence_baseline.db"), // persistence.rs sentinel baseline
     ]
 }
 
@@ -5652,5 +5660,76 @@ mod tests {
         // Clean up the global slot so no later test sees a stray pending.
         confirm::clear();
         assert!(!confirm::is_live(Instant::now()), "slot cleared after the test");
+    }
+}
+#[cfg(test)]
+mod encryption_migration_tests {
+    use super::*;
+
+    /// THE INVARIANT: every store opened WITH the master key must also be MIGRATED by
+    /// it on first enable.
+    ///
+    /// tcc_baseline.db and persistence_baseline.db were opened with the key and absent
+    /// from sensitive_db_paths, so enabling [security].encrypt_memory left them
+    /// plaintext on disk while SQLCipher tried to read them keyed. The open failed, `?`
+    /// propagated out of main, launchd restarted, and the daemon crash-looped
+    /// permanently on a documented setting.
+    #[test]
+    fn every_keyed_open_is_covered_by_the_migration_list() {
+        let src = include_str!("main.rs");
+        let migrated: Vec<String> = sensitive_db_paths(Path::new("/S"))
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+
+        // Find every state_dir join of a .db file handed to an opener alongside
+        // master_key. The opener calls span lines, so scan a window after each key use.
+        let mut missing: Vec<String> = Vec::new();
+        for (idx, _) in src.match_indices("master_key.as_ref()") {
+            let start = src[..idx].rfind("open_").unwrap_or(idx);
+            let window = &src[start.saturating_sub(200)..idx];
+            for (jdx, _) in window.match_indices(".join(\"") {
+                let rest = &window[jdx + 7..];
+                if let Some(end) = rest.find('"') {
+                    let name = &rest[..end];
+                    if name.ends_with(".db") && !migrated.iter().any(|m| m == name) {
+                        missing.push(name.to_string());
+                    }
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "these stores are OPENED with the master key but never MIGRATED by it, so \
+             enabling [security].encrypt_memory crash-loops the daemon on them: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn the_two_sentinel_baselines_are_in_the_list() {
+        let names: Vec<String> = sensitive_db_paths(Path::new("/S"))
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for want in ["tcc_baseline.db", "persistence_baseline.db"] {
+            assert!(
+                names.iter().any(|n| n == want),
+                "{want} is opened with the key but not migrated; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_migration_list_has_no_duplicates() {
+        let mut names: Vec<String> = sensitive_db_paths(Path::new("/S"))
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let n = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), n, "a store would be migrated twice");
     }
 }
