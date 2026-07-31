@@ -1000,9 +1000,34 @@ pub async fn rank_runtime_selected(
         batch.push(f.searchable());
     }
 
-    let dense = match embedder.embed(&batch).await {
-        Ok(vectors) if vectors.len() == batch.len() => {
-            let mut iter = vectors.into_iter();
+    // embed_with_space, not embed: the recall path needs the server's `fell_back`
+    // flag, and plain `embed` discards it.
+    //
+    // WHY THAT MATTERS. When op=embed cannot build the Core ML backend it serves the
+    // legacy mean-pool path instead and says so. That backend has NO separation
+    // signal — this repo's committed eval measures its mean_sep_gap at -0.0059,
+    // NEGATIVE, meaning a relevant fact scores no better than a distractor — and its
+    // geometry is so anisotropic that nothing ever scores below +0.81. Both gates
+    // below are calibrated for bge (floor 0.50), so under mean-pool EVERY candidate
+    // clears them and an empty-handed query comes back as a full page of unrelated
+    // facts presented as genuine semantic recall. That is precisely the fabrication
+    // gate_neural_scores exists to prevent, on the one path nobody measured.
+    //
+    // Since the fallback embedder has measurably no signal, ranking with it is worse
+    // than keyword matching. So we take BM25 and report it honestly rather than dress
+    // a meaningless cosine order up as vector-semantic recall.
+    let dense = match embedder.embed_with_space(&batch).await {
+        Ok(b) if b.fell_back => {
+            tracing::warn!(
+                "recall: the inference server fell back to the mean-pool embedder \
+                 (measured separation gap -0.0059, i.e. no signal, and nothing below \
+                 +0.81 so the relevance gate cannot fire); using lexical BM25 instead \
+                 of presenting a meaningless cosine order as semantic recall"
+            );
+            lexical_result(rank(query, facts, retrieve_k, &lexical))
+        }
+        Ok(b) if b.vectors.len() == batch.len() => {
+            let mut iter = b.vectors.into_iter();
             let query_vec = iter.next().unwrap_or_default();
             let fact_vectors: Vec<Vec<f64>> = iter.collect();
             // Degenerate (empty) query embedding -> not usable; fall back.
@@ -1634,6 +1659,76 @@ mod tests {
         let hits = rank("what pets do I have", &facts, 5, &neural(q, fv));
         assert_eq!(hits.len(), 2, "both genuine hits survive: {hits:?}");
         assert!(hits.iter().all(|h| h.fact.key.starts_with("user.pet")));
+    }
+
+    /// REGRESSION: the SIGNAL-FREE fallback embedder must never be presented as
+    /// semantic recall.
+    ///
+    /// When op=embed cannot build the Core ML backend it serves the legacy mean-pool
+    /// path and sets `fell_back`. That backend's measured separation gap is -0.0059
+    /// (NEGATIVE — a relevant fact scores no better than a distractor) and its
+    /// anisotropy floor is +0.81, so nothing it produces can ever fall below a gate
+    /// calibrated at 0.50. Ranking with it and gating it therefore returns EVERY
+    /// candidate, dressed as vector-semantic recall — the exact fabrication
+    /// gate_neural_scores was written to prevent, on the path nobody measured.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // SERIAL-free: no global state touched here
+    async fn a_fallback_embedder_is_not_presented_as_semantic_recall() {
+        /// Mimics mean-pool: everything mutually similar and far above any bge-tuned
+        /// floor, and it reports the fallback honestly.
+        struct FellBackEmbedder;
+        impl Embedder for FellBackEmbedder {
+            fn embed<'a>(&'a self, texts: &'a [String]) -> EmbedFuture<'a> {
+                let n = texts.len();
+                Box::pin(async move {
+                    // Near-identical unit vectors => every pairwise cosine ~0.99.
+                    Ok((0..n)
+                        .map(|i| {
+                            let e = i as f64 * 1e-4;
+                            let (a, b) = (1.0 - e, e);
+                            let norm = (a * a + b * b).sqrt();
+                            vec![a / norm, b / norm]
+                        })
+                        .collect())
+                })
+            }
+            fn embed_with_space<'a>(&'a self, texts: &'a [String]) -> EmbedSpaceFuture<'a> {
+                Box::pin(async move {
+                    let vectors = self.embed(texts).await?;
+                    Ok(EmbeddedBatch {
+                        vectors,
+                        embedder: Some("llm-meanpool:test".to_string()),
+                        dim: Some(2),
+                        fell_back: true,
+                    })
+                })
+            }
+        }
+
+        let facts = vec![
+            Fact::new("user.pet", "the user has a corgi named Watson"),
+            Fact::new("user.car", "the user drives a blue Subaru"),
+            Fact::new("user.city", "the user lives in Berlin"),
+        ];
+        let out = rank_runtime_selected(
+            "what is the airspeed velocity of an unladen swallow",
+            &facts,
+            5,
+            &FellBackEmbedder,
+        )
+        .await;
+        assert_ne!(
+            out.method,
+            RankMethod::Embedding,
+            "a fallback embedder with no separation signal must not be reported as \
+             vector-semantic recall"
+        );
+        assert!(
+            out.hits.is_empty(),
+            "an unrelated query must not return stored facts just because the \
+             fallback embedder scores everything above the gate: {:?}",
+            out.hits
+        );
     }
 
     /// REGRESSION: a two-candidate batch must be able to return BOTH.
