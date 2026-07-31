@@ -227,6 +227,7 @@ import tempfile
 import re
 import signal
 import sys
+from concurrent.futures import ThreadPoolExecutor
 import threading
 import time
 from pathlib import Path
@@ -3052,6 +3053,24 @@ class InferenceEngine:
         # snapshot_download, under the engine lock, on every question. The Core ML
         # backends latch the same way (_coreml_embed_unavailable).
         self._ocr_unavailable = False
+        # THREAD AFFINITY FOR mlx-vlm. MLX streams are per-thread: a model loaded on
+        # one thread and generated on another dies with "There is no Stream(gpu, N) in
+        # current thread". Engine ops run on asyncio.to_thread's pool, which reuses
+        # ARBITRARY threads, so both the OCR and VLM paths were one scheduling decision
+        # away from failing — they only worked because a lightly-loaded pool tends to
+        # hand back the same idle worker. (This repo has already been bitten by MLX
+        # thread-local state once: see _persona_sampler on the PRNG binding.)
+        #
+        # So ALL mlx-vlm work — load, transcribe, describe — is funnelled onto one
+        # dedicated worker that lives as long as the process. Load and generate are
+        # then always on the same thread by construction. max_workers=1 also means the
+        # funnel serialises, which the engine lock already required anyway.
+        #
+        # NEVER submit to this worker from the worker itself: max_workers=1 makes that
+        # a self-deadlock.
+        self._vlm_worker = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="vlm-worker"
+        )
         # OPTIONAL on-device text->image model id (op=generate_image). Empty
         # string disables the op entirely (honest "unavailable"); a non-empty id
         # is the checkpoint the MLX diffusion engine will lazy-load on first use.
@@ -3801,7 +3820,7 @@ class InferenceEngine:
                 try:
                     t0 = time.perf_counter()
                     with self._lock:
-                        ok = self._ensure_ocr() is not None
+                        ok = self._on_vlm_worker(self._ensure_ocr) is not None
                     log.info(
                         "preload: OCR %s %s (%.1fs)", self.ocr_model_id,
                         "ready" if ok else "unavailable; op=describe_image will ask the "
@@ -4791,6 +4810,13 @@ class InferenceEngine:
     # -- on-device vision-language model (op=describe_image) ------------
     # _ensure_vlm must be called with self._lock held.
 
+    def _on_vlm_worker(self, fn, *args, **kwargs):
+        """Run `fn` on the single mlx-vlm worker and wait for it.
+
+        Callers hold self._lock; the worker function must never take it (the lock is
+        not reentrant) and must never re-enter this method (max_workers=1)."""
+        return self._vlm_worker.submit(fn, *args, **kwargs).result()
+
     def _ensure_ocr(self):
         """Lazy-load the OCR model, mirroring `_ensure_vlm`'s contract exactly:
         returns the mlx-vlm handles on success, or None when OCR cannot run (id
@@ -4830,7 +4856,12 @@ class InferenceEngine:
         }
 
     def _transcribe_screen(self, path):
-        """Transcribe `path` with the OCR model, caching by image CONTENT. Returns the
+        """RUNS ON THE VLM WORKER. Callers reach it through _on_vlm_worker, never
+        directly, so the model is loaded and generated on one thread (see that
+        method). It therefore calls _ensure_ocr inline: re-submitting from the worker
+        would self-deadlock, since the worker has exactly one thread.
+
+        Transcribe `path` with the OCR model, caching by image CONTENT. Returns the
         transcript, or None when OCR is unavailable or produced nothing usable.
 
         NOTE THE RESOLUTION. This deliberately does NOT apply
@@ -5010,7 +5041,7 @@ class InferenceEngine:
         # server outright. That is not hypothetical — the identical mistake was made
         # and caught in the Core ML background-upgrade path.
         with self._lock:
-            transcript = self._transcribe_screen(path)
+            transcript = self._on_vlm_worker(self._transcribe_screen, path)
         if transcript:
             answered = self._answer_from_transcript(prompt, transcript, max_tokens)
             if answered and _transcript_answer_is_a_refusal(answered):
@@ -5037,7 +5068,7 @@ class InferenceEngine:
             )
 
         with self._lock:
-            vlm = self._ensure_vlm()
+            vlm = self._on_vlm_worker(self._ensure_vlm)
             if vlm is None:
                 # SHIPS-OFF / unavailable: honest, never a fabricated answer.
                 return {
@@ -5060,7 +5091,11 @@ class InferenceEngine:
                 # collapse on real screenshots - see DESCRIBE_IMAGE_MAX_PIXELS.
                 vlm_path = downscale_for_vlm(path)
                 try:
-                    text = vlm["generate"](
+                    # ON THE WORKER, like the load above: generating on a different
+                    # thread than the one that loaded the model raises "There is no
+                    # Stream(gpu, N) in current thread".
+                    text = self._on_vlm_worker(
+                        vlm["generate"],
                         vlm["model"],
                         vlm["processor"],
                         formatted,

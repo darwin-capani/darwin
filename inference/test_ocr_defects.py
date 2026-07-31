@@ -197,7 +197,7 @@ class TheOcrModelIsWarmedNotLoadedInsideARequest(unittest.TestCase):
 
     def test_preload_warms_ocr(self):
         self.assertIn(
-            "self._ensure_ocr()", self._preload_src(),
+            "self._on_vlm_worker(self._ensure_ocr)", self._preload_src(),
             "preload() must warm the OCR model. Loaded lazily it runs INSIDE the "
             "request while the engine lock is held -- measured at 19,536 ms against "
             "2,952 ms warm -- which blocks classify/speak/transcribe and exceeds the "
@@ -211,8 +211,9 @@ class TheOcrModelIsWarmedNotLoadedInsideARequest(unittest.TestCase):
         pre = self._preload_src()
         warm = pre[pre.index("def _warm_ocr"):]
         self.assertIn(
-            "self._ensure_ocr()", warm[:warm.index("threading.Thread")],
-            "the _ensure_ocr call must live inside the thread target, not run inline",
+            "self._on_vlm_worker(self._ensure_ocr)",
+            warm[:warm.index("threading.Thread")],
+            "the OCR warm must live inside the thread target, not run inline",
         )
         self.assertRegex(
             warm, r"threading\.Thread\(\s*target=_warm_ocr",
@@ -252,8 +253,26 @@ class TheOcrModelIsWarmedNotLoadedInsideARequest(unittest.TestCase):
         pre = self._preload_src()
         warm = pre[pre.index("def _warm_ocr"):pre.index("threading.Thread")]
         self.assertRegex(
-            warm, r"with self\._lock:\s*\n\s*ok = self\._ensure_ocr\(\)",
+            warm,
+            r"with self\._lock:\s*\n\s*ok = self\._on_vlm_worker\(self\._ensure_ocr\)",
             "the background warm must hold the engine lock across the load",
+        )
+
+    def test_the_warm_loads_on_the_vlm_worker_not_its_own_thread(self):
+        """THE BUG THESE STRUCTURAL TESTS MISSED. Every assertion in this class passed
+        while the warm was loading the model on a thread of its own -- which made
+        every OCR call fail with "There is no Stream(gpu, N) in current thread" and
+        silently fall back to the VLM, in production, on a deployed machine.
+
+        A source-shape assertion cannot see a thread boundary. The property is pinned
+        for real in test_vlm_thread_affinity.py; what is checked here is only that the
+        warm still routes through the funnel, so the two files cannot drift apart."""
+        warm = self._preload_src()
+        warm = warm[warm.index("def _warm_ocr"):]
+        self.assertNotRegex(
+            warm[:warm.index("threading.Thread")], r"(?<!_worker\()self\._ensure_ocr\(\)",
+            "the warm thread must not load the model itself -- it must submit to the "
+            "single mlx-vlm worker that also serves requests",
         )
 
     def test_the_installer_pre_fetches_the_ocr_weights(self):
