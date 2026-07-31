@@ -237,6 +237,18 @@ pub const CONSEQUENTIAL_TOOLS: &[&str] = &[
     // on the user's clipboard, so it is gated PER ACTION: it parks for a spoken
     // yes and never auto-copies (one confirm authorizes exactly one set).
     "pasteboard_put",
+    // Self-Forge: authoring a micro-app from a goal, then COMPILING AND RUNNING the
+    // authored sources to validate them (cargo check + cargo test, or py_compile).
+    // `cargo test` builds and EXECUTES model-written code, and cargo runs any
+    // build.rs the model emitted. That is arbitrary code execution from a CLOUD
+    // model's output — the same capability shell_run is gated for, arriving by a
+    // path the user never typed.
+    //
+    // It was the only tool of that class that never parked, so a prompt-injected
+    // tool continuation could reach it directly. The validation now also runs under
+    // the deny-default seatbelt (forge.rs), but a human authorising the forge is the
+    // gate that closes the injection path itself.
+    "forge_app",
 ];
 
 /// Whether a tool name is consequential (side-effecting) and therefore must be
@@ -1061,12 +1073,18 @@ mod tests {
         // (a pasteboard set only, never a keystroke/file/network) but MUST be gated
         // per action (it parks for a spoken yes; it never auto-copies).
         assert!(is_consequential_tool("pasteboard_put"), "pasteboard_put must be gated (it parks, never auto-copies)");
-        // Exactly the 21 gate-routed tools, no dupes.
-        assert_eq!(CONSEQUENTIAL_TOOLS.len(), 21, "expected 21 consequential tools");
+        // forge_app COMPILES AND RUNS code a cloud model wrote (cargo check + cargo
+        // test, plus any build.rs it emitted). That is arbitrary code execution
+        // arriving by a path the user never typed, so it MUST be gated exactly like
+        // shell_run — it was the only tool of that class that never parked, which
+        // left it reachable from a prompt-injected tool continuation.
+        assert!(is_consequential_tool("forge_app"), "forge_app must be gated (it compiles and RUNS model-authored code)");
+        // Exactly the 22 gate-routed tools, no dupes.
+        assert_eq!(CONSEQUENTIAL_TOOLS.len(), 22, "expected 22 consequential tools");
         let mut sorted = CONSEQUENTIAL_TOOLS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
-        assert_eq!(sorted.len(), 21, "no duplicate consequential tool names");
+        assert_eq!(sorted.len(), 22, "no duplicate consequential tool names");
     }
 
     #[test]

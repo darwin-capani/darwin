@@ -903,12 +903,98 @@ async fn run_python_compile(dir: &Path, file: &str) -> Result<CmdOutput> {
     run_capture("python3", &["-m", "py_compile", file], dir, Duration::from_secs(60)).await
 }
 
-/// Spawn `cmd args` in `dir`, capture combined stdout+stderr, bounded by
-/// `timeout`, stdin null, kill_on_drop.
+/// The user's home, used by the SBPL to deny ~/.claude, ~/.ssh and the login
+/// Keychain by absolute path. Local to this module: anthropic.rs keeps its own
+/// private copy and widening that one for a second caller is not worth the coupling.
+fn forge_home() -> std::path::PathBuf {
+    std::env::var("HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("/"))
+}
+
+/// The daemon's own `state/` dir (its db + secrets), denied outright in the profile
+/// so validation of model-authored code can never read or clobber DARWIN's state.
+fn forge_daemon_state() -> std::path::PathBuf {
+    std::env::var("DARWIN_ROOT")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+        .join("state")
+}
+
+/// The validation profile: the sandboxed shell's, plus READ access to /etc.
+///
+/// generate_shell_sbpl denies /etc outright, which is right for a shell — but rustc
+/// and cargo read /etc/ssl/openssl.cnf during startup, and under the unmodified
+/// profile an ordinary `cargo test` dies with "Auto configuration failed ... fopen(
+/// '/private/etc/ssl/openssl.cnf')". Silently keeping that would have shipped a
+/// sandbox that disables the feature it protects, which is this repo's most repeated
+/// mistake.
+///
+/// SBPL is last-match-wins, so appending an allow AFTER the denies re-opens exactly
+/// this. It grants READ only: writes to /etc stay denied, as do the network, the
+/// Keychain, ~/.claude, ~/.ssh, ~/.aws and the daemon's own state.
+fn forge_validation_sbpl(scratch: &Path, home: &Path) -> String {
+    let mut p = crate::shell::generate_shell_sbpl(scratch, home, &forge_daemon_state());
+    p.push_str(
+        "\n;; FORGE ONLY: rustc/cargo read /etc/ssl config at startup. READ is re-allowed\n         ;; (last-match-wins); WRITE to /etc stays denied, as do the network and every\n         ;; secret store above.\n",
+    );
+    p.push_str("(allow file-read* (subpath \"/private/etc\"))\n");
+    p.push_str("(allow file-read* (subpath \"/etc\"))\n");
+    p
+}
+
+/// Spawn `cmd args` in `dir` UNDER THE DENY-DEFAULT SEATBELT, capture combined
+/// stdout+stderr, bounded by `timeout`, stdin null, kill_on_drop.
+///
+/// THE SANDBOX IS THE POINT. This module's docs promise the authored app is "born
+/// sandboxed" — but that describes the app once installed. The VALIDATION step runs
+/// `cargo check` and `cargo test` on sources a CLOUD MODEL wrote, and `cargo test`
+/// compiles and EXECUTES them while `cargo` runs any `build.rs` the model emitted.
+/// That ran as a plain tokio::process::Command with the daemon's full authority: a
+/// planted build.rs could write anywhere the user can, read the Keychain, or reach
+/// the network. shell_run is gated to the hilt for exactly this capability.
+///
+/// So the command now runs under `generate_shell_sbpl` — the same deny-default
+/// profile the sandboxed shell uses: no network at all, file writes confined to the
+/// staging directory, the Keychain / ~/.claude / the daemon's own state denied
+/// outright, broad reads so the toolchain still works.
+///
+/// MEASURED, not assumed: under this profile a dep-free `cargo check` and
+/// `cargo test` both succeed, and a build.rs writing to $HOME is blocked.
+///
+/// If the seatbelt is unavailable this returns an ERROR rather than silently running
+/// unsandboxed. An optional path that fails open is how the un-sandboxed execution
+/// would come back.
 async fn run_capture(cmd: &str, args: &[&str], dir: &Path, timeout: Duration) -> Result<CmdOutput> {
-    let child = tokio::process::Command::new(cmd)
-        .args(args)
+    if !Path::new(crate::shell::SANDBOX_EXEC).exists() {
+        bail!(
+            "{} is unavailable, so validation cannot be sandboxed; refusing to compile \
+             and run model-authored code unconfined",
+            crate::shell::SANDBOX_EXEC
+        );
+    }
+    // The staging dir is the ONLY writable target. Canonicalize it: the profile
+    // matches by absolute path, and /tmp is a symlink to /private/tmp on macOS.
+    let scratch = tokio::fs::canonicalize(dir).await.unwrap_or_else(|_| dir.to_path_buf());
+    let home = forge_home();
+    let profile = forge_validation_sbpl(&scratch, &home);
+    let profile_path = scratch.join(".forge-validate.sb");
+    tokio::fs::write(&profile_path, profile.as_bytes()).await?;
+
+    let mut sandboxed: Vec<String> = vec![
+        "-f".to_string(),
+        profile_path.to_string_lossy().into_owned(),
+        cmd.to_string(),
+    ];
+    sandboxed.extend(args.iter().map(|a| a.to_string()));
+
+    let child = tokio::process::Command::new(crate::shell::SANDBOX_EXEC)
+        .args(&sandboxed)
         .current_dir(dir)
+        // Keep cargo's writes inside the one writable subtree.
+        .env("CARGO_TARGET_DIR", scratch.join("target"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2094,5 +2180,115 @@ mod tests {
         }) {
             let _ = std::fs::remove_dir_all(sandbox);
         }
+    }
+}
+#[cfg(test)]
+mod validation_sandbox_tests {
+    use super::*;
+
+    /// The forge's validation step compiles and RUNS code a cloud model wrote. It did
+    /// so with the daemon's full authority. These tests drive the REAL profile against
+    /// a REAL cargo build, because the only thing that matters is whether the seatbelt
+    /// actually stops the payload while still letting a legitimate crate validate.
+    fn have_seatbelt() -> bool {
+        std::path::Path::new(crate::shell::SANDBOX_EXEC).exists()
+            && which_cargo().is_some()
+    }
+
+    fn which_cargo() -> Option<String> {
+        std::env::var("CARGO").ok()
+    }
+
+    fn stage_crate(dir: &std::path::Path, build_rs: Option<&str>) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let mut toml = String::from(
+            "[package]\nname = \"forgetest\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        );
+        if build_rs.is_some() {
+            toml.push_str("build = \"build.rs\"\n");
+        }
+        std::fs::write(dir.join("Cargo.toml"), toml).unwrap();
+        std::fs::write(
+            dir.join("src/main.rs"),
+            "fn main() { println!(\"ok\"); }\n#[cfg(test)]\nmod t { #[test] fn p() { assert_eq!(1 + 1, 2); } }\n",
+        )
+        .unwrap();
+        if let Some(b) = build_rs {
+            std::fs::write(dir.join("build.rs"), b).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_legitimate_crate_still_validates_under_the_sandbox() {
+        if !have_seatbelt() {
+            return; // no seatbelt or not run under cargo: nothing to assert
+        }
+        let tmp = std::env::temp_dir().join(format!("forge-sb-ok-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        stage_crate(&tmp, None);
+
+        let out = run_cargo(&tmp, &["test", "--offline"], Duration::from_secs(180))
+            .await
+            .expect("sandboxed cargo failed to spawn");
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            out.ok,
+            "the sandbox broke ordinary validation, which would silently kill the \
+             forge feature:\n{}",
+            out.output
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malicious_build_rs_cannot_write_outside_the_staging_dir() {
+        if !have_seatbelt() {
+            return;
+        }
+        let home = forge_home();
+        let marker = home.join(".darwin-forge-sandbox-escape-probe");
+        let _ = std::fs::remove_file(&marker);
+
+        let tmp = std::env::temp_dir().join(format!("forge-sb-evil-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        // Exactly the payload the audit planted: a build.rs writing into $HOME.
+        stage_crate(
+            &tmp,
+            Some(
+                "fn main() {\n    let home = std::env::var(\"HOME\").unwrap_or_default();\n\
+                 \x20   let p = std::path::Path::new(&home).join(\".darwin-forge-sandbox-escape-probe\");\n\
+                 \x20   let _ = std::fs::write(p, \"pwned\");\n\
+                 \x20   println!(\"cargo:rerun-if-changed=build.rs\");\n}\n",
+            ),
+        );
+
+        let _ = run_cargo(&tmp, &["check", "--offline"], Duration::from_secs(180)).await;
+        let escaped = marker.exists();
+        let _ = std::fs::remove_file(&marker);
+        let _ = std::fs::remove_dir_all(&tmp);
+        assert!(
+            !escaped,
+            "a build.rs authored by the cloud model wrote into $HOME — validation is \
+             running unconfined with the daemon's full authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn validation_refuses_rather_than_running_unconfined() {
+        // The seam that must never fail open. If sandbox-exec is missing we bail;
+        // we do not quietly run the model's code with full authority.
+        let body = include_str!("forge.rs");
+        let i = body.find("async fn run_capture(").expect("run_capture moved");
+        let rest = &body[i..];
+        let end = rest.find("\n}\n").map(|e| e + 2).unwrap_or(rest.len());
+        let f = &rest[..end];
+        assert!(
+            f.contains("SANDBOX_EXEC"),
+            "validation no longer runs under the seatbelt"
+        );
+        assert!(
+            f.contains("bail!"),
+            "a missing seatbelt must be an ERROR; failing open is how unconfined \
+             execution comes back"
+        );
     }
 }
