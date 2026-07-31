@@ -399,6 +399,34 @@ fn normalize_for_classify(cmd: &str) -> String {
 /// `/usr/bin/sandbox-exec` — the macOS seatbelt CLI. Same constant the micro-app
 /// runtime + apply_heal.sh use. Deprecated-but-functional; the kernel enforcement
 /// is live.
+/// Read `reader` to EOF, RETAINING only the first `cap + 1` bytes.
+///
+/// The +1 is what lets the caller distinguish "exactly cap bytes" from "more than
+/// cap". Draining past the cap rather than closing the pipe is the load-bearing part:
+/// a capped reader that is dropped sends SIGPIPE to the child and kills it mid-command.
+async fn drain_capped<R>(mut reader: R, cap: usize) -> Vec<u8>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+    let mut kept: Vec<u8> = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match reader.read(&mut chunk).await {
+            Ok(0) => break,               // real EOF: the child closed the pipe
+            Ok(n) => {
+                if kept.len() <= cap {
+                    let room = (cap + 1) - kept.len();
+                    kept.extend_from_slice(&chunk[..n.min(room)]);
+                }
+                // Past the cap we keep reading and discard, so the child never blocks.
+            }
+            Err(_) => break,
+        }
+    }
+    kept
+}
+
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// Apple's baseline BSD profile: the syscalls + dyld/framework boot reads EVERY
@@ -590,7 +618,6 @@ pub async fn run_sandboxed_with_timeout(
     scratch_dir: &Path,
     timeout: std::time::Duration,
 ) -> anyhow::Result<ShellRunResult> {
-    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
     // Materialize the deny-default profile to a temp file under the scratch dir
@@ -622,21 +649,34 @@ pub async fn run_sandboxed_with_timeout(
     let stdout_pipe = child.stdout.take().expect("piped stdout");
     let stderr_pipe = child.stderr.take().expect("piped stderr");
 
-    // Bounded capture + timeout. We read at most MAX_OUTPUT_BYTES+1 from each pipe
-    // so a runaway command can't exhaust memory; the +1 detects truncation.
+    // Bounded capture + timeout. TWO defects lived in the three lines this replaces.
+    //
+    // 1. THE PIPES WERE DRAINED SEQUENTIALLY. stdout was read to EOF and only then
+    //    stderr. A child that fills the stderr pipe (macOS capacity 64 KiB) blocks
+    //    forever on its next stderr write; because it never exits, stdout never
+    //    reaches EOF, so the reader never advances either. Any command emitting more
+    //    than 64 KiB on stderr — a verbose build, a big diff, a chatty linter —
+    //    deadlocked until the wall-clock timeout, lost ALL of its output, and was
+    //    reported to the user as a timeout rather than as what it was.
+    //
+    // 2. `.take(cap)` DROPPED THE PIPE AT THE CAP. The Take<ChildStdout> temporary
+    //    died the moment the limit was hit, closing the read end; the child's next
+    //    write got EPIPE/SIGPIPE and it was KILLED mid-command, so everything after
+    //    the point where output crossed 64 KiB never ran. The result still came back
+    //    with truncated:true and exit_code None, which reads as "it all happened, we
+    //    just clipped the log" — the opposite of the truth, for a tool whose whole
+    //    contract is reporting faithfully what really ran.
+    //
+    // So: both pipes are drained CONCURRENTLY, and each drain reads to real EOF while
+    // RETAINING only the first cap+1 bytes. The child can always finish writing; we
+    // simply stop remembering. The outer timeout still bounds a runaway.
     let run = async {
-        let mut out_buf = Vec::new();
-        let mut err_buf = Vec::new();
-        let _ = stdout_pipe
-            .take(MAX_OUTPUT_BYTES as u64 + 1)
-            .read_to_end(&mut out_buf)
-            .await;
-        let _ = stderr_pipe
-            .take(MAX_OUTPUT_BYTES as u64 + 1)
-            .read_to_end(&mut err_buf)
-            .await;
+        let (out, err) = tokio::join!(
+            drain_capped(stdout_pipe, MAX_OUTPUT_BYTES),
+            drain_capped(stderr_pipe, MAX_OUTPUT_BYTES),
+        );
         let status = child.wait().await?;
-        Ok::<_, anyhow::Error>((status, out_buf, err_buf))
+        Ok::<_, anyhow::Error>((status, out, err))
     };
 
     let result = match tokio::time::timeout(timeout, run).await {
@@ -948,4 +988,110 @@ mod tests {
     // execution only ever happens on-device behind the full gate. Running a real
     // (even sandboxed) command in a test is the one hard prohibition for this
     // feature.
+}
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    /// A child that writes more than the pipe capacity on BOTH streams. Under the old
+    /// sequential drain this deadlocked: stderr's 64 KiB pipe filled, the child blocked
+    /// forever on its next stderr write, and stdout therefore never reached EOF.
+    fn noisy_cmd(stdout_kb: usize, stderr_kb: usize) -> String {
+        format!(
+            "awk 'BEGIN{{for(i=0;i<{o};i++) printf \"%1024s\", \"o\"}}' ; \
+             awk 'BEGIN{{for(i=0;i<{e};i++) printf \"%1024s\", \"e\" > \"/dev/stderr\"}}' ; \
+             echo DONE",
+            o = stdout_kb,
+            e = stderr_kb
+        )
+    }
+
+    #[tokio::test]
+    async fn a_command_flooding_stderr_does_not_deadlock() {
+        // 512 KiB on stderr, far past the 64 KiB pipe capacity.
+        let out = tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(noisy_cmd(1, 512))
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn();
+        let mut child = match out {
+            Ok(c) => c,
+            Err(_) => return, // no /bin/sh: nothing to assert
+        };
+        let so = child.stdout.take().unwrap();
+        let se = child.stderr.take().unwrap();
+
+        let drained = tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            let (o, e) = tokio::join!(
+                drain_capped(so, MAX_OUTPUT_BYTES),
+                drain_capped(se, MAX_OUTPUT_BYTES),
+            );
+            let status = child.wait().await.unwrap();
+            (o, e, status)
+        })
+        .await;
+
+        let (o, e, status) = drained.expect(
+            "draining deadlocked: a command emitting more than the pipe capacity on \
+             stderr blocks forever unless both pipes are drained concurrently",
+        );
+        assert!(status.success(), "the child was killed instead of completing");
+        assert!(!o.is_empty(), "stdout was lost");
+        assert!(e.len() > MAX_OUTPUT_BYTES, "stderr should have exceeded the cap");
+    }
+
+    #[tokio::test]
+    async fn the_child_still_finishes_after_output_passes_the_cap() {
+        // THE SECOND DEFECT: `.take(cap)` dropped the pipe at the cap, SIGPIPE'd the
+        // child, and everything after that point never ran. The marker proves the tail
+        // of the command still executed.
+        let script = format!(
+            "awk 'BEGIN{{for(i=0;i<{n};i++) printf \"%1024s\", \"x\"}}' ; echo MARKER_AT_THE_END",
+            n = (MAX_OUTPUT_BYTES / 1024) + 256
+        );
+        let mut child = match tokio::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&script)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let so = child.stdout.take().unwrap();
+        let se = child.stderr.take().unwrap();
+        let (_o, _e) = tokio::join!(
+            drain_capped(so, MAX_OUTPUT_BYTES),
+            drain_capped(se, MAX_OUTPUT_BYTES),
+        );
+        let status = child.wait().await.unwrap();
+        assert!(
+            status.success(),
+            "the child did not exit cleanly - it was killed by SIGPIPE when the reader \
+             closed the pipe at the cap, so the rest of the command never ran"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_cap_is_still_enforced_on_what_we_keep() {
+        let big = vec![b'z'; MAX_OUTPUT_BYTES * 4];
+        let kept = drain_capped(std::io::Cursor::new(big), MAX_OUTPUT_BYTES).await;
+        assert_eq!(
+            kept.len(),
+            MAX_OUTPUT_BYTES + 1,
+            "draining past the cap must not mean KEEPING past the cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_short_stream_is_returned_whole() {
+        let kept = drain_capped(std::io::Cursor::new(b"hello".to_vec()), MAX_OUTPUT_BYTES).await;
+        assert_eq!(kept, b"hello");
+    }
 }
