@@ -147,6 +147,57 @@ else
     fail "an in-place deploy corrupted the config"
 fi
 
+
+# --- the installer + doctor must report what is really on disk ----------------
+# Three separate "count the models" expressions, none of which matched the real HF
+# layout (<HF_HOME>/hub/models--<org>--<repo>).
+
+FAKE="$TMP/hf"
+mkdir -p "$FAKE/hub/models--org--a" "$FAKE/hub/models--org--b" \
+         "$FAKE/hub/.locks/models--org--a" "$FAKE/hub/.locks/models--org--b" \
+         "$FAKE/hub/.locks/models--org--c"
+
+old_count=$(find "$FAKE" -maxdepth 3 -type d -name 'models--*' 2>/dev/null | wc -l | tr -d '[:space:]')
+new_count=$(find "$FAKE/hub" -maxdepth 1 -type d -name 'models--*' 2>/dev/null | wc -l | tr -d '[:space:]')
+if [ "$new_count" = "2" ]; then
+    ok "the model count counts repos (2), not lock dirs"
+else
+    fail "model count is $new_count, expected 2"
+fi
+if [ "$old_count" != "2" ]; then
+    ok "the old expression really was wrong (it counted $old_count)"
+else
+    fail "this test cannot distinguish the fix from the bug"
+fi
+if grep -q "find \"\$HF_HOME_DIR/hub\" -maxdepth 1 -type d -name 'models--\*'" "$ROOT/install.sh"; then
+    ok "install.sh's status board uses the corrected expression"
+else
+    fail "install.sh still counts .locks entries as resident models"
+fi
+
+# doctor.sh globbed one level too shallow, so it always reported ZERO.
+if grep -q 'INSTALL_MODELS="\$ROOT/models/hub"' "$ROOT/scripts/doctor.sh"; then
+    ok "doctor.sh points at the real hub/ directory"
+else
+    fail "doctor.sh globs \$ROOT/models/models--* which can never match"
+fi
+
+# Every model the DEFAULT preload path loads must be pre-downloaded.
+for id in LLM_ID STT_ID TTS_ID VLM_ID IMG_ID OCR_ID EMBED_ID RERANK_ID; do
+    if grep -q "MODELS=(.*\$$id" "$ROOT/install.sh"; then
+        ok "install.sh pre-downloads \$$id"
+    else
+        fail "\$$id is loaded at runtime but never pre-downloaded"
+    fi
+done
+
+# uninstall.sh claims complete removal.
+if grep -q 'remove_hud_support_dirs$' "$ROOT/uninstall.sh"; then
+    ok "uninstall.sh removes the HUD's WebKit/cache state"
+else
+    fail "uninstall.sh claims complete removal but leaves HUD support data behind"
+fi
+
 echo
 if [ "$fails" -eq 0 ]; then
     echo "ALL PASS"

@@ -168,6 +168,8 @@ FALLBACK_STT="mlx-community/whisper-small-mlx"
 FALLBACK_TTS="mlx-community/Kokoro-82M-bf16"
 FALLBACK_VLM="mlx-community/Qwen2-VL-2B-Instruct-4bit"
 FALLBACK_OCR="mlx-community/GLM-OCR-4bit"
+FALLBACK_EMBED="BAAI/bge-small-en-v1.5"                    # Core ML embedder source
+FALLBACK_RERANK="cross-encoder/ms-marco-MiniLM-L-6-v2"     # Core ML reranker source
 # (no FALLBACK_DRAFT: the speculative draft model is not pre-downloaded — see MODELS below)
 
 # Dirs that are BUILT or FETCHED fresh in the install home and must NOT be copied
@@ -245,8 +247,10 @@ find_py311() {
 
 # Read a DEFAULT_* model id out of server.py; falls back to the constant given.
 read_model_id() {
-    local key="$1" fallback="$2" line=""
-    line="$(grep -m1 -E "^${key}[[:space:]]*=" "$SRC_ROOT/inference/server.py" 2>/dev/null || true)"
+    # $3 = the inference/ file to read (default server.py). The Core ML backends keep
+    # their ids in their own modules, so this is no longer server.py-only.
+    local key="$1" fallback="$2" file="${3:-server.py}" line=""
+    line="$(grep -m1 -E "^${key}[[:space:]]*=" "$SRC_ROOT/inference/$file" 2>/dev/null || true)"
     # Extract the quoted value.
     line="${line#*\"}"; line="${line%%\"*}"
     if [ -n "$line" ]; then printf '%s' "$line"; else printf '%s' "$fallback"; fi
@@ -1081,7 +1085,13 @@ IMG_ID="black-forest-labs/FLUX.1-schnell"
 # holding the inference server's GPU lock, which blocks every other op and blows the
 # daemon's 30 s request timeout.
 OCR_ID="$(read_model_id DEFAULT_OCR_MODEL "$FALLBACK_OCR")"
-MODELS=("$LLM_ID" "$STT_ID" "$TTS_ID" "$VLM_ID" "$IMG_ID" "$OCR_ID")
+# The Core ML backends are the DEFAULT for op=embed and op=rerank, and each pulls a
+# torch checkpoint from Hugging Face the first time it converts. Omitting them made
+# "every model the OS uses is pre-downloaded" false, and pushed both downloads into
+# the first request that needs them.
+EMBED_ID="$(read_model_id MODEL_ID "$FALLBACK_EMBED" coreml_embed.py)"
+RERANK_ID="$(read_model_id MODEL_ID "$FALLBACK_RERANK" coreml_rerank.py)"
+MODELS=("$LLM_ID" "$STT_ID" "$TTS_ID" "$VLM_ID" "$IMG_ID" "$OCR_ID" "$EMBED_ID" "$RERANK_ID")
 
 ui_info "HF_HOME -> $HF_HOME_DIR (ONE cache for installer + runtime, via state/env.sh; never the repo)"
 
@@ -1395,7 +1405,12 @@ ENGINE_TAG="DEFERRED"
 if [ "$DO_MODELS" -eq 0 ]; then
     MODELS_TAG="DEFERRED"
 else
-    _mcount="$(find "$HF_HOME_DIR" -maxdepth 3 -type d -name 'models--*' 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+    # COUNT REPOS, NOT LOCKS. `-maxdepth 3` also descended into <HF_HOME>/hub/.locks,
+    # which mirrors every repo name — so the last line an operator reads after an
+    # install reported 23 resident models on a machine holding 9. It also counted
+    # repos whose weights were never fetched (a gated FLUX stub is 16 KB of refs).
+    # The real layout is exactly <HF_HOME>/hub/models--<org>--<repo>.
+    _mcount="$(find "$HF_HOME_DIR/hub" -maxdepth 1 -type d -name 'models--*' 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
     case "$_mcount" in ''|*[!0-9]*) _mcount=0 ;; esac
     if [ "$_mcount" -gt 0 ]; then MODELS_TAG="$_mcount RESIDENT"; else MODELS_TAG="RESIDENT"; fi
 fi
