@@ -973,7 +973,13 @@ ui_stage 3 "$TOTAL_STAGES" "PYTHON ENV"
 # so a full install pulls every model backend the OS can use.
 EVERYBIT_EXTRAS=(
     "mlx-vlm>=0.1"        # on-device VLM (op=describe_image)
-    "mflux>=0.4"          # on-device text->image (op=generate_image)
+    # FLOOR RAISED from >=0.4. mflux relocated Flux1/Config out of its top level;
+    # server.py now handles both layouts, but pinning below the move would resolve a
+    # version whose API we would then only discover at runtime. server.py logs a
+    # WARNING if a future layout move makes the package unusable, and
+    # inference/test_mflux_api_contract.py binds our real call arguments against the
+    # installed signatures so drift fails the gate instead of the feature.
+    "mflux>=0.18"         # on-device text->image (op=generate_image)
     "soundfile>=0.12"     # WAV/PCM IO for the voice pipeline
     "huggingface_hub>=0.24"  # model pre-download (hf CLI / snapshot_download API)
     "elevenlabs>=1.0"     # OPTIONAL cloud voice tier SDK (stays OFF until a key is set)
