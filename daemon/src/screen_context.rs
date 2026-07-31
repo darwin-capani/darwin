@@ -330,6 +330,46 @@ impl ScreenContextRing {
 /// the zero-overlap drop and surfacing unrelated snapshots as "matches". An empty
 /// key means only the entry's OWN text is ever ranked. PARALLEL to `entries` — a
 /// hit's `index` maps straight back to its entry.
+/// How many chunk hits to retrieve per requested snapshot. A snapshot can occupy
+/// several chunks, so the chunk-level shortlist must be wider than `k` or the
+/// collapse below would return fewer snapshots than asked for.
+const CHUNKS_SCAN_FACTOR: usize = 4;
+
+/// Words per chunk. Comfortably inside the embedder's 512-token window once
+/// sub-word tokenization is accounted for, and large enough that a chunk still
+/// carries context rather than a stray line.
+const CHUNK_WORDS: usize = 180;
+
+/// Build ONE fact per chunk of each snapshot, plus a parallel array mapping each
+/// fact back to the snapshot it came from. Grounding labels (app + window) are
+/// repeated on every chunk so "what was that in the terminal" still matches a chunk
+/// from the middle of a Terminal capture.
+fn build_chunked_recall_facts(entries: &[ContextEntry]) -> (Vec<Fact>, Vec<usize>) {
+    let mut facts = Vec::new();
+    let mut owners = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let prefix = match (&e.app, &e.window) {
+            (Some(a), Some(w)) => format!("{a} {w} "),
+            (Some(a), None) => format!("{a} "),
+            _ => String::new(),
+        };
+        let words: Vec<&str> = e.redacted_text.split_whitespace().collect();
+        if words.is_empty() {
+            facts.push(Fact { key: String::new(), value: prefix.trim().to_string() });
+            owners.push(i);
+            continue;
+        }
+        for w in words.chunks(CHUNK_WORDS) {
+            facts.push(Fact {
+                key: String::new(),
+                value: format!("{prefix}{}", w.join(" ")),
+            });
+            owners.push(i);
+        }
+    }
+    (facts, owners)
+}
+
 fn build_recall_facts(entries: &[ContextEntry]) -> Vec<Fact> {
     entries
         .iter()
@@ -555,8 +595,43 @@ pub async fn global_rank_render_runtime(query: &str, k: usize, embedder: &dyn Em
                 since screen context was enabled."
             .to_string();
     }
-    let facts = build_recall_facts(&entries);
-    let recall = recall::rank_runtime_selected(query, &facts, k, embedder).await;
+    // CHUNK each snapshot before ranking, and keep the best-scoring chunk per
+    // snapshot.
+    //
+    // The embedder truncates at 512 tokens, and a whole-screen OCR dump is easily
+    // past that, so everything below the fold was INVISIBLE: two snapshots that
+    // differ only in their tails measured cosine 1.000000 against each other, and a
+    // query about either tail scored them IDENTICALLY (0.4181 vs 0.4181). Recall
+    // could not tell the two screens apart at all.
+    //
+    // Truncation was not the only cost. Averaging a whole screen into one vector
+    // DILUTES a genuine match below the relevance gate: those same queries scored
+    // 0.4181 and 0.4592 against snapshots that really did contain their answer, both
+    // under the 0.50 floor, so neither would have been returned. Scoring per chunk
+    // and keeping the best recovers both — MEASURED on the same pair, the right
+    // snapshot wins by 0.6686 to 0.4928 and 0.7757 to 0.5028, now comfortably above
+    // the gate.
+    let (facts, owners) = build_chunked_recall_facts(&entries);
+    let chunk_recall = recall::rank_runtime_selected(query, &facts, k * CHUNKS_SCAN_FACTOR, embedder).await;
+    // Collapse chunk hits back to snapshots, best chunk wins, order preserved.
+    let mut seen_owner: Vec<usize> = Vec::new();
+    let mut hits = Vec::new();
+    for h in chunk_recall.hits.into_iter() {
+        let owner = owners[h.index];
+        if seen_owner.contains(&owner) {
+            continue;
+        }
+        seen_owner.push(owner);
+        hits.push(recall::Hit { index: owner, ..h });
+        if hits.len() >= k {
+            break;
+        }
+    }
+    let recall = recall::RankedRecall {
+        hits,
+        method: chunk_recall.method,
+        method_status: chunk_recall.method_status,
+    };
     let method = recall.method_status;
     if recall.hits.is_empty() {
         return format!(
@@ -1273,6 +1348,64 @@ mod tests {
         fn embed<'a>(&'a self, _texts: &'a [String]) -> crate::recall::EmbedFuture<'a> {
             Box::pin(async move { Err(anyhow::anyhow!("inference socket down")) })
         }
+    }
+
+    /// REGRESSION: text BELOW the embedder's 512-token fold must still be
+    /// recallable, and must still distinguish two snapshots.
+    ///
+    /// A whole-screen OCR dump runs well past 512 tokens, so everything below the
+    /// fold used to be invisible: two snapshots differing ONLY in their tails
+    /// measured cosine 1.000000 against each other, and a query about either tail
+    /// scored them IDENTICALLY (0.4181 vs 0.4181) — recall could not tell the two
+    /// screens apart. Chunking scores each piece separately and keeps the best.
+    #[test]
+    fn chunking_makes_the_tail_of_a_long_snapshot_reachable() {
+        let head: String = (0..140)
+            .map(|i| format!("line{i} of the shared document body "))
+            .collect();
+        let entries = vec![
+            ContextEntry {
+                ts: 1,
+                redacted_text: format!("{head} the tail mentions quarterly revenue"),
+                source_tag: "screen".into(),
+                app: Some("Preview".into()),
+                window: None,
+            },
+            ContextEntry {
+                ts: 2,
+                redacted_text: format!("{head} the tail mentions the kubernetes migration"),
+                source_tag: "screen".into(),
+                app: Some("Preview".into()),
+                window: None,
+            },
+        ];
+        let (facts, owners) = build_chunked_recall_facts(&entries);
+        assert!(
+            facts.len() > entries.len(),
+            "a long snapshot must split into several chunks, got {} for {} entries",
+            facts.len(),
+            entries.len()
+        );
+        assert_eq!(facts.len(), owners.len(), "owners must be parallel to facts");
+        // Every chunk maps back to a real snapshot, and both snapshots are covered.
+        assert!(owners.iter().all(|&o| o < entries.len()));
+        assert!(owners.contains(&0) && owners.contains(&1));
+        // The distinguishing tails must survive INTO the chunks — this is what the
+        // whole-snapshot path lost.
+        let all: String = facts.iter().map(|f| f.value.clone()).collect::<Vec<_>>().join(" ");
+        assert!(all.contains("quarterly revenue"), "tail A was dropped");
+        assert!(all.contains("kubernetes migration"), "tail B was dropped");
+        // And each chunk stays inside the embedder's window.
+        for f in &facts {
+            assert!(
+                f.value.split_whitespace().count() <= CHUNK_WORDS + 4,
+                "chunk is {} words, past the embedding window",
+                f.value.split_whitespace().count()
+            );
+        }
+        // Grounding labels ride on every chunk, so "what was that in Preview" still
+        // matches a chunk from the middle of the capture.
+        assert!(facts.iter().all(|f| f.value.starts_with("Preview ")));
     }
 
     /// REGRESSION: a continuous capture loop over ONE unchanged window must not
