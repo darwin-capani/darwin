@@ -3,7 +3,9 @@
 
 WHY THIS EXISTS. The committed vlm_eval measured ONE fixture with unusually large text
 and judged quality by eyeballing a single answer string. It reported a GO. It could not
-see that the shipped Qwen2-VL-2B scores 2/12 to 4/12 on checkable facts, nor that
+see how the shipped Qwen2-VL-2B actually scores on checkable facts at the cap it
+really runs at (54/72 = 75.0%; an earlier 2/12-to-4/12 figure came from UNCAPPED
+resolutions and is retracted in results.json), nor that
 feeding a full-resolution screen drove it into repetition collapse.
 
 This harness scores CHECKABLE FACTS — an error code, an IP address, a button label —

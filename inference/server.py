@@ -3889,29 +3889,35 @@ class InferenceEngine:
         except Exception:
             log.exception("preload: opener bank generation failed; daemon will run without openers")
         # OCR (op=describe_image, OCR-first screen reading). Warmed in the BACKGROUND,
-        # not inline, and the distinction is the whole point:
+        # on the single mlx-vlm worker that also serves requests (see _on_vlm_worker:
+        # a model loaded on any other thread cannot be generated from here).
         #
-        #   Loaded lazily inside the request, the load runs while the engine lock is
-        #   held — measured on the live server at 19,536 ms against 2,952 ms warm. Every
-        #   other op (classify, converse, speak, transcribe) blocks on that same lock,
-        #   so one screen question made DARWIN deaf for twenty seconds and blew the
-        #   daemon's 30 s timeout.
+        # WHAT THIS ACTUALLY BUYS, corrected. Three earlier commits justified this warm
+        # with "a cold load inside the request held the engine lock for 19,536 ms". That
+        # number was misread off this server's own log. It is a TRANSCRIPTION:
         #
-        #   Loaded inline HERE, that same ~16 s lands on boot instead — against a
-        #   startup this campaign just brought from 63 s to 8.96 s. Trading a 3x boot
-        #   regression for a rare op is not a fix.
+        #   op=describe_image: transcribed 136 chars in 19536ms
+        #   op=describe_image: transcribed 136 chars in 2952ms
+        #   OCR model loaded in 1.2s          <- the load, logged separately
         #
-        # Started LAST, after every other warm and the opener bank. The warm still
-        # contends for the same GPU lock, and started early it slowed the models that
-        # matter more: measured on the live server, moving it ahead of TTS pushed the
-        # TTS warm 3.1s -> 4.3s and the whole preload 12s -> 19s. describe_image is
-        # the rarest op here, so it queues behind speak, listen and think.
+        # Both figures in that pair are transcriptions of the same image AFTER the model
+        # was resident; the spread between them is contention, not loading. The load is
+        # ~1.0-1.2 s. So warming here removes about a second from the first screen
+        # question — worth doing, and free since boot is not blocked — but it is not the
+        # sixteen seconds those messages claimed.
         #
-        # So: a background thread takes the lock and pays the load while nothing is
-        # asking. Boot is unblocked, and by the time a screen question arrives the
-        # model is resident. A question in the first ~16 s simply waits for the warm
-        # already in flight instead of starting a second one — which is the other
-        # reason to do it here rather than leaving it lazy.
+        # THE LONG LOCK HOLD IS THEREFORE STILL HERE, and warming was never going to fix
+        # it: what holds self._lock for 1-19 s is the transcription itself, and every
+        # other op (classify, converse, speak, transcribe) queues behind it against the
+        # daemon's 30 s timeout. Serialising GPU work is deliberate in this server, so
+        # narrowing it is a real design change and not a comment fix; it is recorded here
+        # as a known, measured cost rather than quietly implied to be solved.
+        #
+        # Started LAST, after every other warm and the opener bank. The warm contends
+        # for the same GPU lock, and started early it slowed the models that matter
+        # more: measured live, ahead of TTS it pushed the TTS warm 3.1s -> 4.3s and the
+        # whole preload 12s -> 19s. describe_image is the rarest op here, so it queues
+        # behind speak, listen and think.
         if self.ocr_model_id:
             def _warm_ocr():
                 try:
@@ -5174,10 +5180,17 @@ class InferenceEngine:
                     "model": f"{self.ocr_model_id}+{self.llm_id}",
                     "path": "ocr+llm",
                 }
-            log.info(
-                "op=describe_image: answering from the transcript failed; "
-                "asking the VLM directly"
-            )
+            elif refusal is None:
+                # Only a genuine failure. This used to be unconditional, so a turn
+                # where the transcript answered PERFECTLY WELL and simply said the
+                # screen does not show that logged both "the transcript could not
+                # answer it" (true) and "answering from the transcript failed"
+                # (false) — and the refusal is frequently what the user is ultimately
+                # given, since a contentless VLM reply now loses to it.
+                log.info(
+                    "op=describe_image: answering from the transcript failed; "
+                    "asking the VLM directly"
+                )
 
         with self._lock:
             vlm = self._on_vlm_worker(self._ensure_vlm)

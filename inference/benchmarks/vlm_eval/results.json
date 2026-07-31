@@ -40,11 +40,12 @@
       "floor": "~216 visual tokens (0.35 scale) - accuracy 0/8, text unreadable",
       "chosen": "~459 visual tokens"
     },
-    "WHAT_THIS_DOES_NOT_FIX": "screen-VQA is still not reliable. Across three fixtures and four checkable facts the model scored 2/12 to 4/12 at EVERY resolution, and even after the cap it hallucinated an error code that is not on screen. The cap removes a failure MODE and 5x of latency; it does not make this 2B checkpoint good at reading screens. A better VLM is the real answer and remains unevaluated.",
+    "WHAT_THIS_DOES_NOT_FIX": "SUPERSEDED \u2014 see MODEL_COMPARISON_2026_07_31.CORRECTION_TO_AN_EARLIER_CLAIM. This key asserted '2/12 to 4/12 at EVERY resolution' and 'still not reliable', which contradicted the correction recorded later in this same file. That figure came from UNCAPPED resolutions \u2014 the regime where the model collapses into repetition \u2014 and a harder question set; it was never a measurement of the shipped configuration. Measured at the shipped cap it is 54/72 = 75.0%, evenly 18/24 across all three fixtures. What DOES stand: the cap removes a failure mode and ~5x of latency, and the model still occasionally invents an error code, so an answer is a reading and not a guarantee.",
     "fixtures_added": [
       "fixture_dense_code_13px.png (code editor, 13px text, E0308 banner, Run Tests button)",
       "fixture_settings_12px.png (settings dialog, 12px labels, IP addresses, Renew Lease button)"
-    ]
+    ],
+    "WHAT_THIS_DOES_NOT_FIX_ORIGINAL_TEXT": "screen-VQA is still not reliable. Across three fixtures and four checkable facts the model scored 2/12 to 4/12 at EVERY resolution, and even after the cap it hallucinated an error code that is not on screen. The cap removes a failure MODE and 5x of latency; it does not make this 2B checkpoint good at reading screens. A better VLM is the real answer and remains unevaluated."
   },
   "MODEL_COMPARISON_2026_07_31": {
     "question": "is there a better VLM than the pinned Qwen2-VL-2B for reading screens?",
