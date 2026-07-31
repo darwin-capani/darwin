@@ -2950,6 +2950,58 @@ def _prompt_cache_path(root, name):
     return os.path.join(root, PROMPT_CACHE_DIRNAME, f"{name}.safetensors")
 
 
+# How many PER-AGENT persona caches may sit on disk. Mirrors the in-memory
+# AGENT_PERSONA_CACHE_MAX so the two bounds cannot drift apart.
+PERSONA_DISK_CACHE_MAX = 4
+
+
+def _prune_agent_persona_caches(root, keep=PERSONA_DISK_CACHE_MAX):
+    """Keep only the `keep` most recently used per-agent persona caches on disk.
+
+    Giving every persona its own slot fixed a real bug — all 28 shared one file and
+    clobbered each other — but replaced it with an unbounded one: each file is ~44 MB
+    for this model, nothing ever deleted them, and the 27 shipped personas would
+    accumulate over a gigabyte as the user talked to different agents. The in-memory
+    LRU (AGENT_PERSONA_CACHE_MAX) bounded the resident caches and said nothing about
+    the disk.
+
+    Only `persona-*` files are eligible. The BASE persona (persona.safetensors) and the
+    classifier cache are used every session and are never pruned. Best-effort: a cache
+    we fail to delete is wasted disk, never a broken reply, so this must not raise.
+    """
+    try:
+        d = os.path.join(root, PROMPT_CACHE_DIRNAME)
+        entries = []
+        for name in os.listdir(d):
+            # "persona-" and not "persona.safetensors": the base slot is exempt.
+            if not name.startswith("persona-") or not name.endswith(".safetensors"):
+                continue
+            path = os.path.join(d, name)
+            try:
+                entries.append((os.path.getmtime(path), path))
+            except OSError:
+                continue
+        if len(entries) <= keep:
+            return 0
+        entries.sort(reverse=True)  # newest first
+        removed = 0
+        for _, path in entries[keep:]:
+            try:
+                os.unlink(path)
+                removed += 1
+            except OSError:
+                pass
+        if removed:
+            log.info(
+                "pruned %d per-agent persona cache(s) from disk (keeping the %d most "
+                "recent)", removed, keep,
+            )
+        return removed
+    except Exception:  # noqa: BLE001 - disk hygiene must never break a reply
+        log.debug("could not prune the agent persona caches", exc_info=True)
+        return 0
+
+
 def save_prompt_cache_fingerprinted(root, name, cache, model_id, quant, prefix_str, adapter_stamp=None):
     """BEST-EFFORT persist. Returns True if written. NEVER raises: a cache we could
     not save just means the next boot prefills as it always did, and losing the
@@ -4155,6 +4207,10 @@ class InferenceEngine:
                 self._quant_loaded or self.quant, prefix_str,
                 getattr(self, "_active_adapter", None),
             )
+            if slot != "persona":
+                # Per-agent slots are bounded; the base slot is not (it is used every
+                # session). Pruning AFTER the write means the one just saved survives.
+                _prune_agent_persona_caches(prompt_cache_root())
             log.info(
                 "prompt cache %s prefilled: %d tokens in %dms",
                 slot, len(prefix_tokens),
@@ -5344,11 +5400,17 @@ class InferenceEngine:
                 )
                 self._image_model = None
                 return None
-        return {
-            "Flux1": diff["Flux1"],
-            "Config": diff["Config"],
-            "model": self._image_model,
-        }
+        # CARRY THE WHOLE LOADER DICT. This used to hand back only Flux1/Config/model,
+        # dropping "modern" and "ModelConfig" — and "modern" is exactly what
+        # generate_image branches on. So the loader correctly detected the new mflux
+        # layout and generate_image then always took the LEGACY branch anyway, calling
+        # Config(num_inference_steps=...) against an API whose Config REQUIRES
+        # model_config. op=generate_image stayed 100% dead; the fix only moved the
+        # failure from an ImportError at load to a TypeError at generation.
+        #
+        # Building the return by SPREADING diff means a future key added to the loader
+        # cannot be silently lost here again.
+        return {**diff, "model": self._image_model}
 
     def generate_image(self, prompt, size=None, steps=None, seed=None):
         """Generate an image FROM a text prompt with the on-device MLX diffusion

@@ -6047,6 +6047,13 @@ async fn handle_generate_image(
     }
 }
 
+/// How long to wait for the Vision app to write the describe frame. Screen capture is
+/// fast; this only has to cover process scheduling and the ScreenCaptureKit round trip.
+/// Well under the daemon's 30 s request budget, which the describe itself then spends.
+const CAPTURE_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(6);
+/// Poll granularity while waiting for that frame.
+const CAPTURE_FRAME_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 /// Capture ONE screen frame for the VLM by forwarding the Vision app's screen
 /// capture op (reusing its ScreenCaptureKit path — pixels stay in the app's
 /// process / on-device). Returns the confined frame path the app wrote, or an
@@ -6064,44 +6071,60 @@ async fn capture_screen_frame(
     // The frame the Vision app writes for a VLM describe, under the project
     // state dir (an allowlisted root). The op asks the app to capture + save one
     // frame here; the app owns the on-device capture + TCC consent.
-    let frame = allowed_root.join("state").join("vision").join("describe-frame.png");
+    // INSIDE THE APP'S WRITE GRANT. apps/vision/manifest.toml grants
+    // fs_write = ["state/tmp/vision"] and generate_sbpl emits exactly one
+    // (allow file-write* (subpath ...)) per entry — so the old state/vision/ path was
+    // seatbelt-denied and the app could never have written this frame, on any run.
+    let frame = allowed_root
+        .join("state")
+        .join("tmp")
+        .join("vision")
+        .join("describe-frame.png");
     let op = json!({
         "type": "op",
         "op": "describe.capture",
         "path": frame.display().to_string(),
     })
     .to_string();
-    // WAIT FOR THE APP, and do not accept a frame it did not just write.
+    // WAIT FOR THE ARTIFACT, and do not accept a frame the app did not just write.
     //
-    // This used to be a fire-and-forget `send_op` — a registry lookup plus a channel
-    // send — followed on the VERY NEXT LINE, with no await between them, by
-    // `frame.exists()`. The app could not possibly have captured anything yet, so:
+    // History, because both mistakes are instructive. Originally this was a
+    // fire-and-forget `send_op` followed on the very next line by `frame.exists()`,
+    // with no await between them — so the first screen question always failed with an
+    // untrue "Screen Recording consent is needed" and later ones described a STALE
+    // frame. I then switched it to `apps::request_op`, which waits for a
+    // `{"type":"result","id":...}` line — and the Vision app has no such message type
+    // at all (RelayType is items|status|log|modules), so every screen question stalled
+    // for the whole APP_REQUEST_TIMEOUT and then failed. That was strictly worse: a
+    // fast wrong answer became a slow one.
     //
-    //   * the FIRST screen question always failed, and failed with a reason that was
-    //     simply untrue — "Screen Recording consent is needed on-device" — sending the
-    //     operator to a TCC pane that was already granted;
-    //   * every LATER question saw the leftover file from a previous capture and
-    //     described a STALE screen as though it were the current one, which is worse
-    //     than failing.
-    //
-    // The old frame is removed first so a stale file can never be mistaken for a fresh
-    // one, and request_op waits for the app's own reply instead of guessing.
+    // The app cannot reply, but it does not need to: THE FRAME IS THE RESULT. So the
+    // old frame is removed first (a stale file can never be mistaken for a fresh one)
+    // and we poll for the new one under a deadline. A frame that never appears is the
+    // honest "no frame" case — which is now genuinely what the message says.
     let _ = tokio::fs::remove_file(&frame).await;
-    let op_value: serde_json::Value = serde_json::from_str(&op)
-        .map_err(|e| format!("could not build the capture op ({e})"))?;
-    apps::request_op(
-        app_registry,
-        VISION_APP,
-        op_value,
-        apps::APP_REQUEST_TIMEOUT,
-    )
-    .await
-    .map_err(|e| format!("I couldn't reach Vision to capture your screen ({e})"))?;
+    if let Some(dir) = frame.parent() {
+        // The daemon is not sandboxed; the app is, and cannot create its own scratch
+        // directory outside the granted subpath's existing tree.
+        let _ = tokio::fs::create_dir_all(dir).await;
+    }
+    apps::send_op(app_registry, VISION_APP, &op)
+        .await
+        .map_err(|e| format!("I couldn't reach Vision to capture your screen ({e})"))?;
 
-    // The app replied, so the capture ran. A missing frame now genuinely means no
-    // frame was produced — the reason below is finally the true one.
-    if !frame.exists() {
-        return Err("the screen frame wasn't captured (Screen Recording consent is needed on-device)".to_string());
+    let deadline = std::time::Instant::now() + CAPTURE_FRAME_TIMEOUT;
+    loop {
+        if frame.exists() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(
+                "the screen frame wasn't captured (Screen Recording consent is needed \
+                 on-device)"
+                    .to_string(),
+            );
+        }
+        tokio::time::sleep(CAPTURE_FRAME_POLL).await;
     }
     Ok(frame)
 }
@@ -9994,16 +10017,51 @@ mod describe_capture_tests {
     }
 
     #[test]
-    fn the_capture_waits_for_the_apps_reply() {
+    fn the_capture_waits_for_the_frame_it_asked_for() {
+        // The first version fired and forgot, then checked existence on the next line.
+        // The SECOND version waited on apps::request_op — which only resolves on a
+        // {"type":"result","id":...} line, and the Vision app's RelayType is
+        // items|status|log|modules with no result case at all. So every screen question
+        // stalled for the whole APP_REQUEST_TIMEOUT and then failed: a fast wrong
+        // answer turned into a slow one. The app cannot reply, but the FRAME is the
+        // result, so we poll for it under a deadline.
         let b = body();
         assert!(
-            b.contains("apps::request_op("),
-            "the capture still fires and forgets; the existence check that follows \
-             cannot observe a capture that has not happened yet"
+            b.contains("CAPTURE_FRAME_TIMEOUT"),
+            "the capture does not bound its wait; a Vision app that never writes the \
+             frame would hang the request"
         );
         assert!(
-            !b.contains("apps::send_op("),
-            "a fire-and-forget send_op remains in the capture path"
+            !b.contains("apps::request_op("),
+            "capture_screen_frame waits on request_op, which the Vision app has no \
+             message type to satisfy — every screen question stalls until timeout"
+        );
+        assert!(
+            b.contains("apps::send_op("),
+            "the op must still be forwarded to the app"
+        );
+    }
+
+    #[test]
+    fn the_frame_lives_inside_the_apps_write_grant() {
+        // apps/vision/manifest.toml grants fs_write = ["state/tmp/vision"], and
+        // generate_sbpl emits exactly one (allow file-write* (subpath ...)) per entry.
+        // The frame path was state/vision/, outside that subpath, so the app was
+        // seatbelt-denied and could never have written it on any run.
+        let manifest = include_str!("../../apps/vision/manifest.toml");
+        let grant = manifest
+            .lines()
+            .find(|l| l.trim_start().starts_with("fs_write"))
+            .expect("apps/vision/manifest.toml lost its fs_write line");
+        assert!(
+            grant.contains("state/tmp/vision"),
+            "the Vision write grant moved; re-point the frame path: {grant}"
+        );
+        let b = body();
+        assert!(
+            b.contains(r#".join("tmp")"#),
+            "the describe frame is written outside the Vision app's only fs_write \
+             grant, so the capture is seatbelt-denied"
         );
     }
 
@@ -10025,16 +10083,19 @@ mod describe_capture_tests {
     #[test]
     fn the_reply_is_awaited_before_the_existence_check() {
         let b = body();
-        let request = b.find("apps::request_op(").unwrap();
+        let sent = b.find("apps::send_op(").unwrap();
         let exists = b.find("frame.exists()").unwrap();
         assert!(
-            request < exists,
+            sent < exists,
             "the frame is checked before the app is asked to write it"
         );
-        let awaited = b[request..exists].contains(".await");
         assert!(
-            awaited,
-            "request_op is not awaited before the existence check, so the race is back"
+            b[sent..exists].contains(".await"),
+            "the send is not awaited before the wait loop, so the race is back"
+        );
+        assert!(
+            b.contains("CAPTURE_FRAME_POLL"),
+            "the wait must actually sleep between checks rather than spin"
         );
     }
 }

@@ -107,6 +107,61 @@ class TheInstalledMfluxIsActuallyUsable(unittest.TestCase):
         inspect.signature(ann.save).bind(None, path="/tmp/x.png")
 
 
+class TheDictGENERATE_IMAGEActuallySeesIsTheOneChecked(unittest.TestCase):
+    """THE BUG THIS FILE MISSED THE FIRST TIME.
+
+    Every case above binds against `_load_mlx_diffusion()`'s dict. That is NOT the dict
+    generate_image reads: `_ensure_image_model` re-packs it, and the first version
+    re-packed only Flux1/Config/model — dropping "modern", the exact key generate_image
+    branches on. So the loader detected the new mflux layout, generate_image took the
+    LEGACY branch anyway, and op=generate_image stayed 100% dead. The suite passed
+    13/13 while the feature was broken, because it was testing the wrong object.
+
+    That is the same error as the OCR thread bug earlier in the same session: a green,
+    mutation-proved suite that measures something adjacent to the thing that matters.
+    """
+
+    @unittest.skipUnless(HAVE_MFLUX, "mflux not installed")
+    def test_ensure_image_model_carries_every_loader_key(self):
+        import itertools
+        import threading
+
+        diff = S._load_mlx_diffusion()
+        self.assertIsInstance(diff, dict, "loader is broken; see the cases above")
+
+        e = S.InferenceEngine.__new__(S.InferenceEngine)
+        e._lock = threading.Lock()
+        e.image_model_id = S.DEFAULT_IMAGE_MODEL
+        e._image_model = "STUB"          # skip the multi-GB weight load
+        e._tts_counter = itertools.count(0)
+        got = e._ensure_image_model()
+
+        lost = set(diff) - set(got or {})
+        self.assertEqual(
+            lost, set(),
+            f"_ensure_image_model dropped loader keys {lost}. generate_image reads THIS "
+            "dict, so a dropped key silently changes which API branch runs",
+        )
+
+    @unittest.skipUnless(HAVE_MFLUX, "mflux not installed")
+    def test_generate_image_takes_the_branch_the_loader_detected(self):
+        import itertools
+        import threading
+
+        diff = S._load_mlx_diffusion()
+        e = S.InferenceEngine.__new__(S.InferenceEngine)
+        e._lock = threading.Lock()
+        e.image_model_id = S.DEFAULT_IMAGE_MODEL
+        e._image_model = "STUB"
+        e._tts_counter = itertools.count(0)
+        got = e._ensure_image_model()
+        self.assertEqual(
+            bool(got.get("modern")), bool(diff.get("modern")),
+            "the loader and the generation path disagree about which mflux API is "
+            "installed, so generate_image calls the wrong one and raises TypeError",
+        )
+
+
 class AnInstalledPackageWeCannotCallIsReportedNotSwallowed(unittest.TestCase):
     """The reason this hid for so long: total failure looked exactly like 'switched
     off'. These do not need mflux present."""
