@@ -884,6 +884,22 @@ RSYNC_EXCLUDES=()
 for d in "${EXCLUDE_DIRS[@]}"; do RSYNC_EXCLUDES+=(--exclude "$d/"); done
 RSYNC_EXCLUDES+=(--exclude ".DS_Store" --exclude "*.pyc" --exclude "state/env.sh")
 
+# config/darwin.toml is BOTH shipped-from-source AND written at runtime, so a plain
+# copy destroys operator data on every redeploy — and `./install.sh --yes` IS the
+# documented redeploy.
+#
+#   * the daemon's connector_add tool appends validated [[mcp.servers]] blocks to it.
+#     That tool is CONSEQUENTIAL: it costs a fresh per-action confirm and a spoken
+#     "yes". Every one of them was silently reverted by the next deploy.
+#   * the HUD's Settings panel writes whitelisted keys to it.
+#   * an operator editing it by hand is doing exactly what its own comments invite.
+#
+# So it is excluded here and reconciled explicitly after the copy: a first install
+# gets the shipped file, a redeploy KEEPS what is there. Safe because load_config
+# validates every key independently against a built-in default, so a config predating
+# a new key still boots — the property the [vision].ocr_model fix already relied on.
+RSYNC_EXCLUDES+=(--exclude "config/darwin.toml")
+
 ui_info "Excluding from the copy (built/fetched fresh in the home): ${EXCLUDE_DIRS[*]}"
 
 if [ "$MODE" = "check" ]; then
@@ -901,12 +917,29 @@ else
         ui_ok "Project tree placed at $DARWIN_HOME"
     else
         # Fallback: tar-pipe with excludes (rsync is standard on macOS, but be safe).
-        TAR_EXCLUDES=()
+        TAR_EXCLUDES=(--exclude "./config/darwin.toml")   # see RSYNC_EXCLUDES above
         for d in "${EXCLUDE_DIRS[@]}"; do TAR_EXCLUDES+=(--exclude "./$d"); done
         TAR_EXCLUDES+=(--exclude "./.DS_Store")
         ui_spin "copying project tree (tar) -> install home" -- bash -c \
             "tar -C '$SRC_ROOT' ${TAR_EXCLUDES[*]} -cf - . | tar -C '$DARWIN_HOME' -xf -"
         ui_ok "Project tree placed at $DARWIN_HOME"
+    fi
+
+    # --- config/darwin.toml: place it once, then never clobber it ----------------
+    if [ "$SRC_ROOT" != "$DARWIN_HOME" ]; then
+        if [ ! -f "$DARWIN_HOME/config/darwin.toml" ]; then
+            mkdir -p "$DARWIN_HOME/config"
+            cp "$SRC_ROOT/config/darwin.toml" "$DARWIN_HOME/config/darwin.toml"
+            ui_ok "config/darwin.toml installed (first install)"
+        elif cmp -s "$SRC_ROOT/config/darwin.toml" "$DARWIN_HOME/config/darwin.toml"; then
+            ui_ok "config/darwin.toml matches shipped — kept"
+        else
+            cp "$SRC_ROOT/config/darwin.toml" "$DARWIN_HOME/config/darwin.toml.shipped"
+            ui_ok "config/darwin.toml KEPT — yours (connectors + HUD settings live in it)"
+            ui_note " shipped copy written alongside it; diff for keys added since:"
+            ui_note "   diff \"$DARWIN_HOME/config/darwin.toml\" \"$DARWIN_HOME/config/darwin.toml.shipped\""
+            ui_note " every key falls back to a built-in default, so an older config still boots."
+        fi
     fi
 fi
 
