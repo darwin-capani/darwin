@@ -67,7 +67,13 @@ CONFIG="$ROOT/config/darwin.toml"
 IPC="$ROOT/state/ipc"
 INF_SOCK="$IPC/inference.sock"
 CMD_SOCK="$IPC/command.sock"
-INSTALL_MODELS="$ROOT/models"
+# The HF cache layout is <HF_HOME>/hub/models--<org>--<repo>. This pointed one level
+# too shallow ("$ROOT/models"), so count_models globbed "$ROOT/models/models--*" and
+# could never match anything. Every run therefore reported ZERO models in the install
+# cache and told the operator to re-download weights that were sitting right there —
+# and the HF_HOME-split warning it exists to raise could never fire, because the split
+# is detected by comparing two counts and one of them was always 0.
+INSTALL_MODELS="$ROOT/models/hub"
 HF_CACHE="${HF_HOME:-$HOME/.cache/huggingface}/hub"
 AGENT_DIR="$HOME/Library/LaunchAgents"
 GUI_DOMAIN="gui/$(id -u 2>/dev/null || echo 0)"
@@ -169,23 +175,52 @@ else
 fi
 
 # --- models: check BOTH locations + flag the HF_HOME runtime split -----------
+#
+# Three things were wrong here and each hid the next:
+#   * INSTALL_MODELS pointed one level above the real hub/ dir, so the install count
+#     was ALWAYS zero, the split could never be detected, and a machine with every
+#     model present was told to re-download them.
+#   * the default-cache line asserted "this is what the server reads at runtime"
+#     unconditionally, which is false whenever state/env.sh (sourced above) has
+#     exported HF_HOME.
+#   * when HF_HOME points AT the install cache — the normal deployed state — the two
+#     paths are the SAME directory, and reporting them as two locations double-counts
+#     the same models and calls one of them "not the runtime cache".
 N_INSTALL="$(count_models "$INSTALL_MODELS")"
 N_CACHE="$(count_models "$HF_CACHE")"
 MODELS_TAG="NONE"
-if [ "$N_CACHE" -gt 0 ]; then
-    say_ok "models in default HF cache: $N_CACHE under $HF_CACHE (this is what the server reads at runtime)"
-    MODELS_TAG="OK"
-fi
-if [ "$N_INSTALL" -gt 0 ]; then
-    if [ -z "${HF_HOME:-}" ]; then
-        say_warn "models in install cache: $N_INSTALL under $INSTALL_MODELS — but HF_HOME is UNSET, so the server reads $HF_CACHE instead (the install/runtime HF_HOME split)"
+# Resolve both to compare them as paths, not as strings.
+_ip="$(cd "$INSTALL_MODELS" 2>/dev/null && pwd -P || echo "$INSTALL_MODELS")"
+_cp="$(cd "$HF_CACHE" 2>/dev/null && pwd -P || echo "$HF_CACHE")"
+
+if [ "$_ip" = "$_cp" ]; then
+    # One directory serving both roles: the deployed, correctly-configured state.
+    if [ "$N_INSTALL" -gt 0 ]; then
+        say_ok "models: $N_INSTALL under $INSTALL_MODELS (install cache AND runtime cache are the same directory${HF_HOME:+, HF_HOME=$HF_HOME})"
+        MODELS_TAG="OK"
     else
-        say_ok "models in install cache: $N_INSTALL under $INSTALL_MODELS (HF_HOME=$HF_HOME)"
+        say_warn "no on-device models found in $INSTALL_MODELS (run inference/deploy_models.py) — inference will be unavailable"
     fi
-    [ "$MODELS_TAG" = "NONE" ] && MODELS_TAG="SPLIT"
-fi
-if [ "$N_INSTALL" -eq 0 ] && [ "$N_CACHE" -eq 0 ]; then
-    say_warn "no on-device models found in $HF_CACHE or $INSTALL_MODELS (run inference/deploy_models.py) — inference will be unavailable"
+else
+    if [ "$N_CACHE" -gt 0 ]; then
+        if [ -z "${HF_HOME:-}" ]; then
+            say_ok "models in default HF cache: $N_CACHE under $HF_CACHE (HF_HOME is unset, so this is what the server reads at runtime)"
+        else
+            say_ok "models in default HF cache: $N_CACHE under $HF_CACHE (NOT the runtime cache — HF_HOME=$HF_HOME)"
+        fi
+        MODELS_TAG="OK"
+    fi
+    if [ "$N_INSTALL" -gt 0 ]; then
+        if [ -z "${HF_HOME:-}" ]; then
+            say_warn "models in install cache: $N_INSTALL under $INSTALL_MODELS — but HF_HOME is UNSET, so the server reads $HF_CACHE instead (the install/runtime HF_HOME split)"
+        else
+            say_ok "models in install cache: $N_INSTALL under $INSTALL_MODELS (HF_HOME=$HF_HOME)"
+        fi
+        [ "$MODELS_TAG" = "NONE" ] && MODELS_TAG="SPLIT"
+    fi
+    if [ "$N_INSTALL" -eq 0 ] && [ "$N_CACHE" -eq 0 ]; then
+        say_warn "no on-device models found in $HF_CACHE or $INSTALL_MODELS (run inference/deploy_models.py) — inference will be unavailable"
+    fi
 fi
 
 # --- sockets + telemetry -----------------------------------------------------

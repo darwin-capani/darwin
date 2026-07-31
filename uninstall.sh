@@ -129,6 +129,7 @@ present_targets() {
     done
     ui_note "Keychain items under service \"$KEYCHAIN_SERVICE\"  (your stored API keys / tokens)"
     ui_note "Logs: $LOG_DIR"
+    ui_note "HUD support data: ~/Library/{WebKit,Caches,HTTPStorages,Saved Application State}/$HUD_BUNDLE_ID"
     ui_hr
     ui_info "This removes the INSTALLED OS (~/Library/...). A source clone elsewhere is untouched."
     ui_hr
@@ -230,6 +231,43 @@ remove_keychain_items() {
     fi
 }
 
+# The HUD is a WebKit app, so macOS keeps per-bundle state OUTSIDE the app bundle and
+# outside the install home. Neither was removed, so a script that announced "D.A.R.W.I.N.
+# has been completely removed from this machine" left the HUD's browsing state, local
+# storage and caches behind — and a later reinstall silently inherited them.
+#
+# Every path is derived from HUD_BUNDLE_ID and each is checked to be exactly the
+# bundle-named directory under a known system location, so this can never widen into
+# ~/Library/Caches itself.
+remove_hud_support_dirs() {
+    local base d
+    for base in "$HOME/Library/WebKit" "$HOME/Library/Caches" \
+                "$HOME/Library/Saved Application State" "$HOME/Library/HTTPStorages"; do
+        d="$base/$HUD_BUNDLE_ID"
+        [ -d "$d" ] || continue
+        case "$d" in
+            "$HOME/Library/"*"/$HUD_BUNDLE_ID") ;;   # shape guard
+            *) ui_note "refusing to remove an unexpected path: $d"; continue ;;
+        esac
+        if [ "$DRY_RUN" -eq 1 ]; then
+            ui_note "[dry run] would: rm -rf \"$d\""
+        else
+            rm -rf "$d"
+            ui_ok "Removed HUD support data ($d)."
+        fi
+    done
+    # Saved Application State uses a .savedState suffix.
+    d="$HOME/Library/Saved Application State/$HUD_BUNDLE_ID.savedState"
+    if [ -d "$d" ]; then
+        if [ "$DRY_RUN" -eq 1 ]; then
+            ui_note "[dry run] would: rm -rf \"$d\""
+        else
+            rm -rf "$d"
+            ui_ok "Removed HUD saved state."
+        fi
+    fi
+}
+
 remove_logs() {
     if [ "$DRY_RUN" -eq 1 ]; then
         ui_note "[dry run] would: rm -rf \"$LOG_DIR\""
@@ -269,6 +307,7 @@ stop_and_remove_agents
 remove_hud_app
 remove_home
 remove_keychain_items
+remove_hud_support_dirs
 remove_logs
 ui_hr
 if [ "$DRY_RUN" -eq 1 ]; then
