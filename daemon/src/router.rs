@@ -6071,13 +6071,35 @@ async fn capture_screen_frame(
         "path": frame.display().to_string(),
     })
     .to_string();
-    apps::send_op(app_registry, VISION_APP, &op)
-        .await
-        .map_err(|e| format!("I couldn't reach Vision to capture your screen ({e})"))?;
-    // The capture is asynchronous + TCC-gated; the frame may not exist yet / at
-    // all without consent. Confinement + existence are re-checked by the caller's
-    // describe_confined_path, but a fast existence check here gives an honest
-    // "no frame" reason rather than a confinement reject message.
+    // WAIT FOR THE APP, and do not accept a frame it did not just write.
+    //
+    // This used to be a fire-and-forget `send_op` — a registry lookup plus a channel
+    // send — followed on the VERY NEXT LINE, with no await between them, by
+    // `frame.exists()`. The app could not possibly have captured anything yet, so:
+    //
+    //   * the FIRST screen question always failed, and failed with a reason that was
+    //     simply untrue — "Screen Recording consent is needed on-device" — sending the
+    //     operator to a TCC pane that was already granted;
+    //   * every LATER question saw the leftover file from a previous capture and
+    //     described a STALE screen as though it were the current one, which is worse
+    //     than failing.
+    //
+    // The old frame is removed first so a stale file can never be mistaken for a fresh
+    // one, and request_op waits for the app's own reply instead of guessing.
+    let _ = tokio::fs::remove_file(&frame).await;
+    let op_value: serde_json::Value = serde_json::from_str(&op)
+        .map_err(|e| format!("could not build the capture op ({e})"))?;
+    apps::request_op(
+        app_registry,
+        VISION_APP,
+        op_value,
+        apps::APP_REQUEST_TIMEOUT,
+    )
+    .await
+    .map_err(|e| format!("I couldn't reach Vision to capture your screen ({e})"))?;
+
+    // The app replied, so the capture ran. A missing frame now genuinely means no
+    // frame was produced — the reason below is finally the true one.
     if !frame.exists() {
         return Err("the screen frame wasn't captured (Screen Recording consent is needed on-device)".to_string());
     }
@@ -9939,4 +9961,81 @@ mod tests {
         let reply = crate::lifelog::dispatch(&empty_mem, ns, intent).await;
         assert!(reply.to_lowercase().contains("nothing logged"), "honest empty: {reply}");
     }
+
+#[cfg(test)]
+mod describe_capture_tests {
+    /// capture_screen_frame must WAIT for the Vision app and must not accept a frame
+    /// the app did not just write.
+    ///
+    /// The shipped version did a fire-and-forget send_op and then checked
+    /// frame.exists() on the very next line with no await between them. The first
+    /// screen question therefore always failed — with the untrue reason "Screen
+    /// Recording consent is needed on-device" — and every later one could describe the
+    /// leftover frame from a previous capture as though it were the current screen.
+    /// The function's CODE, with comment lines stripped.
+    ///
+    /// Stripping matters: this function's comments discuss the very bug being pinned
+    /// ("this used to be a fire-and-forget send_op"), so a naive substring check
+    /// reports the fixed code as still broken. An assertion that cannot tell prose
+    /// from code is not an assertion.
+    fn body() -> String {
+        let src = include_str!("router.rs");
+        let i = src
+            .find("async fn capture_screen_frame(")
+            .expect("capture_screen_frame moved; re-point this guard");
+        let rest = &src[i..];
+        // End at the function's own closing brace at column 0.
+        let end = rest.find("\n}\n").map(|e| e + 2).unwrap_or(rest.len());
+        rest[..end]
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn the_capture_waits_for_the_apps_reply() {
+        let b = body();
+        assert!(
+            b.contains("apps::request_op("),
+            "the capture still fires and forgets; the existence check that follows \
+             cannot observe a capture that has not happened yet"
+        );
+        assert!(
+            !b.contains("apps::send_op("),
+            "a fire-and-forget send_op remains in the capture path"
+        );
+    }
+
+    #[test]
+    fn a_stale_frame_is_removed_before_the_capture() {
+        let b = body();
+        let removed = b
+            .find("remove_file")
+            .expect("the previous frame is not deleted, so a stale screen can be \
+                    described as the current one");
+        let checked = b.find("frame.exists()").expect("existence check vanished");
+        assert!(
+            removed < checked,
+            "the stale frame must be removed BEFORE the freshness check, or the check \
+             passes on the old file"
+        );
+    }
+
+    #[test]
+    fn the_reply_is_awaited_before_the_existence_check() {
+        let b = body();
+        let request = b.find("apps::request_op(").unwrap();
+        let exists = b.find("frame.exists()").unwrap();
+        assert!(
+            request < exists,
+            "the frame is checked before the app is asked to write it"
+        );
+        let awaited = b[request..exists].contains(".await");
+        assert!(
+            awaited,
+            "request_op is not awaited before the existence check, so the race is back"
+        );
+    }
+}
 }
