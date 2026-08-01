@@ -205,6 +205,38 @@ def test_non_string_or_empty_id_is_treated_as_absent():
         assert conn.lines[0]["type"] == "items", f"id={bad_id!r} must not correlate"
 
 
+def test_step_forms_never_claim_a_cadence_cron_does_not_perform():
+    """_describe_field documents the rule -- "STEP FORMS describe the set cron ACTUALLY
+    matches, not the step number" -- and only the `*/n` branch enforced it. 0/25 fires
+    at :00, :25, :50 and then :00 again, a 10-minute gap, yet it was described as
+    "every 25 minutes starting at minute 0". The same firing set was described two
+    different ways depending on how it was written."""
+    pairs = [
+        ("*/25 * * * *", "0/25 * * * *"),
+        ("0 */15 * * *", "0 0/15 * * *"),
+    ]
+    for star_form, base_form in pairs:
+        a = compute({"cron": star_form})["summary"]
+        b = compute({"cron": base_form})["summary"]
+        assert a == b, f"{star_form!r} -> {a!r} but {base_form!r} -> {b!r}"
+        assert "every 25 minutes" not in b or "*/25" in base_form
+
+
+def test_a_range_step_that_stops_short_does_not_claim_the_endpoint():
+    """0-30/25 last fires at minute 25, never 30, so "through 30" names a firing that
+    does not happen."""
+    got = compute({"cron": "0-30/25 * * * *"})["summary"]
+    assert "through" not in got, got
+    assert "25" in got and "0" in got
+
+
+def test_honest_cadences_are_still_phrased_as_cadences():
+    """The fix must not flatten every step form into an enumeration."""
+    assert "every 15 minutes" in compute({"cron": "*/15 * * * *"})["summary"]
+    assert "every 15 minutes" in compute({"cron": "5/15 * * * *"})["summary"]
+    assert "every 15 minutes" in compute({"cron": "0-59/15 * * * *"})["summary"]
+
+
 if __name__ == "__main__":
     # Script-style runs exercise the framing tests too — they are plain
     # functions the runner below would otherwise never call.
@@ -216,4 +248,8 @@ if __name__ == "__main__":
     test_tool_op_without_id_keeps_the_legacy_items_line()
     test_non_string_or_empty_id_is_treated_as_absent()
     print("agent-tool contract: 3 checks ok")
+    test_step_forms_never_claim_a_cadence_cron_does_not_perform()
+    test_a_range_step_that_stops_short_does_not_claim_the_endpoint()
+    test_honest_cadences_are_still_phrased_as_cadences()
+    print("step honesty: 3 checks ok")
     unittest.main()

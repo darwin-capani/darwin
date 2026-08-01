@@ -258,7 +258,43 @@ def main_run():
     print("fetch_feed / parse: ok")
     test_run_cycle_uses_the_fetch_proxy_and_falls_back_to_extractive()
     print("run_cycle: ok")
+    test_summary_is_not_cut_at_an_abbreviation()
+    test_summary_still_stops_at_a_real_sentence_end()
+    test_summary_still_respects_the_length_limit()
+    print("summary: ok")
     print("ALL PASSED")
+
+
+def test_summary_is_not_cut_at_an_abbreviation():
+    """The extractive summary took the SHORTEST prefix ending in a terminator followed
+    by whitespace, so newswire prose — dense with abbreviations — summarised to "U.S."
+    or "Sen." and that string is what the HUD showed as the item."""
+    cases = [
+        ("U.S. stocks fell after the Fed held rates steady. Traders shrugged.",
+         "U.S. stocks fell after the Fed held rates steady."),
+        ("Sen. Smith introduced the bill on Tuesday. It passed.",
+         "Sen. Smith introduced the bill on Tuesday."),
+        ("Dr. J. Patel led the study. More followed.",
+         "Dr. J. Patel led the study."),
+        ("Acme Inc. reported a loss. Shares dipped.",
+         "Acme Inc. reported a loss."),
+        ("The vote was 51 to 49. It carried.", "The vote was 51 to 49."),
+        ("Is it ready? Yes.", "Is it ready?"),
+        ("No terminator at all", "No terminator at all"),
+    ]
+    for text, want in cases:
+        got = main._first_sentence(text)
+        assert got == want, f"{text!r} -> {got!r} (want {want!r})"
+
+
+def test_summary_still_stops_at_a_real_sentence_end():
+    long_text = "First sentence here. " + ("x" * 400)
+    assert main._first_sentence(long_text) == "First sentence here."
+
+
+def test_summary_still_respects_the_length_limit():
+    got = main._first_sentence("word " * 200)
+    assert len(got) <= 220
 
 
 if __name__ == "__main__":

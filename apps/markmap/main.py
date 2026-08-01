@@ -47,16 +47,45 @@ def compute(payload):
 
         outline = []
         count = 0
-        in_fence = False
+        # The OPEN fence as (marker char, run length), or None outside a fence.
+        #
+        # This was a bare boolean toggled by ANY line starting with ``` or ~~~, which
+        # gets ordinary Markdown wrong in both directions. CommonMark requires the
+        # closing fence to use the SAME character and be at least as long as the
+        # opener, so:
+        #   * a ~~~ line inside a ``` block (or a longer ``` run used as an inner
+        #     fence) flipped the state early — every real heading after it was read as
+        #     being "inside" code and DROPPED;
+        #   * and once the state was inverted, comment lines in the code block that
+        #     happen to start with # were emitted as HEADINGS.
+        # Measured against a commonmark reference on ordinary release notes: two of
+        # four headings lost, plus an invented one.
+        fence = None
         # Splitlines handles \n, \r\n, and lone \r uniformly and drops the terminator.
         for raw in markdown.splitlines():
             stripped = raw.strip()
-            # A ``` (or longer) fence marker toggles code-block state; it is
-            # never a heading, and headings inside a fence are ignored.
-            if stripped.startswith("```") or stripped.startswith("~~~"):
-                in_fence = not in_fence
-                continue
-            if in_fence:
+            marker = None
+            if stripped[:3] in ("```", "~~~"):
+                ch = stripped[0]
+                run = len(stripped) - len(stripped.lstrip(ch))
+                if run >= 3:
+                    marker = (ch, run)
+            if marker is not None:
+                if fence is None:
+                    # An opening fence's info string may not contain a backtick.
+                    if marker[0] == "`" and "`" in stripped[marker[1]:]:
+                        pass  # not a fence opener at all
+                    else:
+                        fence = marker
+                        continue
+                elif marker[0] == fence[0] and marker[1] >= fence[1]:
+                    # A closer must match the char AND be at least as long, and it
+                    # carries no info string.
+                    if not stripped[marker[1]:].strip():
+                        fence = None
+                        continue
+                # Otherwise it is just content inside the open fence.
+            if fence is not None:
                 continue
 
             # Detect ATX heading: leading '#'s (1-6) followed by whitespace.

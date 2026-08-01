@@ -152,6 +152,41 @@ def test_non_string_or_empty_id_is_treated_as_absent():
         assert conn.lines[0]["type"] == "items", f"id={bad_id!r} must not correlate"
 
 
+def test_fences_are_matched_by_marker_not_toggled():
+    """The tracker was a bare boolean flipped by ANY ``` or ~~~ line. CommonMark
+    requires the closer to use the SAME character and be at least as long, so an inner
+    ~~~ (or a longer ``` run) flipped the state early: every later heading was read as
+    being inside code and DROPPED, and comment lines starting with # inside the block
+    were emitted as HEADINGS. Measured against a reference parser on ordinary release
+    notes: two of four headings lost, plus one invented."""
+    md = (
+        "# Release notes\n\n## Build output\n\n```\n"
+        "$ cargo build\n~~~ not a closer ~~~\n# a comment, not a heading\n```\n\n"
+        "## Known issues\n\n````\n``` inner fence\n````\n\n## Upgrade steps\n"
+    )
+    got = [(h["level"], h["text"]) for h in compute({"markdown": md})["outline"]]
+    assert got == [
+        (1, "Release notes"),
+        (2, "Build output"),
+        (2, "Known issues"),
+        (2, "Upgrade steps"),
+    ], got
+
+
+def test_a_tilde_block_still_closes_on_tildes():
+    md = "# A\n\n~~~\n# not a heading\n~~~\n\n# B\n"
+    got = [h["text"] for h in compute({"markdown": md})["outline"]]
+    assert got == ["A", "B"], got
+
+
+def test_an_unclosed_fence_swallows_the_rest():
+    """CommonMark: an unclosed fence runs to end of document. Headings after it are
+    genuinely inside code."""
+    md = "# A\n\n```\n# not a heading\n\n# also not\n"
+    got = [h["text"] for h in compute({"markdown": md})["outline"]]
+    assert got == ["A"], got
+
+
 if __name__ == "__main__":
     # Script-style runs exercise the framing tests too — they are plain
     # functions the runner below would otherwise never call.
@@ -167,4 +202,7 @@ if __name__ == "__main__":
     test_tool_op_with_id_answers_a_correlated_result()
     test_tool_op_without_id_keeps_the_legacy_items_line()
     test_non_string_or_empty_id_is_treated_as_absent()
+    test_fences_are_matched_by_marker_not_toggled()
+    test_a_tilde_block_still_closes_on_tildes()
+    test_an_unclosed_fence_swallows_the_rest()
     print("all tests passed")
