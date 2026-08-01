@@ -929,19 +929,57 @@ else
         ui_ok "Project tree placed at $DARWIN_HOME"
     fi
 
-    # --- config/darwin.toml: place it once, then never clobber it ----------------
+    # --- config/darwin.toml: update what we own, never clobber what they changed ---
+    #
+    # This file is BOTH shipped-from-source and runtime-written (connector_add appends
+    # [[mcp.servers]]; the HUD Settings panel writes keys; operators hand-edit it), so a
+    # plain copy destroys their data on every redeploy. But "never overwrite" is just as
+    # wrong in the other direction: a config the operator has NEVER touched then freezes
+    # at whatever shipped the day they installed, and a later fix to a shipped default
+    # can never reach them. That happened immediately — [interpret].live shipped true and
+    # swallowed every spoken utterance, and the corrected default would have sat in the
+    # repo forever while the deployed machine stayed mute.
+    #
+    # So we record what we last installed, in config/.darwin.toml.shipped, and use it to
+    # tell the two cases apart:
+    #
+    #   deployed == marker  -> they never customised it; update it and refresh the marker
+    #   deployed != marker  -> theirs; KEEP it, and drop the new one alongside to diff
+    #
+    # This is the standard conffile rule. The marker is dot-prefixed so it is obviously
+    # ours and never mistaken for a config to edit.
     if [ "$SRC_ROOT" != "$DARWIN_HOME" ]; then
-        if [ ! -f "$DARWIN_HOME/config/darwin.toml" ]; then
-            mkdir -p "$DARWIN_HOME/config"
-            cp "$SRC_ROOT/config/darwin.toml" "$DARWIN_HOME/config/darwin.toml"
+        _cfg="$DARWIN_HOME/config/darwin.toml"
+        _marker="$DARWIN_HOME/config/.darwin.toml.shipped"
+        mkdir -p "$DARWIN_HOME/config"
+        if [ ! -f "$_cfg" ]; then
+            cp "$SRC_ROOT/config/darwin.toml" "$_cfg"
+            cp "$SRC_ROOT/config/darwin.toml" "$_marker"
             ui_ok "config/darwin.toml installed (first install)"
-        elif cmp -s "$SRC_ROOT/config/darwin.toml" "$DARWIN_HOME/config/darwin.toml"; then
-            ui_ok "config/darwin.toml matches shipped — kept"
+        elif cmp -s "$SRC_ROOT/config/darwin.toml" "$_cfg"; then
+            cp "$SRC_ROOT/config/darwin.toml" "$_marker"
+            ui_ok "config/darwin.toml already current — kept"
+        elif [ -f "$_marker" ] && cmp -s "$_marker" "$_cfg"; then
+            # Untouched since we installed it: ours to update.
+            cp "$SRC_ROOT/config/darwin.toml" "$_cfg"
+            cp "$SRC_ROOT/config/darwin.toml" "$_marker"
+            ui_ok "config/darwin.toml updated (it matched what we shipped; no local edits)"
+        elif [ ! -f "$_marker" ]; then
+            # An install predating the marker. We cannot prove it is unmodified, so the
+            # SAFE choice is theirs — but say so loudly, because a shipped default may
+            # have changed underneath them.
+            cp "$SRC_ROOT/config/darwin.toml" "$_cfg.shipped"
+            cp "$_cfg" "$_marker"
+            ui_ok "config/darwin.toml KEPT (no marker from a previous install; assuming yours)"
+            ui_note " the new shipped config is at config/darwin.toml.shipped — DIFF IT:"
+            ui_note "   diff \"$_cfg\" \"$_cfg.shipped\""
+            ui_note " a shipped DEFAULT may have changed; every key falls back to a built-in"
+            ui_note " default, so an older config still boots, but it will keep your old values."
         else
-            cp "$SRC_ROOT/config/darwin.toml" "$DARWIN_HOME/config/darwin.toml.shipped"
+            cp "$SRC_ROOT/config/darwin.toml" "$_cfg.shipped"
             ui_ok "config/darwin.toml KEPT — yours (connectors + HUD settings live in it)"
             ui_note " shipped copy written alongside it; diff for keys added since:"
-            ui_note "   diff \"$DARWIN_HOME/config/darwin.toml\" \"$DARWIN_HOME/config/darwin.toml.shipped\""
+            ui_note "   diff \"$_cfg\" \"$_cfg.shipped\""
             ui_note " every key falls back to a built-in default, so an older config still boots."
         fi
     fi

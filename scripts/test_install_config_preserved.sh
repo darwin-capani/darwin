@@ -62,19 +62,36 @@ else
 fi
 
 # --- drive the copy + reconcile, exactly as install.sh does -------------------
+# The conffile rule EXTRACTED from install.sh, not re-typed.
+#
+# An earlier version of this file copied the logic, so mutating install.sh left every
+# assertion passing — the test proved only that the copy was self-consistent. Same trap
+# as the exclude list above. The block is lifted verbatim between two anchors that are
+# unique to it, and eval'd into a function.
+CONFFILE_BODY="$(awk '
+    /_cfg="\$DARWIN_HOME\/config\/darwin.toml"/ { on = 1 }
+    on { print }
+    on && /every key falls back to a built-in default, so an older config still boots\./ { print "        fi"; exit }
+' "$ROOT/install.sh")"
+if ! printf '%s' "$CONFFILE_BODY" | grep -q '_marker'; then
+    echo "  FAIL  could not extract the conffile rule from install.sh"
+    exit 1
+fi
+
+eval "reconcile_inner() {
+    local SRC_ROOT=\"\$1\" DARWIN_HOME=\"\$2\"
+    local _cfg _marker
+    ui_ok() { :; }
+    ui_note() { :; }
+$CONFFILE_BODY
+}"
+
 reconcile() {  # $1 = SRC_ROOT, $2 = DARWIN_HOME
     local SRC_ROOT="$1" DARWIN_HOME="$2"
     rsync -a "${RSYNC_EXCLUDES[@]}" "$SRC_ROOT/" "$DARWIN_HOME/"
-    if [ "$SRC_ROOT" != "$DARWIN_HOME" ]; then
-        if [ ! -f "$DARWIN_HOME/config/darwin.toml" ]; then
-            mkdir -p "$DARWIN_HOME/config"
-            cp "$SRC_ROOT/config/darwin.toml" "$DARWIN_HOME/config/darwin.toml"
-        elif cmp -s "$SRC_ROOT/config/darwin.toml" "$DARWIN_HOME/config/darwin.toml"; then
-            :
-        else
-            cp "$SRC_ROOT/config/darwin.toml" "$DARWIN_HOME/config/darwin.toml.shipped"
-        fi
-    fi
+    [ "$SRC_ROOT" = "$DARWIN_HOME" ] && return 0
+    mkdir -p "$DARWIN_HOME/config"
+    reconcile_inner "$SRC_ROOT" "$DARWIN_HOME"
 }
 
 SRC="$TMP/src"; HOME_="$TMP/home"
@@ -237,6 +254,51 @@ for pkg in "$ROOT"/apps/*/Package.swift; do
     name="$(basename "$(dirname "$pkg")")"
     ok "  covered: apps/$name"
 done
+
+
+# --- an UNTOUCHED config must receive a corrected shipped default -------------
+# "Never overwrite" is as wrong as "always overwrite": a config the operator never
+# edited would freeze at whatever shipped the day they installed, so a fix to a shipped
+# default could never reach them. That is not hypothetical — [interpret].live shipped
+# true and swallowed every spoken utterance.
+SRC2="$TMP/src2"; H2="$TMP/home2"
+mkdir -p "$SRC2/config"
+printf '[interpret]\nlive = true\n' > "$SRC2/config/darwin.toml"
+mkdir -p "$H2"
+reconcile "$SRC2" "$H2"           # first install
+printf '[interpret]\nlive = false\n' > "$SRC2/config/darwin.toml"
+reconcile "$SRC2" "$H2"           # redeploy with a corrected default
+if grep -q 'live = false' "$H2/config/darwin.toml"; then
+    ok "an untouched config receives a corrected shipped default"
+else
+    fail "an untouched config froze at the old default; a shipped fix can never land"
+fi
+
+# ...and a CUSTOMISED one still wins.
+printf '[interpret]\nlive = false\n\n[[mcp.servers]]\nname = "mine"\n' > "$H2/config/darwin.toml"
+printf '[interpret]\nlive = true\nnewkey = 1\n' > "$SRC2/config/darwin.toml"
+reconcile "$SRC2" "$H2"
+if grep -q 'mine' "$H2/config/darwin.toml" && grep -q 'live = false' "$H2/config/darwin.toml"; then
+    ok "a customised config is still kept, edits and all"
+else
+    fail "a customised config was overwritten"
+fi
+if [ -f "$H2/config/darwin.toml.shipped" ]; then
+    ok "the new shipped config is left alongside a customised one"
+else
+    fail "no .shipped copy beside a customised config"
+fi
+
+# An install predating the marker is treated as theirs (safe) and says so.
+H3="$TMP/home3"; mkdir -p "$H3/config"
+printf '[interpret]\nlive = true\n' > "$H3/config/darwin.toml"
+printf '[interpret]\nlive = false\n' > "$SRC2/config/darwin.toml"
+reconcile "$SRC2" "$H3"
+if grep -q 'live = true' "$H3/config/darwin.toml" && [ -f "$H3/config/.darwin.toml.shipped" ]; then
+    ok "a pre-marker install is kept and a marker is seeded for next time"
+else
+    fail "a pre-marker install was overwritten, or no marker was seeded"
+fi
 
 echo
 if [ "$fails" -eq 0 ]; then
