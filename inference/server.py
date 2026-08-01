@@ -2880,6 +2880,16 @@ def _split_complete_sentences(buffer, final=False):
             and buffer[i + 1].isalpha()
         ):
             continue
+        # ...and the SAME hold-back the decimal branch has, for the same reason. The
+        # test above needs `i + 1 < n`, so it can only fire when the next character has
+        # already arrived. When the '.' is the LAST character decoded so far, the rule
+        # cannot fire at all and the boundary is taken immediately — so a dotted
+        # identifier that happens to straddle a chunk boundary is split anyway, and
+        # `_speakable` then says "user dot work" as two sentences with the "dot"
+        # stranded. Whether this '.' ends a sentence is genuinely undecidable until the
+        # next chunk arrives, which is exactly the decimal case's situation.
+        if c == "." and i + 1 == n and not final and buffer[i - 1].isalnum():
+            continue
         sentence = buffer[start : i + 1].strip()
         if sentence:
             sentences.append(sentence)
@@ -6822,14 +6832,40 @@ def habit_supported(key, value, transcripts):
     habit_words = _content_words(f"{slug} {value}")
     if not habit_words:
         return False
-    required = 2 if len(habit_words) >= 3 else 1
+
+    # COUNT DISTINCT CONCEPTS, NOT DISTINCT SPELLINGS.
+    #
+    # `matched` used to collect habit WORDS, so a habit text containing both
+    # "morning" and "mornings" — which _habit_words_match treats as the SAME concept —
+    # let a single user word satisfy the "two distinct content words" bar on its own.
+    # Measured: the habit "checks system status most mornings" has habit_words
+    # {check, morning, mornings, status, system}, required = 2, and the user line
+    # "good morning" matched {morning, mornings} = 2 and counted as evidence. Three
+    # such lines admitted a habit the user never demonstrated — through the very
+    # backstop that exists because the 4B model launders the ASSISTANT's claims into
+    # habits.
+    #
+    # Folding the words into stem GROUPS first (using the same relation the matcher
+    # uses) makes both the threshold and the tally speak in concepts. It also makes
+    # `required` honest: a habit whose 3+ words are morphological variants of two ideas
+    # is a 2-concept habit, and demanding 2 distinct concepts from it is right.
+    stems = []
+    for hw in habit_words:
+        for group in stems:
+            if _habit_words_match(group[0], hw):
+                group.append(hw)
+                break
+        else:
+            stems.append([hw])
+
+    required = 2 if len(stems) >= 3 else 1
     hits = 0
     for turn in transcripts or []:
         user_words = _content_words(str(turn.get("user") or ""))
         matched = {
-            hw
-            for hw in habit_words
-            if any(_habit_words_match(uw, hw) for uw in user_words)
+            idx
+            for idx, group in enumerate(stems)
+            if any(_habit_words_match(uw, hw) for hw in group for uw in user_words)
         }
         if len(matched) >= required:
             hits += 1
