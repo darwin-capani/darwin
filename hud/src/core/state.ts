@@ -192,9 +192,11 @@ import {
   parsePostureSnapshot,
   mergeIntrospectAlert,
   appManifestIssueLine,
+  configIssueLines,
   parseAppRegistry,
   type AppRegistryEntry,
   APP_MANIFEST_ISSUE_CAP,
+  CONFIG_ISSUE_CAP,
   parseAttributionHealth,
   parseMcpStatus,
   parseWebhookEvent,
@@ -1209,6 +1211,13 @@ export interface HudState {
    *  newest-first, capped. Rendered on the App Deck so a broken manifest is a
    *  visible install error instead of an app that silently never appears. */
   appManifestIssues: string[];
+  /** Unknown/malformed keys darwind found in darwin.toml / agents.toml at startup.
+   *  A typo'd key is silently IGNORED by the parser, so a mistyped safety key reads
+   *  as set and is not in effect — the daemon detects exactly this and emits it. */
+  configIssues: string[];
+  /** The last consolidation attempt FAILED and no newer one has succeeded. reflect.rs
+   *  writes no stamp on failure, so the clock can stay stuck indefinitely. */
+  consolidationStale: boolean;
   /** The LIVE app catalog (app.registry): the apps the daemon actually
    *  discovered, with their manifest description + exposed tool. Empty until the
    *  first frame — the App Deck falls back to its curated list until then. */
@@ -1608,6 +1617,8 @@ export function initialState(): HudState {
     runningApps: new Set<string>(),
     appFeeds: {},
     appManifestIssues: [],
+    configIssues: [],
+    consolidationStale: false,
     appRegistry: [],
     visionDescribe: null,
     audioSoundMonitor: null,
@@ -1815,6 +1826,21 @@ export function reduce(state: HudState, action: HudAction): HudState {
           },
           vitals: null,
           processes: null,
+          // The SAME phantom-live class, and the one that matters most: the amber
+          // "WATCHING SCREEN" indicator is the privacy-facing surface of this whole
+          // system. Only screen_context.watching frames ever clear it, so a dead
+          // daemon left it pulsing — telling the operator their screen is being
+          // captured RIGHT NOW by a process that is not running.
+          //
+          // Only the LIVE half is reset. `enabled`/`cap`/`intervalSecs` come from the
+          // startup config snapshot, not from a live sample, and blanking them would
+          // misreport the machine's configuration instead of its state.
+          screenContext: {
+            ...state.screenContext,
+            watching: false,
+            held: 0,
+            ingested: false,
+          },
         },
         "offline",
         action.at,
@@ -2140,7 +2166,30 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
     case "memory.consolidated": {
       const upserts = num(env.data, "upserts") ?? 0;
       const deletes = num(env.data, "deletes") ?? 0;
-      return pushToast(s, "memory", `MEMORY CONSOLIDATED: ${upserts} upserts, ${deletes} deletes`, at);
+      return pushToast(
+        { ...s, consolidationStale: false },
+        "memory",
+        `MEMORY CONSOLIDATED: ${upserts} upserts, ${deletes} deletes`,
+        at,
+      );
+    }
+
+    case "memory.consolidation_failed": {
+      // reflect.rs emits this on failure and deliberately writes NO stamp, so the
+      // next 6h check retries while the 20h staleness still holds — its comment says
+      // "the telemetry event surfaces a stuck reflection clock on the HUD diagnostics
+      // instead". The HUD had no case for it, so success raised a toast and total
+      // failure was a silent no-op: the profile quietly stopped being updated and the
+      // surface that was supposed to say so said nothing.
+      const reason = str(env.data, "error") ?? str(env.data, "reason") ?? "";
+      return pushToast(
+        { ...s, consolidationStale: true },
+        "memory",
+        reason.length > 0
+          ? `MEMORY CONSOLIDATION FAILED: ${reason.slice(0, 120)}`
+          : "MEMORY CONSOLIDATION FAILED — the profile may be stale",
+        at,
+      );
     }
 
     case "episodic.recorded": {
@@ -3952,6 +4001,25 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
     case "app.auth_failed":
       // Surfaced via telemetry/console only; not panel-state-bearing.
       return s;
+
+    case "config.invalid":
+    case "agents.invalid": {
+      // The daemon emits these ONCE at startup and RETAINS them for replay, precisely
+      // so a HUD connecting later still learns about them. Without a case here they
+      // hit applyEnvelope's default and were dropped: a typo'd key in darwin.toml —
+      // including a safety key the operator believes is set — was invisible on the
+      // appliance's only live surface. Bounded + deduped, same as appManifestIssues.
+      const lines = configIssueLines(env.data);
+      if (lines.length === 0) return s;
+      const merged = [...lines, ...s.configIssues]
+        .filter((x, i, a) => a.indexOf(x) === i)
+        .slice(0, CONFIG_ISSUE_CAP);
+      if (merged.length === s.configIssues.length
+          && merged.every((x, i) => x === s.configIssues[i])) {
+        return s;   // no churn on a replayed frame
+      }
+      return { ...s, configIssues: merged };
+    }
 
     // Known but not state-bearing for the HUD.
     case "opener.played":
