@@ -220,6 +220,15 @@ pub async fn route(
                 let agent = agent_for_namespace(agents, &namespace);
                 emit_agent_active(agent);
                 telemetry::emit("system", "confirm.denied", json!({"tool": tool}));
+                // A DENIAL IS A DECISION, and the audit log recorded only the park.
+                // "The operator was asked and said no" is exactly the kind of fact a
+                // hash-chained record exists to hold — and its absence is worse than
+                // an absent execution record, because a reader cannot distinguish a
+                // refused action from one that was never answered at all.
+                crate::audit::record_global(
+                    &namespace, &tool, &tool,
+                    crate::policy::Decision::Ask, crate::audit::Outcome::Denied,
+                ).await;
                 return Ok(RouteOutcome {
                     routed_to: "local",
                     response: ack,
@@ -2290,7 +2299,30 @@ fn is_uncertain_fallback(class: &Classification, cfg: &Config) -> bool {
 /// model (Opus) for deep reasoning, else the fast model (Haiku). Extracted so
 /// "heavy -> opus" stays verified without a live call.
 fn cloud_model(needs_deep_reasoning: bool, cfg: &Config) -> &str {
-    if needs_deep_reasoning {
+    cloud_model_under_budget(needs_deep_reasoning, cfg, crate::obol::current_budget_pressure(cfg))
+}
+
+/// THE DOLLAR CAP APPLIES TO ACTIONS TOO, not only to chat.
+///
+/// `obol::current_budget_pressure` had exactly two call sites: conversation_brain (the
+/// CHAT path) and PRECOG (read-only). The ACTUATING cloud path — the heavy/action turns
+/// that call tools and cost the most — picked its model straight from [cloud] with no
+/// reference to the budget at all. So an operator who set `[obol].daily_usd_cap` had it
+/// enforced on conversation and ignored on the very turns that spend hardest, while
+/// PRECOG told them the cap was in force.
+///
+/// Pressure is REDUCE-ONLY, exactly as it is for chat: Ease steps a Heavy turn down to
+/// the fast model, Floor pins to the fast model (the actuating path needs a cloud model
+/// to drive tools at all — it cannot drop to on-device the way a conversation can, so
+/// Floor buys the cheapest cloud brain rather than pretending to route local). Under
+/// the shipped no-cap default this is Pressure::None and the choice is unchanged.
+fn cloud_model_under_budget(
+    needs_deep_reasoning: bool,
+    cfg: &Config,
+    pressure: crate::obol::Pressure,
+) -> &str {
+    let heavy = needs_deep_reasoning && matches!(pressure, crate::obol::Pressure::None);
+    if heavy {
         &cfg.cloud.heavy_model
     } else {
         &cfg.cloud.fast_model
@@ -10099,4 +10131,70 @@ mod describe_capture_tests {
         );
     }
 }
+}
+#[cfg(test)]
+mod budget_and_audit_tests {
+    use super::*;
+    use crate::obol::Pressure;
+
+    /// The dollar cap applied to CHAT and not to ACTIONS — the turns that spend most.
+    #[test]
+    fn the_actuating_path_steps_down_under_budget_pressure() {
+        let cfg = Config::default();
+        // No cap configured (the shipped default): unchanged routing.
+        assert_eq!(
+            cloud_model_under_budget(true, &cfg, Pressure::None),
+            cfg.cloud.heavy_model,
+            "with no cap the heavy turn must still buy the heavy model"
+        );
+        // Ease: a heavy turn steps down.
+        assert_eq!(
+            cloud_model_under_budget(true, &cfg, Pressure::Ease),
+            cfg.cloud.fast_model,
+            "at the ease shoulder a heavy ACTION turn must step down, as chat does"
+        );
+        // Floor: pinned to the cheapest cloud brain.
+        assert_eq!(
+            cloud_model_under_budget(true, &cfg, Pressure::Floor),
+            cfg.cloud.fast_model,
+            "over the cap a heavy ACTION turn must not still buy the heavy model"
+        );
+    }
+
+    #[test]
+    fn a_light_turn_is_unaffected_by_pressure() {
+        let cfg = Config::default();
+        for p in [Pressure::None, Pressure::Ease, Pressure::Floor] {
+            assert_eq!(cloud_model_under_budget(false, &cfg, p), cfg.cloud.fast_model);
+        }
+    }
+
+    /// Pressure is REDUCE-ONLY: it may never pick a more expensive model.
+    #[test]
+    fn pressure_never_upgrades_the_model() {
+        let cfg = Config::default();
+        let none = cloud_model_under_budget(true, &cfg, Pressure::None);
+        for p in [Pressure::Ease, Pressure::Floor] {
+            let under = cloud_model_under_budget(true, &cfg, p);
+            assert!(
+                under == cfg.cloud.fast_model || under == none,
+                "budget pressure selected a model that is not a step down"
+            );
+        }
+    }
+
+    /// A DENIAL is a decision and must be recorded. The audit log stopped at "parked",
+    /// so a reader could not tell a refused action from one never answered.
+    #[test]
+    fn the_cancel_path_records_a_denial() {
+        let src = include_str!("router.rs");
+        let i = src
+            .find("Resolution::Cancelled(ack) =>")
+            .expect("the cancel arm moved; re-point this guard");
+        let arm = &src[i..(i + 900).min(src.len())];
+        assert!(
+            arm.contains("audit::Outcome::Denied"),
+            "a denied consequential action leaves no audit entry"
+        );
+    }
 }

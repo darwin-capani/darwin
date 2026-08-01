@@ -7824,6 +7824,29 @@ pub async fn replay_confirmed_action(
         executed,
         "confirm",
     );
+    // THE AUDIT LOG MUST NOT STOP AT "parked".
+    //
+    // On the shipped consequential lifecycle — master ON, tool parks, human says
+    // "yes", this replay fires the real side effect — audit.db held exactly ONE row:
+    // outcome=parked. The hash-chained record an operator reads to answer "what did it
+    // actually DO" recorded only that something was once proposed. Outcome::Confirmed
+    // and Outcome::Executed already existed and were simply never written.
+    //
+    // Both are recorded: Confirmed says the human authorised it, Executed says the
+    // side effect really ran — and they are DIFFERENT facts, because a master-off or
+    // lockdown-raced replay is confirmed-but-not-executed. `executed` above is already
+    // the honest verdict for exactly that distinction, so it is reused rather than
+    // re-derived.
+    crate::audit::record_global(
+        &pending.agent, &pending.tool, &pending.preview,
+        crate::policy::Decision::Ask, crate::audit::Outcome::Confirmed,
+    ).await;
+    if executed {
+        crate::audit::record_global(
+            &pending.agent, &pending.tool, &pending.preview,
+            crate::policy::Decision::Ask, crate::audit::Outcome::Executed,
+        ).await;
+    }
     (outcome, is_error)
 }
 
@@ -21826,5 +21849,42 @@ mod tests {
         assert!(defaults.cross_check, "#21 ships ON (full-power default; downgrades/flags only)");
         assert!(defaults.cross_check_model_pass, "#21 model pass ships ON (full-power default)");
         assert!(defaults.debate, "#22 ships ON (full-power default; high-stakes-only, <=2 calls)");
+    }
+}
+#[cfg(test)]
+mod audit_lifecycle_tests {
+    /// audit.db recorded ONLY "parked" on the shipped consequential lifecycle: master
+    /// ON -> the tool parks -> the human says "yes" -> replay_confirmed_action fires the
+    /// real side effect. The execution itself was never written. Outcome::Confirmed and
+    /// Outcome::Executed already existed in audit.rs and were simply never used, so the
+    /// hash-chained record an operator reads to answer "what did it actually DO" held
+    /// only the fact that something was once proposed.
+    #[test]
+    fn the_replay_path_records_confirmed_and_executed() {
+        let src = include_str!("anthropic.rs");
+        let i = src
+            .find("pub async fn replay_confirmed_action")
+            .expect("replay_confirmed_action moved; re-point this guard");
+        let body = &src[i..];
+        let end = body.find("\n}\n").map(|e| e + 2).unwrap_or(body.len());
+        let f = &body[..end];
+        assert!(
+            f.contains("audit::Outcome::Confirmed"),
+            "the human's authorisation is not recorded in the audit log"
+        );
+        assert!(
+            f.contains("audit::Outcome::Executed"),
+            "the side effect actually running is not recorded in the audit log"
+        );
+        // Executed must be conditional on the honest `executed` verdict, not
+        // unconditional: a master-off or lockdown-raced replay is confirmed but NOT
+        // executed, and recording it as executed would be a false record.
+        let exec = f.find("audit::Outcome::Executed").unwrap();
+        let guard = &f[..exec];
+        assert!(
+            guard.contains("if executed {"),
+            "Executed is recorded unconditionally — a confirmed-but-not-executed replay \
+             would be logged as having run"
+        );
     }
 }
