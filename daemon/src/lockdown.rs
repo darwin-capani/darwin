@@ -605,7 +605,7 @@ mod tests {
         let _g = test_guard();
         let _dir = with_temp_marker("drop-pending");
         confirm::clear();
-        confirm::park(PendingConfirmation {
+        confirm::park_ctx(true, PendingConfirmation {
             agent: "agent.pepper".into(),
             tool: "gmail_send".into(),
             input: serde_json::json!({"to": "a@b.com"}),

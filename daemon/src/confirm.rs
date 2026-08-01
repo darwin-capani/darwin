@@ -264,29 +264,49 @@ pub fn is_consequential_tool(name: &str) -> bool {
 /// the action's own bytes, so every parked action carries a correct id whatever
 /// the caller put in the field — the command channel's `confirm {id}` / `deny
 /// {id}` address the slot by exactly this id.
-pub fn park(mut pending: PendingConfirmation) -> String {
+/// `reaches_user` says whether THIS park's prompt is actually spoken to the operator
+/// this turn. Only such a park may arm PROMPTED.
+///
+/// THE GUARD USED TO BE A TAUTOLOGY. The comment below claimed a background parker
+/// "can never be fired by that yes" — but park_ctx(true, ) armed PROMPTED unconditionally, so
+/// every later parker simply re-pointed it at its own id and take_live's `p.id == id`
+/// compared the slot against itself. The only code that modelled a background park was
+/// a `#[cfg(test)]` function, so the guard was exercised solely through a test-only
+/// entry point while production had the hole wide open: the user is prompted for
+/// action ALPHA, a standing tick or overnight agent parks BETA (unattended runs are
+/// deliberately downgraded Always->Ask, so they DO park), and the user's "confirm"
+/// fires BETA — different agent, different arguments, never shown to them.
+/// `reaches_user` is `context_trusted` at the tool paths: true across a live
+/// interactive turn, false for a standing tick / tripwire / durable-mission resume /
+/// inbound webhook / injected-content sub-task. It is exactly "did a human hear this".
+///
+/// It is the FIRST parameter, and there is no one-argument form, so a new call site
+/// cannot park without answering the question.
+pub fn park_ctx(reaches_user: bool, pending: PendingConfirmation) -> String {
+    park_inner(pending, reaches_user)
+}
+
+fn park_inner(mut pending: PendingConfirmation, reaches_user: bool) -> String {
     pending.id = derive_pending_id(&pending.agent, &pending.tool, &pending.input);
     let prompt = confirmation_prompt(&pending.preview);
     // Remember WHICH action this prompt describes. The spoken "yes" is matched
     // against this id (see `take_live`), so a LATER parker — a standing order,
     // an overnight agent, any background turn — that overwrites the slot after
-    // the user was prompted can never be fired by that "yes". Before this, the
-    // single global slot was taken unconditionally and the user could confirm
-    // an action they were never shown (sweep HIGH).
-    *prompted_lock() = Some(pending.id.clone());
+    // the user was prompted can never be fired by that "yes".
+    if reaches_user {
+        *prompted_lock() = Some(pending.id.clone());
+    }
     *lock() = Some(pending);
     prompt
 }
 
 
 /// TEST-ONLY: park an action WITHOUT recording it as the prompted one — models a
-/// background turn whose prompt never reached the user.
+/// background turn whose prompt never reached the user. Production reaches the same
+/// state via `park_ctx(true, pending, false)`.
 #[cfg(test)]
-pub fn park_background_for_test(mut pending: PendingConfirmation) -> String {
-    pending.id = derive_pending_id(&pending.agent, &pending.tool, &pending.input);
-    let prompt = confirmation_prompt(&pending.preview);
-    *lock() = Some(pending);
-    prompt
+pub fn park_background_for_test(pending: PendingConfirmation) -> String {
+    park_inner(pending, false)
 }
 
 /// Build the spoken confirmation prompt from a faithful dry-run preview. The
@@ -682,7 +702,7 @@ mod tests {
 
     /// REGRESSION (sweep HIGH): the spoken "yes" must answer the question the
     /// user was ACTUALLY asked. `PENDING` is a single process-global slot and
-    /// `park()` overwrites it unconditionally, so a background parker (a
+    /// `park_ctx(true, )` overwrites it unconditionally, so a background parker (a
     /// standing order, an overnight agent, any concurrent turn) landing between
     /// the prompt and the reply used to make the user's "yes" fire an action
     /// they were never shown.
@@ -695,7 +715,7 @@ mod tests {
         let _g = store_guard();
         clear();
         // 1. The user is prompted about action A.
-        let _prompt = park(sample("gmail_send"));
+        let _prompt = park_ctx(true, sample("gmail_send"));
         // 2. A BACKGROUND turn parks a DIFFERENT action B, clobbering the slot
         //    without the user ever being prompted about it.
         let mut b = sample("x_post");
@@ -721,7 +741,7 @@ mod tests {
         // Slot-touching -> serialize on PENDING_TEST_LOCK (see above).
         let _g = store_guard();
         clear();
-        let _prompt = park(sample("gmail_send"));
+        let _prompt = park_ctx(true, sample("gmail_send"));
         let taken = take_live(Instant::now()).expect("the prompted action confirms");
         assert_eq!(taken.tool, "gmail_send");
         clear();
@@ -872,8 +892,8 @@ mod tests {
             allowed: vec!["gmail_send".into()],
             preview: "Would send an email to a@b.com".into(),
             created_at: Instant::now(),
-            // park() (re)derives this; the field is set so direct-store tests
-            // that bypass park() still have a well-formed id.
+            // park_ctx(true, ) (re)derives this; the field is set so direct-store tests
+            // that bypass park_ctx(true, ) still have a well-formed id.
             id: String::new(),
             // No structured plan on this generic sample (text-preview path).
             plan: None,
@@ -885,7 +905,7 @@ mod tests {
     #[test]
     fn park_then_take_live_round_trips_and_clears() {
         let _g = store_guard();
-        let prompt = park(sample("gmail_send"));
+        let prompt = park_ctx(true, sample("gmail_send"));
         assert!(prompt.contains("confirm"), "prompt invites a yes: {prompt}");
         assert!(prompt.contains("cancel"), "prompt invites a no: {prompt}");
         let now = Instant::now();
@@ -900,8 +920,8 @@ mod tests {
     #[test]
     fn single_slot_replacement() {
         let _g = store_guard();
-        let _ = park(sample("gmail_send"));
-        let _ = park(sample("slack_post_message"));
+        let _ = park_ctx(true, sample("gmail_send"));
+        let _ = park_ctx(true, sample("slack_post_message"));
         let taken = take_live(Instant::now()).expect("a live pending");
         assert_eq!(taken.tool, "slack_post_message", "newest proposal wins");
         clear();
@@ -915,7 +935,7 @@ mod tests {
         let mut p = sample("gmail_send");
         let base = Instant::now();
         p.created_at = base;
-        let _ = park(p);
+        let _ = park_ctx(true, p);
         let future = base + PENDING_TTL + Duration::from_secs(1);
         assert!(!is_live(future), "aged pending is not live");
         // is_live cleared it; a take at the same instant finds nothing.
@@ -932,7 +952,7 @@ mod tests {
         let _g = store_guard();
         let s = sample("gmail_send");
         let want = derive_pending_id(&s.agent, &s.tool, &s.input);
-        let _ = park(s);
+        let _ = park_ctx(true, s);
         let view = peek_pending(Instant::now()).expect("a live pending");
         assert_eq!(view.id, want, "peek surfaces the stable content id");
         assert_eq!(view.tool, "gmail_send");
@@ -947,7 +967,7 @@ mod tests {
     #[test]
     fn confirm_by_id_takes_only_the_named_action() {
         let _g = store_guard();
-        let _ = park(sample("gmail_send"));
+        let _ = park_ctx(true, sample("gmail_send"));
         let id = peek_pending(Instant::now()).unwrap().id;
         let now = Instant::now();
 
@@ -977,7 +997,7 @@ mod tests {
         let mut p = sample("gmail_send");
         let base = Instant::now();
         p.created_at = base;
-        let _ = park(p);
+        let _ = park_ctx(true, p);
         let id = peek_pending(base).unwrap().id;
         let future = base + PENDING_TTL + Duration::from_secs(1);
         assert!(matches!(confirm_by_id(&id, future), ByIdConfirm::NoMatch), "expired id never fires");
@@ -989,7 +1009,7 @@ mod tests {
     #[test]
     fn deny_by_id_clears_only_the_named_action() {
         let _g = store_guard();
-        let _ = park(sample("gmail_send"));
+        let _ = park_ctx(true, sample("gmail_send"));
         let id = peek_pending(Instant::now()).unwrap().id;
         let now = Instant::now();
         assert!(!deny_by_id("00000000ffffffff", now), "wrong id is a no-op");
@@ -1011,7 +1031,7 @@ mod tests {
         let id_b = derive_pending_id(&b.agent, &b.tool, &b.input);
         assert_ne!(id_a, id_b, "different actions hash to different ids");
         // Park b; confirming with a's id is a no-op.
-        let _ = park(b);
+        let _ = park_ctx(true, b);
         assert!(matches!(confirm_by_id(&id_a, Instant::now()), ByIdConfirm::NoMatch));
         assert!(peek_pending(Instant::now()).is_some(), "b stays parked");
         clear();
@@ -1024,7 +1044,7 @@ mod tests {
         let mut p = sample("x_post");
         let base = Instant::now();
         p.created_at = base;
-        let _ = park(p);
+        let _ = park_ctx(true, p);
         let soon = base + Duration::from_secs(5);
         assert!(is_live(soon), "fresh pending is live");
         assert!(take_live(soon).is_some());
@@ -1035,7 +1055,7 @@ mod tests {
     #[test]
     fn clear_empties_the_slot() {
         let _g = store_guard();
-        let _ = park(sample("dume_control"));
+        let _ = park_ctx(true, sample("dume_control"));
         clear();
         assert!(take_live(Instant::now()).is_none(), "clear drops the pending");
     }
@@ -1122,14 +1142,14 @@ mod tests {
 
     #[test]
     fn parked_confirmation_prompt_omits_enablement_hint() {
-        // End-to-end: park() runs the real preview through confirmation_prompt,
+        // End-to-end: park_ctx(true, ) runs the real preview through confirmation_prompt,
         // and the returned spoken prompt must be free of the OFF-mode hint.
         let _g = store_guard();
         let mut pending = sample("gmail_send");
         pending.preview = "[dry run] Would send an email to a@b.com with subject \"Hi\". \
                            Enable consequential actions and confirm to send."
             .into();
-        let prompt = park(pending);
+        let prompt = park_ctx(true, pending);
         assert!(
             !prompt.contains("Enable consequential actions"),
             "parked prompt must not embed the enablement hint: {prompt}"
@@ -1188,7 +1208,7 @@ mod tests {
             id: String::new(),
             plan: None,
         };
-        let _ = park(parked);
+        let _ = park_ctx(true, parked);
 
         // New turn: the human says yes. Router takes the live pending and
         // resolves the reply.
@@ -1212,7 +1232,7 @@ mod tests {
     #[test]
     fn deny_cancels_and_executes_nothing() {
         let _g = store_guard();
-        let _ = park(sample("slack_post_message"));
+        let _ = park_ctx(true, sample("slack_post_message"));
         let pending = take_live(Instant::now()).expect("a live pending");
         let mock = MockActuator::default();
         match resolve_reply(pending, "no, cancel that", cancel_phrase) {
@@ -1229,7 +1249,7 @@ mod tests {
     #[test]
     fn unrelated_drops_and_passes_through() {
         let _g = store_guard();
-        let _ = park(sample("x_post"));
+        let _ = park_ctx(true, sample("x_post"));
         let pending = take_live(Instant::now()).expect("a live pending");
         let mock = MockActuator::default();
         match resolve_reply(pending, "what's the weather", cancel_phrase) {
@@ -1247,7 +1267,7 @@ mod tests {
     #[test]
     fn qualified_yes_does_not_replay() {
         let _g = store_guard();
-        let _ = park(sample("gmail_send"));
+        let _ = park_ctx(true, sample("gmail_send"));
         let pending = take_live(Instant::now()).expect("a live pending");
         let mock = MockActuator::default();
         match resolve_reply(pending, "yes but change the recipient", cancel_phrase) {
@@ -1255,5 +1275,159 @@ mod tests {
             other => panic!("a qualified yes must not Replay; got {other:?}"),
         }
         assert!(mock.calls().is_empty(), "a qualified yes fires nothing");
+    }
+}
+#[cfg(test)]
+mod hijack_tests {
+    use super::*;
+
+    fn pending(agent: &str, tool: &str, arg: &str) -> PendingConfirmation {
+        PendingConfirmation {
+            agent: agent.to_string(),
+            tool: tool.to_string(),
+            input: serde_json::json!({ "arg": arg }),
+            preview: format!("{tool} with {arg}"),
+            id: String::new(),
+            allowed: Vec::new(),
+            created_at: Instant::now(),
+            plan: None,
+        }
+    }
+
+    /// THE HOLE THE GUARD WAS SUPPOSED TO CLOSE, reached through PRODUCTION code.
+    ///
+    /// park() armed PROMPTED unconditionally, so every later parker re-pointed it at
+    /// its own id and take_live's `p.id == id` compared the slot against itself. The
+    /// only thing that modelled a background park was a #[cfg(test)] helper — so the
+    /// guard was exercised solely through a test-only entry point while production had
+    /// the hole open. This test uses park(.., false), which is what an unattended turn
+    /// now calls.
+    #[test]
+    fn a_background_park_cannot_steal_the_users_confirm() {
+        let _ = take_live(Instant::now());
+        park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
+        // A standing tick / overnight agent / inbound webhook parks its own action.
+        park_ctx(false, pending("scribe", "x_post", "BETA"));
+
+        let taken = take_live(Instant::now());
+        assert!(
+            taken.is_none(),
+            "the spoken confirm fired {:?} — an action the user was never shown",
+            taken.map(|p| p.tool)
+        );
+        // ...and BETA is still parked, waiting for its own confirmation.
+        assert!(lock().is_some(), "the background action was consumed as collateral");
+        let _ = take_live(Instant::now());
+    }
+
+    #[test]
+    fn the_users_own_action_still_confirms() {
+        let _ = take_live(Instant::now());
+        park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
+        let taken = take_live(Instant::now()).expect("the user's own park must confirm");
+        assert_eq!(taken.tool, "gmail_send");
+    }
+
+    /// A user-facing re-park (the plan-drift path) legitimately re-arms PROMPTED.
+    #[test]
+    fn a_user_facing_repark_rearms_the_prompt() {
+        let _ = take_live(Instant::now());
+        park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
+        park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA-REVISED"));
+        let taken = take_live(Instant::now()).expect("the re-prompted action must confirm");
+        assert_eq!(taken.preview, "gmail_send with ALPHA-REVISED");
+    }
+
+    /// park_ctx is what the tool paths call, threading context_trusted.
+    #[test]
+    fn an_unattended_tool_park_does_not_arm_the_prompt() {
+        let _ = take_live(Instant::now());
+        park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
+        park_ctx(false, pending("scribe", "x_post", "BETA"));
+        assert!(
+            take_live(Instant::now()).is_none(),
+            "an unattended park armed the prompt and stole the confirm"
+        );
+        let _ = take_live(Instant::now());
+    }
+
+    /// Parks that CANNOT have reached the user must pass false. Checking only the call
+    /// FORM is not enough — the first version of this guard accepted park_ctx(true, ..)
+    /// from the webhook path, which is precisely the background parker the whole
+    /// mechanism exists to stop.
+    #[test]
+    fn background_only_parkers_declare_that_no_one_was_prompted() {
+        // An inbound webhook fires on its own schedule; nobody was prompted this turn.
+        let src = include_str!("webhooks.rs");
+        let i = src
+            .find("confirm::park_ctx(")
+            .expect("webhooks.rs no longer parks; re-point this guard");
+        let call = &src[i..(i + 40).min(src.len())];
+        assert!(
+            call.contains("park_ctx(false"),
+            "the webhook path claims its prompt reached the user, so it arms PROMPTED \
+             and can steal a confirm the operator spoke for something else: {call}"
+        );
+    }
+
+    /// A PARKED PREVIEW IS A QUESTION, NOT A RESULT — it must never be cached.
+    ///
+    /// tool_loop's per-turn dedup ledger stored any non-error outcome, and a park is
+    /// non-error. So if the model re-requested an identical call later in the same
+    /// turn, AFTER parking a different consequential action in between, the dedup
+    /// branch replayed the stored ALPHA prompt verbatim without re-parking. The model
+    /// asked the user about ALPHA while the armed slot held BETA, and the spoken
+    /// "confirm" fired arguments the user was never read. Same end state as the
+    /// hijack above, reached through the cache instead of the slot.
+    ///
+    /// Checked at the source, because tool_loop needs a live model to drive: the
+    /// insert must be GUARDED, and the guard computed before it.
+    #[test]
+    fn a_parked_preview_never_enters_the_dedup_ledger() {
+        let src = include_str!("anthropic.rs");
+        let insert = src
+            .find("seen.insert(signature, outcome.clone());")
+            .expect("the dedup ledger insert moved; re-point this guard");
+        let parked = src
+            .find("let parked = is_parked_consequential(&name, &block[\"input\"]);")
+            .expect("the parked predicate moved");
+        assert!(
+            parked < insert,
+            "the dedup insert runs before anything knows the call was parked"
+        );
+        // The insert must sit inside an `if !parked` block.
+        let window = &src[parked..insert];
+        assert!(
+            window.contains("if !parked {"),
+            "the dedup ledger caches a parked confirmation prompt; a later identical \
+             call then replays a question about an action that is no longer armed"
+        );
+    }
+
+    /// No production caller may arm PROMPTED unconditionally again.
+    #[test]
+    fn every_park_call_site_states_whether_it_reaches_the_user() {
+        for file in ["anthropic.rs", "command.rs", "lockdown.rs", "main.rs", "webhooks.rs"] {
+            let src = match file {
+                "anthropic.rs" => include_str!("anthropic.rs"),
+                "command.rs" => include_str!("command.rs"),
+                "lockdown.rs" => include_str!("lockdown.rs"),
+                "main.rs" => include_str!("main.rs"),
+                _ => include_str!("webhooks.rs"),
+            };
+            for (i, line) in src.lines().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                assert!(
+                    !t.contains("confirm::park(") || t.contains("park_ctx"),
+                    "{file}:{} calls park() without saying whether the prompt reaches \
+                     the user; an unattended park that arms PROMPTED steals the \
+                     operator's spoken confirm",
+                    i + 1
+                );
+            }
+        }
     }
 }
