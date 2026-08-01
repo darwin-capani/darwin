@@ -39,8 +39,13 @@
 //!      Any patch/validation failure of ALL candidates → state/heal/rejected/<ts>/
 //!   + heal.rejected{ts, stage}.
 //!
-//! SAFETY CONTRACT (non-negotiable): self-heal ships enabled=false /
-//! mode=propose; there is NO path that touches the live daemon/ without an
+//! SAFETY CONTRACT (non-negotiable): self-heal ships enabled=TRUE /
+//! mode=propose. NOTE ON THE POSTURE: this line stated the opposite default for a long
+//! time, on a block labelled SAFETY CONTRACT — the worst place for a stale claim, since
+//! an operator reads exactly this to decide whether autonomy is armed. The master
+//! switch is ON. What is load-bearing, and true, is the rest: mode=propose is the
+//! default, and
+//! there is NO path that touches the live daemon/ without an
 //! explicit human running scripts/apply_heal.sh (except the pre-existing,
 //! documented-dangerous opt-in auto mode); the staged `cargo check` + full
 //! `cargo test` gates are NEVER dropped or weakened. The cloud is reached ONLY
@@ -1446,7 +1451,35 @@ struct CmdOutput {
 /// target/) into the staging dir, apply the diff with patch -p1 --batch
 /// (reject on any hunk failure), then cargo check && cargo test under one
 /// 10-minute deadline.
+/// Wrapper that guarantees the staging tree is REMOVED on every exit.
+///
+/// stage_and_validate creates state/heal/staging-<ts>-c<i>/ per candidate and copies
+/// daemon/src + Cargo.toml + Cargo.lock into it — three per pass, on a loop that runs
+/// unattended. Nothing ever deleted them, so the autonomy path grew the state dir
+/// without bound. The artifacts that matter (the diff and the captured validation
+/// tail) are already carried out in StageResult, so the tree itself is pure scratch.
+///
+/// It has several early returns, hence a wrapper rather than a cleanup line per exit:
+/// a new `return` cannot leak a tree.
 async fn stage_and_validate(
+    source_dir: &Path,
+    heal_root: &Path,
+    ts: u64,
+    candidate: usize,
+    diff: &str,
+) -> anyhow::Result<StageResult> {
+    let staging = heal_root.join(staging_dir_name(ts, candidate));
+    let out = stage_and_validate_inner(source_dir, heal_root, ts, candidate, diff).await;
+    // Best-effort: a tree we could not remove is wasted disk, never a broken heal.
+    if let Err(e) = tokio::fs::remove_dir_all(&staging).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(path = %staging.display(), error = %e, "heal: could not remove the staging tree");
+        }
+    }
+    out
+}
+
+async fn stage_and_validate_inner(
     source_dir: &Path,
     heal_root: &Path,
     ts: u64,
@@ -1550,8 +1583,45 @@ async fn apply_patch(dir: &Path, diff: &str) -> anyhow::Result<CmdOutput> {
 
 /// `cargo <args>` in `dir`, output captured, bounded by `timeout`. Uses the
 /// $CARGO that invoked us when set (tests run under cargo) else PATH lookup.
+/// Resolve the cargo binary EXPLICITLY rather than trusting PATH.
+///
+/// The deployed daemon runs under launchd with PATH=/usr/bin:/bin:/usr/sbin:/sbin and
+/// no $CARGO. cargo lives in ~/.cargo/bin, which is not on that PATH — so spawning it
+/// by bare name failed for every candidate, and self-heal's staged validation could
+/// never run on the machine it is meant to heal. Every drafted candidate was discarded
+/// at the first gate, and the discard looked like a normal validation failure.
+fn resolve_cargo() -> Option<std::path::PathBuf> {
+    if let Ok(c) = std::env::var("CARGO") {
+        let p = std::path::PathBuf::from(&c);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let home = std::env::var("HOME").unwrap_or_default();
+    let candidates = [
+        std::env::var("CARGO_HOME").ok().map(|h| std::path::PathBuf::from(h).join("bin/cargo")),
+        Some(std::path::PathBuf::from(&home).join(".cargo/bin/cargo")),
+        Some(std::path::PathBuf::from("/usr/local/bin/cargo")),
+        Some(std::path::PathBuf::from("/opt/homebrew/bin/cargo")),
+    ];
+    candidates.into_iter().flatten().find(|p| p.exists())
+}
+
 async fn run_cargo(dir: &Path, args: &[&str], timeout: Duration) -> anyhow::Result<CmdOutput> {
-    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
+    let cargo = resolve_cargo().ok_or_else(|| {
+        // A DISTINCT failure, not a per-candidate "validation failed". The operator
+        // needs to know the toolchain is missing, not that three drafts were bad.
+        crate::telemetry::emit(
+            "system",
+            "heal.blocked",
+            serde_json::json!({"reason": "no_cargo"}),
+        );
+        anyhow::anyhow!(
+            "cargo not found (checked $CARGO, $CARGO_HOME/bin, ~/.cargo/bin, \
+             /usr/local/bin, /opt/homebrew/bin); self-heal cannot validate a candidate \
+             on this machine"
+        )
+    })?;
     let child = tokio::process::Command::new(cargo)
         .args(args)
         .current_dir(dir)
@@ -2296,8 +2366,18 @@ mod tests {
                 .contains("x * y"),
             "propose mode must never touch the source tree"
         );
-        // Each candidate staged into its OWN dir.
-        assert!(heal_root.join(staging_dir_name(ts, 2)).join("src").join("lib.rs").exists());
+        // Each candidate staged into its OWN dir — and every one of those trees is
+        // REMOVED again. They used to be left behind forever: three per pass, each a
+        // copy of daemon/src + Cargo.toml + Cargo.lock, on an unattended loop. The
+        // artifacts that matter (the diff and the captured validation tail) are carried
+        // out in StageResult, so the tree itself is pure scratch.
+        for c in 0..3 {
+            assert!(
+                !heal_root.join(staging_dir_name(ts, c)).exists(),
+                "candidate {c}'s staging tree was left on disk; the autonomy path grows \
+                 the state dir without bound"
+            );
+        }
     }
 
     /// When EVERY candidate fails a gate, the attempt is a rejection (no
@@ -2402,10 +2482,15 @@ mod tests {
             }
             StageResult::Rejected { stage, detail } => panic!("expected validation, rejected at {stage}:\n{detail}"),
         }
-        // staged copy patched; live source NOT.
-        let staged = heal_root.join(staging_dir_name(1_760_000_001, 0)).join("src").join("lib.rs");
-        assert!(std::fs::read_to_string(&staged).unwrap().contains("x * 2"));
+        // Reaching Validated above already proves the STAGED copy was patched — the
+        // planted fix cannot compile-and-pass otherwise. What remains to assert is the
+        // live source, and that the scratch tree is gone.
         assert!(std::fs::read_to_string(crate_dir.join("src").join("lib.rs")).unwrap().contains("x * y"));
+        // And the staging tree is GONE. It used to be left behind forever.
+        assert!(
+            !heal_root.join(staging_dir_name(1_760_000_001, 0)).exists(),
+            "the staging tree survived stage_and_validate"
+        );
     }
 
     /// (6 of contract) THE HEAL DRILL via the REAL cloud. #[ignore] by default

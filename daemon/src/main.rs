@@ -1660,6 +1660,26 @@ const STANDING_INTERVAL: Duration = Duration::from_secs(300);
 /// audio path or talk over a live reply). After a run it stamps last_run so the
 /// scheduler's next due-check is correct. Warn-and-continue throughout: a tick must
 /// never wedge or panic the daemon.
+/// Map a verified signal snapshot to the lowercase TOKENS an `on <signal>` standing
+/// mission matches ("on mail", "when mail arrives" -> "mail").
+///
+/// Derived ONLY from signals that are genuinely present. An unwired source yields no
+/// token, so its missions keep not firing — honestly, rather than on a fabricated
+/// value. Kept beside the tick that uses it so the two cannot drift.
+fn signal_tokens(signals: &crate::anticipate::Signals) -> Vec<String> {
+    let mut out = Vec::new();
+    if signals.important_unread > 0 {
+        out.push("mail".to_string());
+    }
+    if !signals.events.is_empty() {
+        out.push("calendar".to_string());
+    }
+    if signals.market.is_some() {
+        out.push("market".to_string());
+    }
+    out
+}
+
 async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, sock: PathBuf) {
     use chrono::Timelike;
 
@@ -1718,10 +1738,36 @@ async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, soc
                 continue;
             }
         };
-        // No live signal source is wired for on-signal standing missions yet, so
-        // the present-signals set is empty (on-signal missions simply don't fire
-        // until a source exists — never fabricated). Daily/interval are unaffected.
-        let signals_present: Vec<String> = Vec::new();
+        // THE PRESENT-SIGNAL SET, derived from the SAME verified snapshot the
+        // tripwires below already consume.
+        //
+        // This was hardcoded empty with the note "no live signal source is wired yet".
+        // But the standing_create tool schema tells the model verbatim that
+        // "'on <signal>' (e.g. 'on mail')" is a valid trigger, Schedule::parse maps
+        // "on mail" / "when mail arrives" to Schedule::OnSignal, the mission is
+        // confirmed by the operator, persisted, and reported as running — and then
+        // could never fire, because due_missions was handed an empty set every tick.
+        // A source HAS existed all along: collect_signals is called a few lines below
+        // to drive the condition tripwires, off the same throttled reads.
+        //
+        // It is moved above this point and its snapshot reused. Tokens are derived
+        // ONLY from signals that are actually present — never fabricated — so an
+        // unwired source (market) yields no token and its missions keep not firing,
+        // honestly.
+        let present = secs_since_last_interaction(&memory)
+            .await
+            .is_some_and(|s| s <= ANTICIPATE_PRESENCE_WINDOW_SECS);
+        let now_rfc3339 = chrono::Utc::now().to_rfc3339();
+        let signals = signals::collect_signals(
+            &mut collector,
+            telemetry::latest_snapshot(),
+            present,
+            now,
+            &now_rfc3339,
+            signals::DEFAULT_REFRESH_SECS,
+        )
+        .await;
+        let signals_present: Vec<String> = signal_tokens(&signals);
         let due = standing::due_missions(
             &missions,
             now,
@@ -1749,19 +1795,8 @@ async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, soc
             && now.saturating_sub(last_condition_eval) >= condition_eval_secs
         {
             last_condition_eval = now;
-            let present = secs_since_last_interaction(&memory)
-                .await
-                .is_some_and(|s| s <= ANTICIPATE_PRESENCE_WINDOW_SECS);
-            let now_rfc3339 = chrono::Utc::now().to_rfc3339();
-            let signals = signals::collect_signals(
-                &mut collector,
-                telemetry::latest_snapshot(),
-                present,
-                now,
-                &now_rfc3339,
-                signals::DEFAULT_REFRESH_SECS,
-            )
-            .await;
+            // `signals` was collected above (it also derives the present-signal token
+            // set for on-signal missions); the tripwires reuse that same snapshot.
             condition_due = standing::due_condition_missions(
                 &missions,
                 &signals,
