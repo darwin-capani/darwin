@@ -365,15 +365,69 @@ mod tests {
     }
 
     #[test]
-    fn live_interpret_ships_on_inert_without_mic_by_default() {
-        // The continuous live-interpret mode SHIPS ON (full-power default) — INERT
-        // WITHOUT TCC/MIC: the device-gated mic loop captures nothing without
-        // Microphone consent. `speak` stays its OWN opt-in (render-only default); the
-        // default target is a sensible "English" and the source auto-detects.
+    fn live_interpret_ships_off_by_default() {
+        // The continuous live-interpret mode SHIPS OFF. It is a MODE: the session
+        // renders every VAD segment it is handed, and main.rs returned that rendering
+        // instead of continuing to classify/route — so with it on, every spoken command
+        // came back as a translation and the assistant was unreachable by voice. It
+        // shipped on. `speak` stays its OWN opt-in (render-only); the default target is
+        // "English" and the source auto-detects.
         let cfg = Config::default();
-        assert!(cfg.interpret.live, "continuous live interpretation ships ON (inert without mic/TCC)");
+        assert!(!cfg.interpret.live, "live interpretation SHIPS OFF: on, it swallows spoken commands");
         assert!(!cfg.interpret.speak, "voicing the translation stays its OWN opt-in (render-only default)");
         assert_eq!(cfg.interpret.target_lang, "English");
         assert_eq!(cfg.interpret.source_lang, "", "empty source => auto-detect");
+    }
+
+    /// THE PROPERTY THAT WAS BROKEN: an utterance addressed to DARWIN must reach the
+    /// assistant, never the interpreter.
+    ///
+    /// main.rs's pipeline computed nothing here -- it was a bare `if cfg.interpret.live`
+    /// with an unconditional `return`, sitting BEFORE the wake gate, before classify and
+    /// before route. With [interpret].live shipping ON, that meant every spoken
+    /// utterance was rendered as a translation and returned. DARWIN answered nothing and
+    /// actuated nothing by voice, on the shipped AND the deployed config.
+    ///
+    /// This pins the predicate main.rs now computes. It is deliberately a source check
+    /// of the GATE EXPRESSION rather than of the surrounding block, because the defect
+    /// was the absence of a condition, and because run_pipeline itself needs a live mic,
+    /// STT and a router to call.
+    #[test]
+    fn the_interpreter_never_swallows_speech_addressed_to_darwin() {
+        let src = include_str!("main.rs");
+        let i = src
+            .find("let addressed_to_darwin =")
+            .expect("main.rs no longer computes whether the utterance is for DARWIN -- \
+                     the interpreter branch swallows every segment again");
+        let gate = &src[i..(i + 400).min(src.len())];
+        assert!(
+            gate.contains("wake::wake_gate(cfg, &text)"),
+            "the wake phrase must be what marks an utterance as addressed to DARWIN"
+        );
+        assert!(
+            gate.contains("confirm::is_live"),
+            "a parked confirmation's invited reply must also reach the assistant -- it \
+             need not repeat the wake word"
+        );
+        assert!(
+            gate.contains("cfg.interpret.live && !addressed_to_darwin"),
+            "the interpret branch must be gated on the utterance NOT being for DARWIN"
+        );
+        // And the gate must sit BEFORE the interpret call it guards.
+        let call = src.find("interpret::interpret_segment_live").expect("call moved");
+        assert!(i < call, "the gate is computed after the interpreter already ran");
+    }
+
+    /// With wake gating off there is no way to tell a command from interpreter
+    /// material, which is exactly why `live` ships off. Pinned so the two defaults
+    /// cannot drift into the combination that produced the original bug.
+    #[test]
+    fn the_two_defaults_cannot_recreate_the_swallowing_combination() {
+        let cfg = Config::default();
+        assert!(
+            !cfg.interpret.live || cfg.wake.enabled,
+            "live interpretation with wake gating OFF renders every spoken command as a \
+             translation -- that combination must never be the shipped default"
+        );
     }
 }

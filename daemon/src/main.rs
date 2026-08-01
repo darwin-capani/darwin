@@ -3626,7 +3626,28 @@ async fn run_pipeline(
     // at the audio.rs segment site behind the SAME flag); only the pure core is proven
     // headlessly. NOTE: this is BEFORE the wake gate on purpose — an interpreter session
     // renders every segment, it is not "addressed to DARWIN" speech.
-    if cfg.interpret.live {
+    // ADDRESSED-TO-DARWIN SPEECH IS NEVER SWALLOWED BY THE INTERPRETER.
+    //
+    // This branch used to be `if cfg.interpret.live` with an UNCONDITIONAL return, and
+    // [interpret].live shipped ON — so on the shipped and deployed config every spoken
+    // utterance was rendered as a translation and returned right here, BEFORE the wake
+    // gate, before classify, before route. DARWIN answered nothing and actuated
+    // nothing by voice. The entire voice product was dead by default.
+    //
+    // The comment two lines up already stated the correct rule -- "an interpreter
+    // session renders every segment, it is not 'addressed to DARWIN' speech" -- it
+    // simply was not enforced. It is now: an utterance that IS addressed to DARWIN
+    // (it carries the wake phrase, or a confirmation is parked and the invited
+    // "confirm"/"cancel" reply need not repeat it) falls through to the assistant.
+    // Everything else is interpreter material, which is what the feature is for.
+    //
+    // With [wake].enabled off there is no way to tell the two apart, so live
+    // interpretation then applies to every segment as before -- and that is exactly
+    // why [interpret].live now ships OFF: turning it on without a wake phrase is a
+    // deliberate "this machine is an interpreter" choice, not a default.
+    let addressed_to_darwin = cfg.wake.enabled
+        && (crate::confirm::is_live(std::time::Instant::now()) || wake::wake_gate(cfg, &text));
+    if cfg.interpret.live && !addressed_to_darwin {
         let outcome = interpret::interpret_segment_live(
             &text,
             cfg,
@@ -3646,9 +3667,11 @@ async fn run_pipeline(
         return Some(outcome.translated_text);
     }
 
-    // #32 CUSTOM WAKE-WORD gate (wake.rs), AFTER STT and the self-echo reject. OFF by
-    // default ([wake].enabled) — with it off `wake_gate` returns true unconditionally and
-    // activation is byte-for-byte today's. When ON, an utterance that does NOT contain the
+    // #32 CUSTOM WAKE-WORD gate (wake.rs), AFTER STT and the self-echo reject. SHIPS ON
+    // ([wake].enabled = true, phrase "darwin") — this comment said "OFF by default" long
+    // after the default flipped, which matters because the gate decides whether an
+    // utterance reaches DARWIN at all. With it off `wake_gate` returns true
+    // unconditionally and every utterance activates. When ON, an utterance that does NOT contain the
     // configured wake phrase (default "darwin", which preserves today's behavior) is
     // dropped here as "not for DARWIN" — the conservative PURE matcher never triggers on a
     // substring of a larger word and never matches an empty/blank phrase. EXCEPTION: while
