@@ -903,6 +903,19 @@ async fn run_python_compile(dir: &Path, file: &str) -> Result<CmdOutput> {
     run_capture("python3", &["-m", "py_compile", file], dir, Duration::from_secs(60)).await
 }
 
+/// PATH for the sandboxed validation. The daemon runs under launchd with a bare system
+/// PATH and cargo lives in the operator's ~/.cargo/bin, so the system PATH alone cannot
+/// find the toolchain — the same trap that makes self-heal's validation unrunnable.
+fn forge_toolchain_path() -> String {
+    let mut parts = vec![
+        forge_home().join(".cargo/bin").to_string_lossy().into_owned(),
+        "/usr/local/bin".to_string(),
+        "/opt/homebrew/bin".to_string(),
+    ];
+    parts.extend(["/usr/bin", "/bin", "/usr/sbin", "/sbin"].map(str::to_string));
+    parts.join(":")
+}
+
 /// The user's home, used by the SBPL to deny ~/.claude, ~/.ssh and the login
 /// Keychain by absolute path. Local to this module: anthropic.rs keeps its own
 /// private copy and widening that one for a second caller is not worth the coupling.
@@ -990,16 +1003,51 @@ async fn run_capture(cmd: &str, args: &[&str], dir: &Path, timeout: Duration) ->
     ];
     sandboxed.extend(args.iter().map(|a| a.to_string()));
 
-    let child = tokio::process::Command::new(crate::shell::SANDBOX_EXEC)
+    // THE SEATBELT DOES NOT SCRUB THE ENVIRONMENT. It filters files, mach lookups and
+    // the network — env vars are not a sandbox-controlled resource, and apps.rs says so
+    // in as many words ("an inherited ANTHROPIC_API_KEY / ELEVENLABS_API_KEY / HF_TOKEN
+    // would sail past the default-deny sandbox and be readable ... via getenv()").
+    //
+    // Both other sandboxed spawns in this daemon env_clear for exactly that reason
+    // (shell.rs, apps.rs). This one — the only spawn that compiles and RUNS code an
+    // untrusted CLOUD MODEL wrote — was the one that skipped it. A build.rs or #[test]
+    // the model authored could read the operator's API key out of getenv and write it
+    // into the staging dir, which is the one path the profile makes writable, or print
+    // it into captured output that is pasted into the forge report.
+    //
+    // Reproduced: a planted build.rs read ANTHROPIC_API_KEY and wrote it to a file.
+    // The `deny network*` in the same profile means it could not be sent anywhere, so
+    // this is a secret-boundary violation rather than a demonstrated exfiltration —
+    // but it contradicts the policy the rest of the daemon follows, on the one spawn
+    // where the code is least trusted.
+    //
+    // A bare env_clear() breaks validation: cargo and rustup need PATH, HOME and their
+    // own home dirs. So the environment is REBUILT from a minimal allowlist, with HOME
+    // pointed inside the staging dir the profile already permits.
+    let mut command = tokio::process::Command::new(crate::shell::SANDBOX_EXEC);
+    command
         .args(&sandboxed)
         .current_dir(dir)
-        // Keep cargo's writes inside the one writable subtree.
+        .env_clear()
+        .env("PATH", forge_toolchain_path())
+        // A throwaway HOME inside the one writable subtree.
+        .env("HOME", &scratch)
+        .env("TMPDIR", scratch.join("tmp"))
+        // Keep cargo's writes inside that subtree too.
         .env("CARGO_TARGET_DIR", scratch.join("target"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()?;
+        .kill_on_drop(true);
+    // rustup/cargo home: inherit the operator's if set, else the conventional path, so
+    // the toolchain still resolves. Neither holds a secret; both are read-only here.
+    for (key, fallback) in [("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")] {
+        let val = std::env::var(key).ok().unwrap_or_else(|| {
+            forge_home().join(fallback).to_string_lossy().into_owned()
+        });
+        command.env(key, val);
+    }
+    let child = command.spawn()?;
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => result?,
         Err(_) => bail!("{cmd} {} timed out after {}s", args.join(" "), timeout.as_secs()),
@@ -2269,6 +2317,61 @@ mod validation_sandbox_tests {
             !escaped,
             "a build.rs authored by the cloud model wrote into $HOME — validation is \
              running unconfined with the daemon's full authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn model_authored_code_cannot_read_the_operators_api_key() {
+        // THE SECRET BOUNDARY. sandbox-exec filters files, mach lookups and the network
+        // — NOT environment variables. This spawn is the only one in the daemon that
+        // compiles and RUNS code an untrusted cloud model wrote, and it was the only one
+        // that did not env_clear. A planted build.rs read ANTHROPIC_API_KEY out of
+        // getenv and wrote it into the staging dir, which is the one path the profile
+        // makes writable.
+        if !have_seatbelt() {
+            return;
+        }
+        std::env::set_var("ANTHROPIC_API_KEY", "sk-ant-FORGE-BOUNDARY-PROBE");
+        let tmp = std::env::temp_dir().join(format!("forge-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        stage_crate(
+            &tmp,
+            Some(
+                "fn main() {\n\
+                 \x20   let k = std::env::var(\"ANTHROPIC_API_KEY\").unwrap_or_default();\n\
+                 \x20   let _ = std::fs::write(\"leaked.txt\", k);\n\
+                 \x20   println!(\"cargo:rerun-if-changed=build.rs\");\n}\n",
+            ),
+        );
+
+        let _ = run_cargo(&tmp, &["check", "--offline"], Duration::from_secs(180)).await;
+        let leaked = std::fs::read_to_string(tmp.join("leaked.txt")).unwrap_or_default();
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::env::remove_var("ANTHROPIC_API_KEY");
+
+        assert!(
+            !leaked.contains("FORGE-BOUNDARY-PROBE"),
+            "cloud-authored code read the operator's API key out of the environment: \
+             {leaked:?}"
+        );
+    }
+
+    #[test]
+    fn the_validation_spawn_clears_the_environment() {
+        // Pinned against the OTHER two sandboxed spawns, which have always done this.
+        let body = include_str!("forge.rs");
+        let i = body.find("async fn run_capture(").expect("run_capture moved");
+        let rest = &body[i..];
+        let end = rest.find("\n}\n").map(|e| e + 2).unwrap_or(rest.len());
+        let f = &rest[..end];
+        assert!(
+            f.contains(".env_clear()"),
+            "the forge validation spawn inherits the daemon's environment, including \
+             every API key — the seatbelt does not filter env vars"
+        );
+        assert!(
+            f.contains("forge_toolchain_path()"),
+            "a bare env_clear breaks cargo; the toolchain PATH must be rebuilt"
         );
     }
 
