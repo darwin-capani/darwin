@@ -1422,7 +1422,19 @@ else
     # install reported 23 resident models on a machine holding 9. It also counted
     # repos whose weights were never fetched (a gated FLUX stub is 16 KB of refs).
     # The real layout is exactly <HF_HOME>/hub/models--<org>--<repo>.
-    _mcount="$(find "$HF_HOME_DIR/hub" -maxdepth 1 -type d -name 'models--*' 2>/dev/null | wc -l | tr -d '[:space:]' || true)"
+    # Count repos whose WEIGHTS are actually present. The previous expression counted
+    # every hub/models--* directory and its own comment claimed it excluded "repos
+    # whose weights were never fetched (a gated FLUX stub is 16 KB of refs)" — it did
+    # not. On this machine models--black-forest-labs--FLUX.1-schnell is exactly that
+    # 16 KB stub, and it was still counted as RESIDENT. A repo with real weights has
+    # blobs; a stub has only refs and an empty blobs dir.
+    _mcount=0
+    for _repo in "$HF_HOME_DIR"/hub/models--*; do
+        [ -d "$_repo" ] || continue
+        if find "$_repo/blobs" -type f -size +1M -print -quit 2>/dev/null | grep -q .; then
+            _mcount=$((_mcount + 1))
+        fi
+    done
     case "$_mcount" in ''|*[!0-9]*) _mcount=0 ;; esac
     if [ "$_mcount" -gt 0 ]; then MODELS_TAG="$_mcount RESIDENT"; else MODELS_TAG="RESIDENT"; fi
 fi

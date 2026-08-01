@@ -42,9 +42,14 @@ fn sticky_key(event: &str, data: &Value) -> Option<String> {
         // toggle must still learn the current vault state to render its indicator.
         "vault.status" => Some(event.to_string()),
         // SAFETY SNAPSHOT (snapshot.rs): an anchored APFS restore point is a rare,
-        // event-driven state (not a 15s cadence), so retain the LATEST frame — a
-        // HUD that connects after a snapshot must still learn the current restore
-        // point to render "you can roll back to 14:32". Latest wins.
+        // event-driven state (not a 15s cadence), so retain the LATEST frame so a
+        // client connecting later still learns the current restore point. Latest wins.
+        //
+        // NOTE: the HUD has NO consumer for this frame today. This comment used to say
+        // a HUD connecting after a snapshot would "render 'you can roll back to
+        // 14:32'" — it does not; the frame falls through applyEnvelope's default. The
+        // retention is still correct and the frame is still useful to any client, but
+        // the claim about the rendered surface was untrue and is not restated here.
         "snapshot.anchor" => Some(event.to_string()),
         // Per-app diagnostic: one retained frame per offending app.
         "app.manifest_invalid" => Some(format!(

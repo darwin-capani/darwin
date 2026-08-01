@@ -2644,8 +2644,15 @@ async fn main() -> Result<()> {
         });
     }
     // DARWIN LANGUAGE SERVER (dls.rs; secret-free, CONFIG-DERIVED status). Always
-    // emit the `dls.status` frame so the HUD learns the state (the shipped default
-    // is enabled=false). When ON, gather the READ-ONLY context (config snapshot +
+    // emit the `dls.status` frame so a client can learn the state (the shipped default
+    // is enabled=false).
+    //
+    // NOTE: no HUD surface consumes this frame today. This comment used to say "so the
+    // HUD learns the state", which overstates what exists — it falls through
+    // applyEnvelope's default. Still emitted: it is cheap, secret-free and correct for
+    // any client; only the claim about a rendered surface is corrected.
+    //
+    // When ON, gather the READ-ONLY context (config snapshot +
     // dependency probes + the capability atlas + the tool allowlist) in a spawned
     // task — the Keychain probes must never block boot — then serve the LSP-style
     // endpoint on 127.0.0.1:[dls].port. STRICTLY READ-ONLY + LOOPBACK: it never

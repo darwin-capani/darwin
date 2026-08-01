@@ -37,16 +37,15 @@ fs_read   = [
 ]
 fs_write  = ["state/tmp/vision"]        # scratch: decoded-frame cache, run artifacts
 
-# --- PROPOSED schema extension (activated in Integrate) --------------------
-# The current daemon AppManifest uses serde(deny_unknown_fields), so the two
-# keys below are kept as comments until daemon/src/apps.rs adds them to
-# PermissionsSection. They DECLARE a TCC-gated capability the app needs; the
-# daemon should surface them in the launch UI / status, but they grant nothing
-# by themselves (TCC consent is the real gate and is requested on-device):
-#   camera = true   # AVFoundation capture from the user's OWN camera (TCC: Camera)
-#   screen = true   # ScreenCaptureKit capture of the user's OWN screen (TCC: Screen Recording)
-# Until then, AppEnv also reads DARWIN_VISION_CAMERA / DARWIN_VISION_SCREEN
-# from the launch env as an interim declaration channel (default: false).
+# --- TCC-gated capabilities this app needs ---------------------------------
+# These DECLARE what the app will ask the OS for; they grant nothing by themselves
+# (TCC consent is the real gate and is requested on-device). They were kept as
+# comments labelled "PROPOSED ... until daemon/src/apps.rs adds them to
+# PermissionsSection" — apps.rs HAS them (`pub camera: bool` / `pub screen: bool`,
+# with serde defaults), so the declaration channel this app was waiting for has been
+# live and unused, and the one capture app on the machine shipped declaring neither.
+camera = true   # AVFoundation capture from the user's OWN camera (TCC: Camera)
+screen = true   # ScreenCaptureKit capture of the user's OWN screen (TCC: Screen Recording)
 
 [ui]
 surface          = "panel"
