@@ -7222,3 +7222,50 @@ mod lifelog_switch_tests {
     }
 }
 }
+#[cfg(test)]
+mod posture_claim_tests {
+    use super::*;
+
+    /// A module header that states the wrong shipped posture is worse than none: three
+    /// of them said "ships OFF" while their subsystem shipped ON, and one of those was
+    /// a block labelled SAFETY CONTRACT (non-negotiable). An operator reading it to
+    /// decide whether autonomy is armed would have been told the opposite of the truth.
+    ///
+    /// This pins the claim to the actual default, per subsystem, so the two cannot
+    /// drift apart again.
+    #[test]
+    fn module_headers_state_the_real_shipped_posture() {
+        let cfg = Config::default();
+        let cases: [(&str, &str, bool); 3] = [
+            ("heal.rs", include_str!("heal.rs"), cfg.self_heal.enabled),
+            ("optimize.rs", include_str!("optimize.rs"), cfg.optimize.enabled),
+            ("macros.rs", include_str!("macros.rs"), cfg.macros.enabled),
+        ];
+        for (name, src, ships_on) in cases {
+            // Only the module header (the //! block at the top).
+            let header: String = src
+                .lines()
+                .take_while(|l| l.starts_with("//!") || l.trim().is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            let claims_off = header.contains("Ships OFF")
+                || header.contains("ships OFF")
+                || header.contains("OFF by default")
+                || header.contains("ships enabled=false");
+            assert!(
+                !(ships_on && claims_off),
+                "{name}'s header claims the subsystem ships OFF, but its default is \
+                 enabled = true"
+            );
+            let claims_on = header.contains("Ships ON")
+                || header.contains("ships ON")
+                || header.contains("ships enabled=TRUE")
+                || header.contains("ON by default");
+            assert!(
+                ships_on || !claims_on,
+                "{name}'s header claims the subsystem ships ON, but its default is \
+                 enabled = false"
+            );
+        }
+    }
+}

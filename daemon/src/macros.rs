@@ -18,8 +18,10 @@
 //!   ran this macro once so skip the gate". The macro carries no authority; it only
 //!   re-issues the words.
 //!
-//! OFF by default ([macros].enabled = false): with it off nothing is recorded or
-//! replayed. Persisted to the SAME bounded `meta.*` fact store (in-RAM/temp SQLite
+//! ON by default ([macros].enabled = true) — this line stated the opposite default long
+//! after it flipped. With the switch off nothing is recorded or replayed; with it on,
+//! replay RE-GATES every step exactly as a live utterance would, so a recorded
+//! consequential action still parks for its own spoken confirmation. Persisted to the SAME bounded `meta.*` fact store (in-RAM/temp SQLite
 //! in tests). HONESTY: a macro stores no secret and never bypasses the gate; replay
 //! never fabricates a step result — it returns exactly what the router gave back.
 

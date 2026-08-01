@@ -10,10 +10,12 @@
 //! reversible. NONE of that lives here — this module only records and reads.
 //!
 //! SAFETY / PRIVACY CONTRACT (non-negotiable, mirrors [self_heal]):
-//!   * Ships OFF: [optimize].enabled = false. With it false [`record_trace`] is a
-//!     pure NO-OP — nothing is written, no corpus accrues, so the optimizer has
-//!     nothing to learn from. The live recording is RUNTIME-gated (traces accrue
-//!     only while the daemon runs with this ON); tests insert mock traces directly.
+//!   * Ships ON: [optimize].enabled = true. This line stated the opposite default long
+//!     after it flipped, which matters because the whole safety story here rests
+//!     on how much accrues by default: the corpus DOES accrue while the daemon runs,
+//!     PII-redacted and capped at MAX_TRACES. With the switch OFF [`record_trace`] is
+//!     a pure NO-OP — nothing is written and the optimizer has nothing to learn from.
+//!     The live recording is RUNTIME-gated; tests insert mock traces directly.
 //!   * PII-REDACTED at the source: every utterance is passed through [`redact`]
 //!     BEFORE it is ever stored. The redactor strips emails, phone numbers, long
 //!     digit runs (>=6), URLs carrying embedded credentials, and anything
