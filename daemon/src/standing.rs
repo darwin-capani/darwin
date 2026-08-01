@@ -1366,7 +1366,7 @@ mod tests {
         );
 
         let preview = establish_preview("review deadlines", &Schedule::Daily { hour: 9, minute: 0 });
-        let prompt = confirm::park(PendingConfirmation {
+        let prompt = confirm::park_ctx(true, PendingConfirmation {
             agent: "agent.fury".into(),
             tool: "standing_create".into(),
             input: serde_json::json!({"goal": "review deadlines", "schedule": "daily"}),
@@ -1804,7 +1804,7 @@ mod tests {
         assert!(preview.contains("free disk drops below 10%"), "preview names the condition: {preview}");
         assert!(preview.starts_with("[dry run]"));
 
-        let prompt = confirm::park(PendingConfirmation {
+        let prompt = confirm::park_ctx(true, PendingConfirmation {
             agent: "agent.fury".into(),
             tool: "standing_create".into(),
             input: serde_json::json!({"goal": "free up space when disk is low", "schedule": "free disk below 10%"}),

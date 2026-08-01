@@ -2837,19 +2837,34 @@ async fn tool_loop(
                 // parked consequential tool too (is_error==false), since the turn
                 // still routed to it. skill_invoke resolves to the SKILL name.
                 answers::record_turn_tool(&capability_label(&name, &block["input"]));
+                // A consequential tool under the ON master switch is PARKED, not
+                // executed: execute_tool returns the dry-run preview with
+                // is_error==false.
+                let parked = is_parked_consequential(&name, &block["input"]);
                 // First successful execution of this signature: record it for
                 // the dedup ledger AND the budget-kill acknowledgment. An
                 // is_error result is NOT recorded — a genuinely failed call may
                 // legitimately be retried with corrected arguments (a different
                 // signature), but a SUCCESSFUL mutating call never re-fires.
-                seen.insert(signature, outcome.clone());
-                // A consequential tool under the ON master switch is PARKED, not
-                // executed: execute_tool returns the dry-run preview with
-                // is_error==false. Such a preview must NOT enter the budget-kill
-                // acknowledgment log, or budget_exhausted_reply would tell the
-                // user a parked action "did complete" when it only awaits a
-                // spoken yes. Keep the dedup ledger insert above; skip the log.
-                let parked = is_parked_consequential(&name, &block["input"]);
+                //
+                // A PARKED PREVIEW IS NEVER CACHED. It is not a result; it is a
+                // QUESTION about live state — "…ALPHA… — say 'confirm' to proceed" —
+                // and the single confirmation slot it refers to can be overwritten by
+                // the very next parking call. Caching it meant that if the model
+                // re-requested the identical call later in the same turn, after having
+                // parked a DIFFERENT consequential action in between, the dedup branch
+                // replayed the stored ALPHA prompt verbatim without re-parking. The
+                // model then asked the user about ALPHA while the armed slot held
+                // BETA, and the spoken "confirm" fired an action with arguments the
+                // user was never read. Skipping the insert makes a repeat call
+                // re-enter execute_tool and re-park, so the armed action always
+                // matches the question that was asked.
+                if !parked {
+                    seen.insert(signature, outcome.clone());
+                }
+                // A parked preview must also NOT enter the budget-kill acknowledgment
+                // log, or budget_exhausted_reply would tell the user a parked action
+                // "did complete" when it only awaits a spoken yes.
                 if !parked {
                     if let Ok(mut log) = executed.lock() {
                         log.push(format!("{name}: {}", first_chars(&outcome, 80)));
@@ -7115,7 +7130,9 @@ async fn execute_mcp_tool(
 
         // ASK path with master ON: PARK the EXACT {agent,tool,input} (unchanged).
         if master_on {
-            let prompt = crate::confirm::park(crate::confirm::PendingConfirmation {
+            // REACHES THE USER: propose_standing_mission is the selector path, reached from
+    // router.rs on the live turn where the operator said "every morning, do X".
+    let prompt = crate::confirm::park_ctx(true, crate::confirm::PendingConfirmation {
                 agent: namespace.to_string(),
                 // Park the FLAT id so the replay routes back through dispatch_tool's
                 // mcp__* arm (which re-checks the allowlist and runs in Execute).
@@ -7576,7 +7593,9 @@ pub async fn execute_tool(
             // Park THE EXACT original input (not the confirm-stripped copy) so the
             // replay fires precisely what the user was shown. New consequential
             // invocation replaces any prior pending (single slot).
-            let prompt = crate::confirm::park(crate::confirm::PendingConfirmation {
+            // REACHES THE USER: propose_standing_mission is the selector path, reached from
+    // router.rs on the live turn where the operator said "every morning, do X".
+    let prompt = crate::confirm::park_ctx(true, crate::confirm::PendingConfirmation {
                 agent: namespace.to_string(),
                 tool: name.to_string(),
                 input: input.clone(),
@@ -7737,9 +7756,11 @@ pub async fn replay_confirmed_action(
             warn!(tool = %pending.tool, "plan-apply: state drifted since the plan was shown; re-parking a fresh plan instead of executing");
             // Re-park the FRESH plan into the (now-empty, taken by the caller) slot
             // so the user re-confirms the CURRENT diff. Same agent/tool/input/
-            // allowlist; only the plan + preview refresh.
+            // allowlist; only the plan + preview refresh. REACHES THE USER: this is
+            // the confirm-replay path — they just spoke "confirm" and are being
+            // re-prompted with the drifted plan right now.
             let repark_preview = plan_drift_preview(&pending.preview, &new_plan);
-            let prompt = crate::confirm::park(crate::confirm::PendingConfirmation {
+            let prompt = crate::confirm::park_ctx(true, crate::confirm::PendingConfirmation {
                 agent: pending.agent.clone(),
                 tool: pending.tool.clone(),
                 input: pending.input.clone(),
@@ -12371,7 +12392,9 @@ pub async fn propose_standing_mission(
     // carries the same plan). `None` (plan off / state unreadable) => the text
     // preview, unchanged.
     let plan = compute_plan("standing_create", &input, memory, true).await;
-    let prompt = crate::confirm::park(crate::confirm::PendingConfirmation {
+    // REACHES THE USER: propose_standing_mission is the selector path, reached from
+    // router.rs on the live turn where the operator said "every morning, do X".
+    let prompt = crate::confirm::park_ctx(true, crate::confirm::PendingConfirmation {
         agent: agent_namespace.to_string(),
         tool: "standing_create".to_string(),
         input,
@@ -16120,7 +16143,7 @@ mod tests {
                 "ui_actuate (action A) must register as a park-needing consequential tool under the ON switch"
             );
             // Simulate the gate parking A, then ONE confirm consuming it.
-            let _ = crate::confirm::park(crate::confirm::PendingConfirmation {
+            let _ = crate::confirm::park_ctx(true, crate::confirm::PendingConfirmation {
                 agent: "agent.steve".into(),
                 tool: "ui_actuate".into(),
                 input: click_a.clone(),

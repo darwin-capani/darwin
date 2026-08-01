@@ -2506,7 +2506,7 @@ mod tests {
 
     fn park_a_consequential(agent: &str, tool: &str, input: Value, allowed: Vec<String>) -> String {
         confirm::clear();
-        confirm::park(PendingConfirmation {
+        confirm::park_ctx(true, PendingConfirmation {
             agent: agent.to_string(),
             tool: tool.to_string(),
             input,

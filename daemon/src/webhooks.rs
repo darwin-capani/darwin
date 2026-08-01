@@ -262,7 +262,11 @@ fn apply_decision(decision: &WebhookDecision) -> Option<String> {
             let preview = format!(
                 "A webhook event '{event}' wants to run the consequential action '{intent}'"
             );
-            crate::confirm::park(crate::confirm::PendingConfirmation {
+            // DOES NOT REACH THE USER. An inbound webhook parks on its own schedule;
+            // nobody was prompted this turn. Arming PROMPTED here would let it steal a
+            // "confirm" the operator spoke for something else entirely — exactly the
+            // hijack take_live exists to block.
+            crate::confirm::park_ctx(false, crate::confirm::PendingConfirmation {
                 agent: "orchestrator".to_string(),
                 tool: intent.clone(),
                 // No replay material from the wire: the body is never trusted to

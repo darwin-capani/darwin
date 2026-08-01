@@ -5662,7 +5662,7 @@ mod tests {
             id: String::new(),
             plan: None,
         };
-        let prompt = confirm::park(pending);
+        let prompt = confirm::park_ctx(true, pending);
         let last_reply = Some(prompt.as_str());
 
         // Sanity: the parked prompt is genuinely the kind of reply that WOULD be
