@@ -380,14 +380,19 @@ impl TccBaseline {
     /// baseline, since it overwrites the stored decision.
     async fn upsert(&self, grants: &[Grant], now: i64) -> Result<()> {
         let conn = self.conn.lock().await;
+        // ONE TRANSACTION. rusqlite is autocommit, so this rewrote every row as its own
+        // WAL commit on every tick — for a grant table that changes only when the user
+        // touches a TCC pane. Same fix as persistence.rs::replace_with.
+        let tx = conn.unchecked_transaction()?;
         for g in grants {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO tcc_baseline(client, service, decision, first_seen, last_seen)
                  VALUES(?1, ?2, ?3, ?4, ?4)
                  ON CONFLICT(client, service) DO UPDATE SET decision = ?3, last_seen = ?4",
                 rusqlite::params![g.client, g.service, g.decision, now],
             )?;
         }
+        tx.commit()?;
         Ok(())
     }
 }

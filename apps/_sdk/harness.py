@@ -42,6 +42,38 @@ import sys
 TOKEN = os.environ.get("DARWIN_APP_TOKEN", "")
 SOCKET_PATH = os.environ.get("DARWIN_APP_SOCKET", "")
 
+# The caller's own budget for this op, injected by darwind at launch (apps.rs
+# APP_REQUEST_TIMEOUT). Absent when an app is run by hand.
+_DEADLINE_MS_ENV = "DARWIN_APP_DEADLINE_MS"
+# Margin left for our own reply to travel back after the model answers.
+_DEADLINE_MARGIN_S = 2.0
+# Used when nothing injected a budget (a hand-run app, or an older daemon).
+_DEFAULT_PROXY_TIMEOUT_S = 30.0
+
+
+def proxy_timeout(default=_DEFAULT_PROXY_TIMEOUT_S):
+    """Seconds an app should wait on the generate/fetch proxy.
+
+    DERIVED from the caller's budget rather than chosen independently. Every
+    LLM-backed app used to hard-code 30 s while the daemon's APP_REQUEST_TIMEOUT is
+    15 s, so the ordering was inverted: under load the daemon gave up first, threw
+    away a reply that was still on its way, and told the user the app did not answer
+    — for a tool call that was working. Waiting LONGER than the caller can only ever
+    produce that outcome.
+
+    Always shorter than the caller's budget by a small margin, so a slow-but-successful
+    generation still has time to travel back. Never raises: a malformed value falls
+    back to the default.
+    """
+    raw = os.environ.get(_DEADLINE_MS_ENV, "")
+    try:
+        budget = float(raw) / 1000.0
+    except (TypeError, ValueError):
+        return default
+    if budget <= 0:
+        return default
+    return max(1.0, budget - _DEADLINE_MARGIN_S)
+
 # Cap on one un-newlined frame from the daemon. Mirrors the daemon's own bound
 # (apps.rs read_line_bounded / genproxy MAX_PROXY_LINE_BYTES): a peer streaming
 # an unframed, unbounded blob can't grow the read buffer without bound (OOM).

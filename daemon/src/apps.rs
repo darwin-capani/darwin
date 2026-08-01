@@ -2120,6 +2120,16 @@ async fn run_once(
             cmd.env(var, v);
         }
     }
+    // THE CALLER'S BUDGET, so an app cannot wait longer than the daemon will listen.
+    // The eight LLM-backed apps each hard-coded a 30 s wait on the generate proxy while
+    // APP_REQUEST_TIMEOUT is 15 s — the ordering was INVERTED, so under a busy
+    // inference server the daemon gave up first, discarded a reply that was still
+    // coming, and reported "the app did not answer" for a tool call that worked.
+    // Deriving the app's deadline from this one makes the ordering unbreakable.
+    cmd.env(
+        "DARWIN_APP_DEADLINE_MS",
+        APP_REQUEST_TIMEOUT.as_millis().to_string(),
+    );
     cmd.env("DARWIN_APP_TOKEN", token);
     cmd.env("DARWIN_APP_SOCKET", abs(&registry.project_root, socket_path));
     cmd.env("DARWIN_APP_NAME", name);
