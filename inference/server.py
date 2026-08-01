@@ -7709,7 +7709,20 @@ class InferenceServer:
 
     async def handle_client(self, reader, writer):
         peer = "client"
-        log.info("%s connected", peer)
+        # LOG THE SESSION, NOT THE PROBE.
+        #
+        # The daemon's liveness check (inference.rs LIVENESS_INTERVAL) opens a fresh
+        # connection every 5 s and closes it immediately without sending anything.
+        # Logging connect+disconnect at INFO on every accept made that 2 lines every
+        # 5 s, ~34,500 lines a day: measured on the live install, 105,443 of 106,155
+        # lines — 99.3% of the inference log — were probe noise, which is what an
+        # operator has to read past to find a real error.
+        #
+        # So the pair is emitted only for a connection that actually served an op. A
+        # bare connect+close still appears at DEBUG, so nothing is hidden from anyone
+        # who turns the level up.
+        served_any = False
+        log.debug("%s connected", peer)
         try:
             while not self._stop.is_set():
                 try:
@@ -7733,6 +7746,11 @@ class InferenceServer:
                 line = line.strip()
                 if not line:
                     continue
+                if not served_any:
+                    # First real request line on this connection: it is a genuine
+                    # client session, not the daemon's 5-second liveness probe.
+                    served_any = True
+                    log.info("%s connected", peer)
                 t0 = time.perf_counter()
                 try:
                     req = json.loads(line)
@@ -7759,7 +7777,10 @@ class InferenceServer:
                 await writer.wait_closed()
             except Exception:
                 pass
-            log.info("%s disconnected", peer)
+            if served_any:
+                log.info("%s disconnected", peer)
+            else:
+                log.debug("%s disconnected (no op; liveness probe)", peer)
 
     # -- lifecycle -------------------------------------------------------
 

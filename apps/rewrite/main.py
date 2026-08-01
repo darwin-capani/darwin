@@ -77,7 +77,7 @@ def generate(prompt, max_tokens=_MAX_TOKENS, sock_path=None):
         raise RuntimeError("generate proxy socket unavailable")
     req = {"name": APP_NAME, "token": TOKEN, "op": "generate", "text": prompt, "max_tokens": int(max_tokens)}
     with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as gc:
-        gc.settimeout(30)
+        gc.settimeout(_proxy_timeout())
         gc.connect(path)
         gc.sendall((json.dumps(req) + "\n").encode("utf-8"))
         buf = b""
@@ -90,6 +90,24 @@ def generate(prompt, max_tokens=_MAX_TOKENS, sock_path=None):
     if not reply.get("ok"):
         raise RuntimeError(str(reply.get("error", "generate failed")))
     return reply.get("text", "")
+
+
+def _proxy_timeout(default=30.0):
+    """Seconds to wait on the generate proxy — DERIVED from the caller's budget.
+
+    This was hard-coded to 30 s while darwind's APP_REQUEST_TIMEOUT is 15 s, so the
+    ordering was inverted: under a busy inference server the daemon gave up first,
+    discarded a reply still on its way, and reported "the app did not answer" for a
+    tool call that was working. Waiting longer than the caller can only produce that.
+    """
+    raw = os.environ.get("DARWIN_APP_DEADLINE_MS", "")
+    try:
+        budget = float(raw) / 1000.0
+    except (TypeError, ValueError):
+        return default
+    if budget <= 0:
+        return default
+    return max(1.0, budget - 2.0)
 
 
 def compute(payload, sock_path=None):

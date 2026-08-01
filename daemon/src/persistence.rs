@@ -1031,8 +1031,20 @@ impl PersistenceBaseline {
     async fn replace_with(&self, items: &[AutostartItem], now: i64) -> Result<()> {
         let live: Vec<&AutostartItem> = items.iter().filter(|i| !i.is_self).collect();
         let conn = self.conn.lock().await;
+        // ONE TRANSACTION for the whole replacement.
+        //
+        // rusqlite is autocommit, so each row used to be its own WAL commit — every
+        // row rewritten on every tick, for a baseline that changes only when the user
+        // installs or removes a login item. That is tens of fsync-backed commits a
+        // tick for a store whose content is almost always identical.
+        //
+        // It also makes the replacement ATOMIC, which it was not: the upsert phase and
+        // the delete phase below were separate commits, so a crash between them left a
+        // baseline that was neither the old set nor the new one — and this baseline is
+        // what the next tick DIFFS against to decide whether to alarm.
+        let tx = conn.unchecked_transaction()?;
         for i in &live {
-            conn.execute(
+            tx.execute(
                 "INSERT INTO persistence_baseline(surface, key, signed, first_seen, last_seen)
                  VALUES(?1, ?2, ?3, ?4, ?4)
                  ON CONFLICT(surface, key) DO UPDATE SET signed = ?3, last_seen = ?4",
@@ -1040,7 +1052,7 @@ impl PersistenceBaseline {
             )?;
         }
         // Delete rows no longer present in the live set.
-        let mut stmt = conn.prepare("SELECT surface, key FROM persistence_baseline")?;
+        let mut stmt = tx.prepare("SELECT surface, key FROM persistence_baseline")?;
         let recorded: Vec<(String, String)> = stmt
             .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
             .filter_map(|r| r.ok())
@@ -1050,12 +1062,13 @@ impl PersistenceBaseline {
             live.iter().map(|i| (i.surface, i.key.as_str())).collect();
         for (s, k) in &recorded {
             if !live_keys.contains(&(s.as_str(), k.as_str())) {
-                conn.execute(
+                tx.execute(
                     "DELETE FROM persistence_baseline WHERE surface = ?1 AND key = ?2",
                     rusqlite::params![s, k],
                 )?;
             }
         }
+        tx.commit()?;
         Ok(())
     }
 }
