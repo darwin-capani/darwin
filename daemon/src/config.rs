@@ -171,7 +171,7 @@ pub struct Config {
     /// enabling preserves today's wake behavior exactly. PURE matcher in wake.rs;
     /// the always-listening loop that consults it is DEVICE-gated (mic/TCC).
     pub wake: WakeConfig,
-    /// [interpret] — CONTINUOUS LIVE INTERPRETATION (#30). `live` SHIPS ON
+    /// [interpret] — CONTINUOUS LIVE INTERPRETATION (#30). `live` SHIPS OFF
     /// (full-power default) — INERT WITHOUT TCC/MIC: the device-gated mic loop feeds
     /// each VAD segment through the PURE interpret_segment pipeline only after
     /// Microphone consent. interpret.speak stays its own opt-in (render-only). The
@@ -813,7 +813,7 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // word) is in wake.rs; the always-listening loop that calls it is DEVICE-GATED.
     // Listed so neither key reads as a typo.
     ("wake", &["enabled", "phrase"]),
-    // [interpret] — CONTINUOUS LIVE INTERPRETATION (#30, interpret.rs). `live` SHIPS ON
+    // [interpret] — CONTINUOUS LIVE INTERPRETATION (#30, interpret.rs). `live` SHIPS OFF
     // (full-power default) — INERT WITHOUT TCC/MIC: the DEVICE-GATED mic loop feeds each
     // VAD segment through the PURE interpret_segment (transcribe -> on-device-LLM
     // translate -> render/optionally speak) only after Microphone consent;
@@ -1800,10 +1800,21 @@ impl Default for WakeConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct InterpretConfig {
-    /// Master switch for the continuous live-interpret mode. SHIPS ON (full-power default)
-    /// — INERT WITHOUT TCC/MIC: the per-segment interpret pipeline runs from the device-
-    /// gated mic loop, so it captures nothing without Microphone consent. Quality is bounded
-    /// by the local ~4B model; offline degrades honestly.
+    /// Master switch for the continuous live-interpret mode. SHIPS OFF, deliberately.
+    ///
+    /// This is a MODE, not an enhancement. A live-interpreter session renders every VAD
+    /// segment it is handed, and main.rs's pipeline returned that rendering instead of
+    /// continuing to classify/route — so with this ON, spoken COMMANDS came back as
+    /// translations and DARWIN answered nothing by voice at all. It shipped ON.
+    ///
+    /// main.rs now lets any utterance addressed to DARWIN (carrying the wake phrase, or
+    /// answering a parked confirmation) through to the assistant, so enabling this is
+    /// safe and useful. It still ships off because with [wake].enabled off there is no
+    /// way to tell a command from interpreter material.
+    ///
+    /// INERT WITHOUT TCC/MIC either way: the per-segment pipeline runs from the
+    /// device-gated mic loop. Quality is bounded by the local ~4B model; offline
+    /// degrades honestly.
     pub live: bool,
     /// Whether the rendered translation is also VOICED (through the single echo-safe speech
     /// path) in addition to being shown. SHIPS OFF (false): render-only by default.
@@ -1820,12 +1831,10 @@ pub struct InterpretConfig {
 impl Default for InterpretConfig {
     fn default() -> Self {
         Self {
-            // SHIPS ON (full-power default) — INERT WITHOUT TCC/MIC: the per-segment
-            // interpret pipeline runs from the DEVICE-GATED mic loop, so without
-            // Microphone consent (macOS TCC) it interprets nothing. Translation
-            // quality is bounded by the local ~4B model; offline degrades honestly
-            // (never a fabricated translation).
-            live: true,
+            // SHIPS OFF. Turning this on makes the machine an INTERPRETER; it shipped
+            // on, and every spoken command was rendered as a translation instead of
+            // being answered. See the field doc above.
+            live: false,
             // Render-only by default — voicing the translation stays its OWN opt-in.
             speak: false,
             // Empty => auto-detect the source language (honest; never claimed-known).
@@ -6868,15 +6877,19 @@ mod tests {
     }
 
     /// Contract lockstep: [interpret] (#30 continuous live interpretation) ships
-    /// live=TRUE (full-power default; INERT WITHOUT TCC/MIC) and speak=false (voicing
-    /// the translation stays its OWN opt-in, render-only). The default target is
-    /// "English" and the source auto-detects (empty). Every key parses without an
-    /// unknown-key diagnostic.
+    /// live=FALSE and speak=false. The default target is "English" and the source
+    /// auto-detects (empty). Every key parses without an unknown-key diagnostic.
+    ///
+    /// live SHIPPED ON, and main.rs's pipeline returned the rendered translation
+    /// instead of continuing to classify/route — so every spoken command came back as
+    /// a translation and DARWIN answered nothing by voice. This assertion pins the
+    /// corrected default; main.rs additionally lets wake-addressed speech through, so
+    /// an operator who turns this on keeps their assistant.
     #[test]
-    fn interpret_ships_on_inert_without_mic_and_keys_match_the_contract() {
+    fn interpret_ships_off_and_keys_match_the_contract() {
         let (cfg, issues) = Config::parse("");
         assert!(issues.is_empty());
-        assert!(cfg.interpret.live, "continuous live interpretation SHIPS ON (full-power default; inert without mic/TCC)");
+        assert!(!cfg.interpret.live, "live interpretation is a MODE and SHIPS OFF: with it on, spoken commands are rendered as translations instead of answered");
         assert!(!cfg.interpret.speak, "voicing the translation stays its OWN opt-in (render-only default)");
         assert_eq!(cfg.interpret.target_lang, "English", "default target language");
         assert_eq!(cfg.interpret.source_lang, "", "empty source => auto-detect");

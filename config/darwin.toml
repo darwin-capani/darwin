@@ -140,7 +140,7 @@ base_model = "mlx-community/Qwen3-4B-Instruct-2507-4bit"   # the checkpoint the 
 iters = 200              # bounded mlx_lm.lora training steps per run.
 
 [interpret]              # #30 CONTINUOUS LIVE INTERPRETATION. The device-gated mic loop feeds each VAD segment through the PURE interpret pipeline.
-live = true             # master gate. SHIPS ON (full-power default) — INERT WITHOUT TCC/MIC: the per-segment pipeline runs from the device-gated mic loop, so without Microphone consent it interprets nothing. Quality is bounded by the local ~4B model; offline degrades honestly (never a fabricated translation). Set false to disable.
+live = false            # master gate. SHIPS OFF, deliberately. This is a MODE, not an enhancement: a live-interpreter session renders every VAD segment it is given, so with it on and no wake phrase to distinguish them, spoken commands are rendered as translations instead of answered. It shipped ON and DARWIN answered nothing by voice at all. With [wake].enabled on, an utterance carrying the wake phrase now always reaches the assistant, so turning this on is safe and useful — foreign speech is interpreted, "darwin, ..." still works. INERT WITHOUT TCC/MIC either way. Quality is bounded by the local ~4B model; offline degrades honestly (never a fabricated translation).
 speak = false           # render-only by default — voicing the translation stays its OWN opt-in (set true to also speak each rendered translation through the echo-safe speech path).
 source_lang = ""        # SOURCE language to interpret FROM. Empty => auto-detect (the translator is told the source is unknown — never claims a source it only guessed).
 target_lang = "English" # TARGET language to interpret INTO.
