@@ -137,6 +137,14 @@ def _describe_field(label, unit, lo, hi, names, raw):
             if len(vals) == 1 or (hi - lo + 1) % step != 0:
                 return _set_phrase(unit, vals)
             return "every %d %s" % (step, plural)
+        # THE SAME HONESTY RULE AS THE WILDCARD BRANCH ABOVE, which this function's own
+        # comment states and only that branch enforced: a step form may be described as
+        # a CADENCE only when the firing set is evenly spaced across the WHOLE cycle.
+        # Otherwise the wrap is short and "every N units" names a rhythm the job does
+        # not have. 0/25 * * * * fires at :00, :25, :50 and then :00 again — a 10-minute
+        # gap — yet it was described as "every 25 minutes starting at minute 0".
+        cycle_is_even = (hi - lo + 1) % step == 0
+
         if "-" in base:
             a_s, _, b_s = base.partition("-")
             a = _resolve(a_s, names, lo, hi)
@@ -147,6 +155,15 @@ def _describe_field(label, unit, lo, hi, names, raw):
             if len(vals) == 1:
                 # e.g. 1-10/20 -> matches ONLY minute 1, never "every 20 minutes".
                 return _single_phrase(unit, vals[0])
+            # A range also claims an ENDPOINT. 0-30/25 last fires at 25, not 30, so
+            # "through 30" names a firing that never happens.
+            spans_the_cycle = (a == lo and b == hi)
+            if not (cycle_is_even and spans_the_cycle) and vals[-1] != b:
+                return _set_phrase(unit, vals)
+            if not cycle_is_even and vals[-1] == b:
+                # Endpoint is right but the cadence is not; enumerate rather than
+                # assert a rhythm the wrap breaks.
+                return _set_phrase(unit, vals)
             return "every %d %s from %s through %s" % (
                 step, plural, _pretty_value(unit, a), _pretty_value(unit, b))
         # base is a single value: e.g. 5/10 -> every 10 <unit> starting at <value>
@@ -155,6 +172,8 @@ def _describe_field(label, unit, lo, hi, names, raw):
         if len(vals) == 1:
             # e.g. 5/70 -> matches ONLY minute 5, never "every 70 minutes".
             return _single_phrase(unit, vals[0])
+        if not cycle_is_even:
+            return _set_phrase(unit, vals)
         return "every %d %s starting at %s %s" % (
             step, plural, unit, _pretty_value(unit, start))
 

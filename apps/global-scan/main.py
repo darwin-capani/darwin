@@ -297,12 +297,59 @@ def _clean_text(value: str | None) -> str:
     return text.strip()
 
 
+# Tokens that end in a period WITHOUT ending a sentence. Newswire prose is dense with
+# them, and the summary shown to the user was being cut at the first one.
+_ABBREVIATIONS = frozenset(
+    """
+    u.s u.k u.n e.u a.m p.m mr mrs ms dr prof rev sen rep gov pres sgt lt col gen
+    st ave rd blvd inc ltd corp co jr sr vs etc approx est dept univ assn bros
+    jan feb mar apr jun jul aug sep sept oct nov dec no vol fig al
+    """.split()
+)
+
+
+def _ends_a_sentence(text: str, end: int) -> bool:
+    """Is the '.'/'!'/'?' at `end - 1` a real sentence terminator?
+
+    `(.+?[.!?])(\s|$)` alone takes the SHORTEST prefix ending in a terminator followed
+    by whitespace, so "U.S. stocks fell after the Fed held rates steady." summarised to
+    exactly "U.S." — and that string is what the HUD showed as the item. Same for
+    "Sen.", "Mr.", "Jan.", a middle initial, or an ordinal like "No. 3".
+    """
+    if end <= 0:
+        return False
+    if text[end - 1] in "!?":
+        return True  # '!' and '?' do not appear in abbreviations
+    # The word carrying the period.
+    start = end - 1
+    while start > 0 and not text[start - 1].isspace():
+        start -= 1
+    word = text[start:end - 1].strip("([\"'“‘").lower()
+    if not word:
+        return False
+    if word in _ABBREVIATIONS:
+        return False
+    # A single letter is an initial ("J. Smith"), and a dotted acronym ("U.S.A.")
+    # collapses to single letters between its dots.
+    if len(word) == 1 and word.isalpha():
+        return False
+    if all(len(part) <= 1 for part in word.split(".") if part):
+        return False
+    # A digit before the dot inside a longer run ("3.5") is not a boundary either;
+    # the regex already requires trailing whitespace, so only "No. 3." style remains.
+    return True
+
+
 def _first_sentence(value: str | None, limit: int = 220) -> str:
     text = _clean_text(value)
     if not text:
         return ""
-    m = re.search(r"(.+?[.!?])(\s|$)", text)
-    sentence = m.group(1) if m else text
+    sentence = text
+    for m in re.finditer(r"[.!?](?=\s|$)", text):
+        end = m.end()
+        if _ends_a_sentence(text, end):
+            sentence = text[:end]
+            break
     if len(sentence) > limit:
         sentence = sentence[: limit - 1].rstrip() + "…"
     return sentence
