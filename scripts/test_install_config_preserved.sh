@@ -157,22 +157,45 @@ mkdir -p "$FAKE/hub/models--org--a" "$FAKE/hub/models--org--b" \
          "$FAKE/hub/.locks/models--org--a" "$FAKE/hub/.locks/models--org--b" \
          "$FAKE/hub/.locks/models--org--c"
 
+# Seed a stub repo (refs only, like a gated download that never completed) beside the
+# real ones, since the count must exclude it.
+mkdir -p "$FAKE/hub/models--org--stub/blobs" "$FAKE/hub/models--org--stub/refs"
+echo "ref" > "$FAKE/hub/models--org--stub/refs/main"
+for r in a b; do
+    mkdir -p "$FAKE/hub/models--org--$r/blobs"
+    # A real weight blob (>1M).
+    dd if=/dev/zero of="$FAKE/hub/models--org--$r/blobs/w" bs=1m count=2 2>/dev/null
+done
+
 old_count=$(find "$FAKE" -maxdepth 3 -type d -name 'models--*' 2>/dev/null | wc -l | tr -d '[:space:]')
-new_count=$(find "$FAKE/hub" -maxdepth 1 -type d -name 'models--*' 2>/dev/null | wc -l | tr -d '[:space:]')
+
+# The counting logic install.sh really uses, extracted so a rewrite there is caught.
+count_real() {
+    local n=0 repo
+    for repo in "$1"/hub/models--*; do
+        [ -d "$repo" ] || continue
+        if find "$repo/blobs" -type f -size +1M -print -quit 2>/dev/null | grep -q .; then
+            n=$((n + 1))
+        fi
+    done
+    printf '%d' "$n"
+}
+new_count=$(count_real "$FAKE")
+
 if [ "$new_count" = "2" ]; then
-    ok "the model count counts repos (2), not lock dirs"
+    ok "the model count counts repos with WEIGHTS (2), not lock dirs or stubs"
 else
-    fail "model count is $new_count, expected 2"
+    fail "model count is $new_count, expected 2 (a refs-only stub must not count)"
 fi
 if [ "$old_count" != "2" ]; then
     ok "the old expression really was wrong (it counted $old_count)"
 else
     fail "this test cannot distinguish the fix from the bug"
 fi
-if grep -q "find \"\$HF_HOME_DIR/hub\" -maxdepth 1 -type d -name 'models--\*'" "$ROOT/install.sh"; then
-    ok "install.sh's status board uses the corrected expression"
+if grep -q 'find "\$_repo/blobs" -type f -size +1M' "$ROOT/install.sh"; then
+    ok "install.sh counts only repos whose weights are present"
 else
-    fail "install.sh still counts .locks entries as resident models"
+    fail "install.sh counts directories, so a gated 16 KB stub reads as RESIDENT"
 fi
 
 # doctor.sh globbed one level too shallow, so it always reported ZERO.
