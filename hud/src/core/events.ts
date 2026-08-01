@@ -1407,6 +1407,39 @@ export interface AppDataData {
  *  deduped ring is plenty. */
 export const APP_MANIFEST_ISSUE_CAP = 8;
 
+/** Cap on retained config/agents parse issues. Same bounded-accumulate shape as
+ *  APP_MANIFEST_ISSUE_CAP: both are emitted ONCE at daemon startup and retained for
+ *  replay, so a HUD that connects later still learns about them. */
+export const CONFIG_ISSUE_CAP = 12;
+
+/** Format a system / config.invalid or agents.invalid payload into display lines.
+ *
+ *  darwind parses config/darwin.toml and agents.toml, records every unknown section,
+ *  unknown key and malformed section as an "issue", and emits the list SPECIFICALLY so
+ *  the HUD can show it (config.rs: "the caller re-emits them as config.invalid
+ *  telemetry once the hub exists"). The HUD had no case for either event, so it fell
+ *  through applyEnvelope's default and was DROPPED.
+ *
+ *  That matters more than a normal missing panel: a typo'd key is silently ignored by
+ *  the parser, so a mistyped SAFETY key — a confirm gate, a lockdown flag, an egress
+ *  switch — reads as "set" to the operator and is not in effect. The daemon detects it,
+ *  says so, and the only live surface on the appliance threw the message away.
+ *
+ *  SECRET-FREE by construction: the daemon emits key/section NAMES and parse errors,
+ *  never values. */
+export function configIssueLines(data: Record<string, unknown>): string[] {
+  const raw = data["issues"];
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const line = item.trim();
+    if (line.length === 0) continue;
+    out.push(line.length > 200 ? `${line.slice(0, 200)}…` : line);
+  }
+  return out;
+}
+
 /** Format a system / app.manifest_invalid payload — apps.rs
  *  AppRegistry::discover skipped an apps/<name>/ directory whose manifest.toml
  *  failed to parse/validate (`{name, error}`; name is the DIRECTORY, the app
