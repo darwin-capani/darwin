@@ -295,9 +295,18 @@ printf '[interpret]\nlive = true\n' > "$H3/config/darwin.toml"
 printf '[interpret]\nlive = false\n' > "$SRC2/config/darwin.toml"
 reconcile "$SRC2" "$H3"
 if grep -q 'live = true' "$H3/config/darwin.toml" && [ -f "$H3/config/.darwin.toml.shipped" ]; then
-    ok "a pre-marker install is kept and a marker is seeded for next time"
+    ok "a pre-marker install is kept and a marker is seeded"
 else
     fail "a pre-marker install was overwritten, or no marker was seeded"
+fi
+# ...and seeding must NOT make it overwritable next time. Seeding the marker with the
+# DEPLOYED file would reclassify "we cannot tell" as "ours", and the next redeploy would
+# destroy a config the operator really had customised.
+reconcile "$SRC2" "$H3"
+if grep -q 'live = true' "$H3/config/darwin.toml"; then
+    ok "a second redeploy still keeps the pre-marker config"
+else
+    fail "the pre-marker seed made a possibly-customised config overwritable"
 fi
 
 echo

@@ -968,8 +968,15 @@ else
             # An install predating the marker. We cannot prove it is unmodified, so the
             # SAFE choice is theirs — but say so loudly, because a shipped default may
             # have changed underneath them.
+            #
+            # The marker is seeded with the SHIPPED file, NOT the deployed one. Seeding
+            # it with the deployed file would silently reclassify "we cannot tell" as
+            # "ours", and the very next redeploy would overwrite a config the operator
+            # HAD customised. Seeding it with the shipped file keeps the file
+            # permanently theirs until they choose to adopt the shipped one, at which
+            # point deployed == marker and normal updates resume.
             cp "$SRC_ROOT/config/darwin.toml" "$_cfg.shipped"
-            cp "$_cfg" "$_marker"
+            cp "$SRC_ROOT/config/darwin.toml" "$_marker"
             ui_ok "config/darwin.toml KEPT (no marker from a previous install; assuming yours)"
             ui_note " the new shipped config is at config/darwin.toml.shipped — DIFF IT:"
             ui_note "   diff \"$_cfg\" \"$_cfg.shipped\""
