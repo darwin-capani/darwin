@@ -230,6 +230,21 @@ def test_a_range_step_that_stops_short_does_not_claim_the_endpoint():
     assert "25" in got and "0" in got
 
 
+def test_a_start_offset_step_is_not_an_even_cadence():
+    """MY PREVIOUS FIX WAS INCOMPLETE. It hoisted `(hi - lo + 1) % step == 0`, which
+    only asks whether the step divides the field's cycle and says nothing about where
+    the set STARTS. So every N/step with N >= step still claimed an even cadence:
+    30/15 fires at :30 and :45 and then :30 again — a 45-minute gap — and was described
+    as "every 15 minutes starting at minute 30"."""
+    for expr, forbidden in [
+        ("30/15 * * * *", "every 15 minutes"),
+        ("0 12/6 * * *", "every 6 hours"),
+        ("45/20 * * * *", "every 20 minutes"),
+    ]:
+        got = compute({"cron": expr})["summary"]
+        assert forbidden not in got, f"{expr!r} -> {got!r}"
+
+
 def test_honest_cadences_are_still_phrased_as_cadences():
     """The fix must not flatten every step form into an enumeration."""
     assert "every 15 minutes" in compute({"cron": "*/15 * * * *"})["summary"]
@@ -250,6 +265,7 @@ if __name__ == "__main__":
     print("agent-tool contract: 3 checks ok")
     test_step_forms_never_claim_a_cadence_cron_does_not_perform()
     test_a_range_step_that_stops_short_does_not_claim_the_endpoint()
+    test_a_start_offset_step_is_not_an_even_cadence()
     test_honest_cadences_are_still_phrased_as_cadences()
     print("step honesty: 3 checks ok")
     unittest.main()
