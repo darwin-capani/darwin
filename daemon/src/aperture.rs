@@ -866,10 +866,8 @@ pub fn classify_aperture_intent(utterance: &str, now: &DateTime<Local>) -> Optio
 
     // FORGET takes precedence so "forget my activity timeline" never reads as a
     // recall. Requires the timeline word + a wipe verb.
-    let is_forget = lower.contains("forget")
-        || lower.contains("wipe")
-        || lower.contains("clear")
-        || lower.contains("delete");
+    let is_forget =
+        crate::utterance::mentions_any_word(&lower, &["forget", "wipe", "clear", "delete"]);
     if mentions_timeline && is_forget {
         return Some(ApertureIntent::Forget);
     }
@@ -993,6 +991,34 @@ pub fn reset_for_test() {
 
 #[cfg(test)]
 mod tests {
+    /// A RECALL MUST NEVER BE HEARD AS A WIPE.
+    ///
+    /// The forget verbs were matched with `contains` over the whole utterance, so
+    /// "clear" inside "nu-CLEAR" / "CLEAR-ance" fired the destructive branch: asking
+    /// to SEE your activity timeline about nuclear policy ERASED it instead. The
+    /// verbs now go through the shared whole-word rule.
+    #[test]
+    fn a_timeline_recall_about_a_clear_shaped_word_is_not_a_wipe() {
+        let now = Local::now();
+        for u in [
+            "show my activity timeline on nuclear policy",
+            "what's on my timeline about clearance reviews",
+            "my activity log on unclear billing",
+        ] {
+            let got = classify_aperture_intent(u, &now);
+            assert!(
+                !matches!(got, Some(ApertureIntent::Forget)),
+                "{u:?} asks to SEE the timeline; wiping it here destroys the history \
+                 the user was trying to read (got {got:?})"
+            );
+        }
+        // A real wipe still wipes.
+        assert!(matches!(
+            classify_aperture_intent("wipe my activity timeline", &now),
+            Some(ApertureIntent::Forget)
+        ));
+    }
+
     use super::*;
 
     // The globals are process-global; serialize every global-touching test and

@@ -578,7 +578,7 @@ pub fn classify_pasteboard_intent(utterance: &str) -> Option<PasteboardIntent> {
     // FORGET: an explicit wipe of the clipboard history. Requires "clipboard" so a
     // generic "forget that" never wipes the ring.
     if mentions_clipboard
-        && (lower.contains("forget") || lower.contains("clear") || lower.contains("wipe"))
+        && crate::utterance::mentions_any_word(&lower, &["forget", "clear", "wipe"])
     {
         return Some(PasteboardIntent::Forget);
     }
@@ -633,6 +633,29 @@ pub fn reset_for_test() {
 
 #[cfg(test)]
 mod tests {
+    /// A CLIPBOARD RECALL MUST NEVER BE HEARD AS A WIPE — same substring trap as
+    /// the timeline: "clear" hides inside "nuclear"/"clearance", and the wipe
+    /// branch ran first, so asking what you had copied ERASED the ring.
+    #[test]
+    fn a_clipboard_recall_about_a_clear_shaped_word_is_not_a_wipe() {
+        for u in [
+            "what did i copy about nuclear power to my clipboard",
+            "what's in my clipboard about clearance rates",
+        ] {
+            let got = classify_pasteboard_intent(u);
+            assert!(
+                !matches!(got, Some(PasteboardIntent::Forget)),
+                "{u:?} asks to READ the clipboard history; wiping it here destroys \
+                 what the user was reaching for (got {got:?})"
+            );
+        }
+        // A real wipe still wipes.
+        assert!(matches!(
+            classify_pasteboard_intent("clear my clipboard"),
+            Some(PasteboardIntent::Forget)
+        ));
+    }
+
     use super::*;
 
     // The globals are process-global; serialize every global-touching test.
