@@ -119,6 +119,12 @@ pub enum Outcome {
     /// The action returned only a DryRun preview (master OFF path, the shipped
     /// default).
     DryRun,
+    /// The VOICE-ID gate refused the action: the speaker was not recognised as the
+    /// owner, or the turn failed closed. Recorded because a refusal IS a decision — the
+    /// gate fired only an ephemeral `voiceid.denied` telemetry event, so the
+    /// hash-chained log held nothing at all and a reader could not tell an unrecognised
+    /// speaker's attempt from an attempt that never happened.
+    BlockedByVoiceId,
 }
 
 impl Outcome {
@@ -134,6 +140,7 @@ impl Outcome {
             Outcome::Denied => "denied",
             Outcome::Executed => "executed",
             Outcome::DryRun => "dry_run",
+            Outcome::BlockedByVoiceId => "blocked_by_voiceid",
         }
     }
 }
