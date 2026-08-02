@@ -2801,6 +2801,7 @@ async fn handle_runbook_command(
                             // never-pre-approved invariant (the user confirms each
                             // consequential step, one at a time).
                             false,
+                            &mut crate::anthropic::ToolEffect::DryRun,
                         )
                         .await;
                         // A consequential step is NEVER mapped to a produced value (it
@@ -2992,8 +2993,14 @@ async fn handle_undo_command(cmd: crate::journal::UndoCommand, memory: &Memory) 
                 // "undo that" is a DIRECT, user-present interactive command, so it is
                 // user_originated=true AND context_trusted=true — the derived inverse
                 // is treated exactly like a live utterance's tool call.
-                let (outcome, is_error) =
-                    anthropic::execute_tool(&tool, &input, memory, &allowed, &agent, true, true).await;
+                // The undo path reads the PARKED slot back below to decide what to
+                // say, so it does not need the reported effect — but the chokepoint
+                // requires somewhere to report it.
+                let mut effect_scratch = anthropic::ToolEffect::DryRun;
+                let (outcome, is_error) = anthropic::execute_tool(
+                    &tool, &input, memory, &allowed, &agent, true, true, &mut effect_scratch,
+                )
+                .await;
                 // Read back whether the inverse is now the parked confirmation —
                 // never assumed from the outcome text.
                 let parked = crate::confirm::peek_pending(Instant::now())
@@ -3914,6 +3921,7 @@ async fn handle_lumen(
                         // context_trusted=true: a live, attended voice actuation
                         // (ui_actuate is NEVER_AUTO_APPROVE regardless, so it parks).
                         true,
+                        &mut crate::anthropic::ToolEffect::DryRun,
                     )
                     .await;
                     outcome
@@ -7907,6 +7915,7 @@ mod tests {
             &actuator.namespace,
             true,
             true, // context_trusted: mirrors the attended live-actuation production call
+            &mut crate::anthropic::ToolEffect::DryRun,
         )
         .await;
         assert!(
