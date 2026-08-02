@@ -40,7 +40,13 @@ public enum Op: Sendable, Equatable {
     /// recognized text blocks + boxes + structuring. ADDITIVE (the frozen op
     /// shapes above are untouched). READ-ON-REQUEST: a single-shot read, never a
     /// continuous screen-watch. DEVICE-GATED at capture (TCC: Screen Recording).
-    case readScreen(source: CaptureSource)
+    /// `query` is the thing the user asked about ("where is the submit button" ->
+    /// "submit"). The daemon has ALWAYS sent it — op_read_screen builds
+    /// {"op":"read.screen","query":...} — and this case simply had nowhere to put it,
+    /// so decode dropped it and readScreenOnce was called with query: nil. Every
+    /// "where is the <X>" located nothing, and the reply still said the readout would
+    /// appear on the Vision panel.
+    case readScreen(source: CaptureSource, query: String?)
 
     /// describe.capture {path, source?}: capture ONE frame from a source (default
     /// .screen) and WRITE it as a PNG to `path` (the daemon's confined frame
@@ -194,11 +200,17 @@ extension Op {
             // Source is OPTIONAL: absent -> .screen (the read-my-screen default).
             // An explicit source (incl. .file) is accepted so the OCR read path
             // is headlessly testable over a confined file, like analyze.file.
+            // OPTIONAL, and independent of `source`: a query may arrive with or
+            // without one.
+            let query = (json["query"] as? String).flatMap { q -> String? in
+                let t = q.trimmingCharacters(in: .whitespacesAndNewlines)
+                return t.isEmpty ? nil : t
+            }
             if json["source"] == nil {
-                return .readScreen(source: .screen)
+                return .readScreen(source: .screen, query: query)
             }
             guard let src = decodeSource(json: json) else { return .unknown(raw: raw) }
-            return .readScreen(source: src)
+            return .readScreen(source: src, query: query)
         case "describe.capture":
             // `path` is REQUIRED — the host names the confined PNG output the app
             // must write. Source is OPTIONAL: absent -> .screen (the

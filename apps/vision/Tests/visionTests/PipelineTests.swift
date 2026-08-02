@@ -618,7 +618,7 @@ final class ReadScreenWiringTests: XCTestCase {
         await pipe.setFrameSourceFactory { src in
             FixedFrameSource(source: src, auth: .notApplicable, images: [img])
         }
-        await pipe.handle(.readScreen(source: .file(path: "ui.png")))
+        await pipe.handle(.readScreen(source: .file(path: "ui.png"), query: nil))
 
         let evs = await sink.snapshot()
         guard case let .screen(_, _, source, readout, located, query, meta)? = evs.first(where: {
@@ -651,7 +651,7 @@ final class ReadScreenWiringTests: XCTestCase {
         await pipe.setFrameSourceFactory { src in
             FixedFrameSource(source: src, auth: .notApplicable, images: [img])
         }
-        await pipe.handle(.readScreen(source: .file(path: "ui.png")))
+        await pipe.handle(.readScreen(source: .file(path: "ui.png"), query: nil))
         let state = await pipe.currentState
         XCTAssertEqual(state, .idle, "a one-shot read.screen must not change the watch lifecycle state")
     }
@@ -664,7 +664,7 @@ final class ReadScreenWiringTests: XCTestCase {
         await pipe.setFrameSourceFactory { src in
             FixedFrameSource(source: src, auth: .denied, images: [])
         }
-        await pipe.handle(.readScreen(source: .screen))
+        await pipe.handle(.readScreen(source: .screen, query: nil))
         let evs = await sink.snapshot()
         XCTAssertTrue(evs.contains {
             if case let .error(code, _, src) = $0 { return code == "tcc_denied" && src == "screen" }
@@ -682,7 +682,7 @@ final class ReadScreenWiringTests: XCTestCase {
         await pipe.setFrameSourceFactory { src in
             FixedFrameSource(source: src, auth: .notApplicable, images: [])
         }
-        await pipe.handle(.readScreen(source: .file(path: "empty")))
+        await pipe.handle(.readScreen(source: .file(path: "empty"), query: nil))
         let evs = await sink.snapshot()
         XCTAssertTrue(evs.contains {
             if case let .error(code, _, _) = $0 { return code == "no_frame" }; return false

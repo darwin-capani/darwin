@@ -12587,7 +12587,18 @@ async fn mission_save_tool(memory: &Memory, goal: &str) -> String {
             telemetry::emit(
                 "system",
                 "mission.saved",
-                json!({"id": m.id, "status": m.status.as_str()}),
+                // `goal` is what the HUD's DURABLE MISSIONS panel RENDERS — parseMissionEvent
+                // reads it and clips it to MISSION_GOAL_CAP. It was never emitted, so every
+                // row showed an id and nothing else. Same for done/total, which drive the
+                // progress readout.
+                json!({
+                    "id": m.id,
+                    "goal": m.goal,
+                    "status": m.status.as_str(),
+                    // Progress comes from the step list; the HUD reads done/total.
+                    "done": m.steps.iter().filter(|s| matches!(s.status, crate::durable_missions::StepStatus::Done)).count(),
+                    "total": m.steps.len(),
+                }),
             );
             format!(
                 "Saved durable mission [{}] \"{}\" — it's PAUSED and won't run on its own. \
@@ -12665,7 +12676,13 @@ async fn mission_resume_tool(memory: &Memory, id: &str) -> String {
         // refuse. The owner does live web work interactively instead.
         context_trusted: false,
     };
-    telemetry::emit("system", "mission.resumed", json!({"id": id.trim()}));
+    // A resumed mission sent ONLY its id, so the HUD kept the status it already had —
+    // PAUSED — forever, for a mission that is now running.
+    telemetry::emit(
+        "system",
+        "mission.resumed",
+        json!({"id": id.trim(), "status": "running"}),
+    );
     match crate::durable_missions::resume(memory, id, &registry, &planner, &dispatcher, cloud_reachable)
         .await
     {
@@ -12678,7 +12695,11 @@ async fn mission_resume_tool(memory: &Memory, id: &str) -> String {
 async fn mission_cancel_tool(memory: &Memory, id: &str) -> String {
     match crate::durable_missions::cancel(memory, id).await {
         Ok(true) => {
-            telemetry::emit("system", "mission.cancelled", json!({"id": id.trim()}));
+            telemetry::emit(
+                "system",
+                "mission.cancelled",
+                json!({"id": id.trim(), "status": "cancelled"}),
+            );
             format!("Cancelled durable mission {}.", id.trim())
         }
         Ok(false) => format!("I have no durable mission with id {} to cancel.", id.trim()),
@@ -12724,7 +12745,16 @@ async fn draft_compose_tool(
             telemetry::emit(
                 "system",
                 "draft.composed",
-                json!({"id": d.id, "kind": d.kind.as_str(), "status": d.status}),
+                // subject/preview are what the PENDING DRAFTS panel renders;
+                // parseDraftComposed reads both and already clips them, so every draft
+                // showed "(no subject)" with no body preview.
+                json!({
+                    "id": d.id,
+                    "kind": d.kind.as_str(),
+                    "status": d.status,
+                    "subject": d.subject,
+                    "preview": d.preview,
+                }),
             );
             crate::drafts::review_line(&d)
         }
@@ -21886,5 +21916,65 @@ mod audit_lifecycle_tests {
             "Executed is recorded unconditionally — a confirmed-but-not-executed replay \
              would be logged as having run"
         );
+    }
+}
+#[cfg(test)]
+mod hud_frame_field_tests {
+    /// FIELD-NAME DRIFT ACROSS A PROCESS BOUNDARY: nothing errors, the panel just
+    /// renders an empty row forever. The HUD parsers read fields the daemon never sent.
+    ///
+    /// Asserted at the source because the emit sites are inside async tool handlers
+    /// that need a live memory + model to reach; what matters is that the payload
+    /// literal carries the keys the other side reads.
+    fn emit_payload(event: &str) -> String {
+        let src = include_str!("anthropic.rs");
+        // Anchor on the emit's own argument list — not the first mention of the name
+        // anywhere in the file, which is a doc comment or a match arm.
+        let needle = format!("\"{event}\",\n");
+        let i = src
+            .find(&needle)
+            .unwrap_or_else(|| panic!("{event} is no longer emitted"));
+        let rest = &src[i..];
+        // ...and bound it to the json! LITERAL. A generous fixed window reaches into
+        // the code after the emit and finds unrelated keys there: a 1200-char window
+        // made the mission.resumed guard pass against a mutant that removed "status"
+        // from its payload, because the resume() call below happens to mention one.
+        let j = rest.find("json!(").expect("emit payload is not a json! literal");
+        let k = rest[j..].find("}),").map(|e| j + e + 2).unwrap_or(rest.len());
+        rest[j..k].to_string()
+    }
+
+    #[test]
+    fn mission_saved_carries_what_the_panel_renders() {
+        let p = emit_payload("mission.saved");
+        for key in ["\"goal\"", "\"status\"", "\"done\"", "\"total\""] {
+            assert!(
+                p.contains(key),
+                "mission.saved omits {key}; the DURABLE MISSIONS panel reads it and \
+                 renders an id with nothing else"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resumed_mission_stops_reporting_paused() {
+        let p = emit_payload("mission.resumed");
+        assert!(
+            p.contains("\"status\""),
+            "mission.resumed sends only an id, so the HUD keeps the status it already \
+             had — PAUSED — for a mission that is now running"
+        );
+    }
+
+    #[test]
+    fn draft_composed_carries_its_subject_and_preview() {
+        let p = emit_payload("draft.composed");
+        for key in ["\"subject\"", "\"preview\""] {
+            assert!(
+                p.contains(key),
+                "draft.composed omits {key}; every PENDING DRAFTS row renders \
+                 \"(no subject)\" with no body preview"
+            );
+        }
     }
 }
