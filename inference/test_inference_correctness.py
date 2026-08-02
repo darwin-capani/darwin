@@ -26,9 +26,12 @@ reproduced by two independent verifiers.
 
   Run: .venv/bin/python inference/test_inference_correctness.py   (from the repo root)
 """
+import pathlib
 import unittest
 
 import server as S
+
+REPO = pathlib.Path(__file__).resolve().parent.parent
 
 
 def _turns(lines):
@@ -109,6 +112,46 @@ class HabitEvidenceCountsConceptsNotSpellings(unittest.TestCase):
         self.assertFalse(S.habit_supported("user.habit.", "", _turns(["anything"])))
         self.assertFalse(S.habit_supported("user.habit.asks_for_jazz", "", []))
         self.assertFalse(S.habit_supported("user.habit.asks_for_jazz", "", None))
+
+    def test_the_stem_fold_is_deterministic_across_hash_seeds(self):
+        """habit_words is a SET, and the fold is greedy against group[0] as the
+        representative of a PREFIX relation — so which word lands first decides the
+        grouping. With a root and two inflections present (check / checks / checking),
+        starting from "checking" leaves three groups and starting from "check" leaves
+        one. Set iteration order varies with hash randomisation, so the SAME habit could
+        be folded into a different number of CONCEPTS on different server boots,
+        changing both the `required` threshold and the per-line tally.
+
+        Run in FRESH interpreters with different PYTHONHASHSEED values, because within
+        one process the order is already fixed."""
+        import os
+        import subprocess
+        import sys
+
+        code = (
+            "import sys; sys.path.insert(0, %r); import server as S;"
+            "g = S._habit_stem_groups({'check','checks','checking','status','statuses'});"
+            "print(sorted(sorted(x) for x in g))" % str(REPO / "inference")
+        )
+        seen = set()
+        for seed in ("0", "1", "2", "3", "4", "5"):
+            env = dict(os.environ, PYTHONHASHSEED=seed)
+            out = subprocess.run(
+                [sys.executable, "-c", code], capture_output=True, text=True, env=env,
+            )
+            seen.add(out.stdout.strip())
+        self.assertEqual(
+            len(seen), 1,
+            f"the stem fold produced different groupings across hash seeds: {seen}",
+        )
+
+    def test_the_shortest_word_is_always_the_group_representative(self):
+        """The property that makes it canonical: every inflection prefixes the root, so
+        starting from the shortest word absorbs them all."""
+        groups = S._habit_stem_groups({"check", "checks", "checking", "status"})
+        self.assertEqual(len(groups), 2, f"expected 2 concepts, got {groups}")
+        big = max(groups, key=len)
+        self.assertEqual(sorted(big), ["check", "checking", "checks"])
 
     def test_stem_variants_collapse_into_one_concept(self):
         """The property directly: a habit whose words are variants of two ideas is a

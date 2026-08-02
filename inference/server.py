@@ -6812,6 +6812,38 @@ def _habit_words_match(user_word, habit_word):
     return len(shorter) >= _HABIT_MIN_STEM_LEN and longer.startswith(shorter)
 
 
+def _habit_stem_groups(habit_words):
+    """Fold habit words into STEM GROUPS — one group per concept.
+
+    DETERMINISTIC BY CONSTRUCTION. The fold is greedy against group[0] as the
+    representative of a PREFIX relation, so which word lands first decides the
+    grouping: with a root and two inflections present (check / checks / checking),
+    starting from "checking" leaves "check" and "checks" as separate groups, while
+    starting from "check" absorbs both. `habit_words` is a Python SET, whose iteration
+    order varies with hash randomisation — so the same habit could be folded into a
+    different number of concepts on different server boots, changing both the
+    `required` threshold and the per-line tally. A backstop that answers differently
+    per boot is not a backstop.
+
+    Sorting by (length, text) makes the SHORTEST word always the representative, so
+    every inflection of a root necessarily prefixes it and joins the same group. The
+    grouping then has exactly one canonical answer.
+
+    Extracted from habit_supported so the property is directly observable: folded
+    inside, the only visible effect was an occasional flipped verdict on inputs that
+    happened to straddle the threshold.
+    """
+    stems = []
+    for hw in sorted(habit_words, key=lambda w: (len(w), w)):
+        for group in stems:
+            if _habit_words_match(group[0], hw):
+                group.append(hw)
+                break
+        else:
+            stems.append([hw])
+    return stems
+
+
 def habit_supported(key, value, transcripts):
     """Deterministic backstop for prompt-level habit mining: a user.habit.*
     upsert survives only when at least _HABIT_MIN_USER_LINES SEPARATE user
@@ -6849,15 +6881,7 @@ def habit_supported(key, value, transcripts):
     # uses) makes both the threshold and the tally speak in concepts. It also makes
     # `required` honest: a habit whose 3+ words are morphological variants of two ideas
     # is a 2-concept habit, and demanding 2 distinct concepts from it is right.
-    stems = []
-    for hw in habit_words:
-        for group in stems:
-            if _habit_words_match(group[0], hw):
-                group.append(hw)
-                break
-        else:
-            stems.append([hw])
-
+    stems = _habit_stem_groups(habit_words)
     required = 2 if len(stems) >= 3 else 1
     hits = 0
     for turn in transcripts or []:
