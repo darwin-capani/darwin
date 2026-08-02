@@ -1281,6 +1281,20 @@ mod tests {
 mod hijack_tests {
     use super::*;
 
+    /// `PENDING` is PROCESS-GLOBAL and cargo runs test modules concurrently, so
+    /// every test here that parks or takes must serialize on the crate-wide lock —
+    /// the same discipline `tests::store_guard` follows. Without it these raced the
+    /// tool-loop park tests in `anthropic::tests`: a `clear()` there emptied a slot
+    /// parked here, and `an_unattended_tool_park_does_not_arm_the_prompt` failed
+    /// intermittently on a defect that was not there.
+    fn slot_guard() -> std::sync::MutexGuard<'static, ()> {
+        let g = super::PENDING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        clear();
+        g
+    }
+
     fn pending(agent: &str, tool: &str, arg: &str) -> PendingConfirmation {
         PendingConfirmation {
             agent: agent.to_string(),
@@ -1304,7 +1318,7 @@ mod hijack_tests {
     /// now calls.
     #[test]
     fn a_background_park_cannot_steal_the_users_confirm() {
-        let _ = take_live(Instant::now());
+        let _guard = slot_guard();
         park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
         // A standing tick / overnight agent / inbound webhook parks its own action.
         park_ctx(false, pending("scribe", "x_post", "BETA"));
@@ -1322,7 +1336,7 @@ mod hijack_tests {
 
     #[test]
     fn the_users_own_action_still_confirms() {
-        let _ = take_live(Instant::now());
+        let _guard = slot_guard();
         park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
         let taken = take_live(Instant::now()).expect("the user's own park must confirm");
         assert_eq!(taken.tool, "gmail_send");
@@ -1331,7 +1345,7 @@ mod hijack_tests {
     /// A user-facing re-park (the plan-drift path) legitimately re-arms PROMPTED.
     #[test]
     fn a_user_facing_repark_rearms_the_prompt() {
-        let _ = take_live(Instant::now());
+        let _guard = slot_guard();
         park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
         park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA-REVISED"));
         let taken = take_live(Instant::now()).expect("the re-prompted action must confirm");
@@ -1341,7 +1355,7 @@ mod hijack_tests {
     /// park_ctx is what the tool paths call, threading context_trusted.
     #[test]
     fn an_unattended_tool_park_does_not_arm_the_prompt() {
-        let _ = take_live(Instant::now());
+        let _guard = slot_guard();
         park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
         park_ctx(false, pending("scribe", "x_post", "BETA"));
         assert!(
@@ -1380,28 +1394,60 @@ mod hijack_tests {
     /// "confirm" fired arguments the user was never read. Same end state as the
     /// hijack above, reached through the cache instead of the slot.
     ///
-    /// Checked at the source, because tool_loop needs a live model to drive: the
-    /// insert must be GUARDED, and the guard computed before it.
+    /// Checked at the source, because tool_loop needs a live model to drive: BOTH
+    /// ledger inserts must be gated on the call having actually run.
+    ///
+    /// This guard used to pin the literal `if !parked {`, computed from
+    /// `is_parked_consequential`. That predicate was itself the bug — it re-derived
+    /// "did this park?" from the master switch and the consequential registry while
+    /// ignoring the per-action policy, so an `Always` rule that FIRED was labeled
+    /// parked and its insert was skipped, double-firing the actuator on a repeated
+    /// tool_use block. `execute_tool` now reports a `ToolEffect` and both loops gate
+    /// on `Executed`. What the effect means in each regime is asserted behaviorally
+    /// in anthropic.rs's
+    /// `execute_tool_reports_park_and_execute_apart_under_the_same_master_switch`;
+    /// this guard only holds the wiring — that no insert is ever unguarded.
     #[test]
-    fn a_parked_preview_never_enters_the_dedup_ledger() {
+    fn neither_tool_loop_caches_a_call_that_did_not_run() {
         let src = include_str!("anthropic.rs");
-        let insert = src
-            .find("seen.insert(signature, outcome.clone());")
-            .expect("the dedup ledger insert moved; re-point this guard");
-        let parked = src
-            .find("let parked = is_parked_consequential(&name, &block[\"input\"]);")
-            .expect("the parked predicate moved");
-        assert!(
-            parked < insert,
-            "the dedup insert runs before anything knows the call was parked"
+        let inserts: Vec<_> = src.match_indices("seen.insert(signature,").collect();
+        assert_eq!(
+            inserts.len(),
+            2,
+            "expected exactly the cloud + offline tool-loop ledger inserts; a new one \
+             appeared (or one moved) and is not covered by this guard"
         );
-        // The insert must sit inside an `if !parked` block.
-        let window = &src[parked..insert];
-        assert!(
-            window.contains("if !parked {"),
-            "the dedup ledger caches a parked confirmation prompt; a later identical \
-             call then replays a question about an action that is no longer armed"
-        );
+        for (at, _) in inserts {
+            // Walk back to the nearest enclosing `if` LINE (skipping comments, so
+            // prose containing "if" cannot stand in for the real guard) and require
+            // it to test the reported effect. A bare `if !is_error {` is what
+            // shipped the defect.
+            let guard = src[..at]
+                .lines()
+                .rev()
+                .map(str::trim)
+                .find(|l| l.starts_with("if ") && !l.starts_with("//"))
+                .unwrap_or("<no enclosing if>");
+            // Either the effect is matched inline, or the guard is a boolean bound
+            // from it one line earlier — resolve that binding rather than trusting
+            // the name, so an `if did_execute {` whose `did_execute` quietly went
+            // back to meaning something else still fails here.
+            let bound_from_effect = guard
+                .strip_prefix("if ")
+                .and_then(|r| r.strip_suffix(" {"))
+                .is_some_and(|ident| {
+                    src.contains(&format!(
+                        "let {ident} = matches!(effect, ToolEffect::Executed);"
+                    ))
+                });
+            assert!(
+                guard.contains("ToolEffect::Executed") || bound_from_effect,
+                "a ledger insert is guarded by `{guard}`, which is not the effect the \
+                 call reported; caching a parked preview replays a stale confirmation \
+                 prompt, and not caching a real execution lets a repeated tool_use \
+                 block fire the actuator twice"
+            );
+        }
     }
 
     /// No production caller may arm PROMPTED unconditionally again.

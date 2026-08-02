@@ -2664,23 +2664,56 @@ impl Brain for CloudBrain<'_> {
 /// effect that did not occur; the actual not-firing is enforced inside
 /// `execute_tool` (the park branch). Pure (reads only the global switch + the
 /// consequential registry), so it is unit-testable for both gate states.
-fn is_parked_consequential(name: &str, input: &Value) -> bool {
-    if !crate::integrations::consequential_allowed() {
-        return false;
-    }
-    // A built-in consequential tool, OR a CONSEQUENTIAL MCP tool (fail-safe:
-    // unknown -> consequential), OR a `skill_invoke` naming a consequential
-    // skill. Each parks under the ON master switch, so its "outcome" is a
-    // confirmation prompt — never a completed side effect — and must be kept out
-    // of the budget-kill acknowledgment log. This mirrors the park condition in
-    // `execute_tool` exactly, keeping the two predicates in lockstep.
+/// What `execute_tool` ACTUALLY did with a call.
+///
+/// This exists because `is_parked_consequential` tried to re-derive it from the master
+/// switch and the consequential registry alone, and could not: `execute_tool` also
+/// consults the per-action POLICY, and an `Always` rule under a live master switch
+/// EXECUTES the tool outright instead of parking it. The predicate therefore reported
+/// "parked" for exactly the tools that auto-fire, and the loop skipped the RC-2 dedup
+/// insert for them — so a model emitting the same tool_use block twice in one turn sent
+/// two emails, made two posts, wrote two budget changes. The same guard also kept the
+/// real execution out of the budget-kill log, so a killed turn told the user nothing
+/// completed while the action had fired.
+///
+/// The predicate could not be repaired in place: policy rules are scoped by the
+/// preview TEXT, which the loop does not have, so only `execute_tool` can answer this.
+/// It now reports what it decided rather than leaving a second guess to drift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolEffect {
+    /// The real side effect ran.
+    Executed,
+    /// Parked for a spoken confirmation; nothing happened yet.
+    Parked,
+    /// Nothing actuated: a preview (master OFF, or a policy that did not
+    /// auto-approve), or an outright refusal (allowlist, voice-id, policy
+    /// `Never`, lockdown). A refusal is already distinguishable by the
+    /// `is_error` half of execute_tool's return, so it needs no variant of its
+    /// own — and a variant nothing ever constructs is a claim callers would
+    /// match on and never see.
+    DryRun,
+}
+
+/// Does this built-in tool need a spoken confirmation before it can actuate?
+///
+/// THE park condition — `execute_tool` calls exactly this, so there is one
+/// definition rather than a copy per caller. It answers only "is this the kind of
+/// action that parks"; whether it ACTUALLY parked on a given call also depends on
+/// the master switch, the per-action policy, and the voice-id gate, and is
+/// reported back by `execute_tool` as a [`ToolEffect`].
+///
+/// This replaced `is_parked_consequential`, a second copy that folded the master
+/// switch in and was consulted by the tool loop to decide "did this run?". It
+/// could not see the per-action policy, so an `Always` rule that FIRED still
+/// looked parked — see the [`ToolEffect`] docs for what that cost.
+///
+/// `skill_invoke` is not in `CONSEQUENTIAL_TOOLS` (it is a pure dispatcher), so
+/// the condition widens to cover a skill the registry marks consequential.
+fn tool_needs_park(name: &str, input: &Value) -> bool {
     crate::confirm::is_consequential_tool(name)
-        || (crate::mcp::is_mcp_flat_name(name)
-            && crate::mcp::global().class_for_flat(name).is_consequential())
         || (name == "skill_invoke" && skill_invoke_is_consequential(input))
 }
 
-#[allow(clippy::too_many_arguments)] // mirrors the loop's full working set
 /// The capability identifier a turn is attributed to in the optimizer trace: the
 /// SKILL name for a `skill_invoke` (so per-skill attribution works instead of
 /// collapsing every skill to "skill_invoke"), otherwise the tool name itself.
@@ -2817,6 +2850,7 @@ async fn tool_loop(
             // egress guard stays armed, closing the exfiltration channel a nested
             // loop would otherwise reopen.
             let user_originated = context_trusted && call == 0;
+            let mut effect = ToolEffect::DryRun;
             let (outcome, is_error) = execute_tool(
                 &name,
                 &block["input"],
@@ -2829,6 +2863,7 @@ async fn tool_loop(
                 // autonomous loop. Gates the `Always`->park downgrade so a standing
                 // mission / tripwire tick never auto-fires a consequential action.
                 context_trusted,
+                &mut effect,
             )
             .await;
             if !is_error {
@@ -2840,7 +2875,16 @@ async fn tool_loop(
                 // A consequential tool under the ON master switch is PARKED, not
                 // executed: execute_tool returns the dry-run preview with
                 // is_error==false.
-                let parked = is_parked_consequential(&name, &block["input"]);
+                // WHAT THE CALL ACTUALLY DID, reported by the function that decided
+                // it. This was `is_parked_consequential(...)`, a second guess that
+                // consulted the master switch and the consequential registry but NOT
+                // the per-action policy — so an `Always` rule under a live master
+                // switch, which makes execute_tool FIRE rather than park, was still
+                // classified as "parked". Both guards below then skipped the RC-2
+                // dedup insert for exactly the auto-firing tools, and a model
+                // repeating a tool_use block in one turn sent two emails / made two
+                // posts / wrote two budget changes.
+                let did_execute = matches!(effect, ToolEffect::Executed);
                 // First successful execution of this signature: record it for
                 // the dedup ledger AND the budget-kill acknowledgment. An
                 // is_error result is NOT recorded — a genuinely failed call may
@@ -2859,13 +2903,13 @@ async fn tool_loop(
                 // user was never read. Skipping the insert makes a repeat call
                 // re-enter execute_tool and re-park, so the armed action always
                 // matches the question that was asked.
-                if !parked {
+                if did_execute {
                     seen.insert(signature, outcome.clone());
                 }
                 // A parked preview must also NOT enter the budget-kill acknowledgment
                 // log, or budget_exhausted_reply would tell the user a parked action
                 // "did complete" when it only awaits a spoken yes.
-                if !parked {
+                if did_execute {
                     if let Ok(mut log) = executed.lock() {
                         log.push(format!("{name}: {}", first_chars(&outcome, 80)));
                     }
@@ -3369,18 +3413,36 @@ async fn local_tool_loop(
             // model answering the owner directly), so it is context_trusted=true —
             // an `Always` here is attended and unchanged. (The offline subset holds
             // no consequential outward tools anyway.)
-            let (out, is_error) =
-                execute_tool(&call.name, &call.input, memory, allowed, namespace, true, true).await;
+            let mut effect = ToolEffect::DryRun;
+            let (out, is_error) = execute_tool(
+                &call.name,
+                &call.input,
+                memory,
+                allowed,
+                namespace,
+                true,
+                true,
+                &mut effect,
+            )
+            .await;
             if !is_error {
                 // ATTRIBUTION: same capability capture as the cloud tool loop, so
                 // an offline turn's tool/skill is recorded in the trace too.
                 answers::record_turn_tool(&capability_label(&call.name, &call.input));
-                seen.insert(signature, out.clone());
+                // Only a call that ACTUALLY FIRED enters the ledger — same rule as
+                // the cloud loop. A parked preview is a question about live state,
+                // not a result, and the confirmation slot it names can be
+                // overwritten by the next parking call before the repeat lands.
+                if matches!(effect, ToolEffect::Executed) {
+                    seen.insert(signature, out.clone());
+                }
             }
             // A parked consequential preview (is_error == false) OR a gate refusal
             // (is_error == true) both mean a SAFETY GATE fired offline — surface it
-            // for the honest HUD copy.
-            if is_error || is_parked_consequential(&call.name, &call.input) {
+            // for the honest HUD copy. Read from the effect the call reported, not
+            // re-guessed from the registry, so an `Always` rule that FIRED offline
+            // is not mislabeled to the user as an awaiting-confirmation park.
+            if is_error || matches!(effect, ToolEffect::Parked) {
                 gated = true;
             }
             telemetry::emit(
@@ -6950,6 +7012,7 @@ fn render_mcp_outcome(outcome: crate::mcp::CallOutcome) -> (String, bool) {
 /// spoken confirmation prompt; only a later human "yes" replays it in Execute
 /// mode. Under the OFF switch the gate yields DryRun, so the manager returns a
 /// preview and nothing fires. A READ-ONLY tool runs ungated.
+#[allow(clippy::too_many_arguments)] // the MCP twin of execute_tool's working set
 async fn execute_mcp_tool(
     manager: &crate::mcp::McpManager,
     flat: &str,
@@ -6967,7 +7030,10 @@ async fn execute_mcp_tool(
     // downgrade as the built-in path — a standing mission can never auto-fire a
     // consequential MCP action with nobody present. See `execute_tool`.
     context_trusted: bool,
+    // Same contract as execute_tool: report what happened, do not let a caller guess.
+    effect: &mut ToolEffect,
 ) -> (String, bool) {
+    *effect = ToolEffect::DryRun;
     let agent = agent_id_from_namespace(namespace);
     let Some((server, tool)) = crate::mcp::parse_flat_tool_name(flat) else {
         return (format!("Malformed MCP tool id '{flat}'."), true);
@@ -7090,6 +7156,8 @@ async fn execute_mcp_tool(
                 return (policy_never_refusal(flat, &preview_text), true);
             }
             crate::policy::Decision::Always if master_on => {
+                // AUTO-APPROVED AND FIRED — the MCP twin of the built-in arm.
+                *effect = ToolEffect::Executed;
                 // Auto-approve: run the EXACT tool+input in Execute mode now.
                 crate::audit::record_global(
                     namespace, flat, &preview_text,
@@ -7140,9 +7208,13 @@ async fn execute_mcp_tool(
 
         // ASK path with master ON: PARK the EXACT {agent,tool,input} (unchanged).
         if master_on {
-            // REACHES THE USER: propose_standing_mission is the selector path, reached from
-    // router.rs on the live turn where the operator said "every morning, do X".
-    let prompt = crate::confirm::park_ctx(true, crate::confirm::PendingConfirmation {
+            // Nothing has actuated: the loop must not cache this preview as a result.
+            *effect = ToolEffect::Parked;
+            // REACHES THE USER only on an ATTENDED turn. An unattended run (standing
+            // tick, tripwire, injected-content sub-task) parks with no one there to
+            // read the prompt, so arming PROMPTED would let the operator's next
+            // spoken "confirm" — meant for something they *were* read — fire this.
+            let prompt = crate::confirm::park_ctx(context_trusted, crate::confirm::PendingConfirmation {
                 agent: namespace.to_string(),
                 // Park the FLAT id so the replay routes back through dispatch_tool's
                 // mcp__* arm (which re-checks the allowlist and runs in Execute).
@@ -7310,6 +7382,7 @@ fn downgrade_always_if_unattended(
 // identical treatment a live utterance's tool call gets: voice-id refusal,
 // faithful dry-run preview, the policy layer, the master ceiling, and the
 // spoken-confirm park. Undo deliberately has no other execution path.
+#[allow(clippy::too_many_arguments)] // the chokepoint's full working set + the effect it reports back
 pub async fn execute_tool(
     name: &str,
     input: &Value,
@@ -7330,7 +7403,17 @@ pub async fn execute_tool(
     // unattended `Always`->park downgrade so a standing mission can never auto-fire
     // a consequential action with nobody present. See `downgrade_always_if_unattended`.
     context_trusted: bool,
+    // WHAT THIS CALL ACTUALLY DID, reported rather than re-derived.
+    //
+    // `is_parked_consequential` used to guess this from the master switch and the
+    // consequential registry alone. It could not be right: an `Always` policy rule under
+    // a live master switch makes this function EXECUTE instead of park, and policy rules
+    // are scoped by the preview TEXT, which the caller does not have. The guess said
+    // "parked" for exactly the auto-firing tools, so the loop skipped its dedup insert
+    // and a repeated tool_use block fired the action twice.
+    effect: &mut ToolEffect,
 ) -> (String, bool) {
+    *effect = ToolEffect::DryRun;
     // EGRESS GUARD (prompt-injection exfiltration). `open_url` / `web_search` /
     // `sage_research` are read-classified outward GETs: they are NOT in
     // CONSEQUENTIAL_TOOLS, so they never park and never hit the voice-id
@@ -7443,6 +7526,7 @@ pub async fn execute_tool(
             namespace,
             user_originated,
             context_trusted,
+            effect,
         )
         .await;
     }
@@ -7473,8 +7557,7 @@ pub async fn execute_tool(
     // dispatch_tool, which gates the skill internally on the confirm flag. With
     // the master switch OFF this branch is skipped and the dispatch's own
     // gate(confirm)=DryRun yields a preview that fires nothing (unchanged).
-    let needs_park = crate::confirm::is_consequential_tool(name)
-        || (name == "skill_invoke" && skill_invoke_is_consequential(input));
+    let needs_park = tool_needs_park(name, input);
 
     // VOICE-ID LAYER (round G), ADDITIVE on top of the master switch + the
     // confirmation gate, never a replacement. When voice-id is enabled AND a
@@ -7557,6 +7640,8 @@ pub async fn execute_tool(
             crate::policy::Decision::Always if master_on => {
                 let mut exec_input = input.clone();
                 force_confirm(&mut exec_input, true); // gate(true) => Execute now
+                // AUTO-APPROVED AND FIRED. This is the arm the old predicate missed.
+                *effect = ToolEffect::Executed;
                 crate::audit::record_global(
                     namespace, name, &preview,
                     crate::policy::Decision::Always, crate::audit::Outcome::AutoApprovedByPolicy,
@@ -7613,9 +7698,10 @@ pub async fn execute_tool(
             // Park THE EXACT original input (not the confirm-stripped copy) so the
             // replay fires precisely what the user was shown. New consequential
             // invocation replaces any prior pending (single slot).
-            // REACHES THE USER: propose_standing_mission is the selector path, reached from
-    // router.rs on the live turn where the operator said "every morning, do X".
-    let prompt = crate::confirm::park_ctx(true, crate::confirm::PendingConfirmation {
+            // Nothing has actuated: the loop must not cache this preview as a result.
+            *effect = ToolEffect::Parked;
+            // REACHES THE USER only on an ATTENDED turn — see the MCP twin above.
+            let prompt = crate::confirm::park_ctx(context_trusted, crate::confirm::PendingConfirmation {
                 agent: namespace.to_string(),
                 tool: name.to_string(),
                 input: input.clone(),
@@ -7669,6 +7755,8 @@ pub async fn execute_tool(
         return (preview, false);
     }
 
+    // The ordinary (non-consequential, or master-off-with-no-park) path: this really runs.
+    *effect = ToolEffect::Executed;
     dispatch_tool(name, input, memory, namespace, user_originated).await
 }
 
@@ -13752,7 +13840,7 @@ mod tests {
         answer_annotation_telemetry, answers, capability_label,
         downgrade_always_if_unattended,
         execute_mcp_tool, execute_tool,
-        extract_text, facts_block, forge_gate, grounded_world_live, is_parked_consequential,
+        extract_text, facts_block, forge_gate, grounded_world_live, tool_needs_park,
         keychain_query_args, outward_get_egress_refusal, parse_confidence, personalization_block,
         persona_body,
         propose_standing_mission,
@@ -14202,56 +14290,43 @@ mod tests {
         // and stayed inside the cap.
         assert!(out.is_ok() || out.is_err(), "loop returned (terminated)");
         assert!(brain.calls() <= TOOL_LOOP_MAX_CALLS, "bounded even with consequential asks");
-        // And the routing predicate the loop uses for these tools is the
-        // consequential gate — never a read, so the deeper loop cannot smuggle a
-        // consequential action into the "completed" acknowledgment as if it fired.
-        assert!(
-            is_parked_consequential("gcal_create_event", &json!({}))
-                == crate::integrations::consequential_allowed()
-        );
+        // And these tools are park-needing, never reads — so the deeper loop
+        // cannot smuggle a consequential action into the "completed"
+        // acknowledgment as if it had fired.
+        assert!(tool_needs_park("gcal_create_event", &json!({})));
         cleanup_temp_memory(&memory_path("conseq"));
     }
 
-    /// The loop's park-routing predicate (`is_parked_consequential`, the exact
-    /// guard `tool_loop` uses to decide whether an outcome counts as "completed")
-    /// for BOTH gate states. With the switch OFF (this binary's default) nothing
-    /// is "parked" via this predicate — but `execute_tool`'s own gate still keeps
-    /// every consequential dispatch in DryRun. The ON-switch column is proven by
-    /// the gate-aware logic: when the switch is on, a consequential tool returns
-    /// true here (parked, never logged as completed) while reads return false.
-    /// Pure-state assertion mirroring `integrations::gate_truth_table`.
+    /// THE park predicate covers the whole consequential registry and nothing
+    /// else. `execute_tool` calls this exact function, so a tool that falls out of
+    /// the registry stops parking — it dispatches straight through.
+    ///
+    /// The master switch is deliberately NOT a limb: it decides whether a
+    /// park-needing tool parks or merely previews, which is `execute_tool`'s
+    /// business and is asserted behaviorally by
+    /// `execute_tool_reports_park_and_execute_apart_under_the_same_master_switch`.
+    /// Folding it in here is what let the old predicate be mistaken for an answer
+    /// to "did this run?" when it could not see the per-action policy.
     #[test]
-    fn parked_predicate_holds_for_consequential_tools_only() {
-        // Reads are never parked, regardless of the switch.
-        assert!(!is_parked_consequential("recall_facts", &json!({})));
-        assert!(!is_parked_consequential("web_search", &json!({})));
-        // Consequential tools: parked iff the master switch is on. In this binary
-        // the switch is OFF, so the predicate is false — but the DECISION is
-        // `is_consequential_tool && consequential_allowed()`, and both halves are
-        // pinned by their own tests (`consequential_registry_is_complete_and_exact`,
-        // `consequential_ships_off_and_gate_is_dryrun_by_default`). Here we assert
-        // the consequential half is what gates it: every consequential tool is in
-        // the registry, so with the switch ON it WOULD park.
+    fn the_park_predicate_covers_the_consequential_registry_exactly() {
+        // Reads never park.
+        assert!(!tool_needs_park("recall_facts", &json!({})));
+        assert!(!tool_needs_park("web_search", &json!({})));
+        // Every tool in the registry parks — a tool that silently fell out of the
+        // predicate would dispatch its side effect with no confirmation at all.
         for t in crate::confirm::CONSEQUENTIAL_TOOLS {
             assert!(
-                crate::confirm::is_consequential_tool(t),
-                "{t} must be consequential"
-            );
-            // Switch OFF in this binary -> predicate false (no false "parked").
-            assert!(
-                !is_parked_consequential(t, &json!({})),
-                "{t}: with the switch OFF nothing parks via this predicate"
+                tool_needs_park(t, &json!({})),
+                "{t} is in the consequential registry but does not park"
             );
         }
-        // Lockstep with the gate: parked predicate == consequential AND switch.
-        let switch = crate::integrations::consequential_allowed();
-        for t in crate::confirm::CONSEQUENTIAL_TOOLS {
-            assert_eq!(
-                is_parked_consequential(t, &json!({})),
-                crate::confirm::is_consequential_tool(t) && switch,
-                "predicate must equal (consequential && switch)"
-            );
-        }
+        // `skill_invoke` is a dispatcher, not itself consequential — it parks only
+        // when the SKILL it names is. An unknown skill must NOT park by name alone
+        // here; the skill registry is the authority.
+        assert!(
+            !tool_needs_park("skill_invoke", &json!({"name": "no-such-skill"})),
+            "an unknown skill must not be treated as consequential by name alone"
+        );
     }
 
     /// Bound invariant: the per-block dedup ledger means even a model that
@@ -15743,7 +15818,7 @@ mod tests {
     ) -> (String, bool) {
         // Tests through this helper model a direct user request: user_originated AND
         // a live, context_trusted interactive turn (the ATTENDED path).
-        execute_tool(name, input, memory, allowed, "agent.darwin", true, true).await
+        execute_tool(name, input, memory, allowed, "agent.darwin", true, true, &mut super::ToolEffect::DryRun).await
     }
 
     /// Test wrapper modeling an UNATTENDED autonomous run (a standing tick /
@@ -15756,7 +15831,7 @@ mod tests {
         memory: &Memory,
         allowed: &[String],
     ) -> (String, bool) {
-        execute_tool(name, input, memory, allowed, "agent.darwin", false, false).await
+        execute_tool(name, input, memory, allowed, "agent.darwin", false, false, &mut super::ToolEffect::DryRun).await
     }
 
     /// Steve's shipped allowlist (the cloud-tool ids from config/agents.toml):
@@ -16108,16 +16183,12 @@ mod tests {
             crate::confirm::is_consequential_tool("shell_run"),
             "shell_run must be consequential (it parks for a spoken yes, never auto-runs)"
         );
-        {
-            // is_parked_consequential is true only when the master switch is ON
-            // AND the tool is consequential — exactly the condition under which
-            // execute_tool returns a parked preview instead of running.
-            let _on = crate::integrations::ConsequentialOverride::force(true);
-            assert!(
-                is_parked_consequential("shell_run", &json!({"command": "ls"})),
-                "shell_run must register as a park-needing consequential tool under the ON switch"
-            );
-        }
+        // ...and `execute_tool` reads that from THE park predicate, so shell_run
+        // takes the park branch rather than dispatching.
+        assert!(
+            tool_needs_park("shell_run", &json!({"command": "ls"})),
+            "shell_run must be park-needing"
+        );
 
         // (4) VOICE-ID unverified REFUSES shell_run before it can even park, even
         //     with the master switch ON. (We force [shell] off in this sandbox, so
@@ -16220,9 +16291,9 @@ mod tests {
         //     a fresh ui_actuate for action B PARKS AGAIN — so B needs its OWN yes.
         {
             let _on = crate::integrations::ConsequentialOverride::force(true);
-            // Action A registers as park-needing under the ON switch.
+            // Action A is park-needing.
             assert!(
-                is_parked_consequential("ui_actuate", &click_a),
+                tool_needs_park("ui_actuate", &click_a),
                 "ui_actuate (action A) must register as a park-needing consequential tool under the ON switch"
             );
             // Simulate the gate parking A, then ONE confirm consuming it.
@@ -16246,7 +16317,7 @@ mod tests {
             // A SECOND actuation (action B) is itself park-needing — it needs its OWN
             // confirm; there is no batch and no autonomous carry-over.
             assert!(
-                is_parked_consequential("ui_actuate", &click_b),
+                tool_needs_park("ui_actuate", &click_b),
                 "a SECOND actuation (action B) must re-park for its own spoken yes — never batched"
             );
         }
@@ -16375,6 +16446,7 @@ mod tests {
             "agent.sage",
             false, // continuation: untrusted fetched content is in context
             true,  // still a live interactive turn (context_trusted); only the call index is a continuation
+            &mut super::ToolEffect::DryRun,
         )
         .await;
         assert!(is_error, "a data-bearing outward GET in a continuation must be refused: {outcome}");
@@ -16717,6 +16789,164 @@ mod tests {
             "Always under master OFF must persist nothing (the master switch is the hard ceiling)"
         );
         cleanup_temp_memory(&mem_path("policy_always_off"));
+    }
+
+    /// THE DEDUP LEDGER'S KEY, MEASURED AT THE SOURCE.
+    ///
+    /// The tool loop caches a result under its signature so a model that repeats
+    /// an identical tool_use block in one turn does not fire the actuator twice.
+    /// That cache is correct only for a call that ACTUALLY RAN: a parked preview
+    /// is a QUESTION about live state, and the single confirmation slot it names
+    /// can be overwritten by the next parking call before the repeat arrives.
+    ///
+    /// The loop used to decide "did this run?" with `is_parked_consequential`, a
+    /// second guess that read the master switch and the consequential registry but
+    /// NOT the per-action policy. So an `Always` rule under a live master switch —
+    /// which makes execute_tool FIRE — was still classified "parked", the insert
+    /// was skipped, and a repeated block sent two emails / made two posts / wrote
+    /// two budget changes. `execute_tool` now REPORTS what it did.
+    ///
+    /// This asserts the report itself, in both regimes that used to collide, so a
+    /// regression fails here rather than in production on the second send.
+    // intentional: hold the global PENDING serialization guard across the awaited action; #[tokio::test] is current-thread so it cannot self-deadlock
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn execute_tool_reports_park_and_execute_apart_under_the_same_master_switch() {
+        let _lock = crate::confirm::PENDING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mem = open_temp_memory("effect_report");
+        let allowed = ["standing_create".to_string()];
+        let args = json!({"goal": "effect-report mission", "schedule": "daily", "confirm": true});
+
+        // (1) Master ON, NO policy rule: the consequential tool PARKS. Reported
+        //     Parked -> the loop skips the insert, so a repeat re-parks and the
+        //     armed action always matches the question the user was just asked.
+        let mut parked = super::ToolEffect::DryRun;
+        {
+            let _on = crate::integrations::ConsequentialOverride::force(true);
+            let _pol = PolicyOverride::force(true, PolicyStore::empty());
+            crate::confirm::clear();
+            execute_tool(
+                "standing_create", &args, &mem, &allowed, "agent.darwin", true, true, &mut parked,
+            )
+            .await;
+        }
+        assert!(
+            matches!(parked, super::ToolEffect::Parked),
+            "a consequential tool with no policy rule must report Parked under the ON \
+             master switch, not {parked:?} — reporting Executed would cache a \
+             confirmation prompt as if it were a result"
+        );
+
+        // (2) SAME master switch, plus an `Always` rule: the tool FIRES. This is the
+        //     case the old registry-only guess got wrong — identical switch, identical
+        //     tool, opposite effect, and only the policy tells them apart.
+        let mut fired = super::ToolEffect::DryRun;
+        {
+            let _on = crate::integrations::ConsequentialOverride::force(true);
+            let _pol =
+                PolicyOverride::force(true, policy_with(&[("standing_create", Decision::Always)]));
+            crate::confirm::clear();
+            execute_tool(
+                "standing_create", &args, &mem, &allowed, "agent.darwin", true, true, &mut fired,
+            )
+            .await;
+        }
+        assert!(
+            matches!(fired, super::ToolEffect::Executed),
+            "an `Always` rule under the ON master switch EXECUTES, so it must report \
+             Executed, not {fired:?} — the old guess said Parked here, the loop skipped \
+             the dedup insert, and a repeated tool_use block fired the actuator twice"
+        );
+
+        // (3) The two regimes must not report the SAME thing. This is the whole
+        //     defect in one line: the old predicate answered "parked" to both.
+        assert!(
+            !matches!(
+                (&parked, &fired),
+                (super::ToolEffect::Parked, super::ToolEffect::Parked)
+                    | (super::ToolEffect::Executed, super::ToolEffect::Executed)
+            ),
+            "park and auto-approve collapsed to the same reported effect"
+        );
+        crate::confirm::clear();
+        cleanup_temp_memory(&mem_path("effect_report"));
+    }
+
+    /// AN UNATTENDED PARK CANNOT STEAL THE OPERATOR'S SPOKEN "CONFIRM".
+    ///
+    /// `execute_tool` parks a consequential action into a SINGLE slot, and the
+    /// spoken "yes" is matched against the id the operator was actually PROMPTED
+    /// with. Both of its park sites hardcoded `park_ctx(true, ..)`, so an unattended
+    /// turn — a standing tick, a tripwire, a sub-task spawned from injected content —
+    /// registered itself as the prompted action even though nobody was there to read
+    /// it. It then overwrote a park the operator HAD been read, and the next
+    /// "confirm" fired the background action instead.
+    ///
+    /// Driven end to end through `execute_tool` rather than asserted against the
+    /// source, because the whole defect was a literal that LOOKED right.
+    // intentional: hold the global PENDING serialization guard across the awaited action; #[tokio::test] is current-thread so it cannot self-deadlock
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_unattended_park_never_claims_the_operators_prompt() {
+        let _lock = crate::confirm::PENDING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mem = open_temp_memory("unattended_park");
+        let allowed = ["standing_create".to_string(), "shell_run".to_string()];
+        crate::confirm::clear();
+
+        let _on = crate::integrations::ConsequentialOverride::force(true);
+        let _pol = PolicyOverride::force(true, PolicyStore::empty());
+
+        // (1) ATTENDED: the operator asks for ALPHA and is read the prompt.
+        let mut eff = super::ToolEffect::DryRun;
+        execute_tool(
+            "standing_create",
+            &json!({"goal": "ALPHA the operator was read", "schedule": "daily", "confirm": true}),
+            &mem, &allowed, "agent.darwin", true, /* context_trusted */ true, &mut eff,
+        )
+        .await;
+        assert!(matches!(eff, super::ToolEffect::Parked), "ALPHA must park");
+        let alpha = crate::confirm::peek_pending(std::time::Instant::now())
+            .expect("ALPHA is the live pending")
+            .id;
+
+        // (2) UNATTENDED: a background turn parks BETA into the same slot. Nobody
+        //     was prompted, so it must NOT register itself as the prompted action.
+        let mut eff = super::ToolEffect::DryRun;
+        execute_tool(
+            "standing_create",
+            &json!({"goal": "BETA nobody was read", "schedule": "daily", "confirm": true}),
+            &mem, &allowed, "agent.darwin", false, /* context_trusted */ false, &mut eff,
+        )
+        .await;
+        assert!(matches!(eff, super::ToolEffect::Parked), "BETA must park too");
+        let beta = crate::confirm::peek_pending(std::time::Instant::now())
+            .expect("BETA now holds the slot")
+            .id;
+        assert_ne!(alpha, beta, "the two parks must be distinct actions");
+
+        // (3) The operator now says "confirm" — answering the ALPHA question they
+        //     were read. It must fire NOTHING: the slot holds BETA, and BETA never
+        //     claimed the prompt. With the hardcoded `true`, BETA owned the prompt
+        //     record and this returned BETA — the background action fired on a yes
+        //     the operator spoke for something else.
+        let taken = crate::confirm::take_live(std::time::Instant::now());
+        assert!(
+            taken.is_none(),
+            "the spoken confirm fired `{}`, which the operator was never read",
+            taken.map(|p| p.preview).unwrap_or_default()
+        );
+        // And BETA is still waiting for its own confirmation, not discarded.
+        assert!(
+            crate::confirm::peek_pending(std::time::Instant::now()).is_some(),
+            "an unmatched confirm must leave the background park intact"
+        );
+
+        crate::confirm::clear();
+        cleanup_temp_memory(&mem_path("unattended_park"));
     }
 
     /// ALWAYS AUTO-APPROVES WHEN MASTER ON: with the master switch ON + the
@@ -17347,7 +17577,7 @@ mod tests {
         let mgr = mcp_manager_files(vec!["friday".into()]).await;
         // Orchestrator namespace -> agent id "darwin" -> always allowed.
         let (outcome, is_error) =
-            execute_mcp_tool(&mgr, "mcp__files__read_file", &json!({"path": "/tmp/x"}), "agent.darwin", true, true)
+            execute_mcp_tool(&mgr, "mcp__files__read_file", &json!({"path": "/tmp/x"}), "agent.darwin", true, true, &mut super::ToolEffect::DryRun)
                 .await;
         assert!(!is_error, "read-only MCP tool must succeed: {outcome}");
         assert_eq!(outcome, "done");
@@ -17369,6 +17599,7 @@ mod tests {
             "agent.darwin",
             false, // continuation
             true,
+            &mut super::ToolEffect::DryRun,
         )
         .await;
         assert!(is_error, "an outward MCP call on a continuation must be refused");
@@ -17383,10 +17614,97 @@ mod tests {
             "agent.darwin",
             true, // user-originated
             true,
+            &mut super::ToolEffect::DryRun,
         )
         .await;
         assert!(!is_error, "a user-originated call still runs: {outcome}");
         assert_eq!(outcome, "done");
+    }
+
+    /// THE MCP TWIN REPORTS ITS EFFECT TOO.
+    ///
+    /// `execute_mcp_tool` carries its own copy of the park / auto-approve decision,
+    /// and the tool loop's dedup ledger keys on what it reports exactly as it does
+    /// for a built-in. A wrong report here double-fires an MCP write on a repeated
+    /// tool_use block — the same defect, on the surface where the side effect lands
+    /// on someone else's server and cannot be undone locally.
+    ///
+    /// Both regimes run under the SAME master switch, so only the policy separates
+    /// them; that is precisely the distinction the old registry-only guess lost.
+    // intentional: hold the global PENDING serialization guard across the awaited action; #[tokio::test] is current-thread so it cannot self-deadlock
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn execute_mcp_tool_reports_park_and_execute_apart() {
+        let _lock = crate::confirm::PENDING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        // write_file is NOT on the server's read-only list -> consequential.
+        let mgr = mcp_manager_files(vec!["friday".into()]).await;
+        let args = json!({"path": "/tmp/x", "content": "hi"});
+
+        // (1) Master ON, no policy rule -> PARK.
+        let mut parked = super::ToolEffect::DryRun;
+        {
+            let _on = crate::integrations::ConsequentialOverride::force(true);
+            let _pol = PolicyOverride::force(true, PolicyStore::empty());
+            crate::confirm::clear();
+            execute_mcp_tool(
+                &mgr, "mcp__files__write_file", &args, "agent.darwin", true, true, &mut parked,
+            )
+            .await;
+        }
+        assert!(
+            matches!(parked, super::ToolEffect::Parked),
+            "a consequential MCP tool with no policy rule must report Parked, not \
+             {parked:?} — reporting Executed caches a confirmation prompt as a result"
+        );
+
+        // (1b) Master OFF (this binary's shipped default) -> the same call PREVIEWS.
+        //      Nothing parks and nothing fires, so the budget-kill log never records
+        //      an MCP action as "completed" while the gate is off.
+        let mut off = super::ToolEffect::DryRun;
+        {
+            let _pol = PolicyOverride::force(true, PolicyStore::empty());
+            crate::confirm::clear();
+            assert!(!crate::integrations::consequential_allowed());
+            execute_mcp_tool(
+                &mgr, "mcp__files__write_file", &args, "agent.darwin", true, true, &mut off,
+            )
+            .await;
+        }
+        assert!(
+            matches!(off, super::ToolEffect::DryRun),
+            "with the master switch OFF a consequential MCP tool only previews, so it \
+             must report DryRun, not {off:?}"
+        );
+        assert!(
+            crate::confirm::peek_pending(std::time::Instant::now()).is_none(),
+            "master OFF must not arm a pending confirmation"
+        );
+
+        // (2) Same switch as (1) + an `Always` rule -> FIRES against the server.
+        let mut fired = super::ToolEffect::DryRun;
+        let outcome = {
+            let _on = crate::integrations::ConsequentialOverride::force(true);
+            let _pol = PolicyOverride::force(
+                true,
+                policy_with(&[("mcp__files__write_file", Decision::Always)]),
+            );
+            crate::confirm::clear();
+            execute_mcp_tool(
+                &mgr, "mcp__files__write_file", &args, "agent.darwin", true, true, &mut fired,
+            )
+            .await
+        };
+        assert!(
+            matches!(fired, super::ToolEffect::Executed),
+            "an `Always` MCP rule under the ON master switch reaches the server, so it \
+             must report Executed, not {fired:?}: {}",
+            outcome.0
+        );
+        // And it really did reach the mock server, not a preview.
+        assert_eq!(outcome.0, "done", "the auto-approved call must have dispatched");
+        crate::confirm::clear();
     }
 
     /// The guard is SCOPED, not a blanket ban on continuations: a LOCAL stdio
@@ -17403,6 +17721,7 @@ mod tests {
             "agent.darwin",
             false, // continuation
             true,
+            &mut super::ToolEffect::DryRun,
         )
         .await;
         assert!(!is_error, "a local read-only MCP tool still chains: {outcome}");
@@ -17422,6 +17741,7 @@ mod tests {
             "agent.darwin",
             false, // continuation
             true,
+            &mut super::ToolEffect::DryRun,
         )
         .await;
         assert!(!is_error, "a dry-run preview is not an error: {outcome}");
@@ -17441,6 +17761,7 @@ mod tests {
             "agent.veronica",
             true,
             true,
+            &mut super::ToolEffect::DryRun,
         )
         .await;
         assert!(is_error, "a non-allowed agent must be refused");
@@ -17465,6 +17786,7 @@ mod tests {
             "agent.darwin",
             true,
             true,
+            &mut super::ToolEffect::DryRun,
         )
         .await;
         assert!(!is_error, "a dry-run preview is not an error: {outcome}");
@@ -17505,7 +17827,7 @@ mod tests {
                 crate::integrations::consequential_allowed(),
                 "the cfg(test) override must report the switch ON"
             );
-            execute_mcp_tool(&mgr, "mcp__files__write_file", &input, "agent.darwin", true, true).await
+            execute_mcp_tool(&mgr, "mcp__files__write_file", &input, "agent.darwin", true, true, &mut super::ToolEffect::DryRun).await
         };
         // The override dropped above -> the switch reads OFF again for other tests.
         assert!(
@@ -17565,7 +17887,7 @@ mod tests {
                 verified: false,
                 scope: crate::voiceid::GateScope::Consequential,
             });
-            execute_mcp_tool(&mgr, "mcp__files__write_file", &input, "agent.darwin", true, true).await
+            execute_mcp_tool(&mgr, "mcp__files__write_file", &input, "agent.darwin", true, true, &mut super::ToolEffect::DryRun).await
         };
 
         // Refused with the honest voice-id message — NOT a preview, NOT a park.
@@ -17599,7 +17921,7 @@ mod tests {
         // class_for_flat -> Consequential (fail-safe) for an undiscovered tool.
         assert!(mgr.class_for_flat("mcp__files__ghost").is_consequential());
         let (outcome, is_error) =
-            execute_mcp_tool(&mgr, "mcp__files__ghost", &json!({}), "agent.darwin", true, true).await;
+            execute_mcp_tool(&mgr, "mcp__files__ghost", &json!({}), "agent.darwin", true, true, &mut super::ToolEffect::DryRun).await;
         // OFF switch -> DryRun path -> the manager rejects the unknown tool.
         assert!(is_error, "unknown MCP tool must surface an error, not run: {outcome}");
     }
@@ -17689,16 +18011,73 @@ mod tests {
         cleanup_temp_memory(&mem_path("mcp_replay"));
     }
 
-    /// `is_parked_consequential` is false for an MCP flat name when the master
-    /// switch is OFF (the test default) — so the budget-kill log never records an
-    /// MCP action as "completed" while the gate is off.
-    #[test]
-    fn mcp_is_not_parked_consequential_when_switch_off() {
-        assert!(!crate::integrations::consequential_allowed());
-        assert!(
-            !is_parked_consequential("mcp__files__write_file", &json!({})),
-            "switch off -> nothing is parked-consequential"
+    /// AN UNATTENDED **MCP** PARK CANNOT STEAL THE OPERATOR'S SPOKEN "CONFIRM".
+    ///
+    /// The MCP twin of `an_unattended_park_never_claims_the_operators_prompt`.
+    /// `execute_mcp_tool` parks into the SAME single slot as a built-in, and it
+    /// hardcoded `park_ctx(true, ..)` too — so an unattended turn that reached an
+    /// MCP write registered itself as the prompted action and the operator's next
+    /// "confirm", spoken for something they HAD been read, fired it instead. This
+    /// site needs its own test: the built-in test leaves it green.
+    // intentional: hold the global PENDING serialization guard across the awaited action; #[tokio::test] is current-thread so it cannot self-deadlock
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn an_unattended_mcp_park_never_claims_the_operators_prompt() {
+        let _lock = crate::confirm::PENDING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mgr = mcp_manager_files(vec!["friday".into()]).await;
+        crate::confirm::clear();
+
+        let _on = crate::integrations::ConsequentialOverride::force(true);
+        let _pol = PolicyOverride::force(true, PolicyStore::empty());
+
+        // (1) ATTENDED: the operator is read a prompt for ALPHA.
+        crate::confirm::park_ctx(
+            true,
+            crate::confirm::PendingConfirmation {
+                agent: "agent.darwin".into(),
+                tool: "gmail_send".into(),
+                input: json!({"to": "a@b.com", "subject": "ALPHA", "body": "x"}),
+                allowed: vec!["gmail_send".into()],
+                preview: "ALPHA the operator was read".into(),
+                created_at: std::time::Instant::now(),
+                id: String::new(),
+                plan: None,
+            },
         );
+
+        // (2) UNATTENDED: a background turn parks an MCP write into the same slot.
+        let mut effect = super::ToolEffect::DryRun;
+        execute_mcp_tool(
+            &mgr,
+            "mcp__files__write_file",
+            &json!({"path": "/tmp/beta", "content": "BETA nobody was read"}),
+            "agent.darwin",
+            false,
+            /* context_trusted */ false,
+            &mut effect,
+        )
+        .await;
+        assert!(
+            matches!(effect, super::ToolEffect::Parked),
+            "the unattended MCP write must park, not {effect:?}"
+        );
+
+        // (3) The operator says "confirm", answering the ALPHA question. It must
+        //     fire NOTHING — the slot holds the MCP write, which never claimed the
+        //     prompt. With the hardcoded `true` this returned the MCP write.
+        let taken = crate::confirm::take_live(std::time::Instant::now());
+        assert!(
+            taken.is_none(),
+            "the spoken confirm fired `{}`, which the operator was never read",
+            taken.map(|p| p.tool).unwrap_or_default()
+        );
+        assert!(
+            crate::confirm::peek_pending(std::time::Instant::now()).is_some(),
+            "an unmatched confirm must leave the background park intact"
+        );
+        crate::confirm::clear();
     }
 
     /// EDITH's two tools are read-only, hermetic (no network, no Keychain, no
@@ -19317,6 +19696,7 @@ mod tests {
             mnemosyne_ns,
             true,
             true,
+            &mut super::ToolEffect::DryRun,
         )
         .await;
         assert!(!is_error, "recall is read-only and must not error: {hit}");
@@ -19332,7 +19712,7 @@ mod tests {
 
         // recall_facts (the generic read tool mnemosyne also holds): same boundary.
         let (facts, is_error) =
-            execute_tool("recall_facts", &json!({}), &mem, &mnemosyne, mnemosyne_ns, true, true).await;
+            execute_tool("recall_facts", &json!({}), &mem, &mnemosyne, mnemosyne_ns, true, true, &mut super::ToolEffect::DryRun).await;
         assert!(!is_error, "recall_facts is read-only and must not error: {facts}");
         assert!(facts.contains("user.project"), "shared fact must surface: {facts}");
         assert!(
