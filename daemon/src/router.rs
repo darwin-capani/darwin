@@ -6904,7 +6904,7 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
     // gravity op) — handled by requiring a world/scene noun and excluding the
     // gravity case, which the gravity branch below also catches first if it has
     // a target.
-    if (lower.contains("reset") || lower.contains("clear") || lower.contains("wipe"))
+    if crate::utterance::mentions_any_word(&lower, &["reset", "clear", "wipe"])
         && !lower.contains("gravity")
         && (mentions_mark_forge(&lower)
             || mentions_word(&lower, "world")
@@ -6970,11 +6970,7 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
 /// as the other seams' `contains_word`): `word` matches only as a standalone
 /// alnum token, so "box" never fires inside "boxer" and "sim" never inside
 /// "simple".
-fn mentions_word(lower: &str, word: &str) -> bool {
-    lower
-        .split(|c: char| !c.is_alphanumeric())
-        .any(|w| w == word)
-}
+use crate::utterance::mentions_word;
 
 /// The downward gravity magnitude a "set gravity to <target>" phrase selects, or
 /// None when no recognized target is named (a bare "set gravity" with no body
@@ -9423,6 +9419,33 @@ mod tests {
     /// Unrelated utterances never produce a Mark-Forge command (so they fall
     /// through to normal routing) — including ones that share a stray keyword,
     /// and the other apps' control phrases (no cross-app capture).
+    /// A DESCRIPTION MUST NEVER BE HEARD AS A WORLD WIPE.
+    ///
+    /// The reset verbs were matched with `contains`, so "clear" inside "unclear"
+    /// paired with an ordinary "world"/"scene" mention destroyed every body in the
+    /// simulation. The nouns beside them already used whole-word matching; the
+    /// verbs — the half that actually does the damage — did not.
+    #[test]
+    fn a_clear_shaped_word_does_not_wipe_the_world() {
+        for text in [
+            "the physics in this world is unclear",
+            "the scene has nuclear reactors in it",
+            "clearance between the bodies looks tight",
+        ] {
+            let got = mark_forge_command(text);
+            assert!(
+                !matches!(got, Some(MarkForgeCommand::Op(_))),
+                "{text:?} describes the scene; wiping it here destroys every body \
+                 the user built (got {got:?})"
+            );
+        }
+        // A real reset still resets.
+        assert!(
+            mark_forge_command("clear the world").is_some(),
+            "an actual reset command must still reset"
+        );
+    }
+
     #[test]
     fn mark_forge_command_ignores_unrelated_utterances() {
         for text in [

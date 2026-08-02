@@ -400,6 +400,10 @@ mod triage;
 mod ui_automation;
 mod unified_search;
 mod user_model;
+// WHOLE-WORD MATCHING for spoken utterances — the one primitive every intent
+// classifier shares, so a destructive verb can never be found hiding inside an
+// ordinary word ("clear" in "nuclear"). Pure, unit-tested.
+mod utterance;
 mod vad;
 mod vault;
 mod vitals;

@@ -811,10 +811,8 @@ pub fn classify_screen_context_intent(utterance: &str) -> Option<ScreenContextIn
     // recall. Requires the explicit "screen context" phrase + a forget/wipe/clear
     // verb so an ordinary sentence never wipes the ring.
     let mentions_screen_context = lower.contains("screen context");
-    let is_forget = lower.contains("forget")
-        || lower.contains("wipe")
-        || lower.contains("clear")
-        || lower.contains("delete");
+    let is_forget =
+        crate::utterance::mentions_any_word(&lower, &["forget", "wipe", "clear", "delete"]);
     if mentions_screen_context && is_forget {
         return Some(ScreenContextIntent::Forget);
     }
@@ -864,6 +862,28 @@ pub fn is_screen_context_recall(utterance: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// A SCREEN-CONTEXT RECALL MUST NEVER BE HEARD AS A WIPE — the third copy of
+    /// the same substring trap.
+    #[test]
+    fn a_screen_context_recall_about_a_clear_shaped_word_is_not_a_wipe() {
+        for u in [
+            "show my screen context about nuclear reactors",
+            "what was in my screen context on clearance reviews",
+        ] {
+            let got = classify_screen_context_intent(u);
+            assert!(
+                !matches!(got, Some(ScreenContextIntent::Forget)),
+                "{u:?} asks to READ the screen context; wiping it destroys what the \
+                 user was reaching for (got {got:?})"
+            );
+        }
+        // A real wipe still wipes.
+        assert!(matches!(
+            classify_screen_context_intent("forget my screen context"),
+            Some(ScreenContextIntent::Forget)
+        ));
+    }
+
     use super::*;
 
     // The process-global RING + SETTINGS are shared in-RAM state; tests that touch

@@ -66,72 +66,6 @@ pub fn topic_key(topic: &str) -> String {
     let lower = lower.trim();
     // Strip a leading glue preamble up to and including a trailing "on/about/of/into".
     let mut rest = lower;
-    // Common lead-ins a user speaks before naming the subject. Ordered LONGEST /
-    // most-specific first so a phrasing that carries a subject after "on"/"about"
-    // strips the full glue (leaving just the subject), while a BARE management
-    // phrase ("save this research", "forget my research") that names NO subject
-    // strips to "" — the caller reads an empty key as "no topic given".
-    const LEAD_INS: &[&str] = &[
-        "show me my research notebook on ",
-        "show me my research notebook about ",
-        "show my research notebook on ",
-        "show my research notebook about ",
-        "my research notebook on ",
-        "my research notebook about ",
-        "research notebook on ",
-        "research notebook about ",
-        "what have i researched about ",
-        "what have i researched on ",
-        "what did i research about ",
-        "what did i research on ",
-        "what i found on ",
-        "what i found about ",
-        "delete my research notebook on ",
-        "delete my research notebook about ",
-        "forget my research notebook on ",
-        "forget my research notebook about ",
-        "delete my notebook on ",
-        "delete my notebook about ",
-        "forget my notebook on ",
-        "forget my notebook about ",
-        "delete my research on ",
-        "delete my research about ",
-        "forget my research on ",
-        "forget my research about ",
-        "save this research on ",
-        "save this research about ",
-        "save my research on ",
-        "save my research about ",
-        "show my research on ",
-        "show my research about ",
-        "my research on ",
-        "my research about ",
-        "research on ",
-        "research about ",
-        // BARE management phrases that name no subject -> strip to "".
-        "what have i researched",
-        "what did i research",
-        "what i've researched",
-        "what i found",
-        "list my research notebooks",
-        "all my research notebooks",
-        "show me my research notebooks",
-        "show my research notebooks",
-        "my research notebooks",
-        "research notebooks",
-        "list my research",
-        "all my research",
-        "show me my research notebook",
-        "show my research notebook",
-        "my research notebook",
-        "research notebook",
-        "save this research",
-        "save my research",
-        "delete my research",
-        "forget my research",
-        "show my research",
-        "my research",
-    ];
     for lead in LEAD_INS {
         if let Some(stripped) = rest.strip_prefix(lead) {
             rest = stripped.trim();
@@ -139,12 +73,77 @@ pub fn topic_key(topic: &str) -> String {
         }
     }
     // Collapse internal whitespace and drop a trailing question mark.
-    let collapsed: String = rest
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed: String = rest.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.trim_end_matches('?').trim().to_string()
 }
+
+/// The lead-in phrases a user speaks before naming the subject, LONGEST /
+/// most-specific first — so a phrasing that carries a subject after "on"/"about"
+/// strips the full glue (leaving just the subject), while a BARE management
+/// phrase ("save this research", "forget my research") that names NO subject
+/// strips to "". Shared by [`topic_key`] and [`split_lead_and_topic`] so the
+/// COMMAND region and the TOPIC are always cut at the same point.
+const LEAD_INS: &[&str] = &[
+    "show me my research notebook on ",
+    "show me my research notebook about ",
+    "show my research notebook on ",
+    "show my research notebook about ",
+    "my research notebook on ",
+    "my research notebook about ",
+    "research notebook on ",
+    "research notebook about ",
+    "what have i researched about ",
+    "what have i researched on ",
+    "what did i research about ",
+    "what did i research on ",
+    "what i found on ",
+    "what i found about ",
+    "delete my research notebook on ",
+    "delete my research notebook about ",
+    "forget my research notebook on ",
+    "forget my research notebook about ",
+    "delete my notebook on ",
+    "delete my notebook about ",
+    "forget my notebook on ",
+    "forget my notebook about ",
+    "delete my research on ",
+    "delete my research about ",
+    "forget my research on ",
+    "forget my research about ",
+    "save this research on ",
+    "save this research about ",
+    "save my research on ",
+    "save my research about ",
+    "show my research on ",
+    "show my research about ",
+    "my research on ",
+    "my research about ",
+    "research on ",
+    "research about ",
+    // BARE management phrases that name no subject -> strip to "".
+    "what have i researched",
+    "what did i research",
+    "what i've researched",
+    "what i found",
+    "list my research notebooks",
+    "all my research notebooks",
+    "show me my research notebooks",
+    "show my research notebooks",
+    "my research notebooks",
+    "research notebooks",
+    "list my research",
+    "all my research",
+    "show me my research notebook",
+    "show my research notebook",
+    "my research notebook",
+    "research notebook",
+    "save this research",
+    "save my research",
+    "delete my research",
+    "forget my research",
+    "show my research",
+    "my research",
+];
 
 // ---------------------------------------------------------------------------
 // CITE-DISCIPLINE — a report -> a notebook entry, citing ONLY grounded sources
@@ -419,6 +418,43 @@ pub enum NotebookIntent {
     Forget { topic: String },
 }
 
+/// The verbs that mean "throw this notebook away", with the inflections a person
+/// actually speaks. Matched as WHOLE WORDS only — `clear` must never fire on
+/// "nuclear" or "clearance", which is how "save my research on nuclear reactors"
+/// used to delete a notebook.
+const FORGET_VERBS: &[&str] = &[
+    "forget", "forgets", "forgot", "delete", "deletes", "deleted", "remove", "removes", "removed",
+    "clear", "clears", "cleared", "erase", "erases", "erased",
+];
+
+/// The verbs that mean "keep this run". Same whole-word rule.
+const SAVE_VERBS: &[&str] = &["save", "saves", "saved", "saving"];
+
+/// Does `haystack` name any of `words` as a WHOLE WORD? Thin alias over the
+/// shared [`crate::utterance::mentions_any_word`] so this module's verb checks
+/// obey the same rule as every other classifier's.
+fn has_action_word(haystack: &str, words: &[&str]) -> bool {
+    crate::utterance::mentions_any_word(haystack, words)
+}
+
+/// Split an utterance into the COMMAND lead-in (where the action verb lives) and
+/// the TOPIC it names. A spoken command leads with its verb and the subject
+/// follows, so a verb-looking word inside the TOPIC is a subject, not an order:
+/// "save my research on how to clear a paper jam" is a SAVE about clearing jams,
+/// not a request to clear anything.
+///
+/// When no known lead-in matches, the whole utterance is treated as the command
+/// region — the conservative fallback, since a phrasing this function does not
+/// recognize ("delete the notebook about X") still has its verb in front.
+fn split_lead_and_topic(lower: &str) -> (&str, String) {
+    for lead in LEAD_INS {
+        if lower.strip_prefix(lead).is_some() {
+            return (&lower[..lead.len()], topic_key(lower));
+        }
+    }
+    (lower, topic_key(lower))
+}
+
 /// Detect a notebook management intent. CONSERVATIVE and phrase-anchored: the
 /// utterance must mention a research NOTEBOOK / "my research" together with a
 /// save/show/list/forget cue, so an ordinary "research the competitors" never
@@ -432,7 +468,7 @@ pub fn classify_notebook_intent(utterance: &str) -> Option<NotebookIntent> {
     // and must trip the gate even though it names no subject — still conservative
     // (it requires BOTH the save verb AND "research", so "save the file" and the
     // live "research the competitors" never trip it).
-    let saves_research = lower.contains("save") && lower.contains("research");
+    let saves_research = has_action_word(lower, SAVE_VERBS) && lower.contains("research");
     let about_notebook = lower.contains("notebook")
         || lower.contains("my research")
         || lower.contains("i research")
@@ -445,17 +481,29 @@ pub fn classify_notebook_intent(utterance: &str) -> Option<NotebookIntent> {
         return None;
     }
 
-    // FORGET first (an unambiguous clear).
-    const FORGET: &[&str] = &["forget", "delete", "remove", "clear", "erase"];
-    if FORGET.iter().any(|v| lower.contains(v)) {
-        let topic = topic_key(lower);
-        if !topic.is_empty() {
-            return Some(NotebookIntent::Forget { topic });
-        }
+    // FORGET vs SAVE — read from the COMMAND region only, as WHOLE WORDS.
+    //
+    // This used to be `FORGET.iter().any(|v| lower.contains(v))` over the whole
+    // utterance, checked before save. Three ways that destroyed a notebook the
+    // user had just asked to keep:
+    //
+    //   "save my research on NUCLEAR reactors"     -> "clear" inside "nuclear"
+    //   "save my research on CLEARANCE rates"      -> "clear" inside "clearance"
+    //   "save my research on how to CLEAR a jam"   -> a real word, but the TOPIC
+    //
+    // The first two are the substring bug; the third is a real word in the wrong
+    // place. Whole-word matching fixes the first two, and reading only the
+    // command lead-in fixes the third — the subject a user names is never an
+    // order. Destructive intent is the one that must be hardest to trip.
+    let (command, topic) = split_lead_and_topic(lower);
+    // A forget with NO topic falls through rather than clearing the shelf: an
+    // unaddressed "forget my research" lists instead of destroying everything.
+    if has_action_word(command, FORGET_VERBS) && !topic.is_empty() {
+        return Some(NotebookIntent::Forget { topic });
     }
 
     // SAVE (persist a run).
-    if lower.contains("save") {
+    if has_action_word(command, SAVE_VERBS) {
         let topic = topic_key(lower);
         let topic = if topic.is_empty() { None } else { Some(topic) };
         return Some(NotebookIntent::Save { topic });
@@ -961,6 +1009,78 @@ mod tests {
         assert_eq!(classify_notebook_intent("what's the weather"), None);
     }
 
+    /// A SAVE MUST NEVER BE HEARD AS A DELETE.
+    ///
+    /// The forget verbs used to be matched with `contains` over the WHOLE
+    /// utterance, before save was even considered. Two independent ways that
+    /// turned "keep this" into "throw it away":
+    ///
+    ///   * substring — "clear" lives inside "nu-CLEAR" and "CLEAR-ance", so
+    ///     "save my research on nuclear reactors" deleted the notebook;
+    ///   * wrong region — "clear" is a real word in "how to clear a paper jam",
+    ///     but it is the SUBJECT the user named, not the order they gave.
+    ///
+    /// Every case here returns Save today and returned Forget before the fix.
+    /// The topic is asserted too: a Save that keeps the wrong notebook is its own
+    /// silent loss.
+    #[test]
+    fn a_save_is_never_heard_as_a_forget() {
+        for (utterance, topic) in [
+            // -- substring: the verb is not in the utterance at all
+            ("save my research on nuclear reactors", "nuclear reactors"),
+            ("save my research on clearance rates", "clearance rates"),
+            ("save my research on nuclear clearance policy", "nuclear clearance policy"),
+            // -- real word, but inside the TOPIC the user named
+            ("save my research on how to clear a paper jam", "how to clear a paper jam"),
+            ("save my research on removing lead paint", "removing lead paint"),
+            ("save my research on deleted file recovery", "deleted file recovery"),
+            ("save my research on erasure coding", "erasure coding"),
+        ] {
+            assert_eq!(
+                classify_notebook_intent(utterance),
+                Some(NotebookIntent::Save { topic: Some(topic.to_string()) }),
+                "{utterance:?} must SAVE — hearing a delete here destroys the notebook \
+                 the user just asked to keep"
+            );
+        }
+    }
+
+    /// The other direction still works: a real forget command is still a forget,
+    /// including when its TOPIC contains a save word. A fix that made deleting
+    /// impossible would pass the test above and be just as broken.
+    #[test]
+    fn a_real_forget_command_still_forgets() {
+        for (utterance, topic) in [
+            ("forget my research on nuclear reactors", "nuclear reactors"),
+            ("delete my notebook on the JWST", "the jwst"),
+            ("delete my research on saving for retirement", "saving for retirement"),
+            ("forget my research notebook about savings accounts", "savings accounts"),
+        ] {
+            assert_eq!(
+                classify_notebook_intent(utterance),
+                Some(NotebookIntent::Forget { topic: topic.to_string() }),
+                "{utterance:?} is a real delete command and must still delete"
+            );
+        }
+    }
+
+    /// The whole-word rule, at the level it is enforced. `clear` is the verb that
+    /// hides inside the most ordinary English, so it gets the sharpest test.
+    #[test]
+    fn action_words_match_whole_words_only() {
+        assert!(has_action_word("clear the notebook", FORGET_VERBS));
+        assert!(has_action_word("please clear it", FORGET_VERBS));
+        assert!(has_action_word("cleared already", FORGET_VERBS));
+        // ...but never as a fragment of a longer word.
+        assert!(!has_action_word("nuclear reactors", FORGET_VERBS));
+        assert!(!has_action_word("clearance rates", FORGET_VERBS));
+        assert!(!has_action_word("unclear results", FORGET_VERBS));
+        assert!(!has_action_word("nuclear clearance", FORGET_VERBS));
+        // The same rule on the save side.
+        assert!(has_action_word("save it", SAVE_VERBS));
+        assert!(!has_action_word("savearama", SAVE_VERBS));
+    }
+
     // ---- dispatch: an utterance routes end-to-end --------------------------
 
     fn run(topic: &str, report: ResearchReport, synth: &str) -> LastResearchRun {
@@ -1216,3 +1336,5 @@ mod tests {
         assert_eq!(last_run().unwrap().topic, "topic2");
     }
 }
+
+
