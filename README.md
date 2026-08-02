@@ -30,7 +30,7 @@ The installer presents a **futuristic, full-screen progress UI** and does the "e
 - **builds every release artifact fresh** (`darwind` + the HUD + the Swift/Rust micro-apps — it never ships a prebuilt binary),
 - downloads the MLX LLM + Whisper STT weights into the **install-home** HuggingFace cache (`HF_HOME` → `~/Library/Application Support/DARWIN/models`, never the shared per-machine HF cache),
 - leaves the SQLite memory store to be created by `darwind` on first start (the installer never seeds it),
-- and (optionally) installs the two LaunchAgents so DARWIN comes up on login.
+- and (optionally) installs the three LaunchAgents (com.darwin.inference / com.darwin.daemon / com.darwin.hud) so DARWIN comes up on login.
 
 Prefer to read before you run? Clone and use the local entrypoint — same steps, same UI:
 
@@ -91,7 +91,7 @@ To enable it (Apple Developer account required):
 ~/Library/Application\ Support/DARWIN/uninstall.sh
 ```
 
-Completely removes DARWIN from the machine, behind a **two-step typed confirmation** — it asks *"Delete DARWIN completely? (yes/no)"*, and only if you answer `yes` does it ask *"Are you ABSOLUTELY sure? (yes/no)"*. Either `no` (or any unrecognized input) cancels and deletes nothing. It removes **only** DARWIN's own footprint — the install home, the two LaunchAgents, the DARWIN Keychain items (`com.darwin.daemon` only), and the logs — each a specific, guarded path (never a broad `rm`). Run it with `--dry-run` first to see exactly what it would remove without touching anything.
+Completely removes DARWIN from the machine, behind a **two-step typed confirmation** — it asks *"Delete DARWIN completely? (yes/no)"*, and only if you answer `yes` does it ask *"Are you ABSOLUTELY sure? (yes/no)"*. Either `no` (or any unrecognized input) cancels and deletes nothing. It removes **only** DARWIN's own footprint — the install home, the three LaunchAgents (com.darwin.inference / com.darwin.daemon / com.darwin.hud), the DARWIN Keychain items (`com.darwin.daemon` only), and the logs — each a specific, guarded path (never a broad `rm`). Run it with `--dry-run` first to see exactly what it would remove without touching anything.
 
 ---
 

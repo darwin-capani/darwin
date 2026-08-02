@@ -261,19 +261,32 @@ fi
 # --- LaunchAgents ------------------------------------------------------------
 INF_AGENT_TAG="UNKNOWN"
 DMN_AGENT_TAG="UNKNOWN"
-for label in com.darwin.inference com.darwin.daemon; do
+HUD_AGENT_TAG="UNKNOWN"
+# ALL THREE. scripts/install_boot.sh installs three agents and docs/BRINGUP.md §7 says
+# "Three agents are rendered + loaded" — this loop checked two, so a dead HUD agent
+# yielded a fully green board while the operator's only live surface was gone.
+for label in com.darwin.inference com.darwin.daemon com.darwin.hud; do
     plist="$AGENT_DIR/$label.plist"
+    _set_tag() {  # $1 = value
+        case "$label" in
+            com.darwin.inference) INF_AGENT_TAG="$1" ;;
+            com.darwin.daemon)    DMN_AGENT_TAG="$1" ;;
+            com.darwin.hud)       HUD_AGENT_TAG="$1" ;;
+        esac
+    }
     if agent_loaded "$label"; then
         say_ok "LaunchAgent loaded: $label"
-        [ "$label" = "com.darwin.inference" ] && INF_AGENT_TAG="LOADED" || DMN_AGENT_TAG="LOADED"
+        _set_tag "LOADED"
     elif [ "$?" -eq 2 ]; then
         say_info "launchctl unavailable — cannot check $label"
     elif [ -f "$plist" ]; then
         say_warn "LaunchAgent installed but NOT loaded: $label ($plist) — scripts/install_boot.sh --install"
-        [ "$label" = "com.darwin.inference" ] && INF_AGENT_TAG="NOTLOADED" || DMN_AGENT_TAG="NOTLOADED"
+        _set_tag "NOTLOADED"
     else
+        # The HUD agent is legitimately absent when DARWIN.app was not installed, so
+        # this stays an INFO for every label rather than a warning.
         say_info "LaunchAgent not installed: $label (manual bring-up only; scripts/install_boot.sh --install to persist)"
-        [ "$label" = "com.darwin.inference" ] && INF_AGENT_TAG="ABSENT" || DMN_AGENT_TAG="ABSENT"
+        _set_tag "ABSENT"
     fi
 done
 
@@ -306,7 +319,8 @@ if [ "$_UI" -eq 1 ] && command -v ui_status_board >/dev/null 2>&1; then
         "COMMAND SOCKET|$CMD_TAG" \
         "TELEMETRY WS|$TEL_TAG" \
         "INFERENCE AGENT|$INF_AGENT_TAG" \
-        "DAEMON AGENT|$DMN_AGENT_TAG" 2>/dev/null || true
+        "DAEMON AGENT|$DMN_AGENT_TAG" \
+        "HUD AGENT|$HUD_AGENT_TAG" 2>/dev/null || true
 else
     printf '\n  DARWIN DOCTOR\n'
     printf '    venv python ........ %s\n' "$VENV_TAG"
@@ -317,6 +331,7 @@ else
     printf '    telemetry ws ....... %s\n' "$TEL_TAG"
     printf '    inference agent .... %s\n' "$INF_AGENT_TAG"
     printf '    daemon agent ....... %s\n' "$DMN_AGENT_TAG"
+    printf '    hud agent .......... %s\n' "$HUD_AGENT_TAG"
 fi
 
 if [ "$FAULT" -ne 0 ]; then
