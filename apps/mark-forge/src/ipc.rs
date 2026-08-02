@@ -301,6 +301,27 @@ pub const MAX_DT: f64 = 1.0;
 /// ~10⁵ g — beyond any plausible sandbox scenario — but finite and bounded.
 pub const MAX_GRAVITY: f64 = 1.0e6;
 
+/// Largest half-extent / radius a spawned shape may carry.
+///
+/// FINITE IS NOT ENOUGH, which is what `shape_is_finite` alone checked. A sphere of
+/// radius 1e308 is finite, so it was accepted — and `Aabb::of_body` then produced
+/// min=-1e308, max=+1e308, both finite, so the body was GRID-BINNED rather than
+/// treated as a plane. The extent `max - min` overflows to +inf, the broadphase binning
+/// loop derives a cell count from it, and one `body.spawn` made the app allocate
+/// unboundedly (~800 MB/s) and never return. Bounded the same way MAX_DT and
+/// MAX_GRAVITY are: the world is metres, so this is already absurdly generous.
+pub const MAX_SHAPE_EXTENT: f64 = 1.0e6;
+
+/// Largest solver iteration counts a `set.params` patch may carry.
+///
+/// `substeps` and `velocity_iterations` arrive as raw `u32` off the wire and were
+/// never validated — `ParamsPatch::apply` clamps substeps only from BELOW. So a patch
+/// of `substeps: 4_000_000_000` multiplied the per-call work by four billion and
+/// defeated MAX_STEPS_PER_CALL entirely: the cap bounds STEPS, not the substeps inside
+/// each one.
+pub const MAX_SUBSTEPS: u32 = 64;
+pub const MAX_VELOCITY_ITERATIONS: u32 = 64;
+
 /// One body's render transform on the `physics.bodies` feed (SPEC §8). `pos` is
 /// `[x,y,z]`, `quat` is `[x,y,z,w]` (the R3F panel feeds these straight into
 /// `THREE.Vector3`/`THREE.Quaternion`). `shape` is the shape's kind string so the
@@ -662,6 +683,12 @@ fn spawn_refusal(state: &AppState, spec: &SpawnSpec) -> Option<String> {
             return Some("non-finite angular velocity; spawn refused".to_string());
         }
     }
+    if !shape_extent_ok(&spec.shape) {
+        return Some(format!(
+            "shape extent exceeds ±{MAX_SHAPE_EXTENT:e}; body.spawn refused (a \
+             finite-but-astronomical extent overflows the broadphase grid)"
+        ));
+    }
     if !shape_is_finite(&spec.shape) {
         return Some("non-finite shape parameter; spawn refused".to_string());
     }
@@ -675,6 +702,24 @@ fn shape_is_finite(shape: &Shape) -> bool {
         Shape::Sphere { radius } => radius.is_finite(),
         Shape::Cuboid { half_extents } => half_extents.is_finite(),
         Shape::Plane { normal, offset } => normal.is_finite() && offset.is_finite(),
+    }
+}
+
+/// Is every extent of a [`Shape`] within [`MAX_SHAPE_EXTENT`]?
+///
+/// A PLANE IS EXEMPT: it is unbounded by definition and the broadphase treats it as
+/// such rather than binning it, so its offset carries no allocation risk. Spheres and
+/// cuboids ARE binned, and that is where a finite-but-astronomical extent turns into an
+/// unbounded grid.
+fn shape_extent_ok(shape: &Shape) -> bool {
+    match shape {
+        Shape::Sphere { radius } => radius.abs() <= MAX_SHAPE_EXTENT,
+        Shape::Cuboid { half_extents } => {
+            half_extents.x.abs() <= MAX_SHAPE_EXTENT
+                && half_extents.y.abs() <= MAX_SHAPE_EXTENT
+                && half_extents.z.abs() <= MAX_SHAPE_EXTENT
+        }
+        Shape::Plane { .. } => true,
     }
 }
 
@@ -706,6 +751,30 @@ fn gravity_refusal(x: f64, y: f64, z: f64) -> Option<String> {
 /// never sneaks a poison value past while a sibling field is accepted. The reason
 /// string is operator-facing (`log`) only.
 fn params_refusal(patch: &ParamsPatch) -> Option<String> {
+    // SOLVER ITERATION COUNTS, which were completely ungated. Both arrive as raw u32
+    // off the wire; ParamsPatch::apply clamps substeps only from BELOW. So
+    // `substeps: 4_000_000_000` multiplied the per-call work by four billion and
+    // defeated MAX_STEPS_PER_CALL, which bounds STEPS and says nothing about the
+    // substeps inside each one. Refused WHOLE, with an operator-visible reason, exactly
+    // like dt.
+    if let Some(n) = patch.substeps {
+        if n == 0 {
+            return Some("substeps must be >= 1; set.params refused".to_string());
+        }
+        if n > MAX_SUBSTEPS {
+            return Some(format!(
+                "substeps exceeds MAX_SUBSTEPS ({MAX_SUBSTEPS}); set.params refused"
+            ));
+        }
+    }
+    if let Some(n) = patch.velocity_iterations {
+        if n > MAX_VELOCITY_ITERATIONS {
+            return Some(format!(
+                "velocity_iterations exceeds MAX_VELOCITY_ITERATIONS \
+                 ({MAX_VELOCITY_ITERATIONS}); set.params refused"
+            ));
+        }
+    }
     if let Some(dt) = patch.dt {
         if !dt.is_finite() {
             return Some("non-finite dt; set.params refused".to_string());
@@ -1744,5 +1813,91 @@ mod tests {
             out.contains("stopping"),
             "the stop after the bad line still processes: {out}"
         );
+    }
+}
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    fn spec(shape: Shape) -> SpawnSpec {
+        SpawnSpec {
+            shape,
+            pos: crate::math::Vec3::new(0.0, 0.0, 0.0),
+            lin_vel: None,
+            ang_vel: None,
+            mass: None,
+            material: None,
+        }
+    }
+
+    fn patch() -> ParamsPatch {
+        ParamsPatch {
+            dt: None,
+            substeps: None,
+            velocity_iterations: None,
+            restitution_threshold: None,
+            ..Default::default()
+        }
+    }
+
+    /// ONE body.spawn made the app allocate ~800 MB/s and never return. `radius: 1e308`
+    /// is FINITE, so shape_is_finite accepted it; Aabb::of_body then produced finite
+    /// min/max whose EXTENT overflows to +inf, and the broadphase derived a cell count
+    /// from that and binned forever.
+    #[test]
+    fn an_astronomical_radius_is_refused() {
+        let r = spawn_refusal(&AppState::new(), &spec(Shape::Sphere { radius: 1.0e308 }));
+        assert!(r.is_some(), "a 1e308 radius was accepted into the broadphase grid");
+        assert!(r.unwrap().contains("extent"));
+    }
+
+    #[test]
+    fn an_astronomical_half_extent_is_refused() {
+        let s = Shape::Cuboid { half_extents: crate::math::Vec3::new(1.0, 1.0e308, 1.0) };
+        assert!(spawn_refusal(&AppState::new(), &spec(s)).is_some());
+    }
+
+    #[test]
+    fn ordinary_shapes_are_still_accepted() {
+        assert!(spawn_refusal(&AppState::new(), &spec(Shape::Sphere { radius: 0.5 })).is_none());
+        assert!(spawn_refusal(&AppState::new(), &spec(Shape::Cuboid {
+            half_extents: crate::math::Vec3::new(1.0, 2.0, 3.0)
+        }))
+        .is_none());
+    }
+
+    /// A PLANE is unbounded by definition and the broadphase does not bin it, so its
+    /// offset must stay acceptable — over-tightening would break the ground plane every
+    /// scene starts with.
+    #[test]
+    fn a_plane_is_exempt_from_the_extent_bound() {
+        let s = Shape::Plane { normal: crate::math::Vec3::new(0.0, 1.0, 0.0), offset: 1.0e9 };
+        assert!(spawn_refusal(&AppState::new(), &spec(s)).is_none());
+    }
+
+    /// substeps and velocity_iterations were raw u32 off the wire with no validation.
+    /// MAX_STEPS_PER_CALL bounds STEPS, not the substeps inside each one.
+    #[test]
+    fn an_absurd_substep_count_is_refused() {
+        let p = ParamsPatch { substeps: Some(4_000_000_000), ..patch() };
+        assert!(params_refusal(&p).is_some(), "substeps was ungated");
+    }
+
+    #[test]
+    fn an_absurd_velocity_iteration_count_is_refused() {
+        let p = ParamsPatch { velocity_iterations: Some(u32::MAX), ..patch() };
+        assert!(params_refusal(&p).is_some(), "velocity_iterations was ungated");
+    }
+
+    #[test]
+    fn zero_substeps_is_refused() {
+        let p = ParamsPatch { substeps: Some(0), ..patch() };
+        assert!(params_refusal(&p).is_some());
+    }
+
+    #[test]
+    fn ordinary_solver_settings_are_still_accepted() {
+        let p = ParamsPatch { substeps: Some(8), velocity_iterations: Some(8), ..patch() };
+        assert!(params_refusal(&p).is_none());
     }
 }

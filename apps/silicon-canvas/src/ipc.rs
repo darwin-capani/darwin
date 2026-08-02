@@ -387,11 +387,38 @@ fn confine_real_path(app_dir: &Path, path: &Path) -> Result<()> {
     }
 }
 
-/// Infer the [`SceneKind`] from a confined document path's extension. `.kicad_pcb`
-/// is a board; everything else supported is schematic-side.
+/// Infer the [`SceneKind`] from a confined document path's extension.
+///
+/// BOARD-SIDE: `.kicad_pcb` and `.kicad_mod`. A footprint IS board geometry — pads on
+/// copper layers — which is exactly why `parse_footprint_library` builds a
+/// `Scene::new(SceneKind::Pcb)`. This map omitted it and fell through to Schematic, so
+/// the equality check at the open site (`scene.kind != scene_kind_for(&path)`) rejected
+/// EVERY `.kicad_mod` with "imported scene kind does not match the file extension".
+///
+/// `.kicad_mod` is one of the four types the app declares it supports: the extension
+/// gate accepts it, `parse_document` dispatches it to a fully-implemented ~90-line
+/// parser, and the module docs advertise it. All of it was unreachable — a whole
+/// supported file type that could never be opened, and the error blamed the file.
+/// Viewport zoom bounds (SPEC §3: 0.01x-500x). Shared, because they were enforced only
+/// on the explicit `view.set {scale}` branch — `fit_viewport`, which computes the scale
+/// for `project.open` AND for `view.set {fit:...}`, published whatever the framing
+/// arithmetic produced. A document with a tiny extent yields an enormous scale and one
+/// with a huge extent a vanishing one, so the app could publish a viewport far outside
+/// the range its own explicit path documents and enforces.
+const MIN_VIEWPORT_SCALE: f64 = 0.01;
+const MAX_VIEWPORT_SCALE: f64 = 500.0;
+
+fn clamp_viewport_scale(scale: f64) -> f64 {
+    // NaN would survive a bare clamp comparison chain; map it to unit scale.
+    if !scale.is_finite() {
+        return 1.0;
+    }
+    scale.clamp(MIN_VIEWPORT_SCALE, MAX_VIEWPORT_SCALE)
+}
+
 fn scene_kind_for(path: &Path) -> SceneKind {
     match path.extension().and_then(|e| e.to_str()) {
-        Some("kicad_pcb") => SceneKind::Pcb,
+        Some("kicad_pcb") | Some("kicad_mod") => SceneKind::Pcb,
         _ => SceneKind::Schematic,
     }
 }
@@ -527,7 +554,7 @@ fn fit_viewport(bounds: &Aabb, layers: Vec<LayerVisibility>) -> ViewportState {
     // surface with a 10% margin. The renderer owns the real surface size; this
     // is a reasonable headless default the HUD can refine.
     let extent = bounds.width().max(bounds.height()).max(QUANTUM_FALLBACK);
-    let scale = (1000.0 * 0.9) / extent;
+    let scale = clamp_viewport_scale((1000.0 * 0.9) / extent);
     ViewportState {
         x: center.x,
         y: center.y,
@@ -548,7 +575,7 @@ fn dispatch_view_set(state: &mut AppState, view: &ViewSet) -> Result<Vec<Telemet
             state.viewport.y = *y;
             // Clamp the zoom into the SPEC §3 range (0.01×–500×) defensively so a
             // bogus op cannot drive the renderer to a degenerate transform.
-            state.viewport.scale = scale.clamp(0.01, 500.0);
+            state.viewport.scale = clamp_viewport_scale(*scale);
         }
         ViewSet::Fit { target } => {
             let bounds = fit_bounds(state, target)?;
@@ -2436,6 +2463,65 @@ mod tests {
         assert!(
             out.contains("stopping"),
             "the stop after the bad line still processes (the loop did not break): {out}"
+        );
+    }
+}
+#[cfg(test)]
+mod extension_and_viewport_tests {
+    use super::*;
+
+    /// The open site rejects a document when `scene.kind != scene_kind_for(&path)`.
+    /// `parse_footprint_library` builds a Pcb scene while this map sent `.kicad_mod` to
+    /// Schematic, so EVERY footprint open failed with "imported scene kind does not
+    /// match the file extension" — a supported file type, with a fully implemented
+    /// parser and an accepting extension gate, that could never be opened. The error
+    /// blamed the file.
+    #[test]
+    fn every_supported_extension_maps_to_the_kind_its_parser_builds() {
+        assert_eq!(scene_kind_for(Path::new("b.kicad_pcb")), SceneKind::Pcb);
+        assert_eq!(
+            scene_kind_for(Path::new("f.kicad_mod")),
+            SceneKind::Pcb,
+            "a footprint IS board geometry — pads on copper layers — and its parser \
+             builds a Pcb scene, so the open check rejects it unless this agrees"
+        );
+        assert_eq!(scene_kind_for(Path::new("s.kicad_sch")), SceneKind::Schematic);
+        assert_eq!(scene_kind_for(Path::new("l.kicad_sym")), SceneKind::Schematic);
+    }
+
+    /// SPEC §3 documents a 0.01x-500x zoom range, and the explicit `view.set {scale}`
+    /// branch enforced it — while `fit_viewport`, which computes the scale for
+    /// `project.open` AND `view.set {fit}`, published whatever the framing arithmetic
+    /// produced.
+    #[test]
+    fn the_viewport_scale_is_bounded_wherever_it_is_written() {
+        assert_eq!(clamp_viewport_scale(1e9), MAX_VIEWPORT_SCALE);
+        assert_eq!(clamp_viewport_scale(1e-9), MIN_VIEWPORT_SCALE);
+        assert_eq!(clamp_viewport_scale(2.5), 2.5);
+        // A degenerate extent (zero size) makes the framing division produce inf or
+        // NaN. Both fall back to UNIT scale rather than to MAX: an infinite scale is
+        // not "as zoomed as possible", it is "this document has no size", and 500x on
+        // that is worse than 1x.
+        assert_eq!(clamp_viewport_scale(f64::INFINITY), 1.0);
+        assert_eq!(clamp_viewport_scale(f64::NEG_INFINITY), 1.0);
+        assert_eq!(clamp_viewport_scale(f64::NAN), 1.0);
+    }
+
+    #[test]
+    fn the_fit_path_clamps_too() {
+        // Scoped to fit_viewport's BODY. An earlier version searched the whole file for
+        // the literal call and found the copy inside this very test — the third
+        // self-match trap of the session, and one that made the guard pass against a
+        // mutant that removed the clamp entirely.
+        let src = include_str!("ipc.rs");
+        let i = src.find("fn fit_viewport(").expect("fit_viewport moved");
+        let rest = &src[i..];
+        let end = rest.find("\n}\n").map(|e| e + 2).unwrap_or(rest.len());
+        let body = &rest[..end];
+        assert!(
+            body.contains("clamp_viewport_scale"),
+            "fit_viewport publishes an unclamped scale, so project.open and \
+             view.set{{fit}} can exceed the documented 0.01x-500x range"
         );
     }
 }
