@@ -1068,6 +1068,9 @@ pub async fn run(rb: &Runbook, reg: &Registry, router: &dyn RunbookRouter) -> Ru
     // Outputs actually produced by completed steps (id -> value). A parked / refused /
     // blocked step NEVER writes here, so a downstream ref to it stays unresolved.
     let mut produced: HashMap<String, Value> = HashMap::new();
+    // Step ids that completed with RunOutcome::Done — the only outcome that satisfies
+    // a `needs` edge. A parked or refused prerequisite must block its dependants.
+    let mut completed: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut outcomes = Vec::with_capacity(order.len());
 
     for id in &order {
@@ -1080,7 +1083,24 @@ pub async fn run(rb: &Runbook, reg: &Registry, router: &dyn RunbookRouter) -> Ru
         // never route it on a fabricated input).
         let mut input = serde_json::Map::new();
         let mut blocked_on: Option<String> = None;
+        // `needs` IS A BARRIER, not just a sort key.
+        //
+        // Only an unresolved ${producer.output} reference used to block a step. A
+        // `needs = ["x"]` ordering edge with no data reference was consumed purely to
+        // compute topological order and never re-checked against x's OUTCOME — so a
+        // step whose prerequisite PARKED for a confirmation, or was REFUSED, ran anyway.
+        // The DAG then applied half of itself: "back up the database" parks awaiting a
+        // spoken yes, and "wipe the old volume" executes regardless.
+        for dep in &s.needs {
+            if !completed.contains(dep.as_str()) {
+                blocked_on = Some(dep.clone());
+                break;
+            }
+        }
         for (k, expr) in &s.with {
+            if blocked_on.is_some() {
+                break;
+            }
             match expr {
                 Expr::Literal { value, .. } => {
                     input.insert(k.clone(), value.clone());
@@ -1126,7 +1146,10 @@ pub async fn run(rb: &Runbook, reg: &Registry, router: &dyn RunbookRouter) -> Ru
                 if s.out.is_some() {
                     produced.insert(s.id.clone(), v);
                 }
-                (RunOutcome::Done, "done".to_string())
+                {
+                    completed.insert(s.id.clone());
+                    (RunOutcome::Done, "done".to_string())
+                }
             }
             StepResult::Parked(prompt) => (RunOutcome::Parked, prompt),
             StepResult::Refused(reason) => (RunOutcome::Refused, reason),
@@ -1721,6 +1744,52 @@ mod tests {
                 }
             })
         }
+    }
+
+    /// `needs` IS A BARRIER, not just a sort key.
+    ///
+    /// Only an unresolved ${producer.output} reference blocked a step. A `needs = ["x"]`
+    /// ORDERING edge with no data reference was consumed purely to compute topological
+    /// order and never re-checked against x's OUTCOME — so a step whose prerequisite
+    /// PARKED for a spoken confirmation ran anyway, and the DAG applied half of itself.
+    #[tokio::test]
+    async fn a_step_whose_prerequisite_parked_is_blocked() {
+        // "post" is consequential, so MockRouter parks it. "cleanup" needs it by
+        // ORDERING only — it references no ${post.*} value, which is exactly the case
+        // that used to slip through.
+        let src = r#"
+            [runbook]
+            name = "half-applied"
+            [[step]]
+            id = "post"
+            uses = "post"
+            with = { channel = "c", text = "hi" }
+            [[step]]
+            id = "cleanup"
+            uses = "list_prs"
+            with = { owner = "o", repo = "r" }
+            needs = ["post"]
+        "#;
+        let rb = parse(src).unwrap();
+        let router = MockRouter::new();
+        let report = run(&rb, &reg(), &router).await;
+
+        assert!(!report.refused_unsound, "the runbook must parse as sound");
+        let cleanup = report
+            .steps
+            .iter()
+            .find(|o| o.id == "cleanup")
+            .unwrap_or_else(|| panic!("cleanup missing; report was {report:?}"));
+        assert_ne!(
+            cleanup.outcome,
+            RunOutcome::Done,
+            "cleanup ran while its prerequisite was still awaiting a spoken \
+             confirmation — the runbook applied half of itself"
+        );
+        assert!(
+            !router.routed().contains(&"cleanup".to_string()),
+            "a blocked step must not even be ROUTED"
+        );
     }
 
     #[tokio::test]

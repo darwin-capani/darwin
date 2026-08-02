@@ -7033,6 +7033,16 @@ async fn execute_mcp_tool(
             "voiceid.denied",
             json!({"tool": flat, "agent": namespace, "phase": "execute", "mcp": true}),
         );
+        // A REFUSAL IS A DECISION. This emitted only an ephemeral voiceid.denied
+        // telemetry event, so the hash-chained audit log held nothing — and a reader
+        // could not distinguish an unrecognised speaker attempting a consequential
+        // action from an attempt that never happened. Secret-free by construction: the
+        // tool NAME and the refusal class only, never a preview (no preview is built on
+        // this path, deliberately).
+        crate::audit::record_global(
+            namespace, flat, "voice-id refused (speaker not recognised)",
+            crate::policy::Decision::Ask, crate::audit::Outcome::BlockedByVoiceId,
+        ).await;
         return (crate::voiceid::unrecognized_refusal(), true);
     }
 
@@ -7486,6 +7496,16 @@ pub async fn execute_tool(
             "voiceid.denied",
             json!({"tool": name, "agent": namespace, "phase": "execute"}),
         );
+        // A REFUSAL IS A DECISION. This emitted only an ephemeral voiceid.denied
+        // telemetry event, so the hash-chained audit log held nothing — and a reader
+        // could not distinguish an unrecognised speaker attempting a consequential
+        // action from an attempt that never happened. Secret-free by construction: the
+        // tool NAME and the refusal class only, never a preview (no preview is built on
+        // this path, deliberately).
+        crate::audit::record_global(
+            namespace, name, "voice-id refused (speaker not recognised)",
+            crate::policy::Decision::Ask, crate::audit::Outcome::BlockedByVoiceId,
+        ).await;
         return (crate::voiceid::unrecognized_refusal(), true);
     }
 
@@ -7700,6 +7720,16 @@ pub async fn replay_confirmed_action(
             "voiceid.denied",
             json!({"tool": pending.tool, "agent": pending.agent, "phase": "confirm"}),
         );
+        // A REFUSAL IS A DECISION. This emitted only an ephemeral voiceid.denied
+        // telemetry event, so the hash-chained audit log held nothing — and a reader
+        // could not distinguish an unrecognised speaker attempting a consequential
+        // action from an attempt that never happened. Secret-free by construction: the
+        // tool NAME and the refusal class only, never a preview (no preview is built on
+        // this path, deliberately).
+        crate::audit::record_global(
+            &pending.agent, &pending.tool, "voice-id refused (speaker not recognised)",
+            crate::policy::Decision::Ask, crate::audit::Outcome::BlockedByVoiceId,
+        ).await;
         return (crate::voiceid::unrecognized_refusal(), true);
     }
     // THRESHOLD — GUEST MODE: a parked action is the OWNER's; a guest may NEVER
