@@ -57,25 +57,49 @@ final class OpDecodeTests: XCTestCase {
 
     // --- read.screen (the additive OCR screen-read op) ----------------------
 
+    /// THE FIELD THE DAEMON HAS ALWAYS SENT. op_read_screen emits
+    /// {"type":"op","op":"read.screen","query":"submit"} for "where is the submit
+    /// button", and this decode read only `source` — so the query was dropped, the
+    /// pipeline ran with query: nil, and every "where is the <X>" located nothing while
+    /// the spoken reply still promised a readout on the Vision panel.
+    func testReadScreenCarriesTheQueryTheDaemonSends() {
+        XCTAssertEqual(
+            Op.decode(line: #"{"type":"op","op":"read.screen","query":"submit"}"#),
+            .readScreen(source: .screen, query: "submit"))
+    }
+
+    func testReadScreenQueryIsIndependentOfSource() {
+        XCTAssertEqual(
+            Op.decode(line: #"{"type":"op","op":"read.screen","source":"screen","query":"cancel"}"#),
+            .readScreen(source: .screen, query: "cancel"))
+    }
+
+    /// A whitespace-only query is not a query; it must not become a search for "".
+    func testABlankReadScreenQueryIsTreatedAsAbsent() {
+        XCTAssertEqual(
+            Op.decode(line: #"{"type":"op","op":"read.screen","query":"   "}"#),
+            .readScreen(source: .screen, query: nil))
+    }
+
     func testReadScreenDefaultsToScreenWhenNoSource() {
         // Bare read.screen (no source) -> .readScreen(.screen): the "read my
         // screen" default.
         XCTAssertEqual(
             Op.decode(line: #"{"type":"op","op":"read.screen"}"#),
-            .readScreen(source: .screen))
+            .readScreen(source: .screen, query: nil))
     }
 
     func testReadScreenAcceptsExplicitSource() {
         XCTAssertEqual(
             Op.decode(line: #"{"type":"op","op":"read.screen","source":"screen"}"#),
-            .readScreen(source: .screen))
+            .readScreen(source: .screen, query: nil))
         XCTAssertEqual(
             Op.decode(line: #"{"type":"op","op":"read.screen","source":"camera"}"#),
-            .readScreen(source: .camera))
+            .readScreen(source: .camera, query: nil))
         // Explicit .file source is accepted (the headlessly-testable read path).
         XCTAssertEqual(
             Op.decode(line: #"{"type":"op","op":"read.screen","source":"file","path":"videos/input/ui.png"}"#),
-            .readScreen(source: .file(path: "videos/input/ui.png")))
+            .readScreen(source: .file(path: "videos/input/ui.png"), query: nil))
     }
 
     func testReadScreenFileWithoutPathIsUnknown() {
@@ -87,7 +111,7 @@ final class OpDecodeTests: XCTestCase {
     }
 
     func testReadScreenWireName() {
-        XCTAssertEqual(Op.readScreen(source: .screen).wireName, "read.screen")
+        XCTAssertEqual(Op.readScreen(source: .screen, query: nil).wireName, "read.screen")
     }
 
     // --- describe.capture (the additive VLM screen-capture op) --------------

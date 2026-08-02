@@ -558,8 +558,8 @@ public actor Pipeline {
             config.sensitivity = max(0, min(1, value))
             await emitStatus(message: nil)
 
-        case let .readScreen(source):
-            await readScreenOnce(source: source, query: nil)
+        case let .readScreen(source, query):
+            await readScreenOnce(source: source, query: query)
 
         case let .describeCapture(path, source):
             await describeCaptureOnce(source: source, path: path)

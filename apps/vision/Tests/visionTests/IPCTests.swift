@@ -322,4 +322,5 @@ actor RecordingSink: EventSink {
     private(set) var events: [VisionEvent] = []
     func emit(_ event: VisionEvent) async { events.append(event) }
     func snapshot() -> [VisionEvent] { events }
+
 }
