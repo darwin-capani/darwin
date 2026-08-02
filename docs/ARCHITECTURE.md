@@ -68,7 +68,7 @@ Pipeline: **audio loop → VAD → (optional instant opener) → STT → intent 
 
 ## Configuration
 
-Canonical file: `config/darwin.toml`. Both `darwind` and the inference server read it at startup and fall back to hardcoded defaults (identical to the file's values) if it is missing. The daemon recognizes **~38 config sections** (see `config/darwin.toml` for the full schema and every key); this table covers the core pipeline sections and their headline keys:
+Canonical file: `config/darwin.toml`. Both `darwind` and the inference server read it at startup and fall back to hardcoded defaults (identical to the file's values) if it is missing. The daemon recognizes **one config section per `Config` field** (81 today) (see `config/darwin.toml` for the full schema and every key); this table covers the core pipeline sections and their headline keys:
 
 | Section | Keys |
 |---|---|

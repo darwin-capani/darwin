@@ -47,6 +47,45 @@ const CAPTURE_POLL: Duration = Duration::from_millis(500);
 /// any wake-from-sleep device re-acquire.
 const DEVICE_DEAF_AFTER: Duration = Duration::from_secs(15);
 
+/// How long to wait for CoreAudio to answer a device query before giving up.
+///
+/// Both calls are synchronous with no deadline of their own; measured at 173-450 s on
+/// a machine whose input device was in a bad state. Acquisition is a startup step, so
+/// this only has to cover a healthy machine's answer.
+const DEVICE_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Query the default input device and its config, BOUNDED.
+///
+/// cpal's calls cannot be cancelled, so the probe runs on a throwaway thread and the
+/// caller stops waiting at the deadline. A hung probe thread leaks — there is no way to
+/// interrupt CoreAudio — but it no longer holds the daemon hostage.
+fn acquire_input_device() -> Result<(cpal::Device, cpal::SupportedStreamConfig)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("audio-device-probe".to_string())
+        .spawn(move || {
+            let host = cpal::default_host();
+            let out = host
+                .default_input_device()
+                .ok_or_else(|| anyhow!("no default input device"))
+                .and_then(|d| {
+                    d.default_input_config()
+                        .context("querying default input config")
+                        .map(|c| (d, c))
+                });
+            let _ = tx.send(out);
+        })
+        .context("spawning the device probe thread")?;
+    match rx.recv_timeout(DEVICE_QUERY_TIMEOUT) {
+        Ok(res) => res,
+        Err(_) => Err(anyhow!(
+            "the input-device query did not answer within {}s (CoreAudio is wedged); \
+             capture is unavailable this run",
+            DEVICE_QUERY_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 pub fn spawn_capture(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) {
     // cpal::Stream is !Send, so the stream must live on the thread that owns
     // the capture loop, not in a tokio task.
@@ -172,14 +211,39 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
         _cpal_stream = None;
         info!(sample_rate, channels, "audio capture running (app source)");
     } else {
-        // DEVICE MODE (default): today's cpal path, byte-for-byte unchanged.
-        let host = cpal::default_host();
-        let device = host
-            .default_input_device()
-            .ok_or_else(|| anyhow!("no default input device"))?;
-        let supported = device
-            .default_input_config()
-            .context("querying default input config")?;
+        // DEVICE MODE (default): the cpal path, with the device query BOUNDED.
+        //
+        // `default_input_device()` and `default_input_config()` are synchronous
+        // CoreAudio calls with no deadline of their own, and on this machine they were
+        // measured blocking for 173-450 s. When one eventually failed, capture_loop
+        // returned Err, spawn_capture logged "audio capture stopped" and dropped `tx`
+        // — which ends main's event loop by design, so launchd relaunched the daemon
+        // into the same hang. That is an unbounded restart cycle every ~450 s, and each
+        // turn of it wipes the in-memory confirmation slot, the tripwire ledger and
+        // every other non-persisted piece of daemon state.
+        //
+        // The tx-drop-on-device-death behaviour is DELIBERATE and stays: a device that
+        // dies mid-run is best recovered by a fresh process. What was wrong is that a
+        // device that cannot be ACQUIRED took the whole daemon with it, on a loop. The
+        // daemon is a router, a scheduler, a HUD feed and a tool host; losing the
+        // microphone must not stop any of that.
+        let (device, supported) = match acquire_input_device() {
+            Ok(pair) => pair,
+            Err(e) => {
+                error!(error = %e, "audio: could not acquire an input device; capture is \
+                                    OFF for this run — the rest of the daemon keeps running");
+                crate::telemetry::emit(
+                    "audio",
+                    "capture.unavailable",
+                    serde_json::json!({"error": e.to_string()}),
+                );
+                // Park the thread rather than dropping `tx`. Returning Err here is what
+                // made a device problem a daemon restart.
+                loop {
+                    std::thread::sleep(Duration::from_secs(3600));
+                }
+            }
+        };
         sample_rate = supported.sample_rate();
         channels = supported.channels() as usize;
         let stream_config: cpal::StreamConfig = supported.into();

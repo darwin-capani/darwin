@@ -31,7 +31,9 @@ cd ~/Downloads/darwin
 # Memory DB (creates state/ and state/darwin.db)
 .venv/bin/python scripts/init_memory.py
 
-# Download the on-device models (MLX LLM + Whisper STT + Kokoro TTS)
+# Download the LLM + Whisper STT. (TTS, the embedder, the reranker, the VLM and
+# the OCR model are pulled on first use / by ./install.sh — deploy_models.py fetches
+# only what config/darwin.toml declares under [models].)
 .venv/bin/python inference/deploy_models.py
 
 # Build the daemon (release)
