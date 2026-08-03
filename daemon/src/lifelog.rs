@@ -329,8 +329,19 @@ pub fn classify_lifelog_intent(utterance: &str) -> Option<LifeLogIntent> {
         || lower.contains("what i've been doing")
         || lower.contains("what i did")
         || lower.contains("my activity")
-        || lower.contains("my week")
-        || lower.contains("my day");
+        // "my week" / "my day" ALONE are not a request for a digest. They are how
+        // people talk about their lives: "why does it always rain on MY DAY off",
+        // "a nice compliment from a stranger MADE MY WEEK". Both rendered a
+        // lifelog digest. The possessive needs a RECALL cue beside it — the same
+        // thing every other limb of this gate already carries.
+        || ((lower.contains("my week") || lower.contains("my day"))
+            && crate::utterance::mentions_any_word(
+                lower,
+                &[
+                    "recap", "summarize", "summarise", "summary", "digest", "review",
+                    "rundown", "walk", "tell", "show", "how", "what",
+                ],
+            ));
     if !about_my_activity {
         return None;
     }
@@ -377,6 +388,27 @@ pub async fn dispatch(memory: &Memory, namespace: &str, intent: LifeLogIntent) -
 
 #[cfg(test)]
 mod tests {
+
+    /// "my day" / "my week" ALONE are how people talk about their lives, not a
+    /// request for a digest. Both rendered one.
+    #[test]
+    fn a_possessive_period_alone_is_not_a_digest_request() {
+        for u in [
+            "why does it always rain on my day off",
+            "I got a really nice compliment from a stranger and it made my week",
+            "my day was long",
+            "that made my week honestly",
+        ] {
+            assert!(
+                classify_lifelog_intent(u).is_none(),
+                "{u:?} is a remark about a life, not a request to summarize one"
+            );
+        }
+        // A real recall still works.
+        for u in ["what did i do today", "recap my week", "show me my activity"] {
+            assert!(classify_lifelog_intent(u).is_some(), "{u:?} IS a lifelog request");
+        }
+    }
     use super::*;
     use crate::config::Config;
     use crate::episodic::{record_episode, VoiceGate};
