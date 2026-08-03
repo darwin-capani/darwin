@@ -3231,6 +3231,23 @@ async fn main() -> Result<()> {
             "interval_secs": interval,
         })
         .to_string();
+        // ARM IT FOR EVERY VISION CONNECTION, not just this instant.
+        //
+        // This used to be a bare `send_op`, which can only reach an app that is
+        // ALREADY RUNNING. The shipped config autostarts nothing, so on a normal
+        // boot the op was dropped with "vision is not running" — and nothing
+        // re-armed when the user opened Vision a minute later, or an hour later,
+        // or ever. The capture ring was empty on 100% of real boots while the
+        // config and README told the user the only missing piece was a Screen
+        // Recording grant. Registering the op makes it fire on whatever
+        // connection Vision eventually makes, including after a restart.
+        let armed = apps::arm_on_connect(&app_registry, "vision", &op_line).await;
+        if !armed {
+            warn!("screen-context: no 'vision' app is installed; the loop can never arm");
+        }
+        // Still send it now, for the case where Vision IS already up (an explicit
+        // `[apps] autostart = ["vision"]`), so the loop starts this second rather
+        // than on the next reconnect.
         match apps::send_op(&app_registry, "vision", &op_line).await {
             Ok(()) => {
                 info!(interval_secs = interval, "started continuous screen-context loop (#42)");
@@ -3241,11 +3258,18 @@ async fn main() -> Result<()> {
                 );
             }
             Err(e) => {
-                warn!(error = %e, "screen-context loop not started (Vision app not running?)");
+                // NOT a failure any more — the arm above will fire on connect. Say
+                // that, rather than leaving a warning that reads like the feature
+                // is broken when it is merely waiting.
+                info!(
+                    error = %e,
+                    armed,
+                    "screen-context loop armed; it starts when Vision connects"
+                );
                 telemetry::emit(
                     "system",
-                    "screen_context.loop_start_failed",
-                    json!({"error": e.to_string()}),
+                    "screen_context.loop_armed",
+                    json!({"interval_secs": interval, "armed": armed}),
                 );
             }
         }
