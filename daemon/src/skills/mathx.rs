@@ -111,8 +111,17 @@ fn eval_expression(args: &Value) -> Result<String> {
         .get("expr")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("eval_expression needs an 'expr' string argument"))?;
+    // Refuse absurd input before tokenizing. This is the cheap outer bound; the
+    // load-bearing one is MAX_DEPTH, since how many bytes it takes to overflow
+    // the stack depends on the build profile.
+    if expr.len() > MAX_EXPR_BYTES {
+        return Err(anyhow!(
+            "eval_expression: expression is {} bytes; the limit is {MAX_EXPR_BYTES}",
+            expr.len()
+        ));
+    }
     let tokens = tokenize(expr)?;
-    let mut p = Parser { tokens: &tokens, pos: 0 };
+    let mut p = Parser { tokens: &tokens, pos: 0, depth: 0 };
     let v = p.parse_expr(0)?;
     if p.pos != p.tokens.len() {
         return Err(anyhow!("eval_expression: unexpected trailing input in '{expr}'"));
@@ -209,9 +218,35 @@ fn tokenize(s: &str) -> Result<Vec<Tok>> {
     Ok(out)
 }
 
+/// The longest expression `eval_expression` will look at.
+///
+/// The sibling text skill has carried this discipline all along
+/// (`crate::skills::text`'s `MAX_INPUT`, "guard against unbounded work"); mathx
+/// had neither a length nor a depth bound, and its parser recurses once per
+/// leading `-` and once per `(`.
+const MAX_EXPR_BYTES: usize = 4096;
+
+/// The deepest the parser will nest before refusing.
+///
+/// THIS IS THE REAL GUARD, not the length cap. `parse_expr`/`parse_atom` are
+/// mutually recursive with one stack frame per nesting level, and the frame is
+/// 112 bytes in release (measured off the shipped binary), so a 2 MiB tokio
+/// worker stack overflows at roughly 18,700 levels — but only about 3,100 in a
+/// debug build. A bound expressed in BYTES would therefore be safe in one build
+/// profile and not the other; a bound on DEPTH is safe in both.
+///
+/// Overflow here is not a catchable panic. It is `rtabort` — SIGABRT, the whole
+/// `darwind` process, taking every in-flight voice session, the mic loop, and any
+/// parked confirmation with it. launchd restarts the daemon, so it was an
+/// availability hole rather than data loss, but the turn simply died mid-sentence.
+const MAX_DEPTH: u32 = 256;
+
 struct Parser<'a> {
     tokens: &'a [Tok],
     pos: usize,
+    /// Current recursion depth, checked against [`MAX_DEPTH`] on entry to
+    /// `parse_expr` and released on every exit path.
+    depth: u32,
 }
 
 impl Parser<'_> {
@@ -232,7 +267,24 @@ impl Parser<'_> {
     }
 
     /// Pratt parser: parse expressions whose operators bind at least `min_bp`.
+    ///
+    /// DEPTH-BOUNDED. This counts in and out around the real body so the bound
+    /// holds on every exit path, including the `?` early returns — a counter
+    /// incremented here and decremented only at the happy-path end would leak on
+    /// the first parse error and refuse the next legitimate expression.
     fn parse_expr(&mut self, min_bp: u8) -> Result<f64> {
+        if self.depth >= MAX_DEPTH {
+            return Err(anyhow!(
+                "eval_expression: expression nests deeper than {MAX_DEPTH} levels"
+            ));
+        }
+        self.depth += 1;
+        let out = self.parse_expr_inner(min_bp);
+        self.depth -= 1;
+        out
+    }
+
+    fn parse_expr_inner(&mut self, min_bp: u8) -> Result<f64> {
         let mut lhs = self.parse_atom()?;
         while let Some(tok) = self.peek() {
             let (l_bp, r_bp) = match Self::binding_power(tok) {
@@ -916,6 +968,77 @@ mod tests {
         assert!(eval_expression(&json!({"expr": "2 @ 3"})).is_err(), "bad char");
         assert!(eval_expression(&json!({"expr": ""})).is_err(), "empty");
         assert!(eval_expression(&json!({})).is_err(), "missing expr arg");
+    }
+
+    /// A DEEPLY NESTED EXPRESSION MUST BE REFUSED, NOT ABORT THE DAEMON.
+    ///
+    /// `parse_expr`/`parse_atom` recurse once per leading `-` and once per `(`,
+    /// and had no depth bound. A 112-byte release frame on a 2 MiB tokio worker
+    /// stack overflows at ~18,700 levels — ~3,100 in a debug build. Overflow is
+    /// `rtabort`, not a catchable panic: SIGABRT for the whole `darwind` process,
+    /// killing every in-flight voice session, the mic loop, and any parked
+    /// confirmation. Reachable from one model-emitted `skill_invoke` naming
+    /// `eval_expression`, whose args are unbounded.
+    ///
+    /// NOTE FOR ANYONE TOUCHING THIS: before the guard, this test did not FAIL —
+    /// it aborted the entire test binary. If you see `fatal runtime error: stack
+    /// overflow` here, the depth bound is gone, not weakened.
+    #[test]
+    fn eval_refuses_a_pathologically_deep_expression() {
+        // Well past the debug-build overflow threshold, well under the byte cap,
+        // so this exercises MAX_DEPTH rather than MAX_EXPR_BYTES.
+        let deep_minus = format!("{}1", "-".repeat(3500));
+        assert!(deep_minus.len() < MAX_EXPR_BYTES, "must not be caught by the byte cap");
+        let e = eval_expression(&json!({ "expr": deep_minus }))
+            .expect_err("a 3500-deep unary chain must be refused");
+        assert!(e.to_string().contains("nests deeper"), "honest reason: {e}");
+
+        // The paren form recurses the same way.
+        let deep_paren = format!("{}1{}", "(".repeat(1000), ")".repeat(1000));
+        let e = eval_expression(&json!({ "expr": deep_paren }))
+            .expect_err("a 1000-deep paren nest must be refused");
+        assert!(e.to_string().contains("nests deeper"), "honest reason: {e}");
+
+        // The byte cap is the outer bound, with its own distinct message.
+        let huge = format!("{}1", "-".repeat(MAX_EXPR_BYTES + 1));
+        let e = eval_expression(&json!({ "expr": huge })).expect_err("over-long must be refused");
+        assert!(e.to_string().contains("the limit is"), "honest reason: {e}");
+    }
+
+    /// ...and the bound does not break ORDINARY arithmetic.
+    ///
+    /// DEPTH IS NESTING, NOT LENGTH. `parse_expr` counts in on entry and out on
+    /// every exit path; if it only counted in, the number would accumulate across
+    /// SIBLING recursions and a long FLAT sum — nesting depth 2, hundreds of
+    /// operators — would be refused as "too deeply nested". That is the mutation
+    /// this test exists to catch, and the flat sum below is the only assertion
+    /// here that catches it: a leak cannot be observed across CALLS, because
+    /// `eval_expression` builds a fresh `Parser` each time.
+    #[test]
+    fn the_depth_bound_counts_nesting_not_length() {
+        assert_eq!(eval_expression(&json!({"expr": "2 + 3 * 4"})).unwrap(), "14");
+        assert_eq!(eval_expression(&json!({"expr": "-(-(-5))"})).unwrap(), "-5");
+        assert_eq!(eval_expression(&json!({"expr": "((((1+2))))*3"})).unwrap(), "9");
+        // 200 levels of real nesting: deep for a human, inside the bound.
+        let nested = format!("{}1{}", "(".repeat(200), ")".repeat(200));
+        assert_eq!(eval_expression(&json!({ "expr": nested })).unwrap(), "1");
+
+        // 400 terms, nesting depth 2. Far MORE operators than MAX_DEPTH, so this
+        // fails the moment the counter stops being released.
+        let terms = 400;
+        let flat = vec!["1"; terms].join("+");
+        assert!(terms > MAX_DEPTH as usize, "the flat sum must exceed MAX_DEPTH to be a real probe");
+        assert!(flat.len() < MAX_EXPR_BYTES, "and must not be caught by the byte cap");
+        assert_eq!(
+            eval_expression(&json!({ "expr": flat })).unwrap(),
+            terms.to_string(),
+            "a long FLAT sum is not deep nesting; refusing it means the depth \
+             counter is accumulating across siblings instead of being released"
+        );
+
+        // Mixed: shallow nesting, many operators, and a unary minus per term.
+        let mixed = (0..300).map(|_| "-1").collect::<Vec<_>>().join("+");
+        assert_eq!(eval_expression(&json!({ "expr": mixed })).unwrap(), "-300");
     }
 
     // ---- percentage --------------------------------------------------------
