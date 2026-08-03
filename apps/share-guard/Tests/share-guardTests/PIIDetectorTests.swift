@@ -156,4 +156,74 @@ final class PIIDetectorTests: XCTestCase {
         XCTAssertTrue(PIIDetector.detect(in: "code 12345 here").isEmpty, "a lone short number is untouched")
         XCTAssertTrue(PIIDetector.detect(in: "the year 2026 was").isEmpty, "a 4-digit year is untouched")
     }
+    /// TWO CARD NUMBERS, WRITTEN THE WAY CARD NUMBERS ARE WRITTEN.
+    ///
+    /// The candidate run greedily spans both, lands out of every band, and used to
+    /// be split into eight 4-digit atoms — none of which is a band on its own. So
+    /// NOTHING was emitted: the "redacted copy" came back byte-identical to the
+    /// input while the preview reported "No PII detected". The redactor failed open
+    /// on exactly the data it exists to protect, and since the user then shares that
+    /// copy themselves, the false negative actively induces the leak.
+    ///
+    /// Asserted on the SCRUBBED TEXT, not just the span count: some orderings would
+    /// satisfy a count-only assertion while still leaking a PAN.
+    func testTwoGroupedCardsSideBySideAreBothRedacted() {
+        // Precondition — if these stopped being Luhn-valid the test would pass
+        // vacuously, having proved nothing about regrouping.
+        XCTAssertTrue(PIIDetector.luhnValid("4111 1111 1111 1111"))
+        XCTAssertTrue(PIIDetector.luhnValid("5555 5555 5555 4444"))
+
+        let text = "cards 4111 1111 1111 1111 5555 5555 5555 4444 ok"
+        XCTAssertEqual(PIIDetector.detect(in: text).map(\.kind), [.card, .card])
+        let out = ShareGuard.scrub(text: text).redactedText
+        XCTAssertFalse(out.contains("4111"), "first PAN leaked: \(out)")
+        XCTAssertFalse(out.contains("4444"), "second PAN leaked: \(out)")
+        XCTAssertFalse(out.contains(where: { $0.isNumber }), "a digit survived: \(out)")
+    }
+
+    /// Mixed bare + grouped, BOTH orderings. The bare one used to redact and the
+    /// grouped one used to leak, which is worse than a total failure: the user is
+    /// shown a redaction happening and reasonably concludes the scan worked.
+    func testMixedBareAndGroupedCardsBothRedacted() {
+        for text in [
+            "pay 4111111111111111 5555 5555 5555 4444 now",
+            "pay 4111 1111 1111 1111 5555555555554444 now",
+        ] {
+            XCTAssertEqual(PIIDetector.detect(in: text).map(\.kind), [.card, .card], "\(text)")
+            let out = ShareGuard.scrub(text: text).redactedText
+            XCTAssertFalse(out.contains("4111"), "first PAN leaked from \(text): \(out)")
+            XCTAssertFalse(out.contains("4444"), "second PAN leaked from \(text): \(out)")
+        }
+    }
+
+    /// The regroup must not swallow neighbours. Two spaced PHONES stay two phones —
+    /// this is the case the per-atom split was originally added for, and the card
+    /// regroup runs in front of it.
+    func testTwoAdjacentPhonesAreStillTwoPhones() {
+        let text = "call 5551234567 5559876543 today"
+        XCTAssertEqual(PIIDetector.detect(in: text).map(\.kind), [.phone, .phone])
+        let out = ShareGuard.scrub(text: text).redactedText
+        XCTAssertFalse(out.contains("5551234567"), "phone leaked: \(out)")
+        XCTAssertFalse(out.contains("5559876543"), "phone leaked: \(out)")
+    }
+
+    /// KNOWN RESIDUAL, pinned so it is a documented limit rather than a surprise.
+    ///
+    /// A spaced PHONE sandwiched between two grouped cards is still missed: the
+    /// card regroup consumes greedily around it and a 10-12 digit window has no
+    /// checksum to gate a symmetric phone regroup on. Both CARDS redact — strictly
+    /// better than before, when only the bare one did — but the phone survives.
+    /// If this is ever fixed, this test should flip, not be deleted.
+    func testKnownResidual_spacedPhoneBetweenTwoCardsIsMissed() {
+        let text = "a@b.com 4111 1111 1111 1111 555 123 4567 4485275742308327"
+        let out = ShareGuard.scrub(text: text).redactedText
+        XCTAssertFalse(out.contains("4111"), "the first card must redact: \(out)")
+        XCTAssertFalse(out.contains("4485275742308327"), "the second card must redact: \(out)")
+        XCTAssertTrue(
+            out.contains("555 123 4567"),
+            "residual changed — a spaced phone between two cards now redacts. That is an "
+                + "improvement: flip this assertion rather than deleting the test. Got: \(out)"
+        )
+    }
+
 }
