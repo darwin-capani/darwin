@@ -10284,14 +10284,43 @@ impl crate::recall::Embedder for InferenceEmbedder {
     /// every comparison they make is same-space by construction.)
     fn embed_with_space<'a>(&'a self, texts: &'a [String]) -> crate::recall::EmbedSpaceFuture<'a> {
         Box::pin(async move {
+            // SPLIT BEFORE SENDING. The server REFUSES a batch over
+            // `EMBED_MAX_BATCH` (inference/server.py:4874) rather than trimming it,
+            // and this used to hand it the whole corpus in one call: a reindex of
+            // any folder over 256 chunks got a plain Err back, committed every chunk
+            // WITHOUT a vector, and left file search on BM25 forever — while telling
+            // the user the on-device embedder was unavailable. It was healthy; the
+            // request was just too big to answer.
+            //
+            // ONE client across all sub-batches: constructing one per chunk would
+            // reconnect to the socket for every 256 texts of a 9,000-chunk rebuild.
             let mut client = crate::inference::InferenceClient::new(self.socket_path.clone());
-            let out = client.embed_with_meta(texts).await?;
-            Ok(crate::recall::EmbeddedBatch {
-                vectors: out.vectors,
-                embedder: out.embedder,
-                dim: out.dim,
-                fell_back: out.fell_back,
-            })
+            let mut vectors = Vec::with_capacity(texts.len());
+            let (mut embedder, mut dim, mut fell_back) = (None, None, false);
+            let mut first = true;
+            for part in texts.chunks(crate::inference::EMBED_MAX_BATCH) {
+                let out = client.embed_with_meta(part).await?;
+                // THE VECTOR SPACE MUST NOT CHANGE MID-REBUILD. Each sub-batch names
+                // the backend that actually ran; if the server swapped models between
+                // them, the halves are not comparable and a cosine across them is
+                // meaningless. Fail the whole rebuild rather than commit a store whose
+                // stamp describes only some of its vectors.
+                if !first && out.embedder != embedder {
+                    anyhow::bail!(
+                        "the embedder changed mid-batch ({:?} -> {:?}); refusing to \
+                         build a store whose vectors live in two different spaces",
+                        embedder,
+                        out.embedder
+                    );
+                }
+                first = false;
+                embedder = out.embedder;
+                dim = out.dim;
+                // Advisory, and true if ANY sub-batch fell back.
+                fell_back |= out.fell_back;
+                vectors.extend(out.vectors);
+            }
+            Ok(crate::recall::EmbeddedBatch { vectors, embedder, dim, fell_back })
         })
     }
 
@@ -22291,6 +22320,168 @@ mod tests {
         assert!(defaults.debate, "#22 ships ON (full-power default; high-stakes-only, <=2 calls)");
     }
 }
+#[cfg(test)]
+mod embed_batching_tests {
+    use super::*;
+
+    /// A fake inference server that enforces the SAME cap the real one does
+    /// (`inference/server.py:4874` raises above `EMBED_MAX_BATCH`), answers
+    /// `ok:false` on breach exactly as the real server does
+    /// (`server.py:7759-7766`), and otherwise returns one unit vector per input.
+    ///
+    /// Returns the socket path plus a handle recording the batch sizes it saw, so
+    /// a test can assert the CALLER split rather than that the server tolerated.
+    async fn fake_embed_server(
+        tag: &str,
+        space_ids: Vec<&'static str>,
+    ) -> (std::path::PathBuf, std::sync::Arc<std::sync::Mutex<Vec<usize>>>) {
+        // /tmp (not the long /var/folders temp dir) keeps the sockaddr_un path
+        // under macOS's ~104-byte SUN_LEN cap — same reason as inference.rs's
+        // live-socket tests.
+        let dir = std::path::PathBuf::from("/tmp").join(format!("dw-embed-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("i.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind fake inference socket");
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_task = seen.clone();
+        tokio::spawn(async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+            let mut call = 0usize;
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let seen_conn = seen_task.clone();
+                let ids = space_ids.clone();
+                let (r, mut w) = tokio::io::split(stream);
+                let mut lines = BufReader::new(r).lines();
+                // One connection carries many requests — the client reuses it.
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let req: serde_json::Value = match serde_json::from_str(&line) {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    let id = req["id"].as_str().unwrap_or("").to_string();
+                    let n = req["texts"].as_array().map(|a| a.len()).unwrap_or(0);
+                    seen_conn.lock().unwrap().push(n);
+                    let resp = if n > crate::inference::EMBED_MAX_BATCH {
+                        // Exactly the real server's refusal shape.
+                        json!({"id": id, "ok": false,
+                               "error": format!("op=embed batch of {n} exceeds the {} cap",
+                                                crate::inference::EMBED_MAX_BATCH)})
+                    } else {
+                        let space = ids.get(call).or_else(|| ids.last()).copied().unwrap_or("space-a");
+                        json!({"id": id, "ok": true,
+                               "vectors": vec![vec![1.0_f64, 0.0, 0.0]; n],
+                               "embedder": space, "dim": 3, "fell_back": false})
+                    };
+                    call += 1;
+                    let mut out = serde_json::to_vec(&resp).unwrap();
+                    out.push(b'\n');
+                    if w.write_all(&out).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        (sock, seen)
+    }
+
+    /// A CORPUS LARGER THAN ONE BATCH STILL GETS EVERY VECTOR.
+    ///
+    /// docsearch's reindex handed every gathered chunk to ONE `op=embed` call,
+    /// bounded only by `[docsearch].max_chunks` (ships at 50,000). The server
+    /// REFUSES a batch over 256 rather than trimming it, so any corpus over about
+    /// ten markdown files got a plain `Err` back — and reindex's error arm commits
+    /// every chunk WITHOUT a vector and leaves the store unstamped. File search
+    /// then reports "the on-device embedder was unavailable, so search will be
+    /// keyword-based" while the embedder is perfectly healthy, and rerunning the
+    /// reindex hits the same wall. This is the flagship on-device semantic search,
+    /// dead on every real folder and blaming the wrong component.
+    #[tokio::test]
+    async fn an_over_cap_corpus_is_split_and_every_text_comes_back_embedded() {
+        use crate::recall::Embedder;
+        let cap = crate::inference::EMBED_MAX_BATCH;
+        let (sock, seen) = fake_embed_server("split", vec!["space-a"]).await;
+        let emb = InferenceEmbedder { socket_path: sock.clone() };
+
+        // 3 full batches + a remainder — the shape a real corpus has.
+        let n = cap * 3 + 7;
+        let texts: Vec<String> = (0..n).map(|i| format!("chunk {i}")).collect();
+        let out = emb.embed_with_space(&texts).await.expect(
+            "an over-cap corpus must be split and embedded, not refused whole",
+        );
+
+        assert_eq!(out.vectors.len(), n, "every text must come back with a vector");
+        assert_eq!(out.embedder.as_deref(), Some("space-a"), "the store must still be stamped");
+        assert_eq!(out.dim, Some(3));
+
+        // And the SPLIT is what made it work: the server saw only legal batches.
+        let sizes = seen.lock().unwrap().clone();
+        assert_eq!(sizes, vec![cap, cap, cap, 7], "the caller must chunk to the server's cap, in order");
+        assert!(
+            sizes.iter().all(|s| *s <= cap),
+            "a batch over the cap is REFUSED by the real server, not trimmed: {sizes:?}"
+        );
+        let _ = std::fs::remove_dir_all(sock.parent().unwrap());
+    }
+
+    /// THE VECTOR SPACE MUST NOT CHANGE MID-REBUILD.
+    ///
+    /// Splitting introduces a hazard the single call did not have: if the server
+    /// swaps embedding models between sub-batches, half the vectors live in one
+    /// space and half in another, and a cosine across them is meaningless. Worse,
+    /// the store would be STAMPED with just one of the two ids, so the
+    /// cross-space guard that exists to catch exactly this would see a store that
+    /// looks internally consistent. The rebuild must fail instead.
+    #[tokio::test]
+    async fn a_mid_rebuild_embedder_swap_fails_the_whole_batch() {
+        use crate::recall::Embedder;
+        let cap = crate::inference::EMBED_MAX_BATCH;
+        // First sub-batch answers "space-a", the second "space-b".
+        let (sock, _seen) = fake_embed_server("swap", vec!["space-a", "space-b"]).await;
+        let emb = InferenceEmbedder { socket_path: sock.clone() };
+
+        let texts: Vec<String> = (0..cap + 5).map(|i| format!("chunk {i}")).collect();
+        let err = emb
+            .embed_with_space(&texts)
+            .await
+            .expect_err("a space change mid-rebuild must fail, never commit a mixed store");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("two different spaces") || msg.contains("changed mid-batch"),
+            "the failure must name the real cause: {msg}"
+        );
+        let _ = std::fs::remove_dir_all(sock.parent().unwrap());
+    }
+
+    /// THE CAP IS THE SERVER'S NUMBER, NOT OURS.
+    ///
+    /// `inference/server.py` owns `EMBED_MAX_BATCH` and RAISES above it. If the
+    /// two drift apart, a too-large daemon-side cap silently re-opens this whole
+    /// defect. Read the server's literal and compare.
+    #[test]
+    fn embed_batch_cap_matches_the_server() {
+        let server = include_str!("../../inference/server.py");
+        let line = server
+            .lines()
+            .find(|l| l.trim_start().starts_with("EMBED_MAX_BATCH") && l.contains('='))
+            .expect("EMBED_MAX_BATCH moved in inference/server.py; re-point this guard");
+        let n: usize = line
+            .split('=')
+            .nth(1)
+            .and_then(|v| v.split('#').next())
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or_else(|| panic!("could not read the server's cap from {line:?}"));
+        assert_eq!(
+            crate::inference::EMBED_MAX_BATCH, n,
+            "the daemon splits embed batches at {} but the server refuses above {n} — \
+             a larger daemon-side cap means every reindex of a real corpus is refused \
+             and silently stored vector-less",
+            crate::inference::EMBED_MAX_BATCH
+        );
+    }
+}
+
 #[cfg(test)]
 mod audit_lifecycle_tests {
     /// audit.db recorded ONLY "parked" on the shipped consequential lifecycle: master
