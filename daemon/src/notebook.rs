@@ -72,8 +72,19 @@ pub fn topic_key(topic: &str) -> String {
             break;
         }
     }
+    normalized_topic(rest)
+}
+
+/// Normalize an ALREADY-CUT subject into the shape a notebook is keyed by:
+/// single-spaced, no trailing question mark. This is the tail of [`topic_key`],
+/// split out so the subject [`parse_notebook_command`] cuts out of an utterance is
+/// normalized IDENTICALLY without being run through the lead-in stripper a SECOND
+/// time. Re-running `topic_key` over an already-cut subject DOUBLE-strips it:
+/// "save my research on what i found on the beach" would lose its subject down to
+/// "the beach" and file the run under a notebook the user never named.
+fn normalized_topic(subject: &str) -> String {
     // Collapse internal whitespace and drop a trailing question mark.
-    let collapsed: String = rest.split_whitespace().collect::<Vec<_>>().join(" ");
+    let collapsed: String = subject.split_whitespace().collect::<Vec<_>>().join(" ");
     collapsed.trim_end_matches('?').trim().to_string()
 }
 
@@ -81,8 +92,17 @@ pub fn topic_key(topic: &str) -> String {
 /// most-specific first — so a phrasing that carries a subject after "on"/"about"
 /// strips the full glue (leaving just the subject), while a BARE management
 /// phrase ("save this research", "forget my research") that names NO subject
-/// strips to "". Shared by [`topic_key`] and [`split_lead_and_topic`] so the
-/// COMMAND region and the TOPIC are always cut at the same point.
+/// strips to "".
+///
+/// [`topic_key`] is this table's ONLY consumer, and that is deliberate. Its job is
+/// to normalize a topic STRING — whoever supplied it — into the key a notebook row
+/// is stored under, so being GENEROUS is correct there: a generous normalizer only
+/// ever merges two spellings of ONE subject. It is NOT the classifier's gate.
+/// Whether an utterance is a COMMAND at all is decided by [`COMMAND_HEADS`], which
+/// is anchored at the front of the utterance and far stricter. Conflating the two
+/// is the bug this table used to carry: because the bare words "my research" are
+/// listed here, ANY sentence containing them ("my research is going nowhere") read
+/// as a notebook command.
 const LEAD_INS: &[&str] = &[
     "show me my research notebook on ",
     "show me my research notebook about ",
@@ -437,28 +457,211 @@ fn has_action_word(haystack: &str, words: &[&str]) -> bool {
     crate::utterance::mentions_any_word(haystack, words)
 }
 
-/// Split an utterance into the COMMAND lead-in (where the action verb lives) and
-/// the TOPIC it names. A spoken command leads with its verb and the subject
-/// follows, so a verb-looking word inside the TOPIC is a subject, not an order:
-/// "save my research on how to clear a paper jam" is a SAVE about clearing jams,
-/// not a request to clear anything.
+/// The words a person puts in FRONT of a spoken command and nothing else: the
+/// wake phrase (main.rs GATES on `wake::wake_gate` and never STRIPS it, so the
+/// shipped voice transcript really is "darwin, save this research") and bare
+/// politeness. Stripped one token at a time before the command is matched.
 ///
-/// When no known lead-in matches, the whole utterance is treated as the command
-/// region — the conservative fallback, since a phrasing this function does not
-/// recognize ("delete the notebook about X") still has its verb in front.
-fn split_lead_and_topic(lower: &str) -> (&str, String) {
-    for lead in LEAD_INS {
-        if lower.strip_prefix(lead).is_some() {
-            return (&lower[..lead.len()], topic_key(lower));
-        }
-    }
-    (lower, topic_key(lower))
+/// This list is short ON PURPOSE. Every word added here is a word that may sit in
+/// front of a DELETE and still be obeyed, so it may hold nothing that changes what
+/// the sentence means. "don't", "never", "why", "i want to", "they told me to" are
+/// absent for exactly that reason: with them absent, "don't delete my research on
+/// the jwst" / "why would i delete my research on black holes" / "the irb told me
+/// to delete my research on human subjects" match no command at position 0 and are
+/// REFUSED — structurally, with no negation blacklist to keep in sync.
+const ADDRESS_WORDS: &[&str] = &["hey", "hi", "hello", "ok", "okay", "yo", "darwin", "please"];
+
+/// The two-word polite openers, same rule. "would you delete X" is a real order;
+/// "would i delete X" and "why would you delete X" are not, and neither matches
+/// here because only the exact pair is stripped.
+const ADDRESS_PAIRS: &[[&str; 2]] =
+    &[["can", "you"], ["could", "you"], ["would", "you"], ["will", "you"]];
+
+/// The COMPLETE command phrases a user speaks to address a notebook, each naming
+/// NO subject on its own. THIS is the classifier's gate: an utterance is a notebook
+/// command only if, after [`strip_address_prefix`], it OPENS with one of these and
+/// then either ends or introduces its subject with [`SUBJECT_CONNECTORS`].
+///
+/// It is deliberately NOT [`LEAD_INS`]. That table exists to normalize a topic
+/// string and is generous by design; using it as the gate is what let the mere
+/// substring "my research" turn a sentence into an order. Two entries it holds are
+/// pointedly absent here: bare "research" (so "research on the competitors" stays a
+/// LIVE SAGE run, as it is today) and bare "my research" (so "my research on
+/// climate change was published last year" is not heard as a REVISIT — a verb-less
+/// possessive is a declarative sentence far more often than an order, and the
+/// documented revisit phrasings, "show my research on X" and "my research notebook
+/// on X", are both still here).
+///
+/// Order is irrelevant: the LONGEST entry that opens the utterance wins. That is
+/// load-bearing — "save my research notebook on quantum computing" must cut at
+/// "save my research notebook", not at the shorter "save my research", or the
+/// subject the user just named is silently dropped and the run is filed elsewhere.
+const COMMAND_HEADS: &[&str] = &[
+    // SAVE — persist the run that just happened.
+    "save it to my research notebook",
+    "save this to my research notebook",
+    "save that to my research notebook",
+    "save this research notebook",
+    "save my research notebook",
+    "save this research",
+    "save my research",
+    // REVISIT / LIST — read back what was saved.
+    "show me my research notebooks",
+    "show my research notebooks",
+    "show me my research notebook",
+    "show my research notebook",
+    "show me my research",
+    "show my research",
+    "list my research notebooks",
+    "list my research",
+    "list my notebooks",
+    "all my research notebooks",
+    "all my research",
+    "my research notebooks",
+    "my research notebook",
+    "research notebooks",
+    "research notebook",
+    "what have i researched",
+    "what did i research",
+    "what i've researched",
+    // FORGET — destructive. Reached ONLY through one of these, at the front.
+    "delete my research notebooks",
+    "forget my research notebooks",
+    "delete my research notebook",
+    "forget my research notebook",
+    "delete my notebooks",
+    "forget my notebooks",
+    "delete my notebook",
+    "forget my notebook",
+    "delete my research",
+    "forget my research",
+];
+
+/// The ONLY things that may introduce a subject after a head. A head followed by
+/// anything else is not a command with a long subject — it is a sentence that
+/// happens to start with those words ("my research notebook IS IN MY BACKPACK",
+/// "my research IS GOING NOWHERE"), and it is refused.
+const SUBJECT_CONNECTORS: &[&str] = &[" on ", " about "];
+
+/// Words allowed to trail a subject-less command without making it a sentence —
+/// address and courtesy only, never content. "list my research notebooks please"
+/// is the same order as "list my research notebooks"; "list my research expenses
+/// for taxes" is not an order at all.
+const TRAILING_FILLER: &[&str] =
+    &["please", "sir", "darwin", "now", "then", "again", "thanks", "thank", "you", "ok", "okay"];
+
+/// The leading alphanumeric run of `s`, and the remainder. `("", s)` when `s` does
+/// not start with an alphanumeric.
+fn next_word(s: &str) -> (&str, &str) {
+    let end = s.find(|c: char| !c.is_alphanumeric()).unwrap_or(s.len());
+    s.split_at(end)
 }
 
-/// Detect a notebook management intent. CONSERVATIVE and phrase-anchored: the
-/// utterance must mention a research NOTEBOOK / "my research" together with a
-/// save/show/list/forget cue, so an ordinary "research the competitors" never
-/// trips it (that routes to SAGE's live run). Pure — unit-tested.
+/// Drop a leading wake/politeness ADDRESS from an utterance, plus the punctuation
+/// around it, so the command itself starts at byte 0 of the result.
+///
+/// This is not cosmetic. The wake gate in main.rs never strips the phrase, so the
+/// transcript that reaches this classifier is "darwin, save this research" — which
+/// matched no lead-in at all and was therefore filed under the topic "darwin, save
+/// this research". Stripping the address is what lets the command be ANCHORED
+/// (rather than searched for anywhere in the sentence, which is how a negated or
+/// reported delete would sneak back in) while still obeying the shipped voice shape.
+fn strip_address_prefix(lower: &str) -> &str {
+    let mut rest = lower;
+    loop {
+        let head = rest.trim_start_matches(|c: char| !c.is_alphanumeric());
+        let (w1, after1) = next_word(head);
+        if w1.is_empty() {
+            return head;
+        }
+        if ADDRESS_WORDS.contains(&w1) {
+            rest = after1;
+            continue;
+        }
+        let after1 = after1.trim_start_matches(|c: char| !c.is_alphanumeric());
+        let (w2, after2) = next_word(after1);
+        if ADDRESS_PAIRS.iter().any(|p| p[0] == w1 && p[1] == w2) {
+            rest = after2;
+            continue;
+        }
+        return head;
+    }
+}
+
+/// Is what follows a subject-less head nothing but courtesy and punctuation?
+/// An empty remainder is trivially yes ("what have i researched").
+fn is_filler_only(rest: &str) -> bool {
+    rest.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .all(|w| TRAILING_FILLER.contains(&w))
+}
+
+/// Parse an utterance as a notebook COMMAND: the [`COMMAND_HEADS`] phrase it opens
+/// with (where the action verb is read from — a verb-looking word in the SUBJECT is
+/// a subject, not an order: "save my research on how to clear a paper jam" is a
+/// SAVE about clearing jams) and the subject it names, `""` when it names none.
+///
+/// `None` means NOT A COMMAND, and that is the whole point. The three ways an
+/// ordinary sentence used to get in are each closed here:
+///   * it does not OPEN with a head -> "he spilled coffee on my research notebook",
+///     "i deleted my research on the shared drive", "why would i delete my research
+///     on black holes". The old code searched nowhere and simply fell back to
+///     treating the WHOLE utterance as the command;
+///   * it opens with one but keeps going into something that is not a subject ->
+///     "my research notebook is in my backpack" (was REVISIT "is in my backpack"),
+///     "my research assistant quit yesterday" (REVISIT "assistant quit yesterday"),
+///     "delete my research from the shared drive" (FORGET "from the shared drive").
+///     The rule that a BARE head names no subject was already written in
+///     [`LEAD_INS`]'s doc; it was never enforced, so the trailing words became a
+///     notebook's NAME. (Say the same sentence with a leading "please" and the old
+///     code went wrong the OTHER way — no lead-in matched at byte 0 at all, so the
+///     topic became the entire sentence. Both are the same missing question: was a
+///     command ever cut off the front?);
+///   * the topic used to be re-derived as `topic_key(whole utterance)` at three
+///     separate places, each of which handed back the sentence itself when it could
+///     strip nothing. It is cut ONCE, here.
+fn parse_notebook_command(lower: &str) -> Option<(&'static str, String)> {
+    let body = strip_address_prefix(lower);
+    // LONGEST head wins — see [`COMMAND_HEADS`]; a shorter head that is a prefix of
+    // a longer one would swallow the connector and drop the named subject.
+    let mut found: Option<&'static str> = None;
+    for &head in COMMAND_HEADS {
+        if body.starts_with(head) && found.is_none_or(|prev: &str| head.len() > prev.len()) {
+            found = Some(head);
+        }
+    }
+    let head = found?;
+    // The heads are ASCII, so `head.len()` is a char boundary of `body`.
+    let rest = &body[head.len()..];
+    if is_filler_only(rest) {
+        return Some((head, String::new()));
+    }
+    for conn in SUBJECT_CONNECTORS {
+        if let Some(subject) = rest.strip_prefix(conn) {
+            return Some((head, normalized_topic(subject)));
+        }
+    }
+    None
+}
+
+/// Detect a notebook management intent. CONSERVATIVE and GRAMMAR-anchored: the
+/// utterance must OPEN with one of the enumerated [`COMMAND_HEADS`] (after nothing
+/// but a wake/politeness address) and must then either STOP or name its subject
+/// after "on"/"about". An ordinary "research the competitors" never trips it (that
+/// routes to SAGE's live run), and neither does a sentence that merely uses the
+/// words: "my research is going nowhere", "he spilled coffee on my research
+/// notebook", "she deleted the notebook page with the recipe".
+///
+/// WHAT THIS USED TO BE, AND WHY IT WAS WRONG. The gate was "does the utterance
+/// CONTAIN a notebook-ish word", and the topic was `topic_key(whole utterance)` —
+/// which, when it could strip nothing, handed back THE UTTERANCE ITSELF. A
+/// sentence that never addressed a notebook therefore arrived looking exactly like
+/// a command with a very long subject, and three branches acted on it: REVISIT read
+/// out a notebook named after the sentence, SAVE filed a run under it, and FORGET —
+/// destructive, unconfirmed, unjournalled (`memory::forget_notebook` is a hard
+/// transactional DELETE) — fired on "i deleted my research on the shared drive".
+/// A subject is only a subject when a COMMAND was cut off the front of it.
+/// Pure — unit-tested.
 pub fn classify_notebook_intent(utterance: &str) -> Option<NotebookIntent> {
     let lower = utterance.to_lowercase();
     let lower = lower.trim();
@@ -495,47 +698,54 @@ pub fn classify_notebook_intent(utterance: &str) -> Option<NotebookIntent> {
     // place. Whole-word matching fixes the first two, and reading only the
     // command lead-in fixes the third — the subject a user names is never an
     // order. Destructive intent is the one that must be hardest to trip.
-    let (command, topic) = split_lead_and_topic(lower);
+    // NOT A COMMAND AT ALL => NOT A NOTEBOOK INTENT. The gate above only asks
+    // whether the utterance CONTAINS notebook-ish words, which ordinary English
+    // does all the time; this asks whether the user actually gave the order.
+    let (head, topic) = parse_notebook_command(lower)?;
+
     // A forget with NO topic falls through rather than clearing the shelf: an
     // unaddressed "forget my research" lists instead of destroying everything.
-    if has_action_word(command, FORGET_VERBS) && !topic.is_empty() {
+    //
+    // The destructive verb is read from the HEAD — the enumerated phrase the
+    // utterance OPENS with — never from a wider region. Together with the anchor
+    // that is the hardest gate in this function, and it is the one that must be:
+    // `memory::forget_notebook` is a hard transactional DELETE that the router
+    // dispatches with no confirmation and no undo entry, so a wrong FORGET is
+    // unrecoverable while a wrong REVISIT is a wasted sentence. Anchoring (rather
+    // than finding the phrase anywhere) is what refuses the whole family of
+    // sentences that merely REPORT or NEGATE a deletion — "i deleted my research on
+    // the shared drive", "don't delete my research on the jwst", "the irb told me
+    // to delete my research on human subjects" — without a negation blacklist,
+    // which would have to be exhaustive to work and would maim real topics
+    // ("delete my research on never events") when it over-reached.
+    if has_action_word(head, FORGET_VERBS) && !topic.is_empty() {
         return Some(NotebookIntent::Forget { topic });
     }
 
-    // SAVE (persist a run).
-    if has_action_word(command, SAVE_VERBS) {
-        let topic = topic_key(lower);
+    // SAVE (persist a run) — the topic is the one CUT above. Re-deriving it from
+    // the whole utterance is what filed "darwin, save this research" under that
+    // literal sentence instead of under the run's own topic: main.rs gates on the
+    // wake phrase and never strips it, so that IS the shipped voice shape.
+    if has_action_word(head, SAVE_VERBS) {
         let topic = if topic.is_empty() { None } else { Some(topic) };
         return Some(NotebookIntent::Save { topic });
     }
 
-    // LIST (browse) — a generic "what have I researched" with no specific subject,
-    // or an explicit "my notebooks"/"list my research".
-    let looks_like_list = lower.contains("notebooks")
-        || lower.contains("list my research")
-        || lower.contains("all my research")
-        || lower == "what have i researched"
-        || lower == "what have i researched?"
-        || lower == "what i've researched";
-    // REVISIT (a specific topic) — "show/what about X". Distinguished from LIST by
-    // whether a topic remains after stripping the lead-in.
-    let topic = topic_key(lower);
-    if looks_like_list && topic.is_empty() {
+    // LIST vs REVISIT — decided by whether the command NAMED a subject, which the
+    // grammar already answered. There is nothing left to sniff for.
+    //
+    // This used to be two unanchored `contains` piles ("show" / "revisit" /
+    // "notebook" / "my research" …) sitting over a topic RE-DERIVED as
+    // `topic_key(lower)`. Both halves were wrong the same way: the cue fired on any
+    // sentence using the word, and the re-derivation returned the sentence itself
+    // whenever it could strip nothing, so REVISIT read out a notebook named after
+    // the whole utterance ("my chemistry teacher wants a chart of the reactions in
+    // my notebook"). A bare FORGET head still lands here — an unaddressed "forget
+    // my research" LISTS rather than destroying the shelf.
+    if topic.is_empty() {
         return Some(NotebookIntent::List);
     }
-    let revisit_cue = lower.contains("show")
-        || lower.contains("revisit")
-        || lower.contains("notebook")
-        || lower.contains("what have i researched")
-        || lower.contains("what did i research")
-        || lower.contains("my research");
-    if revisit_cue {
-        if topic.is_empty() {
-            return Some(NotebookIntent::List);
-        }
-        return Some(NotebookIntent::Revisit { topic });
-    }
-    None
+    Some(NotebookIntent::Revisit { topic })
 }
 
 // ---------------------------------------------------------------------------
@@ -1063,6 +1273,232 @@ mod tests {
             );
         }
     }
+
+    /// A SENTENCE THAT MERELY USES THE WORDS IS NOT A COMMAND.
+    ///
+    /// Every one of these classified as a notebook intent before the grammar
+    /// landed, and not harmlessly: the topic was the WHOLE SENTENCE, because
+    /// `topic_key` hands its input back when it can strip nothing. So REVISIT read
+    /// out a notebook named after the sentence, SAVE filed a run under it, and
+    /// FORGET aimed a transactional DELETE at it. None of these addressed a
+    /// notebook at all.
+    #[test]
+    fn a_sentence_that_merely_mentions_a_notebook_is_not_a_command() {
+        for u in [
+            "my chemistry teacher wants a chart of the reactions in my notebook",
+            "she deleted the notebook page with the recipe",
+            "i need to clear out my old chemistry notebook",
+            "i left my notebook in the car",
+            "my notebook computer died",
+            "i deleted my research on the shared drive",
+            "delete my research from the shared drive",
+            "please delete my research from the shared drive",
+            "my research is going nowhere",
+            "my research assistant quit yesterday",
+            "my research notebook is in my backpack",
+            "he spilled coffee on my research notebook",
+            "there's a chart in my research notebook about the reactions",
+            "the notebook was full of my research on birds",
+            "i lost my research on the old laptop",
+            "i want to show my research at the conference",
+            "what did i research last week for the class",
+            "i saved a photo of my research notebook",
+            "did you save my research paper",
+            "she saved my research from the fire",
+            "my mom saved my research notebook from the trash",
+            "i'm saving up for a new research notebook",
+            "i was saving my research notebook for later",
+        ] {
+            // PRECONDITION. Each case must actually be inside this classifier's
+            // blast radius — it really does carry the words the outer prefilter
+            // looks for. A case that never reached the code would pass this test
+            // while proving nothing about it.
+            assert!(
+                u.contains("notebook") || u.contains("research"),
+                "{u:?} would not even reach the gate — this case proves nothing"
+            );
+            assert_eq!(
+                classify_notebook_intent(u),
+                None,
+                "{u:?} never addressed a notebook; classifying it hands a whole \
+                 sentence to the notebook store as a topic"
+            );
+        }
+    }
+
+    /// A DELETE THAT WAS ONLY REPORTED, NEGATED, OR WONDERED ABOUT IS NOT AN ORDER.
+    ///
+    /// `memory::forget_notebook` is a hard transactional DELETE and the router
+    /// dispatches it with no confirmation and no journal/undo entry, so this is the
+    /// branch that must be hardest to trip: a wrong REVISIT is a wasted sentence, a
+    /// wrong FORGET is unrecoverable. It is held shut by ANCHORING — the command
+    /// has to be the first thing in the utterance, with only a wake/politeness
+    /// address allowed in front — which refuses this entire family at once. A
+    /// negation word list would have to be exhaustive to do the same job, and would
+    /// maim a real topic ("delete my research on never events") the moment it
+    /// over-reached.
+    #[test]
+    fn a_reported_or_negated_delete_never_forgets() {
+        for u in [
+            "don't delete my research on the jwst",
+            "please don't delete my research on the jwst",
+            "darwin, don't delete my research on the jwst",
+            "never forget my research on quantum computing",
+            "why would i delete my research on black holes",
+            "why would you delete my research on black holes",
+            "the irb told me to delete my research on human subjects",
+            "my advisor made me delete my research on mice",
+            "i had to delete my research on the grant last year",
+            "she said to forget my research on that topic",
+            "they want me to delete my notebook on the old project",
+            "i want to delete my research on the shared drive",
+            "did you delete my research on the jwst",
+            "someone deleted my research on the jwst",
+            "what if i delete my research on the jwst",
+            "remember when i deleted my research on the jwst",
+        ] {
+            assert!(
+                !matches!(classify_notebook_intent(u), Some(NotebookIntent::Forget { .. })),
+                "{u:?} reports or negates a deletion and must never reach FORGET — got {:?}",
+                classify_notebook_intent(u)
+            );
+        }
+        // ...and the fix must not have made deleting impossible. A real order still
+        // forgets exactly the named notebook, including through the address a voice
+        // transcript always carries (main.rs never strips the wake phrase).
+        for u in [
+            "delete my research on the jwst",
+            "please delete my research on the jwst",
+            "darwin, delete my research on the jwst",
+            "hey darwin, forget my research on the jwst",
+            "would you delete my research on the jwst",
+            "delete my notebook about the jwst",
+        ] {
+            assert_eq!(
+                classify_notebook_intent(u),
+                Some(NotebookIntent::Forget { topic: "the jwst".to_string() }),
+                "{u:?} is a real delete order and must still forget the named notebook"
+            );
+        }
+    }
+
+    /// THE SHIPPED VOICE SHAPE CARRIES THE WAKE PHRASE, AND IT IS NOT THE TOPIC.
+    ///
+    /// main.rs GATES on `wake::wake_gate` and never STRIPS the phrase, so the
+    /// transcript reaching this classifier really is "darwin, save this research".
+    /// No lead-in prefix-matched that, so the old code filed the run under the
+    /// literal topic "darwin, save this research" — a notebook named after the
+    /// transcript, permanently separate from the one the user meant.
+    #[test]
+    fn the_wake_phrase_and_politeness_never_become_the_topic() {
+        assert_eq!(
+            classify_notebook_intent("darwin, save this research"),
+            Some(NotebookIntent::Save { topic: None })
+        );
+        assert_eq!(
+            classify_notebook_intent("hey darwin, save this research"),
+            Some(NotebookIntent::Save { topic: None })
+        );
+        assert_eq!(
+            classify_notebook_intent("please save this research"),
+            Some(NotebookIntent::Save { topic: None })
+        );
+        assert_eq!(
+            classify_notebook_intent("save this research please"),
+            Some(NotebookIntent::Save { topic: None })
+        );
+        assert_eq!(
+            classify_notebook_intent("darwin save my research on quantum computing"),
+            Some(NotebookIntent::Save { topic: Some("quantum computing".to_string()) })
+        );
+        assert_eq!(
+            classify_notebook_intent("can you show my research notebook on the jwst"),
+            Some(NotebookIntent::Revisit { topic: "the jwst".to_string() })
+        );
+        assert!(matches!(
+            classify_notebook_intent("hey darwin what have i researched"),
+            Some(NotebookIntent::List)
+        ));
+        assert!(matches!(
+            classify_notebook_intent("could you list my research notebooks"),
+            Some(NotebookIntent::List)
+        ));
+    }
+
+    /// THE LONGEST COMMAND HEAD WINS, OR THE NAMED TOPIC IS SILENTLY LOST.
+    ///
+    /// "save my research notebook on quantum computing" opens with BOTH "save my
+    /// research" and "save my research notebook". Cut at the shorter one and what
+    /// is left is " notebook on quantum computing" — not a subject at all — so the
+    /// save falls back to some other notebook and never says it did.
+    #[test]
+    fn the_longest_command_head_wins_so_a_named_topic_is_never_dropped() {
+        for (u, topic) in [
+            ("save my research notebook on quantum computing", "quantum computing"),
+            ("save my research notebook about black holes", "black holes"),
+            ("save this research notebook on the jwst", "the jwst"),
+            ("please save my research notebook on the jwst", "the jwst"),
+        ] {
+            assert_eq!(
+                classify_notebook_intent(u),
+                Some(NotebookIntent::Save { topic: Some(topic.to_string()) }),
+                "{u:?} names its topic explicitly; dropping it files the run under \
+                 the wrong notebook"
+            );
+        }
+        assert_eq!(
+            classify_notebook_intent("show me my research notebook on the jwst"),
+            Some(NotebookIntent::Revisit { topic: "the jwst".to_string() })
+        );
+    }
+
+    /// EVERY ENUMERATED HEAD IS LIVE, AND A HEAD WITH CONTENT AFTER IT IS A SENTENCE.
+    ///
+    /// The first half is the dead-branch check: the outer `about_notebook`
+    /// prefilter is kept as a cheap early-out, so a head it happened to reject
+    /// would be an entry that can never fire — silently, forever. The second half
+    /// is the rule [`LEAD_INS`]'s own doc always stated and nothing ever enforced:
+    /// a BARE phrase names no subject, so the words after it are not a notebook's
+    /// NAME ("my research notebook IS IN MY BACKPACK").
+    #[test]
+    fn every_command_head_is_live_and_trailing_content_makes_it_a_sentence() {
+        assert!(!COMMAND_HEADS.is_empty(), "the grammar must enumerate something");
+        for head in COMMAND_HEADS {
+            assert!(
+                classify_notebook_intent(head).is_some(),
+                "{head:?} is enumerated as a command but never classifies — a dead entry"
+            );
+            let named = format!("{head} on the jwst");
+            assert!(
+                classify_notebook_intent(&named).is_some(),
+                "{named:?} names a subject after an enumerated head and must classify"
+            );
+            let sentence = format!("{head} is in my backpack");
+            assert_eq!(
+                classify_notebook_intent(&sentence),
+                None,
+                "{sentence:?} is a statement, not an order — the trailing words are \
+                 not the notebook's name"
+            );
+        }
+    }
+
+    /// A LIVE RESEARCH REQUEST IS STILL A LIVE RESEARCH REQUEST. [`LEAD_INS`] lists
+    /// a bare "research on " because that is a fine thing to STRIP off a topic
+    /// string; [`COMMAND_HEADS`] deliberately does not, because "research on the
+    /// competitors" is an order to go and research, not to open a notebook.
+    #[test]
+    fn a_live_research_request_never_becomes_a_notebook_command() {
+        for u in [
+            "research the competitors thoroughly",
+            "research on the competitors",
+            "research about the housing market",
+            "can you research the housing market",
+        ] {
+            assert_eq!(classify_notebook_intent(u), None, "{u:?} is a live SAGE run");
+        }
+    }
+
 
     /// The whole-word rule, at the level it is enforced. `clear` is the verb that
     /// hides inside the most ordinary English, so it gets the sharpest test.
