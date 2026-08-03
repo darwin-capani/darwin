@@ -63,7 +63,9 @@ use tracing::{info, warn};
 
 use crate::policy::Decision;
 
-/// Max entries retained before the oldest are pruned + the chain re-rooted.
+/// Max entries retained before the oldest are pruned. The prune is DELETE-ONLY:
+/// a surviving entry's stored hashes are never rewritten, so the external anchor
+/// taken over one of them stays valid (see [`AuditLog::prune_oldest`]).
 /// Generous for an appliance's consequential-action cadence; the cap only bounds
 /// disk, it does not weaken the integrity property of the surviving suffix.
 pub const MAX_ENTRIES: usize = 10_000;
@@ -233,7 +235,7 @@ impl ChainStatus {
 pub struct AuditLog {
     conn: Mutex<Connection>,
     /// Retention cap: past this many entries the oldest are pruned and the chain
-    /// re-rooted. Defaults to [`MAX_ENTRIES`]; overridden from `[audit].max_entries`
+    /// deleted. Defaults to [`MAX_ENTRIES`]; overridden from `[audit].max_entries`
     /// via [`with_max_entries`](AuditLog::with_max_entries) at construction.
     max_entries: usize,
 }
@@ -318,8 +320,8 @@ impl AuditLog {
     /// the log. The new entry's `prev_hash` is the current tail's `entry_hash` (or
     /// [`GENESIS_PREV`] when empty), and its `entry_hash` folds that in — so the
     /// chain extends by construction. After append, if the count exceeds
-    /// [`MAX_ENTRIES`], the oldest are pruned and the chain re-rooted (see
-    /// [`Self::prune_and_reroot`]). Returns the stored [`AuditEntry`].
+    /// [`MAX_ENTRIES`], the oldest are deleted — survivors are left untouched (see
+    /// [`Self::prune_oldest`]). Returns the stored [`AuditEntry`].
     pub async fn record(
         &self,
         agent: &str,
@@ -338,7 +340,7 @@ impl AuditLog {
     }
 
     /// The SINGLE append path: link an ALREADY-FINAL record onto the chain, INSERT
-    /// it, and run the bounded prune+re-root. `target_stored` is written VERBATIM —
+    /// it, and run the bounded delete-only prune. `target_stored` is written VERBATIM —
     /// [`record`] pre-redacts it (secret-free defense in depth), while
     /// [`record_triage_evidence`] passes a public SHA-256 digest that must survive
     /// intact. Factoring this out keeps the seq/prev_hash linkage and the canonical
@@ -404,10 +406,11 @@ impl AuditLog {
             entry_hash,
         };
 
-        // Bounded retention: prune + re-root if we are over the cap.
+        // Bounded retention: delete the oldest if we are over the cap. Survivors
+        // keep their hashes, so an anchor over one of them survives this.
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))?;
         if count as usize > self.max_entries {
-            Self::prune_and_reroot(&conn, self.max_entries)?;
+            Self::prune_oldest(&conn, self.max_entries)?;
         }
 
         Ok(entry)
@@ -525,7 +528,7 @@ impl AuditLog {
             // An entry EXISTS at the witnessed seq but its hash CHANGED: the chain was
             // rewritten under the witness — the exact offline full-rewrite tamper the
             // external anchor catches (and that verify_chain alone cannot). A rare
-            // local prune+re-root of a still-present witnessed entry also lands here
+            // local prune of a still-present witnessed entry also lands here
             // (documented residual — a prune is uncommon at the generous retention cap).
             Some(_) => Ok(AnchorStatus::Mismatch {
                 anchored_seq: a_seq,
@@ -552,7 +555,20 @@ impl AuditLog {
     /// evidence a prune happened); `verify_chain` treats the first surviving entry
     /// as the new root. Emits a secret-free telemetry note so truncation is
     /// explicit. Synchronous — runs under the held connection lock.
-    fn prune_and_reroot(conn: &Connection, keep: usize) -> Result<()> {
+    /// Retention: drop the oldest entries, keeping the newest `keep`.
+    ///
+    /// DELETE-ONLY. This used to RE-ROOT: after deleting, it recomputed every
+    /// surviving entry's `prev_hash`/`entry_hash` so the retained suffix started
+    /// from GENESIS again. That rewrote hashes the operator's EXTERNAL WITNESS was
+    /// taken over — the Keychain anchor stores `hash_at_seq(a_seq)` — so the first
+    /// prune after any `anchor_to` made `verify_against_anchor` report `Mismatch`
+    /// on a log nobody had touched. Tamper-evidence that cries wolf on its own
+    /// housekeeping is worse than none: the one alarm that matters gets ignored.
+    ///
+    /// A survivor's stored hash is now immutable for the entry's whole lifetime,
+    /// which is what makes the anchor mean anything. `verify_entries` seeds its
+    /// expected root from the retained suffix instead of demanding GENESIS.
+    fn prune_oldest(conn: &Connection, keep: usize) -> Result<()> {
         // The seq of the oldest entry we KEEP (the (count-keep+1)-th oldest).
         let cutoff: Option<i64> = conn
             .query_row(
@@ -566,42 +582,16 @@ impl AuditLog {
         // Drop everything older than the cutoff.
         let removed = conn.execute("DELETE FROM audit WHERE seq < ?1", params![cutoff_seq])?;
 
-        // Recompute the chain over the survivors, re-rooting at the first one.
-        let mut stmt = conn.prepare(
-            "SELECT seq, ts, agent, tool, target_redacted, decision, outcome
-             FROM audit ORDER BY seq ASC",
-        )?;
-        let rows: Vec<(i64, String, String, String, String, String, String)> = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        drop(stmt);
+        // How many survive — read, never rewritten.
+        let kept: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit", [], |r| r.get(0))
+            .unwrap_or(0);
 
-        let mut prev = GENESIS_PREV.to_string();
-        for (seq, ts, agent, tool, target, decision, outcome) in &rows {
-            let entry_hash =
-                hash_entry(&prev, *seq, ts, agent, tool, target, decision, outcome);
-            conn.execute(
-                "UPDATE audit SET prev_hash = ?1, entry_hash = ?2 WHERE seq = ?3",
-                params![prev, entry_hash, seq],
-            )?;
-            prev = entry_hash;
-        }
-
-        info!(removed, kept = rows.len(), "audit: pruned + re-rooted the chain (truncation)");
+        info!(removed, kept, "audit: pruned the chain (truncation; hashes untouched)");
         crate::telemetry::emit(
             "system",
             "audit.truncated",
-            serde_json::json!({"removed": removed, "kept": rows.len()}),
+            serde_json::json!({"removed": removed, "kept": kept}),
         );
         Ok(())
     }
@@ -611,7 +601,9 @@ impl AuditLog {
     ///   * a broken PREV-LINK (an entry's `prev_hash` != the prior `entry_hash`,
     ///     i.e. a reorder or a mid-chain DELETE/INSERT),
     ///   * a wrong root anchor (the first entry's `prev_hash` != [`GENESIS_PREV`]),
-    ///   * a non-contiguous seq (a deletion that left a gap WITHOUT re-rooting).
+    ///   * a non-contiguous seq WITHIN the retained range (a deletion mid-chain).
+    ///     A gap at the FRONT is retention doing its job and is not a break: the
+    ///     root is seeded from the retained suffix, not from GENESIS.
     ///     Read-only.
     pub async fn verify_chain(&self) -> Result<ChainStatus> {
         let conn = self.conn.lock().await;
@@ -956,7 +948,7 @@ pub fn snapshot_json(
         })
         .collect();
     // `truncated` is surfaced LIVE via the separate `audit.truncated` event the
-    // prune path emits; the snapshot reports the durable count, so a re-rooted
+    // prune path emits; the snapshot reports the durable count, so a truncated
     // chain still verifies as a fresh chain (count == surviving suffix).
     serde_json::json!({
         "enabled": enabled,
@@ -1032,11 +1024,29 @@ pub async fn emit_snapshot() {
 /// (and so the DB method and the test exercise the exact same code). An empty
 /// chain is trivially OK.
 fn verify_entries(entries: &[AuditEntry]) -> ChainStatus {
-    let mut expected_prev = GENESIS_PREV.to_string();
-    let mut expected_seq = 1i64; // re-rooted chains are verified as a fresh chain
+    // THE ROOT IS WHATEVER THE RETAINED SUFFIX LINKS TO, not necessarily GENESIS.
+    //
+    // Retention deletes the oldest entries and — deliberately — does NOT rewrite
+    // the survivors, because rewriting them invalidates the external Keychain
+    // witness taken over their hashes. So after a prune the first retained entry
+    // legitimately links to an entry that no longer exists, and demanding GENESIS
+    // here would report tampering on the daemon's own housekeeping.
+    //
+    // Nothing is lost by seeding from the suffix. `prev_hash` is folded into
+    // `hash_entry`, so an attacker cannot edit the root link without recomputing
+    // the whole forward chain — and recomputing the forward chain is exactly what
+    // the external anchor catches, which now works because a survivor's hash is
+    // immutable for its lifetime. The seq-gap check and the per-entry
+    // `entry_hash` recomputation below still catch mutate / insert / delete /
+    // reorder within the retained range.
+    let mut expected_prev = entries
+        .first()
+        .map(|e| e.prev_hash.clone())
+        .unwrap_or_else(|| GENESIS_PREV.to_string());
+    let mut expected_seq = 1i64;
     for (i, e) in entries.iter().enumerate() {
-        // The first entry anchors to GENESIS; each subsequent prev_hash must equal
-        // the prior entry_hash. A reorder / mid-chain delete / insert breaks this.
+        // Each subsequent prev_hash must equal the prior entry_hash. A reorder /
+        // mid-chain delete / insert breaks this.
         if e.prev_hash != expected_prev {
             return ChainStatus::Broken {
                 seq: e.seq,
@@ -1044,7 +1054,7 @@ fn verify_entries(entries: &[AuditEntry]) -> ChainStatus {
             };
         }
         // Seq must be strictly increasing by 1 from the first entry's own seq.
-        // (We seed expected_seq from the first entry so a re-rooted suffix that
+        // (We seed expected_seq from the first entry so a truncated suffix that
         // legitimately starts above 1 still verifies, while a GAP within the
         // retained chain is caught.)
         if i == 0 {
@@ -1053,7 +1063,7 @@ fn verify_entries(entries: &[AuditEntry]) -> ChainStatus {
         if e.seq != expected_seq {
             return ChainStatus::Broken {
                 seq: e.seq,
-                reason: "sequence gap (a deletion that did not re-root)".into(),
+                reason: "sequence gap within the retained chain (a mid-chain deletion)".into(),
             };
         }
         // The recomputed content hash must equal the stored one — catches any
@@ -1114,8 +1124,8 @@ mod tests {
             3,
             "retention pruned to the CONFIGURED cap, not MAX_ENTRIES"
         );
-        // The chain stays intact across the re-root.
-        assert!(log.verify_chain().await.unwrap().is_ok(), "chain re-roots cleanly at the custom cap");
+        // The chain stays intact across the prune.
+        assert!(log.verify_chain().await.unwrap().is_ok(), "the truncated chain verifies at the custom cap");
 
         // A 0 / absent config keeps the default cap — a typo can never DISABLE
         // retention (which would let the log grow unbounded). A handful of records
@@ -1296,21 +1306,29 @@ mod tests {
         assert_eq!(recent[1].seq, 2);
     }
 
-    // -- bounded retention + re-root ------------------------------------------
+    // -- bounded retention (delete-only) --------------------------------------
 
-    /// After pruning past the cap, the surviving suffix re-roots and STILL
-    /// verifies as a fresh chain (truncation keeps integrity).
+    /// After pruning past the cap, the surviving suffix STILL verifies — and every
+    /// survivor's stored hash is BYTE-IDENTICAL to what it was before the prune.
+    ///
+    /// This test used to assert the opposite: that the prune RE-ROOTED the suffix
+    /// to GENESIS. That re-root is what broke the external witness — the Keychain
+    /// anchor stores a survivor's hash, and rewriting it made the very next
+    /// `verify_against_anchor` report `Mismatch` on an untouched log. Immutability
+    /// of a retained entry's hash is now the property under test.
     #[test]
-    fn truncation_re_roots_and_still_verifies() {
+    fn truncation_is_delete_only_and_still_verifies() {
         // Drive the pure prune logic over a hand-built chain to keep it fast +
-        // deterministic, then verify the re-rooted result.
+        // deterministic, then verify the retained suffix.
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE audit(seq INTEGER PRIMARY KEY, ts TEXT, agent TEXT, tool TEXT,
              target_redacted TEXT, decision TEXT, outcome TEXT, prev_hash TEXT, entry_hash TEXT);",
         )
         .unwrap();
-        // Build a valid 5-entry chain by hand.
+        // Build a valid 5-entry chain by hand, remembering each entry's
+        // (prev_hash, entry_hash) so the prune's effect on them can be asserted.
+        let mut before: Vec<(String, String)> = Vec::new();
         let mut prev = GENESIS_PREV.to_string();
         for seq in 1..=5i64 {
             let ts = format!("2026-01-0{seq}T00:00:00+00:00");
@@ -1320,12 +1338,13 @@ mod tests {
                 params![seq, ts, prev, h],
             )
             .unwrap();
+            before.push((prev.clone(), h.clone()));
             prev = h;
         }
-        // Keep only the newest 2 -> prune seqs 1,2,3, re-root at seq 4.
-        AuditLog::prune_and_reroot(&conn, 2).unwrap();
+        // Keep only the newest 2 -> prune seqs 1,2,3. Seq 4 survives UNCHANGED.
+        AuditLog::prune_oldest(&conn, 2).unwrap();
 
-        // Read back + verify the re-rooted suffix.
+        // Read back + verify the RETAINED suffix (hashes untouched by the prune).
         let mut stmt = conn
             .prepare("SELECT seq, ts, agent, tool, target_redacted, decision, outcome, prev_hash, entry_hash FROM audit ORDER BY seq ASC")
             .unwrap();
@@ -1348,10 +1367,31 @@ mod tests {
             .unwrap();
         assert_eq!(entries.len(), 2, "only the newest 2 survive");
         assert_eq!(entries[0].seq, 4, "seq is preserved (the gap is the prune evidence)");
-        assert_eq!(entries[0].prev_hash, GENESIS_PREV, "the new oldest is re-rooted to genesis");
+        // THE POINT: the prune did not touch a survivor's hashes. `before` was
+        // captured from the pre-prune chain above.
+        assert_eq!(
+            entries[0].prev_hash, before[3].0,
+            "a survivor's prev_hash was rewritten — the external anchor over it is now invalid"
+        );
+        assert_eq!(
+            entries[0].entry_hash, before[3].1,
+            "a survivor's entry_hash was rewritten — verify_against_anchor will cry wolf"
+        );
+        assert_ne!(
+            entries[0].prev_hash, GENESIS_PREV,
+            "the suffix must NOT be re-rooted; it still links to the entry that was dropped"
+        );
         assert!(
             verify_entries(&entries).is_ok(),
-            "the re-rooted suffix must verify as a fresh chain"
+            "a delete-only truncated suffix must still verify"
+        );
+
+        // ...and the chain is still tamper-EVIDENT: edit one survivor and it breaks.
+        let mut tampered = entries.clone();
+        tampered[1].outcome = "executed".to_string();
+        assert!(
+            !verify_entries(&tampered).is_ok(),
+            "editing a survivor after a prune must still be caught"
         );
     }
 
@@ -1480,6 +1520,88 @@ mod tests {
             *self.value.lock().await = Some(value.to_string());
             Ok(())
         }
+    }
+
+    /// THE FIRST PRUNE MUST NOT POISON THE EXTERNAL WITNESS.
+    ///
+    /// The operator anchors the chain head into the Keychain, and
+    /// `verify_against_anchor` later corroborates the live log against it. Retention
+    /// used to RE-ROOT after deleting — recomputing every survivor's stored hashes —
+    /// so the anchor, taken over a hash that no longer existed, reported `Mismatch`
+    /// on a log nobody had touched. An alarm that fires on the daemon's own
+    /// housekeeping is worse than no alarm: the operator learns to ignore it, and the
+    /// one time it means something they ignore that too.
+    ///
+    /// This is the seam nothing covered: `truncation_is_delete_only_and_still_verifies`
+    /// never anchored, and the anchor tests never pruned. The two only meet here.
+    #[tokio::test]
+    async fn a_prune_does_not_poison_the_external_anchor() {
+        let log = AuditLog::in_memory().unwrap().with_max_entries(5);
+        let anchor = MemAnchor { value: Mutex::new(None) };
+        for i in 0..3 {
+            log.record("agent.darwin", "open_url", &format!("t{i}"), Decision::Ask, Outcome::Parked)
+                .await
+                .unwrap();
+        }
+        let (a_seq, a_head) = log.anchor_to(&anchor).await.unwrap().expect("head to witness");
+
+        // Push JUST past the cap so retention runs but the witnessed entry (seq 3)
+        // survives: 6 recorded, cap 5 -> seq 1 is dropped, seqs 2..6 are kept.
+        for i in 3..6 {
+            log.record("agent.darwin", "open_url", &format!("t{i}"), Decision::Ask, Outcome::Parked)
+                .await
+                .unwrap();
+        }
+        assert_eq!(log.len().await.unwrap(), 5, "retention ran");
+
+        // PRECONDITION — the witnessed entry SURVIVED the prune. Without this the
+        // test could pass vacuously: a witnessed entry that was deleted is a
+        // different (and legitimate) situation, and would prove nothing about
+        // rewriting.
+        let live = log.hash_at_seq(a_seq).await.unwrap();
+        assert_eq!(
+            live.as_deref(),
+            Some(a_head.as_str()),
+            "the witnessed entry's hash changed across a prune — the anchor is now invalid"
+        );
+
+        assert!(log.verify_chain().await.unwrap().is_ok(), "the pruned chain still verifies");
+        assert!(
+            matches!(log.verify_against_anchor(&anchor).await.unwrap(), AnchorStatus::Extended { .. }),
+            "a pruned-but-untampered log must corroborate as Extended, never Mismatch"
+        );
+    }
+
+    /// ...and the anchor still CATCHES a real rewrite after a prune. A fix that made
+    /// `Mismatch` unreachable would satisfy the test above and destroy the feature.
+    #[tokio::test]
+    async fn the_anchor_still_catches_a_rewrite_after_a_prune() {
+        let log = AuditLog::in_memory().unwrap().with_max_entries(5);
+        let anchor = MemAnchor { value: Mutex::new(None) };
+        for i in 0..3 {
+            log.record("agent.darwin", "open_url", &format!("t{i}"), Decision::Ask, Outcome::Parked)
+                .await
+                .unwrap();
+        }
+        let (a_seq, _) = log.anchor_to(&anchor).await.unwrap().expect("head to witness");
+        for i in 3..6 {
+            log.record("agent.darwin", "open_url", &format!("t{i}"), Decision::Ask, Outcome::Parked)
+                .await
+                .unwrap();
+        }
+        // Forge the witnessed entry's stored hash — what a rewrite looks like.
+        {
+            let conn = log.conn.lock().await;
+            conn.execute(
+                "UPDATE audit SET entry_hash = ?1 WHERE seq = ?2",
+                params!["deadbeef", a_seq],
+            )
+            .unwrap();
+        }
+        assert!(
+            matches!(log.verify_against_anchor(&anchor).await.unwrap(), AnchorStatus::Mismatch { .. }),
+            "a rewritten witnessed entry must still be caught after a prune"
+        );
     }
 
     #[test]
