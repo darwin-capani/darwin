@@ -41,7 +41,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::telemetry;
 
@@ -1202,6 +1202,38 @@ struct AppEntry {
     /// timeout. Shared (Arc) because relay_line resolves it under its own
     /// registry lock while request_op holds a clone across its await.
     pending: Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<Value>>>>,
+    /// Op lines to send EVERY time this app connects, right after `start`.
+    ///
+    /// For an app whose host-side feature must be armed per-connection rather
+    /// than once at daemon startup. Continuous screen context is the case that
+    /// forced this: it was armed by a single `screen.context.start` sent during
+    /// `main()`, which can only reach an ALREADY-RUNNING Vision app — and the
+    /// shipped config autostarts nothing, so on a normal boot the op was dropped
+    /// with "vision is not running" and NOTHING re-armed when the user later
+    /// opened Vision. The ring was empty on every real boot while the config and
+    /// README said the only missing piece was a TCC grant.
+    ///
+    /// Safe to repeat: the Vision side cancels any prior capture task before
+    /// starting a new one, so a reconnect re-arms rather than doubling up.
+    on_connect_ops: Vec<String>,
+}
+
+/// Arm an op to be re-sent to `app` on EVERY connection, right after `start`.
+///
+/// Called once at startup for a feature whose loop lives inside an app but whose
+/// lifetime must follow the CONNECTION, not the daemon. See
+/// [`AppEntry::on_connect_ops`] for why a one-shot send at boot is not enough.
+pub async fn arm_on_connect(registry: &Arc<AppRegistry>, app: &str, op_line: &str) -> bool {
+    let mut apps = registry.apps.lock().await;
+    match apps.get_mut(app) {
+        Some(e) => {
+            if !e.on_connect_ops.iter().any(|o| o == op_line) {
+                e.on_connect_ops.push(op_line.to_string());
+            }
+            true
+        }
+        None => false,
+    }
 }
 
 /// The host's registry of installed micro-apps, keyed by name. One per daemon.
@@ -1330,6 +1362,7 @@ impl AppRegistry {
                                 op_tx,
                                 op_rx: Arc::new(Mutex::new(Some(op_rx))),
                                 pending: Arc::new(Mutex::new(HashMap::new())),
+                                on_connect_ops: Vec::new(),
                             },
                         );
                         info!(app = name, "micro-app manifest registered");
@@ -2245,6 +2278,22 @@ async fn handle_conn(
 
     // Host -> app: kick it off.
     let _ = send_command(&mut write_half, "start").await;
+
+    // ...then RE-ARM anything whose lifetime follows this connection rather than
+    // the daemon's. Sent on every connect, so a feature stays armed across an app
+    // restart and — the case this exists for — becomes armed the FIRST time the
+    // user opens the app, long after the daemon booted.
+    let on_connect: Vec<String> = {
+        let apps = registry.apps.lock().await;
+        apps.get(name).map(|e| e.on_connect_ops.clone()).unwrap_or_default()
+    };
+    for op_line in &on_connect {
+        if send_op_line(&mut write_half, op_line).await.is_err() {
+            warn!(app = name, "failed to re-arm an on-connect op");
+            break;
+        }
+        debug!(app = name, "re-armed an on-connect op");
+    }
 
     // Take the op receiver for the life of THIS connection. None should never
     // happen (run_once serves one connection at a time per app), but if it
@@ -4890,4 +4939,107 @@ mod tests {
             "clean EOF returns None"
         );
     }
+    /// AN ON-CONNECT OP IS RE-ARMED ON A CONNECTION THE DAEMON DID NOT START.
+    ///
+    /// Continuous screen context was armed by ONE `screen.context.start` sent
+    /// during `main()`. That can only reach an already-running app, and the
+    /// shipped config autostarts nothing — so on a normal boot the op was dropped
+    /// ("vision is not running") and NOTHING re-armed when the user opened Vision
+    /// later. The ring was empty on every real boot while the config and README
+    /// told the user the only missing piece was a Screen Recording grant.
+    ///
+    /// This drives the real socket: arm the op AFTER the registry exists, start
+    /// the app, then play the app and assert the op arrives on THIS connection,
+    /// right after `start` — i.e. without anyone calling `send_op`.
+    #[tokio::test]
+    async fn an_armed_op_is_resent_on_every_connection() {
+        use tokio::io::AsyncBufReadExt;
+        let root = PathBuf::from(format!(
+            "/private/tmp/jrv-arm-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000
+        ));
+        let app_dir = root.join("apps/echo-app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(root.join("state/ipc/apps")).unwrap();
+        std::fs::create_dir_all(root.join("state/apps")).unwrap();
+        std::fs::write(
+            app_dir.join("manifest.toml"),
+            r#"
+            [app]
+            name = "echo-app"
+            version = "0.1.0"
+            description = "hermetic test echo app"
+            entry = "apps/echo-app/main.py"
+            runtime = "python"
+            [permissions]
+            audio = false
+            gpu = false
+            net_hosts = []
+            fs_read = []
+            fs_write = ["state/apps/echo-app"]
+            [ui]
+            surface = "panel"
+            telemetry_topics = ["feed"]
+        "#,
+        )
+        .unwrap();
+
+        let mut registry = AppRegistry::discover(&root);
+        Arc::get_mut(&mut registry).unwrap().interpreter_override =
+            Some(PathBuf::from("/bin/sleep"));
+
+        // Arm BEFORE the app has ever connected — the situation at daemon boot.
+        let armed = arm_on_connect(&registry, "echo-app", r#"{"op":"screen.context.start"}"#).await;
+        assert!(armed, "arming a known app must succeed");
+        assert!(
+            !arm_on_connect(&registry, "no-such-app", r#"{"op":"x"}"#).await,
+            "arming an unknown app must report failure, not silently succeed"
+        );
+
+        start(&registry, "echo-app").await.unwrap();
+        let sock_path = root.join("state/ipc/apps/echo-app.sock");
+        let mut waited = 0;
+        while !sock_path.exists() && waited < 60 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += 1;
+        }
+        assert!(sock_path.exists(), "host bound the app socket");
+
+        // Play the app. Nobody calls send_op here — the arm is the only source.
+        let stream = UnixStream::connect(&sock_path).await.expect("connect to host socket");
+        let (read_half, _write_half) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+
+        let mut start_line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut start_line))
+            .await
+            .expect("host sends start promptly")
+            .expect("read start");
+        assert_eq!(
+            serde_json::from_str::<Value>(start_line.trim()).unwrap()["type"],
+            "start",
+            "host kicks the app with start first"
+        );
+
+        let mut op_line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut op_line))
+            .await
+            .expect("the armed op must arrive on this connection without a send_op")
+            .expect("read armed op");
+        let op: Value = serde_json::from_str(op_line.trim()).unwrap();
+        assert_eq!(
+            op["op"], "screen.context.start",
+            "the armed op must be re-sent right after start, on a connection the \
+             daemon did not initiate: got {op_line}"
+        );
+
+        let _ = stop(&registry, "echo-app").await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
 }
