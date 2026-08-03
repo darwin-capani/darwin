@@ -11541,10 +11541,31 @@ fn load_ui_automation_config() -> crate::config::UiAutomationConfig {
 /// real pixel). The real on-device geometry read replaces the fallback behind the
 /// gate; the pure planner is proven hermetically with a fixed bound.
 fn ui_screen_bounds() -> crate::ui_automation::ScreenBounds {
-    // Deny-leaning fallback: no resolvable display => 0x0 => every click refused.
-    // The on-device path reads CGDisplayBounds(CGMainDisplayID()) here behind the
-    // [ui_automation].enabled + Accessibility-TCC gates. Kept off the hermetic
-    // path so no test depends on a real display.
+    // 0x0 => `ScreenBounds::contains` refuses every coordinate => `ui_actuate`'s
+    // click has never fired, on any display.
+    //
+    // THIS IS NOT ONE MISSING FFI CALL, and the previous comment here — "the
+    // on-device path reads CGDisplayBounds(CGMainDisplayID()) here" — read like it
+    // was. Reading the real display geometry would make things WORSE, not better.
+    //
+    // The coordinates that reach the click come from the Lumen voice path, which
+    // takes them from the Vision app's `read.screen` readout. Those are
+    // `VNRecognizedTextObservation.boundingBox` centers: NORMALIZED 0..1, origin
+    // BOTTOM-LEFT. `lumen::parse_center` rounds them to an integer, so a control at
+    // 72% across and 55% up the screen arrives as the point (1, 1). The Vision
+    // source says as much in its own doc comment: "NOT a click target."
+    //
+    // So today's refusal is FAIL-SAFE. Give this function real bounds while the
+    // coordinates are still normalized and every "click the Send button" lands on
+    // pixel (1, 1) — the top-left corner of the main display, where macOS keeps the
+    // Apple menu and a window's close button.
+    //
+    // Enabling clicking needs BOTH halves, together:
+    //   1. the Vision app emits a screen-point target (top-left origin,
+    //      denormalized against the display it captured), and
+    //   2. this returns that display's geometry — in the SAME units, which on a
+    //      scaled Retina panel means points, not `CGDisplayPixelsWide`.
+    // `lumen::a_normalized_vision_center_is_not_a_clickable_point` pins the coupling.
     crate::ui_automation::ScreenBounds { width: 0, height: 0 }
 }
 

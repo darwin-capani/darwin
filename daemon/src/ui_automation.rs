@@ -88,6 +88,11 @@ impl ScreenBounds {
     /// Is `(x, y)` a real on-screen pixel: `0 <= x < width` and `0 <= y < height`?
     /// Strict upper bound — a click at exactly `width`/`height` is off the last
     /// pixel and is refused. A non-positive screen (no display) accepts nothing.
+    #[cfg(test)]
+    pub(crate) fn contains_for_test(&self, x: i32, y: i32) -> bool {
+        self.contains(x, y)
+    }
+
     fn contains(&self, x: i32, y: i32) -> bool {
         x >= 0 && y >= 0 && x < self.width && y < self.height
     }
