@@ -7069,8 +7069,16 @@ pub fn nexus_command(text: &str) -> Option<NexusCommand> {
 
     // --- mute / unmute (specific verb; before gain/route/launch) -----------
     // "mute the mic", "unmute input 2", "mute the microphone".
-    if lower.contains("mute") {
-        let unmute = lower.contains("unmute") || lower.contains("un-mute");
+    //
+    // WHAT WENT WRONG: `contains("mute")` fires inside "commute". Measured over
+    // 1,897 everyday utterances, "my commute was a nightmare this morning"
+    // MUTED THE OWNER'S MICROPHONE. Whole-word now, plus the utterance must
+    // either name the hardware ("mute the mic", "mute input 2") or be nothing
+    // but the bare mute idiom ("mute me", "unmute everything").
+    if crate::utterance::mentions_any_word(&lower, &["mute", "unmute"])
+        && (nexus_hardware_context(&lower) || nexus_bare_mute_phrase(&lower))
+    {
+        let unmute = mentions_word(&lower, "unmute") || lower.contains("un-mute");
         let channel = extract_channel(&lower, "input").unwrap_or(NEXUS_MIC_INPUT);
         return Some(NexusCommand::Op(op_gain_mute(channel, !unmute)));
     }
@@ -7078,7 +7086,21 @@ pub fn nexus_command(text: &str) -> Option<NexusCommand> {
     // --- gain set ----------------------------------------------------------
     // "set input gain to -18", "set the gain on output 1 to -3 dB", "turn the
     // mic gain down to -24". Requires an explicit dB value to be a gain.set.
-    if lower.contains("gain") || lower.contains("trim") {
+    //
+    // WHAT WENT WRONG: `contains("gain")` fires inside "again", "against" and
+    // "bargain", and the dB value is NOT a second safety net — extract_db takes
+    // the first number after the LAST "to"/"at" anywhere in the sentence, so
+    // "let's start again at 6" wrote +6 dB onto the mic and "how much weight
+    // gain at 6 months is normal" wrote +6 dB. Whole words now, and the gain
+    // word must be BOUND to a channel noun ("input gain", "the gain on input
+    // 1", "output 1 gain"), or TAKE one as its direct object with an explicit
+    // dB target ("trim input 1 to -6 db"), or the utterance must be nothing but
+    // a bare gain instruction ("set the gain to -6").
+    if crate::utterance::mentions_any_word(&lower, NEXUS_GAIN_WORDS)
+        && (nexus_head_names_a_channel(&lower, NEXUS_GAIN_WORDS, NEXUS_GAIN_NOUNS)
+            || nexus_gain_verb_targets_a_channel(&lower)
+            || nexus_bare_gain_phrase(&lower))
+    {
         if let Some(gain_db) = extract_db(&lower) {
             // Stage: "output" if the utterance names an output, else input
             // (the SM7dB chain trims the input by default — SPEC §3).
@@ -7095,14 +7117,57 @@ pub fn nexus_command(text: &str) -> Option<NexusCommand> {
     // "route input 1 to the monitor", "route input 2 to output 3", "unroute
     // input 1 from the monitor". A "route … to the monitor" without an explicit
     // output targets the monitor bus.
-    if (lower.contains("route") || lower.contains("send") || lower.contains("patch"))
-        && (lower.contains("input") || lower.contains("monitor") || lower.contains("output"))
+    //
+    // WHAT WENT WRONG, and this is the worst branch in the classifier because
+    // it is the one that can DESTROY a crosspoint. It matched on five bare
+    // `contains()` calls, one of them "send" — one of the most ordinary verbs
+    // in English — paired with a bare "input"/"monitor"/"output". That emitted
+    // a route.set for "send me the output of the report", "please send the
+    // output to the printer", and for "my router keeps dropping and the input
+    // lags" ("route" INSIDE "router"). Worse, `clear` was `contains("from") &&
+    // !contains(" to ")`, so an ordinary "from" with no "to" wrote -inf and
+    // CLEARED the crosspoint: "send me the output from the meeting" silently
+    // tore down a route.
+    //
+    // The gate is deliberately ASYMMETRIC, and that asymmetry is the fix for
+    // the previous attempt, which gated this branch on "the sentence mentions
+    // some audio hardware somewhere" and thereby made the DESTRUCTIVE branch
+    // WIDER than the code it replaced: with only a noun required, "send the
+    // microphone back to amazon", "send me the mic drop clip" and "send a clear
+    // photo of the microphone to the seller" all became crosspoint writes, the
+    // last one a -inf CLEAR, on utterances the original code ignored. So:
+    //   * a NUMBERED channel ("input 1", "output 3") admits any of the verbs,
+    //     including the ordinary-English "send" and "disconnect" — nobody says
+    //     "input 1" by accident, and 0 of the 1,897 everyday utterances contain
+    //     even a bare "input" or "output";
+    //   * otherwise the utterance must be a routing SENTENCE, not a sentence
+    //     that happens to contain routing words. An unmistakable ROUTING verb
+    //     (route/patch and their un-/re- forms) must TAKE the signal chain as
+    //     its object, and a prepositional phrase must name where the signal
+    //     goes. Each of those three is load-bearing and each was measured:
+    //     without the verb restriction "send the microphone back to amazon" was
+    //     a write; without the destination "the mic patch cable is broken" and
+    //     "there's a patch for the preamp driver" were writes; without the
+    //     object binding "route the kids from the mic stand to the door" was a
+    //     write. A patch CABLE is a parcel, and a mic STAND is furniture.
+    // The `from`/`to` heuristic is gone entirely; clearing now requires an
+    // explicit unroute/unpatch/clear/disconnect verb, whole-word so "clear"
+    // never fires inside "nuclear".
+    if crate::utterance::mentions_any_word(
+        &lower,
+        &[
+            "route", "routes", "reroute", "unroute", "patch", "patches", "repatch", "unpatch",
+            "send", "disconnect",
+        ],
+    ) && (mentions_nexus_numbered_channel(&lower)
+        || (nexus_routing_verb_takes_the_signal_chain(&lower)
+            && nexus_names_a_routing_destination(&lower)))
     {
-        let clear = lower.contains("unroute")
-            || lower.contains("un-route")
-            || lower.contains("clear")
-            || lower.contains("disconnect")
-            || (lower.contains("from") && !lower.contains(" to "));
+        let clear = crate::utterance::mentions_any_word(
+            &lower,
+            &["unroute", "unpatch", "clear", "disconnect"],
+        ) || lower.contains("un-route")
+            || lower.contains("un-patch");
         let input = extract_channel(&lower, "input").unwrap_or(NEXUS_MIC_INPUT);
         // The destination output: an explicit "output M", else the monitor bus
         // when "monitor" is named, else the monitor bus as the sensible default.
@@ -7116,12 +7181,64 @@ pub fn nexus_command(text: &str) -> Option<NexusCommand> {
     // "monitor input 1", "stop monitoring", "turn off the monitor". This is the
     // direct-monitor route toggle (SPEC §5 monitor.set), distinct from a generic
     // crosspoint route above (which already matched if "route"/"send" was said).
-    if lower.contains("monitor") {
-        let off = lower.contains("stop")
-            || lower.contains("turn off")
-            || lower.contains("disable")
-            || lower.contains("no longer")
-            || lower.contains("unmonitor");
+    //
+    // WHAT WENT WRONG: this fired on a bare `contains("monitor")` with no gate
+    // at all, and "monitor" is a verb ordinary people use about their bodies
+    // and their money. Over 1,897 everyday utterances it REWROTE a monitor
+    // crosspoint 25 times — "I need to monitor my blood pressure twice a day",
+    // "the rangers monitor the snowpack all winter", "the bank offers free
+    // credit monitoring", "is a curved monitor worth the extra money". A
+    // sentence about blood pressure mutated the audio matrix.
+    //
+    // The utterance must now name the hardware ("monitor input 1", "monitor the
+    // mic") or be nothing but the bare toggle. Note what is NOT accepted as
+    // hardware: a bare "channel", "input", "output" or "audio". Those are what
+    // an earlier draft of this fix used, and "monitor the slack channel for
+    // updates", "can you monitor the youtube channel" and "monitor the output
+    // of the build script" walked straight through it.
+    //
+    // "unmonitor" is whole-word alongside "monitor"/"monitoring": as a raw
+    // substring it half-matched inside "unmonitored" and turned "the server
+    // input is unmonitored overnight" into monitor.set{on:false}.
+    //
+    // WHAT WENT WRONG IN THE OFF-WORDS, and this one is the dangerous
+    // direction. Making the off-words whole-word stopped them matching the
+    // PAST and PROGRESSIVE forms that `contains("stop")`/`contains("disable")`
+    // used to catch, and the failure is not a missed command — it is a FLIP
+    // into the device-activating direction. Measured: "I stopped monitoring the
+    // mic last week", "I've stopped monitoring my mic levels", "we stopped
+    // monitoring input 1 months ago" and "they disabled the mic monitoring
+    // already" each went on:false -> on:TRUE. A sentence that literally says
+    // the user STOPPED monitoring would have OPENED a live mic-to-monitor-bus
+    // crosspoint where the code being replaced closed one. Every inflection is
+    // therefore listed. "kill" is listed for the same reason: it is already in
+    // the bare-toggle vocabulary, so "kill the monitor" reaches here — and
+    // without it in this list it turned the monitor ON. These words can only
+    // ever be read inside this already-gated branch, so naming more of them
+    // cannot widen the classifier; it can only stop it opening a mic.
+    //
+    // A whole-word "off" is added because "turn the monitor off" is the same
+    // command as "turn off the monitor" and the substring test only caught one
+    // of the two word orders.
+    if crate::utterance::mentions_any_word(&lower, &["monitor", "monitoring", "unmonitor"])
+        && (nexus_hardware_context(&lower) || nexus_bare_monitor_toggle(&lower))
+    {
+        let off = crate::utterance::mentions_any_word(
+            &lower,
+            &[
+                "stop", "stopped", "stopping", "disable", "disabled", "disabling", "kill",
+                "killed", "unmonitor", "unmonitored", "off",
+                // Admitting a verb to the toggle's TRIGGER list without adding it
+                // here is how "quit monitoring" and "pause monitoring" ended up
+                // turning the monitor ON: the branch fired, saw no off-word it
+                // recognized, and defaulted to on. Every off-verb the trigger
+                // accepts must be readable here or the toggle opens a live mic on
+                // a request to close one.
+                "quit", "quitting", "pause", "paused", "pausing", "end", "ended",
+                "ending", "shut", "cut", "switch off",
+            ],
+        ) || lower.contains("turn off")
+            || lower.contains("no longer");
         let input = extract_channel(&lower, "input").unwrap_or(NEXUS_MIC_INPUT);
         let output = extract_channel(&lower, "output").unwrap_or(NEXUS_MONITOR_OUT);
         return Some(NexusCommand::Op(op_monitor_set(input, output, !off)));
@@ -7130,6 +7247,11 @@ pub fn nexus_command(text: &str) -> Option<NexusCommand> {
     // --- preset load -------------------------------------------------------
     // "load the vocal preset", "load preset podcast", "recall the streaming
     // preset". Only LOAD (preset.save is a panel/manual action, not voiced).
+    //
+    // LEFT ALONE DELIBERATELY. "preset" occurs in 0 of the 1,897 everyday
+    // utterances, the branch needs BOTH a load verb and an extractable name,
+    // and whole-wording "load" here would break "download the vocal preset" /
+    // "reload the preset" for no measured gain.
     if (lower.contains("load") || lower.contains("recall") || lower.contains("apply"))
         && lower.contains("preset")
     {
@@ -7144,20 +7266,53 @@ pub fn nexus_command(text: &str) -> Option<NexusCommand> {
     // "matrix" is a routing snapshot ONLY in a Nexus/routing context — a bare
     // "matrix" (e.g. "the matrix movie") is conversational and must fall
     // through, so it is gated on a routing/read co-word or a Nexus mention.
-    let matrix_state_query = lower.contains("matrix")
+    //
+    // WHAT WENT WRONG: the "matrix" arm got that gate. "level" and "meter"
+    // never did, and they are two of the most ordinary nouns in English. A bare
+    // `contains("level") || contains("meter")` answered 93 of the 1,897
+    // everyday utterances with an audio-matrix snapshot instead of a real
+    // answer: "my stress levels have been through the roof", "sea level is
+    // rising a little every year", "I got a parking meter ticket", "the gas
+    // meter guy is coming Thursday", "how many meters is a lap in that pool".
+    // It did not even require the word to BE a word — it fired inside
+    // "thermometer" ("do I own a meat thermometer") and inside "levelled". The
+    // matrix arm carried the same disease one level down: `contains("rout")` is
+    // a FRAGMENT and fired inside "routine", so "my whole routine is a matrix
+    // of pills and timers" read the routing matrix.
+    //
+    // A wrong read is an annoyance rather than a privacy incident, so this arm
+    // keeps a wider escape than the mutating branches above — but it is an
+    // escape of the same KIND. Three ways in, in narrowing order: the utterance
+    // names the hardware; or the level word is BOUND to a channel noun ("my
+    // input levels", "the mic level"); or the whole utterance is nothing but a
+    // bare read of "the levels"/"the meters".
+    //
+    // "whats" is listed beside "what" and that is not cosmetic. Making this a
+    // whole-word test broke the apostrophe-free form STT emits constantly:
+    // "whats routed to output 1" stopped reading the matrix, and because the
+    // route branch above still saw "output 1", the question about the routing
+    // fell into the branch that WRITES it. A contraction must not be the
+    // difference between reading a crosspoint and rewiring one.
+    let matrix_state_query = mentions_word(&lower, "matrix")
         && !mentions_nexus_launch_verb(&lower)
         && (mentions_nexus(&lower)
-            || lower.contains("rout")
+            || crate::utterance::mentions_any_word(
+                &lower,
+                &["route", "routes", "routed", "routing", "crosspoint", "crosspoints"],
+            )
             || lower.contains("read out")
             || lower.contains("read me")
-            || lower.contains("state")
-            || lower.contains("crosspoint"));
-    if lower.contains("level")
-        || lower.contains("meter")
+            || mentions_word(&lower, "state"));
+    let levels_query = crate::utterance::mentions_any_word(&lower, NEXUS_LEVEL_WORDS)
+        && (nexus_hardware_context(&lower)
+            || nexus_head_names_a_channel(&lower, NEXUS_LEVEL_WORDS, NEXUS_LEVEL_NOUNS)
+            || nexus_bare_levels_read(&lower));
+    if levels_query
         || matrix_state_query
         || lower.contains("routing state")
         || lower.contains("route state")
-        || (lower.contains("what") && lower.contains("routed"))
+        || (crate::utterance::mentions_any_word(&lower, &["what", "whats"])
+            && mentions_word(&lower, "routed"))
     {
         return Some(NexusCommand::Op(op_state_get()));
     }
@@ -7182,6 +7337,517 @@ fn mentions_nexus_launch_verb(lower: &str) -> bool {
         || lower.contains("bring up")
         || lower.contains("fire up")
         || lower.contains("show")
+}
+
+/// The PHYSICAL signal chain: words that are only ever audio gear. Shared by
+/// `mentions_nexus_signal_chain` (does the sentence name this app's hardware at
+/// all) and `nexus_routing_verb_takes_the_signal_chain` (is that hardware the
+/// thing being routed), so the two can never drift apart.
+const NEXUS_SIGNAL_CHAIN_NOUNS: &[&str] = &[
+    "mic", "mics", "microphone", "microphones", "fader", "faders", "preamp", "preamps",
+    "crosspoint", "crosspoints", "submix", "submixes",
+];
+
+/// Whether the utterance names THIS APP'S HARDWARE by a word that is only ever
+/// audio gear — the physical signal chain ("the mic", "the faders", "the
+/// preamp", "a crosspoint") or one of the Nexus aliases that is already a
+/// multi-word phrase ("the routing matrix", "the mixer").
+///
+/// The bare word "nexus" is NOT here, and that omission is load-bearing.
+/// `mentions_nexus` accepts it, which is right for the LAUNCH ("open nexus") —
+/// but "nexus" is an ordinary English noun and a very common venue/brand name.
+/// It appears in 12 of the 1,897 everyday utterances measured against this
+/// classifier ("book us a table at Nexus Bistro", "do I have tax nexus in
+/// another state", "the region is a nexus of trade disputes", "who's playing at
+/// the Nexus arena"). Letting it satisfy the gate below would turn "send the
+/// Nexus card statement to my accountant" into a crosspoint WRITE that the
+/// original code correctly ignored. A mutation has to be aimed at a mic or at a
+/// numbered channel, not at a hotel.
+fn mentions_nexus_signal_chain(lower: &str) -> bool {
+    lower.contains("routing matrix")
+        || lower.contains("the audio matrix")
+        || lower.contains("the mixer")
+        || lower.contains("the routing grid")
+        || crate::utterance::mentions_any_word(lower, NEXUS_SIGNAL_CHAIN_NOUNS)
+}
+
+/// Whether the utterance names an EXPLICITLY NUMBERED channel — "input 1",
+/// "output 3". Deliberately the numbered form only: reusing `extract_channel`
+/// means the keyword must be followed by an integer, so "input 2" counts and
+/// "the input queue" / "the output of the build script" do not. Bare
+/// "input"/"output"/"channel"/"audio" are what made the first version of this
+/// gate useless — in ordinary speech "channel" is Slack or YouTube, "input" and
+/// "output" are data.
+fn mentions_nexus_numbered_channel(lower: &str) -> bool {
+    extract_channel(lower, "input").is_some() || extract_channel(lower, "output").is_some()
+}
+
+/// The context an op needs before it may act: the utterance must name this
+/// app's hardware. The per-branch idioms below are the only other way past it,
+/// and they get narrower the more destructive the op is.
+fn nexus_hardware_context(lower: &str) -> bool {
+    mentions_nexus_signal_chain(lower) || mentions_nexus_numbered_channel(lower)
+}
+
+/// The verbs that can only mean CROSSPOINT ROUTING. "send" and "disconnect" are
+/// NOT here: they are ordinary English and are admitted by the numbered-channel
+/// path only.
+const NEXUS_ROUTING_VERBS: &[&str] = &[
+    "route", "routes", "reroute", "unroute", "patch", "patches", "repatch", "unpatch",
+];
+
+/// Whether a routing verb actually takes the signal chain as its OBJECT —
+/// "route THE MIC to the monitor", "unpatch THE STUDIO MIC from the monitor" —
+/// rather than merely sharing a sentence with an audio noun.
+///
+/// WHAT WENT WRONG WITHOUT THIS: requiring a routing verb, an audio noun and a
+/// destination preposition is still CO-OCCURRENCE, just with three terms
+/// instead of two. "route the kids from the mic stand to the door" has all
+/// three and WROTE A CROSSPOINT the original code ignored. The mic there is a
+/// modifier inside the SOURCE phrase ("the mic stand"), not the signal being
+/// routed.
+///
+/// The object is everything between the verb and the FIRST preposition after
+/// it, which is where English puts the thing being moved — "route [the mic] to
+/// the monitor", "route [the kids] from the mic stand to the door". Taking the
+/// span up to the FIRST preposition rather than the last, or the whole
+/// sentence, is what separates those two, and unlike a bare direct-object test
+/// it still admits an adjective between the determiner and the noun ("route the
+/// studio mic to the monitor"), which people say constantly.
+///
+/// Only the PHYSICAL signal chain counts as the object, never the app aliases:
+/// "can you patch the mixer software to the new version tonight" is a software
+/// chore, and letting "the mixer" be a routable object would have made it a
+/// crosspoint write. Routing the mixer itself is addressed by naming channels.
+fn nexus_routing_verb_takes_the_signal_chain(lower: &str) -> bool {
+    const PREPS: &[&str] = &[
+        "to", "into", "onto", "from", "of", "for", "at", "on", "with", "by", "in",
+    ];
+    let toks: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    for (i, t) in toks.iter().enumerate() {
+        if !NEXUS_ROUTING_VERBS.contains(t) {
+            continue;
+        }
+        for w in toks.iter().skip(i + 1) {
+            if PREPS.contains(w) {
+                break;
+            }
+            if NEXUS_SIGNAL_CHAIN_NOUNS.contains(w) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Whether a routing PREPOSITIONAL PHRASE binds the verb to a place — "route
+/// the mic TO the monitor", "patch the mic INTO output 2" — or, for the
+/// CLEARING direction only, to a source: "unpatch the mic FROM the monitor".
+///
+/// WHAT WENT WRONG WITHOUT THIS: the signal-chain-noun path below was pure
+/// CO-OCCURRENCE — a routing verb anywhere plus an audio noun anywhere, with
+/// nothing binding them — and "patch" and "route" are ordinary English NOUNS.
+/// Ten sentences that name real studio gear became crosspoint WRITES the
+/// original code ignored: "the mic patch cable is broken", "I need a longer
+/// patch cable for the mic", "did the mic firmware patch land", "there's a
+/// patch for the preamp driver", "can you patch the mixer software tonight",
+/// "where did I put the mic patch bay diagram", "the fader cap fell off, order
+/// a patch kit", "is there a patch note for the crosspoint bug", "my running
+/// route goes past the microphone store", "the mixer is on the delivery route
+/// today". A patch CABLE is a parcel too; the verb alone does not establish
+/// command shape. A crosspoint has a destination, so the utterance must name
+/// one.
+///
+/// "from" is admitted ONLY beside an explicit clearing verb, and that asymmetry
+/// is deliberate. "unroute the mic from the monitor" and "unpatch the mic from
+/// the monitor" are real commands with no "to" in them, so a destination-only
+/// rule would silently kill the whole noun-form UNROUTE family — but a bare
+/// "from" is the most ordinary preposition in the language ("there's a patch
+/// from the vendor for the preamp") and must not open a write on its own.
+fn nexus_names_a_routing_destination(lower: &str) -> bool {
+    lower.contains(" to ")
+        || lower.contains(" into ")
+        || lower.contains(" onto ")
+        || (lower.contains(" from ")
+            && crate::utterance::mentions_any_word(
+                lower,
+                &["unroute", "unpatch", "clear", "disconnect"],
+            ))
+}
+
+/// Nouns a GAIN or a TRIM can belong to. Only ever consulted through
+/// `nexus_head_names_a_channel` / `nexus_gain_verb_targets_a_channel`, i.e.
+/// bound by adjacency — the word has to be the head's neighbour, not merely
+/// present somewhere in the sentence. Wider than `NEXUS_LEVEL_NOUNS` below
+/// because the shipped gain idioms name the monitor side by its speaker ("set
+/// the speaker gain to -12 db", "set the headphone gain to -6"), and because a
+/// gain.set also needs an explicit dB value before it can fire.
+const NEXUS_GAIN_NOUNS: &[&str] = &[
+    "input", "inputs", "output", "outputs", "mic", "mics", "microphone", "microphones", "fader",
+    "faders", "preamp", "preamps", "monitor", "monitors", "headphone", "headphones", "speaker",
+    "speakers", "mixer", "crosspoint", "crosspoints",
+];
+
+/// Nouns a LEVEL or a METER can belong to. Deliberately just the I/O words, and
+/// deliberately much shorter than the gain list: every other audio noun is
+/// already `mentions_nexus_signal_chain`, so all this list adds is the bare,
+/// UNNUMBERED "my input levels" / "the output meters" phrasing that the read
+/// idiom needs. Widening it costs real accuracy for nothing — "speaker" would
+/// make "the speaker levels at the conference were painful" a mixer read, and
+/// "channel" would take "the channel levels on that stream".
+const NEXUS_LEVEL_NOUNS: &[&str] = &["input", "inputs", "output", "outputs"];
+
+/// Whether one of `heads` ("gain"/"trim", or "level"/"meter") is BOUND to one
+/// of `nouns` — either the noun sits to its LEFT ("input gain", "output 1
+/// gain", "my input levels") or a PREPOSITION links them to its RIGHT ("the
+/// gain on input 1", "the level of the mic"). Articles, possessives, a channel
+/// index and a spoken dB target may sit in between; nothing else may.
+///
+/// Adjacency rather than co-occurrence is the whole point, and the preposition
+/// on the right side is not decoration. "I need to trim the mic budget by 5
+/// percent to 2 people" contains "trim" AND "mic" and sails through any
+/// list-based gate; it also sails through a bare right-hand neighbour test,
+/// because "the mic" is literally "trim"'s next content word. It is the DIRECT
+/// OBJECT of the verb, not the owner of a trim — and "trim X" and "the trim on
+/// X" are different sentences. Requiring on/of/for is what separates them. On
+/// the other side, "let me check the gain we booked, bump it to 5" and "the
+/// gain on the portfolio last year came to 12" have no channel noun adjacent to
+/// "gain" at all; both of those wrote a gain value onto the mic before this
+/// existed.
+fn nexus_head_names_a_channel(lower: &str, heads: &[&str], nouns: &[&str]) -> bool {
+    let toks: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    let is_filler = |t: &str| {
+        matches!(t, "the" | "a" | "an" | "my" | "our" | "its" | "this" | "that")
+            || t.chars().all(|c| c.is_ascii_digit())
+    };
+    for (i, t) in toks.iter().enumerate() {
+        if !heads.contains(t) {
+            continue;
+        }
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            if is_filler(toks[j]) {
+                continue;
+            }
+            if nouns.contains(&toks[j]) {
+                return true;
+            }
+            break;
+        }
+        let mut k = i + 1;
+        let mut linked = false;
+        while k < toks.len() {
+            if matches!(toks[k], "on" | "of" | "for") {
+                linked = true;
+                k += 1;
+                continue;
+            }
+            // WHAT WENT WRONG: the walk stopped dead at "to", so "set the gain
+            // TO -6 DB on input 1" — the single most common way anyone says it,
+            // and the phrasing the SPEC's own gain-staging examples use — never
+            // reached "input" and the whole command was thrown away. A spoken dB
+            // TARGET is not a content word and it is not the thing the gain
+            // belongs to; step over it and keep looking for the channel the
+            // preposition binds. Note "to"/"at" deliberately do NOT set `linked`
+            // — only on/of/for do — so "the gain to the input of the fund" is
+            // still not a channel reference.
+            if matches!(
+                toks[k],
+                "to" | "at" | "db" | "dbs" | "dbfs" | "decibel" | "decibels" | "minus" | "negative"
+            ) {
+                k += 1;
+                continue;
+            }
+            if is_filler(toks[k]) {
+                k += 1;
+                continue;
+            }
+            if linked && nouns.contains(&toks[k]) {
+                return true;
+            }
+            break;
+        }
+    }
+    false
+}
+
+/// Whether the utterance carries an EXPLICIT dB target: a decibel unit word, or
+/// a value that is NEGATIVE (spoken "minus 6" is normalized to -6 by
+/// `extract_db`). Trims and monitor gains are cut, not boosted, so the negative
+/// sign is the everyday form; a bare positive number is not evidence of
+/// anything.
+///
+/// This is the ONLY thing separating "trim the mic to -6" (a command) from "I
+/// need to trim the mic budget by 5 percent to 2 people" (a sentence about
+/// staffing that contains both trigger words and puts the mic in the verb's
+/// direct-object slot). The second one yields +2 with no unit and is refused.
+fn nexus_explicit_db_target(lower: &str) -> bool {
+    crate::utterance::mentions_any_word(lower, &["db", "dbs", "dbfs", "decibel", "decibels"])
+        || matches!(extract_db(lower), Some(v) if v < 0.0)
+}
+
+/// Whether a gain/trim word takes a CHANNEL as its DIRECT OBJECT and the
+/// utterance carries an explicit dB target — "trim input 1 to -6 db", "trim
+/// output 1 to -3 db", "trim the mic to -6", "trim the input to -6 db".
+///
+/// WHAT WENT WRONG WITHOUT THIS: `nexus_head_names_a_channel` recognizes only
+/// the NOUN form of a trim ("the input trim", "the trim on input 1"), and the
+/// must-match corpus it was tuned against happened to contain only that form.
+/// The VERB form — which is what "trim" mostly is, and the SPEC's own word for
+/// input gain staging (§ "Gain staging policy": the interface preamp is
+/// *trimmed* to -18 dBFS nominal) — was killed outright, including utterances
+/// that name a numbered channel, which is this classifier's strongest safety
+/// signal. Whole-word "trim" occurs in 0 of the 1,897 everyday utterances and
+/// "gain" in 1 (with no dB target), so restoring the verb form behind an
+/// explicit dB target costs nothing measurable.
+fn nexus_gain_verb_targets_a_channel(lower: &str) -> bool {
+    if !nexus_explicit_db_target(lower) {
+        return false;
+    }
+    let toks: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    for (i, t) in toks.iter().enumerate() {
+        if !NEXUS_GAIN_WORDS.contains(t) {
+            continue;
+        }
+        // The direct object is the FIRST content word to the right. Articles and
+        // possessives may intervene; a preposition may not — "the gain ON input
+        // 1" is the noun form and is `nexus_head_names_a_channel`'s job, not
+        // this one.
+        for w in toks.iter().skip(i + 1) {
+            if matches!(*w, "the" | "a" | "an" | "my" | "our" | "its" | "this" | "that") {
+                continue;
+            }
+            return NEXUS_GAIN_NOUNS.contains(w);
+        }
+    }
+    false
+}
+
+/// The head words of the two branches that use the adjacency test.
+const NEXUS_GAIN_WORDS: &[&str] = &["gain", "gains", "trim", "trims"];
+const NEXUS_LEVEL_WORDS: &[&str] = &["level", "levels", "meter", "meters", "metering"];
+
+/// The subset of those the BARE read (the one path that names no channel at
+/// all) will anchor on: the PLURAL/mass forms only. "the levels" and "the
+/// meters" are how anyone talks about a mixer, which has many of both; the
+/// SINGULAR is where ordinary speech lives — "check the meter" is a parking
+/// meter, "what's the level" is a tank. Both singulars still work the moment
+/// the utterance names a channel ("what's the level on input 1", "the mic
+/// level"), which is the only context in which they mean this app.
+const NEXUS_BARE_READ_HEADS: &[&str] = &["levels", "meters", "metering"];
+
+/// Audio QUALIFIERS that may sit between the article and the level word — "the
+/// PEAK levels", "the AUDIO levels", "the CURRENT meters", "the MASTER levels".
+///
+/// WHAT WENT WRONG WITHOUT THIS: the bare read demanded the head be literally
+/// the next token after "the", so a single adjective — the most ordinary thing
+/// in the world to say — destroyed the command. "show me the peak levels",
+/// "what are the audio levels" and "show me the current levels" all died while
+/// "show me the levels" worked. These words widen NOTHING on their own: they
+/// are only reachable inside the CLOSED VOCABULARY below, which still refuses
+/// any utterance carrying a content word from outside the list, so "the peak
+/// levels of tourism in july" is rejected on "tourism" exactly as before.
+const NEXUS_READ_QUALIFIERS: &[&str] = &[
+    "peak", "peaks", "rms", "audio", "current", "master", "mix", "input", "inputs", "output",
+    "outputs", "mic", "mics",
+];
+
+/// Whether EVERY token of the utterance is drawn from `vocab` (numbers too,
+/// when `allow_numbers`), and there is at least one token.
+///
+/// This is the shape of a bare control phrase: "stop monitoring", "what are the
+/// levels", "set the gain to -6" are complete utterances whose whole content IS
+/// the command. One content word from outside the list — "reservoir", "credit",
+/// "portfolio", "blood" — and it is somebody talking about their life, not
+/// driving a mixer. A closed vocabulary is used instead of a keyword list
+/// precisely because it cannot be satisfied by ADDING words; the previous
+/// attempt gated on "does the sentence contain an audio-ish noun somewhere",
+/// which every one of those sentences also satisfied.
+fn nexus_closed_vocabulary(lower: &str, vocab: &[&str], allow_numbers: bool) -> bool {
+    let mut any = false;
+    for w in lower.split(|c: char| !c.is_alphanumeric()) {
+        if w.is_empty() {
+            continue;
+        }
+        any = true;
+        if allow_numbers && w.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        if !vocab.contains(&w) {
+            return false;
+        }
+    }
+    any
+}
+
+/// The bare mute idiom — "mute", "mute me", "unmute everything". "mute" is the
+/// one trigger here that is unambiguous as a WHOLE word (the adjective sense,
+/// "he went mute", brings its own content words and so fails this vocabulary),
+/// so it may act without naming a channel. It still must be a whole word:
+/// `contains("mute")` fires inside "commute", and "my commute was a nightmare
+/// this morning" MUTED THE OWNER'S MICROPHONE in the measured corpus.
+const NEXUS_BARE_MUTE_VOCAB: &[&str] = &[
+    "mute", "unmute", "un", "the", "my", "a", "me", "myself", "yourself", "everything", "all",
+    "audio", "sound", "input", "inputs", "output", "outputs", "channel", "channels", "mic",
+    "mics", "microphone", "microphones", "monitor", "headphone", "headphones", "speaker",
+    "speakers", "please", "darwin", "hey", "ok", "okay", "thanks", "thank", "you", "just", "can",
+    "could", "would", "and", "now", "it", "again", "right", "for",
+];
+
+/// The bare gain idiom — "set the gain to -6", "turn the gain down to -12".
+/// Also requires a set verb, because without one "my gain at 10" (every token
+/// is in the list) wrote +10 dB onto the mic.
+///
+/// "right"/"for"/"me"/"us" are in the list for a measured reason: a closed
+/// vocabulary is only as good as its coverage of the words people wrap a
+/// command in, and "set the gain to -6 RIGHT NOW" died while "set the gain to
+/// -6" worked. A trailing "right now" or "for me" is not a change of subject.
+/// Adding them cannot widen the gate — every other token must still come from
+/// this list AND the utterance must still carry a set verb and a dB value.
+const NEXUS_BARE_GAIN_VOCAB: &[&str] = &[
+    "gain", "trim", "set", "put", "turn", "make", "bring", "it", "the", "a", "my", "to", "at",
+    "up", "down", "by", "db", "dbs", "decibel", "decibels", "minus", "negative", "plus",
+    "please", "darwin", "hey", "ok", "okay", "thanks", "thank", "you", "just", "can", "could",
+    "would", "and", "now", "right", "for", "me", "us",
+    // THE VERBS ENGINEERS ACTUALLY USE. A closed vocabulary is only as good as
+    // its coverage, and this list originally held set/turn/put/make/bring —
+    // so "drop the gain to -12 db" and "lower the gain to -12 db" died while
+    // "lower the INPUT gain to -12" survived, purely because a channel noun
+    // happened to sit left of "gain". Same command, same speaker, served or not
+    // by an accident of word order.
+    "drop", "lower", "raise", "cut", "push", "pull", "adjust", "dial", "crank", "knock",
+    "take", "back", "off", "ease", "nudge", "bump", "roll", "leave",
+];
+
+/// The bare levels read — "what are the levels", "show me the meters on my
+/// screen", "what do the meters say", "what are the meters showing", "look at
+/// the levels". Every word people wrap the read in has to be here or the
+/// command dies on a preposition, which is how "look AT the levels" was lost.
+const NEXUS_BARE_READ_VOCAB: &[&str] = &[
+    "level", "levels", "meter", "meters", "metering", "what", "whats", "s", "is", "are", "how",
+    "show", "showing", "read", "out", "check", "give", "tell", "look", "looking", "doing", "say",
+    "saying", "like", "do", "does", "sitting", "currently", "right", "now", "on", "at", "screen", "the",
+    "me", "us", "my", "you", "it", "please", "darwin", "hey", "ok", "okay", "thanks", "thank",
+    "just", "can", "could", "would", "and", "peak", "peaks", "rms", "audio", "current", "master",
+    "mix", "input", "inputs", "output", "outputs", "mic", "mics",
+    // "are the levels clipping" is the most natural question anyone asks a meter,
+    // and it died on "clipping". "again" was already in the mute and monitor
+    // vocabularies and missing only here — the signature of a list fitted to a
+    // corpus rather than to speech.
+    "again", "more", "one", "time", "to", "we", "clipping", "peaking", "moving", "any",
+    "over", "hot", "still", "there", "reading", "readings",
+];
+
+/// The bare monitor toggle — "stop monitoring", "turn the monitor off please",
+/// "disable the monitor", "turn the monitor back on". Deliberately WITHOUT "me"
+/// and without "my": "stop monitoring me" is a privacy complaint about the
+/// assistant, and "I should monitor my credit" is a sentence about money —
+/// neither is a request to drop a monitor crosspoint.
+const NEXUS_MONITOR_TOGGLE_VOCAB: &[&str] = &[
+    "monitor", "monitoring", "unmonitor", "stop", "start", "begin", "resume", "turn", "kill",
+    "enable", "disable", "on", "off", "the", "a", "please", "darwin", "hey", "ok", "okay",
+    "thanks", "thank", "you", "just", "can", "could", "would", "and", "then", "already", "right",
+    "now", "back", "for", "again",
+    // "switch off the monitor" / "quit monitoring" answered ON before this — the
+    // toggle saw no off-verb it knew and defaulted the wrong way.
+    "shut", "switch", "quit", "pause", "paused", "end", "ended",
+];
+
+/// Whether the utterance is nothing but a bare gain instruction.
+fn nexus_bare_gain_phrase(lower: &str) -> bool {
+    nexus_closed_vocabulary(lower, NEXUS_BARE_GAIN_VOCAB, true)
+        && crate::utterance::mentions_any_word(
+            lower,
+            &[
+                "set", "turn", "put", "make", "bring", "drop", "lower", "raise", "cut", "push",
+                "pull", "adjust", "dial", "crank", "knock", "take", "ease", "nudge", "bump",
+                "roll", "back",
+            ],
+        )
+}
+
+/// Whether the utterance is nothing but a bare mute instruction.
+///
+/// Numbers are allowed because a channel number is part of the command —
+/// "mute channel 3", "unmute channel 3". The vocabulary already lists "channel"
+/// but rejected the digit beside it, so those two died while "mute input 2"
+/// lived. Admitting digits cannot widen this into ordinary speech: EVERY other
+/// token still has to come from the mute vocabulary, and the branch is separately
+/// gated on a whole-word "mute"/"unmute".
+fn nexus_bare_mute_phrase(lower: &str) -> bool {
+    nexus_closed_vocabulary(lower, NEXUS_BARE_MUTE_VOCAB, true)
+}
+
+/// The BARE monitor toggle: the whole utterance is the toggle, with nothing but
+/// address and politeness around it, and it carries an actual on/off word.
+///
+/// A closed vocabulary rather than a list of fixed phrases, because the phrase
+/// list has to be complete to be correct and it never is — "disable the
+/// monitor" and "turn the monitor off please" are the same command as "turn off
+/// the monitor" and a phrase list silently drops them. What this separates is
+/// "stop monitoring" (a Nexus command) from "the bank told me to stop
+/// monitoring my credit so obsessively" (a sentence about someone's money): a
+/// sentence that has a subject or an object keeps them, fails the vocabulary,
+/// and falls through to a real answer.
+fn nexus_bare_monitor_toggle(lower: &str) -> bool {
+    nexus_closed_vocabulary(lower, NEXUS_MONITOR_TOGGLE_VOCAB, false)
+        && crate::utterance::mentions_any_word(
+            lower,
+            &[
+                "stop", "start", "begin", "resume", "turn", "kill", "enable", "disable", "on",
+                "off", "unmonitor", "quit", "pause", "end", "shut", "switch", "cut",
+            ],
+        )
+}
+
+/// The bare levels/meters read — "what are the levels", "show me the meters".
+/// Every token must come from the read vocabulary AND the noun must carry the
+/// definite article (an audio qualifier may sit between the two).
+///
+/// The article is doing real work, not stylistic work. Ordinary speech
+/// qualifies the noun with a possessive or a scope, and the closed vocabulary
+/// alone still admitted "can you check my levels" and "what are my levels" —
+/// which are about bloodwork. Requiring "the levels" / "the meters" drops
+/// exactly those and costs nothing: every idiom this app is actually driven by
+/// carries the article, and the one real phrasing that does not ("what are my
+/// input levels") names a channel and is admitted by the adjacency test
+/// instead.
+fn nexus_bare_levels_read(lower: &str) -> bool {
+    if !nexus_closed_vocabulary(lower, NEXUS_BARE_READ_VOCAB, false) {
+        return false;
+    }
+    let toks: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    toks.iter().enumerate().any(|(i, w)| {
+        if !NEXUS_BARE_READ_HEADS.contains(w) || i == 0 {
+            return false;
+        }
+        // Walk left over any audio qualifiers ("the PEAK levels") to the
+        // article. Everything skipped here is itself confined to the closed
+        // vocabulary above, so this cannot admit a sentence the vocabulary
+        // already refused.
+        let mut j = i;
+        while j > 0 {
+            j -= 1;
+            if NEXUS_READ_QUALIFIERS.contains(&toks[j]) {
+                continue;
+            }
+            return toks[j] == "the";
+        }
+        false
+    })
 }
 
 /// Whether the utterance names an OUTPUT channel (so a gain.set targets the
@@ -9973,6 +10639,90 @@ mod tests {
     /// Unrelated utterances never produce a Nexus command (so they fall through
     /// to normal routing) — including ones that merely share a stray keyword, and
     /// the other apps' control phrases (no cross-app capture).
+    /// EVERY OFF-VERB THE TOGGLE ACCEPTS MUST TURN THE MONITOR OFF.
+    ///
+    /// The toggle has two lists: one deciding whether the branch FIRES, and one
+    /// deciding on-vs-off. A verb admitted to the first without the second makes
+    /// the branch fire, find no off-word it recognizes, and default to ON — so
+    /// "quit monitoring" and "pause monitoring" OPENED A LIVE MIC-TO-MONITOR
+    /// crosspoint on a request to close one. That is the worst possible direction
+    /// for this particular op to be wrong in.
+    ///
+    /// This asserts the two lists agree, which is the invariant; the counts alone
+    /// would not catch a verb added to one and not the other.
+    #[test]
+    fn every_monitor_off_verb_actually_turns_it_off() {
+        for u in [
+            "stop monitoring",
+            "quit monitoring",
+            "pause monitoring",
+            "end monitoring",
+            "switch off the monitor",
+            "shut off the monitor",
+            "turn the monitor off",
+            "turn off the monitor",
+            "disable the monitor",
+            "kill the monitor",
+        ] {
+            let got = nexus_command(u).expect(&format!("{u:?} must reach the monitor toggle"));
+            let NexusCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["op"], "monitor.set", "{u:?}");
+            assert_eq!(
+                v["on"], false,
+                "{u:?} asked to STOP monitoring and this opens a live mic instead"
+            );
+        }
+        // ...and the on-direction still works, so the fix is not "always off".
+        for u in ["start monitoring", "turn the monitor on", "enable the monitor"] {
+            let got = nexus_command(u).expect(&format!("{u:?} must reach the toggle"));
+            let NexusCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["on"], true, "{u:?} asked to START monitoring");
+        }
+    }
+
+    /// A CHANNEL NUMBER IS PART OF THE COMMAND.
+    ///
+    /// The mute vocabulary listed "channel" but rejected the digit beside it, so
+    /// "mute channel 3" and "unmute channel 3" were dropped while "mute input 2"
+    /// worked. The user says a number; the classifier has to be able to hear one.
+    #[test]
+    fn mute_accepts_a_spoken_channel_number() {
+        for (u, muted) in [
+            ("mute channel 3", true),
+            ("unmute channel 3", false),
+            ("mute input 2", true),
+            ("mute the mic", true),
+        ] {
+            let got = nexus_command(u).expect(&format!("{u:?} must reach the mute branch"));
+            let NexusCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
+            let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(v["mute"], muted, "{u:?}");
+        }
+    }
+
+    /// The read idiom people actually speak. "are the levels clipping" is the
+    /// most natural question anyone asks a meter and it died on the word
+    /// "clipping"; "again" was in the mute and monitor vocabularies and missing
+    /// only from this one — the signature of a list fitted to a corpus rather
+    /// than to speech.
+    #[test]
+    fn the_levels_read_admits_ordinary_wrapper_words() {
+        for u in [
+            "what are the levels",
+            "show me the meters",
+            "show me the levels again",
+            "are the levels clipping",
+            "are the meters moving",
+            "read the levels to me",
+        ] {
+            let got = nexus_command(u).expect(&format!("{u:?} must read the levels"));
+            let NexusCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
+            assert!(line.contains("state.get"), "{u:?} -> {line}");
+        }
+    }
+
     #[test]
     fn nexus_command_ignores_unrelated_utterances() {
         for text in [
@@ -10011,6 +10761,260 @@ mod tests {
         assert_nexus_op(
             &buried,
             r#"{"op":"gain.set","channel":0,"mute":true,"stage":"input"}"#,
+        );
+    }
+
+    /// REGRESSION: ordinary speech must never MUTATE the audio matrix. Every
+    /// utterance here comes from the 1,897-utterance everyday corpus this
+    /// classifier was measured against, and every one of them wrote to the
+    /// mixer before the gates above existed: a sentence about someone's COMMUTE
+    /// muted the owner's microphone (`contains("mute")`), and 25 sentences
+    /// about blood pressure, credit and computer displays rewrote a monitor
+    /// crosspoint (`contains("monitor")`, no gate at all).
+    #[test]
+    fn ordinary_speech_never_mutates_the_audio_matrix() {
+        for text in [
+            "my commute was a nightmare this morning",
+            "I need to monitor my blood pressure twice a day",
+            "the bank offers free credit monitoring",
+            "is a curved monitor worth the extra money",
+            "the rangers monitor the snowpack all winter",
+            "I don't want to monitor my teenager's every move",
+            "the bank told me to stop monitoring my credit so obsessively",
+            "I need to trim the mic budget by 5 percent to 2 people",
+        ] {
+            assert_eq!(nexus_command(text), None, "{text:?} must not touch the mixer");
+        }
+        // PRECONDITION: the trigger letters really are in these utterances, so a
+        // future edit that simply stopped looking for them could not make this
+        // test pass vacuously.
+        assert!("my commute was a nightmare this morning".contains("mute"));
+        assert!("is a curved monitor worth the extra money".contains("monitor"));
+        assert!("I need to trim the mic budget by 5 percent to 2 people".contains("trim"));
+        // ...and the real commands built from the same words still work.
+        assert_nexus_op(
+            "mute the mic",
+            r#"{"op":"gain.set","channel":0,"mute":true,"stage":"input"}"#,
+        );
+        assert_nexus_op(
+            "stop monitoring",
+            r#"{"op":"monitor.set","in":0,"out":0,"on":false}"#,
+        );
+    }
+
+    /// REGRESSION: naming a mic is not permission to REWIRE one, and neither is
+    /// naming one NEXT TO a routing verb. route.set is the only op that can
+    /// write -inf and DESTROY a crosspoint, so its gate is the narrowest in the
+    /// file, and it took three separate bindings to get there — each of these
+    /// groups is a design that was measured and found to write crosspoints on
+    /// utterances the original code ignored:
+    ///   * ordinary-English verbs ("send", "disconnect") need an explicitly
+    ///     NUMBERED channel — otherwise "send the microphone back to amazon"
+    ///     routes and "send a clear photo of the microphone to the seller"
+    ///     CLEARS;
+    ///   * a routing verb plus an audio noun is not enough — "the mic patch
+    ///     cable is broken" and "there's a patch for the preamp driver" have
+    ///     both, and a patch CABLE is a parcel. A destination is required;
+    ///   * verb + noun + destination is STILL only co-occurrence — "route the
+    ///     kids from the mic stand to the door" has all three. The verb must
+    ///     take the signal chain as its OBJECT, and a mic STAND is furniture.
+    #[test]
+    fn sending_something_that_merely_mentions_a_mic_is_not_a_route_write() {
+        for text in [
+            "send the microphone back to amazon",
+            "send me the open mic night lineup",
+            "send a clear photo of the microphone to the seller",
+            "can you send the mic specs to the AV vendor",
+            "disconnect the mic and send it back",
+            "did you send the preamp invoice yet",
+            "the mic patch cable is broken",
+            "I need a longer patch cable for the mic",
+            "did the mic firmware patch land",
+            "there's a patch for the preamp driver",
+            "can you patch the mixer software tonight",
+            "where did I put the mic patch bay diagram",
+            "the fader cap fell off, order a patch kit",
+            "is there a patch note for the crosspoint bug",
+            "my running route goes past the microphone store",
+            "the mixer is on the delivery route today",
+            "route the kids from the mic stand to the door",
+        ] {
+            assert_eq!(nexus_command(text), None, "{text:?} is a parcel, not a patch");
+        }
+        // PRECONDITION: these really do carry a routing verb AND an audio noun,
+        // so the test cannot pass just because the branch stopped looking.
+        assert!("the mic patch cable is broken".contains("patch"));
+        assert!("route the kids from the mic stand to the door".contains("mic"));
+        // The real routing commands built from the same words are unchanged.
+        assert_nexus_op(
+            "route the mic to the monitor",
+            r#"{"op":"route.set","in":0,"out":0,"gain_db":0.0}"#,
+        );
+        assert_nexus_op(
+            "patch the mic into the monitor",
+            r#"{"op":"route.set","in":0,"out":0,"gain_db":0.0}"#,
+        );
+        assert_nexus_op(
+            "unpatch the mic from the monitor",
+            r#"{"op":"route.set","in":0,"out":0,"gain_db":"-inf"}"#,
+        );
+        assert_nexus_op(
+            "send input 1 to output 2",
+            r#"{"op":"route.set","in":1,"out":2,"gain_db":0.0}"#,
+        );
+        assert_nexus_op(
+            "disconnect input 2 from output 3",
+            r#"{"op":"route.set","in":2,"out":3,"gain_db":"-inf"}"#,
+        );
+    }
+
+    /// REGRESSION: "level" and "meter" are two of the most ordinary nouns in
+    /// English, and a bare `contains()` answered 93 of the 1,897 everyday
+    /// utterances with a mixer snapshot instead of a real answer — including
+    /// ones where the word was not even a word ("thermometer", "levelled").
+    /// "matrix" carried the same disease one level down: `contains("rout")` is
+    /// a FRAGMENT and fires inside "routine".
+    ///
+    /// The read idiom accepts an adjective between the article and the noun
+    /// ("the PEAK levels"), so the last three negatives matter: that adjective
+    /// must not become a way back in for a sentence about a reservoir.
+    #[test]
+    fn an_ordinary_level_or_meter_is_not_a_mixer_read() {
+        for text in [
+            "my stress levels have been through the roof this week",
+            "sea level is rising a little every year",
+            "I got a parking meter ticket, can I contest it",
+            "do I own a meat thermometer or just a candy meter",
+            "how many meters is a lap in that pool",
+            "my whole routine is a matrix of pills and timers",
+            "can you check my levels",
+            "the volume level is way too low on this video",
+            "the peak levels of tourism in july were insane",
+            "what are the current levels of the reservoir",
+            "the audio levels at the concert were painful",
+        ] {
+            assert_eq!(nexus_command(text), None, "{text:?} is not a mixer read");
+        }
+        // The read idioms — bare ("the levels"/"the meters" with nothing but
+        // function words and audio adjectives around them) and channel-named.
+        let state = r#"{"op":"state.get"}"#;
+        assert_nexus_op("what are the levels", state);
+        assert_nexus_op("show me the meters on my screen", state);
+        assert_nexus_op("what do the meters say", state);
+        assert_nexus_op("how are the levels looking", state);
+        assert_nexus_op("what are my input levels", state);
+        assert_nexus_op("show me the peak levels", state);
+        assert_nexus_op("what are the audio levels", state);
+        assert_nexus_op("what are the meters showing", state);
+    }
+
+    /// REGRESSION: a QUESTION about the routing is a READ. Both of the first two
+    /// wrote a crosspoint before this — the route branch matched "route" inside
+    /// "routed" and took the bare word "output"/"input" as its target, so asking
+    /// what was patched PATCHED SOMETHING. The apostrophe-free "whats" is here
+    /// because STT emits it constantly and a whole-word "what" test silently
+    /// dropped it back into the WRITING branch — a contraction must never be the
+    /// difference between reading a crosspoint and rewiring one.
+    #[test]
+    fn asking_about_the_routing_reads_it_and_never_writes_it() {
+        let state = r#"{"op":"state.get"}"#;
+        assert_nexus_op("what's routed to output 1", state);
+        assert_nexus_op("whats routed to output 1", state);
+        assert_nexus_op("what inputs are routed right now", state);
+        assert_nexus_op("what is currently routed", state);
+    }
+
+    /// REGRESSION: "trim" is a VERB, and it is the SPEC's own word for input
+    /// gain staging (§"Gain staging policy": the interface preamp is *trimmed*
+    /// so speech peaks hit -18 dBFS). An earlier gate recognized only the NOUN
+    /// form ("the input trim", "the trim on input 1") because the command list
+    /// it was tuned against happened to contain only that form, and it killed
+    /// the entire verb family — including utterances naming a NUMBERED channel,
+    /// which is this classifier's strongest safety signal. Same blindness in
+    /// the other direction: "set the gain TO -6 DB ON INPUT 1" puts the dB
+    /// target between the head and its channel, and the adjacency walk stopped
+    /// dead at "to".
+    #[test]
+    fn a_trim_is_a_trim_when_it_is_a_verb_too() {
+        assert_nexus_op(
+            "trim input 1 to -6 db",
+            r#"{"op":"gain.set","channel":1,"gain_db":-6.0,"stage":"input"}"#,
+        );
+        assert_nexus_op(
+            "trim output 1 to -3 db",
+            r#"{"op":"gain.set","channel":1,"gain_db":-3.0,"stage":"output"}"#,
+        );
+        assert_nexus_op(
+            "trim the mic to -6",
+            r#"{"op":"gain.set","channel":0,"gain_db":-6.0,"stage":"input"}"#,
+        );
+        assert_nexus_op(
+            "trim the input to -6 db",
+            r#"{"op":"gain.set","channel":0,"gain_db":-6.0,"stage":"input"}"#,
+        );
+        assert_nexus_op(
+            "set the gain to -6 db on input 1",
+            r#"{"op":"gain.set","channel":1,"gain_db":-6.0,"stage":"input"}"#,
+        );
+        assert_nexus_op(
+            "set the gain to -12 on the mic",
+            r#"{"op":"gain.set","channel":0,"gain_db":-12.0,"stage":"input"}"#,
+        );
+        // The NOUN form is untouched, and so is the bare idiom with a trailing
+        // phrase on it (a closed vocabulary that has not heard of "right now"
+        // throws away a real command).
+        assert_nexus_op(
+            "set the input trim to -18 db",
+            r#"{"op":"gain.set","channel":0,"gain_db":-18.0,"stage":"input"}"#,
+        );
+        assert_nexus_op(
+            "set the gain to -6 right now",
+            r#"{"op":"gain.set","channel":0,"gain_db":-6.0,"stage":"input"}"#,
+        );
+        // What the verb form must NOT take: the mic as a direct object with no
+        // dB target is somebody talking about a budget, not a gain stage.
+        assert_eq!(
+            nexus_command("I need to trim the mic budget by 5 percent to 2 people"),
+            None
+        );
+        assert_eq!(nexus_command("we should trim the mic budget to 2 people"), None);
+        // No dB value at all is still not a gain.set.
+        assert_eq!(nexus_command("turn up the gain"), None);
+    }
+
+    /// REGRESSION: an utterance that says the user STOPPED monitoring must never
+    /// TURN THE MONITOR ON. Making the off-words whole-word stopped them
+    /// matching the past and progressive forms that `contains("stop")` and
+    /// `contains("disable")` used to catch, and the result was not a missed
+    /// command but a FLIP into the device-activating direction: each of these
+    /// went on:false -> on:TRUE, opening a live mic-to-monitor-bus crosspoint
+    /// where the code being replaced closed one. "kill the monitor" is the same
+    /// class — it reaches this branch through the bare-toggle vocabulary and
+    /// turned the monitor ON.
+    #[test]
+    fn past_tense_off_speech_never_opens_the_monitor() {
+        let off = r#"{"op":"monitor.set","in":0,"out":0,"on":false}"#;
+        assert_nexus_op("I stopped monitoring the mic last week", off);
+        assert_nexus_op("I've stopped monitoring my mic levels", off);
+        assert_nexus_op("they disabled the mic monitoring already", off);
+        assert_nexus_op("kill the monitor", off);
+        assert_nexus_op("turn the monitor off please", off);
+        assert_nexus_op(
+            "we stopped monitoring input 1 months ago",
+            r#"{"op":"monitor.set","in":1,"out":0,"on":false}"#,
+        );
+        // PRECONDITION: these are the INFLECTED forms, not the bare ones — if a
+        // future edit reverted to whole-word "stop"/"disable" only, the
+        // assertions above would fail rather than pass vacuously.
+        assert!(!"I stopped monitoring the mic last week".contains("stop "));
+        assert!(!"they disabled the mic monitoring already".contains("disable "));
+        // The ON direction is untouched.
+        let on = r#"{"op":"monitor.set","in":0,"out":0,"on":true}"#;
+        assert_nexus_op("turn on the monitor", on);
+        assert_nexus_op("turn the monitor back on", on);
+        assert_nexus_op(
+            "monitor input 1",
+            r#"{"op":"monitor.set","in":1,"out":0,"on":true}"#,
         );
     }
 
