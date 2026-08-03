@@ -11513,7 +11513,7 @@ mod tests {
             "disable the monitor",
             "kill the monitor",
         ] {
-            let got = nexus_command(u).expect(&format!("{u:?} must reach the monitor toggle"));
+            let got = nexus_command(u).unwrap_or_else(|| panic!("{u:?} must reach the monitor toggle"));
             let NexusCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
             let v: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(v["op"], "monitor.set", "{u:?}");
@@ -11524,7 +11524,7 @@ mod tests {
         }
         // ...and the on-direction still works, so the fix is not "always off".
         for u in ["start monitoring", "turn the monitor on", "enable the monitor"] {
-            let got = nexus_command(u).expect(&format!("{u:?} must reach the toggle"));
+            let got = nexus_command(u).unwrap_or_else(|| panic!("{u:?} must reach the toggle"));
             let NexusCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
             let v: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(v["on"], true, "{u:?} asked to START monitoring");
@@ -11544,7 +11544,7 @@ mod tests {
             ("mute input 2", true),
             ("mute the mic", true),
         ] {
-            let got = nexus_command(u).expect(&format!("{u:?} must reach the mute branch"));
+            let got = nexus_command(u).unwrap_or_else(|| panic!("{u:?} must reach the mute branch"));
             let NexusCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
             let v: serde_json::Value = serde_json::from_str(&line).unwrap();
             assert_eq!(v["mute"], muted, "{u:?}");
@@ -11566,7 +11566,7 @@ mod tests {
             "are the meters moving",
             "read the levels to me",
         ] {
-            let got = nexus_command(u).expect(&format!("{u:?} must read the levels"));
+            let got = nexus_command(u).unwrap_or_else(|| panic!("{u:?} must read the levels"));
             let NexusCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
             assert!(line.contains("state.get"), "{u:?} -> {line}");
         }
