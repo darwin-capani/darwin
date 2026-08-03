@@ -21,13 +21,21 @@
 //!      lockdown + the agent allowlist + policy) is intact and unbypassed; the
 //!      webhook PARKS into exactly that gate, it does not route around it.
 //!
-//! LIVE LISTENER (runtime-gated). [`serve`] binds 127.0.0.1 LOOPBACK by default
+//! LIVE LISTENER. [`serve`] binds 127.0.0.1 LOOPBACK by default
 //! (`[webhooks].bind`) and ships ON (`[webhooks].enabled = true`) but is INERT
-//! WITHOUT MAPPINGS + A KEYCHAIN HMAC SECRET. The
-//! bind/accept-loop is reached ONLY when the flag is on — it is wired behind the
-//! flag (the mic-loop / vision-capture precedent), not exercised in tests. The
-//! HMAC secret is resolved from the macOS Keychain (account
+//! WITHOUT MAPPINGS + A KEYCHAIN HMAC SECRET — with no secret it refuses to open
+//! the port at all (fail-closed: nothing could ever authenticate). The HMAC
+//! secret is resolved from the macOS Keychain (account
 //! [`WEBHOOK_SECRET_ACCOUNT`]), NEVER from the config TOML / a log / Debug.
+//!
+//! This doc used to say the bind was "runtime-gated ... not exercised in tests".
+//! That was a euphemism: `serve` contained no socket primitive of any kind, so
+//! the feature did not exist at runtime, while this comment, the config, docs/,
+//! the HUD panel and an INFO log all asserted a working receiver. A correctly
+//! signed, correctly mapped delivery got connection-refused forever. The accept
+//! loop is now real and [`serve_conn`] IS exercised — over a real loopback socket
+//! — for accept, forgery, unmapped events, the body cap, an unterminated head,
+//! and a non-POST method.
 //!
 //! HERMETIC. The whole AUTHORIZE-then-MAP-then-CLASSIFY decision is the PURE
 //! [`handle_webhook`] (a valid-HMAC mapped event -> Route; bad/missing HMAC ->
@@ -42,7 +50,7 @@ use std::sync::Arc;
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::json;
 use sha2::Sha256;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::config::{Config, WebhookMapping};
 use crate::telemetry;
@@ -86,6 +94,17 @@ pub enum WebhookDecision {
     /// unparseable. 400-equivalent.
     BadRequest,
 }
+
+/// How many webhook connections may be in flight at once. A loopback relay is
+/// trusted to behave; any local process that can reach loopback is not.
+const MAX_CONCURRENT_CONNS: usize = 16;
+
+/// Whole-exchange deadline. A client that connects and goes quiet must not hold
+/// a concurrency permit indefinitely.
+const EXCHANGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hard cap on the request HEAD. Bounds a client that never sends the blank line.
+const MAX_HEAD_BYTES: usize = 8 * 1024;
 
 /// Is `bind` a loopback address? The receiver refuses to bind anything else by
 /// default — it is for a LOCAL relay/tunnel, never a public internet listener.
@@ -247,7 +266,7 @@ fn emit_decision(decision: &WebhookDecision) {
 /// resolved intent for a Route, so the live accept-loop can hand it to the router.
 ///
 /// This is the LIVE seam that ties the pure [`handle_webhook`] to the gate. It is
-/// reached only from [`serve`] (runtime-gated); the decision logic it applies is
+/// reached only from [`serve`]; the decision logic it applies is
 /// the pure handler the tests prove.
 fn apply_decision(decision: &WebhookDecision) -> Option<String> {
     emit_decision(decision);
@@ -328,28 +347,146 @@ pub async fn serve(cfg: Arc<Config>) {
         );
         return;
     };
-    info!(
-        bind = %cfg.webhooks.bind,
-        port = cfg.webhooks.port,
-        mappings = cfg.webhooks.mappings.len(),
-        "webhook receiver configured (loopback, HMAC-authenticated); live bind is runtime-gated"
-    );
-    // The live TCP bind + HTTP accept-loop is the runtime-gated leg. When a
-    // request is received it is dispatched through EXACTLY this seam — pull the
-    // signature/event from the canonical headers, run the pure handler, then
-    // apply_decision — so the live path cannot diverge from the proven core. (The
-    // HTTP framing itself is out of the hermetic scope; no port is opened in any
-    // tested path.)
-    let _dispatch = |raw_body: &[u8], headers: &std::collections::HashMap<String, String>| -> Option<String> {
-        // Headers are looked up by the CANONICAL lowercase names — the same names
-        // a relay must send. (HTTP header names are case-insensitive; the live
-        // framing lowercases them before this lookup.)
-        let sig = headers.get(SIGNATURE_HEADER).map(String::as_str);
-        let evt = headers.get(EVENT_HEADER).map(String::as_str);
-        let decision = handle_webhook(raw_body, sig, evt, Some(secret.as_bytes()), &cfg);
-        apply_decision(&decision)
+    let addr = format!("{}:{}", cfg.webhooks.bind, cfg.webhooks.port);
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            warn!(%addr, error = %e, "webhook receiver could NOT bind; the receiver is DOWN");
+            return;
+        }
     };
-    let _ = &_dispatch; // wired; the live accept-loop that calls it is runtime-gated.
+    info!(
+        %addr,
+        mappings = cfg.webhooks.mappings.len(),
+        "webhook receiver LISTENING (loopback, HMAC-authenticated)"
+    );
+
+    // BOUNDED CONCURRENCY. A loopback relay is trusted to be well-behaved; a
+    // process that can reach loopback is not necessarily. Without a cap, a client
+    // opening connections faster than they are served would grow tasks without
+    // limit inside the daemon.
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CONNS));
+    loop {
+        let (sock, peer) = match listener.accept().await {
+            Ok(v) => v,
+            // A transient accept error must not kill the receiver for the rest of
+            // the process's life.
+            Err(e) => {
+                warn!(error = %e, "webhook accept failed; continuing");
+                continue;
+            }
+        };
+        let Ok(permit) = sem.clone().acquire_owned().await else { return };
+        let cfg = cfg.clone();
+        let secret = secret.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            // WHOLE-EXCHANGE DEADLINE. A client that connects and then goes silent
+            // must not hold a permit forever.
+            match tokio::time::timeout(EXCHANGE_TIMEOUT, serve_conn(sock, &cfg, &secret)).await {
+                Ok(Err(e)) => debug!(?peer, error = %e, "webhook connection ended early"),
+                Err(_) => debug!(?peer, "webhook connection timed out"),
+                Ok(Ok(())) => {}
+            }
+        });
+    }
+}
+
+/// One HTTP/1.1 request/response exchange.
+///
+/// Deliberately a minimal reader rather than an HTTP crate: this endpoint accepts
+/// exactly one shape — a POST with two headers and a bounded body — and every
+/// byte it reads is attacker-influenced, so a small surface that refuses anything
+/// unexpected is worth more here than generality.
+///
+/// The decision itself is NOT made here. Headers are lowercased and handed to
+/// [`handle_webhook`], the same pure, hermetically-tested core the unit tests
+/// drive, so the live path cannot diverge from the proven one.
+async fn serve_conn(
+    mut sock: tokio::net::TcpStream,
+    cfg: &Config,
+    secret: &str,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt;
+
+    // -- head, with a hard byte cap so a client that never sends \r\n\r\n cannot
+    //    make the daemon buffer without bound.
+    let mut head = Vec::with_capacity(1024);
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() >= MAX_HEAD_BYTES {
+            return respond(&mut sock, 431, "Request Header Fields Too Large").await;
+        }
+        if sock.read(&mut byte).await? == 0 {
+            return Ok(()); // client hung up mid-head
+        }
+        head.push(byte[0]);
+    }
+    let head = String::from_utf8_lossy(&head).to_string();
+    let mut lines = head.lines();
+    let Some(request_line) = lines.next() else {
+        return respond(&mut sock, 400, "Bad Request").await;
+    };
+    if !request_line.starts_with("POST ") {
+        // Only POST carries a webhook. Anything else is a probe, not a delivery.
+        return respond(&mut sock, 405, "Method Not Allowed").await;
+    }
+
+    // HTTP header names are case-insensitive; the pure core looks them up by their
+    // canonical lowercase names, so normalize here — at the framing edge — rather
+    // than teaching the core about casing.
+    let mut headers: std::collections::HashMap<String, String> = Default::default();
+    for line in lines {
+        if let Some((k, v)) = line.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), v.trim().to_string());
+        }
+    }
+
+    // -- body. REJECT ON THE DECLARED LENGTH, BEFORE READING A BYTE OF IT. The
+    //    config promises "a larger body is rejected rather than buffered"; checking
+    //    after the read would make that promise false in exactly the case it exists
+    //    for.
+    let declared: usize = headers.get("content-length").and_then(|v| v.parse().ok()).unwrap_or(0);
+    if declared > cfg.webhooks.max_body_bytes {
+        warn!(declared, cap = cfg.webhooks.max_body_bytes, "webhook body over cap; rejected unread");
+        return respond(&mut sock, 413, "Payload Too Large").await;
+    }
+    let mut body = vec![0u8; declared];
+    if declared > 0 {
+        sock.read_exact(&mut body).await?;
+    }
+
+    let sig = headers.get(SIGNATURE_HEADER).map(String::as_str);
+    let evt = headers.get(EVENT_HEADER).map(String::as_str);
+    let decision = handle_webhook(&body, sig, evt, Some(secret.as_bytes()), cfg);
+    let (code, reason) = status_for(&decision);
+    apply_decision(&decision);
+    respond(&mut sock, code, reason).await
+}
+
+/// The HTTP status each decision answers with. Split out so the mapping is
+/// assertable without a socket — an Unauthorized that answered 200 would tell a
+/// prober their forged signature worked.
+fn status_for(d: &WebhookDecision) -> (u16, &'static str) {
+    match d {
+        WebhookDecision::Route { .. } | WebhookDecision::ParkForConfirm { .. } => (200, "OK"),
+        WebhookDecision::Unauthorized => (401, "Unauthorized"),
+        WebhookDecision::Unmapped { .. } => (404, "Not Found"),
+        WebhookDecision::BadRequest => (400, "Bad Request"),
+    }
+}
+
+/// A bare, bodyless response. Deliberately says nothing about WHY beyond the
+/// status: a detailed error is a probing oracle for an unauthenticated caller.
+async fn respond(
+    sock: &mut tokio::net::TcpStream,
+    code: u16,
+    reason: &str,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let msg = format!("HTTP/1.1 {code} {reason}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+    sock.write_all(msg.as_bytes()).await?;
+    sock.flush().await
 }
 
 #[cfg(test)]
@@ -603,4 +740,149 @@ mod tests {
         // A non-hex signature fails cleanly (no panic).
         assert!(!verify_signature(SECRET, body, "not-hex-zzzz"));
     }
+    // =====================================================================
+    // THE LIVE LISTENER — it binds, and it answers
+    // =====================================================================
+
+    /// Drive `serve_conn` over a REAL loopback socket.
+    ///
+    /// `serve` itself resolves the Keychain secret and loops forever, so the test
+    /// binds its own listener and hands one accepted connection to the same
+    /// per-connection handler the accept loop uses. Everything under test — the
+    /// framing, the cap, the status mapping, and the dispatch into the pure core —
+    /// is exercised for real.
+    async fn round_trip(cfg: Config, request: &[u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let addr = listener.local_addr().unwrap();
+        // BOUNDED. If a change makes the handler wait for bytes a client never
+        // sends — e.g. reading a declared Content-Length before checking it against
+        // the cap — this fails the test instead of hanging the whole suite.
+        let server = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.expect("accept");
+            let secret = String::from_utf8(SECRET.to_vec()).unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(3), serve_conn(sock, &cfg, &secret))
+                .await
+                .expect("the handler must not block on bytes the client never sent")
+                .ok();
+        });
+        let mut client = tokio::net::TcpStream::connect(addr).await.expect("connect");
+        client.write_all(request).await.expect("write request");
+        client.flush().await.unwrap();
+        let mut resp = Vec::new();
+        let _ = client.read_to_end(&mut resp).await;
+        let _ = server.await;
+        String::from_utf8_lossy(&resp).to_string()
+    }
+
+    fn post(headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut r = format!("POST / HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-length: {}\r\n", body.len());
+        for (k, v) in headers {
+            r.push_str(&format!("{k}: {v}\r\n"));
+        }
+        r.push_str("\r\n");
+        let mut out = r.into_bytes();
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// THE FEATURE EXISTS AT RUNTIME.
+    ///
+    /// `serve` used to resolve the secret, log "webhook receiver configured", and
+    /// return — it contained no socket primitive of any kind. Nothing ever listened
+    /// on the port, under any configuration, while config, docs, the HUD panel and
+    /// that log line all asserted a working loopback receiver. A correctly signed,
+    /// correctly mapped delivery got connection-refused forever.
+    #[tokio::test]
+    async fn a_signed_mapped_delivery_is_accepted() {
+        let cfg = cfg_with_mappings(&[("ci.failed", "system.query")]);
+        let body = br#"{"event":"ci.failed"}"#;
+        let resp = round_trip(
+            cfg,
+            &post(&[(SIGNATURE_HEADER, &valid_sig(body)), (EVENT_HEADER, "ci.failed")], body),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"), "expected 200, got: {resp}");
+    }
+
+    /// A FORGED SIGNATURE IS REFUSED — and says so with 401, not 200. Answering
+    /// 200 to a bad signature tells a prober their forgery worked.
+    #[tokio::test]
+    async fn a_forged_signature_is_rejected_over_the_wire() {
+        let cfg = cfg_with_mappings(&[("ci.failed", "system.query")]);
+        let body = br#"{"event":"ci.failed"}"#;
+        let resp = round_trip(
+            cfg,
+            &post(
+                &[(SIGNATURE_HEADER, "sha256=00000000deadbeef"), (EVENT_HEADER, "ci.failed")],
+                body,
+            ),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 401"), "expected 401, got: {resp}");
+    }
+
+    /// An authenticated but UNMAPPED event is 404 — rejected, never guessed into
+    /// some intent.
+    #[tokio::test]
+    async fn an_unmapped_event_is_404_over_the_wire() {
+        let cfg = cfg_with_mappings(&[("ci.failed", "system.query")]);
+        let body = br#"{"event":"something.else"}"#;
+        let resp = round_trip(
+            cfg,
+            &post(&[(SIGNATURE_HEADER, &valid_sig(body)), (EVENT_HEADER, "something.else")], body),
+        )
+        .await;
+        assert!(resp.starts_with("HTTP/1.1 404"), "expected 404, got: {resp}");
+    }
+
+    /// AN OVER-CAP BODY IS REJECTED UNREAD. The config promises "a larger body is
+    /// rejected rather than buffered"; the declared Content-Length is checked
+    /// BEFORE a byte of body is read, so the promise holds in the case it exists
+    /// for. The body here is never sent — only its length is claimed.
+    #[tokio::test]
+    async fn an_over_cap_body_is_rejected_before_it_is_read() {
+        let mut cfg = cfg_with_mappings(&[("ci.failed", "system.query")]);
+        cfg.webhooks.max_body_bytes = 64;
+        let mut req =
+            b"POST / HTTP/1.1\r\nhost: 127.0.0.1\r\ncontent-length: 100000\r\n\r\n".to_vec();
+        req.extend_from_slice(b"only a few bytes actually follow");
+        let resp = round_trip(cfg, &req).await;
+        assert!(resp.starts_with("HTTP/1.1 413"), "expected 413, got: {resp}");
+    }
+
+    /// A HEAD that never terminates is bounded rather than buffered without limit.
+    #[tokio::test]
+    async fn an_unterminated_head_is_bounded() {
+        let cfg = cfg_with_mappings(&[("ci.failed", "system.query")]);
+        let mut req = b"POST / HTTP/1.1\r\n".to_vec();
+        // Well past MAX_HEAD_BYTES, and never the blank line.
+        for i in 0..600 {
+            req.extend_from_slice(format!("x-pad-{i}: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n").as_bytes());
+        }
+        let resp = round_trip(cfg, &req).await;
+        assert!(resp.starts_with("HTTP/1.1 431"), "expected 431, got: {resp}");
+    }
+
+    /// GET is not a delivery. Only POST carries a webhook.
+    #[tokio::test]
+    async fn a_get_is_not_a_delivery() {
+        let cfg = cfg_with_mappings(&[("ci.failed", "system.query")]);
+        let resp = round_trip(cfg, b"GET / HTTP/1.1\r\nhost: 127.0.0.1\r\n\r\n").await;
+        assert!(resp.starts_with("HTTP/1.1 405"), "expected 405, got: {resp}");
+    }
+
+    /// Every decision maps to a distinct, honest status. Pure — no socket.
+    #[test]
+    fn every_decision_has_an_honest_status() {
+        assert_eq!(status_for(&WebhookDecision::Route { event: "e".into(), intent: "i".into() }).0, 200);
+        assert_eq!(
+            status_for(&WebhookDecision::ParkForConfirm { event: "e".into(), intent: "i".into() }).0,
+            200
+        );
+        assert_eq!(status_for(&WebhookDecision::Unauthorized).0, 401);
+        assert_eq!(status_for(&WebhookDecision::Unmapped { event: "e".into() }).0, 404);
+        assert_eq!(status_for(&WebhookDecision::BadRequest).0, 400);
+    }
+
 }
