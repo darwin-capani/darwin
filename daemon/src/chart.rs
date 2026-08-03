@@ -202,16 +202,46 @@ pub fn classify_chart_intent(utterance: &str) -> Option<ChartIntent> {
     let lower = utterance.to_lowercase();
     let lower = lower.trim();
     const VERBS: &[&str] = &["chart", "plot", "graph"];
-    if !VERBS.iter().any(|v| lower.contains(v)) {
+
+    // THE VERB MUST LEAD, AND IT MUST BE THE WHOLE WORD.
+    //
+    // This was `VERBS.iter().any(|v| lower.contains(v))`, and the subject anchor
+    // accepted a bare "this". Over 1,897 ordinary utterances that combination
+    // rendered a CPU chart seven times, two ways:
+    //
+    //   substring   "graph" lives inside photoGRAPH, teleGRAPH, paraGRAPH —
+    //               "I love this old photograph of my parents" charted the CPU.
+    //   wrong role  "chart" and "plot" are ordinary NOUNS — "my cholesterol chart
+    //               from the clinic", "the plot of this reorg", "is a pie chart
+    //               the right choice for this assignment".
+    //
+    // A spoken command leads with its verb. Requiring that — after nothing but a
+    // wake word or bare politeness — drops every one of the seven while keeping
+    // "chart this", "plot the system load" and "graph the cpu", because a noun
+    // almost never opens the sentence it is the subject of.
+    const ADDRESS: &[&str] = &["darwin", "hey", "hi", "ok", "okay", "please", "can", "you", "could"];
+    let mut toks = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty());
+    let leads = loop {
+        match toks.next() {
+            Some(w) if ADDRESS.contains(&w) => continue,
+            Some(w) => break VERBS.contains(&w),
+            None => break false,
+        }
+    };
+    if !leads {
         return None;
     }
-    // Anchored to a chartable subject: "this", or the system load / cpu / memory
-    // (the only real series this op has on hand without a fetch).
-    let chartable = lower.contains("this")
+
+    // Anchored to a series this op can actually plot. It reads ONE telemetry
+    // snapshot — CPU % and memory % — so the subject is that or the demonstrative
+    // standing in for it. "load" is matched WHOLE: as a substring it is inside
+    // downLOAD, upLOAD and workLOAD.
+    let whole = |w: &str| crate::utterance::mentions_word(lower, w);
+    let chartable = whole("this")
         || lower.contains("system load")
-        || lower.contains("cpu")
-        || lower.contains("memory")
-        || lower.contains("load");
+        || whole("cpu")
+        || whole("memory")
+        || whole("load");
     if !chartable {
         return None;
     }
@@ -338,8 +368,23 @@ mod tests {
         let mut rx = telemetry::subscribe_for_test();
         let spec = line_spec();
         emit_chart(&spec);
-        let raw = rx.try_recv().expect("a chart.data envelope was published");
-        let env: Value = serde_json::from_str(&raw).unwrap();
+        // TAKE OUR OWN ENVELOPE, not whatever arrives first. The telemetry hub is
+        // process-global and cargo runs these tests concurrently, so a sibling
+        // test's emission could be the first thing on this receiver — which made
+        // this test fail under `cargo test chart` while passing when run alone.
+        // Matching on the event NAME alone is not enough — a sibling chart test
+        // emits chart.data too, and whichever lands first is not necessarily ours.
+        // `line_spec` is the only one carrying three points.
+        let mut env: Option<Value> = None;
+        while let Ok(raw) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&raw).unwrap();
+            let n = v["data"]["series"][0]["points"].as_array().map(Vec::len);
+            if v["event"] == "chart.data" && n == Some(3) {
+                env = Some(v);
+                break;
+            }
+        }
+        let env = env.expect("a chart.data envelope carrying THIS spec was published");
         assert_eq!(env["source"], "system");
         assert_eq!(env["event"], "chart.data");
         // The data is the EXACT serialized spec — the three points ride through.
@@ -349,6 +394,28 @@ mod tests {
     }
 
     // ---- intent classification ---------------------------------------------
+
+    /// A CHART VERB THAT IS NOT A COMMAND MUST NOT RENDER A CHART.
+    ///
+    /// `contains` over ["chart","plot","graph"] plus a bare "this" rendered a CPU
+    /// chart on seven ordinary sentences, two ways: "graph" lives inside
+    /// photoGRAPH / teleGRAPH / paraGRAPH, and "chart"/"plot" are ordinary NOUNS.
+    #[test]
+    fn a_chart_word_that_is_not_a_command_renders_nothing() {
+        for u in [
+            "I love this old photograph of my parents on their wedding day",
+            "my grandmother sent this telegraph before the war",
+            "I want to photograph the fall colors this weekend",
+            "the Telegraph ran a piece on it this morning",
+            "my cholesterol chart from the clinic looked better this year",
+            "the plot of this reorg makes no sense to me",
+            "is a pie chart the right choice for this assignment",
+            "what does this paragraph say",
+            "download this file",
+        ] {
+            assert!(classify_chart_intent(u).is_none(), "{u:?} must not render a chart");
+        }
+    }
 
     #[test]
     fn classifies_explicit_chart_requests() {

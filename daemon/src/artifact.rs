@@ -646,13 +646,45 @@ pub fn classify_peek_intent(utterance: &str) -> bool {
     let lower = utterance.to_lowercase();
     let lower = lower.trim();
     // Explicit peek cues.
-    if lower == "peek"
-        || lower.contains("quick look")
-        || lower.contains("quicklook")
-        || lower.contains("peek at what")
-        || lower.contains("let me peek")
-    {
+    // THE OBJECT OF A PEEK MUST BE THE ARTIFACT.
+    //
+    // This op shows the LAST THING DARWIN PRODUCED, so the bare verb cannot be
+    // the trigger — "peek" is an ordinary English verb with an ordinary object.
+    // `contains("let me peek")` and `contains("peek at what")` caught six
+    // ordinary sentences: "let me peek outside and see if it's still drizzling",
+    // "let me peek in the oven real quick", "let me peek at the answer key before
+    // I give up", "can I peek at what I spent on groceries", "give me a peek at
+    // what's on the front pages today", and — pointedly — "no spoilers, don't let
+    // me peek at the ending".
+    //
+    // A peek at the artifact either names NOTHING (the object is understood) or
+    // names a DEMONSTRATIVE / DARWIN's own output. An oven, an answer key and the
+    // front pages are none of those.
+    const ARTIFACT_OBJECT: &[&str] =
+        &["that", "it", "this", "those", "them", "the output", "the result", "the draft"];
+    let peek_object_is_the_artifact = |after: &str| {
+        let a = after.trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
+        a.is_empty()
+            || a.starts_with("at what you")
+            || a.starts_with("at what darwin")
+            || ARTIFACT_OBJECT.iter().any(|o| {
+                a == *o || a.starts_with(&format!("{o} ")) || a.starts_with(&format!("at {o}"))
+            })
+    };
+    if lower == "peek" || lower.contains("quick look") || lower.contains("quicklook") {
         return true;
+    }
+    if let Some(rest) = lower.split_once("peek").map(|(_, r)| r) {
+        // A NEGATED peek is not a request. "don't let me peek at the ending" is
+        // the opposite of one.
+        let negated = lower.contains("don't let")
+            || lower.contains("dont let")
+            || lower.contains("no spoilers");
+        if !negated && (lower.contains("let me peek") || lower.contains("peek at"))
+            && peek_object_is_the_artifact(rest)
+        {
+            return true;
+        }
     }
     // "what did you just do / make / produce / create / build / draft" — the
     // recall phrasing the overlay is summoned by. Anchored to a "what did/have you"
@@ -1117,6 +1149,30 @@ mod tests {
     }
 
     // ---- intent classification ----------------------------------------------
+
+    /// AN ORDINARY PEEK IS NOT A REQUEST FOR THE ARTIFACT.
+    ///
+    /// This op shows the last thing DARWIN produced, so the bare verb cannot be
+    /// the trigger. `contains("let me peek")` / `contains("peek at what")` caught
+    /// six ordinary sentences — including "no spoilers, don't let me peek at the
+    /// ending", which is the opposite of a request.
+    #[test]
+    fn an_ordinary_peek_is_not_a_request_for_the_artifact() {
+        for u in [
+            "let me peek outside and see if it's still drizzling",
+            "let me peek in the oven real quick",
+            "let me peek at the answer key before I give up",
+            "can I peek at what I spent on groceries",
+            "give me a peek at what's on the front pages today",
+            "no spoilers, don't let me peek at the ending",
+        ] {
+            assert!(!classify_peek_intent(u), "{u:?} is not a request for the artifact");
+        }
+        // ...and the real ones still work.
+        for u in ["peek", "quick look", "let me peek at that", "peek at what you made"] {
+            assert!(classify_peek_intent(u), "{u:?} IS a peek");
+        }
+    }
 
     #[test]
     fn classifies_peek_and_what_did_you_just_do() {
