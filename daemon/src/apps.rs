@@ -845,6 +845,37 @@ pub fn generate_sbpl(
                     sbpl_str(&interp_real)
                 ));
             }
+            // THE SECOND EXEC. A FRAMEWORK CPython's `bin/pythonX.Y` is a stub
+            // that immediately posix_spawns the real interpreter inside the
+            // framework bundle:
+            //
+            //   <prefix>/bin/python3.11
+            //     -> <prefix>/Resources/Python.app/Contents/MacOS/Python
+            //
+            // Both literals above describe only the FIRST exec — `canonicalize`
+            // fully resolves the venv symlink chain, so they are two spellings of
+            // the same file. The stub's own spawn was never granted, seatbelt
+            // denied it, and the child exited 1 before ever reaching its socket:
+            // `start()` still returned Ok (it only probes that the entry .py
+            // exists), the restart governor burned its budget, and the caller's
+            // `request_op` timed out after 15s with nothing to show for it.
+            //
+            // HOST-CONDITIONAL, which is why it survived review: a venv over
+            // /usr/bin/python3 or any non-framework build performs no second exec
+            // and works fine. Homebrew python@3.x and the python.org installers
+            // are framework builds — and both this dev tree and the deployed
+            // install resolve to one, where all 36 runtime="python" apps are dead.
+            //
+            // EXEC ONLY, and a LITERAL. `interpreter_install_prefix` already emits
+            // a read subpath covering this file; what was missing is permission to
+            // execute exactly it. A subpath grant here would hand the app exec over
+            // the whole framework.
+            if let Some(stub) = framework_python_stub(&interp_real) {
+                s.push_str(&format!(
+                    "(allow process-exec* (literal {}))\n",
+                    sbpl_str(&stub)
+                ));
+            }
         }
         Runtime::Binary => {
             // The entry binary itself (the interp == entry for a binary app).
@@ -1052,6 +1083,21 @@ fn abs(root: &Path, p: &Path) -> PathBuf {
 /// (`bin/`'s parent). Returns None when the path has no such structure (e.g. a
 /// bare `/usr/bin/python3`), in which case the per-file interpreter read grant
 /// and the system dyld roots already cover the boot.
+/// The framework CPython stub `<prefix>/bin/pythonX.Y` re-execs, or `None`.
+///
+/// A framework build ships `bin/pythonX.Y` as a small stub that posix_spawns
+/// `<prefix>/Resources/Python.app/Contents/MacOS/Python`. That is a SECOND exec
+/// event and needs its own seatbelt grant; without it every python micro-app
+/// dies at launch on a framework host (Homebrew python@3.x, python.org).
+///
+/// Returns the path only when it EXISTS, so a non-framework interpreter emits no
+/// grant at all rather than a dangling literal.
+fn framework_python_stub(interp_real: &Path) -> Option<PathBuf> {
+    let stub = interpreter_install_prefix(interp_real)?
+        .join("Resources/Python.app/Contents/MacOS/Python");
+    stub.is_file().then_some(stub)
+}
+
 fn interpreter_install_prefix(interp_real: &Path) -> Option<PathBuf> {
     let bin_dir = interp_real.parent()?; // <prefix>/bin
     // Only treat it as an install prefix when the interpreter sits in a `bin`
@@ -5040,6 +5086,136 @@ mod tests {
 
         let _ = stop(&registry, "echo-app").await;
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE PROFILE MUST ACTUALLY LET A PYTHON APP RUN — proved by running it.
+    ///
+    /// A framework CPython (Homebrew python@3.x, python.org) ships
+    /// `bin/pythonX.Y` as a stub that posix_spawns
+    /// `<prefix>/Resources/Python.app/Contents/MacOS/Python`. That SECOND exec had
+    /// no grant, so seatbelt denied it and every one of the 36 shipped
+    /// `runtime="python"` apps exited 1 before reaching its socket — while
+    /// `start()` returned Ok (it only checks the entry .py exists) and the caller
+    /// saw a 15s `request_op` timeout, then "crashed too often".
+    ///
+    /// Two string-matching tests already covered the exec grants and BOTH passed
+    /// throughout: they asserted the literals the generator emits, which is the
+    /// generator agreeing with itself. This one hands the profile to the real
+    /// `sandbox-exec` and makes the interpreter print something.
+    ///
+    /// macOS-only, and skips itself when the host's interpreter is not a framework
+    /// build — where there is no second exec and nothing to prove.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_generated_python_profile_actually_executes_the_interpreter() {
+        let interp_real = match std::fs::canonicalize(
+            std::process::Command::new("/usr/bin/env")
+                .args(["python3", "-c", "import sys; print(sys.executable)"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default(),
+        ) {
+            Ok(p) => p,
+            Err(_) => return, // no usable python3 on this host
+        };
+        if framework_python_stub(&interp_real).is_none() {
+            // Not a framework build: no second exec exists, nothing to regress.
+            return;
+        }
+
+        let root = PathBuf::from(format!("/private/tmp/jrv-sbx-{}", std::process::id()));
+        let app_dir = root.join("apps/probe-app");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(root.join("state/ipc/apps")).unwrap();
+
+        let mut m = sample_manifest();
+        m.app.name = "probe-app".into();
+        m.app.runtime = Runtime::Python;
+        // No declared net_hosts: that branch emits SBPL macOS rejects outright
+        // (pinned separately by `a_net_hosts_profile_does_not_compile_today`), and
+        // this test is about the interpreter exec chain, not the network rules.
+        m.permissions.net_hosts = Vec::new();
+        let profile = generate_sbpl(
+            &m,
+            &root,
+            &interp_real,
+            &app_dir,
+            &root.join("state/ipc/apps/probe-app.sock"),
+        );
+        let profile_path = root.join("probe.sb");
+        std::fs::write(&profile_path, &profile).unwrap();
+
+        let out = std::process::Command::new(SANDBOX_EXEC)
+            .arg("-f")
+            .arg(&profile_path)
+            .arg(&interp_real)
+            .args(["-c", "print('alive')"])
+            .output()
+            .expect("run sandbox-exec");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert!(
+            stdout.contains("alive"),
+            "the sandboxed interpreter did not run.\nstatus: {:?}\nstderr: {stderr}\n\nprofile:\n{profile}",
+            out.status.code()
+        );
+    }
+
+    /// KNOWN DEFECT, PINNED: a declared `net_hosts` emits SBPL that macOS refuses
+    /// to compile, so the profile is rejected (exit 65) and the app can never
+    /// launch. It fails CLOSED, so there is no security exposure — but two shipped
+    /// apps (fab-link, algo-core) are unlaunchable, and docs/SANDBOX.md describes a
+    /// host-name allow-list and resolver-pinned DNS that this OS has never
+    /// accepted.
+    ///
+    /// The two string-matching tests over these rules pass, because they assert
+    /// the literals the generator emits — the generator agreeing with itself. Only
+    /// handing the profile to `sandbox-exec` catches it.
+    ///
+    /// This is not fixable by correcting the syntax: SBPL has NO host or IP
+    /// filtering primitive at all (`(remote ip "1.2.3.4:443")` is rejected too;
+    /// host must be `*` or `localhost`). It needs a decision — refuse `net_hosts`
+    /// at manifest validation and route those apps through the daemon-side fetch
+    /// proxy, or emit a port-scoped `*:443` grant and rewrite the threat model to
+    /// match. WHEN THAT LANDS, THIS TEST SHOULD FLIP, not be deleted.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn a_net_hosts_profile_does_not_compile_today() {
+        let root = PathBuf::from(format!("/private/tmp/jrv-nh-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("state/ipc/apps")).unwrap();
+        let m = sample_manifest(); // declares net_hosts
+        assert!(!m.permissions.net_hosts.is_empty(), "this probe needs declared net_hosts");
+        let profile = generate_sbpl(
+            &m,
+            &root,
+            &PathBuf::from("/usr/bin/true"),
+            &root.join("apps/probe"),
+            &root.join("state/ipc/apps/probe.sock"),
+        );
+        let path = root.join("nh.sb");
+        std::fs::write(&path, &profile).unwrap();
+        let out = std::process::Command::new(SANDBOX_EXEC)
+            .arg("-f")
+            .arg(&path)
+            .arg("/usr/bin/true")
+            .output()
+            .expect("run sandbox-exec");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(
+            out.status.code(),
+            Some(65),
+            "net_hosts SBPL now compiles — the defect is fixed, so FLIP this test to \
+             assert success rather than deleting it. stderr: {stderr}"
+        );
+        assert!(
+            stderr.contains("host must be * or localhost"),
+            "the failure changed shape; re-read it before assuming it is the same defect: {stderr}"
+        );
     }
 
 }
