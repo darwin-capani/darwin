@@ -4571,6 +4571,541 @@ fn mentions_silicon_canvas(lower: &str) -> bool {
         || lower.contains("the board view")
 }
 
+// ---------------------------------------------------------------------------
+// THE GATES. Every op below used to fire on a bare substring, which is how a
+// corpus of 1,897 ORDINARY utterances (health, weather, cooking, travel, work,
+// chat — not one of them about a circuit board) put 132 turns into this app:
+// 80 ran an electrical rule check because "erc" is spelled inside "percent",
+// "mercy", "merchant" and "commerce"; 31 entered trace mode because "trace" is
+// ordinary English; 20 selected a net named MY / S / IT / MOSQUITO; 1 re-framed
+// the viewport because "actually" contains "all". A captured turn never reaches
+// conversation (router.rs:1953 is an else-if chain), so every one of those was
+// an answer the user did not get.
+//
+// Three rules run through everything here.
+//
+// WHOLE-WORD, via the shared `crate::utterance::mentions_word` primitive — a
+// substring is not a word.
+//
+// OBJECT POSITION: whole-word is only half a fix, because "the safety net PLAN"
+// and "the whole board OF DIRECTORS" pass it. What makes an utterance a command
+// is where the words sit: a speaker names the object of a command LAST
+// ("highlight the batt net", "fit the board") while ordinary English keeps
+// going. So a keyword has to END its phrase — where "end" means end, or trail
+// off into politeness ("... please"), a "for me", or a locus that points at the
+// board ("... on my screen", "... in the sandbox"). That last allowance is not
+// decoration: "darwin show me the 3v3 net on my screen" is how people actually
+// talk to this assistant, and an earlier draft of this fix rejected it.
+//
+// A CLOSED CONTINUATION SET for trace, which object position alone cannot
+// handle because a trace command legitimately continues ("trace the gnd net",
+// "advance the trace one step"). What follows the trace word must be PCB
+// material — a net/connection/route/pad, or mode/step/segment/forward — and
+// then settle. Adjacency of a lifecycle verb is NOT enough on its own, which is
+// the specific defect that sank the previous attempt: "please stop the trace on
+// my credit report", "resume the trace of the phone call", "i want to begin a
+// trace on the missing package", "enter the trace number on the website" and
+// "stop tracing the outline and color it in" all have the verb sitting right on
+// the word, and not one of them is about a circuit board.
+// ---------------------------------------------------------------------------
+
+/// The tokens of an utterance, split exactly the way
+/// `crate::utterance::mentions_word` splits: every non-alphanumeric character is
+/// a boundary. The gates below need POSITIONS, which no presence test can give.
+fn speech_words(lower: &str) -> Vec<&str> {
+    lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect()
+}
+
+/// The determiners a speaker slips between a verb and its object ("step THE
+/// trace", "fit THE board").
+const SPEECH_DETERMINERS: &[&str] = &[
+    "the", "a", "an", "this", "that", "these", "those", "my", "your", "our", "their", "its",
+];
+
+/// Words that can trail a noun phrase without continuing it, so that "show me
+/// the sda net PLEASE" is still a selection.
+const SPEECH_TRAILERS: &[&str] = &[
+    "please", "now", "sir", "darwin", "again", "thanks", "thank", "ok", "okay", "alright", "first",
+];
+
+/// Nouns that say WHERE the board is. A command may point at it after naming
+/// its object ("fit the board ON MY SCREEN", "highlight the clk net IN THE
+/// SANDBOX") and still be a command. Deliberately a closed list of surfaces:
+/// "on my CREDIT REPORT" and "on the SHIPMENT" must not qualify, and they are
+/// the exact shapes that made the previous attempt capture ordinary speech.
+const SPEECH_LOCUS_NOUNS: &[&str] = &[
+    "screen", "display", "monitor", "view", "viewport", "canvas", "board", "schematic", "sandbox",
+    "pcb", "layout", "window", "editor",
+];
+
+/// Tokens skipped when looking BACK from a noun for its verb. Determiners plus
+/// the prepositions a speaker drops in ("next step IN the trace"). Skipping
+/// prepositions here is safe ONLY because the continuation test below already
+/// rejected "begin TO trace THE PAYMENTS TOMORROW" on its tail; without that
+/// test this list would re-open the hole.
+const SPEECH_LOOKBACK_SKIP: &[&str] = &[
+    "the", "a", "an", "this", "that", "these", "those", "my", "your", "our", "their", "its", "in",
+    "on", "of", "to", "at", "along", "through", "with", "up", "over",
+];
+
+/// Is everything from `i` onward mere tail — a politeness trailer, a "for me",
+/// or a locus phrase that points at the board? This one test separates "select
+/// the safety net" from "select the safety net PLAN", "show the whole board"
+/// from "show me the whole board GAME COLLECTION", and "stop the trace" from
+/// "stop the trace ON MY CREDIT REPORT".
+fn settles_from(words: &[&str], mut i: usize) -> bool {
+    while i < words.len() {
+        let w = words[i];
+        if SPEECH_TRAILERS.contains(&w) {
+            i += 1;
+            continue;
+        }
+        if w == "for" && matches!(words.get(i + 1).copied(), Some("me" | "us")) {
+            i += 2;
+            continue;
+        }
+        if matches!(w, "on" | "in" | "onto" | "upon" | "at" | "over" | "to") {
+            let mut j = i + 1;
+            while j < words.len() && SPEECH_DETERMINERS.contains(&words[j]) {
+                j += 1;
+            }
+            if j < words.len() && SPEECH_LOCUS_NOUNS.contains(&words[j]) {
+                i = j + 1;
+                continue;
+            }
+            return false;
+        }
+        return false;
+    }
+    true
+}
+
+/// Does the noun phrase END at `idx` (modulo the tail material above)?
+fn phrase_settles_at(words: &[&str], idx: usize) -> bool {
+    settles_from(words, idx + 1)
+}
+
+/// A locus phrase that names the BOARD specifically, not just any surface. Used
+/// only by "fit EVERYTHING on the board", where the object is too generic to
+/// carry the utterance on its own — "can we fit everything in the car" must
+/// stay out.
+fn board_locus_from(words: &[&str], i: usize) -> bool {
+    if !matches!(words.get(i).copied(), Some("on" | "in" | "onto" | "upon")) {
+        return false;
+    }
+    let mut j = i + 1;
+    while j < words.len() && SPEECH_DETERMINERS.contains(&words[j]) {
+        j += 1;
+    }
+    match words.get(j) {
+        Some(&("board" | "boards" | "pcb" | "schematic" | "canvas")) => settles_from(words, j + 1),
+        _ => false,
+    }
+}
+
+/// Nouns that can only mean a printed circuit board. Deliberately NOT "board"
+/// or "circuit": a board is a plank, a committee, an exam and a game, and a
+/// circuit is training, a court and a race track. Deliberately not "copper" or
+/// "footprint" either, which an earlier draft included — "the copper pipes are
+/// leaking, we should trace them" and "my carbon footprint" are ordinary
+/// English, and a board noun BYPASSES the position tests below, so a wrong
+/// entry here is expensive. Deliberately not "net": see `selected_net` for how
+/// "net" earns its board reading.
+fn mentions_board_noun(lower: &str) -> bool {
+    mentions_silicon_canvas(lower)
+        || crate::utterance::mentions_any_word(
+            lower,
+            &[
+                "pcb", "pcbs", "netlist", "netlists", "silkscreen", "kicad", "gerber", "gerbers",
+            ],
+        )
+}
+
+/// The nouns a PCB trace can be traced ALONG. This is the closed continuation
+/// set: after the trace word, either the utterance settles immediately, or the
+/// next thing named is one of these.
+fn is_trace_object_noun(w: &str) -> bool {
+    matches!(
+        w,
+        "net" | "nets"
+            | "trace"
+            | "traces"
+            | "connection"
+            | "connections"
+            | "route"
+            | "routes"
+            | "track"
+            | "tracks"
+            | "wire"
+            | "wires"
+            | "signal"
+            | "signals"
+            | "pad"
+            | "pads"
+            | "pin"
+            | "pins"
+            | "path"
+            | "paths"
+    )
+}
+
+/// What kind of thing follows the trace word.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum TraceHead {
+    /// Nothing, or nothing recognizable ("stop the trace", "... trace of gluten").
+    Empty,
+    /// A PCB object ("trace THE GND NET", "trace THIS CONNECTION").
+    Object,
+    /// "trace MODE".
+    Mode,
+    /// A stepping word ("next trace STEP", "advance the trace ONE STEP").
+    Step,
+}
+
+/// Parse what follows the trace word at `at`. Returns the index where the tail
+/// begins (everything from there must `settles_from`) and what was consumed.
+fn trace_head(words: &[&str], at: usize) -> (usize, TraceHead) {
+    let mut i = at + 1;
+    // "trace ALONG this net" / "trace FROM this pad" — a locus preposition may lead
+    // the object. Skipping one keeps the object visible; without this the head
+    // reads as the preposition and the whole command is refused.
+    if i < words.len() && matches!(words[i], "along" | "from" | "on" | "down" | "through" | "out") {
+        i += 1;
+    }
+    if i >= words.len() {
+        return (i, TraceHead::Empty);
+    }
+    if words[i] == "mode" {
+        return (i + 1, TraceHead::Mode);
+    }
+    if matches!(words[i], "step" | "steps" | "segment" | "segments" | "forward") {
+        return (i + 1, TraceHead::Step);
+    }
+    if words[i] == "next" {
+        let mut j = i + 1;
+        if j < words.len() && matches!(words[j], "step" | "steps" | "segment" | "segments") {
+            j += 1;
+        }
+        return (j, TraceHead::Step);
+    }
+    if words[i] == "one" && matches!(words.get(i + 1).copied(), Some("step" | "steps")) {
+        return (i + 2, TraceHead::Step);
+    }
+    // "[determiner] [name] <pcb noun>" — "the net", "this connection",
+    // "the gnd net". At most ONE name token, so "the recipe with me" and "the
+    // outline and color it in" do not reach a noun.
+    let mut j = i;
+    if SPEECH_DETERMINERS.contains(&words[j]) {
+        j += 1;
+    }
+    if j < words.len() && is_trace_object_noun(words[j]) {
+        return (j + 1, TraceHead::Object);
+    }
+    if j + 1 < words.len() && is_trace_object_noun(words[j + 1]) {
+        return (j + 2, TraceHead::Object);
+    }
+    (i, TraceHead::Empty)
+}
+
+/// The nearest content token before `at`, skipping determiners and the
+/// prepositions in `SPEECH_LOOKBACK_SKIP`; None when `at` opens the utterance.
+fn trace_verb_before<'a>(words: &[&'a str], at: usize) -> Option<&'a str> {
+    let mut i = at;
+    while i > 0 {
+        i -= 1;
+        if !SPEECH_LOOKBACK_SKIP.contains(&words[i]) {
+            return Some(words[i]);
+        }
+    }
+    None
+}
+
+/// Which trace op the utterance is asking for, or None when "trace" was just
+/// ordinary English.
+///
+/// WHAT WENT WRONG: this replaces three branches that each keyed on
+/// `lower.contains("trace")`. The word is a noun ("is there any trace of gluten
+/// in this bread") and a verb ("can the bank trace the wire transfer") in
+/// everyday speech, it hides inside "retrace" and even "exTRACEllular", and the
+/// lifecycle verbs beside it were `contains` too, so "spend" matched "end" and
+/// "steps" matched "step". 31 ordinary utterances entered trace mode.
+///
+/// The rule is CONTINUATION, not adjacency. An adjacency-only draft of this fix
+/// was measured and rejected: it still captured "please stop the trace on my
+/// credit report", "restart the trace on the shipment", "let's cancel the trace
+/// request with the bank" and seven more, because in every one of them a
+/// lifecycle verb does sit on the word. What those sentences do NOT do is
+/// continue with PCB material. So each occurrence must first pass its tail
+/// (`trace_head` + `settles_from`), and only then is the verb read off it.
+/// Precedence is the old branch order — step, then stop, then the broad start.
+fn trace_command(lower: &str) -> Option<String> {
+    let words = speech_words(lower);
+    let spoken: Vec<usize> = words
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| matches!(**w, "trace" | "traces" | "tracing"))
+        .map(|(i, _)| i)
+        .collect();
+    if spoken.is_empty() {
+        return None;
+    }
+    // A one-word utterance IS the command: nobody says a bare "trace." in
+    // conversation, and that is how the mode gets re-armed mid-session.
+    if words.len() == 1 {
+        return Some(op_trace_start());
+    }
+    // The bare imperative "trace it" / "trace this" / "trace that", but ONLY
+    // when the trace word opens the utterance and nothing but tail follows.
+    // "can they trace it back to me" and "can you trace this charge on my card"
+    // fail both halves.
+    if spoken[0] == 0
+        && matches!(words.get(1).copied(), Some("it" | "this" | "that"))
+        && settles_from(&words, 2)
+    {
+        return Some(op_trace_start());
+    }
+    // A named board licenses a trace phrase whose tail we cannot parse ("on the
+    // schematic, start the trace at the connector"). It does NOT supply an op
+    // on its own — the verb or the object still has to be there.
+    let board = mentions_board_noun(lower);
+    let (mut step, mut stop, mut start) = (false, false, false);
+    for at in spoken {
+        let (tail, head) = trace_head(&words, at);
+        if !(settles_from(&words, tail) || board) {
+            continue;
+        }
+        let before = trace_verb_before(&words, at);
+        if head == TraceHead::Step
+            || matches!(before, Some("next" | "step" | "advance" | "forward"))
+        {
+            step = true;
+        }
+        if matches!(
+            before,
+            Some("stop" | "end" | "exit" | "cancel" | "quit" | "finish")
+        ) {
+            stop = true;
+        }
+        if matches!(
+            before,
+            Some(
+                "start" | "begin" | "resume" | "enter" | "restart" | "reenter" | "keep"
+                    | "continue"
+            )
+        ) || head == TraceHead::Mode
+            || head == TraceHead::Object
+        {
+            start = true;
+        }
+    }
+    if step {
+        return Some(op_trace_step());
+    }
+    if stop {
+        return Some(op_trace_stop());
+    }
+    if start {
+        return Some(op_trace_start());
+    }
+    None
+}
+
+/// Is this "erc" one of the three ordinary-English ERCs rather than an
+/// electrical rule check? "erc 20" / "erc-721" / "erc 1155" is the crypto token
+/// standard (a number directly after the acronym gives it away); an ERC GRANT is
+/// the European Research Council; an ERC REFUND/CREDIT is the US employee
+/// retention credit. None of the three is worth a swallowed turn.
+fn says_erc_in_a_non_pcb_sense(lower: &str) -> bool {
+    let words = speech_words(lower);
+    let token_standard = words.iter().enumerate().any(|(i, w)| {
+        *w == "erc"
+            && words
+                .get(i + 1)
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()))
+    });
+    token_standard
+        || crate::utterance::mentions_any_word(
+            lower,
+            &[
+                "grant", "grants", "refund", "refunds", "credit", "credits", "token", "tokens",
+                "crypto", "nft", "nfts", "wallet", "council", "irs", "payroll",
+            ],
+        )
+}
+
+/// Does the extracted name look like a net LABEL? Either a letters-and-digits
+/// mix (3V3, 12V, GPIO2 — the MIX matters: the bare "2019" in "the 2019 net
+/// income was higher" is not a net) or one of the standard power/signal names.
+/// IN and OUT are real labels on an analog sheet, which is why they are here
+/// rather than treated as English stopwords; object position is what keeps "how
+/// much do you take home IN NET PAY" out instead.
+fn looks_like_net_label(name: &str) -> bool {
+    (name.chars().any(|c| c.is_ascii_digit()) && name.chars().any(|c| c.is_ascii_alphabetic()))
+        || matches!(
+            name,
+            "GND" | "AGND" | "DGND" | "GROUND" | "VCC" | "VDD" | "VSS" | "VBUS" | "VIN" | "VOUT"
+                | "VREF" | "VBAT" | "SDA" | "SCL" | "CLK" | "MCLK" | "SCK" | "MISO" | "MOSI"
+                | "RESET" | "NRST" | "SWDIO" | "SWCLK" | "CS" | "EN" | "INT" | "TX" | "RX"
+                | "USB" | "PWM" | "CHASSIS" | "IN" | "OUT"
+        )
+}
+
+/// The modifier half of the English "<X> net" compounds. This is a closed class
+/// — the language has about two dozen — and no PCB net is named MOSQUITO, so an
+/// entry here can never cost a real command. It exists because the select-verb
+/// path below would otherwise read "show me the mosquito net" as a selection of
+/// a net called MOSQUITO.
+fn is_ordinary_net_compound(name: &str) -> bool {
+    matches!(
+        name,
+        "MOSQUITO" | "SAFETY" | "TENNIS" | "VOLLEYBALL" | "BASKETBALL" | "BADMINTON" | "SOCCER"
+            | "GOAL" | "HAIR" | "FISHING" | "FISH" | "BUTTERFLY" | "CARGO" | "DRAG" | "GILL"
+            | "BUG" | "INSECT" | "BIRD" | "LANDING" | "DIP" | "TRAWL" | "CASTING" | "SCREEN"
+            | "SHRIMP"
+    )
+}
+
+/// Verbs that mean "act on this object on screen". "go" is accepted only in the
+/// navigation phrase "GO TO the batt net" — bare "go" would let "go grab the
+/// net" select a net called GRAB.
+fn mentions_select_verb(lower: &str) -> bool {
+    if crate::utterance::mentions_any_word(
+        lower,
+        &[
+            "show", "shows", "highlight", "highlights", "select", "selects", "isolate", "probe",
+            "jump", "zoom", "find",
+        ],
+    ) {
+        return true;
+    }
+    let words = speech_words(lower);
+    words.windows(2).any(|w| w[0] == "go" && w[1] == "to")
+}
+
+/// The net a selection utterance names, or None when "net" was ordinary
+/// English.
+///
+/// WHAT WENT WRONG: the branch below ran `extract_net_name` on EVERY utterance
+/// with no verb, no app gate and no test of the name it produced, then forwarded
+/// that name to the app verbatim — "my net calories were way under yesterday"
+/// selected the net MY, "what's the net weight of a can of chickpeas" selected S
+/// (the tail of the contraction), "nothing but net" selected BUT. Twenty of them
+/// in the corpus.
+///
+/// A selection now needs the board named, or a name that looks like a net label
+/// (or carries a select verb) AND a phrase that settles on it. The bare-
+/// reference form is deliberately kept: with the board open, "the 3v3 net" with
+/// no verb at all is the likeliest thing a user says.
+fn selected_net(lower: &str) -> Option<String> {
+    let name = extract_net_name(lower)?;
+    // The board itself is named ("... net on the schematic"): any name, and the
+    // net need not end the phrase.
+    if mentions_board_noun(lower) {
+        return Some(name);
+    }
+    let words = speech_words(lower);
+    let pos = words.iter().position(|w| *w == "net")?;
+    if !phrase_settles_at(&words, pos) {
+        return None;
+    }
+    if looks_like_net_label(&name)
+        || (mentions_select_verb(lower) && !is_ordinary_net_compound(&name))
+    {
+        Some(name)
+    } else {
+        None
+    }
+}
+
+/// Does the reference look like a KiCad reference designator (a letter prefix
+/// then digits: U3, R12, C5)? A bare "5" does not, which is what made
+/// "component 5 is backordered" a selection.
+fn looks_like_designator(reference: &str) -> bool {
+    reference
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic())
+        && reference.chars().any(|c| c.is_ascii_digit())
+}
+
+/// The component a selection utterance names. Same defect as the net branch —
+/// the extractor ran on every utterance with no verb and no app gate — and the
+/// same shape of fix. A bare number is only a component when a select verb is
+/// present AND the phrase settles on it, because a select verb alone still let
+/// "show me component 4 of the essay" and "find component 7 of the rubric"
+/// through.
+fn selected_component(lower: &str) -> Option<String> {
+    let reference = extract_component_ref(lower)?;
+    if looks_like_designator(&reference) || mentions_board_noun(lower) {
+        return Some(reference);
+    }
+    if !mentions_select_verb(lower) {
+        return None;
+    }
+    let words = speech_words(lower);
+    let pos = words.iter().position(|w| *w == "component")?;
+    if phrase_settles_at(&words, pos + 1) {
+        Some(reference)
+    } else {
+        None
+    }
+}
+
+/// The object of a fit phrase may be followed by the redundant "view" /
+/// "viewport" / "layout" ("fit the board VIEW") before the tail.
+fn fit_object_settles(words: &[&str], mut k: usize) -> bool {
+    if matches!(words.get(k).copied(), Some("view" | "viewport" | "layout")) {
+        k += 1;
+    }
+    settles_from(words, k)
+}
+
+/// Is this a "re-frame the viewport" phrase?
+///
+/// WHAT WENT WRONG: `contains("fit")` matches inside nonprofit / benefit /
+/// outfit, `contains("board")` inside keyboard / boarding / cardboard, and the
+/// "whole board" arm carried no verb requirement at all, so "the whole board of
+/// directors approved the budget" re-framed the view. Whole-word is only half
+/// the fix — "the fit of these boards is off" and "how many bodies can that
+/// minivan actually fit with luggage" pass whole-word too. `fit` has to be the
+/// VERB (its object follows it) and the object has to settle the phrase.
+fn view_fit_requested(lower: &str) -> bool {
+    let words = speech_words(lower);
+    let fit_arm = words.iter().enumerate().any(|(i, w)| {
+        if *w != "fit" {
+            return false;
+        }
+        let mut j = i + 1;
+        while j < words.len() && SPEECH_DETERMINERS.contains(&words[j]) {
+            j += 1;
+        }
+        match words.get(j).copied() {
+            Some("board" | "boards" | "all") => fit_object_settles(&words, j + 1),
+            Some("whole" | "entire") => {
+                matches!(words.get(j + 1).copied(), Some("board" | "boards"))
+                    && fit_object_settles(&words, j + 2)
+            }
+            // "fit everything ON THE BOARD" — too generic without the board.
+            Some("everything") => board_locus_from(&words, j + 1),
+            _ => false,
+        }
+    });
+    let whole_arm = words.iter().enumerate().any(|(i, w)| {
+        matches!(*w, "board" | "boards")
+            && i > 0
+            && matches!(words[i - 1], "whole" | "entire")
+            && fit_object_settles(&words, i + 1)
+            && crate::utterance::mentions_any_word(
+                lower,
+                &["show", "fit", "zoom", "view", "display", "frame", "center"],
+            )
+    });
+    fit_arm || whole_arm
+}
+
 /// Map a spoken utterance to a Silicon Canvas command, or None when it is not a
 /// Silicon-Canvas control phrase (the turn then falls through to normal
 /// routing). Deterministic and pure so the mapping is unit-tested without a
@@ -4590,53 +5125,94 @@ fn mentions_silicon_canvas(lower: &str) -> bool {
 ///   - "run erc" / "run the electrical rule check(s)" /
 ///     "check the electrical rules"                          -> erc.run
 ///   - "fit the board" / "show the whole board" / "fit all"  -> view.set fit all
+///
+/// EVERY one of those needs the board in the sentence, not merely the keyword.
+/// The op branches are gated by the helpers above (`trace_command`,
+/// `selected_net`, `selected_component`, `view_fit_requested`): what follows a
+/// trace word has to be PCB material, a net name has to look like a net label
+/// (or the board has to be named) and settle the phrase, a component reference
+/// has to look like a designator or carry a select verb and settle, and "fit" /
+/// "whole board" have to be a view verb with the board as its object. A bare
+/// keyword is never enough, because 132 of 1,897 ordinary utterances contained
+/// one.
 pub fn silicon_canvas_command(text: &str) -> Option<SiliconCanvasCommand> {
     let lower = text.to_lowercase();
 
     // --- trace mode (specific verbs before the broad launch) ---------------
-    // Step BEFORE start/stop so "next trace step" is unambiguous.
-    if (lower.contains("trace") || lower.contains("tracing"))
-        && (lower.contains("next") || lower.contains("step") || lower.contains("advance"))
-    {
-        return Some(SiliconCanvasCommand::Op(op_trace_step()));
-    }
-    if (lower.contains("trace") || lower.contains("tracing"))
-        && (lower.contains("stop")
-            || lower.contains("end")
-            || lower.contains("exit")
-            || lower.contains("cancel"))
-    {
-        return Some(SiliconCanvasCommand::Op(op_trace_stop()));
-    }
-    // "trace this net", "start tracing", "begin the trace", "trace the net".
-    if lower.contains("trace") || lower.contains("tracing") {
-        return Some(SiliconCanvasCommand::Op(op_trace_start()));
+    // "trace this net", "start tracing", "next trace step", "exit trace mode".
+    // The step-before-stop-before-start precedence lives inside
+    // `trace_command` so the three cannot drift apart; see it for what a bare
+    // `contains("trace")` used to do to ordinary speech.
+    if let Some(op) = trace_command(&lower) {
+        return Some(SiliconCanvasCommand::Op(op));
     }
 
     // --- ERC ---------------------------------------------------------------
-    if lower.contains("erc")
-        || (lower.contains("electrical rule")
-            && (lower.contains("run") || lower.contains("check")))
+    // WHAT WENT WRONG: `contains("erc")` is three letters that live inside
+    // percent, percentage, mercy, merchant, commerce and e-commerce — 80 of the
+    // 132 corpus captures came through this single line ("what percent of my
+    // paycheck goes to taxes", "have mercy, this curry is spicy", "the chamber
+    // of commerce sent me a membership bill"). Whole-word alone closes all 80:
+    // the token "erc" appears ZERO times in the 1,897-utterance corpus.
+    //
+    // The acronym still needs a reason to be a rule check, and it gets the same
+    // choice the rest of this file offers — a run/check verb, an unambiguous
+    // ERC noun ("any erc errors"), or object position ("show me the erc"). The
+    // spelled-out "electrical rule" arm keeps its verb requirement and may NOT
+    // trade it for a board co-word: an earlier draft allowed that, and "what
+    // are the electrical rules for a subpanel on this board" — an electrician's
+    // question the shipped code leaves alone — started running an ERC. A fix
+    // that closes captures must not open one.
+    let erc_verb = crate::utterance::mentions_any_word(
+        &lower,
+        &[
+            "run", "runs", "running", "rerun", "reruns", "check", "checks", "checking", "recheck",
+            "rechecks",
+        ],
+    );
+    let erc_words = speech_words(&lower);
+    let erc_is_the_object = erc_words
+        .iter()
+        .position(|w| *w == "erc")
+        .is_some_and(|pos| phrase_settles_at(&erc_words, pos));
+    if (mentions_word(&lower, "erc")
+        && !says_erc_in_a_non_pcb_sense(&lower)
+        && (erc_verb
+            || crate::utterance::mentions_any_word(
+                &lower,
+                &[
+                    "error", "errors", "violation", "violations", "warning", "warnings", "report",
+                    "reports", "results",
+                ],
+            )
+            || erc_is_the_object))
+        || (lower.contains("electrical rule") && erc_verb)
     {
         return Some(SiliconCanvasCommand::Op(op_erc_run()));
     }
 
     // --- net selection -----------------------------------------------------
-    // "show me the 3V3 net", "highlight the GND net", "select the VBUS net".
-    if let Some(net) = extract_net_name(&lower) {
+    // "show me the 3V3 net", "highlight the GND net", "select the VBUS net",
+    // and the bare mid-session "the 3v3 net". `selected_net` holds the gate:
+    // the extractor on its own handed the app nets called MY, S and BUT.
+    if let Some(net) = selected_net(&lower) {
         return Some(SiliconCanvasCommand::Op(op_select_net(&net)));
     }
 
     // --- component selection ----------------------------------------------
-    if let Some(reference) = extract_component_ref(&lower) {
+    // "select component u3", "show component r12", the bare "component r12".
+    // `selected_component` holds the gate; ungated, "component 5 is
+    // backordered" selected component 5, and gated only on a select verb,
+    // "show me component 4 of the essay" still did.
+    if let Some(reference) = selected_component(&lower) {
         return Some(SiliconCanvasCommand::Op(op_select_component(&reference)));
     }
 
     // --- view fit ----------------------------------------------------------
-    if (lower.contains("fit") && (lower.contains("board") || lower.contains("all")))
-        || lower.contains("whole board")
-        || lower.contains("entire board")
-    {
+    // "fit the board", "fit all", "show the whole board". `view_fit_requested`
+    // holds the gate: `contains` here matched "nonprofit", "boarding", and the
+    // "all" inside "actually".
+    if view_fit_requested(&lower) {
         return Some(SiliconCanvasCommand::Op(op_view_fit_all()));
     }
 
@@ -4683,10 +5259,24 @@ fn extract_net_name(lower: &str) -> Option<String> {
         idx -= 1;
     }
     let name = words[idx];
-    // A pure stopword/verb is not a net name.
+    // A pure stopword/verb is not a net name. The PRONOUNS and copulas matter
+    // as much as the verbs did: with only the verbs listed, "my net calories"
+    // handed the app the net MY and "what's the net weight" handed it S — the
+    // tail of the contraction, because the split above breaks "what's" into
+    // "what" and "s". The remaining select verbs are here for the same reason
+    // the first three were: "can you find a net" walks back over the article
+    // and offers FIND as the name. A bogus name is not a harmless miss; it is
+    // forwarded to the app verbatim as a real selection.
+    //
+    // "in" and "out" are deliberately NOT here — they are ordinary net labels
+    // on an analog sheet ("show me the in net"), and object position is what
+    // keeps "how much do you take home in net pay" out instead.
     if matches!(
         name,
-        "show" | "me" | "highlight" | "select" | "the" | "this" | "that" | "trace"
+        "show" | "me" | "highlight" | "select" | "the" | "this" | "that" | "trace" | "find"
+            | "get" | "buy" | "go" | "jump" | "zoom" | "isolate" | "probe" | "my" | "your"
+            | "our" | "their" | "its" | "it" | "i" | "you" | "s" | "is" | "are" | "was" | "of"
+            | "and" | "or" | "to" | "for" | "on" | "at"
     ) {
         return None;
     }
@@ -7721,6 +8311,191 @@ mod tests {
         assert!(silicon_canvas_command("open netflix").is_none());
         // But a real net selection still fires.
         assert_op("show me the clk net", r#"{"op":"select.net","name":"CLK"}"#);
+    }
+
+    /// THE ORDINARY-SPEECH CORPUS, IN TEST FORM. Every utterance here was
+    /// captured by the shipped classifier out of a 1,897-line corpus of
+    /// ordinary speech (or is the minimal shape of one that was). None of them
+    /// is about a circuit board; each one was an answer the user did not get,
+    /// because router.rs:1953 is an else-if chain and a captured turn never
+    /// reaches conversation.
+    ///
+    /// Mutation-proof: delete any single gate helper's condition and lines here
+    /// go red. The four classes are labelled with the substring that did it.
+    #[test]
+    fn silicon_canvas_does_not_capture_ordinary_speech() {
+        for text in [
+            // "erc" inside percent / mercy / merchant / commerce — 80 captures.
+            "what percent of my paycheck goes to taxes",
+            "have mercy, this curry is spicy",
+            "the chamber of commerce sent me a membership bill",
+            "the merchant charged me twice",
+            "we need to check her erc grant application",
+            "i bought erc 721 nfts last year",
+            "can you check the erc refund status",
+            // "trace" as ordinary English — 31 captures.
+            "is there any trace of gluten in this bread",
+            "the recipe calls for a trace of nutmeg at the end",
+            "they found trace amounts of lead",
+            "i had to retrace my steps to find my keys",
+            "there's no trace",
+            // ...and the shape that survives mere ADJACENCY of a lifecycle verb.
+            "please stop the trace on my credit report",
+            "resume the trace of the phone call",
+            "restart the trace on the shipment",
+            "i want to begin a trace on the missing package",
+            "let's cancel the trace request with the bank",
+            "they will exit the trace program next year",
+            "enter the trace number on the website",
+            "stop tracing the outline and color it in",
+            "step by step trace the recipe with me",
+            "the trace mode on my fitness watch is broken",
+            "begin to trace the payments tomorrow",
+            "can you trace this charge on my card",
+            "can they trace it back to me",
+            "please trace my package",
+            // "net" as ordinary English — 20 captures.
+            "my net calories were way under yesterday",
+            "what's the net weight of a can of chickpeas",
+            "nothing but net",
+            "how much do you take home in net pay",
+            "show me the mosquito net options",
+            "the safety net plan is generous",
+            "i watched a tennis net repair video",
+            "can you go to the store and get a net",
+            "go grab the net",
+            // "fit"/"board"/"all" as substrings, and as whole words in
+            // non-board senses — 1 capture plus its neighbours.
+            "how many bodies can that minivan actually fit with luggage",
+            "the fit of these boards is off",
+            "the whole board of directors approved the budget",
+            "show me the whole board game collection",
+            "i told the whole board about it",
+            "will it all fit in the car",
+            "i fit all my clothes in one bag",
+            // A component reference that is not a component.
+            "component 5 is backordered",
+            "show me component 4 of the essay",
+            "find component 7 of the rubric",
+            // The electrician's question the ERC gate must not steal.
+            "the electrical rules for a subpanel on this board",
+        ] {
+            assert_eq!(
+                silicon_canvas_command(text),
+                None,
+                "ordinary speech must not be captured: {text:?}"
+            );
+        }
+    }
+
+    /// ...and the real commands, which the gate above must NOT cost. Every one
+    /// of these is either asserted elsewhere in this file, printed in the doc
+    /// comment on `silicon_canvas_command`, listed in apps/silicon-canvas/SPEC.md,
+    /// or the way a person actually phrases one of those out loud. A previous
+    /// attempt at this fix drove captures to zero and broke a third of them; a
+    /// zero-capture number on its own is not a result.
+    #[test]
+    fn silicon_canvas_still_takes_the_real_commands() {
+        // Launch, including the phrasings with a trailing locus.
+        for text in [
+            "start silicon canvas",
+            "darwin open up silicon canvas please",
+            "can you open silicon canvas for me",
+            "show me the schematic",
+            "open the schematic on my screen",
+            "open silicon canvas in the sandbox",
+            "launch the board view",
+        ] {
+            assert_eq!(
+                silicon_canvas_command(text),
+                Some(SiliconCanvasCommand::Launch),
+                "should still launch: {text:?}"
+            );
+        }
+        // Net selection: label names need no verb; a trailing locus, a
+        // "please" and a "for me" do not end the command.
+        assert_op("the 3v3 net", r#"{"op":"select.net","name":"3V3"}"#);
+        assert_op("what's on the 3v3 net", r#"{"op":"select.net","name":"3V3"}"#);
+        assert_op(
+            "darwin show me the 3v3 net on my screen",
+            r#"{"op":"select.net","name":"3V3"}"#,
+        );
+        assert_op(
+            "could you highlight the vbus net for me",
+            r#"{"op":"select.net","name":"VBUS"}"#,
+        );
+        assert_op(
+            "can you highlight the clk net in the sandbox",
+            r#"{"op":"select.net","name":"CLK"}"#,
+        );
+        assert_op("select the ground net", r#"{"op":"select.net","name":"GROUND"}"#);
+        assert_op("show me the in net", r#"{"op":"select.net","name":"IN"}"#);
+        // A non-label name still works when a select verb names it.
+        assert_op("show me the batt net", r#"{"op":"select.net","name":"BATT"}"#);
+        assert_op("go to the batt net", r#"{"op":"select.net","name":"BATT"}"#);
+        // Trace: the object may continue the phrase, and the lifecycle verb may
+        // sit anywhere a speaker puts it.
+        assert_op("trace this connection", r#"{"op":"trace.start"}"#);
+        assert_op("trace the gnd net", r#"{"op":"trace.start"}"#);
+        assert_op("trace this net on my screen", r#"{"op":"trace.start"}"#);
+        assert_op("can you trace this net for me", r#"{"op":"trace.start"}"#);
+        assert_op("enter trace mode", r#"{"op":"trace.start"}"#);
+        assert_op("trace it", r#"{"op":"trace.start"}"#);
+        assert_op("next step in the trace", r#"{"op":"trace.step"}"#);
+        assert_op("advance the trace one step", r#"{"op":"trace.step"}"#);
+        assert_op("step the trace forward", r#"{"op":"trace.step"}"#);
+        assert_op("keep tracing, next segment", r#"{"op":"trace.step"}"#);
+        assert_op("step to the next trace segment", r#"{"op":"trace.step"}"#);
+        assert_op("okay stop the trace now", r#"{"op":"trace.stop"}"#);
+        assert_op("that's enough, stop tracing", r#"{"op":"trace.stop"}"#);
+        assert_op("cancel the trace", r#"{"op":"trace.stop"}"#);
+        // ERC: verb, ERC noun, or object position.
+        assert_op("re-run erc", r#"{"op":"erc.run"}"#);
+        assert_op("rerun the erc", r#"{"op":"erc.run"}"#);
+        assert_op("can you run erc on the board", r#"{"op":"erc.run"}"#);
+        assert_op("show me the erc errors", r#"{"op":"erc.run"}"#);
+        assert_op("any erc violations", r#"{"op":"erc.run"}"#);
+        assert_op("show me the erc", r#"{"op":"erc.run"}"#);
+        assert_op(
+            "run an electrical rule check on the schematic",
+            r#"{"op":"erc.run"}"#,
+        );
+        // Component: a designator needs no verb; a bare number needs a verb AND
+        // object position.
+        assert_op("component r12", r#"{"op":"select.component","name":"R12"}"#);
+        assert_op(
+            "select component u7 on my screen",
+            r#"{"op":"select.component","name":"U7"}"#,
+        );
+        assert_op("select component 5", r#"{"op":"select.component","name":"5"}"#);
+        // View fit.
+        let fit = r#"{"op":"view.set","mode":"fit","target":"all"}"#;
+        assert_op("fit the board on my screen", fit);
+        assert_op("zoom to fit the board", fit);
+        assert_op("can you fit the whole board", fit);
+        assert_op("fit everything on the board", fit);
+        assert_op("fit the board view", fit);
+        assert_op("show the entire board", fit);
+    }
+
+    /// The three real commands this gate DOES cost, pinned so the trade is
+    /// visible rather than discovered. Each is a phrase the shipped classifier
+    /// accepted and this one does not, and each is the price of a specific
+    /// ordinary-speech capture listed above:
+    ///   - "the whole board" with no view verb, because "i told the whole
+    ///     board" and "we presented to the whole board" have the same shape;
+    ///   - "trace this charge"-shaped objects, i.e. any trace object that is
+    ///     not PCB material;
+    ///   - an "<X> net" with a non-label name and no select verb, because
+    ///     "nothing but net" has exactly that shape.
+    ///
+    /// If a user reports one of these missing, the fix is to name the board or
+    /// add the verb — not to widen the gate without a corpus re-run.
+    #[test]
+    fn silicon_canvas_documented_trade_offs() {
+        assert!(silicon_canvas_command("the whole board").is_none());
+        assert!(silicon_canvas_command("trace this charge").is_none());
+        assert!(silicon_canvas_command("the batt net").is_none());
     }
 
     // ======================================================================
