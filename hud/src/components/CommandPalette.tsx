@@ -68,8 +68,6 @@ export default function CommandPalette({
     el?.scrollIntoView({ block: "nearest" });
   }, [selected, open]);
 
-  if (!open) return null;
-
   const runResolution = (item: PaletteItem) => {
     const res = resolveAction(item.action, targetAgent);
     if (res.kind === "send") {
@@ -127,6 +125,22 @@ export default function CommandPalette({
     open,
     ".palette-input",
   );
+
+  // THE EARLY RETURN MUST SIT BELOW EVERY HOOK.
+  //
+  // It used to sit above `paletteRef` + `useModalFocus`, so the closed render
+  // called 10 hooks and the open render called 13. React throws "Rendered more
+  // hooks than during the previous render" on that transition, and because the
+  // throw escapes the per-column boundaries it reached the ROOT one: the first
+  // Cmd-K on a fresh HUD replaced the entire interface — panels, StatusBar,
+  // takeover controls — with the "HUD ERROR / Reload" screen. The palette never
+  // opened once, on any machine.
+  //
+  // Running the two hooks while closed is a no-op by construction:
+  // `useModalFocus` returns at `if (!active) return` with `active = open`, and
+  // `paletteRef.current` is null until the dialog mounts. CommandDeck has always
+  // ordered it this way.
+  if (!open) return null;
 
   const activeId = filtered[selected] ? `palette-opt-${selected}` : undefined;
 
