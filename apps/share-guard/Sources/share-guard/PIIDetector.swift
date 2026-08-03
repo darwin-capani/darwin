@@ -137,23 +137,85 @@ public enum PIIDetector {
             return
         }
 
-        // Out of every band. If it contains whitespace, the run class glued SEPARATE
-        // numbers together (e.g. "5551234567 5559876543" -> a 20-digit run): split
-        // and classify each piece over ITS OWN range so both redact, instead of
-        // silently leaking both as one out-of-band run (the review's under-mask leak).
+        // Out of every band. The run class glued SEPARATE numbers together.
         guard token.contains(where: { $0.isWhitespace }) else { return }
+
+        // Walk the whitespace-separated groups, keeping each one's REAL source range
+        // so a span can be spliced back over the original text.
+        var groups: [(text: Substring, range: Range<String.Index>)] = []
         var cursor = range.lowerBound
         for sub in token.split(omittingEmptySubsequences: true, whereSeparator: { $0.isWhitespace }) {
             while cursor < range.upperBound, text[cursor].isWhitespace {
                 cursor = text.index(after: cursor)
             }
-            let subStart = cursor
+            let start = cursor
             for _ in 0..<sub.count { cursor = text.index(after: cursor) }
-            let subToken = String(sub)
-            if let kind = numberBand(subToken, digitsOf(sub)) {
-                spans.append(PIISpan(kind: kind, range: subStart..<cursor, matched: subToken))
+            groups.append((sub, start..<cursor))
+        }
+
+        // GREEDY, LUHN-GATED REGROUP — then per-atom for whatever is left over.
+        //
+        // WHAT WENT WRONG: this used to classify each whitespace-separated group
+        // ALONE. Two card numbers written the way card numbers are actually written
+        //
+        //     "4111 1111 1111 1111 5555 5555 5555 4444"
+        //
+        // decompose into eight 4-digit atoms. `numberBand` gives a 4-digit atom no
+        // band at all, so NOTHING was emitted: the "redacted copy" came back
+        // byte-identical to the input while the preview said "No PII detected". The
+        // redactor failed open on precisely the data it exists to protect, and
+        // because the user then shares that copy themselves, the false negative
+        // actively induces the leak. This is not an exotic format — it is the format
+        // this file's own `testFindsLuhnValidCard` uses, and the format
+        // VNRecognizeTextRequest emits from a screenshot.
+        //
+        // So: try to REASSEMBLE a card out of consecutive groups before falling back
+        // to per-atom. Take the LONGEST window from each start (scanning k down)
+        // whose digits land in the card band AND pass Luhn.
+        //
+        // THE LUHN GATE IS LOAD-BEARING, not decoration. It is what stops the
+        // regroup from swallowing benign digit runs, and it is why there is
+        // deliberately NO symmetric phone regroup: a 10-12 digit window has no
+        // checksum, so regrouping for phone would mask the first three groups of
+        // "ref 1234 5678 9012 3456 end" and break `testLongNumber...NotOverMasked`.
+        var consumed = [Bool](repeating: false, count: groups.count)
+        var i = 0
+        while i < groups.count {
+            var digits = 0
+            var j = i
+            while j < groups.count, digits + digitsOf(groups[j].text) <= cardDigitRange.upperBound {
+                digits += digitsOf(groups[j].text)
+                j += 1
+            }
+            var matched = false
+            var k = j - 1
+            while k > i {
+                let span = groups[i].range.lowerBound..<groups[k].range.upperBound
+                let windowText = String(text[span])
+                let windowDigits = windowText.reduce(0) { $0 + ($1.isNumber ? 1 : 0) }
+                if cardDigitRange.contains(windowDigits), luhnValid(windowText) {
+                    spans.append(PIISpan(kind: .card, range: span, matched: windowText))
+                    for c in i...k { consumed[c] = true }
+                    i = k + 1
+                    matched = true
+                    break
+                }
+                k -= 1
+            }
+            if !matched { i += 1 }
+        }
+
+        // Whatever no card window claimed is classified on its own, exactly as
+        // before — this is what still turns "5551234567 5559876543" into two phones.
+        for (idx, g) in groups.enumerated() where !consumed[idx] {
+            let subToken = String(g.text)
+            if let kind = numberBand(subToken, digitsOf(g.text)) {
+                spans.append(PIISpan(kind: kind, range: g.range, matched: subToken))
             }
         }
+        // The regroup can emit ahead of a leftover atom, so restore source order —
+        // `Redaction.compose` splices spans in sequence and would corrupt otherwise.
+        spans.sort { $0.range.lowerBound < $1.range.lowerBound }
     }
 
     // -- Luhn -----------------------------------------------------------------
