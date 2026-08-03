@@ -247,6 +247,28 @@ pub fn parse_vision_controls(readout: &Value, max: usize) -> Vec<NarratableEleme
 
 /// Parse a `{"x":..,"y":..}` center into an integer point, or None. Accepts
 /// integer or floating JSON numbers (rounded). PURE.
+///
+/// THIS IS NOT A CLICK TARGET, AND THE UNITS ARE WHY.
+///
+/// What arrives here is the Vision app's `ScreenReadout.Block.center`, derived
+/// from `VNRecognizedTextObservation.boundingBox` — which is NORMALIZED (0..1)
+/// with origin BOTTOM-LEFT. The Swift side says so in as many words: "The
+/// block's center in Vision coords (origin bottom-left). A 'where', purely for
+/// describing/locating — NOT a click target."
+///
+/// So the rounding below turns a real element position into 0 or 1. A button at
+/// 72% across and 55% up the screen becomes the point (1, 1).
+///
+/// That is currently harmless ONLY because `ui_screen_bounds()` reports 0x0, so
+/// `ScreenBounds::contains` refuses every click. The dead `ui_actuate` click path
+/// is therefore FAIL-SAFE, and the two facts are coupled: giving
+/// `ui_screen_bounds()` real display geometry WITHOUT first converting these
+/// coordinates to screen points (top-left origin, denormalized against the
+/// captured display) would not fix clicking — it would make every "click the Send
+/// button" land on pixel (1, 1), the top-left corner of the main display, where
+/// macOS keeps the Apple menu and a window's close button.
+///
+/// `a_normalized_vision_center_is_not_a_clickable_point` pins that coupling.
 fn parse_center(center: Option<&Value>) -> Option<(i32, i32)> {
     let c = center?;
     let x = c.get("x").and_then(Value::as_f64)?;
@@ -800,6 +822,57 @@ pub fn resolved_action_frame(
 
 #[cfg(test)]
 mod tests {
+
+    /// THE CLICK PIPELINE IS NOT WIRED, AND THIS PINS WHY — so that nobody
+    /// "fixes" the dead `ui_actuate` click by giving `ui_screen_bounds()` real
+    /// display geometry and thereby ships something worse.
+    ///
+    /// `ui_actuate`'s click has never worked: `ui_screen_bounds()` returns 0x0, so
+    /// `ScreenBounds::contains` refuses every coordinate. It is tempting to read
+    /// that as "one missing FFI call". It is not. The coordinates flowing into it
+    /// from the Lumen voice path are NORMALIZED Vision coords with origin
+    /// bottom-left, and `parse_center` rounds them to an integer — so a real
+    /// element anywhere on screen arrives as (0,0) or (1,1).
+    ///
+    /// Fixing ONLY the bounds converts a refused click into a click on the
+    /// top-left corner of the main display. Both halves have to land together:
+    /// the Vision app must emit a screen-point target (top-left origin,
+    /// denormalized against the captured display), and only then can the bounds
+    /// be real.
+    #[test]
+    fn a_normalized_vision_center_is_not_a_clickable_point() {
+        // A control at 72% across, 55% up — the shape VNRecognizedTextObservation
+        // actually produces (normalized 0..1, origin bottom-left).
+        let center = json!({"x": 0.72 + 0.10 / 2.0, "y": 0.55 + 0.04 / 2.0});
+        let point = parse_center(Some(&center)).expect("a center parses");
+        assert_eq!(
+            point,
+            (1, 1),
+            "a normalized center collapses to a corner pixel; if this now yields a \
+             real screen point, the Vision app has started emitting click targets — \
+             at which point ui_screen_bounds() may finally be given real geometry"
+        );
+
+        // ...and the whole lower-left quadrant collapses to the ORIGIN, which is
+        // the same pixel a refused click would have used. Nothing about this point
+        // identifies the element the user named.
+        for (x, y) in [(0.10, 0.10), (0.30, 0.40), (0.49, 0.49)] {
+            assert_eq!(
+                parse_center(Some(&json!({"x": x, "y": y}))),
+                Some((0, 0)),
+                "({x}, {y}) must collapse to the origin"
+            );
+        }
+
+        // The guard that makes the above harmless today. If this stops being 0x0
+        // while the coordinates above are still normalized, clicks start landing in
+        // the corner of the screen.
+        let bounds = crate::ui_automation::ScreenBounds { width: 0, height: 0 };
+        assert!(
+            !bounds.contains_for_test(1, 1),
+            "the 0x0 fallback is what makes an un-denormalized coordinate safe"
+        );
+    }
     use super::*;
 
     // The continuous-narration gate is a process-global; the few tests that flip
