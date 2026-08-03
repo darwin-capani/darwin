@@ -5374,6 +5374,724 @@ fn mentions_vision(lower: &str) -> bool {
         || lower.contains("the screen feed")
 }
 
+// ===========================================================================
+// VISION INTENT GATES — the locks the app NOUN always had and the app's VERBS
+// never did.
+//
+// WHAT WENT WRONG: `mentions_vision` above is careful ("television"/"revision"
+// can never launch Vision, because `contains_word` demands a whole token), but
+// every branch below it matched its VERB with a bare `contains()`. We replayed
+// 1,897 ordinary sentences (health, weather, cooking, travel, work, chat) that
+// name no app at all through `vision_command`: 46 of them became Vision ops, and
+// 39 of those TURNED THE CAMERA ON — "is there a tornado watch in effect", "I
+// want to watch the sunset from the porch", "we should watch for black ice on
+// the way up", "my watch says I've been standing in this kitchen for three
+// hours". Opening a camera because somebody asked about the weather is a privacy
+// incident, not a misroute.
+//
+// Three failures stacked:
+//   1. SUBSTRINGS. "end" hides in sp-END-ing, "read" in alREADy, "scan" in
+//      SCANdal, "form" in perFORMance, "on" in wr-ON-g, "locate" in reLOCATEd.
+//   2. NO OBJECT. "watch" is one of the commonest verbs in English and also the
+//      noun for the thing on your wrist. The verb alone says nothing; WHAT the
+//      user is watching is the whole signal.
+//   3. A CAMERA DEFAULT. Three separate branches ended in "…otherwise, the
+//      camera" — so an unrecognized object did not fall through, it opened a
+//      lens.
+//
+// The helpers below are the shared locks: whole-word tokens (via
+// `crate::utterance`), the verb in COMMAND position, and the verb's DIRECT
+// OBJECT. Their callers then NAME a source instead of defaulting to one.
+// ===========================================================================
+
+/// Tokens that may legally sit BEFORE a spoken command's verb: an address, a
+/// politeness, a modal request frame ("can you …", "i need you to …"), an aspect
+/// verb ("keep watching", "start watching"), and the fragments an apostrophe
+/// leaves behind once the utterance is split on non-alphanumerics ("i'd" -> "i"
+/// + "d").
+///
+/// WHAT WENT WRONG: a bare `contains("read")` cannot tell a COMMAND from a
+/// NARRATION. "already read the whiteboard notes" and "she read this to the
+/// kids" are both past-tense reports about a human reading something, and both
+/// used to open the camera / capture the screen. A command puts its verb first,
+/// behind nothing but this frame; a narration puts a subject or an adverb there.
+/// This is the same discipline `lumen_is_act` already applies to "tap" (which
+/// counts only as the LEADING imperative, so "is the tap water safe" is inert).
+const VISION_COMMAND_FRAME: &[&str] = &[
+    "darwin", "hey", "ok", "okay", "please", "and", "then", "now", "just", "go",
+    "ahead", "also", "alright", "yes", "yeah", "sure", "could", "can", "will",
+    "would", "should", "you", "i", "we", "let", "lets", "us", "me", "my", "to",
+    "want", "wants", "need", "needs", "like", "try", "help", "gonna", "going",
+    "keep", "keeps", "keeping", "start", "starts", "continue",
+    // The PHRASAL continuation verbs. "resume"/"begin" were added and these were
+    // missed, so "go back to watching the driveway" and "carry on watching the
+    // front door" — the two most ordinary ways to say it — were refused.
+    "get", "gets", "carry", "back", "on",
+    // The rest of the ASPECT verbs ("resume watching the front door", "begin
+    // watching the driveway") — "keep"/"start"/"continue" were here and their
+    // synonyms were not — and the DISCOURSE MARKERS and manner adverbs a spoken
+    // command actually opens with. WHAT WENT WRONG: "quickly scan this receipt",
+    // "first, read this", "actually, read this to me", "maybe scan the receipt"
+    // and "excuse me, read this" were all refused, because the frame admitted
+    // "please" but nothing else a person says before getting to the verb. These
+    // only ever PERMIT a verb to be read as a command; the verb's own object still
+    // has to name a Vision target, so none of them can trigger anything alone.
+    "resume", "resumes", "begin", "begins", "quickly", "quick", "first",
+    "actually", "maybe", "right", "excuse", "simply", "kindly",
+    "m", "s", "t", "d", "ll", "re", "ve",
+    // …and the APOSTROPHE-FREE spellings of the same contractions. WHAT WENT
+    // WRONG: dictation writes "im"/"id"/"ill"/"ive" as ONE token, so while
+    // "i'm going to need you to watch the front door" passed (as the fragments
+    // "i" + "m"), the identical sentence without the apostrophe was refused. These
+    // four are the exact twins of "m"/"d"/"ll"/"ve" above and carry no new
+    // meaning. The "re" twins ("were"/"youre"/"theyre") are deliberately NOT
+    // here: "were" is also the past tense of "be", which already sits in
+    // VISION_OBJECT_CLOSERS as a phrase boundary, and no command needs it.
+    "im", "id", "ill", "ive",
+];
+
+/// The frame tokens that make what follows a REQUEST rather than a report.
+const VISION_REQUEST_MODALS: &[&str] = &[
+    "could", "can", "will", "would", "should", "please", "want", "wants", "need",
+    "needs", "like", "let", "lets", "try", "help", "gonna", "going", "d", "ll",
+    "darwin", "hey", "ok", "okay", "keep", "keeps", "keeping", "start", "starts",
+    "continue",
+];
+
+/// Bare subject pronouns. English spells the PAST tense of "read" and "set"
+/// exactly like the imperative, so "we read the whiteboard notes" and "i set the
+/// sensitivity myself last week" are indistinguishable from a command by the
+/// verb alone — but a subject sitting directly in front of the verb, with no
+/// modal ahead of it, is the tell. "can YOU read my screen" keeps working
+/// because the modal came first; "WE read the whiteboard" does not.
+const VISION_BARE_SUBJECTS: &[&str] = &["i", "we", "you"];
+
+/// Whether the FIRST content token of `lower` is one of `verbs` — i.e. the verb
+/// is in COMMAND position, preceded by nothing but [`VISION_COMMAND_FRAME`], and
+/// not sitting behind a bare subject (see [`VISION_BARE_SUBJECTS`]). Whole-word
+/// by construction (the split is the same alnum-boundary rule
+/// `crate::utterance::mentions_word` uses), so "proofread this" is not a "read"
+/// and "already read …" is not a command. Single pass, no allocation — an
+/// oversize junk utterance must stay cheap.
+fn vision_verb_in_command_position(lower: &str, verbs: &[&str]) -> bool {
+    let mut modal_seen = false;
+    let mut prev_was_subject = false;
+    for w in lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
+        if verbs.contains(&w) {
+            return !prev_was_subject || modal_seen;
+        }
+        if !VISION_COMMAND_FRAME.contains(&w) {
+            return false;
+        }
+        if VISION_REQUEST_MODALS.contains(&w) {
+            modal_seen = true;
+        }
+        prev_was_subject = VISION_BARE_SUBJECTS.contains(&w);
+    }
+    false
+}
+
+/// Tokens that END the direct object of a Vision verb: prepositions, conjunctions,
+/// subordinators, pronouns and auxiliaries all start a NEW phrase, so whatever
+/// follows them is no longer what the user asked us to watch/scan. This is what
+/// separates "watch the door" from "watch the sunset FROM the porch" and "watch
+/// the front desk ON tuesdays".
+///
+/// "that" is deliberately NOT here: it is a DETERMINER far more often than a
+/// subordinator in this position ("watch that door", "scan that receipt"), and
+/// listing it in both places made the object scan stop before it ever saw a head.
+const VISION_OBJECT_CLOSERS: &[&str] = &[
+    "for", "while", "when", "until", "till", "in", "on", "at", "from", "to",
+    "with", "without", "about", "over", "under", "into", "onto", "after",
+    "before", "during", "through", "around", "near", "by", "and", "or", "but",
+    "so", "if", "because", "than", "i", "we", "he", "she", "they", "it", "you",
+    "there", "is", "was", "were", "are", "am", "be", "been", "says", "said",
+    "will", "can", "could", "would", "should", "do", "does", "did", "has",
+    "have", "had", "out", "up", "down", "off", "all", "again", "tonight", "today",
+    "tomorrow", "yesterday", "instead", "too", "together",
+];
+
+/// Determiners/possessives introduce the object; they are never its head.
+const VISION_OBJECT_DETERMINERS: &[&str] = &[
+    "the", "a", "an", "my", "our", "your", "this", "that", "these", "those",
+    "his", "her", "their", "its", "any", "some", "every", "each", "both",
+];
+
+/// Generic MEDIUM nouns and post-object ADVERBS that trail a real target without
+/// changing it: "watch the camera feed" is still the camera and "watch the door
+/// closely" is still the door. Skipped so the head stays the subject. Note how
+/// narrowly this differs from ordinary speech — "feed" is here, "fee" is not,
+/// which is exactly why "watch the entrance fee, it went up" must not fire.
+const VISION_OBJECT_TAILS: &[&str] = &[
+    "feed", "feeds", "stream", "streams", "view", "now", "right", "here",
+    "please", "closely", "carefully", "quickly", "quick", "real", "continuously",
+    "constantly", "intently", "live", "later", "awhile",
+    // A DEGREE/MEASURE word trailing the head names the same thing: "set the
+    // sensitivity LEVEL to high" is the sensitivity and "set the sensitivity
+    // HIGHER" is the sensitivity. Without these the head read as "level" /
+    // "higher" and the config write — the one command in this whole seam the user
+    // has to repeat until it works — silently stopped happening.
+    "level", "levels", "higher", "lower",
+    // …and the VALUE itself when it trails the head: "set motion sensitivity
+    // HIGH" and "set sensitivity HIGH please" read their head as "high" and
+    // stopped writing. This cannot open the value up to anything new — the head
+    // must still be "sensitivity", so "set a HIGH sensitivity ALARM at the shop"
+    // (head "alarm") stays refused.
+    "high", "low", "medium", "max",
+];
+
+/// The verbs that can SET the motion sensitivity — a MUTATION of the app's
+/// config, so the branch below reads this verb's own object rather than trusting
+/// that the word "sensitivity" appeared somewhere in the sentence.
+const VISION_SENSITIVITY_VERBS: &[&str] = &[
+    "set", "sets", "turn", "turns", "adjust", "adjusts", "change", "changes",
+    "raise", "lower", "increase", "decrease", "put", "make",
+];
+
+/// The HEAD of the noun phrase that is the DIRECT OBJECT of the first `verbs`
+/// token in `lower`, together with the token immediately in front of it (the
+/// compound-noun modifier, `None` when only a determiner precedes it). `None`
+/// when the verb has no object at all.
+///
+/// WHAT WENT WRONG: the watch/scan branches fired on the VERB and ignored what
+/// followed it, so "watch out for the strike", "watch a movie with my sister",
+/// "watch the earnings call" and "scan the performance report" were all
+/// commands. Reading the head is what tells "watch the door" (a target) from
+/// "watch the front DESK" and "watch the front ROW" (not targets) — a fixed-size
+/// keyword WINDOW cannot, because it sees "front" in all three. The scan stops
+/// at the first closer and after six tokens (a spoken direct object is short),
+/// so this stays a single cheap pass over an oversize utterance.
+///
+/// "of" does not merely CLOSE the object, it REJECTS it: a partitive/possessive
+/// head belongs to whatever follows, so "watch the entrance OF the movie", "the
+/// hall OF fame game" and "the front OF the house" name no Vision target even
+/// though "entrance"/"front" would pass on their own.
+fn vision_object_head<'a>(lower: &'a str, verbs: &[&str]) -> Option<(&'a str, Option<&'a str>)> {
+    let mut it = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty());
+    loop {
+        match it.next() {
+            Some(w) if verbs.contains(&w) => break,
+            Some(_) => continue,
+            None => return None,
+        }
+    }
+    let mut head: Option<&str> = None;
+    let mut modifier: Option<&str> = None;
+    let mut seen = 0usize;
+    // A leading quantifier is part of the determiner, not a closer. "all" sits in
+    // VISION_OBJECT_CLOSERS (it closes an object elsewhere), so "watch all the
+    // doors" broke the scan before any head was seen. Skipping ONE leading "all"
+    // also has to permit the partitive that follows it — "watch all OF the doors"
+    // — which the `of` guard below would otherwise refuse.
+    let mut it = it.peekable();
+    let mut allow_one_of = false;
+    if it.peek() == Some(&"all") {
+        it.next();
+        allow_one_of = true;
+    }
+    for w in it {
+        if w == "of" {
+            if allow_one_of {
+                allow_one_of = false;
+                continue;
+            }
+            return None;
+        }
+        // A POSSESSIVE OWNER IS NOT A MODIFIER. "baby's room" tokenizes to
+        // baby / s / room, and the bare "s" took the modifier slot, so every
+        // "watch the baby's room" / "watch my son's room" was refused — the
+        // apostrophe-fragment class that was fixed on the frame side (im/id/ive)
+        // and missed here. The owner constrains nothing about the target, so the
+        // slot is cleared rather than filled.
+        if w == "s" {
+            // Clear the HEAD as well as the modifier. Clearing only the modifier
+            // leaves the owner sitting in `head`, and the next word shifts it INTO
+            // the modifier slot — so "watch the baby's room" passed (because
+            // "baby" happens to be a target word) while "watch my son's room" and
+            // "watch the neighbor's driveway" were still refused on "son" and
+            // "neighbor". The owner is not part of the target description at all.
+            head = None;
+            modifier = None;
+            continue;
+        }
+        if VISION_OBJECT_CLOSERS.contains(&w) {
+            break;
+        }
+        seen += 1;
+        if seen > 6 {
+            break;
+        }
+        if VISION_OBJECT_DETERMINERS.contains(&w) || VISION_OBJECT_TAILS.contains(&w) {
+            continue;
+        }
+        modifier = head;
+        head = Some(w);
+    }
+    head.map(|h| (h, modifier))
+}
+
+/// Which SOURCE a "watch …" utterance NAMES — `"screen"`, `"camera"`, or None
+/// when it names no Vision target, in which case it is not a Vision command at
+/// all and the turn falls through to normal routing.
+///
+/// WHAT WENT WRONG: this branch used to be `contains("watch")` and then
+/// `else { "camera" }` — anything not about a screen opened the lens. Across
+/// 1,897 ordinary sentences that default started 39 camera watches. The verb
+/// alone is worthless: "watch" is a wristwatch ("my watch band broke"), a
+/// weather alert ("a winter storm watch for the county"), an entertainment verb
+/// ("watch a movie with my sister"), an attention verb ("watch for black ice")
+/// and a cooking verb ("watch the milk so it doesn't boil over"). So the source
+/// must now be NAMED, as the HEAD of the verb's own direct object, with the verb
+/// itself in command position — there is no default left to fall into.
+///
+/// The camera list stays SHORT on purpose: a word earns its place only if
+/// "watch the <target>", said to DARWIN, can only mean a lens. "hall", "gate",
+/// "front", "office" and "yard" were tried and REMOVED — "watch the hall of fame
+/// game", "watch the gate for our flight number", "watch the front of the house"
+/// and "watch the office for me" are ordinary English, and a list that holds
+/// them opens a camera on all four.
+///
+/// The MODIFIER check is the compound-noun lock: a target noun with a foreign
+/// noun glued in front of it is a different object. "watch the front door" and
+/// "watch the nursery camera" are camera watches; "watch the OVEN door", "watch
+/// the CAR door" and "watch the BABY monitor" are not, and only the word in
+/// front of the head can tell them apart.
+///
+/// A screen word ANYWHERE still wins for a camera-headed object — that is the
+/// old predicate, kept verbatim, so this branch can only ever move a turn AWAY
+/// from the camera, never toward it.
+fn watch_start_source(lower: &str) -> Option<&'static str> {
+    const WATCH_VERBS: &[&str] = &["watch", "watching"];
+    // The user's OWN display.
+    const SCREEN_TARGETS: &[&str] =
+        &["screen", "screens", "display", "displays", "monitor", "monitors"];
+    // The camera itself, and the places a camera watch covers.
+    const CAMERA_TARGETS: &[&str] = &[
+        "camera", "cameras", "webcam", "webcams", "door", "doors", "doorway",
+        "doorways", "doorstep", "entrance", "entrances", "entryway", "hallway",
+        "room", "rooms", "driveway", "driveways", "porch", "backyard", "garage",
+        "crib", "nursery", "baby",
+        // "cam" names a lens exactly as "camera" does. It used to sit in
+        // VISION_OBJECT_TAILS, where it was SKIPPED — so "watch the doorbell cam"
+        // read its head as "doorbell" and was refused while "watch the doorbell
+        // camera" worked.
+        "cam", "cams",
+    ];
+    // Words that may sit between the determiner and the head WITHOUT making it a
+    // different thing — locations, directions, and the camera's own kinds; never
+    // foreign objects.
+    const TARGET_MODIFIERS: &[&str] = &[
+        "front", "back", "rear", "side", "main", "second", "other", "spare",
+        "upstairs", "downstairs", "outside", "outdoor", "indoor", "basement",
+        "patio", "garden", "kitchen", "living", "dining", "guest", "security",
+        "entry", "sliding", "laundry", "utility", "hall", "corner", "new", "old",
+        "doorbell", "video", "wifi", "ip",
+        // ROOM KINDS and CAMERA BRANDS. Without these "watch the kitchen door"
+        // worked and "watch the bedroom door" did not — the same command, refused
+        // on which room the user happens to have.
+        "bedroom", "bathroom", "office", "closet", "apartment", "lobby", "shed",
+        "balcony", "deck", "gate", "kids", "kid", "ring", "nest",
+        // Plain ADJECTIVES of size / material / position. WHAT WENT WRONG: only
+        // the ONE token in front of the head is read, so in "watch the sliding
+        // GLASS door" and "watch my EXTERNAL monitor" an adjective sat in the
+        // modifier slot and locked out its own noun — both went to None while the
+        // old code watched both. An adjective does not make a door a different
+        // OBJECT the way "oven", "car" and "baby" do, and stopping those compounds
+        // is the only thing this lock is for. The head still has to be a target,
+        // so these can never introduce one on their own.
+        "glass", "wooden", "metal", "double", "big", "small", "little", "whole",
+        "entire", "external", "primary", "left", "right",
+        // Door kinds and display ordinals from the same probe: "watch the STORM
+        // door", "watch the FRENCH doors", "watch the THIRD monitor", "watch my
+        // LAPTOP screen".
+        "storm", "french", "third", "fourth", "laptop", "desktop",
+    ];
+    if !vision_verb_in_command_position(lower, WATCH_VERBS) {
+        return None;
+    }
+    // The OLD source predicate, unchanged, used only to keep a camera-headed
+    // object on the SCREEN when the utterance also names one ("watch the door on
+    // my screen"). Deliberately the substring form: it must not be narrower than
+    // what it replaces, or this could open a camera the old code did not.
+    let names_a_screen =
+        lower.contains("screen") || lower.contains("display") || lower.contains("monitor");
+    // "watch what's on the screen": the object is a free relative clause whose
+    // head sits inside the embedded "on <screen>" phrase, so the head walk below
+    // cannot see it. Only the SCREEN source is reachable this way — a free
+    // relative never names a camera — so this arm cannot activate a lens.
+    if lower.contains("watch what") && asks_what_is_on_screen(lower) {
+        return Some("screen");
+    }
+    let (head, modifier) = vision_object_head(lower, WATCH_VERBS)?;
+    // The modifier has to belong to the HEAD'S OWN family. Sharing one list across
+    // both families is what let "watch the BABY monitor" through: "baby" is a
+    // legitimate camera target, "monitor" a legitimate screen target, and the
+    // compound is neither.
+    let modifier_fits = |family: &[&str]| {
+        modifier.is_none_or(|m| TARGET_MODIFIERS.contains(&m) || family.contains(&m))
+    };
+    if SCREEN_TARGETS.contains(&head) {
+        return modifier_fits(SCREEN_TARGETS).then_some("screen");
+    }
+    if CAMERA_TARGETS.contains(&head) && modifier_fits(CAMERA_TARGETS) {
+        return Some(if names_a_screen { "screen" } else { "camera" });
+    }
+    None
+}
+
+/// Whether `lower` asks us to STOP an existing watch: a stop verb whose OBJECT
+/// is the watch ("stop watching", "end the watch", "stop the camera watch").
+///
+/// WHAT WENT WRONG: the old test was `contains("watch")` AND any of
+/// `contains("stop"|"end"|"quit"|"cancel")` — five substring tests, no whole-word
+/// rule, no order, no adjacency. "I need to watch my spending this month" matched
+/// because "end" hides inside sp-END-ing; "my watch stopped syncing with my
+/// phone" and "my grandfather's old pocket watch stopped working" matched because
+/// the thing on your wrist is also a "watch" and "stopped" contains "stop".
+/// Nobody in any of those sentences asked DARWIN to stop anything.
+///
+/// The shape that separates them is ORDER: a real stop names the watch AFTER the
+/// stop verb ("stop watching the door"), while a wristwatch sentence puts the
+/// watch FIRST ("watch stopped"). Only determiners and Vision's own nouns may sit
+/// between the two, and at most three of them.
+fn watch_stop_targets_the_watch(lower: &str) -> bool {
+    // "kill"/"halt" are the two other things people say to a running watch. They
+    // are worth listing because of what the OLD code did with them: "kill the
+    // watch" and "halt the watch" carry no stop SUBSTRING, so they fell past the
+    // stop branch into the start branch and TURNED THE CAMERA ON — the user asked
+    // to end a watch and got a lens. They still have to take the watch as their
+    // object, exactly like the other four.
+    const STOP_VERBS: &[&str] = &["stop", "end", "quit", "cancel", "kill", "halt"];
+    const FILLERS: &[&str] = &[
+        "the", "this", "that", "my", "our", "your", "a", "an", "it", "all", "any",
+        "vision", "camera", "cameras", "screen", "door", "room", "video", "live",
+    ];
+    // What "stop WATCHING <x>" may legally take as its object: nothing at all, a
+    // trailing adverb, or one of Vision's own targets behind determiners and
+    // location modifiers. Anything else is somebody describing their own viewing
+    // habits — "i need to stop watching so much tv", "stop watching the news",
+    // "you should stop watching that show". None of them asked DARWIN for
+    // anything, and all three used to stop a running watch.
+    const OBJECTS: &[&str] = &[
+        "watch", "watching", "camera", "cameras", "webcam", "webcams", "screen",
+        "screens", "display", "displays", "monitor", "monitors", "door", "doors",
+        "doorway", "doorways", "doorstep", "entrance", "entrances", "entryway",
+        "hallway", "room", "rooms", "driveway", "driveways", "porch", "backyard",
+        "garage", "crib", "nursery", "baby", "vision", "everything", "feed", "feeds",
+        // "back YARD" as two tokens. The START branch deliberately does NOT take
+        // "yard" as a camera target — "watch the yard sale" must not open a lens —
+        // but STOPPING a watch is not a device activation, and refusing to stop
+        // the watch the user just started is the worse failure of the two.
+        "yard", "yards",
+    ];
+    // Tokens that may sit between "watching" and its target without being the
+    // target: determiners, pro-forms, and the same location modifiers the START
+    // branch accepts ("stop watching the FRONT door").
+    const NEUTRAL: &[&str] = &[
+        "the", "this", "that", "my", "our", "your", "a", "an", "his", "her", "its",
+        "their", "it", "them", "all", "any", "front", "back", "rear", "side",
+        "main", "second", "other", "spare", "upstairs", "downstairs", "outside",
+        "outdoor", "indoor", "basement", "patio", "garden", "kitchen", "living",
+        "dining", "guest", "security", "entry", "sliding", "hall", "doorbell",
+        "video", "live", "new", "old",
+    ];
+    // Adverbs and connectives that END the request ("stop watching now").
+    const CLOSERS: &[&str] =
+        &["now", "please", "again", "ok", "okay", "darwin", "for", "and", "then", "already"];
+    // The stop verb has to be the utterance's own leading imperative. Without
+    // that, "START the STOP WATCH" armed on its middle word and stopped a
+    // running watch.
+    if !vision_verb_in_command_position(lower, STOP_VERBS) {
+        return false;
+    }
+    let mut it = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .peekable();
+    let mut armed = false;
+    let mut gap = 0usize;
+    while let Some(w) = it.next() {
+        if STOP_VERBS.contains(&w) {
+            armed = true;
+            gap = 0;
+            continue;
+        }
+        // "stop the watch" / "end the watch" — the watch as a NOUN, which then has
+        // to END the request: "end the WATCH PARTY at nine" is somebody's evening.
+        if armed && w == "watch" {
+            if it.peek().is_none_or(|n| CLOSERS.contains(n)) {
+                return true;
+            }
+            armed = false;
+            continue;
+        }
+        // "stop watching …" — the watch as a VERB, so read its object.
+        if armed && w == "watching" {
+            let mut seen = 0usize;
+            loop {
+                match it.next() {
+                    // Nothing (more) followed: a bare "stop watching".
+                    None => return true,
+                    Some(n) if OBJECTS.contains(&n) || CLOSERS.contains(&n) => return true,
+                    Some(n) if NEUTRAL.contains(&n) => {
+                        seen += 1;
+                        if seen > 4 {
+                            break;
+                        }
+                    }
+                    // A foreign object ("… so much tv", "… the news"): not our watch.
+                    Some(_) => break,
+                }
+            }
+            armed = false;
+            continue;
+        }
+        if armed && gap < 3 && FILLERS.contains(&w) {
+            gap += 1;
+            continue;
+        }
+        armed = false;
+    }
+    false
+}
+
+/// Whether `lower` is a "what is ON (my|the) SCREEN" question — the OCR read's
+/// question form.
+///
+/// WHAT WENT WRONG: the old arm was `contains("what") && contains("on") &&
+/// (contains("screen") || contains("display"))`, three substrings that ordinary
+/// English satisfies by accident: "on" hides in wr-ON-g, d-ON't, g-ON-e, and
+/// "what's wrong with my screen", "i don't know what to do about my cracked
+/// screen" and "what's going on with my display at work" all captured the user's
+/// screen. Worse, `is_screen_read` then flagged them TRANSIENT, so DARWIN
+/// neither answered them nor learned from them.
+///
+/// The fix is structural, not just whole-word: "on" must be the preposition that
+/// governs the screen noun, with at most one determiner between them. That also
+/// settles the one genuine idiom — "what was ON DISPLAY at the museum" is an
+/// exhibition, "what's on THE display" is a screen — so a bare "on display"
+/// needs its determiner while the fixed collocation "on screen" does not. The
+/// glued "onscreen"/"fullscreen" are listed because the old `contains("screen")`
+/// matched them and real speech uses them.
+fn asks_what_is_on_screen(lower: &str) -> bool {
+    const DETS: &[&str] = &["the", "my", "our", "your", "this", "that", "a"];
+    // ONE adjective may sit between the determiner and the screen noun. WHAT WENT
+    // WRONG: "what's on my SECOND screen" walked det -> "second" -> fell out of
+    // the on-run before it ever reached "screen". This is the same
+    // adjective-between-determiner-and-noun shape the watch branch had.
+    const SCREEN_ADJS: &[&str] = &[
+        "second", "third", "other", "main", "external", "laptop", "big", "left",
+        "right", "primary", "whole", "entire",
+    ];
+    // WHAT WENT WRONG, in the first cut of THIS function: the guard was
+    // `mentions_word(lower, "what")`, and "whats" is a SINGLE alphanumeric token
+    // — dictation drops the apostrophe, so the canonical screen read arrives as
+    // "whats on my screen" and the whole arm went dark, where the old
+    // `contains("what")` had matched. Eight real phrasings died silently
+    // ("whats on my screen", "tell me whats on the screen", "whats displayed on
+    // the screen", …) and nothing downstream caught them: `lumen_is_read` tests
+    // "what's on"/"what is on" only, and `describe_command` needs a describe verb.
+    // The whole-word rule is right; the word list was one spelling short.
+    if !crate::utterance::mentions_any_word(lower, &["what", "whats"]) {
+        return false;
+    }
+    let mut it = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|x| !x.is_empty())
+        .peekable();
+    let mut in_on_run = false;
+    let mut saw_det = false;
+    let mut saw_adj = false;
+    while let Some(w) = it.next() {
+        if w == "onscreen" || w == "fullscreen" {
+            return true;
+        }
+        if w == "on" {
+            in_on_run = true;
+            saw_det = false;
+            saw_adj = false;
+            continue;
+        }
+        if !in_on_run {
+            continue;
+        }
+        if !saw_det && DETS.contains(&w) {
+            saw_det = true;
+            continue;
+        }
+        if !saw_adj && SCREEN_ADJS.contains(&w) {
+            saw_adj = true;
+            continue;
+        }
+        if w == "screen" || w == "screens" || (saw_det && (w == "display" || w == "displays")) {
+            // The screen word has to END its phrase. A noun glued after it names
+            // something else entirely — "what is on the display CASE at the
+            // bakery", "what's on my screen PROTECTOR", "what's on the screen
+            // DOOR" — and all three used to capture the screen.
+            match it.peek() {
+                None => return true,
+                Some(n)
+                    if VISION_OBJECT_CLOSERS.contains(n)
+                        || VISION_OBJECT_TAILS.contains(n)
+                        || *n == "that" =>
+                {
+                    return true
+                }
+                _ => {}
+            }
+        }
+        in_on_run = false;
+        saw_det = false;
+        saw_adj = false;
+    }
+    false
+}
+
+/// Whether `lower` is the bare hands-free "read this / read that" — the most
+/// common "read what's in front of me".
+///
+/// WHAT WENT WRONG: the old arms were `contains("read this")` and
+/// `contains("read that")`, which is a two-word substring and therefore fires
+/// inside "proofREAD THIS for me before I turn it in", and fires on every
+/// past-tense sentence that happens to contain the pair: "i read this book last
+/// night and loved it", "did you read that email i forwarded you", "she read
+/// this to the kids", "can you read that back to me". Each one captured the
+/// user's screen through TCC and was then flagged TRANSIENT, so DARWIN answered
+/// none of them and remembered none of them.
+///
+/// Two locks, both structural: the read verb must be in COMMAND position (which
+/// kills "proofread"/"already read"/"she read"/"i read"), and the this/that must
+/// be the END of the request — nothing after it, or a directional tail ("read
+/// this for me", "read that out", "read this to me"). An OBJECT after it ("read
+/// this BOOK", "read that EMAIL", "read this MORNING") means the user is talking
+/// about something else entirely.
+fn reads_this_or_that(lower: &str) -> bool {
+    if !vision_verb_in_command_position(lower, &["read"]) {
+        return false;
+    }
+    const OK_TAIL: &[&str] = &["for", "out", "aloud", "please", "now", "again", "back"];
+    let mut it = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty());
+    for w in it.by_ref() {
+        if w == "read" {
+            break;
+        }
+    }
+    match it.next() {
+        Some("this") | Some("that") => {}
+        _ => return false,
+    }
+    match it.next() {
+        None => true,
+        Some(w) if OK_TAIL.contains(&w) => true,
+        // "read this to me"/"to us" is the request; "read this to the kids" is not.
+        Some("to") => matches!(it.next(), Some("me") | Some("us")),
+        _ => false,
+    }
+}
+
+/// The on-screen CONTROL kinds a "where is / find / locate" request can name.
+/// These are the only things Vision's structured OCR blocks can be matched
+/// against; anything else the user is looking for is not on their screen.
+const VISION_CONTROL_NOUNS: &[&str] = &[
+    "button", "buttons", "icon", "icons", "field", "fields", "control", "controls",
+    "link", "links", "tab", "tabs", "menu", "menus", "checkbox", "checkboxes",
+    "toggle", "toggles", "dropdown", "dropdowns", "bar", "bars", "box", "boxes",
+    "slider", "sliders", "panel", "panels", "pane", "scrollbar", "scrollbars",
+    "arrow", "window", "windows", "dialog", "dialogs", "textbox", "switch",
+    "option", "options", "setting", "settings", "gear", "gears",
+];
+
+/// Whether `phrase` — the body of a "where is / where's / find / locate …"
+/// request, with the locate verb and its leading article already stripped — is
+/// asking about something ON THE USER'S SCREEN.
+///
+/// WHAT WENT WRONG, twice, in opposite directions. Requiring NO control at all
+/// made every where-is question in English a screen OCR: "where's my rolling
+/// pin", "where's the coldest place in the world right now" and "where is the
+/// Voyager probe now" all captured the screen, and `is_screen_read` then flagged
+/// them TRANSIENT, so DARWIN answered none of them and remembered none of them.
+/// Then requiring the LAST token of the whole phrase to be a control broke the
+/// canonical locate, because a trailing prepositional phrase moves the head:
+/// "where's the submit button ON MY SCREEN" ended at "screen", not "button", and
+/// emitted no Vision op at all.
+///
+/// So two tests, and both have to pass:
+///
+///   1. THE HEAD, taken before any real prepositional phrase, is a control kind.
+///      What makes a preposition "real" is the noun after it: "sign IN button"
+///      and "log IN field" are control NAMES and must not be split, while
+///      "button ON my screen" starts a new phrase.
+///
+///   2. THE PLACE, when the user named one WITH a determiner, is a screen. "on
+///      THE tv", "on THE router", "on MY headphones" and "on MY shirt" are
+///      physical objects in the room — we cannot locate a control on any of them,
+///      and the query we used to emit for them was garbage. A place named WITHOUT
+///      a determiner is an application ("in Photoshop", "in Chrome"), which is a
+///      UI context rather than an object, so it is left alone.
+fn locate_targets_a_control(phrase: &str) -> bool {
+    const PREPS: &[&str] = &[
+        "on", "in", "at", "of", "under", "over", "above", "below", "near",
+        "inside", "within", "from", "by", "beside", "behind",
+        // "for" was missing, so "where's the CHECKBOX for terms" read its head as
+        // "terms" and located nothing.
+        "for",
+    ];
+    const DETS: &[&str] = &[
+        "the", "my", "our", "your", "this", "that", "these", "those", "a", "an",
+        "his", "her", "its", "their",
+    ];
+    // Adverbs a spoken question trails off with; never the thing asked for.
+    const TAILS: &[&str] =
+        &["now", "please", "again", "right", "exactly", "currently", "here", "today"];
+    // The only PLACE we can look.
+    const SCREENS: &[&str] = &[
+        "screen", "screens", "display", "displays", "monitor", "monitors",
+        "desktop", "page", "pages", "window", "windows", "browser", "tab", "tabs",
+        "dialog", "toolbar", "sidebar", "menu", "panel", "view", "form", "site",
+        "website", "app", "ui",
+    ];
+    let mut it = phrase
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .peekable();
+    let mut head: Option<&str> = None;
+    let mut place: Option<&str> = None;
+    let mut in_place = false;
+    let mut place_has_det = false;
+    while let Some(w) = it.next() {
+        if !in_place && PREPS.contains(&w) {
+            if it.peek().is_some_and(|n| VISION_CONTROL_NOUNS.contains(n)) {
+                continue;
+            }
+            in_place = true;
+            continue;
+        }
+        if in_place {
+            if PREPS.contains(&w) || TAILS.contains(&w) {
+                continue;
+            }
+            if DETS.contains(&w) {
+                place_has_det = true;
+                continue;
+            }
+            place = Some(w);
+            continue;
+        }
+        if TAILS.contains(&w) {
+            continue;
+        }
+        head = Some(w);
+    }
+    if !head.is_some_and(|h| VISION_CONTROL_NOUNS.contains(&h)) {
+        return false;
+    }
+    if place_has_det {
+        return place.is_some_and(|p| SCREENS.contains(&p));
+    }
+    true
+}
+
+
 /// Map a spoken utterance to a Vision command, or None when it is not a Vision
 /// control phrase (the turn falls through to normal routing). Deterministic and
 /// pure so the mapping is unit-tested without a socket, a running app, or the
@@ -5398,32 +6116,29 @@ pub fn vision_command(text: &str) -> Option<VisionCommand> {
 
     // --- watch lifecycle (specific before the broad launch) ----------------
     // STOP first so "stop watching the door" is unambiguous.
-    if (lower.contains("watch") || lower.contains("watching"))
-        && (lower.contains("stop")
-            || lower.contains("end")
-            || lower.contains("quit")
-            || lower.contains("cancel"))
+    if watch_stop_targets_the_watch(&lower)
+        || (mentions_vision(&lower)
+            && crate::utterance::mentions_any_word(&lower, &["watch", "watching"])
+            && vision_verb_in_command_position(&lower, &["stop", "end", "quit", "cancel"]))
     {
         return Some(VisionCommand::Op(op_watch_stop()));
     }
-    // "watch the screen|display|monitor" -> screen; otherwise (door/room/camera/
-    // entrance/the front) the camera. The verb "watch the <X>" is the trigger;
-    // the source is decided by whether a SCREEN word is present.
-    if lower.contains("watch") || lower.contains("watching") {
-        let source = if lower.contains("screen")
-            || lower.contains("display")
-            || lower.contains("monitor")
-        {
-            "screen"
-        } else {
-            "camera"
-        };
+    // START. THE SOURCE IS THE GATE: "watch the screen|display|monitor" -> screen,
+    // "watch the door|room|camera|doorway|driveway|…" -> camera, and anything else
+    // is not a Vision command at all. The verb alone no longer starts anything and
+    // there is NO camera default left to fall into — see `watch_start_source` for
+    // the 39 ordinary sentences that used to open a lens here.
+    if let Some(source) = watch_start_source(&lower) {
         return Some(VisionCommand::Op(op_watch_start(source)));
     }
 
     // --- analyze a video file ----------------------------------------------
     // "analyze this video", "analyze <name>.mp4", "analyze the video clip".
-    if (lower.contains("analyze") || lower.contains("analyse"))
+    // The verb must be WHOLE-WORD and IN COMMAND POSITION. WHAT WENT WRONG:
+    // `contains("analyze")` also fires inside "analyzed"/"analyzes", so "the
+    // doctor analyzed the video of my swallowing" and "our team analyzes the
+    // clip every monday" were both orders to hand a file to the Vision app.
+    if vision_verb_in_command_position(&lower, &["analyze", "analyse"])
         && (lower.contains("video") || lower.contains("clip") || extract_video_path(&lower).is_some())
     {
         // A named file (…/foo.mp4) is forwarded verbatim. A bare "analyze this
@@ -5436,8 +6151,32 @@ pub fn vision_command(text: &str) -> Option<VisionCommand> {
     }
 
     // --- sensitivity -------------------------------------------------------
-    if (lower.contains("sensitivity") || lower.contains("sensitive"))
-        && (lower.contains("set") || lower.contains("to") || lower.contains("at"))
+    // A MUTATION of the app's config, so the set VERB has to be in command
+    // position AND the sensitivity has to be the thing it is setting.
+    //
+    // WHAT WENT WRONG: the old gate accepted ANY utterance containing "sensitiv…"
+    // plus the substring "to" — and `extract_sensitivity` reads a bare
+    // "high"/"low" as a value, so "she is sensitive to high pollen counts" and "i
+    // am sensitive to loud noises" rewrote the motion threshold. Requiring the
+    // verb alone is not enough either: "set a high sensitivity ALARM at the shop"
+    // puts the verb in command position and still means nothing to Vision, which
+    // is why the object HEAD (not the mere presence of the word) is the test.
+    //
+    // AND WHAT WENT WRONG IN THE FIX ITSELF: an earlier cut of this gate DELETED
+    // the old `set|to|at` conjunct and put VISION_SENSITIVITY_VERBS in its place.
+    // That verb list carries raise/lower/increase/decrease — and
+    // `extract_sensitivity` reads "lower" as "low" and returns 0.25 — so the VERB
+    // SUPPLIED ITS OWN VALUE and a bare "lower the sensitivity", "lower the mic
+    // sensitivity", "lower the sensitivity on my hearing aid" became config
+    // WRITES the old code never made. A gate on the ONE state-mutating op in this
+    // seam must not be able to widen. So the value-bearing "set"/"to"/"at" is
+    // required again, now as a WHOLE WORD — strictly narrower than the substring
+    // test it replaces, which is what keeps this branch a subset of the old one.
+    if crate::utterance::mentions_any_word(&lower, &["sensitivity", "sensitive"])
+        && crate::utterance::mentions_any_word(&lower, &["set", "to", "at"])
+        && vision_verb_in_command_position(&lower, VISION_SENSITIVITY_VERBS)
+        && vision_object_head(&lower, VISION_SENSITIVITY_VERBS)
+            .is_some_and(|(head, _)| head == "sensitivity" || head == "sensitive")
     {
         if let Some(value) = extract_sensitivity(&lower) {
             return Some(VisionCommand::Op(op_set_sensitivity(value)));
@@ -5640,16 +6379,36 @@ fn op_scan_document(source: Option<&str>) -> String {
 ///   - "scan this document" / "scan the page" / "scan this receipt"  -> scan.document
 ///     The recognized text is SENSITIVE + TRANSIENT (`is_screen_read` covers these).
 fn handwriting_document_op(lower: &str) -> Option<String> {
-    // SCAN a document/page/receipt with the camera (#29). The verb "scan" plus a
-    // document-ish noun. Checked first so "scan this document" never falls into a
-    // handwriting/OCR read.
-    let names_scan = lower.contains("scan");
-    let mentions_document = lower.contains("document")
-        || lower.contains("page")
-        || lower.contains("receipt")
-        || lower.contains("paper")
-        || lower.contains("invoice")
-        || lower.contains("form");
+    // SCAN a document/page/receipt with the camera (#29). Checked first so "scan
+    // this document" never falls into a handwriting/OCR read.
+    //
+    // WHAT WENT WRONG: this was `contains("scan")` AND a substring document noun,
+    // and this branch runs BEFORE the screen-read seam, so it was the FIRST camera
+    // default in the function. "scan" hides inside SCANdal, "form" inside
+    // perFORMance and "paper" inside PAPERwork, so "there was a scandal about the
+    // paperwork" and "i need to scan the performance report" both opened the
+    // camera. Now the verb must be whole-word AND in command position (a past-tense
+    // "he … scanned the invoice" is a report, not an order), and the document noun
+    // must be the HEAD of the verb's own object — which is what tells "scan the
+    // page" from "scan the qr code on the invoice".
+    const SCAN_VERBS: &[&str] = &["scan", "scanning"];
+    const DOCUMENT_NOUNS: &[&str] = &[
+        "document", "documents", "page", "pages", "receipt", "receipts",
+        "paper", "papers", "invoice", "invoices", "form", "forms",
+    ];
+    let names_scan = vision_verb_in_command_position(lower, SCAN_VERBS);
+    // A PARTITIVE tail says WHICH page, not a different thing: "scan the second
+    // page OF the contract" is still a page scan, and it stopped working.
+    // `vision_object_head` REJECTS a partitive object outright, and on the
+    // camera-WATCH branch it must — there the noun after "of" is the real
+    // referent ("watch the entrance OF the movie"), and letting a camera target
+    // through on the noun BEFORE it is the exact mistake that gate exists to
+    // stop. A scan is the other way round, so this arm — and only this arm —
+    // reads the object up to the partitive. It cannot widen past the old code:
+    // that fired on the bare substrings "scan" + a document noun anywhere.
+    let object_span = lower.split(" of ").next().unwrap_or(lower);
+    let mentions_document = vision_object_head(object_span, SCAN_VERBS)
+        .is_some_and(|(head, _)| DOCUMENT_NOUNS.contains(&head));
     if names_scan && mentions_document {
         // A document is scanned with the camera by default; honor an explicit
         // "on screen" / "on my display" request.
@@ -5668,11 +6427,21 @@ fn handwriting_document_op(lower: &str) -> Option<String> {
         || lower.contains("whiteboard")
         || lower.contains("white board")
         || lower.contains("hand writing");
-    let names_read = lower.contains("read")
-        || lower.contains("transcribe")
+    // The read verb must be WHOLE-WORD and IN COMMAND POSITION.
+    //
+    // WHAT WENT WRONG: `contains("read")` fires inside alREADy, so "i already
+    // erased the whiteboard" opened the camera, and a plain whole-word "read" is
+    // not enough either — "we read the whiteboard notes yesterday" is somebody
+    // REPORTING that they read it, in the past tense English spells exactly like
+    // the imperative. This is the second of the two camera defaults that run
+    // ahead of the screen-read seam.
+    let names_read = vision_verb_in_command_position(
+            lower,
+            &["read", "reread", "transcribe", "transcribing"],
+        )
         // "what does this say" / "what does this handwriting say" / "what does it
         // say" — a "what does … say" question over the handwriting cue is a read.
-        || (lower.contains("what does") && lower.contains("say"))
+        || (lower.contains("what does") && mentions_word(lower, "say"))
         || lower.contains("what's written")
         || lower.contains("whats written");
     if mentions_handwriting && names_read {
@@ -5728,11 +6497,13 @@ fn screen_read_op(lower: &str) -> Option<String> {
     // hands-free "read what's in front of me"); "read my/the screen", "what's
     // on (my) screen", "read what's on screen" all map here too. Guarded so a
     // continuous "watch the screen" (handled above) never reaches this.
-    let mentions_screen = lower.contains("screen") || lower.contains("display");
-    let read_screen = (lower.contains("read") && mentions_screen)
-        || (lower.contains("what") && lower.contains("on") && mentions_screen)
-        || lower.contains("read this")
-        || lower.contains("read that");
+    const SCREEN_WORDS: &[&str] =
+        &["screen", "screens", "display", "displays", "onscreen", "fullscreen"];
+    let mentions_screen = crate::utterance::mentions_any_word(lower, SCREEN_WORDS);
+    let read_screen = (mentions_screen
+        && vision_verb_in_command_position(lower, &["read", "reread"]))
+        || asks_what_is_on_screen(lower)
+        || reads_this_or_that(lower);
     if read_screen {
         return Some(op_read_screen(None));
     }
@@ -5745,10 +6516,15 @@ fn screen_read_op(lower: &str) -> Option<String> {
 /// PURE + unit-tested. READ-ONLY semantics: this only NAMES the control to
 /// locate; nothing here (or downstream) clicks it.
 fn extract_where_is_query(lower: &str) -> Option<String> {
+    // WHAT WENT WRONG: `contains("locate")` fires inside reLOCATEd / alLOCATEd /
+    // disLOCATEd and `contains("find")` inside FINDings, so "they relocated the
+    // office to the fourth floor" and "the findings mention every button" were
+    // both screen captures.
     let is_locate = lower.contains("where is")
         || lower.contains("where's")
-        || lower.contains("locate")
-        || (lower.contains("find") && lower.contains("button"));
+        || mentions_word(lower, "locate")
+        || (mentions_word(lower, "find")
+            && crate::utterance::mentions_any_word(lower, &["button", "buttons"]));
     if !is_locate {
         return None;
     }
@@ -5766,7 +6542,14 @@ fn extract_where_is_query(lower: &str) -> Option<String> {
             break;
         }
     }
+    // A locate is a SCREEN question only when an on-screen CONTROL is the HEAD of
+    // what is being asked for, in a PLACE we can actually look — see
+    // `locate_targets_a_control` for the two tests and the two ways an earlier
+    // cut of this gate got them wrong.
     let mut phrase = s.trim();
+    if !locate_targets_a_control(phrase) {
+        return None;
+    }
     for tail in [" button", " control", " icon", " field", " link", " tab", " menu", "?"] {
         if let Some(stripped) = phrase.strip_suffix(tail) {
             phrase = stripped.trim();
@@ -10417,6 +11200,72 @@ mod tests {
 
     /// Unrelated utterances never produce a Vision command (so they fall through
     /// to normal routing) — including ones that merely share a stray keyword.
+    /// A POSSESSIVE OWNER IS NOT PART OF THE TARGET.
+    ///
+    /// "baby's" tokenizes to baby / s / room, and the bare "s" took the modifier
+    /// slot, so every "watch the baby's room" was refused. Fixing only the
+    /// modifier left the OWNER in `head`, which the next word then shifted into
+    /// the modifier slot — so "watch the baby's room" passed only because "baby"
+    /// happens to be a target word, while "watch my son's room" and "watch the
+    /// neighbor's driveway" stayed refused. Both slots have to clear.
+    #[test]
+    fn a_possessive_owner_does_not_block_the_target() {
+        for u in [
+            "watch the baby's room",
+            "watch my son's room",
+            "watch my daughter's room",
+            "watch the kid's room",
+            "watch the neighbor's driveway",
+        ] {
+            let got = vision_command(u).unwrap_or_else(|| panic!("{u:?} must watch"));
+            let VisionCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
+            assert!(line.contains("watch.start"), "{u:?} -> {line}");
+            assert!(line.contains("\"camera\""), "{u:?} names a camera target -> {line}");
+        }
+    }
+
+    /// The room a person happens to have must not decide whether the command
+    /// works. "watch the kitchen door" worked and "watch the bedroom door" did
+    /// not. Same for the lens: "watch the doorbell camera" worked and "watch the
+    /// doorbell cam" did not, because "cam" sat in the TAILS list and was skipped,
+    /// making the modifier the head.
+    #[test]
+    fn room_kinds_and_short_lens_words_are_real_targets() {
+        for u in [
+            "watch the bedroom door",
+            "watch the bathroom door",
+            "watch the office door",
+            "watch the kitchen door",
+            "watch the doorbell cam",
+            "watch the security cam",
+            "watch the ring camera",
+            "watch the nest camera",
+        ] {
+            let got = vision_command(u).unwrap_or_else(|| panic!("{u:?} must watch"));
+            let VisionCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
+            assert!(line.contains("watch.start"), "{u:?} -> {line}");
+        }
+    }
+
+    /// A leading quantifier is part of the determiner, not a closer — including
+    /// the partitive "all OF the doors", which the `of` guard would otherwise
+    /// refuse. And the PHRASAL continuation verbs are how people actually resume.
+    #[test]
+    fn quantifiers_and_phrasal_continuations_still_reach_the_camera() {
+        for u in [
+            "watch all the doors",
+            "watch all the cameras",
+            "watch all of the doors",
+            "go back to watching the driveway",
+            "carry on watching the front door",
+            "get back to watching the front door",
+        ] {
+            let got = vision_command(u).unwrap_or_else(|| panic!("{u:?} must watch"));
+            let VisionCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
+            assert!(line.contains("watch.start"), "{u:?} -> {line}");
+        }
+    }
+
     #[test]
     fn vision_command_ignores_unrelated_utterances() {
         for text in [
