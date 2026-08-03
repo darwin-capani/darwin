@@ -8948,8 +8948,7 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
         && (mentions_mark_forge(&lower)
             || mentions_word(&lower, "world")
             || mentions_word(&lower, "scene")
-            || mentions_word(&lower, "bodies")
-            || mentions_word(&lower, "everything"))
+            || mentions_word(&lower, "bodies"))
     {
         return Some(MarkForgeCommand::Op(op_world_reset()));
     }
@@ -8959,7 +8958,31 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
     // gravity". Requires the word "gravity" so it never fires on an unrelated
     // "moon"/"mars". The target body picks the constant; an unrecognized target
     // with a bare "set gravity" falls through (the daemon won't guess a vector).
-    if lower.contains("gravity") {
+    // GRAVITY MUST BE COMMANDED, NOT MENTIONED. `contains("gravity")` plus a
+    // target word was enough, so "gravity is what, mass warping space" — a
+    // sentence ABOUT gravity, in which "space" is the target — set the world's
+    // gravity to zero. A statement is not an instruction.
+    //
+    // Accepts the documented forms: a setting verb ("set gravity to the moon",
+    // "turn off gravity"), a named sandbox, or the bare adjacency "moon gravity"
+    // / "zero gravity" where the target sits immediately before the noun.
+    let gravity_commanded = crate::utterance::mentions_any_word(
+        &lower,
+        &["set", "turn", "make", "change", "switch", "put", "use", "give", "raise", "lower"],
+    ) || mentions_mark_forge(&lower)
+        || lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect::<Vec<_>>()
+            .windows(2)
+            .any(|w| {
+                w[1] == "gravity"
+                    && matches!(
+                        w[0],
+                        "moon" | "lunar" | "mars" | "martian" | "earth" | "zero" | "no" | "normal"
+                    )
+            });
+    if lower.contains("gravity") && gravity_commanded {
         if let Some(y) = gravity_target(&lower) {
             return Some(MarkForgeCommand::Op(op_set_gravity(y)));
         }
@@ -8977,18 +9000,31 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
         || mentions_word(&lower, "sim")
         || mentions_word(&lower, "world")
         || mentions_word(&lower, "physics")
-        || mentions_word(&lower, "frame")
+        // PLURAL ONLY. "advance 5 frames" is a step count; "the picture FRAME my
+        // aunt got won't hold a charge" is a photograph, and the singular used to
+        // make it a physics context — which then let "hold" pause the world.
         || mentions_word(&lower, "frames");
-    if (lower.contains("step") || lower.contains("advance"))
-        && (physics_ctx || lower.contains("step the") || lower.contains("frame"))
-    {
+    // WHAT WENT WRONG: this had two substring escape hatches beside the real
+    // gate, and both fired on ordinary speech.
+    //
+    //   contains("step the")  matches "step THERE" — "probe the snow with a pole
+    //                         before you step there" advanced the simulation.
+    //   contains("frame")     matches "picture FRAME" — "the picture frame my
+    //                         aunt got won't hold a charge" paused the world.
+    //
+    // Neither bought anything: "step the simulation" and "advance 5 frames" are
+    // already admitted by `physics_ctx`, which matches the same words WHOLE.
+    if crate::utterance::mentions_any_word(&lower, &["step", "steps", "advance"]) && physics_ctx {
         let n = extract_step_count(&lower).unwrap_or(1);
         return Some(MarkForgeCommand::Op(op_world_step(n)));
     }
+    // "hold" was here and is ordinary English — "won't hold a charge", "hold on
+    // a second". `physics_ctx` alone did not save it, because "frame" used to be
+    // a physics word.
     if (mentions_word(&lower, "pause")
         || mentions_word(&lower, "freeze")
         || mentions_word(&lower, "hold")
-        || lower.contains("halt"))
+        || mentions_word(&lower, "halt"))
         && physics_ctx
     {
         return Some(MarkForgeCommand::Op(op_world_step(0)));
@@ -12072,6 +12108,68 @@ mod tests {
             mark_forge_command("clear the world").is_some(),
             "an actual reset command must still reset"
         );
+    }
+
+    /// ORDINARY SPEECH MUST NOT REACH THE DESTRUCTIVE OPS.
+    ///
+    /// Four ordinary sentences reached mark-forge, two of them destructive. Each
+    /// came in through a different hole, and three were substring bugs sitting
+    /// beside a correct whole-word gate:
+    ///
+    ///   "does the second book reset everything that happened" -> world.RESET
+    ///       "everything" was listed as a physics noun. It is ordinary English.
+    ///   "gravity is what, mass warping space"                 -> set.GRAVITY 0
+    ///       contains("gravity") + a target word was enough, so a sentence ABOUT
+    ///       gravity, in which "space" is the target, zeroed the world's gravity.
+    ///   "probe the snow with a pole before you step there"    -> world.step
+    ///       contains("step the") matches "step THERE".
+    ///   "the picture frame my aunt got won't hold a charge"   -> world.step 0
+    ///       contains("frame") matches "picture FRAME", making it a physics
+    ///       context, which then let the ordinary verb "hold" pause the world.
+    #[test]
+    fn ordinary_speech_never_resets_or_regravitates_the_world() {
+        for u in [
+            "does the second book reset everything that happened",
+            "gravity is what, mass warping space",
+            "probe the snow with a pole before you step there",
+            "the picture frame my aunt got won't hold a charge",
+            "clear everything off the kitchen table",
+            "let me step there for a second",
+            "the picture frame is crooked",
+            "gravity is the weakest of the four forces",
+        ] {
+            assert!(
+                mark_forge_command(u).is_none(),
+                "{u:?} is ordinary speech and must not reach the physics sandbox: {:?}",
+                mark_forge_command(u)
+            );
+        }
+    }
+
+    /// ...and every real command still works, including the two the first cut of
+    /// the above broke: "advance 5 frames" (PLURAL frames is a step count, the
+    /// singular is a photograph) and "hold the simulation".
+    #[test]
+    fn the_real_physics_commands_all_survive() {
+        for (u, op) in [
+            ("reset the simulation", "world.reset"),
+            ("clear the world", "world.reset"),
+            ("wipe the scene", "world.reset"),
+            ("step the simulation", "world.step"),
+            ("advance 5 frames", "world.step"),
+            ("advance the physics", "world.step"),
+            ("pause the simulation", "world.step"),
+            ("hold the simulation", "world.step"),
+            ("freeze the physics", "world.step"),
+            ("set gravity to the moon", "set.gravity"),
+            ("turn off gravity", "set.gravity"),
+            ("moon gravity", "set.gravity"),
+        ] {
+            let got = mark_forge_command(u)
+                .unwrap_or_else(|| panic!("{u:?} is a real command and must still work"));
+            let MarkForgeCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
+            assert!(line.contains(op), "{u:?} -> {line}, expected {op}");
+        }
     }
 
     #[test]
