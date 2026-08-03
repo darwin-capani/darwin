@@ -46,6 +46,25 @@ const CONVERSE_EVENT_TIMEOUT: Duration = Duration::from_secs(15);
 
 const MAX_INFERENCE_LINE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB: inference responses are text/paths/embedding-vectors (images/audio are returned as PATHS, not inlined); well above the server's own 8 MiB request limit, bounds a hijacked inference server from OOMing the daemon.
 
+/// The MOST TEXTS one `op=embed` request may carry.
+///
+/// THE SERVER IS THE AUTHORITY: `inference/server.py:1553` defines
+/// `EMBED_MAX_BATCH = 256` and `server.py:4874` RAISES on any larger batch, so an
+/// over-cap request is not slow — it is refused outright, and the caller sees a
+/// plain `Err` that reads like the embedder is down.
+///
+/// This constant exists because callers must SPLIT before they send. docsearch's
+/// reindex used to hand every gathered chunk to one call (bounded only by
+/// `[docsearch].max_chunks`, which ships at 50,000), so any corpus over 256 chunks
+/// — about ten markdown files — had its embed refused, committed every chunk with
+/// no vector, and left file search permanently on BM25 while reporting that the
+/// on-device embedder was unavailable. It was not unavailable; it was never asked
+/// a question it could answer.
+///
+/// `embed_batch_cap_matches_the_server` pins the two numbers together so they
+/// cannot drift apart again.
+pub const EMBED_MAX_BATCH: usize = 256;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Classification {
     pub intent: String,
