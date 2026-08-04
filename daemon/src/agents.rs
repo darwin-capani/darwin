@@ -227,7 +227,27 @@ const FURY_CUES: &[&str] = &[
 /// "assemble the team for X" routes to the Mission Orchestrator rather than to
 /// whichever specialist happens to match a stray domain keyword inside the goal.
 fn is_mission_query(lower: &str) -> bool {
-    FURY_CUES.iter().any(|cue| lower.contains(cue))
+    // WHOLE-WORD for the single-token cues, substring for the multi-word phrases.
+    //
+    // This was a bare `lower.contains(cue)` for every cue — the only agent in this
+    // file matching that way; every other one already uses `contains_word`. So
+    // FURY's one-word cues fired inside ordinary words and claimed the turn AHEAD
+    // of the whole keyword chain:
+    //
+    //   "mission"     inside perMISSION, comMISSION, transMISSION, subMISSION
+    //   "coordinate"  inside COORDINATEs ("what are the coordinates")
+    //   "campaign"    inside a political campaign
+    //
+    // "do I have permission to..." was a mission-orchestration request. The
+    // multi-word cues ("run point", "get the team on") are already specific
+    // enough that a substring match cannot misfire.
+    FURY_CUES.iter().any(|cue| {
+        if cue.contains(' ') || cue.contains('-') {
+            lower.contains(cue)
+        } else {
+            contains_word(lower, cue)
+        }
+    })
 }
 
 /// CASSANDRA (Forecast & Simulation) delegation cues: phrases that ask DARWIN to
@@ -248,6 +268,18 @@ const CASSANDRA_MULTI_CUES: &[&str] = &[
     "what if",
     "what-if",
     "model this",
+    // The VERB sense of "project", which takes a direct object right after it.
+    // The bare noun was removed from the word cues below because "the project" /
+    // "my project" / "that project slipped" is the most ordinary phrase in a
+    // working day, and that list is consulted BEFORE the keyword chain — so every
+    // such turn was handed to the forecaster. These phrases keep "project this
+    // out a year" and "project the revenue" while the noun no longer fires.
+    "project this",
+    "project that",
+    "project the",
+    "project it",
+    "project out",
+    "project forward",
 ];
 const CASSANDRA_WORD_CUES: &[&str] = &[
     "simulate",
@@ -255,7 +287,12 @@ const CASSANDRA_WORD_CUES: &[&str] = &[
     "forecast",
     "scenario",
     "scenarios",
-    "project",
+    // "project" is NOT here. As a bare noun it is the most ordinary word in a
+    // working day — "the project", "my project", "that project slipped" — and
+    // this list is consulted BEFORE the whole keyword chain, so every one of
+    // those turns was handed to the forecaster. The VERB sense lives in
+    // CASSANDRA_MULTI_CUES above as "project this"/"project the"/... — a phrase,
+    // because the verb always takes an object and the noun rarely does.
     "projection",
     "projections",
     "odds",
@@ -641,7 +678,7 @@ fn is_personal_finance_query(lower: &str) -> bool {
 /// it has no reservation or payment tool, so a "book me a flight" request is NOT
 /// claimed here; only the routes/places/ETA reads are. The cues are the navigation
 /// vocabulary: the multi-word phrases ("how long to get", "travel time", "coffee
-/// near", "restaurant near", "find a") are already specific (plain substring), and
+/// near", "restaurant near") are already specific (plain substring), and
 /// the single tokens ("directions", "route", "navigate", "nearby", "eta",
 /// "map"/"maps") are matched whole-word in the select() chain so a cue cannot fire
 /// as a substring of a larger word. "how far" is a multi-word phrase. Order is
@@ -653,7 +690,13 @@ const VOYAGER_MULTI_CUES: &[&str] = &[
     "travel time",
     "coffee near",
     "restaurant near",
-    "find a",
+    // "find a" is NOT here. It is the opening of almost every search a person
+    // makes — "find a dentist that takes my insurance", "find a pharmacy open
+    // past ten", "find a quieter way to do this" — and this list is matched as a
+    // plain substring ahead of the keyword chain, so the travel agent claimed all
+    // of them. It also swallowed "find another", "find all" and "find anything".
+    // A real place lookup carries a place cue ("near", "nearby", "directions",
+    // "map"), and those are already listed here and in VOYAGER_WORD_CUES.
 ];
 const VOYAGER_WORD_CUES: &[&str] = &[
     "directions",
@@ -3178,6 +3221,75 @@ mod tests {
     /// (market/trade/stock/crypto/portfolio/ticker). Pinned separately because
     /// the two are adjacent in domain (both can touch a price) and the contract
     /// forbids the theft: Cassandra runs the numbers, gecko quotes the tape.
+    /// AN ORDINARY WORD MUST NOT CLAIM THE TURN AHEAD OF THE KEYWORD CHAIN.
+    ///
+    /// Three agents were consulted before the broad keyword chain on cues that
+    /// are ordinary English, so the turn never reached the specialist that
+    /// actually wanted it:
+    ///
+    ///   FURY      matched its cues as BARE SUBSTRINGS — the only agent in this
+    ///             file that did; every other one already used `contains_word`.
+    ///             So "mission" fired inside perMISSION / comMISSION /
+    ///             transMISSION, and "coordinate" inside "what are the
+    ///             coordinates". "do I have permission to..." was routed to the
+    ///             mission orchestrator.
+    ///   CASSANDRA listed the bare noun "project" — "the project", "my project",
+    ///             "that project slipped" all went to the forecaster.
+    ///   VOYAGER   listed the phrase "find a", which opens almost every search a
+    ///             person makes, so the travel agent claimed "find a dentist that
+    ///             takes my insurance".
+    #[test]
+    fn an_ordinary_word_does_not_hijack_an_agent() {
+        let reg = AgentRegistry::canonical();
+        for q in [
+            // FURY's substring cues inside ordinary words.
+            "do i have permission to change this",
+            "what commission does the broker charge",
+            "the transmission is slipping in second gear",
+            "what are the coordinates of the trailhead",
+            // CASSANDRA's bare noun.
+            "the project slipped again",
+            "how is my project going",
+            "that project is behind schedule",
+            // VOYAGER's phrase.
+            "find a dentist that takes my insurance",
+            "find a pharmacy open past ten",
+            "find another way to do this",
+            "find all the files i edited today",
+        ] {
+            let got = reg.select("conversation", q, true).name.clone();
+            assert!(
+                !matches!(got.as_str(), "fury" | "cassandra" | "voyager"),
+                "{q:?} is ordinary speech and must reach the keyword chain, not {got}"
+            );
+        }
+    }
+
+    /// ...and each of the three still claims what it should. A gate that stopped
+    /// routing real work would pass the test above and be worse than the bug.
+    #[test]
+    fn the_three_agents_still_claim_their_real_work() {
+        let reg = AgentRegistry::canonical();
+        for (q, who) in [
+            ("run this mission end to end", "fury"),
+            ("orchestrate the whole campaign", "fury"),
+            ("get the team on this", "fury"),
+            ("project this out a year", "cassandra"),
+            ("project the revenue for q3", "cassandra"),
+            ("what are the odds of hitting target", "cassandra"),
+            ("forecast the portfolio", "cassandra"),
+            ("directions to the airport", "voyager"),
+            ("coffee near the office", "voyager"),
+            ("how long to get downtown", "voyager"),
+        ] {
+            assert_eq!(
+                reg.select("conversation", q, true).name,
+                who,
+                "{q:?} is {who}'s real work"
+            );
+        }
+    }
+
     #[test]
     fn cassandra_owns_forecasts_without_stealing_geckos_market_watch() {
         let reg = AgentRegistry::canonical();
