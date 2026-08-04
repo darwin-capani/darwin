@@ -49,7 +49,7 @@ cpal = "0.18"
 # compile together with the current tauri-utils. Kept as an exact pin so a stray
 # `cargo update` can't reintroduce a conflicting point release; bump deliberately
 # and re-check `cargo check` for E0119 before advancing.
-time = "=0.3.54"
+time = "=0.3.55"
 
 # macOS kiosk presentation-options for the DEVICE-GATED takeover (hide Dock /
 # menu bar). These are NOT new heavy deps: tao (Tauri's windowing layer) already
