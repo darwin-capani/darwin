@@ -37,6 +37,33 @@ private func grayImage(_ value: Double, side: Int = 8) -> CGImage {
     return ctx.makeImage()!
 }
 
+
+/// A gray CVPixelBuffer — the shape EVERY production source actually yields.
+/// FileSource, CameraSource and ScreenSource all build `Frame(pixelBuffer:)`;
+/// `Frame(cgImage:)` exists only in this test target.
+private func grayPixelBuffer(_ value: Double, side: Int = 8) -> CVPixelBuffer {
+    var pb: CVPixelBuffer?
+    let attrs: [CFString: Any] = [kCVPixelBufferCGImageCompatibilityKey: true,
+                                  kCVPixelBufferCGBitmapContextCompatibilityKey: true]
+    CVPixelBufferCreate(kCFAllocatorDefault, side, side, kCVPixelFormatType_32BGRA,
+                        attrs as CFDictionary, &pb)
+    let buf = pb!
+    CVPixelBufferLockBaseAddress(buf, [])
+    let v = UInt8(max(0, min(1, value)) * 255)
+    if let base = CVPixelBufferGetBaseAddress(buf) {
+        let rowBytes = CVPixelBufferGetBytesPerRow(buf)
+        let p = base.assumingMemoryBound(to: UInt8.self)
+        for y in 0..<side {
+            for x in 0..<side {
+                let o = y * rowBytes + x * 4
+                p[o] = v; p[o + 1] = v; p[o + 2] = v; p[o + 3] = 255
+            }
+        }
+    }
+    CVPixelBufferUnlockBaseAddress(buf, [])
+    return buf
+}
+
 /// A detector that returns a fixed list, gated by minConfidence (mirrors the
 /// real Detector contract so the pipeline's confidence floor is exercised).
 private struct FixedDetector: Detector {
@@ -1514,4 +1541,43 @@ final class ClassifySoundWiringTests: XCTestCase {
         }
         XCTAssertTrue(line.contains("alarm"), "the derived label must be present")
     }
+    /// MOTION MUST WORK ON THE FRAMES PRODUCTION ACTUALLY PRODUCES.
+    ///
+    /// `LumaGrid.sample(_ frame:)` required `frame.cgImage`, and a comment claimed
+    /// CVPixelBuffer-only frames were "sampled by the capture/inference seam in
+    /// the real build". There is no such seam. `Frame(pixelBuffer:)` hard-sets
+    /// `cgImage = nil`, and FileSource / CameraSource / ScreenSource — every
+    /// production path — construct frames that way. `Frame(cgImage:)` is built
+    /// ONLY in this test target.
+    ///
+    /// So `vision.motion` could never fire in production: the topic is declared in
+    /// the manifest, named in the app description, and rendered by the HUD's MOTION
+    /// readout, which was permanently empty.
+    ///
+    /// Every other motion test uses the CGImage shape and passed throughout — which
+    /// is exactly why none of them caught it. This one uses the pixel-buffer shape.
+    func testMotionFiresOnPixelBufferFramesTheWayProductionDelivers() async {
+        let sink = CollectingSink()
+        let pipe = Pipeline(detector: FixedDetector(detections: []),
+                            sink: sink, config: PipelineConfig(sensitivity: 1.0))
+        await pipe.handle(.watchStart(source: .file(path: "v.mov")))
+
+        let f0 = Frame(pixelBuffer: grayPixelBuffer(0.0), timestamp: 0.0,
+                       source: .file(path: "v.mov"), index: 0)
+        XCTAssertNil(f0.cgImage, "production frames carry no CGImage — that is the point")
+        // Precondition: the sampler must see something. A nil grid here means the
+        // pixel-buffer path is dead again and the rest of this test proves nothing.
+        XCTAssertNotNil(LumaGrid.sample(f0), "the sampler must read a pixel buffer")
+
+        let e0 = await pipe.processFrame(f0)
+        XCTAssertFalse(e0.contains { if case .motion = $0 { return true }; return false },
+                       "first frame is the baseline")
+
+        let f1 = Frame(pixelBuffer: grayPixelBuffer(1.0), timestamp: 0.2,
+                       source: .file(path: "v.mov"), index: 1)
+        let e1 = await pipe.processFrame(f1)
+        XCTAssertTrue(e1.contains { if case .motion = $0 { return true }; return false },
+                      "0.0 -> 1.0 luma on PIXEL BUFFER frames must emit motion")
+    }
+
 }

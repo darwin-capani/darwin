@@ -96,12 +96,25 @@ public struct LumaGrid: Sendable, Equatable {
         LumaGrid(side: side, cells: Array(repeating: value, count: side * side))
     }
 
-    /// Sample a frame's CGImage into a `side x side` luma grid. Returns nil if
-    /// the frame carries no CGImage (live CVPixelBuffer-only frames are sampled
-    /// by the capture/inference seam in the real build; for the headlessly
-    /// testable path we sample CGImages). Pure read; pixels never leave here.
+    /// Sample a frame into a `side x side` luma grid, from EITHER backing.
+    ///
+    /// WHAT WENT WRONG: this required `frame.cgImage`, and the comment said the
+    /// CVPixelBuffer-only frames were "sampled by the capture/inference seam in
+    /// the real build". No such seam exists. `Frame(pixelBuffer:)` hard-sets
+    /// `cgImage = nil` (SharedTypes.swift), and every production source —
+    /// FileSource, CameraSource, ScreenSource — constructs frames that way.
+    /// `Frame(cgImage:)` is built ONLY in Tests/.
+    ///
+    /// So this returned nil on every real frame and `vision.motion` could never
+    /// fire: the topic is declared in the manifest, named in the app description,
+    /// and rendered by the HUD's MOTION readout, which was permanently empty. The
+    /// motion tests all pass because they use the test-only CGImage shape, which
+    /// is the one shape production never produces.
+    ///
+    /// Pure read; pixels never leave here.
     public static func sample(_ frame: Frame, side: Int = 12) -> LumaGrid? {
-        guard side > 0, let cg = frame.cgImage else { return nil }
+        guard side > 0 else { return nil }
+        guard let cg = VisionEngine.encodableCGImage(for: frame) else { return nil }
         return sample(cgImage: cg, side: side)
     }
 
