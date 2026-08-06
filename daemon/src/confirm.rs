@@ -367,9 +367,27 @@ pub fn take_live(now: Instant) -> Option<PendingConfirmation> {
     let mut guard = lock();
     let matches_prompt = match (guard.as_ref(), prompted.as_deref()) {
         (Some(p), Some(id)) => p.id == id,
-        // No prompt on record (e.g. a pre-existing park): fall back to the old
-        // take-whatever behavior rather than silently refusing every confirm.
-        (Some(_), None) => true,
+        // NO PROMPT ON RECORD -> REFUSE. This used to fall through to `true`
+        // ("take whatever is parked"), with a comment reasoning about "a
+        // pre-existing park". There is no such state.
+        //
+        // PENDING is written in exactly ONE place (`park_inner`, below), and
+        // PROMPTED is armed there too — but ONLY `if reaches_user`. Nothing nulls
+        // PROMPTED without also nulling the slot: `clear()` nulls both, and a
+        // successful `take_live` nulls both. So `slot == Some && PROMPTED == None`
+        // holds if and only if the park DECLARED IT DID NOT REACH THE USER.
+        //
+        // Which means the fallback fired exactly and only in the case the guard
+        // exists to catch. A standing-mission tick, tripwire, durable-mission
+        // resume or runbook step parks something consequential — gmail_send,
+        // shell_run — with arguments the operator was never read, and the
+        // operator's next "yes" to anything at all executed it. The module header
+        // and this function's own doc both state that cannot happen.
+        //
+        // Refusing here does not strand a real confirmation: a park the user was
+        // actually prompted with always arms PROMPTED, so it matches on the arm
+        // above. An unprompted park keeps waiting for its own explicit confirm.
+        (Some(_), None) => false,
         _ => false,
     };
     if !matches_prompt {
@@ -706,6 +724,53 @@ mod tests {
     /// standing order, an overnight agent, any concurrent turn) landing between
     /// the prompt and the reply used to make the user's "yes" fire an action
     /// they were never shown.
+    /// AN ACTION THE USER WAS NEVER PROMPTED WITH CANNOT BE CONFIRMED BY "YES".
+    ///
+    /// `take_live`'s prompt guard fell through to "take whatever is parked"
+    /// whenever PROMPTED was None, reasoning about "a pre-existing park". No such
+    /// state exists: PENDING is written in exactly one place, PROMPTED is armed
+    /// there too but only `if reaches_user`, and nothing nulls PROMPTED without
+    /// also nulling the slot. So Some/None held IF AND ONLY IF the park declared
+    /// it did not reach the user — the fallback fired exactly and only in the case
+    /// the guard exists to catch.
+    ///
+    /// Reachable from production: a standing-mission tick parks with
+    /// `context_trusted: false`, which does not arm PROMPTED. The operator's next
+    /// "yes" — to anything — executed it, with arguments they were never read.
+    ///
+    /// The sibling test above covers a background park CLOBBERING a prompted one.
+    /// This covers a background park standing ALONE, which is the reachable case
+    /// (PROMPTED is None at daemon start, after any successful take_live, and
+    /// after every clear() — which barge-in and panic both call).
+    #[test]
+    fn a_lone_unprompted_park_is_not_taken_by_a_spoken_yes() {
+        let _lock = PENDING_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        clear();
+
+        let mut b = sample("shell_run");
+        b.input = json!({"cmd": "rm -rf ~/research"});
+        let _ = park_background_for_test(b);
+        assert!(peek_pending(Instant::now()).is_some(), "the action is parked");
+
+        assert!(
+            take_live(Instant::now()).is_none(),
+            "a spoken yes must NOT confirm an action the user was never prompted with"
+        );
+        assert!(
+            peek_pending(Instant::now()).is_some(),
+            "the unprompted action must remain parked, not silently dropped"
+        );
+
+        // The prompted case still works, or this would just break confirmation.
+        clear();
+        let _ = park_ctx(true, sample("gmail_send"));
+        assert!(
+            take_live(Instant::now()).is_some(),
+            "an action the user WAS prompted with is still confirmable"
+        );
+        clear();
+    }
+
     #[test]
     fn a_background_parker_cannot_hijack_the_spoken_confirm() {
         // These drive the PROCESS-GLOBAL slot, so they must hold PENDING_TEST_LOCK
@@ -1476,4 +1541,6 @@ mod hijack_tests {
             }
         }
     }
+
+
 }
