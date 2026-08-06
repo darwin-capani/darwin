@@ -204,3 +204,119 @@ export function updateDialogReduce(
 export function silentUpdateNotice(version: string): string {
   return `Updating DARWIN to ${version}…`;
 }
+
+/* --- the button + launch ACTION BODIES (injectable seams) ------------------ *
+ *
+ * WHAT WENT WRONG: these bodies used to live entirely inside
+ * UpdateDialog.tsx's onClick handlers and App.tsx's launch effect. The vitest
+ * env is `node` — components render through renderToStaticMarkup, whose markup
+ * cannot be clicked — so auto-update.test.ts's "three-button wiring" block
+ * defined its OWN copies of them and asserted on those. The result was a guard
+ * that did not guard: UpdateDialog's Cancel could be changed to call
+ * setAutoUpdateOn(true) (silently arming permanent auto-install from the button
+ * labelled Cancel), either install button could be changed to
+ * checkForUpdates(FALSE) (check, never install), the relaunch could be dropped,
+ * or App could be changed to auto-install regardless of the user's OFF
+ * preference — and the whole HUD suite still went green.
+ *
+ * The bodies now live HERE behind injected seams, so the component/App and the
+ * test drive the SAME code. Nothing about the install AUTHORITY changed: the
+ * only install path is still the signed `checkForUpdates(true)` backend
+ * command. */
+
+/** The side-effecting seams the two install buttons and Cancel need. */
+export interface UpdateInstallDeps {
+  /** The SIGNED backend command. `install: true` downloads + minisign-verifies
+   *  + installs; `false` only CHECKS and can never install anything. */
+  check(install: boolean): Promise<UpdateCheck>;
+  /** The built-in restart. Resolves false when there is no shell to relaunch. */
+  relaunch(): Promise<boolean>;
+  /** Persist the auto-install-on-launch preference. */
+  persistPref(on: boolean): void;
+}
+
+/** The launch path additionally needs the honest non-blocking notice. */
+export interface LaunchUpdateDeps extends UpdateInstallDeps {
+  notify(text: string): void;
+}
+
+/** What an install attempt actually did — never a claimed success. */
+export interface InstallOutcome {
+  /** The backend's own result, verbatim. */
+  result: UpdateCheck;
+  /** The backend reported "installed" AND the relaunch succeeded. */
+  relaunched: boolean;
+  /** Installed, but there was no shell to relaunch — the honest "restart to
+   *  finish updating" state. NEVER treated as a completed update. */
+  needsManualRestart: boolean;
+}
+
+/**
+ * The shared body of BOTH install buttons ("Update" and "Update & don't ask
+ * again").
+ *
+ *   - `dontAskAgain` persists the preference FIRST, so the user's choice sticks
+ *     even if the install then fails. "Update" passes false and must never
+ *     touch the preference.
+ *   - The install ALWAYS goes through `check(true)` — the signed path. A
+ *     `check(false)` here would only look for an update and never install one.
+ *   - The relaunch is attempted ONLY on the honest "installed" status; any
+ *     other status returns without relaunching, for the reducer to surface as
+ *     an honest error.
+ */
+export async function runDialogInstall(
+  deps: UpdateInstallDeps,
+  dontAskAgain: boolean,
+): Promise<InstallOutcome> {
+  if (dontAskAgain) deps.persistPref(true);
+  const result = await deps.check(true);
+  if (result.status !== "installed") {
+    return { result, relaunched: false, needsManualRestart: false };
+  }
+  const relaunched = await deps.relaunch();
+  return { result, relaunched, needsManualRestart: !relaunched };
+}
+
+/**
+ * The "Cancel" button body. CLOSE-ONLY BY CONSTRUCTION: it must never write the
+ * preference and never touch the install command, so the next launch re-checks
+ * and asks again. `deps` is taken — and deliberately only `void`-referenced —
+ * precisely so a test can hand in spies and prove that none of them fire.
+ */
+export function runDialogCancel(deps: UpdateInstallDeps, close: () => void): void {
+  void deps;
+  close();
+}
+
+/** What the launch auto-check did. */
+export type LaunchUpdateOutcome = "none" | "dialog" | "silent";
+
+/**
+ * The launch auto-check body. Routes the backend's own status through
+ * `decideLaunchUpdateAction` (THE cardinal honesty rule) and then does exactly
+ * one of: nothing at all, open the dialog naming the real version, or the
+ * silent install — honest notice FIRST, then the SIGNED install, then relaunch
+ * only on "installed". `autoOn` is passed in so this stays storage-free, and
+ * `cancelled` preserves App's unmount-safety across the awaits.
+ */
+export async function runLaunchUpdate(
+  deps: LaunchUpdateDeps,
+  check: UpdateCheck,
+  autoOn: boolean,
+  openDialog: (version: string) => void,
+  cancelled: () => boolean = () => false,
+): Promise<LaunchUpdateOutcome> {
+  const action = decideLaunchUpdateAction(check, autoOn);
+  if (action.kind === "none") return "none";
+  if (action.kind === "dialog") {
+    openDialog(action.version);
+    return "dialog";
+  }
+  // "silent": the pref is ON. Notice first, so an auto-install is never a
+  // silent surprise, then the SAME signed backend command + relaunch.
+  deps.notify(silentUpdateNotice(action.version));
+  const installed = await deps.check(true);
+  if (cancelled()) return "silent";
+  if (installed.status === "installed") await deps.relaunch();
+  return "silent";
+}

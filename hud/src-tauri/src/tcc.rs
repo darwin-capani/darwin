@@ -20,7 +20,11 @@ use serde::Serialize;
 
 /// The honest outcome of a permission request, surfaced to the HUD.
 ///   * `fired`  — true when a NATIVE OS PROMPT was actually triggered this call
-///     (only possible from the "not determined" state).
+///     (only possible from the "not determined" state). CAVEAT — SCREEN
+///     RECORDING: `CGPreflightScreenCaptureAccess` returns false for BOTH "not
+///     determined" and "denied", so that one path CANNOT know whether a prompt
+///     appeared. It reports `fired: false` rather than guessing true — see
+///     `request_screen`.
 ///   * `status` — `not_determined` | `granted` | `denied` | `restricted` |
 ///     `no_prompt_api` | `error`.
 ///   * `detail` — a short human line (no secret).
@@ -148,12 +152,37 @@ mod imp {
         if now {
             PromptResult::new(true, "granted", "Screen Recording granted.")
         } else {
-            PromptResult::new(
-                true,
-                "not_determined",
-                "Asked macOS for Screen Recording — approve the DARWIN prompt (you may need to quit & reopen DARWIN).",
-            )
+            screen_request_undecided()
         }
+    }
+
+    /// The honest report for a screen-capture request that did not come back
+    /// granted.
+    ///
+    /// WHAT WENT WRONG: this branch used to return `fired: true` +
+    /// `"not_determined"` unconditionally. Both are GUESSES presented as fact:
+    /// `CGPreflightScreenCaptureAccess` returns false for "not determined" AND
+    /// for "denied", and `CGRequestScreenCaptureAccess` prompts only from the
+    /// former (afterwards it is a no-op returning the cached denial), so this
+    /// path cannot tell them apart. The cost of guessing "not_determined" was
+    /// concrete: permissions.rs::request_access routes its
+    /// already-decided -> open-the-Settings-pane fallback on `status`
+    /// (`"denied" | "no_prompt_api" | "error"`), so for Screen Recording — and
+    /// ONLY Screen Recording; microphone/camera/input-monitoring all return a
+    /// real "denied" — that fallback was unreachable. A user who had denied once
+    /// pressed REQUEST, was told "Asked macOS for Screen Recording — approve the
+    /// DARWIN prompt", and then waited for a dialog macOS would never show.
+    ///
+    /// So: report what we actually know (not granted), do not claim a prompt we
+    /// cannot observe, and use the status that routes to the Settings pane the
+    /// user can always act on. Pure, so the routing contract is testable without
+    /// touching real TCC state.
+    pub(super) fn screen_request_undecided() -> PromptResult {
+        PromptResult::new(
+            false,
+            "denied",
+            "Screen Recording is not granted. If no DARWIN prompt appeared it was already decided — opening System Settings (you may need to quit & reopen DARWIN after granting).",
+        )
     }
 
     fn request_accessibility() -> PromptResult {
@@ -224,5 +253,44 @@ mod stub {
     /// Off macOS there is no TCC; every permission reports `no_prompt_api`.
     pub fn request_permission(_key: &str) -> PromptResult {
         PromptResult::new(false, "no_prompt_api", "macOS-only")
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    /// The exact set permissions.rs::request_access routes to the
+    /// open-the-Settings-pane fallback. Kept here as a literal so a drift in
+    /// either file is visible from both sides.
+    const FALLBACK_STATUSES: [&str; 3] = ["denied", "no_prompt_api", "error"];
+
+    #[test]
+    fn an_undecided_screen_request_routes_to_the_settings_fallback() {
+        // REGRESSION. CGPreflightScreenCaptureAccess cannot distinguish "not
+        // determined" from "denied", so a not-granted screen request used to
+        // report `fired: true` + "not_determined" — a guess that made the
+        // already-denied case unreachable: no prompt appeared, no Settings pane
+        // opened, and the panel said "Asked macOS for Screen Recording — approve
+        // the DARWIN prompt". This pins the honest report instead.
+        let r = super::imp::screen_request_undecided();
+        assert!(
+            !r.fired,
+            "we cannot observe whether a prompt appeared, so we must not claim one did"
+        );
+        assert!(
+            FALLBACK_STATUSES.contains(&r.status.as_str()),
+            "status {:?} must route to permissions.rs's Settings fallback",
+            r.status
+        );
+        assert_ne!(
+            r.status, "not_determined",
+            "not_determined is precisely the status that skipped the fallback"
+        );
+        // The copy must not promise a dialog macOS may never show.
+        assert!(
+            !r.detail.contains("approve the DARWIN prompt"),
+            "detail must not promise a prompt: {}",
+            r.detail
+        );
+        assert!(r.detail.contains("System Settings"), "detail: {}", r.detail);
     }
 }

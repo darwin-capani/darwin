@@ -35,10 +35,16 @@ import Frame from "./Frame";
  *     diverged and BOTH answers are shown; the panel never fabricates a consensus.
  *   - THE SECOND-BRAIN GAIN IS RUNTIME-GATED. When the second brain is
  *     unavailable the outcome is ONE-MODEL (stated), never a fake agreement.
- *   - SHIPPED OFF. [answers].cross_check and [answers].debate both ship false (and
- *     debate gates only high-stakes turns), so until they are deliberately enabled
- *     the daemon emits the "off" outcome (null badge) and the corresponding row
- *     renders NOTHING — behavior is byte-for-byte today's.
+ *   - BOTH SHIP ON; THE *TURN* GATES ARE WHAT KEEP THIS QUIET. [answers].cross_check
+ *     and [answers].debate both ship TRUE (config/darwin.toml:809/811;
+ *     daemon/src/config.rs AnswersConfig::default). A row still renders NOTHING on
+ *     most turns — cross-check only runs over a tool result, and debate only on a
+ *     conservatively-predicated high-stakes turn (the daemon emits the "off"
+ *     outcome with a null badge otherwise) — but that is the TURN predicate, not a
+ *     disabled feature. WHAT WENT WRONG: this doc and the footer copy said "ship
+ *     false" long after the defaults flipped, so the panel displayed a live
+ *     CHECKED/CORROBORATED badge next to a sentence claiming the pass that
+ *     produced it was disabled.
  *   - SECRET-FREE. The wire carries only the gate flag, the outcome token, the
  *     derived badge, and honest copy — never the raw tool result, never the raw
  *     answers, never an embedding/audio/secret.
@@ -63,10 +69,10 @@ export default function AnswerCrossCheckPanel({
   const showDebate = debate !== null && debate.badge !== null;
 
   // Nothing to show until a cross-check or debate carries a real outcome. Both
-  // gates ship OFF (and debate only fires on gated high-stakes turns), so the
-  // reducer holds both at null (clearing each whenever the pass did not run this
-  // turn) — render nothing rather than a placeholder, mirroring VerifyPanel and
-  // the other event-fed panels.
+  // gates ship ON, but cross-check only runs over a tool result and debate only
+  // fires on high-stakes turns, so the reducer holds both at null on ordinary
+  // turns (clearing each whenever the pass did not run) — render nothing rather
+  // than a placeholder, mirroring VerifyPanel and the other event-fed panels.
   if (!showCross && !showDebate) return null;
 
   return (
@@ -112,8 +118,8 @@ export default function AnswerCrossCheckPanel({
                 <b>downgrades confidence and flags</b> a questionable result —{" "}
                 <b>it never removes a confirmation gate</b>, and CHECKED is{" "}
                 <b>not a correctness guarantee</b>, only that nothing tripped. When
-                a check tripped, the answer itself carries the reason. Ships OFF (
-                <code>[answers].cross_check</code>).
+                a check tripped, the answer itself carries the reason. Ships ON (
+                <code>[answers].cross_check</code>) — set it false to disable.
               </p>
             )}
             {showDebate && (
@@ -123,8 +129,9 @@ export default function AnswerCrossCheckPanel({
                 <b>disagree both answers are surfaced</b> — never silently picked or
                 averaged into a fake consensus. If the second model is unavailable
                 it <b>falls back to one and says so</b> (the quality gain is
-                runtime-gated). At most two model calls; ships OFF (
-                <code>[answers].debate</code>).
+                runtime-gated). At most two model calls; ships ON (
+                <code>[answers].debate</code>), engaging only on high-stakes turns
+                — set it false to disable.
               </p>
             )}
           </div>

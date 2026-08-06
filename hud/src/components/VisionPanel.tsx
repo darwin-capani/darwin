@@ -82,19 +82,24 @@ export default function VisionPanel({
    *  screen-read readout below. Daemon-driven, so it surfaces even when the
    *  Vision app feed itself is offline. */
   describe?: VisionDescribe | null;
-  /** The OPT-IN ambient sound-monitor STATE (audio.sound_monitor, channel
-   *  "local"), or null until the daemon emits it at startup. Daemon-driven (NOT
-   *  part of the Vision app feed), so the indicator surfaces even when the app
-   *  surface is offline. SHIPS OFF: `enabled` is the operator's config opt-in;
-   *  even when enabled, continuous ambient capture is DEVICE-GATED behind macOS
-   *  mic/TCC. LABELS ONLY — the audio never leaves the device. */
+  /** The ambient sound-monitor STATE (audio.sound_monitor, channel "local"), or
+   *  null until the daemon emits it at startup. Daemon-driven (NOT part of the
+   *  Vision app feed), so the indicator surfaces even when the app surface is
+   *  offline. SHIPS ON (full-power default: config/darwin.toml [audio]
+   *  `sound_monitor = true`, daemon/src/config.rs AudioConfig::default, pinned by
+   *  the daemon test `sound_monitor_ships_on_and_keys_are_known`) — INERT WITHOUT
+   *  MIC/TCC: the flag cannot grant Microphone consent, so without it nothing is
+   *  captured. `enabled` is config-only (no tool/agent/model can flip it).
+   *  LABELS ONLY — the audio never leaves the device. */
   soundMonitor?: AudioSoundMonitor | null;
   /** The CONTINUOUS SCREEN-CONTEXT posture (#42, folded from the secret-free
    *  screen_context.* system envelopes), or null/undefined until the daemon
    *  emits the startup config. Daemon-driven (NOT part of the Vision app feed),
    *  so the PROMINENT WATCHING indicator surfaces even when the app surface is
-   *  offline. SHIPS OFF: the continuous loop never runs by default; the live
-   *  capture is TCC-DEVICE-GATED (Screen Recording). SECRET-FREE — only the
+   *  offline. SHIPS ON (full-power default, config/darwin.toml [screen_context]
+   *  `enabled = true`) — INERT WITHOUT TCC: the flag cannot grant Screen
+   *  Recording consent, so without it the loop captures NOTHING and the ring
+   *  never grows. The real gate is the OS consent, not the config. SECRET-FREE — only the
    *  loop-active bit + bounded counts ride this surface, NEVER the recognized
    *  glyphs / recalled text; glyph-only (never a person id), transient, bounded,
    *  forgettable, read-only. */
@@ -262,10 +267,11 @@ export default function VisionPanel({
                   ? "The continuous screen-read loop is ACTIVE — it periodically OCRs one frame into a bounded, redacted, transient in-RAM ring (TCC-device-gated: it requires Screen Recording consent). Glyph-only — never a face or person id; pixels never leave the device. Say “forget my screen context” to wipe it."
                   : screenContext.enabled
                     ? "The continuous screen-read loop is enabled but NOT watching right now — even enabled, live capture is TCC-device-gated behind macOS Screen Recording consent the daemon cannot grant. Nothing is being read."
-                    : "OFF by default — the continuous screen-read loop never auto-starts. Even when enabled, live capture is TCC-device-gated (Screen Recording). Nothing is being read."}
+                    : "Turned OFF in config — [screen_context].enabled is false, so the continuous screen-read loop is not running. (It SHIPS ON by default; even then live capture is TCC-device-gated behind macOS Screen Recording consent.) Nothing is being read."}
               </div>
               <div className="vi-sctx-note">
-                OFF by default · TCC-device-gated · glyph-only, never a person id ·
+                ships ON, inert without Screen Recording consent · TCC-device-gated ·
+                glyph-only, never a person id ·
                 transient + bounded (held {screenContext.held}/cap {screenContext.cap}) ·
                 forgettable (“forget my screen context”) · read-only
               </div>
@@ -361,9 +367,11 @@ export default function VisionPanel({
               persona-voiced reply and kept transient; this readout shows only the
               honest POSTURE: which source, whether the on-device VLM actually
               described it (`available`), and whether the model is enabled (`vlm`).
-              DEVICE-GATED: the VLM needs a multi-GB model download + RAM, so it
-              ships OFF; when it isn't downloaded / enabled the readout shows an
-              honest "model not downloaded" fallback state, never a fake scene. */}
+              DEVICE-GATED: [vision].enabled SHIPS ON (full-power default) but is
+              INERT WITHOUT A MODEL — the VLM needs a multi-GB checkpoint + RAM,
+              so with no model downloaded the readout shows an honest "model not
+              downloaded" fallback state, never a fake scene. The gate is the
+              missing checkpoint, not the config flag. */}
           {describe ? (
             <div className={`vi-vlm ${describe.available ? "available" : "fallback"}`}>
               <div className="vi-vlm-head">
@@ -392,7 +400,7 @@ export default function VisionPanel({
                 <div className="vi-vlm-fallback">
                   {describe.vlm
                     ? "The on-device vision-language model couldn't describe this — it fell back honestly (e.g. to OCR text). No scene is invented."
-                    : "The on-device vision-language model isn't enabled — it needs a multi-GB model download + RAM, so it ships OFF. Fell back honestly (e.g. to OCR text)."}
+                    : "The on-device vision-language model is turned off — [vision].enabled is false. (The gate SHIPS ON by default; it is inert until the multi-GB model download + RAM are in place.) Fell back honestly (e.g. to OCR text)."}
                 </div>
               )}
               <div className="vi-vlm-note">
@@ -490,9 +498,13 @@ export default function VisionPanel({
             </div>
           ) : null}
 
-          {/* audio.sound_monitor — the OPT-IN ambient sound-monitor STATE
-              indicator. SHIPS OFF: `enabled` is the operator's config opt-in (no
-              tool/agent/model can flip it, no auto-arm). Even when MONITORING,
+          {/* audio.sound_monitor — the ambient sound-monitor STATE indicator.
+              SHIPS ON (full-power default) and is INERT WITHOUT MIC/TCC: the
+              flag is config-only (no tool/agent/model can flip it) and it cannot
+              grant consent. WHAT WENT WRONG: this block and the copy below called
+              the monitor "OPT-IN ... ships OFF" while [audio].sound_monitor
+              shipped true, so a mic-adjacent feature that is armed on a stock
+              install was presented as something the user had opted into. Even when MONITORING,
               continuous ambient capture is DEVICE-GATED behind macOS mic/TCC
               consent (consent="device_gated"). LABELS ONLY — only the sound-class
               labels would ever surface; the audio never leaves the device. Daemon-
@@ -507,11 +519,11 @@ export default function VisionPanel({
               </div>
               <div className="vi-monitor-copy">
                 {soundMonitor.enabled
-                  ? "OPT-IN monitor is enabled — periodic on-device Apple Sound Analysis runs ONCE macOS mic/TCC consent is granted (continuous monitoring is device-gated). Only the sound-class labels surface; the audio never leaves the device."
-                  : "OPT-IN monitor ships OFF and never auto-starts — the mic stays closed for ambient classification. Distinct from speech/STT. Only labels would ever surface; the audio never leaves the device."}
+                  ? "Monitor is enabled (the shipped default) — periodic on-device Apple Sound Analysis runs ONCE macOS mic/TCC consent is granted (continuous monitoring is device-gated). Only the sound-class labels surface; the audio never leaves the device."
+                  : "Monitor is turned OFF in config — [audio].sound_monitor is false, so the mic stays closed for ambient classification. (It SHIPS ON by default and is inert without macOS Microphone consent.) Distinct from speech/STT. Only labels would ever surface; the audio never leaves the device."}
               </div>
               <div className="vi-monitor-note">
-                opt-in + mic/TCC gated · consent {soundMonitor.consent} ·
+                ships ON, inert without mic/TCC · consent {soundMonitor.consent} ·
                 labels only · audio never leaves the device
               </div>
             </div>

@@ -85,16 +85,30 @@ function StatusRow({ last }: { last: ShellOutcome }) {
       <span className="shell-title">STATUS</span>
       <span
         className={`shell-pill ${off ? "off" : "armed"}`}
-        title={
-          off
-            ? "the sandboxed shell is OFF / LOCKED by default — it runs nothing until [shell].enabled"
-            : "a command rode the consequential gate — it never auto-ran; it parked for your spoken confirm first"
-        }
+        title={statusPillTitle(last.kind)}
       >
         {off ? "OFF / LOCKED" : "GATED"}
       </span>
     </div>
   );
+}
+
+/** The STATUS tooltip. WHAT WENT WRONG: every non-OFF kind used to get "a
+ *  command rode the consequential gate … it parked for your spoken confirm
+ *  first" — which is FALSE for a denial (refused pre-gate, it never reached the
+ *  gate or the sandbox, exactly as the detail line beneath it says) and for an
+ *  exec-seam failure. */
+function statusPillTitle(kind: ShellOutcomeKind): string {
+  switch (kind) {
+    case "blocked-off":
+      return "the sandboxed shell is OFF / LOCKED by default — it runs nothing until [shell].enabled";
+    case "denied":
+      return "a command was REFUSED outright as destructive/unsafe — it never reached the gate or the sandbox";
+    case "blocked-exec-failed":
+      return "the sandboxed exec seam errored — the command produced no result";
+    default:
+      return "a command rode the consequential gate — it never auto-ran; it parked for your spoken confirm first";
+  }
 }
 
 /** The last command + its HONEST outcome. NEVER shows a fabricated output — only
@@ -116,7 +130,15 @@ function OutcomeRow({ last }: { last: ShellOutcome }) {
       </div>
 
       {/* The exact command (faithful, the daemon's own text), shown as text — not
-          a runnable control. The OFF gate carries no command. */}
+          a runnable control.
+          WHAT WENT WRONG: the empty branch was hard-coded to the OFF
+          explanation, on the belief that only the OFF gate carries no command.
+          It is not: anthropic.rs emits `shell.denied` with ONLY {"reason": …}
+          and `shell.blocked {"reason":"exec_failed"}` with no command either. So
+          a GENUINE refusal of a destructive command rendered "the sandboxed
+          shell is off, so nothing was classified" directly above a REFUSED —
+          DENYLISTED pill and a detail line saying it had been classified. The
+          copy now follows `kind`. */}
       {last.command.length > 0 ? (
         <div className="shell-cmd" role="note">
           <span className="shell-cmd-prompt" aria-hidden="true">
@@ -125,10 +147,7 @@ function OutcomeRow({ last }: { last: ShellOutcome }) {
           <code>{last.command}</code>
         </div>
       ) : (
-        <div className="shell-empty dim-note">
-          No command — the sandboxed shell is off, so nothing was classified,
-          parked, or run.
-        </div>
+        <div className="shell-empty dim-note">{emptyCommandNote(last.kind)}</div>
       )}
 
       <div className="shell-detail dim-note">
@@ -207,6 +226,22 @@ function outcomeLead(last: ShellOutcome): string {
       return "Confirmed and gated through — running it now in the deny-default sandbox.";
     case "ran":
       return "The faithful real result of the sandboxed run (the honest exit code below — never a fabricated output):";
+  }
+}
+
+/** What to say when the event carried NO command text. Only the OFF gate means
+ *  "nothing was classified" — a denial and an exec-seam failure both DID
+ *  classify a real command; the daemon simply does not put it on the wire. */
+function emptyCommandNote(kind: ShellOutcomeKind): string {
+  switch (kind) {
+    case "blocked-off":
+      return "No command — the sandboxed shell is off, so nothing was classified, parked, or run.";
+    case "denied":
+      return "The command is not shown — it was refused before it could run, so it is never echoed back.";
+    case "blocked-exec-failed":
+      return "The command is not shown — the sandboxed exec seam errored before it produced a result.";
+    default:
+      return "The command is not shown — the daemon did not carry it on this event.";
   }
 }
 

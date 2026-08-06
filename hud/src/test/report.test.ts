@@ -288,9 +288,26 @@ describe("ReportPanel render", () => {
   });
 
   it("never shows a citation the readout does not carry", () => {
+    // WHAT WENT WRONG BEFORE: this asserted only that the markup lacked
+    // "https://fabricated" and "[99]" — two strings that appear nowhere in
+    // ReportPanel and that no input can produce. No regression in citation
+    // rendering (duplicated rows, renumbered ids, an invented row) could make
+    // either assertion fail. Assert the POSITIVE shape instead: exactly one
+    // rendered row per parsed citation, and the rendered id set equal to the
+    // parsed id set.
     const r = parseReportReadout(builtPayload)!;
     const html = render(r);
-    expect(html).not.toContain("https://fabricated");
+    const rows = html.match(/class="report-citation"/g) ?? [];
+    expect(rows).toHaveLength(r.citations.length);
+    const renderedIds = [...html.matchAll(/class="report-citation-id"[^>]*>\[(\d+)\]/g)].map(
+      (m) => Number(m[1]),
+    );
+    expect(renderedIds).toEqual(r.citations.map((c) => c.id));
+    // Every rendered url is one the readout actually carries — nothing invented.
+    const carried = new Set(r.citations.map((c) => c.url));
+    for (const m of html.matchAll(/class="report-citation-url"[^>]*>([^<]+)</g)) {
+      expect(carried.has(m[1])).toBe(true);
+    }
     expect(html).not.toContain("[99]");
   });
 });

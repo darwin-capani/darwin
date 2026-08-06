@@ -262,6 +262,44 @@ describe("ShellPanel (read-only, consequential, never-auto-run)", () => {
     expect(html).toMatch(/never reached the gate or the sandbox/i);
   });
 
+  it("a REAL refusal (the daemon sends NO command) never claims the shell is off", () => {
+    // THE PAYLOAD THE DAEMON ACTUALLY SENDS: anthropic.rs emits shell.denied
+    // with ONLY {"reason": …} — no command field. The tests above all fed a
+    // `command`, which the wire never carries, so the empty branch was never
+    // rendered. It was hard-coded to the OFF explanation, so a genuine
+    // destructive-command refusal read "the sandboxed shell is off, so nothing
+    // was classified, parked, or run" — directly above a REFUSED — DENYLISTED
+    // pill and a detail line saying it HAD been classified.
+    const html = render({
+      last: { kind: "denied", command: "", reason: "broad-rm", exitCode: null, timedOut: false, truncated: false, at: "T" },
+    });
+    expect(html).toMatch(/REFUSED — DENYLISTED/);
+    expect(html).toMatch(/refused before it could run/i);
+    expect(html).not.toMatch(/sandboxed shell is off/i);
+    expect(html).not.toMatch(/nothing was classified/i);
+    // ...and the STATUS tooltip must not claim it parked for a spoken confirm,
+    // which the detail line directly contradicts.
+    expect(html).not.toContain("it parked for your spoken confirm first");
+    expect(html).toContain("it never reached the gate or the sandbox");
+  });
+
+  it("an exec-seam failure (also command-less on the wire) gets its own honest line", () => {
+    const html = render({
+      last: { kind: "blocked-exec-failed", command: "", reason: "exec_failed", exitCode: null, timedOut: false, truncated: false, at: "T" },
+    });
+    expect(html).toMatch(/sandboxed exec seam errored/i);
+    expect(html).not.toMatch(/sandboxed shell is off/i);
+    expect(html).not.toContain("it parked for your spoken confirm first");
+  });
+
+  it("the OFF gate — and ONLY the OFF gate — still gets the OFF explanation", () => {
+    const html = render({
+      last: { kind: "blocked-off", command: "", reason: "", exitCode: null, timedOut: false, truncated: false, at: "T" },
+    });
+    expect(html).toMatch(/No command — the sandboxed shell is off/i);
+    expect(html).toMatch(/nothing was classified, parked, or run/i);
+  });
+
   it("shows a RAN result with the honest exit code — and NEVER a command output", () => {
     const html = render({
       last: { kind: "ran", command: "echo hi", reason: "", exitCode: 0, timedOut: false, truncated: true, at: "T" },

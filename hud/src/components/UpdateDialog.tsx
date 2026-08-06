@@ -1,9 +1,12 @@
-import { useCallback, useReducer, useRef, useState } from "react";
+import { useCallback, useMemo, useReducer, useRef, useState } from "react";
 import { checkForUpdates, relaunchApp } from "../tauri/bridge";
 import {
+  runDialogCancel,
+  runDialogInstall,
   setAutoUpdateOn,
   updateDialogInitial,
   updateDialogReduce,
+  type UpdateInstallDeps,
 } from "../core/autoUpdate";
 import useModalFocus from "./useModalFocus";
 
@@ -50,50 +53,60 @@ export default function UpdateDialog({ version, onClose }: UpdateDialogProps) {
 
   const busy = state.phase === "installing";
 
+  // The real seams, handed to the shared action bodies in core/autoUpdate.ts.
+  // THOSE bodies are what auto-update.test.ts drives — see the note there: the
+  // wiring tests used to assert on their own private copies of this logic, so
+  // gutting the install path here shipped green.
+  const deps = useMemo<UpdateInstallDeps>(
+    () => ({ check: checkForUpdates, relaunch: relaunchApp, persistPref: setAutoUpdateOn }),
+    [],
+  );
+
   // The shared install+relaunch path used by BOTH "Update" and
-  // "Update & don't ask again". It calls the EXISTING signed backend command
-  // (download + minisign verify + install). On the honest "installed" result it
-  // attempts the built-in relaunch; if that is unavailable it surfaces the
-  // honest "restart to finish" state. Any other result is an honest error
-  // (the reducer never treats a non-"installed" status as success).
-  const installAndRelaunch = useCallback(async () => {
-    if (busy) return;
-    dispatch({ type: "installStart" });
-    const result = await checkForUpdates(true);
-    dispatch({ type: "installResult", result });
-    if (result.status === "installed") {
-      const relaunched = await relaunchApp();
-      if (relaunched) {
+  // "Update & don't ask again". runDialogInstall calls the EXISTING signed
+  // backend command (download + minisign verify + install). On the honest
+  // "installed" result it attempts the built-in relaunch; if that is
+  // unavailable it surfaces the honest "restart to finish" state. Any other
+  // result is an honest error (the reducer never treats a non-"installed"
+  // status as success).
+  const installAndRelaunch = useCallback(
+    async (dontAskAgain: boolean) => {
+      if (busy) return;
+      dispatch({ type: "installStart" });
+      const outcome = await runDialogInstall(deps, dontAskAgain);
+      dispatch({ type: "installResult", result: outcome.result });
+      if (outcome.relaunched) {
         // restart() replaces the process; if we are still here, close cleanly.
         onClose();
-      } else {
+      } else if (outcome.needsManualRestart) {
         // No shell to relaunch (or relaunch failed) — be honest, ask the user
         // to restart. We do NOT claim the update is "finished".
         setNeedsManualRestart(true);
       }
-    }
-    // On a non-"installed" result the reducer is already in "error" with the
-    // backend's honest detail; the buttons re-enable for retry/cancel.
-  }, [busy, onClose]);
+      // On a non-"installed" result the reducer is already in "error" with the
+      // backend's honest detail; the buttons re-enable for retry/cancel.
+    },
+    [busy, deps, onClose],
+  );
 
-  // "Update" — install + relaunch. Pref UNCHANGED.
+  // "Update" — install + relaunch. Pref UNCHANGED (dontAskAgain = false).
   const onUpdate = useCallback(() => {
-    void installAndRelaunch();
+    void installAndRelaunch(false);
   }, [installAndRelaunch]);
 
-  // "Update & don't ask again" — FIRST persist the pref = ON (so future
-  // launches auto-install without this dialog), THEN the same install+relaunch.
+  // "Update & don't ask again" — runDialogInstall persists the pref = ON FIRST
+  // (so future launches auto-install without this dialog), THEN runs the same
+  // install+relaunch.
   const onUpdateDontAsk = useCallback(() => {
-    setAutoUpdateOn(true);
-    void installAndRelaunch();
+    void installAndRelaunch(true);
   }, [installAndRelaunch]);
 
-  // "Cancel" — just close. Pref is NOT touched, so the next launch re-checks
-  // and (if still available) shows this dialog again.
+  // "Cancel" — just close. Pref is NOT touched and no install command runs, so
+  // the next launch re-checks and (if still available) shows this dialog again.
   const onCancel = useCallback(() => {
     if (busy) return;
-    onClose();
-  }, [busy, onClose]);
+    runDialogCancel(deps, onClose);
+  }, [busy, deps, onClose]);
 
   const installed = state.phase === "installed";
   const errored = state.phase === "error";

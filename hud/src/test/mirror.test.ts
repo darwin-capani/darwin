@@ -149,8 +149,14 @@ describe("MirrorPanel", () => {
     expect(html).toContain("Recurring topic"); // facet label for "topic"
     expect(html).toContain("observed 5"); // the evidence chip's observed-count
     expect(html).toContain("2 sources"); // provenance source count
-    expect(html).toContain("that"); // the "that's wrong" contest control
-    expect(html.toLowerCase()).toContain("wrong");
+    // WHAT WENT WRONG BEFORE: `toContain("that")` and `toContain("wrong")` were
+    // both satisfied by the panel's static head ("...contest anything that is
+    // wrong.") and foot ("“That’s wrong” drops the belief..."), which render
+    // with ZERO beliefs. The test named for the contest control passed on a
+    // render with no BeliefRow and no button at all. Pin the button itself —
+    // note the component emits a curly apostrophe (U+2019).
+    expect(html).toContain("mirror-contest");
+    expect(html).toContain("that’s wrong");
     expect(html).toContain("1 contested"); // the suppressed count surfaced
     expect(html).toContain("Review only");
   });

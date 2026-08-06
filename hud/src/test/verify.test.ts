@@ -42,12 +42,16 @@ function render(status: VerifyStatus | null): string {
 
 /* The daemon's verify_telemetry shape (anthropic.rs verify_telemetry / the
  * verify_telemetry_is_secret_free_and_honest fixture). Gate ON, with each
- * possible outcome. The honest note is taken verbatim from the daemon. */
+ * possible outcome. The honest note is copied verbatim from the daemon — it had
+ * DRIFTED: this constant still ended "ships OFF by default." long after
+ * anthropic.rs:5368 was corrected to "ships ON (engaging only on important
+ * turns)." and config/darwin.toml:808 flipped `verify` to true, so the fixture
+ * that claimed to mirror the daemon contradicted it. */
 const NOTE =
   "A second self-check against the sources this turn used. It REDUCES " +
   "hallucination on important turns; it is NOT a correctness guarantee. " +
   "Runs only on important turns, at most one critique + one revise, and " +
-  "ships OFF by default.";
+  "ships ON (engaging only on important turns).";
 
 const verifiedClean: Record<string, unknown> = {
   verify_on: true,
@@ -70,8 +74,11 @@ const flagged: Record<string, unknown> = {
   note: NOTE,
 };
 
-/* The SHIPPED DEFAULT: [answers].verify OFF — outcome "off" + null badge. The
- * HUD must render NOTHING. */
+/* The gate-OFF turn: outcome "off" + null badge. NOTE this is NOT the shipped
+ * default — [answers].verify SHIPS ON (config/darwin.toml:808). This payload is
+ * what the daemon sends when the importance gate skipped the turn, or when the
+ * operator deliberately set the flag false. Either way the HUD must render
+ * NOTHING. */
 const verifyOff: Record<string, unknown> = {
   verify_on: false,
   outcome: "off",
@@ -197,7 +204,7 @@ describe("answer.verified reducer", () => {
 });
 
 describe("VerifyPanel", () => {
-  it("renders nothing when there is no status (shipped OFF default)", () => {
+  it("renders nothing when there is no status (no pass ran this turn)", () => {
     expect(render(null)).toBe("");
   });
 
@@ -220,7 +227,13 @@ describe("VerifyPanel", () => {
     expect(lower).toContain("does not eliminate");
     expect(lower).toContain("does not mean guaranteed-correct");
     expect(lower).toContain("important turns");
-    expect(lower).toContain("ships off");
+    // REGRESSION GUARD. This footer is only ever on screen BECAUSE the pass ran,
+    // and it used to end "ships OFF ([answers].verify)" — telling the user the
+    // feature was disabled while showing them its result. [answers].verify SHIPS
+    // ON (config/darwin.toml:808, config.rs AnswersConfig::default), so pin the
+    // honest posture AND pin the false one out.
+    expect(lower).toContain("ships on (<code>[answers].verify</code>)");
+    expect(lower).not.toContain("ships off");
   });
 
   it("surfaces the REVISED badge (the self-check corrected the answer)", () => {

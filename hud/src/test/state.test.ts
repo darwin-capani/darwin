@@ -1,4 +1,7 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import GlobalScanPanel from "../components/GlobalScanPanel";
 import type { TelemetryEnvelope } from "../core/events";
 import { CONFIDENCE_SEGMENTS, confidencePct, litSegments } from "../core/heal";
 import {
@@ -1064,8 +1067,39 @@ describe("micro-app: app.data feed relay", () => {
     const items = s.appFeeds[GS].items;
     // the non-object entry is dropped; the malformed object is coerced
     expect(items).toHaveLength(2);
-    expect(items[0]).toEqual({ title: "", source: "", url: "", published: "", category: "", summary: "" });
+    expect(items[0]).toEqual({ title: "", source: "", url: "", published: "", category: "", summary: "", flag: "" });
     expect(items[1].title).toBe("ok");
+  });
+
+  it("carries the app's ALERT FLAG through to the panel's red accent", () => {
+    // REGRESSION. apps/global-scan/main.py computes an alert verdict per
+    // headline (`_ALERT_RE`) and emits it as a SEPARATE `flag` field, because
+    // `category` is only ever a feeds.toml SECTION NAME (world / tech / science
+    // / markets). coerceFeedItem used to drop `flag` entirely and
+    // GlobalScanPanel derived its red accent from `category` against
+    // {breaking, alert, urgent} — values `category` never holds. So a breaking
+    // headline rendered identically to a routine tech item and the
+    // `.gs-item.alert` styling was unreachable.
+    const s = tel(
+      connected(),
+      appData(GS, {
+        items: [
+          gsItem({ title: "BREAKING: explosion downtown", category: "world", flag: "alert" }),
+          gsItem({ title: "a routine tech item", category: "tech", flag: "normal" }),
+        ],
+      }),
+    );
+    const items = s.appFeeds[GS].items;
+    expect(items[0].flag).toBe("alert"); // survives ingest
+    expect(items[1].flag).toBe("normal");
+
+    const html = renderToStaticMarkup(
+      createElement(GlobalScanPanel, { feed: s.appFeeds[GS], running: true }),
+    );
+    // Exactly ONE row lights red — the flagged one, whose category is "world".
+    expect(html.match(/class="gs-item alert"/g) ?? []).toHaveLength(1);
+    expect(html).toContain('class="gs-chip alert"');
+    expect(html).toContain('class="gs-item "'); // the routine item stays neutral
   });
 
   it("app.data with no name or a non-object payload is ignored (same reference)", () => {

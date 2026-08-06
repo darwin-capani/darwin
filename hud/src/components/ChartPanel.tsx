@@ -27,8 +27,11 @@ import Frame from "./Frame";
  *     unchanged and labelled with its real number).
  *   - HONEST EMPTY. `spec.empty` (re-derived by the parser from the surviving
  *     points) drives a plain "no data to chart" state — never a fabricated point.
- *   - SHIPPED OFF. The [chart].enabled gate ships false, so until it is enabled
- *     the daemon emits no chart.data and this panel renders NOTHING.
+ *   - SHIPS ON; THE PANEL IS EVENT-FED, NOT GATE-GATED. [chart].enabled ships
+ *     TRUE (config/darwin.toml:93; daemon/src/config.rs ChartConfig::default;
+ *     daemon/src/chart.rs) — "chart this" works out of the box. This panel still
+ *     renders NOTHING at rest, but that is because no chart.data has arrived yet,
+ *     NOT because a gate is off.
  *   - NEUTRAL + SECRET-FREE. A chart is pure presentation — no button, no action,
  *     no network. The wire carries only labels, axis strings, a title, and the
  *     numeric points.
@@ -106,8 +109,8 @@ function fmtTick(v: number): string {
 
 export default function ChartPanel({ spec }: { spec: ChartSpec | null }) {
   // Nothing to show until a chart.data arrives. The [chart].enabled gate ships
-  // OFF, so the reducer holds `chart` at null until it is enabled AND a chart op
-  // runs — render nothing rather than a placeholder (mirrors the other event-fed
+  // ON, so the reducer holds `chart` at null only until a chart op actually runs
+  // — render nothing rather than a placeholder (mirrors the other event-fed
   // panels).
   if (spec === null) return null;
 
@@ -127,8 +130,8 @@ export default function ChartPanel({ spec }: { spec: ChartSpec | null }) {
             segments only between the given points, no interpolation, no invented or
             extrapolated point. Axis ranges are derived from the data. An empty
             series shows &ldquo;no data&rdquo;, never a fabricated point. Charting is
-            neutral presentation (no action, no network) and ships OFF behind{" "}
-            <code>[chart].enabled</code>.
+            neutral presentation (no action, no network) and ships ON{" "}
+            (<code>[chart].enabled</code>) — set it false to disable.
           </div>
         </div>
       </Frame>
@@ -187,13 +190,28 @@ function ChartPlot({ spec }: { spec: ChartSpec }) {
         <text x={PAD_L - 4} y={PAD_T + PLOT_H} className="chart-tick-label y">
           {fmtTick(yr.min)}
         </text>
-        {/* x-axis tick labels — the REAL min/max of the data */}
-        <text x={PAD_L} y={PAD_T + PLOT_H + 14} className="chart-tick-label x start">
-          {fmtTick(xr.min)}
-        </text>
-        <text x={PAD_L + PLOT_W} y={PAD_T + PLOT_H + 14} className="chart-tick-label x end">
-          {fmtTick(xr.max)}
-        </text>
+        {/* x-axis tick labels — the REAL min/max of the data.
+            NOT drawn for a BAR chart. WHAT WENT WRONG: bars are placed purely by
+            INDEX (one slot per point, see SeriesGlyph), so a numeric min..max
+            axis beneath them asserted a value-mapping the renderer does not
+            have — points [0, 1, 100] and [0, 50, 100] drew byte-identical bars
+            under an axis labelled 0..100, and chart_from_snapshot's second bar
+            sat mid-plot under a right-edge "1" tick. Each bar still carries its
+            own REAL x in its <title>. */}
+        {spec.kind === "bar" ? (
+          <text x={PAD_L} y={PAD_T + PLOT_H + 14} className="chart-tick-label x start">
+            one slot per point (categorical)
+          </text>
+        ) : (
+          <>
+            <text x={PAD_L} y={PAD_T + PLOT_H + 14} className="chart-tick-label x start">
+              {fmtTick(xr.min)}
+            </text>
+            <text x={PAD_L + PLOT_W} y={PAD_T + PLOT_H + 14} className="chart-tick-label x end">
+              {fmtTick(xr.max)}
+            </text>
+          </>
+        )}
 
         {spec.series.map((s, i) => (
           <SeriesGlyph
@@ -266,14 +284,18 @@ function SeriesGlyph({
     // for multiple series are split across the slot so none overlaps; each bar's
     // height is the REAL value, never a fabricated one.
     const n = series.points.length;
-    // A slot per x position; when x values are distinct, space them by index so a
-    // single-series bar chart reads cleanly while still mapping x by value.
+    // CATEGORICAL PLACEMENT: one slot per point, spaced by INDEX. This does NOT
+    // map x by value (projectX is used only by the line/sparkline branch below),
+    // which is why the x-axis draws no numeric min/max ticks for bars — the two
+    // used to contradict each other. Each bar's real x rides its <title>.
     const baselineY = PAD_T + PLOT_H;
     return (
       <g className="chart-series bar" style={{ color: accent }}>
         {series.points.map((p, i) => {
           // Slot width: divide the plot among the points (by index), then narrow
-          // per series so grouped bars sit side by side without overlap.
+          // per series so grouped bars sit side by side without overlap. NOTE the
+          // no-overlap property holds only while every series has the SAME point
+          // count — `slot` is computed from this series' own `n`.
           const slot = PLOT_W / Math.max(1, n);
           const groupW = (slot * 0.7) / Math.max(1, seriesCount);
           const x0 = PAD_L + slot * i + slot * 0.15 + groupW * seriesIndex;

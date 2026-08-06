@@ -35,17 +35,20 @@ import Frame from "./Frame";
  *     macro stores only the recorded intents/utterances; a replay re-runs each
  *     command through the normal router + the gate fresh (no batch bypass).
  *
- * All three SHIP OFF behind their own flags, so the resting state is the honest
- * empty surface (which renders nothing — mirroring the other event-fed panels).
+ * All three SHIP ON (config/darwin.toml [drafts].enabled / [missions].durable /
+ * [macros].enabled all `true`; daemon/src/config.rs DraftsConfig / MissionsConfig
+ * / MacrosConfig defaults). The resting state is still the honest empty surface
+ * (which renders nothing — mirroring the other event-fed panels), but that means
+ * "no draft/mission/macro exists yet", NOT "the features are disabled".
  * The parsers in core/events.ts already drop malformed fields, so this component
  * never has to defend against junk shapes — it renders the bounded, clean data.
  */
 export default function ActionPanel({ action }: { action: ActionSurface }) {
   const { drafts, missions, macros } = action;
 
-  // Nothing on any of the three sub-surfaces yet (the shipped-OFF resting state)
-  // — render nothing rather than an empty placeholder, like the other event-fed
-  // panels. A feature only populates its section once the operator enables it.
+  // Nothing on any of the three sub-surfaces yet — render nothing rather than an
+  // empty placeholder, like the other event-fed panels. All three features are
+  // ON; a section populates as soon as a draft / mission / macro actually exists.
   if (drafts.length === 0 && missions.length === 0 && macros.length === 0) {
     return null;
   }

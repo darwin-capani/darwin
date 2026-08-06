@@ -106,7 +106,13 @@ describe("HandoffPanel", () => {
   it("shows OFF and the no-credentials / restore-parks / inert-transport footnotes", () => {
     const html = render(parseHandoffStatus(offWire));
     expect(html).toContain("HANDOFF // CONTINUITY");
-    expect(html).toContain("OFF");
+    // WHAT WENT WRONG BEFORE: `toContain("OFF")` matched the panel TITLE —
+    // "HAND-OFF-// CONTINUITY" literally contains "OFF" — so this test, the one
+    // named for the OFF pill, passed on an ARMED · PAIRED render. Pin the pill
+    // markup and pin the armed labels out.
+    expect(html).toContain("handoff-pill off");
+    expect(html).toContain(">OFF<");
+    expect(html).not.toContain("ARMED");
     expect(html).toContain("end-to-end encrypted");
     expect(html).toContain("carries NO credentials");
     expect(html).toContain("never restores permission");

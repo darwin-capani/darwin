@@ -1,4 +1,7 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import MemoryPanel from "../components/MemoryPanel";
 import {
   parseEpisodicRecorded,
   parseMemoryRetention,
@@ -10,6 +13,7 @@ import {
   initialState,
   reduce,
   type HudState,
+  type MemoryState,
 } from "../core/state";
 
 /* ------------------------------------------------------------------------ *
@@ -205,5 +209,77 @@ describe("memory reducer — user model + retention", () => {
     const s = initialState();
     expect(tel(s, env("user_model.consolidated", { entries_written: "x" }))).toBe(s);
     expect(tel(s, env("memory.retention", {}))).toBe(s);
+  });
+});
+
+/* ------------------------------------------------------------------------ *
+ * MemoryPanel — the WHAT DARWIN KNOWS ABOUT YOU section + the FORGET gate.   *
+ *                                                                            *
+ * WHAT WENT WRONG: the section's empty copy AND the FORGET control's          *
+ * enablement both hung off `memory.userModelEntries`, which is written ONLY   *
+ * by `user_model.consolidated` — emitted by the reflection task at most once  *
+ * per ~20h and NOT in telemetry.rs's sticky replay-on-connect set. The MIRROR *
+ * belief snapshot IS retained and IS replayed on connect. So after every HUD  *
+ * reload on a daemon that already held a profile, MIRROR listed the beliefs   *
+ * while MEMORY said "NOTHING OBSERVED YET" and refused FORGET with the false  *
+ * tooltip "nothing observed to forget yet".                                   *
+ * ------------------------------------------------------------------------ */
+describe("MemoryPanel — WHAT DARWIN KNOWS ABOUT YOU / FORGET gate", () => {
+  /** MemoryPanel calls inTauri(); the FORGET control is (correctly) disabled
+   *  outside the desktop shell, so stub the shell marker to observe the
+   *  hasModel gate itself. Restored after each render. */
+  function renderInShell(memory: MemoryState, beliefCount?: number): string {
+    const g = globalThis as { window?: unknown };
+    const had = "window" in g;
+    const prev = g.window;
+    g.window = { __TAURI_INTERNALS__: {} };
+    try {
+      return renderToStaticMarkup(
+        createElement(MemoryPanel, { memory, beliefCount }),
+      );
+    } finally {
+      if (had) g.window = prev;
+      else delete g.window;
+    }
+  }
+
+  /** The state a HUD really holds right after connecting to a daemon that has a
+   *  profile: no consolidation event has been replayed, so userModelEntries is
+   *  still null. */
+  const freshConnect = (): MemoryState => initialState().memory;
+
+  it("with a live MIRROR profile the FORGET control is ENABLED, even before any consolidation pass", () => {
+    const html = renderInShell(freshConnect(), 2);
+    expect(html).toContain("mem-forget-btn");
+    expect(html).not.toContain('class="mem-forget-btn" disabled=""');
+    expect(html).toContain("clear the whole observed user model");
+    expect(html).not.toContain("nothing observed to forget yet");
+    // ...and the section must not claim the profile is empty while MIRROR lists it.
+    expect(html).not.toContain("NOTHING OBSERVED YET");
+  });
+
+  it("with no profile at all the control stays disabled and says so honestly", () => {
+    const html = renderInShell(freshConnect(), 0);
+    expect(html).toContain('class="mem-forget-btn" disabled=""');
+    expect(html).toContain("nothing observed to forget yet");
+    expect(html).toContain("NOTHING OBSERVED YET");
+  });
+
+  it("prints the PROFILE SIZE as OBSERVED ENTRIES, not the last pass's write count", () => {
+    // The daemon's `entries_written` counts only what THIS pass wrote (the
+    // groups built from the most recent 200 shared-tier episodes + facts).
+    // Entries from earlier passes stay in the profile and are never re-counted,
+    // so a quiet cycle that wrote 0 used to render "0 OBSERVED ENTRIES" beside
+    // a MIRROR panel listing 7 beliefs.
+    const memory: MemoryState = {
+      ...freshConnect(),
+      userModelEntries: 0,
+      userModelConsolidatedAt: "2026-06-16T09:00:00Z",
+    };
+    const html = renderInShell(memory, 7);
+    expect(html).toContain('<span class="mem-um-num">7</span>');
+    expect(html).not.toContain('<span class="mem-um-num">0</span>');
+    // The pass's own write count is still surfaced — just labelled truthfully.
+    expect(html).toContain("WRITTEN LAST PASS");
   });
 });

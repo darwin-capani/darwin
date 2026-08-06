@@ -339,6 +339,18 @@ export interface FeedItem {
   published: string;
   category: string;
   summary: string;
+  /** The producing app's own ALERT VERDICT ("alert" | "normal"), distinct from
+   *  `category` (which is only ever a feeds.toml SECTION NAME: world / tech /
+   *  science / markets).
+   *
+   *  WHAT WENT WRONG: this field was dropped on ingest, and GlobalScanPanel
+   *  derived its red accent from `category` against a set of {breaking, alert,
+   *  urgent} — values `category` never holds. So the app computed the verdict
+   *  (main.py `_ALERT_RE`), sent it over the wire, and the reducer silently
+   *  discarded it: a breaking headline rendered identically to a routine tech
+   *  item, and the one signal the intel feed is meant to escalate never
+   *  escalated. */
+  flag: string;
 }
 
 /** Render-ready state for one running micro-app panel, keyed by app name in
@@ -1775,6 +1787,9 @@ function coerceFeedItem(o: Record<string, unknown>): FeedItem {
     published: str(o, "published") ?? "",
     category: str(o, "category") ?? "",
     summary: str(o, "summary") ?? "",
+    // The app's alert verdict — see FeedItem.flag. Absent/garbled reads as
+    // "normal", so a malformed frame can never fabricate a red alert.
+    flag: str(o, "flag") ?? "",
   };
 }
 

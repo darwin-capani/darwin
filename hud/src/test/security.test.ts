@@ -224,8 +224,14 @@ describe("StatusBar encryption chip", () => {
 
   it("renders ENCRYPTED in the on tone when the key actually resolved", () => {
     const html = renderStatusBar(parseSecurityStatus(mockActive));
-    expect(html).toContain("encryption-chip");
-    expect(html).toContain("on");
+    // WHAT WENT WRONG BEFORE: this asserted the bare word "on", which appears in
+    // the surrounding prose of EVERY render ("...impression", "confirmation"),
+    // and the sibling test asserted the bare word "idle", which appears in the
+    // neighbouring voiceid/modeltier chips of EVERY render. Neither could tell
+    // the two tones apart, so a wiring regression painting a green dot beside
+    // "NOT ENCRYPTED" was invisible. Assert the COMPOSED class.
+    expect(html).toContain("encryption-chip on");
+    expect(html).not.toContain("encryption-chip idle");
     expect(html).toContain("ENCRYPTED");
     // the honest hover copy: at-rest-on-disk only, the cipher + key location
     expect(html).toContain("AT REST ON DISK only");
@@ -238,7 +244,9 @@ describe("StatusBar encryption chip", () => {
       parseSecurityStatus({ encrypt_memory_config: false, active: false }),
     );
     expect(html).toContain("NOT ENCRYPTED");
-    expect(html).toContain("idle");
+    // Composed class, not the bare word — see the note above.
+    expect(html).toContain("encryption-chip idle");
+    expect(html).not.toContain("encryption-chip on");
   });
 
   it("renders NOT ENCRYPTED + an honest key-failed note when config-on but key failed", () => {

@@ -326,11 +326,35 @@ describe("EvalPanel render", () => {
   });
 
   it("shows OFF + PROPOSE-ONLY optimizer status with honest copy", () => {
+    // WHAT WENT WRONG BEFORE: this asserted the bare substrings "OFF",
+    // "PROPOSE-ONLY" and "never", every one of which comes from
+    // state-INDEPENDENT footer copy ("The optimizer is propose-only and ships
+    // OFF — it never tunes routing itself."). It therefore passed for ANY
+    // optimizer payload, including enabled / mode "auto" / posture
+    // "auto-apply". Assert the pill + posture markup the state actually drives.
     const out = html(parseEvalReport(measuredReport));
-    expect(out).toContain("OFF");
-    expect(out.toUpperCase()).toContain("PROPOSE-ONLY");
+    expect(out).toContain("eval-opt-pill off");
+    expect(out).toContain(">OFF<");
+    expect(out).toContain(">PROPOSE-ONLY<");
+    expect(out).not.toContain("eval-opt-pill on");
     // Honest: it never auto-tunes
     expect(out.toLowerCase()).toContain("never");
+  });
+
+  it("an ENABLED/auto-apply optimizer renders the ON pill and its real posture — the readout tracks state", () => {
+    // The companion case the substring assertions above could not distinguish.
+    // A regression that painted "ON · AUTO / AUTO-APPLY" (or that lost the
+    // wiring entirely) used to be invisible to this whole file.
+    const out = html(
+      parseEvalReport({
+        ...measuredReport,
+        optimizer: { enabled: true, mode: "auto", posture: "auto-apply" },
+      }),
+    );
+    expect(out).toContain("eval-opt-pill on");
+    expect(out).toContain(">ON · AUTO<");
+    expect(out).toContain(">AUTO-APPLY<");
+    expect(out).not.toContain("eval-opt-pill off");
   });
 
   it("shows AWAITING TURNS for an empty latency/cost window — never a fake number", () => {

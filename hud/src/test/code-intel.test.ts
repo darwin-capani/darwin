@@ -249,6 +249,24 @@ describe("CodeIntelPanel (grounded + propose-only, no auto-apply)", () => {
     expect(render({ explained: null, proposal: null, note: null })).toBe("");
   });
 
+  it("states the TRUE shipped posture — [code].enabled ships ON, the empty roots allowlist is the gate", () => {
+    // REGRESSION GUARD. config/darwin.toml:770 ships `enabled = true` and
+    // daemon/src/config.rs pins it ("code intelligence SHIPS ON (full-power
+    // default; inert without a root)") with `roots` asserted EMPTY. The footer
+    // used to read "The code index is on-device and ships OFF — enable
+    // [code].enabled and allowlist a root", telling the operator to flip a
+    // switch that was already on and hiding the real gate.
+    const html = render({
+      explained: null,
+      proposal: { ts: 1770000000, groundedHits: 3, at: "T" },
+      note: null,
+    });
+    const lower = html.toLowerCase();
+    expect(lower).toContain("ships on");
+    expect(lower).toContain("[code].roots");
+    expect(lower).not.toContain("ships off");
+  });
+
   it("shows a cited explanation: the question, the method, and the real file+offset", () => {
     const html = render({
       explained: {

@@ -42,7 +42,10 @@ function connected(at = 0): HudState {
  *  anthropic.rs::unified_search_tool emission: on-device sources searched, a
  *  connected cloud source (gmail) searched, two cloud sources skipped (slack not
  *  connected, calendar not requested). Hits CITE real (test) items, grouped by
- *  source in the daemon's deterministic ranked order. */
+ *  source ONLY because each source happens to contribute one hit here — the
+ *  daemon does NOT group by source (unified_search.rs sorts score DESC with the
+ *  source as a mere tie-break), which is why the interleaved fixture below
+ *  exists. */
 const searchedMixed: Record<string, unknown> = {
   query: "renewal clause",
   coverage: {
@@ -330,6 +333,40 @@ describe("UnifiedSearchPanel (grouped, cited, honest, review-only)", () => {
     expect(html).toContain("Past conversations");
     expect(html).toContain("Gmail");
     expect(html).toContain("REVIEW ONLY");
+  });
+
+  it("a source with SEVERAL interleaved hits gets ONE group with the RIGHT count", () => {
+    // THE case the fixture above cannot exercise (it has exactly one hit per
+    // source). unified_search.rs sorts score DESC with the source only as a
+    // tie-break, and scores are per-source max-normalized — so every source's
+    // top hit scores 1.0 and the merged list arrives INTERLEAVED. The panel used
+    // to group CONSECUTIVE runs, so this input rendered "Files 1 · Memory 1 ·
+    // Files 1 · Memory 1": the same header four times, each count reporting the
+    // length of a run instead of the source's real contribution.
+    const interleaved: Record<string, unknown> = {
+      query: "launch date",
+      coverage: { searched: ["docsearch", "facts"], skipped: [] },
+      hits: [
+        { source: "docsearch", source_label: "Files", citation: "/notes/launch.md (offset 0)", title: "launch.md", snippet: "a", score: 0.85, ts: null },
+        { source: "facts", source_label: "Memory", citation: "fact:user.launch_date", title: "launch_date", snippet: "b", score: 0.85, ts: null },
+        { source: "docsearch", source_label: "Files", citation: "/notes/plan.md (offset 0)", title: "plan.md", snippet: "c", score: 0.425, ts: null },
+        { source: "facts", source_label: "Memory", citation: "fact:user.launch_owner", title: "launch_owner", snippet: "d", score: 0.425, ts: null },
+      ],
+    };
+    const html = render(parseUnifiedSearchResult(interleaved));
+    // Exactly one group per source...
+    const heads = html.match(/class="unified-group-head"/g) ?? [];
+    expect(heads).toHaveLength(2);
+    expect(html.match(/class="unified-group-title">Files</g) ?? []).toHaveLength(1);
+    expect(html.match(/class="unified-group-title">Memory</g) ?? []).toHaveLength(1);
+    // ...each reporting its REAL contribution, not the length of a run.
+    const counts = [...html.matchAll(/class="unified-group-count">(\d+)</g)].map((m) => m[1]);
+    expect(counts).toEqual(["2", "2"]);
+    // Every hit is still rendered, none lost by the regrouping.
+    expect(html).toContain("/notes/launch.md (offset 0)");
+    expect(html).toContain("/notes/plan.md (offset 0)");
+    expect(html).toContain("fact:user.launch_date");
+    expect(html).toContain("fact:user.launch_owner");
   });
 
   it("renders each hit's REAL citation anchor + snippet + score", () => {

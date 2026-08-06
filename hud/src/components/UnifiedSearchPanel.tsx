@@ -173,19 +173,31 @@ function Results({ result }: { result: UnifiedSearchResult }) {
     );
   }
 
-  // Group consecutive hits by source. The daemon already sorted the merged list
-  // (score DESC, then a deterministic tie-break), grouping each source's hits
-  // together in rank order, so a single linear pass preserves that ranking while
-  // attributing every hit to its source header.
-  const groups: { source: UnifiedSource; label: string; hits: UnifiedHit[] }[] = [];
+  // Group ALL of a source's hits into ONE block, keyed by source.
+  //
+  // WHAT WENT WRONG: this used to group CONSECUTIVE runs, on the stated premise
+  // that "the daemon already sorted the merged list ... grouping each source's
+  // hits together in rank order". It does not. unified_search.rs sorts score
+  // DESC and uses the source only as a TIE-BREAK, and the scores are per-source
+  // max-normalized (`rel_norm = c.relevance / src_max`) — so EVERY source's top
+  // hit scores 1.0 and the merged list INTERLEAVES round-robin (A1, B1, A2,
+  // B2, …), the worst possible input for run-grouping. The cross-encoder rerank
+  // of the fused head permutes it further. The result was the same source header
+  // repeated ("Files 1 · Memory 1 · Files 1 · Memory 1") with a
+  // `unified-group-count` reporting the length of a RUN rather than the source's
+  // contribution — understating every source's reach in every multi-hit search,
+  // the exact opposite of this panel's purpose.
+  //
+  // A Map keyed by source preserves insertion order, so the group order is still
+  // the daemon's ranking (by each source's best hit) and every hit lands in its
+  // own source's block with a correct count.
+  const bySource = new Map<UnifiedSource, { source: UnifiedSource; label: string; hits: UnifiedHit[] }>();
   for (const h of result.hits) {
-    const last = groups[groups.length - 1];
-    if (last && last.source === h.source) {
-      last.hits.push(h);
-    } else {
-      groups.push({ source: h.source, label: h.sourceLabel, hits: [h] });
-    }
+    const g = bySource.get(h.source);
+    if (g) g.hits.push(h);
+    else bySource.set(h.source, { source: h.source, label: h.sourceLabel, hits: [h] });
   }
+  const groups = [...bySource.values()];
 
   return (
     <div className="unified-groups">

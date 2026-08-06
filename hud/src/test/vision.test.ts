@@ -856,13 +856,18 @@ describe("VisionPanel VISUAL DESCRIPTION readout (on-device VLM, honest)", () =>
     expect(html).not.toContain("DESCRIBED");
   });
 
-  it("shows an honest 'model not enabled / needs download' state when the VLM ships OFF", () => {
+  it("shows an honest 'model turned off / needs download' state, and does NOT claim the VLM ships OFF", () => {
     const html = renderPanel({ source: "image", available: false, vlm: false });
     expect(html).toContain("FALLBACK");
-    // renderToStaticMarkup HTML-escapes the apostrophe in "isn't".
-    expect(html.toLowerCase()).toContain("vision-language model isn&#x27;t enabled");
+    expect(html.toLowerCase()).toContain("vision-language model is turned off");
     expect(html.toLowerCase()).toContain("multi-gb model download");
     expect(html).toContain("MODEL OFF");
+    // REGRESSION GUARD. [vision].enabled SHIPS ON (config/darwin.toml:126,
+    // config.rs VisionConfig::default) and is INERT WITHOUT A MODEL. The copy
+    // used to read "so it ships OFF", sending a user who wanted the VLM to look
+    // for a switch that was already on instead of at the missing checkpoint.
+    expect(html.toLowerCase()).toContain("ships on by default");
+    expect(html.toLowerCase()).not.toContain("so it ships off");
   });
 });
 
@@ -970,15 +975,17 @@ describe("parseVisionSound (vision.sound — Apple Sound Analysis class readout)
 });
 
 /* ------------------------------------------------------------------------ *
- * parseAudioSoundMonitor (audio.sound_monitor — the OPT-IN monitor STATE).     *
- * Channel "local", emitted once at startup from [audio].sound_monitor (SHIPS    *
- * OFF + pinned). NEVER returns null — a malformed payload yields the honest     *
+ * parseAudioSoundMonitor (audio.sound_monitor — the monitor STATE).            *
+ * Channel "local", emitted once at startup from [audio].sound_monitor, which    *
+ * SHIPS ON (config/darwin.toml:17; the daemon pins it in                        *
+ * sound_monitor_ships_on_and_keys_are_known) and is INERT WITHOUT MIC/TCC.      *
+ * NEVER returns null — a malformed payload yields the honest                    *
  * fail-OFF snapshot (enabled:false) so a garbled event can never fake           *
  * "monitoring". LABELS-ONLY posture; consent is device_gated (macOS mic/TCC).   *
  * ------------------------------------------------------------------------ */
 
 describe("parseAudioSoundMonitor (audio.sound_monitor — opt-in monitor state)", () => {
-  it("parses the shipped-OFF state (the default — never auto-arms)", () => {
+  it("parses the disabled state (fail-OFF; never auto-arms)", () => {
     const m = parseAudioSoundMonitor({
       enabled: false,
       consent: "device_gated",
@@ -1155,13 +1162,13 @@ describe("VisionPanel SOUND-CLASS readout (on-device Apple Sound Analysis, hones
   });
 });
 
-describe("VisionPanel AMBIENT-MONITOR indicator (OPT-IN, ships OFF, honest)", () => {
+describe("VisionPanel AMBIENT-MONITOR indicator (SHIPS ON, mic/TCC-inert, honest)", () => {
   it("renders nothing monitor-specific before audio.sound_monitor arrives", () => {
     const html = renderSoundPanel(null, null);
     expect(html).not.toContain("AMBIENT SOUND MONITOR");
   });
 
-  it("shows OFF (the shipped default) — never auto-starts, honest copy", () => {
+  it("shows OFF when the operator disabled it — and does NOT call that the shipped default", () => {
     const html = renderSoundPanel(null, {
       enabled: false,
       consent: "device_gated",
@@ -1171,9 +1178,17 @@ describe("VisionPanel AMBIENT-MONITOR indicator (OPT-IN, ships OFF, honest)", ()
     expect(html).toContain("AMBIENT SOUND MONITOR");
     expect(html).toContain(">OFF<");
     expect(html).not.toContain("MONITORING");
-    expect(html.toLowerCase()).toContain("ships off and never auto-starts");
-    expect(html.toLowerCase()).toContain("opt-in + mic/tcc gated");
+    expect(html.toLowerCase()).toContain("turned off in config");
     expect(html.toLowerCase()).toContain("audio never leaves the device");
+    // REGRESSION GUARD. [audio].sound_monitor SHIPS ON (config/darwin.toml:17,
+    // config.rs:1307, pinned by the daemon's own
+    // sound_monitor_ships_on_and_keys_are_known). The disabled render used to
+    // read "OPT-IN monitor ships OFF and never auto-starts", presenting an armed
+    // mic-adjacent feature as something the user had opted into. Pin the honest
+    // posture and pin the false copy OUT.
+    expect(html.toLowerCase()).toContain("ships on, inert without mic/tcc");
+    expect(html.toLowerCase()).not.toContain("ships off");
+    expect(html.toLowerCase()).not.toContain("opt-in");
   });
 
   it("shows MONITORING when opted in, but states continuous capture is device-gated", () => {
@@ -1186,7 +1201,9 @@ describe("VisionPanel AMBIENT-MONITOR indicator (OPT-IN, ships OFF, honest)", ()
     expect(html).toContain("MONITORING");
     expect(html.toLowerCase()).toContain("continuous monitoring is device-gated");
     expect(html.toLowerCase()).toContain("macos mic/tcc consent");
-    expect(html.toLowerCase()).toContain("opt-in");
+    // The ENABLED render must also state the true posture, never "opt-in".
+    expect(html.toLowerCase()).toContain("the shipped default");
+    expect(html.toLowerCase()).not.toContain("opt-in");
   });
 
   it("surfaces the monitor indicator even while the Vision app feed is offline", () => {
@@ -1225,7 +1242,7 @@ describe("screen_context parsers (continuous screen context — secret-free post
     });
   });
 
-  it("folds the startup config (enabled / cap / interval_secs); enabled ships FALSE", () => {
+  it("folds the startup config (enabled / cap / interval_secs) — here the disabled case", () => {
     const sc = applyScreenContextConfigured(screenContextInitial(), {
       enabled: false,
       cap: 32,
@@ -1320,7 +1337,7 @@ describe("reducer: screen_context.* (continuous screen context, secret-free)", (
     expect(s.screenContext.watching).toBe(false);
   });
 
-  it("folds the startup configured snapshot (OFF-default: enabled false)", () => {
+  it("folds the startup configured snapshot (the operator-disabled case: enabled false)", () => {
     let s = connected();
     s = tel(s, {
       ...env(SCREEN_CONTEXT_CONFIGURED_EVENT, { enabled: false, cap: 32, interval_secs: 5 }),
@@ -1400,7 +1417,7 @@ describe("reducer: screen_context.* (continuous screen context, secret-free)", (
  * VisionPanel — the SCREEN CONTEXT readout (#42). The PROMINENT amber WATCHING  *
  * SCREEN indicator whenever the continuous loop is active (absent/dim when      *
  * OFF), the bounded recent-context summary (held N / cap M — NEVER raw text),   *
- * and the honest copy: OFF by default, TCC-device-gated, glyph-only never a     *
+ * and the honest copy: SHIPS ON but inert without Screen Recording consent,     *
  * person id, transient + bounded + forgettable, read-only.                     *
  * ------------------------------------------------------------------------ */
 
@@ -1426,13 +1443,20 @@ describe("VisionPanel SCREEN CONTEXT readout (#42 — prominent WATCHING, honest
     expect(html).toContain("VISION OFFLINE");
   });
 
-  it("shows the OFF-default resting state — NOT WATCHING, honest copy, no amber alert", () => {
+  it("shows the not-yet-configured resting state — NOT WATCHING, honest copy, no amber alert", () => {
     const html = renderScreenContextPanel(screenContextInitial());
     expect(html).toContain("SCREEN CONTEXT");
     expect(html).toContain("NOT WATCHING");
     expect(html).not.toContain("WATCHING SCREEN");
-    expect(html.toLowerCase()).toContain("off by default");
-    expect(html.toLowerCase()).toContain("never auto-starts");
+    // REGRESSION GUARD. [screen_context].enabled SHIPS ON (config/darwin.toml:122,
+    // config.rs ScreenContextConfig::default) — the MOST privacy-sensitive read
+    // in the product. This note renders in EVERY branch, including while the
+    // amber WATCHING SCREEN indicator is live, and it used to read "OFF by
+    // default · ... the continuous screen-read loop never auto-starts", telling a
+    // user auditing their own privacy posture the exact opposite of the truth.
+    expect(html.toLowerCase()).toContain("ships on, inert without screen recording consent");
+    expect(html.toLowerCase()).not.toContain("off by default");
+    expect(html.toLowerCase()).not.toContain("never auto-starts");
     // Honest empty ring.
     expect(html).toContain("No recent screen context");
   });

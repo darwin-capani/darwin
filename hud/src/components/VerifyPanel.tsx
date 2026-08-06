@@ -28,9 +28,15 @@ import Frame from "./Frame";
  *   - RUNS ONLY ON IMPORTANT TURNS, BOUNDED. The gate skips trivial turns; the
  *     pass is at most one critique + one revise — never an unbounded loop. The
  *     extra call is a latency/cost tradeoff, taken only when it is worth it.
- *   - SHIPPED OFF. [answers].verify ships false, so until it is deliberately
- *     enabled the daemon emits the "off" outcome (null badge) and this panel
- *     renders NOTHING — behavior is byte-for-byte today's.
+ *   - SHIPS ON; THE *IMPORTANT-TURN* GATE IS WHAT KEEPS IT QUIET. [answers].verify
+ *     ships TRUE (config/darwin.toml `verify = true`; daemon/src/config.rs
+ *     AnswersConfig::default) — the full-power default. This panel still renders
+ *     NOTHING most turns, but that is the importance gate skipping a trivial turn
+ *     (the daemon emits the "off" outcome with a null badge), NOT a disabled
+ *     feature. WHAT WENT WRONG: commit ae1a08a flipped the default false -> true
+ *     and this doc, the footer copy, and verify.test.ts were never updated, so the
+ *     panel appeared ONLY when the pass had demonstrably run and then told the
+ *     user the pass ships off.
  *   - SECRET-FREE. The wire carries only the gate flag, the outcome token, the
  *     derived badge, and honest copy — never the flagged-claim text, never any
  *     content beyond the answer, never an embedding/audio/secret.
@@ -49,10 +55,11 @@ export default function VerifyPanel({
   status: VerifyStatus | null;
 }) {
   // Nothing to show until an answer.verified carries a real outcome. The
-  // [answers].verify gate ships OFF, so the reducer holds `verifyStatus` at null
-  // (and clears it whenever the pass did not run this turn) — render nothing
-  // rather than a placeholder, mirroring the other event-fed panels
-  // (AnswerSourcesPanel, DocSearchPanel, UnifiedSearchPanel).
+  // [answers].verify gate ships ON, but it engages only on IMPORTANT turns, so the
+  // reducer holds `verifyStatus` at null on every other turn (and clears it
+  // whenever the pass did not run) — render nothing rather than a placeholder,
+  // mirroring the other event-fed panels (AnswerSourcesPanel, DocSearchPanel,
+  // UnifiedSearchPanel).
   if (status === null || status.badge === null) return null;
 
   return (
@@ -78,7 +85,8 @@ export default function VerifyPanel({
             self-check found nothing to flag. The check is the model grading
             itself against the real sources it consulted, not a measured accuracy
             score. It runs only on important turns, is at most one critique plus
-            one revise, and ships OFF (<code>[answers].verify</code>).
+            one revise, and ships ON (<code>[answers].verify</code>) — engaging
+            only on important turns; set it false to disable.
           </div>
         </div>
       </Frame>

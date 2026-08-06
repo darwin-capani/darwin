@@ -292,8 +292,12 @@ body,
 
 /* Hover "alive" state: the panel rises a hair and its cyan glow strengthens,
    the corner brackets brighten, and a single light-streak sweeps the title bar
-   once. Pointer-only (hover: hover) so touch/keyboard never trigger it; fully
-   neutralized under prefers-reduced-motion (see the a11y section). */
+   once. Pointer-only (hover: hover) so touch/keyboard never trigger it; the
+   2px LIFT is neutralized under prefers-reduced-motion by the a11y section's
+   `.frame:hover { transform: none !important }` — the !important is load-bearing,
+   because the MK III block re-declares `.frame:hover` at equal specificity much
+   later in the file and would otherwise win. (The glow change is a colour
+   change, not motion, and is deliberately kept.) */
 @media (hover: hover) {
   .frame:hover {
     transform: translateY(-2px);
@@ -902,9 +906,30 @@ svg.tri circle {
 /* ------------------------------------------------ self-heal proposal panel */
 /* SELF-REPAIR // PROPOSALS. A pending/validated proposal (and the in-flight
  * diagnosis) is an ATTENTION state, not an error: it leans on --warn-amber.
- * --alert-red is NOT used anywhere in this panel — that colour is reserved
- * for the rejected/blocked banner (.alert-panel.red). Display-and-guide only:
- * the apply command is surfaced as read-only text, never a one-click action. */
+ *
+ * TWO CORRECTIONS — this header used to claim (a) that --alert-red is NOT used
+ * anywhere in this panel and (b) that the surface is "display-and-guide only:
+ * the apply command is surfaced as read-only text, never a one-click action".
+ * Both were false about rules INSIDE this same section, and it is the most
+ * safety-sensitive posture statement on the self-repair surface — a reviewer
+ * auditing what the HUD can mutate would have concluded SELF-REPAIR cannot
+ * trigger an apply, and would have read the (correct) red failure styling as a
+ * colour-vocabulary violation to be removed. The truth:
+ *
+ *   (a) --alert-red appears on EXACTLY ONE rule here, `.sh-apply-status.failed`,
+ *       for a real failure of a live-mutation attempt (see the note above that
+ *       rule). Everywhere else red stays reserved for the rejected/blocked
+ *       banner (.alert-panel.red).
+ *   (b) SELF-REPAIR ships a HUMAN-GATED TWO-STEP apply — `.sh-apply` /
+ *       `.sh-apply.confirm` ("ACCEPT & APPLY" -> "CONFIRM — APPLY & REBUILD",
+ *       SelfHealPanel.tsx), whose second click invokes `heal_apply` and runs
+ *       scripts/apply_heal.sh <ts> --yes. It is human-gated, NOT auto-heal, and
+ *       it is a real mutation path — in ADDITION to the read-only `.sh-cmd`
+ *       terminal line.
+ *
+ * SELF-FORGE, which shares this section's chrome, genuinely is review-only —
+ * see its own note below. Keep these three (here, the .sh-apply-status note,
+ * and SelfHealPanel.tsx's contract block) in agreement. */
 
 /* Centered modal (was docked top-right, where it collided with the
  * constellation roster + diagnostics, then center, where it hit Global-Scan —
@@ -915,9 +940,12 @@ svg.tri circle {
 /* SELF-FORGE // PROPOSALS shares the exact same review-modal posture: a
  * validated, sandboxed micro-app proposed for HUMAN REVIEW is an attention
  * state (warn-amber), display-and-guide ONLY — the apply command is read-only
- * text, never a one-click action. Forge ships OFF by default, so this surface
- * is rare. Both panels reuse the .sh-* card internals + .frame.self-heal.attn
- * chrome below; only the wrapper selector differs. */
+ * text, never a one-click action (ForgePanel.tsx: "REVIEW-ONLY. There is
+ * deliberately NO button that applies/deploys/installs") — this is the claim
+ * that was wrongly generalized to SELF-REPAIR in the section header above.
+ * Forge ships OFF by default, so this surface is rare. Both panels reuse the
+ * .sh-* card internals + .frame.self-heal.attn chrome below; only the wrapper
+ * selector differs. */
 .self-heal-panel,
 .forge-panel {
   position: fixed;
@@ -950,8 +978,35 @@ svg.tri circle {
   overflow: auto;
   pointer-events: auto;
   font-family: var(--mono);
-  animation: alertIn 240ms cubic-bezier(0.33, 1, 0.68, 1);
+  /* modalIn, NOT alertIn.
+     WHAT WENT WRONG: this card is centred by the FLEXBOX on its parent
+     (.self-heal-panel / .forge-panel above), but it borrowed @keyframes alertIn,
+     which is written for .alert-panel — an element that centres ITSELF with
+     `left: 50%; transform: translateX(-50%)`. alertIn therefore hard-codes that
+     -50% into both keyframes, and an animation's transform WINS over the
+     element's own layout. Measured (headless Chrome, 1440x900): the 460px card
+     sat at OFFSET -230px — exactly half its width — for the whole 240ms
+     entrance and then snapped back to centre, a travel the .frame transform
+     transition stretched to ~460ms. On a narrow window (max-width: 100vw - 44px)
+     that is nearly half the viewport, so the card entered partly off the left
+     edge — in the surface whose section comment justifies it as "no panel
+     collision, clearly an attention layer". @keyframes alertIn is left untouched
+     for .alert-panel, which needs the -50%. */
+  animation: modalIn 240ms cubic-bezier(0.33, 1, 0.68, 1);
   filter: drop-shadow(0 14px 54px rgba(0, 0, 0, 0.7));
+}
+
+/* Entrance for a FLEX-CENTRED modal card: translate only on Y, so the parent's
+   centring is preserved for every frame. */
+@keyframes modalIn {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 /* Opaque surface so nothing bleeds through the card. */
@@ -4673,9 +4728,20 @@ svg.tri circle {
 
 /* FIRST-RUN SETUP — the install gate. Sits ABOVE every other overlay (it is the
    pre-backend state, so nothing else is meaningfully interactive yet) and is a
-   touch wider so the honest multi-paragraph copy stays readable. */
+   touch wider so the honest multi-paragraph copy stays readable.
+   WHAT WENT WRONG: that "above every other overlay" claim was written when 60
+   was the top of the ladder, and stayed put while two later overlays were added
+   ABOVE it — .palette-backdrop (65, PR #109) and .about-backdrop (70). Both are
+   siblings under <div class="hud"> and neither is gated on showSetup, so Cmd-K
+   or the native About item painted a scrim + 3px blur OVER the only surface the
+   user can act on before the backend exists, and took the hit-test. Measured in
+   headless Chrome: the topmost element at the viewport centre was the About
+   panel, and with the palette open it was .palette-backdrop. 95 puts the gate
+   above the whole modal tier while staying below the takeover exit (100) and
+   the boot reveal (9999). Anything added above 60 from here must stay below
+   this. */
 .first-run-setup-backdrop {
-  z-index: 60;
+  z-index: 95;
 }
 
 .first-run-setup {
@@ -6060,8 +6126,9 @@ svg.tri circle {
    (arbitrary code execution). It mirrors the confirm-park + code-apply postures:
    a consequential action shown READ-ONLY with NO control that runs anything. The
    command parks for the user's SPOKEN confirm and never auto-runs. Cyan =
-   neutral/command; amber = the honest review-only attention states (OFF, parked,
-   denied, executing — NOT alerts); green = a clean run (exit 0); --alert-red is
+   neutral/command (including EXECUTING, which is cyan-bright); amber = the
+   honest review-only attention states (OFF, parked, denied — NOT alerts);
+   green = a clean run (exit 0); --alert-red is
    used ONLY for the genuinely-bad run signals (nonzero exit, timed out). The
    panel deliberately has NO button/link — the daemon never puts a command's
    output on the wire, so NONE is ever rendered. */
@@ -6081,8 +6148,13 @@ svg.tri circle {
   border-radius: 3px;
   border: 1px solid currentColor;
 }
-/* Honest review-only attention (OFF / parked / denied / executing / blocked) is
-   AMBER — red is reserved for the genuinely-bad run signals only. */
+/* Honest review-only attention (OFF / parked / denied / blocked) is AMBER;
+   EXECUTING is CYAN-BRIGHT (a neutral in-flight state, matching the ACTUATE
+   panel's "actuating is cyan-bright"); red is reserved for the genuinely-bad
+   run signals only. This comment used to list `executing` among the amber
+   states while the rule three lines below painted it --cyan-bright, so the
+   file's own documented colour vocabulary was wrong for that state and a later
+   edit "preserving the palette" would have repainted the wrong thing. */
 .shell-pill.off { color: var(--warn-amber); }
 .shell-pill.note { color: var(--warn-amber); }
 .shell-pill.denied { color: var(--warn-amber); }
@@ -7983,6 +8055,16 @@ svg.tri circle {
   color: #5f7184;
 }
 
+/* The last consolidation pass's write count, shown beside the profile size. Same
+   treatment as .mem-um-when — without a rule it inherits the 16px proportional
+   body face and renders nearly twice the size of its siblings in this stack. */
+.mem-um-written {
+  font-family: var(--mono);
+  font-size: 8.5px;
+  letter-spacing: 0.06em;
+  color: #5f7184;
+}
+
 .mem-um-stale {
   font-family: var(--mono);
   font-size: 8.5px;
@@ -8245,8 +8327,24 @@ textarea:focus-visible,
     transition-delay: 0ms !important;
     scroll-behavior: auto !important;
   }
+  /* !important, deliberately.
+     WHAT WENT WRONG: this neutralizer is (0,2,0) and so is the MK III
+     `@media (hover: hover) { .frame:hover { transform: translateY(-2px) } }`
+     927 lines below — media queries add no specificity, so the LATER rule won
+     and this one never took effect. Every one of the ~60 panels still jumped
+     2px under the cursor for a user who had explicitly asked the OS for less
+     motion, and (because the global reset above also forces
+     transition-duration to 0.01ms) the jump was an instant snap, which reads as
+     jitter. The a11y block must not lose to a later cosmetic append, so the
+     override is marked important rather than being moved (a future append
+     would re-break a source-order fix). Note the global reset above only zeroes
+     animation/transition DURATIONS — it never removes a transform, so a
+     transform lift is not "auto-neutralized" by it. */
   .frame:hover {
-    transform: none;
+    transform: none !important;
+  }
+  .deck-card:hover {
+    transform: none !important;
   }
   .frame-title::after {
     display: none;
@@ -8603,10 +8701,15 @@ textarea:focus-visible,
   }
 }
 
-.cmd-deck-frame {
+.frame.cmd-deck-frame {
   /* float it on the top of the elevation ladder + a cyan rim glow, and let it
-     spring in from slightly small/low (transform-origin centered). */
-  filter: drop-shadow(var(--elev-3)) drop-shadow(0 0 28px rgba(26, 214, 255, 0.2));
+     spring in from slightly small/low (transform-origin centered).
+     Selector note: this must out-specify the generic `.frame { filter: … }` in
+     the MK III block, which is later in source order and would otherwise
+     REPLACE this at equal (0,1,0) specificity (filter is not additive) —
+     leaving the deck with the plain panel glow instead of its elevation.
+     Token note: --elev-3-drop, not --elev-3 — see the MK III :root block. */
+  filter: drop-shadow(var(--elev-3-drop)) drop-shadow(0 0 28px rgba(26, 214, 255, 0.2));
   animation: deckIn var(--dur-slow) var(--ease-out);
 }
 @keyframes deckIn {
@@ -8648,7 +8751,7 @@ textarea:focus-visible,
      so hovering the panel keeps its depth instead of shrinking it. */
   .frame.cmd-deck-frame:hover {
     transform: translateY(-2px);
-    filter: drop-shadow(var(--elev-3)) drop-shadow(0 0 32px rgba(26, 214, 255, 0.26));
+    filter: drop-shadow(var(--elev-3-drop)) drop-shadow(0 0 32px rgba(26, 214, 255, 0.26));
   }
   .cmd-btn {
     transition:
@@ -9093,8 +9196,12 @@ textarea:focus-visible,
    refinement over the existing FUI: richer frosted glass, a luminous reactor
    seat, cinematic atmosphere, iridescent edges, and precise data typography.
    Pure material quality — no layout changes. Offline-first: no remote fonts
-   or network assets. New motion is inherited from the shared easing tokens and
-   auto-neutralized by the global prefers-reduced-motion reset above.
+   or network assets. New motion is inherited from the shared easing tokens, and
+   the global prefers-reduced-motion reset above zeroes its DURATIONS — note
+   that reset only touches animation/transition timing, it does NOT remove a
+   transform, so any hover/entrance TRANSFORM added here must be neutralized by
+   an explicit rule in the a11y section (which is earlier in source order, so
+   such rules carry !important to survive this block's re-declarations).
    =================================================================== */
 :root {
   /* Frosted glass tuned for more depth + clarity. */
@@ -9116,6 +9223,20 @@ textarea:focus-visible,
     0 1px 0 rgba(140, 246, 255, 0.1),
     0 30px 70px -20px rgba(0, 4, 10, 0.8),
     0 10px 30px -14px rgba(0, 6, 14, 0.7);
+
+  /* A drop-shadow-LEGAL elevation token, for the Command Deck's `filter`.
+     WHAT WENT WRONG: --elev-3 was authored (line 73) as a SINGLE shadow, which
+     is legal inside `drop-shadow()`, and .cmd-deck-frame consumed it that way.
+     This MK III block then redefined it as a THREE-shadow comma list with
+     spread radii — fine for `box-shadow`, but `drop-shadow()` takes
+     `<length>{2,3}` + a colour and accepts NO comma list. The substituted value
+     was therefore invalid, which makes the WHOLE `filter` declaration invalid
+     at computed-value time, so it computed to `filter: none`. The deck never
+     got its elev-3 float or cyan rim glow, and the higher-specificity hover
+     rule written specifically to STOP the deck losing depth was what deleted
+     it: hovering the panel collapsed the floating modal flat onto the scrim.
+     Keep the two tokens separate — box-shadow uses --elev-3, filter uses this. */
+  --elev-3-drop: 0 22px 60px rgba(1, 4, 9, 0.66);
 }
 
 /* Cinematic void: deepen the gradient + add a faint third aurora so the

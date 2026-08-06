@@ -263,6 +263,18 @@ describe("ChartPanel render", () => {
     expect(render(null)).toBe("");
   });
 
+  it("states the TRUE shipped posture in the footer — charting SHIPS ON, never 'ships OFF'", () => {
+    // REGRESSION GUARD. [chart].enabled ships TRUE (config/darwin.toml:93,
+    // daemon/src/config.rs ChartConfig::default, daemon/src/chart.rs), so "chart
+    // this" works out of the box. The footer used to read "...and ships OFF
+    // behind [chart].enabled" — a false statement about the shipped config,
+    // rendered on a panel that is ONLY on screen because the gate is on.
+    const html = render(parseChartSpec(linePayload)!);
+    const lower = html.toLowerCase();
+    expect(lower).toContain("ships on");
+    expect(lower).not.toContain("ships off");
+  });
+
   it("plots EXACTLY the emitted points (one polyline vertex per given point)", () => {
     const spec = parseChartSpec(linePayload)!;
     const html = render(spec);
@@ -295,6 +307,46 @@ describe("ChartPanel render", () => {
     const html = render(spec);
     const bars = html.match(/class="chart-bar"/g) ?? [];
     expect(bars).toHaveLength(3);
+  });
+
+  it("a BAR chart draws NO numeric x axis — bars are placed by index, not by value", () => {
+    // WHAT WENT WRONG: bars are positioned purely by index
+    // (`PAD_L + slot * i + …`; projectX is used only by the line branch), while
+    // the x axis beneath them was labelled with the data's real min/max. Two
+    // different datasets therefore drew byte-identical bars under an axis that
+    // said otherwise.
+    const wide = parseChartSpec({
+      ...linePayload,
+      kind: "bar",
+      series: [{ label: "s", points: [[0, 1], [1, 1], [100, 1]] }],
+    })!;
+    const spread = parseChartSpec({
+      ...linePayload,
+      kind: "bar",
+      series: [{ label: "s", points: [[0, 1], [50, 1], [100, 1]] }],
+    })!;
+    const wideHtml = render(wide);
+    const spreadHtml = render(spread);
+
+    // The geometry really is index-based — the two datasets place bars alike...
+    const rects = (h: string) => [...h.matchAll(/class="chart-bar" x="([\d.]+)"/g)].map((m) => m[1]);
+    const rectsAlt = (h: string) => [...h.matchAll(/<rect[^>]*x="([\d.]+)"[^>]*class="chart-bar"/g)].map((m) => m[1]);
+    const wideX = rects(wideHtml).length > 0 ? rects(wideHtml) : rectsAlt(wideHtml);
+    const spreadX = rects(spreadHtml).length > 0 ? rects(spreadHtml) : rectsAlt(spreadHtml);
+    expect(wideX).toHaveLength(3);
+    expect(wideX).toEqual(spreadX);
+
+    // ...so the axis must NOT claim a numeric mapping.
+    expect(wideHtml).toContain("one slot per point (categorical)");
+    expect(wideHtml).not.toMatch(/class="chart-tick-label x end"/);
+    // The real x of each bar is still carried, honestly, per bar.
+    expect(wideHtml).toContain("x=100");
+    expect(spreadHtml).toContain("x=50");
+
+    // The LINE chart keeps its honest numeric axis.
+    const lineHtml = render(parseChartSpec(linePayload)!);
+    expect(lineHtml).toMatch(/class="chart-tick-label x end"/);
+    expect(lineHtml).not.toContain("one slot per point (categorical)");
   });
 
   it("renders the honest-empty state for an empty spec — never a fabricated point", () => {

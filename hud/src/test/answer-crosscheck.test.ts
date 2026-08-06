@@ -374,7 +374,12 @@ describe("AnswerCrossCheckPanel", () => {
     const lower = html.toLowerCase();
     expect(lower).toContain("never removes a confirmation gate");
     expect(lower).toContain("not a correctness guarantee");
-    expect(lower).toContain("ships off");
+    // REGRESSION GUARD. [answers].cross_check SHIPS ON (config/darwin.toml:809,
+    // config.rs:3566). This footer is only on screen BECAUSE the pass ran, and it
+    // used to end "Ships OFF ([answers].cross_check)" — a live CHECKED badge next
+    // to a claim that the pass producing it was disabled.
+    expect(lower).toContain("ships on (<code>[answers].cross_check</code>)");
+    expect(lower).not.toContain("ships off");
   });
 
   it("surfaces the UNVERIFIED badge (a check tripped, confidence downgraded)", () => {
@@ -386,7 +391,14 @@ describe("AnswerCrossCheckPanel", () => {
   it("surfaces the CORROBORATED badge (two models agreed, raises confidence)", () => {
     const html = render(null, parseDebateStatus(debateAgree));
     expect(html).toContain("CORROBORATED");
-    expect(html.toLowerCase()).toContain("agreed");
+    const lower = html.toLowerCase();
+    expect(lower).toContain("agreed");
+    // REGRESSION GUARD, same defect as the CHECKED footer above: [answers].debate
+    // SHIPS ON (config/darwin.toml:811, config.rs AnswersConfig::default), and
+    // this footer is only on screen BECAUSE the debate ran. It used to read
+    // "ships OFF ([answers].debate)" beside a live CORROBORATED badge.
+    expect(lower).toContain("ships on (<code>[answers].debate</code>)");
+    expect(lower).not.toContain("ships off");
   });
 
   it("surfaces DISPUTED honestly — models disagree, both surfaced (never hidden)", () => {

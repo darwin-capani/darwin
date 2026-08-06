@@ -95,16 +95,19 @@ import { hasSeenOnboarding, markOnboardingSeen } from "./core/onboarding";
 import type { OnboardingRouteTarget } from "./core/onboarding";
 import { activeConsensusAdvisory, activePlanDiff, initialState, reduce } from "./core/state";
 import {
+  handleTakeoverKey,
   initialTakeoverState,
-  isExitKey,
+  runEnterTakeover,
+  runExitTakeover,
   takeoverReduce,
+  type TakeoverHandlerDeps,
 } from "./core/takeover";
 import { backendInstalled, bindFullscreenKey, checkForUpdates, inTauri, onAboutMenu, relaunchApp } from "./tauri/bridge";
 import { decideShowSetup } from "./core/firstRunSetup";
 import {
-  decideLaunchUpdateAction,
   isAutoUpdateOn,
-  silentUpdateNotice,
+  runLaunchUpdate,
+  setAutoUpdateOn,
 } from "./core/autoUpdate";
 import { sendCommand } from "./tauri/command";
 import { enterTakeover as invokeEnterTakeover, exitTakeover as invokeExitTakeover } from "./tauri/takeover";
@@ -230,18 +233,24 @@ export default function App() {
   // window (graceful no-op outside the Tauri shell, so a windowed dev/vitest
   // session can still preview the takeover LAYOUT). The visible EXIT control and
   // the Esc handler below both call exitTakeover.
+  const takeoverDeps = useMemo<TakeoverHandlerDeps>(
+    () => ({
+      dispatch: takeoverDispatch,
+      enter: invokeEnterTakeover,
+      exit: invokeExitTakeover,
+    }),
+    [],
+  );
   const enterTakeover = useCallback(() => {
-    takeoverDispatch({ type: "enter" });
-    void invokeEnterTakeover();
-  }, []);
+    runEnterTakeover(takeoverDeps);
+  }, [takeoverDeps]);
 
   // EXIT — the always-available escape hatch. Clears the HUD bit AND asks the
   // backend to reverse every window mutation + restore the Dock/menu bar. Both
   // the in-HUD EXIT control and the Esc key route here. Idempotent + total.
   const exitTakeover = useCallback(() => {
-    takeoverDispatch({ type: "exit" });
-    void invokeExitTakeover();
-  }, []);
+    runExitTakeover(takeoverDeps);
+  }, [takeoverDeps]);
 
   // PANIC / LOCKDOWN (task #12) — the prominent emergency stop. The StatusBar
   // PANIC button fires the DEDICATED `panic` verb (NOT {cmd:"ask"}), so a panic
@@ -472,26 +481,26 @@ export default function App() {
     void (async () => {
       const result = await checkForUpdates(false);
       if (cancelled) return;
-      const action = decideLaunchUpdateAction(result, isAutoUpdateOn());
-      if (action.kind === "none") return; // honest quiet launch
-      if (action.kind === "dialog") {
-        setUpdateDialogVersion(action.version);
-        return;
-      }
-      // action.kind === "silent": pref is ON. Show a brief honest notice, then
-      // install through the SAME signed backend command and relaunch — no
-      // dialog, but never a silent surprise.
-      dispatch({ type: "notice.toast", text: silentUpdateNotice(action.version), at: Date.now() });
-      const installed = await checkForUpdates(true);
-      if (cancelled) return;
-      if (installed.status === "installed") {
-        await relaunchApp();
-        // If relaunch is unavailable the new binary still applies on the next
-        // manual restart; we do not claim it finished.
-      }
-      // A non-"installed" result (e.g. an install error) is left to the manual
-      // UpdatesSection on the next check — the launch path stays non-blocking
-      // and never claims a success that did not happen.
+      // The branch body lives in core/autoUpdate.ts (runLaunchUpdate) so the
+      // suite can drive THIS code rather than a copy of it — see the note
+      // there. "none" -> honest quiet launch; "dialog" -> open the modal naming
+      // the real version; "silent" (pref ON) -> honest notice, then the SAME
+      // signed backend command + relaunch, never a silent surprise. A
+      // non-"installed" result is left to the manual UpdatesSection on the next
+      // check — the launch path stays non-blocking and never claims a success
+      // that did not happen.
+      await runLaunchUpdate(
+        {
+          check: checkForUpdates,
+          relaunch: relaunchApp,
+          persistPref: setAutoUpdateOn,
+          notify: (text) => dispatch({ type: "notice.toast", text, at: Date.now() }),
+        },
+        result,
+        isAutoUpdateOn(),
+        setUpdateDialogVersion,
+        () => cancelled,
+      );
     })();
     return () => {
       cancelled = true;
@@ -514,10 +523,9 @@ export default function App() {
           target.tagName === "TEXTAREA" ||
           target.tagName === "SELECT" ||
           target.isContentEditable);
-      if (takeoverActive && isExitKey(ev.key)) {
+      if (handleTakeoverKey(takeoverActive, ev.key, takeoverDeps)) {
         // Highest-priority binding: Esc always leaves takeover.
         ev.preventDefault();
-        exitTakeover();
         return;
       }
       // Cmd-K toggles the command palette. Checked BEFORE the typing guard so it
@@ -758,7 +766,11 @@ export default function App() {
           <SessionRewindPanel rewind={state.sessionRewind} />
           <CausaTracePanel trace={state.causaTrace} />
           <MirrorPanel mirror={state.mirror} onContest={contestBelief} />
-          <MemoryPanel memory={state.memory} />
+          {/* The live profile size rides the MIRROR snapshot (sticky-retained,
+              so a reconnecting HUD gets it immediately) — MemoryPanel needs it
+              or its FORGET control is dead until the next ~20-hourly
+              consolidation pass. */}
+          <MemoryPanel memory={state.memory} beliefCount={state.mirror?.beliefs.length ?? 0} />
           <EvalPanel report={state.evalReport} proposal={state.optimizerProposal} />
           <SpendMeter spend={state.obolSpend} />
           <SkillsPanel skills={state.skills} />

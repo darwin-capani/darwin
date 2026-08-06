@@ -60,7 +60,27 @@ function clock(ts: string): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
-export default function MemoryPanel({ memory }: { memory: MemoryState }) {
+export default function MemoryPanel({
+  memory,
+  beliefCount = 0,
+}: {
+  memory: MemoryState;
+  /** How many beliefs the LIVE user-model profile holds, from the MIRROR
+   *  snapshot (`mirror.belief` action "snapshot", built by the daemon from
+   *  user_model::snapshot). App passes `state.mirror?.beliefs.length`.
+   *
+   *  WHAT WENT WRONG: this panel used to infer "a profile exists" purely from
+   *  `memory.userModelEntries`, which is set ONLY by `user_model.consolidated`
+   *  — an event the reflection task emits at most once per ~20h
+   *  (reflect.rs STALENESS_SECS), that is NOT in telemetry.rs's sticky
+   *  replay-on-connect set, and that therefore never arrives on a fresh HUD
+   *  start. The mirror snapshot IS retained and IS replayed on connect. So on
+   *  every HUD reload, MIRROR listed the beliefs DARWIN holds while MEMORY said
+   *  "NOTHING OBSERVED YET" and disabled the FORGET control with the false
+   *  tooltip "nothing observed to forget yet" — for up to ~20 hours, precisely
+   *  when a user who had just read their profile would reach for it. */
+  beliefCount?: number;
+}) {
   const shell = inTauri();
   const { timeline } = memory;
   const kept = memory.recordedCount;
@@ -126,7 +146,7 @@ export default function MemoryPanel({ memory }: { memory: MemoryState }) {
             <span className="mem-section-note">observed profile · not certain</span>
           </div>
 
-          {memory.userModelEntries === null ? (
+          {beliefCount === 0 && memory.userModelEntries === null ? (
             <div className="mem-empty">
               NOTHING OBSERVED YET — the profile compounds from repeated signals
               across your turns; one-off mentions are not kept
@@ -134,12 +154,27 @@ export default function MemoryPanel({ memory }: { memory: MemoryState }) {
           ) : (
             <div className="mem-um">
               <div className="mem-um-stat">
-                <span className="mem-um-num">{memory.userModelEntries}</span>
+                {/* The PROFILE SIZE, from the live MIRROR snapshot. NOT
+                    `userModelEntries` — that is `entries_written`, how many
+                    entries the LAST consolidation pass wrote, which counts only
+                    the groups this pass's inputs produced (the most recent 200
+                    shared-tier episodes + stored facts). Entries written by an
+                    earlier pass whose source episodes have scrolled out of that
+                    window stay in the profile and are never re-counted, so
+                    printing it under "WHAT DARWIN KNOWS ABOUT YOU" under-reported
+                    what DARWIN actually stores — and read "0 OBSERVED ENTRIES"
+                    after a quiet cycle while MIRROR listed the beliefs. */}
+                <span className="mem-um-num">{beliefCount}</span>
                 <span className="mem-um-unit">
-                  OBSERVED {memory.userModelEntries === 1 ? "ENTRY" : "ENTRIES"}
+                  OBSERVED {beliefCount === 1 ? "ENTRY" : "ENTRIES"}
                 </span>
               </div>
               <div className="mem-um-meta">
+                {memory.userModelEntries !== null ? (
+                  <span className="mem-um-written">
+                    {memory.userModelEntries} WRITTEN LAST PASS
+                  </span>
+                ) : null}
                 {memory.userModelConsolidatedAt ? (
                   <span className="mem-um-when">
                     CONSOLIDATED {clock(memory.userModelConsolidatedAt) || "—"}
@@ -161,7 +196,14 @@ export default function MemoryPanel({ memory }: { memory: MemoryState }) {
             <b>&ldquo;that&rsquo;s wrong, &hellip;&rdquo;</b> to correct an entry.
           </div>
 
-          <ForgetControl shell={shell} hasModel={memory.userModelEntries !== null} />
+          {/* The FORGET gate keys off the LIVE profile (the replayed MIRROR
+              snapshot), not off the ~20-hourly consolidation activity event —
+              otherwise the control is dead after every HUD start on a daemon
+              that already holds a profile. */}
+          <ForgetControl
+            shell={shell}
+            hasModel={beliefCount > 0 || memory.userModelEntries !== null}
+          />
         </div>
 
         {/* ---- RETENTION — the bounded evict-oldest proof. ---- */}

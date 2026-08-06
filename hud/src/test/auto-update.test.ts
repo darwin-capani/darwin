@@ -7,11 +7,16 @@ import {
   AUTO_UPDATE_ON_VALUE,
   decideLaunchUpdateAction,
   isAutoUpdateOn,
+  runDialogCancel,
+  runDialogInstall,
+  runLaunchUpdate,
   setAutoUpdateOn,
   silentUpdateNotice,
   updateDialogInitial,
   updateDialogReduce,
   type AutoUpdateStorage,
+  type LaunchUpdateDeps,
+  type UpdateInstallDeps,
 } from "../core/autoUpdate";
 import type { UpdateCheck } from "../tauri/bridge";
 
@@ -240,73 +245,99 @@ describe("UpdateDialog render (three buttons + honest copy)", () => {
 
 /* ======================================================================== *
  * Button wiring — the exact action each of the three buttons performs.       *
- * (No jsdom in this env, so we drive the SAME helpers the onClicks call and  *
- * assert the persistence side-effect + install/relaunch sequence via spies.) *
+ *                                                                            *
+ * WHAT WENT WRONG BEFORE: this block never imported UpdateDialog. It defined  *
+ * its OWN `installAndRelaunch()` (three lines calling two local spies) and    *
+ * asserted on THAT, while the Cancel case only asserted that a vi.fn() the    *
+ * test itself had just called had been called. Proven by mutation: making     *
+ * UpdateDialog's onCancel call setAutoUpdateOn(true), making both install     *
+ * buttons call checkForUpdates(FALSE), and deleting the relaunch left the     *
+ * whole suite green.                                                          *
+ *                                                                            *
+ * The three bodies now live in core/autoUpdate.ts (runDialogInstall /         *
+ * runDialogCancel) and UpdateDialog's onClicks are thin wrappers over them,   *
+ * so these assertions run the SHIPPED code with injected spies. There is      *
+ * still no jsdom in this env — what is pinned is the action bodies, not the   *
+ * button-to-body binding, which the component keeps to one call each.         *
  * ======================================================================== */
 describe("three-button wiring (the exact action each performs)", () => {
   const checkSpy = vi.fn<(install: boolean) => Promise<UpdateCheck>>();
   const relaunchSpy = vi.fn<() => Promise<boolean>>();
+  const persistSpy = vi.fn<(on: boolean) => void>();
+
+  /** The seams UpdateDialog hands to the same functions under test. */
+  const deps = (): UpdateInstallDeps => ({
+    check: checkSpy,
+    relaunch: relaunchSpy,
+    persistPref: persistSpy,
+  });
 
   beforeEach(() => {
     checkSpy.mockReset();
     relaunchSpy.mockReset();
+    persistSpy.mockReset();
   });
   afterEach(() => {
     vi.restoreAllMocks();
   });
 
-  // The shared install+relaunch the two install buttons run (mirrors the
-  // component's installAndRelaunch): call checkForUpdates(true); on "installed"
-  // relaunch. We assert the call shapes + ordering against the spies.
-  async function installAndRelaunch(): Promise<UpdateCheck> {
-    const result = await checkSpy(true);
-    if (result.status === "installed") await relaunchSpy();
-    return result;
-  }
-
   it("'Update' installs via the SIGNED backend command (install=true) then relaunches", async () => {
     checkSpy.mockResolvedValue(installed("1.4.0"));
     relaunchSpy.mockResolvedValue(true);
-    const store = memStorage();
-    // "Update" never touches the preference.
-    const r = await installAndRelaunch();
+    const out = await runDialogInstall(deps(), false);
     expect(checkSpy).toHaveBeenCalledWith(true); // the EXISTING install path
+    expect(checkSpy).not.toHaveBeenCalledWith(false); // never a mere check
     expect(relaunchSpy).toHaveBeenCalledTimes(1);
-    expect(r.status).toBe("installed");
-    expect(isAutoUpdateOn(store)).toBe(false); // pref unchanged
+    expect(out.result.status).toBe("installed");
+    expect(out.relaunched).toBe(true);
+    expect(out.needsManualRestart).toBe(false);
+    expect(persistSpy).not.toHaveBeenCalled(); // pref UNCHANGED
   });
 
   it("'Update & don't ask again' persists pref=ON BEFORE installing, then installs+relaunches", async () => {
     checkSpy.mockResolvedValue(installed());
     relaunchSpy.mockResolvedValue(true);
-    const store = memStorage();
-    // The component sets the pref FIRST, then runs the same install path.
-    setAutoUpdateOn(true, store);
-    expect(isAutoUpdateOn(store)).toBe(true); // persisted before the install
-    await installAndRelaunch();
+    await runDialogInstall(deps(), true);
+    expect(persistSpy).toHaveBeenCalledWith(true);
     expect(checkSpy).toHaveBeenCalledWith(true);
     expect(relaunchSpy).toHaveBeenCalledTimes(1);
+    // Ordering: the pref is written BEFORE the install command is issued, so a
+    // failed install cannot lose the user's choice.
+    expect(persistSpy.mock.invocationCallOrder[0]).toBeLessThan(
+      checkSpy.mock.invocationCallOrder[0],
+    );
   });
 
-  it("'Cancel' closes WITHOUT changing the preference (re-checks next launch)", () => {
-    const store = memStorage();
+  it("an 'installed' result with NO shell to relaunch is honest, never a claimed finish", async () => {
+    checkSpy.mockResolvedValue(installed());
+    relaunchSpy.mockResolvedValue(false);
+    const out = await runDialogInstall(deps(), false);
+    expect(out.relaunched).toBe(false);
+    expect(out.needsManualRestart).toBe(true);
+  });
+
+  it("'Cancel' closes WITHOUT changing the preference and WITHOUT installing", () => {
     const onClose = vi.fn();
-    // Cancel's onClick = onClose(); it never calls setAutoUpdateOn or check.
-    onClose();
+    runDialogCancel(deps(), onClose);
     expect(onClose).toHaveBeenCalledTimes(1);
+    // The two things Cancel must NEVER do — a regression that silently armed
+    // permanent auto-install from the button labelled Cancel used to ship green.
+    expect(persistSpy).not.toHaveBeenCalled();
     expect(checkSpy).not.toHaveBeenCalled();
-    expect(isAutoUpdateOn(store)).toBe(false);
+    expect(relaunchSpy).not.toHaveBeenCalled();
   });
 
   it("an install error does NOT relaunch and is never reported as success", async () => {
     checkSpy.mockResolvedValue(errored());
-    const r = await installAndRelaunch();
-    expect(r.status).toBe("error");
+    const out = await runDialogInstall(deps(), false);
+    expect(out.result.status).toBe("error");
+    expect(out.relaunched).toBe(false);
+    expect(out.needsManualRestart).toBe(false);
     expect(relaunchSpy).not.toHaveBeenCalled();
     // The reducer keeps it honest.
     const s = updateDialogReduce(
       { phase: "installing", detail: "" },
-      { type: "installResult", result: r },
+      { type: "installResult", result: out.result },
     );
     expect(s.phase).toBe("error");
   });
@@ -326,39 +357,69 @@ describe("silent launch install when pref is ON", () => {
     toastSpy.mockReset();
   });
 
-  // Mirrors App's launch effect for the "available" branch.
-  async function runLaunch(check: UpdateCheck, autoOn: boolean): Promise<string> {
-    const action = decideLaunchUpdateAction(check, autoOn);
-    if (action.kind === "none") return "none";
-    if (action.kind === "dialog") return "dialog"; // App would open the modal
-    // silent:
-    toastSpy(silentUpdateNotice(action.version)); // honest brief notice FIRST
-    const installed = await checkSpy(true); // the EXISTING signed command
-    if (installed.status === "installed") await relaunchSpy();
-    return "silent";
-  }
+  const openDialogSpy = vi.fn<(version: string) => void>();
+
+  /** App's real seams for the launch branch. */
+  const deps = (): LaunchUpdateDeps => ({
+    check: checkSpy,
+    relaunch: relaunchSpy,
+    persistPref: () => {
+      throw new Error("the launch path must never write the auto-update pref");
+    },
+    notify: toastSpy,
+  });
+
+  /* WHAT WENT WRONG BEFORE: this block also defined its own `runLaunch()` copy
+   * of App's launch effect, so mutating App.tsx to
+   * `decideLaunchUpdateAction(result, true)` — auto-installing regardless of the
+   * user's OFF preference, the exact unattended-binary-replacement this module
+   * exists to prevent — left the suite green. It now calls App's real body
+   * (core/autoUpdate.ts runLaunchUpdate). */
 
   it("pref ON + available -> shows the honest notice, installs (install=true), relaunches; NO dialog", async () => {
+    openDialogSpy.mockReset();
     checkSpy.mockResolvedValue(installed("5.0.0"));
     relaunchSpy.mockResolvedValue(true);
-    const outcome = await runLaunch(available("5.0.0"), true);
+    const outcome = await runLaunchUpdate(deps(), available("5.0.0"), true, openDialogSpy);
     expect(outcome).toBe("silent"); // never "dialog"
+    expect(openDialogSpy).not.toHaveBeenCalled();
     expect(toastSpy).toHaveBeenCalledWith("Updating DARWIN to 5.0.0…");
     expect(checkSpy).toHaveBeenCalledWith(true);
     expect(relaunchSpy).toHaveBeenCalledTimes(1);
   });
 
   it("pref OFF + available -> opens the dialog (no silent install, no toast)", async () => {
-    const outcome = await runLaunch(available("5.0.0"), false);
+    openDialogSpy.mockReset();
+    const outcome = await runLaunchUpdate(deps(), available("5.0.0"), false, openDialogSpy);
     expect(outcome).toBe("dialog");
+    // THE preference gate: with the pref OFF nothing may install unattended.
+    expect(openDialogSpy).toHaveBeenCalledWith("5.0.0");
+    expect(toastSpy).not.toHaveBeenCalled();
+    expect(checkSpy).not.toHaveBeenCalled();
+    expect(relaunchSpy).not.toHaveBeenCalled();
+  });
+
+  it("pref ON but NOT armed (not_configured) -> nothing happens (no install, no toast)", async () => {
+    openDialogSpy.mockReset();
+    const outcome = await runLaunchUpdate(deps(), notConfigured(), true, openDialogSpy);
+    expect(outcome).toBe("none");
+    expect(openDialogSpy).not.toHaveBeenCalled();
     expect(toastSpy).not.toHaveBeenCalled();
     expect(checkSpy).not.toHaveBeenCalled();
   });
 
-  it("pref ON but NOT armed (not_configured) -> nothing happens (no install, no toast)", async () => {
-    const outcome = await runLaunch(notConfigured(), true);
-    expect(outcome).toBe("none");
-    expect(toastSpy).not.toHaveBeenCalled();
-    expect(checkSpy).not.toHaveBeenCalled();
+  it("an unmount mid-install stops before the relaunch (cancellation is honoured)", async () => {
+    openDialogSpy.mockReset();
+    checkSpy.mockResolvedValue(installed("5.0.0"));
+    relaunchSpy.mockResolvedValue(true);
+    const outcome = await runLaunchUpdate(
+      deps(),
+      available("5.0.0"),
+      true,
+      openDialogSpy,
+      () => true,
+    );
+    expect(outcome).toBe("silent");
+    expect(relaunchSpy).not.toHaveBeenCalled();
   });
 });

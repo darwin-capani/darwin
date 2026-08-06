@@ -72,3 +72,57 @@ export function exitAlwaysReachable(state: TakeoverState): boolean {
 export function isExitKey(key: string): boolean {
   return key === "Escape";
 }
+
+/* --- App's ENTER / EXIT / Esc-guard BODIES (injectable seams) -------------- *
+ *
+ * WHAT WENT WRONG: the enter/exit handlers and the Esc guard lived inline in
+ * App.tsx, and takeover.test.ts's "App takeover handlers" block claimed to be
+ * "modeled exactly as App.tsx wires them ... so the assertions track the real
+ * handlers" while importing nothing from App at all. Proven by mutation: making
+ * App's exit handler an empty body AND killing its Esc guard
+ * (`if (false && takeoverActive && isExitKey(ev.key))`) left the whole HUD
+ * suite green — i.e. the "EXIT IS ALWAYS REACHABLE" invariant, on a chrome-less
+ * full-desktop mode with no OS escape, had no coverage at the wiring level.
+ *
+ * The bodies live here now and App calls them, so the test drives the real
+ * code. The OS-level window/Dock restore still belongs to the Tauri backend's
+ * exit_takeover (proven by the src-tauri cargo tests, not here). */
+
+/** The seams App hands to the takeover handlers: the reducer dispatch plus the
+ *  two device-gated backend commands. */
+export interface TakeoverHandlerDeps {
+  dispatch(action: TakeoverAction): void;
+  enter(): Promise<boolean>;
+  exit(): Promise<boolean>;
+}
+
+/** App's ENTER body: flip the HUD bit, then ask the backend to mutate the real
+ *  window (a graceful no-op outside the Tauri shell). */
+export function runEnterTakeover(deps: TakeoverHandlerDeps): void {
+  deps.dispatch({ type: "enter" });
+  void deps.enter();
+}
+
+/** App's EXIT body — the always-available escape hatch. Clears the HUD bit AND
+ *  asks the backend to reverse every window mutation. BOTH the visible EXIT
+ *  control and the Esc key route here; it must never become conditional. */
+export function runExitTakeover(deps: TakeoverHandlerDeps): void {
+  deps.dispatch({ type: "exit" });
+  void deps.exit();
+}
+
+/**
+ * App's keydown guard for takeover: Esc exits FIRST, and ONLY while takeover is
+ * active (so an idle Esc still reaches the deck/palette handlers). Returns true
+ * when it HANDLED the key — App then preventDefaults and stops. Pure of the
+ * DOM, so the guard itself is assertable.
+ */
+export function handleTakeoverKey(
+  active: boolean,
+  key: string,
+  deps: TakeoverHandlerDeps,
+): boolean {
+  if (!active || !isExitKey(key)) return false;
+  runExitTakeover(deps);
+  return true;
+}

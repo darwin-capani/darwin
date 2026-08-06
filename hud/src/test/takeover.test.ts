@@ -22,9 +22,13 @@ vi.mock("../tauri/bridge", async (importOriginal) => {
 import TakeoverStage from "../components/TakeoverStage";
 import {
   exitAlwaysReachable,
+  handleTakeoverKey,
   initialTakeoverState,
   isExitKey,
+  runEnterTakeover,
+  runExitTakeover,
   takeoverReduce,
+  type TakeoverAction,
   type TakeoverState,
 } from "../core/takeover";
 import { initialState, type HudState } from "../core/state";
@@ -112,42 +116,82 @@ describe("takeover bridge dispatch (mocked Tauri invoke)", () => {
 
 /* ------------------------------------------------------------------------ *
  * App-handler contract: the enter/exit handlers fold the reducer AND fire    *
- * the right backend command. Modeled exactly as App.tsx wires them (reducer  *
- * dispatch + void invoke), so the assertions track the real handlers.        *
+ * the right backend command, and the Esc guard exits ONLY while active.      *
+ *                                                                            *
+ * WHAT WENT WRONG BEFORE: this block claimed to be "modeled exactly as       *
+ * App.tsx wires them ... so the assertions track the real handlers" while    *
+ * importing nothing from App and re-implementing every body inline. One      *
+ * assertion was a literal tautology (`({active:false}).active && isExitKey(…)` *
+ * is `false` unconditionally). Mutation proof: making App's exit handler an  *
+ * empty body and killing its Esc guard left all 101 files / 1982 tests       *
+ * green — the "EXIT IS ALWAYS REACHABLE" invariant had no wiring coverage at *
+ * all. The bodies now live in core/takeover.ts and App calls them, so these  *
+ * assertions run the SHIPPED code.                                           *
  * ------------------------------------------------------------------------ */
-describe("App takeover handlers (reducer + bridge, as wired in App.tsx)", () => {
+describe("App takeover handlers (the SHIPPED bodies from core/takeover.ts)", () => {
+  /** The seams App hands the handlers, with a spy on the reducer dispatch. */
+  function deps() {
+    const folded: TakeoverState[] = [];
+    let state: TakeoverState = initialTakeoverState();
+    return {
+      folded,
+      current: () => state,
+      handlers: {
+        dispatch: (a: TakeoverAction) => {
+          state = takeoverReduce(state, a);
+          folded.push(state);
+        },
+        enter: enterTakeover,
+        exit: exitTakeover,
+      },
+    };
+  }
+
   it("ENTER sets takeoverActive AND invokes enter_takeover", async () => {
     invokeMock.mockResolvedValue(true);
-    // App.enterTakeover(): dispatch enter, then void invokeEnterTakeover().
-    const next = takeoverReduce(initialTakeoverState(), { type: "enter" });
-    await enterTakeover();
-    expect(next.active).toBe(true); // takeoverActive becomes true
+    const d = deps();
+    runEnterTakeover(d.handlers);
+    await Promise.resolve();
+    expect(d.current().active).toBe(true); // takeoverActive becomes true
     expect(invokeMock.mock.calls[0][0]).toBe("enter_takeover");
   });
 
   it("EXIT clears takeoverActive AND invokes exit_takeover", async () => {
     invokeMock.mockResolvedValue(true);
-    const active: TakeoverState = { active: true };
-    // App.exitTakeover(): dispatch exit, then void invokeExitTakeover().
-    const next = takeoverReduce(active, { type: "exit" });
-    await exitTakeover();
-    expect(next.active).toBe(false); // takeoverActive becomes false
+    const d = deps();
+    d.handlers.dispatch({ type: "enter" });
+    runExitTakeover(d.handlers);
+    await Promise.resolve();
+    expect(d.current().active).toBe(false); // takeoverActive becomes false
     expect(invokeMock.mock.calls[0][0]).toBe("exit_takeover");
   });
 
   it("Esc exits ONLY while active — exactly the App keydown guard", async () => {
     invokeMock.mockResolvedValue(true);
-    // App: `if (takeoverActive && isExitKey(ev.key)) { exit }`.
-    const escWhileActive = ({ active: true } as TakeoverState).active && isExitKey("Escape");
-    expect(escWhileActive).toBe(true);
-    const next = takeoverReduce({ active: true }, { type: "exit" });
-    await exitTakeover();
-    expect(next.active).toBe(false);
+    const active = deps();
+    active.handlers.dispatch({ type: "enter" });
+    expect(handleTakeoverKey(true, "Escape", active.handlers)).toBe(true);
+    await Promise.resolve();
+    expect(active.current().active).toBe(false);
     expect(invokeMock.mock.calls[0][0]).toBe("exit_takeover");
 
-    // While inactive, Esc does NOT route to takeover-exit (deck/other handlers win).
-    const escWhileIdle = ({ active: false } as TakeoverState).active && isExitKey("Escape");
-    expect(escWhileIdle).toBe(false);
+    // While inactive, Esc does NOT route to takeover-exit (deck/other handlers
+    // win) — and it must not fire the backend command either.
+    invokeMock.mockClear();
+    const idle = deps();
+    expect(handleTakeoverKey(false, "Escape", idle.handlers)).toBe(false);
+    expect(idle.folded).toHaveLength(0);
+    expect(invokeMock).not.toHaveBeenCalled();
+  });
+
+  it("a NON-Esc key while active is not a takeover exit", async () => {
+    invokeMock.mockResolvedValue(true);
+    const d = deps();
+    d.handlers.dispatch({ type: "enter" });
+    invokeMock.mockClear();
+    expect(handleTakeoverKey(true, "k", d.handlers)).toBe(false);
+    expect(d.current().active).toBe(true);
+    expect(invokeMock).not.toHaveBeenCalled();
   });
 });
 

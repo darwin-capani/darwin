@@ -73,8 +73,15 @@ const annotatedFromKnowledge: Record<string, unknown> = {
   confidence: { level: "inferred", reason: "reasoned from general knowledge" },
 };
 
-/** The SHIPPED DEFAULT: both [answers] gates OFF — empty sources + null
- *  confidence + from_my_knowledge false. The HUD must render NOTHING. */
+/** The gates-OFF case: the operator set [answers].cite and .confidence false —
+ *  empty sources + null confidence + from_my_knowledge false. The HUD must
+ *  render NOTHING.
+ *
+ *  NOTE this is NOT the shipped default, as this comment used to claim. Both
+ *  gates SHIP ON (config/darwin.toml:806-807 `cite = true` / `confidence = true`;
+ *  daemon/src/config.rs AnswersConfig::default), so a stock install DOES emit
+ *  citations + confidence and the ANSWER // PROVENANCE panel DOES render. The
+ *  fixture itself is still a valid off-gate case; only the label was wrong. */
 const annotatedOff: Record<string, unknown> = {
   cite_on: false,
   confidence_on: false,
@@ -202,7 +209,7 @@ describe("answer.annotated reducer", () => {
 });
 
 describe("AnswerSourcesPanel", () => {
-  it("renders nothing when there is no annotation (shipped OFF default)", () => {
+  it("renders nothing when there is no annotation (no annotated turn yet)", () => {
     expect(render(null)).toBe("");
   });
 

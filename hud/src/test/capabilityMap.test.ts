@@ -105,11 +105,51 @@ describe("CapabilityStatusPanel (honest render)", () => {
     expect(html).toContain("capmap-pill needs-dep");
   });
 
+  /** The single `capmap-row` block that contains `needle`.
+   *
+   *  WHAT WENT WRONG BEFORE: this describe asserted on the WHOLE document, and
+   *  the panel footer ALWAYS renders the literal word "unverified" (it explains
+   *  what the marker means). So the positive assertion
+   *  `/elevenlabs_api_key in Keychain[\s\S]*unverified/` bridged tags all the way
+   *  down to that footer and matched whenever the dependency phrase rendered at
+   *  all — verified or not. And the negative assertion
+   *  `/sandbox-exec[^<]*unverified/` could never cross the nested
+   *  `<span class="capmap-unverified">` that CARRIES the marker, so it never
+   *  matched even when the marker was present. Both survived the exact inversion
+   *  of the flags they claim to check. Cut the footer off and scope to the row. */
+  function rowContaining(html: string, needle: string): string {
+    const rows = html.split("capmap-foot")[0].split('<div class="capmap-row">').slice(1);
+    const row = rows.find((r) => r.includes(needle));
+    expect(row, `no capmap-row contains ${needle}`).toBeDefined();
+    return row!;
+  }
+
   it("marks an unprobed dependency as 'unverified', a probed one not", () => {
     const html = render(parseCapabilityMap(sample));
-    // elevenlabs (verified:false) carries the unverified marker...
-    expect(html).toMatch(/elevenlabs_api_key in Keychain[\s\S]*unverified/);
+    // elevenlabs (verified:false) carries the unverified marker IN ITS OWN ROW...
+    expect(rowContaining(html, "elevenlabs_api_key in Keychain")).toContain(
+      "capmap-unverified",
+    );
     // ...shell_run (verified:true) does not present its dep as unverified.
-    expect(html).not.toMatch(/sandbox-exec[^<]*unverified/);
+    expect(rowContaining(html, "sandbox-exec")).not.toContain("capmap-unverified");
+  });
+
+  it("the unverified marker follows `verified` — the INVERTED fixture fails both ways", () => {
+    // The mutation the shipped assertions could not see: swap the two `verified`
+    // flags and every claim above must flip. This pins the honesty contract in
+    // CapabilityStatusPanel ("The UI must not present an unverified requirement
+    // as a confirmed one") in BOTH directions.
+    const inverted = {
+      capabilities: (sample.capabilities as Record<string, unknown>[]).map((c) =>
+        c.key === "shell_run" || c.key === "elevenlabs_voice"
+          ? { ...c, verified: !c.verified }
+          : c,
+      ),
+    };
+    const html = render(parseCapabilityMap(inverted));
+    expect(rowContaining(html, "sandbox-exec")).toContain("capmap-unverified");
+    expect(rowContaining(html, "elevenlabs_api_key in Keychain")).not.toContain(
+      "capmap-unverified",
+    );
   });
 });

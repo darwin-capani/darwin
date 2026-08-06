@@ -238,16 +238,53 @@ fn classify_oauth_client(provider: &str, field: &str, value: &str) -> VerifyResu
     }
 }
 
+/// Strip the separators Google Ads' own UI shows in a customer id, leaving the
+/// canonical digits-only form.
+///
+/// WHAT WENT WRONG: the classifier stripped `-` / whitespace ONLY to decide
+/// validity, and `verify_and_store` then persisted the RAW paste. A user who
+/// copied the id the way Google Ads displays it (`123-456-7890`) saw the green
+/// "customer id saved" pill, and the daemon then built
+/// `customers/123-456-7890/googleAds:search` (google_ads.rs `search_url` /
+/// `campaign_resource` / `budget_resource`) and set a dashed `login-customer-id`
+/// header — both of which the Google Ads API rejects. The whole Ads integration
+/// was silently dead with only a generic mapped HTTP error, and nothing in the
+/// UI pointed at the id. oauth2.rs documents the contract it never enforced
+/// ("digits only, no dashes"), and the frontend hint says the same. Normalize
+/// ONCE, here at the boundary, and store the canonical form.
+fn canonical_customer_id(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| !matches!(c, '-') && !c.is_whitespace())
+        .collect()
+}
+
 /// Format/sanity check for a Google Ads customer id (operating OR login). Google
 /// Ads customer ids are 10-digit numbers (often shown dash-grouped like
-/// 123-456-7890); we accept a value that is all digits once dashes/spaces are
+/// 123-456-7890); we accept a value that is all digits once dashes/whitespace are
 /// stripped and is 10 digits long. PURE — unit-tested. The value is never echoed.
 fn classify_customer_id(provider: &str, value: &str) -> VerifyResult {
-    let digits: String = value.chars().filter(|c| !matches!(c, '-' | ' ')).collect();
+    let digits = canonical_customer_id(value);
     if digits.len() == 10 && digits.chars().all(|c| c.is_ascii_digit()) {
         VerifyResult::valid(format!("customer id saved — connect {provider} to finish"))
     } else {
         VerifyResult::unauthorized("expected a 10-digit Google Ads customer id (digits only)")
+    }
+}
+
+/// The value actually written to the Keychain for `id`, given the user's raw
+/// paste. For every credential this is the trimmed paste; for the two Google Ads
+/// customer-id rows it is the CANONICAL digits-only form, because the daemon
+/// interpolates the stored value straight into a `customers/<id>/…` resource
+/// path and a `login-customer-id` header. Validation and storage must agree on
+/// the same normalization — accepting a dashed id and then storing the dashes is
+/// what broke the integration. PURE — unit-tested.
+fn canonical_secret_for(id: &str, secret: &str) -> String {
+    match id {
+        "google_ads_customer_id" | "google_ads_login_customer_id" => {
+            canonical_customer_id(secret)
+        }
+        _ => secret.to_string(),
     }
 }
 
@@ -526,7 +563,10 @@ async fn verify_and_store(id: String, secret: String) -> Result<StoreResult, Str
 
     let result = verify_dispatch(&id, &secret).await?;
     let stored = if result.status == "valid" {
-        keychain_set_internal(account, secret).await?;
+        // Store the CANONICAL value, not the raw paste — see canonical_secret_for.
+        // A Google Ads customer id accepted as `123-456-7890` must be persisted
+        // as `1234567890`, or every downstream `customers/<id>/…` call is malformed.
+        keychain_set_internal(account, canonical_secret_for(&id, &secret)).await?;
         true
     } else {
         false
@@ -1227,6 +1267,51 @@ mod tests {
     }
 
     #[test]
+    fn customer_id_is_stored_canonical_not_as_pasted() {
+        // REGRESSION. The classifier accepted the dash-grouped form Google Ads'
+        // own UI shows, but verify_and_store persisted the RAW paste, so the
+        // daemon built `customers/123-456-7890/googleAds:search` (and a dashed
+        // `login-customer-id` header) — rejected by the API, with a green
+        // "customer id saved" pill telling the user it was configured.
+        // Validation and storage must normalize identically.
+        for pasted in ["123-456-7890", "123 456 7890", " 1234567890 ", "123-456 7890"] {
+            assert_eq!(
+                classify_customer_id("Google Ads", pasted).status,
+                "valid",
+                "the classifier accepts {pasted:?}"
+            );
+            assert_eq!(
+                canonical_secret_for("google_ads_customer_id", pasted),
+                "1234567890",
+                "so the STORED value for {pasted:?} must be the canonical digits"
+            );
+            assert_eq!(
+                canonical_secret_for("google_ads_login_customer_id", pasted),
+                "1234567890",
+                "the optional login customer id rides the same header contract"
+            );
+        }
+        // The resource path the daemon builds from the stored value is now legal.
+        assert_eq!(
+            format!(
+                "customers/{}/googleAds:search",
+                canonical_secret_for("google_ads_customer_id", "123-456-7890")
+            ),
+            "customers/1234567890/googleAds:search"
+        );
+        // Every OTHER credential is stored exactly as pasted (trimmed upstream) —
+        // normalization must not silently mangle an opaque secret.
+        assert_eq!(
+            canonical_secret_for("anthropic_api_key", "sk-ant-a-b-c"),
+            "sk-ant-a-b-c"
+        );
+        assert_eq!(
+            canonical_secret_for("meta_ad_account_id", "act_1234567890"),
+            "act_1234567890"
+        );
+    }
+
+    #[test]
     fn meta_ad_account_classifier_requires_act_prefix_and_digits() {
         assert_eq!(classify_meta_ad_account("act_1234567890").status, "valid");
         // Missing prefix, empty digits, or non-digits are rejected.
@@ -1354,9 +1439,25 @@ mod tests {
         );
         // Too-short values are rejected (won't be stored), and the detail never
         // echoes the value.
-        let bad = verify_dispatch("whoop_client_secret", "no").await.unwrap();
+        //
+        // WHAT WENT WRONG: this used to assert
+        // `!detail.contains("no") || !detail.contains("\"no\"")` against the
+        // pasted value "no". The detail is
+        // `"that does not look like a WHOOP client secret"`, which contains "no"
+        // inside "not" — so the first disjunct was always false and the whole
+        // assertion collapsed to `!detail.contains("\"no\"")`, something the
+        // fixed format string can never violate. A mutant that appended the
+        // pasted value to the detail passed. Use a distinctive canary (still
+        // short enough to be rejected) and assert it directly, exactly like
+        // oauth_client_classifier_never_echoes_the_secret does.
+        let canary = "zqv";
+        let bad = verify_dispatch("whoop_client_secret", canary).await.unwrap();
         assert_eq!(bad.status, "unauthorized");
-        assert!(!bad.detail.contains("no") || !bad.detail.contains("\"no\""));
+        assert!(
+            !bad.detail.contains(canary),
+            "the unauthorized detail must never echo the pasted value: {}",
+            bad.detail
+        );
     }
 
     #[tokio::test]

@@ -28,7 +28,8 @@ npm run tauri build   # bundles DARWIN.app (macOS only)
 ## Tests & checks
 
 ```sh
-npx vitest run                  # headless state-core suite (69 tests)
+npx vitest run                  # headless suite: state core, event parsers,
+                                # and SSR panel renders (whole HUD surface)
 npm run build                   # tsc + vite production build
 (cd src-tauri && cargo check)   # Rust shell
 ```
@@ -39,9 +40,12 @@ DOM/Tauri/three.js imports — vitest covers them headlessly: every core-state
 transition, malformed JSON, unknown events ignored without churn, ring-buffer caps,
 reconnect → offline → idle, the 12s stuck-state decay, and the degradation ladder.
 
-> Dependency note: `src-tauri/Cargo.toml` pins `time = "=0.3.47"` — `time 0.3.48`
-> breaks `cookie 0.18.1` / `tauri-utils 2.9.2` with E0119 conflicts. Remove the pin
-> once upstream ships fixes.
+> Dependency note: `src-tauri/Cargo.toml` pins `time` exactly. The pin exists
+> because a range of point releases added conflicting impls (E0119); the manifest
+> comment records the current version, the exact conflicting range, and which
+> releases were verified good. It is a pin to be BUMPED DELIBERATELY, not removed —
+> dropping it lets a stray `cargo update` pull a conflicting release back in.
+> Read the rationale at the pin itself; that comment is the source of truth.
 
 ## What's on screen
 
@@ -106,8 +110,19 @@ registry** driven by a single source of truth mirrored Rust↔TS
 | `anthropic` | Anthropic API Key | `anthropic_api_key` | bearer | **yes** — `GET /v1/models` |
 | `github` | GitHub Token (PAT) | `github_pat` | bearer | **yes** — `GET api.github.com/user` |
 | `slack` | Slack Bot Token | `slack_bot_token` | bearer | **yes** — `POST auth.test` |
-| `google_drive` | Google Drive | `google_drive_oauth` | oauth | deferred (Connect placeholder) |
-| `google_calendar` | Google Calendar | `google_calendar_oauth` | oauth | deferred (Connect placeholder) |
+| `google_client_id` | Google OAuth Client ID | `google_oauth_client_id` | bearer | format-checked locally (only the consent flow proves it) |
+| `google_client_secret` | Google OAuth Client Secret | `google_oauth_client_secret` | bearer | format-checked locally |
+| `google_workspace` | Google Workspace | `google_oauth_refresh_token` | oauth | Connect (the daemon runs the consent + loopback) |
+
+<!-- These rows previously listed `google_drive` / `google_calendar` with accounts
+     `google_drive_oauth` / `google_calendar_oauth`. NO SUCH IDS EXIST — the Rust
+     mirror asserts they are unknown (`assert_eq!(account_for_id("google_drive"),
+     None)`, `assert!(!is_known_account("google_drive_oauth"))` in
+     src-tauri/src/credentials.rs), so `guard_account`/`account_for_id` reject
+     them outright and a reader looking for those rows in Settings -> Credentials
+     could never find them. The real Google path is the three rows above plus the
+     spoken "connect Google" flow (docs/BRINGUP.md). The source of truth is
+     `hud/src/core/credentials.ts`. -->
 
 The Anthropic account stays **exactly** `anthropic_api_key` — the daemon reads that
 item at startup.
@@ -148,8 +163,10 @@ src/tauri/       guarded invoke/window wrappers (bridge.ts)
 src/three/       CoreScene.tsx — R3F core, particles, bloom, perf ladder
 src/components/  glass panels: transcript, diagnostics, waveform, latency,
                  status bar, toasts, settings modal
-src/test/        vitest suite for src/core
+src/test/        vitest suite (state core, parsers, and headless panel renders)
 src-tauri/       Tauri 2 shell: keychain_status / keychain_set /
-                 keychain_delete / test_api_key commands (security(1),
-                 args-only, 5s timeout; reqwest for the key test)
+                 keychain_delete / verify_credential / verify_and_store
+                 commands (IN-PROCESS `security-framework`, never `security(1)`
+                 — no key material on any subprocess argv; reqwest for the
+                 network-verifiable credentials)
 ```

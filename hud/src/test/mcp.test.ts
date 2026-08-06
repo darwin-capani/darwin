@@ -206,6 +206,13 @@ describe("McpPanel (review-only, secret-free)", () => {
     expect(html).toContain("STDIO");
     expect(html).toContain("CONNECTED");
     expect(html).toContain("NOT CONNECTED"); // the unconnected weather server
+    // WHAT WENT WRONG BEFORE: `toContain("CONNECTED")` is implied by the
+    // `toContain("NOT CONNECTED")` on the line above — "NOT CONNECTED" contains
+    // "CONNECTED" — so the positive case was never checked at all, and a panel
+    // that reported every server as unreachable passed. Pin the element.
+    expect(html).toContain(">CONNECTED<");
+    expect(html).toContain("mcp-pill ok");
+    expect(html).toContain("mcp-pill off");
     expect(html).toContain("read_file");
     expect(html).toContain("write_file");
     // The consequential tool is badged GATED; the read-only one RO.

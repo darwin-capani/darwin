@@ -43,9 +43,12 @@ import Frame from "./Frame";
  *     ride the local broadcast only and carry nothing but what the persona
  *     already speaks/shows (the question, real cited chunks, a <ts>, a count, a
  *     short reason) — never an embedding/secret/token.
- *   - SHIPPED OFF + ALLOWLIST-ONLY. The [code] feature is disabled by default and
- *     touches nothing until the operator enables it AND allowlists a codebase
- *     root — so this panel stays empty until then.
+ *   - SHIPS ON + ALLOWLIST-ONLY; THE ROOTS LIST IS THE REAL GATE. [code].enabled
+ *     ships TRUE (config/darwin.toml:770; daemon/src/config.rs pins it with
+ *     "code intelligence SHIPS ON (full-power default; inert without a root)")
+ *     while [code].roots ships EMPTY — so the feature is INERT WITHOUT ROOTS and
+ *     touches nothing until the operator allowlists a codebase root. The operator
+ *     action is allowlisting a root, NOT flipping the enable flag.
  *
  * The reducer only ever sets `codeIntel` from defensively-parsed code.* events
  * (real cited chunks / a ts-bearing proposal / a short reason — never a secret),
@@ -54,8 +57,8 @@ import Frame from "./Frame";
 export default function CodeIntelPanel({ code }: { code: CodeIntel | null }) {
   // Nothing to show until a code.* event lands — render nothing rather than a
   // placeholder, mirroring the other event-fed panels (DocSearchPanel, McpPanel).
-  // The feature ships OFF, so no event arrives until [code] is enabled AND a
-  // codebase root is allowlisted.
+  // The feature ships ON but INERT: no event arrives until a codebase root is
+  // allowlisted under [code].roots (which ships empty).
   if (code === null) return null;
   const { explained, proposal, note } = code;
   if (explained === null && proposal === null && note === null) return null;
@@ -77,9 +80,10 @@ export default function CodeIntelPanel({ code }: { code: CodeIntel | null }) {
             diff, then YOU apply it via the confined script shown, which
             re-validates and writes only under your allowlisted codebase root. The
             model authored the diff; whether it compiles/works is not guaranteed.
-            The code index is on-device and ships OFF — enable{" "}
-            <code>[code].enabled</code> and allowlist a root under{" "}
-            <code>[code].roots</code>.
+            The code index is on-device. <code>[code].enabled</code> ships ON but
+            is inert until you allowlist a codebase root under{" "}
+            <code>[code].roots</code> (which ships empty) — and allowlist the same
+            root under <code>[docsearch].roots</code> so retrieval can reach it.
           </div>
         </div>
       </Frame>
