@@ -571,6 +571,20 @@ fn is_net_label(kind: crate::scene::LabelKind) -> bool {
 /// copper in physical stackup order (`parser::seed_copper_layers`), this range
 /// is exactly the copper the via stitches — mirrors `rtree::layer_span`.
 #[inline]
+/// A pad's `(layer, layer_to)` normalized to an inclusive `(lo, hi)` raw range —
+/// the copper it contacts. Degenerate (lo == hi) for a surface-mount pad, the
+/// full stack for a plated through-hole. Mirrors [`via_layer_span`].
+fn pad_layer_span(layer: LayerId, layer_to: LayerId) -> (u16, u16) {
+    // A scene written before the span existed deserializes `layer_to` as
+    // SCHEMATIC; read that as "no span" rather than as a range down to layer 0,
+    // which would wrongly merge every copper layer under an SMD pad.
+    if layer_to == LayerId::SCHEMATIC && layer != LayerId::SCHEMATIC {
+        return (layer.raw(), layer.raw());
+    }
+    let (a, b) = (layer.raw(), layer_to.raw());
+    if a <= b { (a, b) } else { (b, a) }
+}
+
 fn via_layer_span(from: LayerId, to: LayerId) -> (u16, u16) {
     let (a, b) = (from.raw(), to.raw());
     if a <= b {
@@ -616,12 +630,25 @@ fn build_pcb(scene: &Scene) -> Graph {
         stitch_cell.entry(t.b.quantize()).or_default().push((node, t.layer.raw()));
     }
 
-    // Pads: connect at their position on their layer, and register for stitching
-    // (a through-hole pad bridges layers like a via).
+    // Pads: connect at their position on EVERY copper layer in the pad's span,
+    // and register on each so a via or a later spanning pad can stitch to it.
+    //
+    // The comment here used to say "a through-hole pad bridges layers like a via"
+    // while the code registered exactly ONE layer. For a THT pad that layer was
+    // the phantom `*.Cu` the parser interned from KiCad's wildcard, so the pad was
+    // electrically isolated: one net split into many, `select.net "GND"` picked an
+    // arbitrary singleton and highlighted a single pad, and ERC emitted a false
+    // `unconnected_pin` for every through-hole pin. The parser now resolves that
+    // wildcard to a real (top, bottom) span, and this honors it.
     for (i, p) in scene.pads.iter().enumerate() {
         let node = b.node(EntityRef::pad((i as u32).into()), p.layer);
-        touch_layer(&mut b, &mut layer_cell, p.layer, p.position, node);
-        stitch_cell.entry(p.position.quantize()).or_default().push((node, p.layer.raw()));
+        let (lo, hi) = pad_layer_span(p.layer, p.layer_to);
+        let key = p.position.quantize();
+        for raw in lo..=hi {
+            let layer = LayerId::new(raw);
+            touch_layer(&mut b, &mut layer_cell, layer, p.position, node);
+            stitch_cell.entry(key).or_default().push((node, raw));
+        }
     }
 
     // Vias: a node at their position; stitch together the copper registered at
@@ -691,6 +718,7 @@ mod tests {
             shape: PadShape::Rect,
             pin_type: PinType::Passive,
             layer: LayerId::SCHEMATIC,
+            layer_to: LayerId::SCHEMATIC,
             net_id: NetId::NONE,
         }
     }
@@ -1051,4 +1079,105 @@ mod tests {
         assert_eq!(g.net_count(), 0);
         assert!(g.bfs_walk(EntityRef::pad(0u32.into())).is_empty());
     }
+    /// A THROUGH-HOLE PAD IS PART OF THE COPPER IT SITS ON.
+    ///
+    /// KiCad writes a THT pad's layers as the wildcard `(layers "*.Cu" "*.Mask")`,
+    /// meaning "every copper layer". `is_copper_layer` accepted `"*.Cu"` because it
+    /// ends with ".Cu", so the wildcard was interned as a stackup layer of its own
+    /// and every through-hole pad sat alone on a phantom layer that no track, zone
+    /// or via could reach: one net split into many, `select.net "GND"` highlighted
+    /// a single pad and left the actual copper dim, and ERC emitted a false
+    /// `unconnected_pin` for every through-hole pin.
+    ///
+    /// The fixture is INLINE rather than read from `projects/` — those files are
+    /// untracked, so a test reading them would be green here and red on a clean
+    /// checkout.
+    const TWO_THT_F_CU: &str = r#"(kicad_pcb (version 20221018) (generator pcbnew)
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (37 "F.Mask" user))
+  (net 0 "") (net 1 "GND")
+  (footprint "C:R" (layer "F.Cu") (at 100 100 0)
+    (pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (net 1 "GND")))
+  (footprint "C:R" (layer "F.Cu") (at 110 100 0)
+    (pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (net 1 "GND")))
+  (segment (start 100 100) (end 110 100) (width 0.25) (layer "F.Cu") (net 1)))"#;
+
+    /// The same board with the joining track on the BOTTOM copper layer. A THT pad
+    /// is a plated barrel — it reaches B.Cu just as it reaches F.Cu. This is the
+    /// case that proves the SPAN rather than just the top of it.
+    const TWO_THT_B_CU: &str = r#"(kicad_pcb (version 20221018) (generator pcbnew)
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (37 "F.Mask" user))
+  (net 0 "") (net 1 "GND")
+  (footprint "C:R" (layer "F.Cu") (at 100 100 0)
+    (pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (net 1 "GND")))
+  (footprint "C:R" (layer "F.Cu") (at 110 100 0)
+    (pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (net 1 "GND")))
+  (segment (start 100 100) (end 110 100) (width 0.25) (layer "B.Cu") (net 1)))"#;
+
+    /// Surface-mount: the pad names ONE real layer, so it must not span.
+    const TWO_SMD: &str = r#"(kicad_pcb (version 20221018) (generator pcbnew)
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal) (37 "F.Mask" user))
+  (net 0 "") (net 1 "GND")
+  (footprint "C:R" (layer "F.Cu") (at 100 100 0)
+    (pad "1" smd rect (at 0 0) (size 1.0 1.0) (layers "F.Cu" "F.Mask") (net 1 "GND")))
+  (footprint "C:R" (layer "F.Cu") (at 110 100 0)
+    (pad "1" smd rect (at 0 0) (size 1.0 1.0) (layers "F.Cu" "F.Mask") (net 1 "GND")))
+  (segment (start 100 100) (end 110 100) (width 0.25) (layer "F.Cu") (net 1)))"#;
+
+    fn pcb(src: &str) -> Scene {
+        let root = crate::sexpr::parse(src).expect("fixture lexes");
+        crate::parser::parse_pcb(std::path::Path::new("t.kicad_pcb"), &root).expect("fixture parses")
+    }
+
+    #[test]
+    fn a_through_hole_pad_joins_the_copper_at_its_position() {
+        for (label, src) in [("F.Cu track", TWO_THT_F_CU), ("B.Cu track", TWO_THT_B_CU)] {
+            let scene = pcb(src);
+            assert_eq!(scene.pads.len(), 2, "{label}: two THT pads");
+            assert_eq!(scene.tracks.len(), 1, "{label}: one track joining them");
+            // PRECONDITION: the pads must actually be SPANNING, or this proves
+            // nothing about the wildcard — a fixture edited to a plain "F.Cu"
+            // would pass trivially.
+            for p in &scene.pads {
+                assert_ne!(p.layer, p.layer_to, "{label}: a THT pad spans the copper stack");
+            }
+            let g = build_pcb(&scene);
+            let n0 = g.node_net(EntityRef::pad(0u32.into()));
+            let n1 = g.node_net(EntityRef::pad(1u32.into()));
+            let nt = g.node_net(EntityRef::track(0u32.into()));
+            assert_eq!(n0, nt, "{label}: pad 0 and the track are one net");
+            assert_eq!(n1, nt, "{label}: pad 1 and the track are one net");
+        }
+    }
+
+    /// ...and an SMD pad still touches exactly ONE layer. A fix that spanned every
+    /// pad would satisfy the test above and short the board: here the two pads sit
+    /// on F.Cu, and a spanning pad would also join anything on B.Cu beneath them.
+    #[test]
+    fn a_surface_mount_pad_does_not_span_the_stack() {
+        let scene = pcb(TWO_SMD);
+        assert_eq!(scene.pads.len(), 2, "two SMD pads");
+        for p in &scene.pads {
+            assert_eq!(p.layer, p.layer_to, "an SMD pad occupies one layer only");
+        }
+    }
+
+    /// ...and the false ERC warnings go with it. On the F.Cu fixture the two GND
+    /// pins are wired by a track; before the span they were isolated, so ERC
+    /// reported both as `unconnected_pin` on a fully routed board.
+    #[test]
+    fn a_wired_through_hole_pin_is_not_reported_unconnected() {
+        let mut scene = pcb(TWO_THT_F_CU);
+        let g = build_pcb(&scene);
+        g.apply_nets(&mut scene);
+        let markers = crate::erc::run(&scene);
+        let unconnected: Vec<_> = markers
+            .iter()
+            .filter(|m| m.code == crate::ops::ErcCode::UnconnectedPin.as_str())
+            .collect();
+        assert!(
+            unconnected.is_empty(),
+            "both GND pins are wired by the track; ERC must not call them unconnected: {unconnected:?}"
+        );
+    }
+
 }
