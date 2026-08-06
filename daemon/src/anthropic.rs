@@ -17269,10 +17269,21 @@ mod tests {
             crate::standing::list(&mem_un).await.unwrap().is_empty(),
             "an unattended Always must persist NOTHING (it parked, did not auto-dispatch)"
         );
+        // PEEK, do not TAKE. This assertion originally called `take_live`, which
+        // asserted that a bare spoken "yes" could confirm an UNATTENDED park —
+        // i.e. it asserted the confirm-hijack this codebase exists to prevent. The
+        // intent was only "a pending confirmation is armed", and `peek_pending` is
+        // the primitive for that: it checks without consuming and without implying
+        // the user was ever shown the action.
+        //
+        // An unattended park is confirmable only after it is genuinely surfaced,
+        // which re-parks it via `park_ctx(true, ..)` and arms the prompt —
+        // see `a_user_facing_repark_rearms_the_prompt`.
         assert!(
-            crate::confirm::take_live(Instant::now()).is_some(),
+            crate::confirm::peek_pending(Instant::now()).is_some(),
             "the downgraded Always armed a pending confirmation for the human"
         );
+        crate::confirm::clear();
         cleanup_temp_memory(&mem_path("policy_unattended_park"));
     }
 
