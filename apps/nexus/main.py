@@ -108,6 +108,17 @@ LEVELS_HZ = 30.0
 SPECTRUM_HZ = 30.0
 ROUTES_MIN_HZ = 1.0
 
+# The dBFS value an UNMEASURABLE spectrum band is reported as on the wire.
+# The core's 96-band log fold spreads [20 Hz, Nyquist] far more finely down low
+# than the 2048-pt FFT's bin spacing (23.44 Hz @ 48 kHz), so ~24 of the 96 bands
+# have NO bin folded into them and read -inf forever, at every sample rate, on
+# any signal (nexus_core metering.rs
+# `log_fold_leaves_bands_with_no_bin_so_minus_inf_is_structural`). The HUD's
+# parseNexusSpectrum rejects the WHOLE frame if a single entry is not a finite
+# number, so those bands must ship as a number, not as null. -140 dBFS is far
+# below the panel's -60 dBFS display floor, so it renders as an empty bar.
+SPECTRUM_FLOOR_DBFS = -140.0
+
 # The C-ABI status codes from core/src/error.rs `codes` (FROZEN — keep in sync).
 OK = 0
 NULL_POINTER = -1
@@ -679,7 +690,18 @@ def _emit_levels(core: NexusCore, link: HostLink) -> None:
 
 
 def _emit_spectrum(core: NexusCore, link: HostLink) -> None:
-    bands = [_finite(b) for b in core.spectrum()]
+    """SPEC §6 audio.spectrum (30 Hz): the 96-band log spectrum strip.
+
+    WHAT WENT WRONG: this used to fold each band through `_finite`, which maps
+    -inf/NaN to None. That is right for a LEVEL (an empty meter) and wrong for
+    this array. ~24 of the 96 bands are STRUCTURALLY -inf — the log fold is finer
+    down low than the FFT's bin spacing, so those bands have no bin and read -inf
+    at every sample rate on any signal, forever. The HUD's parseNexusSpectrum
+    (hud/src/core/events.ts) rejects the whole frame unless EVERY entry is a
+    finite number (`typeof null === "object"`), so ONE null killed the frame and
+    the 96-bar strip never drew a single time on any hardware. Floor the
+    unmeasurable bands to a real number instead."""
+    bands = [_spectrum_band(b) for b in core.spectrum()]
     link.telemetry("audio.spectrum", {"bands": bands})
 
 
@@ -699,6 +721,19 @@ def _finite(x: float) -> float | None:
     """JSON has no -inf; map silence (-inf / NaN) to None so the HUD shows an
     empty meter rather than a malformed payload."""
     return None if (x is None or math.isinf(x) or math.isnan(x)) else x
+
+
+def _spectrum_band(x: float) -> float:
+    """The `audio.spectrum` band fold: ALWAYS a finite number, never None.
+
+    Unlike a scalar level, a spectrum band cannot be None — the HUD parser
+    rejects the entire 96-band frame on the first non-number (see
+    `_emit_spectrum`). Any non-finite band — silence, a structurally-unmapped
+    band, NaN — floors to SPECTRUM_FLOOR_DBFS, which sits below the panel's
+    display floor and renders as an empty bar."""
+    if x is None or math.isinf(x) or math.isnan(x):
+        return SPECTRUM_FLOOR_DBFS
+    return float(x)
 
 
 # --------------------------------------------------------------------------- #

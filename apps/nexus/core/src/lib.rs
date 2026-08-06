@@ -29,9 +29,11 @@
 //!                    de-esser/compressor + trim) with 5 ms smoothing (SPEC §3).
 //!     - [`metering`] peak/RMS, true-peak clip detect, BS.1770-4 LUFS, and the
 //!                    2048-pt FFT -> 96 log bands (SPEC §3 step 4, §6).
-//!     - [`coreaudio`] DEVICE-GATED: aggregate device + `AudioDeviceIOProc` +
-//!                    loopback RTT. Built CORRECT under `--features coreaudio`;
-//!                    NEVER run headlessly, NEVER claim-measured.
+//!     - [`coreaudio`] DEVICE-GATED: aggregate device + `AudioDeviceIOProc`.
+//!                    Built CORRECT under `--features coreaudio`; NEVER run
+//!                    headlessly, NEVER claim-measured. The loopback RTT
+//!                    (`monitor.measure`) is NOT implemented in either build —
+//!                    it refuses rather than report a number nobody measured.
 //!
 //! HARD BOUNDARY honored crate-wide: nothing here opens a CoreAudio device,
 //! plays audio, binds a socket, or runs a server. The headless surface is pure

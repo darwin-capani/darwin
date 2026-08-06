@@ -933,8 +933,24 @@ impl SpectrumState {
             }
         } else {
             // Not yet full: place the `filled` samples (written at indices
-            // 0..pos) at the END of the window so the newest data is windowed
-            // most heavily. Leading zeros pad the front.
+            // 0..pos) at the END of the window, leading zeros padding the front.
+            // This is the natural zero-padded generalization of the full-ring
+            // path above: the newest sample always sits at the window's LAST
+            // slot, exactly where it sits once the ring fills.
+            //
+            // WHAT THAT COSTS (and what this comment used to get backwards): the
+            // window is a PERIODIC HANN (see `new`) — it peaks in the MIDDLE and
+            // decays to ~0 at both ends (`window[1024] = 1.0`, `window[2047] =
+            // 2.4e-6`). End-placement therefore gives the newest data the
+            // window's SMALLEST weights, not its largest; this comment used to
+            // claim the newest data was "windowed most heavily", which is the
+            // exact inverse. Consequence: for the first FFT_SIZE samples
+            // (~43 ms @ 48 kHz) the strip UNDER-reads — a full-scale on-bin tone
+            // reads about -74 dBFS after one 64-frame block (the last 64 window
+            // slots top out at 0.0096 = -40 dB) and climbs to 0 dBFS as the ring
+            // fills. Self-healing, and deliberately left as-is so the partial and
+            // full paths agree on sample placement; the pinning test is
+            // `partial_fill_attenuates_until_the_ring_fills`.
             let start = FFT_SIZE - self.filled;
             for n in 0..self.filled {
                 re[start + n] = self.ring[n] * self.window[start + n];
@@ -1397,6 +1413,94 @@ mod tests {
         s.push(&silence);
         let frame = s.read();
         assert!(frame.bands.iter().all(|b| b.is_infinite() && b.is_sign_negative()));
+    }
+
+    /// REGRESSION (comment drift, pinned as behavior): before the ring fills, the
+    /// partial frame is placed at the END of the periodic Hann window, whose
+    /// weights there are ~0 — so the strip UNDER-reads until `filled` reaches
+    /// FFT_SIZE. `compute_frame`'s comment used to claim the newest data was
+    /// "windowed most heavily", the exact inverse. This pins the real direction:
+    /// anyone who moves the partial frame to the window's high-weight middle must
+    /// come back and rewrite that comment.
+    #[test]
+    fn partial_fill_attenuates_until_the_ring_fills() {
+        let fs = 48_000u32;
+        let bin = 256usize;
+        let freq = bin as f32 * fs as f32 / FFT_SIZE as f32; // 6 kHz, exactly on-bin
+        let tone = sine(freq, 1.0, FFT_SIZE, fs);
+        let loudest = |s: &SpectrumState| -> f32 {
+            s.read().bands.iter().copied().fold(f32::NEG_INFINITY, f32::max)
+        };
+
+        // One 64-frame callback in: the only samples we have sit in the window's
+        // decaying tail, so a FULL-SCALE tone reads far below 0 dBFS.
+        let mut s = SpectrumState::new(fs);
+        s.push(&tone[..64]);
+        let early = loudest(&s);
+        assert!(
+            early < -40.0,
+            "partial fill must UNDER-read (samples land in the Hann tail), got {early} dBFS"
+        );
+
+        // Same tone, ring now full: the identical signal reads ~0 dBFS.
+        s.push(&tone[64..]);
+        let settled = loudest(&s);
+        assert!(settled > -3.0, "full ring of a full-scale on-bin tone: {settled} dBFS");
+        assert!(
+            settled > early + 30.0,
+            "the partial-fill transient must resolve UPWARD: {early} -> {settled} dBFS"
+        );
+    }
+
+    /// REGRESSION (wire contract, see apps/nexus/main.py `_emit_spectrum`): the log
+    /// fold CANNOT cover every band. 96 log bands spread over [20 Hz, Nyquist] are
+    /// far narrower down low than the FFT bin spacing (23.44 Hz @ 48 kHz), so the
+    /// bottom bands get NO bin at all, `band_max` stays 0.0 and `linear_to_db(0.0)`
+    /// is -inf. That is STRUCTURAL, not signal-dependent: even broadband noise that
+    /// excites every bin leaves those bands at -inf. Anything that SERIALIZES a
+    /// frame must therefore floor them to a finite number — the HUD's
+    /// `parseNexusSpectrum` rejects a whole frame containing one non-number, which
+    /// is exactly how the 96-band strip came to never render a single time.
+    #[test]
+    fn log_fold_leaves_bands_with_no_bin_so_minus_inf_is_structural() {
+        for fs in [44_100u32, 48_000, 96_000] {
+            let mut s = SpectrumState::new(fs);
+
+            // (a) Straight from the fold table: some band index is claimed by no bin.
+            let mut mapped = [false; SPECTRUM_BANDS];
+            for &b in s.bin_band.iter() {
+                if b != usize::MAX {
+                    mapped[b] = true;
+                }
+            }
+            assert!(
+                mapped.iter().any(|&m| !m),
+                "fs={fs}: expected at least one band with no FFT bin folded into it"
+            );
+
+            // (b) Observable through a real frame: deterministic broadband noise
+            // (xorshift64) excites every bin, and the unmapped bands STILL read -inf.
+            let mut x = 0x2545_F491_4F6C_DD1Du64;
+            let noise: Vec<f32> = (0..FFT_SIZE * 2)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (((x >> 32) as u32) as f32 / u32::MAX as f32) - 0.5
+                })
+                .collect();
+            s.push(&noise);
+            let frame = s.read();
+            let dead = frame.bands.iter().filter(|b| !b.is_finite()).count();
+            assert!(
+                dead > 0,
+                "fs={fs}: broadband noise left every band finite — the fold changed"
+            );
+            assert!(
+                frame.bands[SPECTRUM_BANDS - 1].is_finite(),
+                "fs={fs}: the noise did not actually excite the top band"
+            );
+        }
     }
 
     #[test]

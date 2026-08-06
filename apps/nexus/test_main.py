@@ -11,7 +11,10 @@ Scope (the python-control module's verifiable surface — SPEC §5/§6):
   - the capability TOKEN is stamped on EVERY emitted line,
   - preset-name PATH CONFINEMENT (no traversal out of presets/ or scratch/).
 
-NO socket, NO device, NO audio: a FakeLink captures outbound lines in memory,
+NO socket, NO device, NO audio: a FakeLink SUBCLASSES the real HostLink with a
+fake socket, so the wire-shape/token assertions run against HostLink's OWN
+send/telemetry framing (it used to reimplement that framing, which made every
+one of those assertions vacuous — see the FakeLink docstring),
 and the engine is driven purely through the FFI on synthesized state. Tests that
 need the native core are skipped (not failed) if the cdylib is not yet built, so
 this file is runnable headlessly even before a `cargo build`; the pure-Python
@@ -24,7 +27,9 @@ Run: python3.11 -m unittest apps/nexus/test_main.py  (or `-m unittest` from here
 from __future__ import annotations
 
 import json
+import math
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -34,36 +39,67 @@ import main as nexus
 # --------------------------------------------------------------------------- #
 # Test doubles.
 # --------------------------------------------------------------------------- #
-class FakeLink:
-    """A HostLink stand-in that captures every outbound line in memory instead
-    of writing to a socket. Mirrors HostLink's public surface (send / telemetry
-    / log) AND its token-stamping + wire framing, so token-discipline and
-    payload-shape assertions test the real serialization path."""
+class FakeSocket:
+    """A socket stand-in: the ONLY thing HostLink actually needs to write to.
+    Every byte HostLink `sendall`s is appended here verbatim, so the framing
+    under test is the real one."""
+
+    def __init__(self) -> None:
+        self.written: list[bytes] = []
+
+    def sendall(self, payload: bytes) -> None:
+        self.written.append(payload)
+
+
+class FakeLink(nexus.HostLink):
+    """A HostLink whose SOCKET is faked — not its logic.
+
+    WHAT WENT WRONG: this used to be a stand-alone class that REIMPLEMENTED
+    HostLink's token stamping and wire framing, and every assertion in
+    TestTelemetryWireShape ran against that copy while `HostLink` was never
+    instantiated anywhere in this file. Mutating main.py's HostLink to emit
+    `type:"telemetry"` (a type the daemon DROPS), to nest the payload under a
+    `payload` key (which leaves every HUD field one level too deep), and to strip
+    the capability token entirely still passed all 45 tests. The class advertised
+    that it tested "the real serialization path"; it tested itself.
+
+    Now it SUBCLASSES HostLink and substitutes only the socket, so
+    HostLink.send / HostLink.telemetry / HostLink.log ARE the code under test.
+    `raw`/`lines` are derived from the bytes that reached the fake socket."""
 
     def __init__(self, token: str = "tok-CAFEBABE") -> None:
+        # Deliberately NOT calling HostLink.__init__ — it connects a real AF_UNIX
+        # socket. We bind exactly the attributes HostLink's write path touches.
         self._token = token
-        self.lines: list[dict] = []          # decoded {token,type,data} dicts
-        self.raw: list[str] = []             # the exact JSON strings written
+        self._sock = FakeSocket()
+        self._wlock = threading.Lock()
+        self._rfile = None  # no inbound command stream in these tests
 
-    def send(self, msg_type: str, data: dict) -> None:
-        # Identical framing to HostLink.send (token stamped, compact separators).
-        line = json.dumps(
-            {"token": self._token, "type": msg_type, "data": data},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        self.raw.append(line)
-        self.lines.append(json.loads(line))
+    # -- what actually went over the wire --
+    @property
+    def raw(self) -> list[str]:
+        """The exact JSON strings written, one per line, newline stripped."""
+        out: list[str] = []
+        for chunk in self._sock.written:
+            text = chunk.decode("utf-8")
+            # HostLink frames one newline-terminated line per send; assert that
+            # here so a framing regression (missing/extra newline, batched
+            # writes) surfaces instead of being smoothed over by the split.
+            assert text.endswith("\n"), f"HostLink wrote an unterminated line: {text!r}"
+            out.append(text[:-1])
+        return out
 
-    def telemetry(self, topic: str, payload: dict) -> None:
-        # Same shape HostLink.telemetry produces: type "items", with the payload
-        # fields FLATTENED into data alongside topic ({**payload, "topic": topic}),
-        # matching Vision + the HUD parsers (no nested "payload" wrapper). topic is
-        # applied last so a stray payload "topic" key can't override routing.
-        self.send("items", {**payload, "topic": topic})
+    @property
+    def lines(self) -> list[dict]:
+        """The decoded {token,type,data} dicts, parsed back off the wire."""
+        return [json.loads(r) for r in self.raw]
 
-    def log(self, line: str) -> None:
-        self.send("log", {"line": line})
+    def clear(self) -> None:
+        """Drop everything captured so far, so a test can assert on only what a
+        LATER call emits. `lines`/`raw` are DERIVED from the fake socket's byte
+        log, so `link.lines.clear()` would empty a temporary copy and silently do
+        nothing — the source has to be cleared."""
+        self._sock.written.clear()
 
     # -- assertion helpers --
     def telemetry_for(self, topic: str) -> list[dict]:
@@ -203,6 +239,123 @@ class TestTelemetryWireShape(unittest.TestCase):
             json.loads(raw)  # must parse
 
 
+class TestFakeLinkIsTheRealHostLink(unittest.TestCase):
+    """REGRESSION (vacuous test): FakeLink used to be a stand-alone class that
+    REIMPLEMENTED HostLink's token stamping and wire framing, so every assertion
+    in TestTelemetryWireShape ran against that copy and HostLink.send /
+    HostLink.telemetry had ZERO coverage — a mutation making main.py emit
+    `type:"telemetry"` with a nested payload and no token at all shipped green.
+    Pin that the double delegates to the real methods."""
+
+    def test_fake_link_subclasses_hostlink_without_overriding_the_write_path(self):
+        link = FakeLink()
+        self.assertIsInstance(link, nexus.HostLink)
+        # The methods under test must BE HostLink's, not a copy in this file.
+        self.assertIs(type(link).send, nexus.HostLink.send)
+        self.assertIs(type(link).telemetry, nexus.HostLink.telemetry)
+        self.assertIs(type(link).log, nexus.HostLink.log)
+
+    def test_captured_bytes_come_from_hostlinks_own_sendall(self):
+        # Nothing is captured until HostLink.send writes to the socket, and what
+        # is captured is exactly the bytes it wrote.
+        link = FakeLink(token="cap-xyz")
+        self.assertEqual(link.raw, [])
+        link.telemetry("audio.routes", {"revision": 7})
+        self.assertEqual(len(link._sock.written), 1)
+        self.assertEqual(link._sock.written[0].decode("utf-8"), link.raw[0] + "\n")
+        self.assertEqual(link.lines[0]["token"], "cap-xyz")
+
+
+# --------------------------------------------------------------------------- #
+# Pure-Python: the audio.spectrum band fold (must NEVER emit a null band).
+# --------------------------------------------------------------------------- #
+class _SpectrumStubCore:
+    """The one NexusCore method `_emit_spectrum` calls."""
+
+    def __init__(self, bands: list[float]) -> None:
+        self._bands = list(bands)
+
+    def spectrum(self) -> list[float]:
+        return list(self._bands)
+
+
+class TestSpectrumWireShape(unittest.TestCase):
+    """REGRESSION: the 96-band strip never rendered a single frame, on any
+    hardware, ever. `_emit_spectrum` folded each band through `_finite`, which
+    maps -inf to None — and ~24 of the 96 bands are STRUCTURALLY -inf (the log
+    fold is finer down low than the FFT's bin spacing; see the nexus_core test
+    `log_fold_leaves_bands_with_no_bin_so_minus_inf_is_structural`). The HUD's
+    parseNexusSpectrum rejects the WHOLE frame on the first non-number, so one
+    null killed every frame."""
+
+    @staticmethod
+    def _realistic_bands() -> list[float]:
+        # What the engine really produces: mostly real levels, with the
+        # structurally-unmapped low bands at -inf.
+        bands = [-30.0 - (i % 40) for i in range(96)]
+        for i in (0, 1, 3, 4, 5, 6, 7, 8, 9, 10, 12, 13):
+            bands[i] = float("-inf")
+        return bands
+
+    def test_every_emitted_band_is_a_finite_number(self):
+        link = FakeLink()
+        nexus._emit_spectrum(_SpectrumStubCore(self._realistic_bands()), link)
+        wire = link.lines[0]["data"]["bands"]
+        self.assertEqual(len(wire), 96)
+        for i, v in enumerate(wire):
+            self.assertIsInstance(v, float, f"band {i} is not a number: {v!r}")
+            self.assertTrue(math.isfinite(v), f"band {i} is not finite: {v!r}")
+
+    def test_unmeasurable_bands_floor_and_measured_bands_pass_through(self):
+        bands = [float("-inf")] * 96
+        bands[2] = -77.65314
+        bands[95] = float("nan")
+        link = FakeLink()
+        nexus._emit_spectrum(_SpectrumStubCore(bands), link)
+        wire = link.lines[0]["data"]["bands"]
+        self.assertEqual(wire[0], nexus.SPECTRUM_FLOOR_DBFS)
+        self.assertEqual(wire[95], nexus.SPECTRUM_FLOOR_DBFS)
+        self.assertAlmostEqual(wire[2], -77.65314, places=5)
+
+    def test_serialized_line_carries_no_null_infinity_or_nan(self):
+        # The ACTUAL bytes on the wire. `json.dumps` emits the non-standard
+        # `-Infinity`/`NaN` literals for non-finite floats (which the daemon's
+        # serde_json rejects) and `null` for None (which parseNexusSpectrum
+        # rejects) — neither may appear.
+        link = FakeLink()
+        nexus._emit_spectrum(_SpectrumStubCore(self._realistic_bands()), link)
+        raw = link.raw[0]
+        self.assertNotIn("null", raw)
+        self.assertNotIn("Infinity", raw)
+        self.assertNotIn("NaN", raw)
+
+    def test_frame_satisfies_the_hud_parser_rule_verbatim(self):
+        # hud/src/core/events.ts parseNexusSpectrum: reject unless `bands` is an
+        # array of EXACTLY 96 entries, each `typeof v === "number"` AND
+        # `Number.isFinite(v)`. `typeof null === "object"`, so a single None is
+        # fatal to the frame. Re-parse from the wire text, as the HUD does.
+        link = FakeLink()
+        nexus._emit_spectrum(_SpectrumStubCore(self._realistic_bands()), link)
+        raw = json.loads(link.raw[0])["data"]["bands"]
+        accepted = (
+            isinstance(raw, list)
+            and len(raw) == 96
+            and all(
+                isinstance(v, (int, float))
+                and not isinstance(v, bool)
+                and math.isfinite(v)
+                for v in raw
+            )
+        )
+        self.assertTrue(accepted, "parseNexusSpectrum would reject this frame")
+
+    def test_spectrum_band_fold_never_returns_none(self):
+        for bad in (float("-inf"), float("inf"), float("nan"), None):
+            self.assertEqual(nexus._spectrum_band(bad), nexus.SPECTRUM_FLOOR_DBFS)
+        self.assertEqual(nexus._spectrum_band(-6.0), -6.0)
+        self.assertEqual(nexus._spectrum_band(0.0), 0.0)
+
+
 # --------------------------------------------------------------------------- #
 # Pure-Python: the -inf/NaN -> None JSON-safety fold.
 # --------------------------------------------------------------------------- #
@@ -310,7 +463,7 @@ class TestOpDispatch(unittest.TestCase):
 
     def test_state_get_emits_full_snapshot(self):
         self.disp.dispatch("route.set", {"in": 0, "out": 0, "gain_db": -1.0})
-        self.link.lines.clear()
+        self.link.clear()
         self.disp.dispatch("state.get", {})
         routes = self.link.telemetry_for("audio.routes")
         self.assertTrue(routes)

@@ -414,7 +414,11 @@ fn ring_handoff_deterministic_interleaving_is_race_free() {
     // Pre-publish round-trip: a load before any publish returns the silent init.
     // The silent grid is GAIN_OFF_DB (the encoded-coherence invariant does NOT
     // apply to it — that invariant only holds for snapshots the producer built
-    // via `snapshot_at_revision`), so we assert the silent shape directly.
+    // via `publish_coherent`), so we assert the silent shape directly.
+    // (This used to name `snapshot_at_revision` — an identifier that exists
+    // NOWHERE in the repo, so anyone auditing the SPSC hand-off invariant chased
+    // a symbol that was never defined. `publish_coherent` below is the real
+    // producer helper that establishes the encoded-coherence invariant.)
     let init = ring.load();
     assert_eq!(init.revision, 0);
     assert_eq!(init.grid[0][0], GAIN_OFF_DB);

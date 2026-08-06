@@ -8,9 +8,11 @@
 //! returns [`NexusError::Device`] for every entry point, and the real HAL
 //! bodies live behind `--features coreaudio` (`cargo check --features
 //! coreaudio` type-checks them; they are still never RUN). No number produced
-//! by this module on the headless box is ever claim-measured — `monitor.measure`
-//! reports `None` until it runs on real hardware (SPEC §2: "Measured, not
-//! assumed").
+//! by this module is ever claim-measured — `monitor.measure` reports `None` in
+//! BOTH builds, because the loopback impulse it would have to time is not
+//! implemented at all (see [`measure_monitor_rtt_ms`], which used to fabricate
+//! `Ok(~0.00 ms)` from two adjacent clock reads under the feature). SPEC §2:
+//! "Measured, not assumed".
 //!
 //! Two compilation faces:
 //!   - WITHOUT `--features coreaudio` (the default, this headless box): the
@@ -83,9 +85,11 @@ impl RtContext {
     /// configured format. DEVICE-GATED — the headless build has no ring to wire
     /// and never installs an IOProc, so it constructs an inert placeholder.
     ///
-    /// SAFETY (feature build): `ring` must outlive every IOProc installed with
-    /// this context (the control plane guarantees this — it owns the ring and
-    /// destroys the IOProc before dropping it).
+    /// # Safety
+    ///
+    /// (feature build) `ring` must outlive every IOProc installed with this
+    /// context — the control plane guarantees this: it owns the ring and destroys
+    /// the IOProc before dropping it.
     #[cfg(feature = "coreaudio")]
     pub unsafe fn new(ring: *const crate::matrix::SnapshotRing, format: AudioFormat) -> Self {
         Self { ring, format, meters: MeterRing::new() }
@@ -254,9 +258,11 @@ impl AggregateDevice {
     /// [`crate::matrix::SnapshotRing`] before [`install_ioproc`]. Additive
     /// builder; the four frozen device-op signatures are unchanged.
     ///
-    /// SAFETY: `ring` must outlive the installed IOProc — the control plane owns
-    /// the ring and destroys the proc (via [`IoProc::shutdown`]/`Drop`) before
-    /// dropping the ring.
+    /// # Safety
+    ///
+    /// `ring` must outlive the installed IOProc — the control plane owns the ring
+    /// and destroys the proc (via [`IoProc::shutdown`]/`Drop`) before dropping
+    /// the ring.
     pub unsafe fn with_ring(
         mut self,
         ring: *const crate::matrix::SnapshotRing,
@@ -310,10 +316,15 @@ impl std::fmt::Debug for IoProc {
 
 #[cfg(feature = "coreaudio")]
 mod sys {
-    //! Thin re-export of the `coreaudio-sys` items this seam uses, plus the two
-    //! Mach timing externs `coreaudio-sys` does not surface (hand-declared, as
-    //! the task allows). Keeping them in one module documents the exact HAL
-    //! surface the IOProc/aggregate path touches.
+    //! Thin re-export of the `coreaudio-sys` items this seam uses. Keeping them
+    //! in one module documents the exact HAL surface the IOProc/aggregate path
+    //! touches.
+    //!
+    //! This used to also hand-declare `mach_absolute_time`/`mach_timebase_info`
+    //! "for the loopback RTT impulse timing". There is no impulse — the only
+    //! caller timed two adjacent clock reads and returned the delta as a measured
+    //! RTT (see [`super::measure_monitor_rtt_ms`]). The externs are gone with it;
+    //! bring them back WITH the impulse path, not before it.
     pub use coreaudio_sys::{
         kAudioAggregateDeviceIsPrivateKey, kAudioAggregateDeviceMasterSubDeviceKey,
         kAudioAggregateDeviceNameKey, kAudioAggregateDeviceSubDeviceListKey,
@@ -329,21 +340,6 @@ mod sys {
         CFArrayCreateMutable, CFDictionaryCreateMutable, CFDictionarySetValue, CFNumberCreate,
         CFRelease, CFStringCreateWithCString, CFStringRef, CFTypeRef, OSStatus,
     };
-
-    // Mach absolute-time clock for the loopback RTT impulse timing. Not surfaced
-    // by `coreaudio-sys`; hand-declared per the task ("coreaudio-sys OR
-    // hand-declared externs"). DEVICE-GATED — only called inside the real RTT
-    // body, never on this box.
-    #[repr(C)]
-    #[derive(Clone, Copy, Default)]
-    pub struct MachTimebaseInfo {
-        pub numer: u32,
-        pub denom: u32,
-    }
-    extern "C" {
-        pub fn mach_absolute_time() -> u64;
-        pub fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
-    }
 }
 
 /// DEVICE-GATED: turn a Rust `&str` into a retained `CFStringRef` (UTF-8). The
@@ -723,52 +719,93 @@ unsafe extern "C" fn nexus_io_proc(
         }
     }
 
-    // Mix into each output buffer in place.
-    let mut peak: [f32; crate::types::MAX_CHANNELS] = [0.0; crate::types::MAX_CHANNELS];
-    let mut out_idx = 0usize;
-    for b in out_buffers.iter_mut() {
+    // Mix EVERY output bus in ONE `mix_block` call, over a slice whose position
+    // IS the matrix output index.
+    //
+    // WHAT WENT WRONG: this used to loop the output AudioBuffers and call
+    // `mix_block` once per buffer with a ONE-ELEMENT slice. `mix_block` derives
+    // the matrix output index from the position in the `outputs` slice
+    // (`for (o, out) in outputs.iter_mut().enumerate()` -> `snapshot.grid[i][o]`,
+    // `snapshot.output_mutes[o]`), so with a 1-element slice `o` was ALWAYS 0:
+    // every output bus received output 0's crosspoint column and output 0's mute.
+    // An N x M matrix collapsed to M copies of column 0 — an UNROUTED bus emitted
+    // full-level audio and a MUTED bus was not silenced, so SPEC §5's "mute the
+    // mic" would not have silenced any bus except output 0. `engine.rs`'s
+    // `process_block` has always passed the WHOLE slice; this is now the same
+    // shape, so the two paths agree.
+    //
+    // The old `out_idx` counter also incremented only for NON-null buffers, so a
+    // null `mData` shifted every later buffer's matrix index down by one. The
+    // index below is the AudioBufferList position itself — a null buffer keeps
+    // its own slot.
+    let n_out = out_count.min(crate::types::MAX_CHANNELS);
+
+    // Any output buffer past `MAX_CHANNELS` cannot be addressed by the matrix at
+    // all; silence it rather than leave whatever the HAL had in it. (Bounded by
+    // `out_count` because `out_buffers` was built with `.max(1)`.)
+    for b in out_buffers.iter_mut().take(out_count).skip(n_out) {
         if b.mData.is_null() {
             continue;
         }
         let n = (b.mDataByteSize as usize) / std::mem::size_of::<f32>();
-        let data = std::slice::from_raw_parts_mut(b.mData as *mut f32, n);
-        let mut out_block = [BlockMut { data, format: fmt }];
-        crate::dsp::mix_block(&snapshot, &in_refs[..n_in], &mut out_block);
-        // Per-output peak tap for the control plane.
-        if out_idx < crate::types::MAX_CHANNELS {
-            let mut p = 0.0f32;
-            for &s in out_block[0].data.iter() {
-                let a = s.abs();
-                if a > p {
-                    p = a;
-                }
-            }
-            peak[out_idx] = p;
+        std::slice::from_raw_parts_mut(b.mData as *mut f32, n).fill(0.0);
+    }
+
+    // Capture each addressable buffer's span ONCE (raw pointer + sample count),
+    // indexed by its AudioBufferList position, then build the `BlockMut` slice
+    // from those spans. Going through the spans keeps `out_buffers` out of the
+    // aliasing picture while the mutable sample borrows are live.
+    let mut out_spans: [(*mut f32, usize); crate::types::MAX_CHANNELS] =
+        [(std::ptr::null_mut(), 0); crate::types::MAX_CHANNELS];
+    for (o, b) in out_buffers.iter_mut().enumerate().take(n_out) {
+        if b.mData.is_null() {
+            continue;
         }
-        out_idx += 1;
+        out_spans[o] =
+            (b.mData as *mut f32, (b.mDataByteSize as usize) / std::mem::size_of::<f32>());
+    }
+    let mut out_blocks: [BlockMut<'_>; crate::types::MAX_CHANNELS] = std::array::from_fn(|o| {
+        let (p, n) = out_spans[o];
+        // A null-`mData` (or beyond-`n_out`) slot gets an empty block: `mix_block`
+        // writes nothing to it but still consumes its output index.
+        let data: &mut [f32] =
+            if p.is_null() { &mut [] } else { std::slice::from_raw_parts_mut(p, n) };
+        BlockMut { data, format: fmt }
+    });
+    crate::dsp::mix_block(&snapshot, &in_refs[..n_in], &mut out_blocks[..n_out]);
+
+    // Per-output peak tap for the control plane, read off the SAME blocks we just
+    // mixed (so the peak is indexed by the real output bus, not by loop order).
+    let mut peak: [f32; crate::types::MAX_CHANNELS] = [0.0; crate::types::MAX_CHANNELS];
+    for (o, blk) in out_blocks.iter().enumerate().take(n_out) {
+        let mut p = 0.0f32;
+        for &s in blk.data.iter() {
+            let a = s.abs();
+            if a > p {
+                p = a;
+            }
+        }
+        peak[o] = p;
     }
 
     // Tap the monitored output (if assigned) into a mono meter block for the
-    // control plane to fold LUFS/FFT off the audio thread.
-    let mut meter = MeterBlock::default();
-    meter.out_peak = peak;
+    // control plane to fold LUFS/FFT off the audio thread. Read through
+    // `out_blocks` too — re-deriving a slice from `out_buffers[mon].mData` here
+    // would alias the mutable borrows above.
+    let mut meter = MeterBlock { out_peak: peak, ..MeterBlock::default() };
     if let Some(mon) = snapshot.monitor_output {
-        if mon < out_count {
-            let b = &out_buffers[mon];
-            if !b.mData.is_null() {
-                let n = (b.mDataByteSize as usize) / std::mem::size_of::<f32>();
-                let data = std::slice::from_raw_parts(b.mData as *const f32, n);
-                let frames = (n / channels).min(METER_BLOCK_FRAMES);
-                for f in 0..frames {
-                    // Sum interleaved channels to mono for the program meter.
-                    let mut acc = 0.0f32;
-                    for c in 0..channels {
-                        acc += data[f * channels + c];
-                    }
-                    meter.samples[f] = acc / channels as f32;
+        if mon < n_out {
+            let data: &[f32] = out_blocks[mon].data;
+            let frames = (data.len() / channels).min(METER_BLOCK_FRAMES);
+            for f in 0..frames {
+                // Sum interleaved channels to mono for the program meter.
+                let mut acc = 0.0f32;
+                for c in 0..channels {
+                    acc += data[f * channels + c];
                 }
-                meter.frames = frames;
+                meter.samples[f] = acc / channels as f32;
             }
+            meter.frames = frames;
         }
     }
     ctx.meters.push(meter);
@@ -904,11 +941,25 @@ impl Drop for IoProc {
     }
 }
 
-/// Measure the loopback monitor round-trip (SPEC §2 `monitor.measure`): drive an
-/// impulse out the monitor route and report the actual RTT in ms. DEVICE-GATED —
-/// there is NO headless number for this; it is MEASURED on hardware, never
-/// assumed. Returns [`NexusError::Device`] in the stub build so no false RTT is
-/// ever reported (SPEC §2: "Measured, not assumed").
+/// The loopback monitor round-trip (SPEC §2 `monitor.measure`). NOT IMPLEMENTED
+/// in EITHER build: measuring it needs an impulse emitted on the monitor route
+/// and detected at the input tap, and the IOProc has no such injection/detection
+/// path. Always returns [`NexusError::Device`], so `monitor.measure` reports
+/// `None` (SPEC §2: "Measured, not assumed") rather than a number nobody
+/// measured.
+///
+/// WHAT WENT WRONG: under `--features coreaudio` this used to time two
+/// BACK-TO-BACK `mach_absolute_time()` reads with nothing in between and return
+/// the delta as milliseconds — i.e. `Ok(~0.00 ms)`. No impulse was emitted and no
+/// input tap was read. Its own doc claimed it "computes a real elapsed time from
+/// the Mach clock around a loopback impulse" and that "the caller supplies the
+/// real [timestamps]", through a signature (`&IoProc` and nothing else) that
+/// gives a caller no way to supply anything. On hardware that would have
+/// published `measured_rtt_ms ≈ 0.00` on `audio.routes` and trivially "passed"
+/// SPEC §7 milestone 1's "measured RTT < 10 ms" — the exact claim this module's
+/// header promises never to make. A refusal is the honest answer until the
+/// impulse path exists; when it does, this should take the hardware-measured
+/// `(t0, t1)` Mach ticks as arguments rather than inventing them here.
 pub fn measure_monitor_rtt_ms(_proc: &IoProc) -> Result<f32> {
     #[cfg(not(feature = "coreaudio"))]
     {
@@ -918,30 +969,11 @@ pub fn measure_monitor_rtt_ms(_proc: &IoProc) -> Result<f32> {
     }
     #[cfg(feature = "coreaudio")]
     {
-        // DEVICE-GATED real body. This computes a real elapsed time from the Mach
-        // clock around a loopback impulse, but it is NEVER run on this box — the
-        // control plane only calls it on hardware, and `monitor.measure` reports
-        // `None` until then. The impulse injection itself is driven through the
-        // live IOProc's input/output taps (wired on hardware); here we provide
-        // the timing math so the seam compiles end-to-end.
-        unsafe {
-            if _proc.proc_id.is_none() {
-                return Err(NexusError::Device("no running IOProc to measure".into()));
-            }
-            let mut tb = sys::MachTimebaseInfo::default();
-            if sys::mach_timebase_info(&mut tb as *mut _) != 0 || tb.denom == 0 {
-                return Err(NexusError::Device("mach_timebase_info failed".into()));
-            }
-            // On real hardware the control plane records `t0` at impulse emission
-            // and `t1` when the loopback impulse is detected at the input tap; the
-            // two timestamps below are placeholders for that hardware-measured
-            // pair. We DO NOT fabricate a delta — equal timestamps yield 0 and the
-            // caller (which only runs this on hardware) supplies the real ones.
-            let t0 = sys::mach_absolute_time();
-            let t1 = sys::mach_absolute_time();
-            let elapsed_ns = (t1.wrapping_sub(t0)) as f64 * (tb.numer as f64) / (tb.denom as f64);
-            Ok((elapsed_ns / 1.0e6) as f32)
-        }
+        Err(NexusError::Device(
+            "monitor RTT needs a loopback impulse on the monitor route detected at the input \
+             tap; the IOProc does not implement one, so no RTT is reported"
+                .into(),
+        ))
     }
 }
 
@@ -976,6 +1008,23 @@ mod tests {
         }
     }
 
+    /// REGRESSION: `monitor.measure` must NEVER return a number, in EITHER build.
+    /// Under `--features coreaudio` the body used to time two back-to-back
+    /// `mach_absolute_time()` reads with no impulse in between and return the
+    /// delta as milliseconds — `Ok(~0.00 ms)`. On hardware that would publish
+    /// `measured_rtt_ms ≈ 0.00` on `audio.routes` and trivially "pass" SPEC §7
+    /// milestone 1's "measured RTT < 10 ms" with a number nobody measured. This
+    /// test is NOT `#[cfg]`-gated: it is the one assertion that has to hold in the
+    /// device build too.
+    #[test]
+    fn monitor_rtt_is_never_fabricated_in_either_build() {
+        let proc = IoProc::default();
+        match measure_monitor_rtt_ms(&proc) {
+            Err(NexusError::Device(_)) => {}
+            other => panic!("monitor.measure returned a value nobody measured: {other:?}"),
+        }
+    }
+
     #[test]
     fn ioproc_default_and_shutdown_are_safe_headlessly() {
         // The headless IoProc placeholder shuts down cleanly (no device, no-op)
@@ -986,6 +1035,191 @@ mod tests {
             assert!(p.shutdown().is_ok());
             // Debug + Default don't panic.
             let _ = format!("{p:?}");
+        }
+    }
+
+    // --- the IOProc's own mix wiring (run with `cargo test --features coreaudio`)
+    //
+    // These DRIVE `nexus_io_proc` directly with synthesized `AudioBufferList`s.
+    // That is legitimate on this box and touches NO device: the callback only
+    // loads the snapshot ring, calls the pure `dsp::mix_block`, and pushes a
+    // `MeterBlock` — every HAL symbol lives in install/teardown, which these do
+    // not go near. Nothing here is claim-measured; they assert routing, not
+    // latency.
+    #[cfg(feature = "coreaudio")]
+    mod io_proc_mix {
+        use super::*;
+        use crate::matrix::{MatrixState, SnapshotRing};
+        // Straight from the binding crate rather than the `sys` re-export: the
+        // IOProc itself never NAMES this type (it reaches it through
+        // `AudioBufferList::mBuffers`), so re-exporting it would be an unused
+        // import in every non-test build.
+        use coreaudio_sys::AudioBuffer;
+
+        const FS: u32 = 48_000;
+        const FRAMES: usize = 8;
+
+        /// An `AudioBufferList` carrying three buffers. The C type declares
+        /// `mBuffers` as a 1-element flexible array, so a `#[repr(C)]` struct with
+        /// the same `UInt32` header and a longer array reproduces exactly the
+        /// layout the HAL hands the callback (asserted below).
+        #[repr(C)]
+        struct BufferList3 {
+            number_buffers: u32,
+            buffers: [AudioBuffer; 3],
+        }
+
+        /// An `AudioBuffer` pointing at `data` (mono, f32 frames).
+        fn buf(data: &mut [f32]) -> AudioBuffer {
+            AudioBuffer {
+                mNumberChannels: 1,
+                mDataByteSize: std::mem::size_of_val(data) as u32,
+                mData: data.as_mut_ptr() as *mut std::os::raw::c_void,
+            }
+        }
+
+        /// A buffer the HAL declared but did not back with memory.
+        fn null_buf() -> AudioBuffer {
+            AudioBuffer {
+                mNumberChannels: 1,
+                mDataByteSize: 0,
+                mData: std::ptr::null_mut(),
+            }
+        }
+
+        #[test]
+        fn synthesized_buffer_list_matches_the_hal_layout() {
+            // If this ever fails, the two tests below are writing into the wrong
+            // offsets and prove nothing.
+            assert_eq!(
+                std::mem::offset_of!(BufferList3, buffers),
+                std::mem::offset_of!(sys::AudioBufferList, mBuffers),
+                "mBuffers offset drifted from the HAL struct"
+            );
+            assert_eq!(
+                std::mem::align_of::<BufferList3>(),
+                std::mem::align_of::<sys::AudioBufferList>()
+            );
+        }
+
+        /// Run ONE IOProc callback over the given lists, returning the published
+        /// meter block. SAFETY: the buffer lists and the ring outlive the call and
+        /// the callback never touches a device.
+        unsafe fn drive(
+            ring: &SnapshotRing,
+            fmt: AudioFormat,
+            in_list: &BufferList3,
+            out_list: &mut BufferList3,
+        ) -> MeterBlock {
+            let ctx = RtContext::new(ring as *const SnapshotRing, fmt);
+            let status = nexus_io_proc(
+                0,
+                std::ptr::null(),
+                in_list as *const BufferList3 as *const sys::AudioBufferList,
+                std::ptr::null(),
+                out_list as *mut BufferList3 as *mut sys::AudioBufferList,
+                std::ptr::null(),
+                &ctx as *const RtContext as *mut std::os::raw::c_void,
+            );
+            assert_eq!(status, 0, "the IOProc must return noErr");
+            ctx.meters.load().expect("the IOProc must publish a meter block")
+        }
+
+        /// REGRESSION: the IOProc called `mix_block` once PER OUTPUT BUFFER with a
+        /// ONE-ELEMENT slice, so `mix_block`'s output index `o` was always 0 and
+        /// every bus got output 0's crosspoint column and output 0's mute. An
+        /// N x M matrix collapsed to M copies of column 0: an UNROUTED bus emitted
+        /// full-level audio and a MUTED bus was never silenced.
+        #[test]
+        fn each_output_bus_uses_its_own_crosspoint_column_and_mute() {
+            // 1 input x 3 outputs:
+            //   out0 routed at unity, unmuted -> full level
+            //   out1 NOT routed               -> silence
+            //   out2 routed at unity, MUTED   -> silence
+            let mut state = MatrixState::new(1, 3).unwrap();
+            state.set_crosspoint(0, 0, 0.0).unwrap();
+            state.set_crosspoint(0, 2, 0.0).unwrap();
+            state.set_output_mute(2, true).unwrap();
+            state.set_monitor_output(Some(0)).unwrap();
+            let ring = SnapshotRing::new(state.snapshot());
+
+            let fmt = AudioFormat::new(1, FS);
+            let mut inbuf = vec![1.0f32; FRAMES];
+            // Pre-fill the outputs with garbage: the mix must clear every bus.
+            let mut o0 = vec![7.0f32; FRAMES];
+            let mut o1 = vec![7.0f32; FRAMES];
+            let mut o2 = vec![7.0f32; FRAMES];
+
+            let meter = unsafe {
+                let in_list =
+                    BufferList3 { number_buffers: 1, buffers: [buf(&mut inbuf), null_buf(), null_buf()] };
+                let mut out_list = BufferList3 {
+                    number_buffers: 3,
+                    buffers: [buf(&mut o0), buf(&mut o1), buf(&mut o2)],
+                };
+                drive(&ring, fmt, &in_list, &mut out_list)
+            };
+
+            assert!(
+                o0.iter().all(|s| (s - 1.0).abs() < 1e-6),
+                "routed, unmuted out0 did not receive the input: {o0:?}"
+            );
+            assert!(o1.iter().all(|s| *s == 0.0), "UNROUTED out1 emitted audio: {o1:?}");
+            assert!(o2.iter().all(|s| *s == 0.0), "MUTED out2 was not silenced: {o2:?}");
+
+            // The per-output peak tap is indexed by the real bus too.
+            assert!((meter.out_peak[0] - 1.0).abs() < 1e-6, "peak[0] = {}", meter.out_peak[0]);
+            assert_eq!(meter.out_peak[1], 0.0, "peak[1] = {}", meter.out_peak[1]);
+            assert_eq!(meter.out_peak[2], 0.0, "peak[2] = {}", meter.out_peak[2]);
+            // The monitored bus (output 0) reached the program meter.
+            assert_eq!(meter.frames, FRAMES);
+            assert!((meter.samples[0] - 1.0).abs() < 1e-6);
+        }
+
+        /// REGRESSION: the old per-output counter incremented only for buffers
+        /// with non-null `mData`, so one null buffer shifted every LATER bus's
+        /// index down by one — the peak for bus 2 was filed under bus 1.
+        #[test]
+        fn a_null_output_buffer_does_not_shift_the_later_bus_indices() {
+            let mut state = MatrixState::new(1, 3).unwrap();
+            state.set_crosspoint(0, 2, 0.0).unwrap(); // in0 -> out2 ONLY
+            state.set_monitor_output(Some(2)).unwrap();
+            let ring = SnapshotRing::new(state.snapshot());
+
+            let fmt = AudioFormat::new(1, FS);
+            let mut inbuf = vec![1.0f32; FRAMES];
+            let mut o0 = vec![7.0f32; FRAMES];
+            let mut o2 = vec![7.0f32; FRAMES];
+
+            let meter = unsafe {
+                let in_list =
+                    BufferList3 { number_buffers: 1, buffers: [buf(&mut inbuf), null_buf(), null_buf()] };
+                // Buffer 1 is declared but has no memory behind it.
+                let mut out_list = BufferList3 {
+                    number_buffers: 3,
+                    buffers: [buf(&mut o0), null_buf(), buf(&mut o2)],
+                };
+                drive(&ring, fmt, &in_list, &mut out_list)
+            };
+
+            assert!(o0.iter().all(|s| *s == 0.0), "UNROUTED out0 emitted audio: {o0:?}");
+            assert!(
+                o2.iter().all(|s| (s - 1.0).abs() < 1e-6),
+                "out2 did not receive its own route: {o2:?}"
+            );
+            assert_eq!(meter.out_peak[0], 0.0, "peak[0] = {}", meter.out_peak[0]);
+            assert_eq!(
+                meter.out_peak[1], 0.0,
+                "the null buffer's slot took bus 2's peak (index shift): {}",
+                meter.out_peak[1]
+            );
+            assert!(
+                (meter.out_peak[2] - 1.0).abs() < 1e-6,
+                "bus 2's peak was filed elsewhere: peak[2] = {}",
+                meter.out_peak[2]
+            );
+            assert_eq!(meter.frames, FRAMES, "the monitored bus (2) did not reach the meter");
+            assert!((meter.samples[0] - 1.0).abs() < 1e-6);
         }
     }
 }

@@ -19,17 +19,37 @@ use crate::metering::{
     TruePeakKernel,
 };
 use crate::types::{
-    AudioFormat, BlockMut, BlockRef, ChannelDsp, ChannelMeter, ClipEvent, LoudnessMeter, Sample,
-    MAX_CHANNELS,
+    db_to_linear, AudioFormat, BlockMut, BlockRef, ChannelDsp, ChannelMeter, ClipEvent,
+    LoudnessMeter, Sample, MAX_CHANNELS,
 };
 
 /// Worst-case interleaved samples per `process_block` we preallocate audio-thread
 /// scratch for. The SPEC §2 realtime config is 64 frames, stepping to 128 under
-/// load; a generous headroom (4096) covers a 128-frame block at the full
-/// `MAX_CHANNELS` interleave (128 * 32 = 4096) and any oversized test block,
-/// so the scratch buffers never need to reallocate on the audio path. If a block
-/// somehow exceeds this the engine degrades gracefully (it only meters the
-/// reserved prefix) rather than allocating.
+/// load; 4096 covers the full `MAX_CHANNELS` fan-in at that geometry (32 mono
+/// inputs * 128 frames = 4096), so the scratch buffers never reallocate on the
+/// audio path at the shipped configuration.
+///
+/// THE BUDGET IS A SUM, NOT ONE BLOCK. `chain_scratch` stages EVERY active
+/// input's processed samples CONCATENATED (one region per input), so what has to
+/// fit is `sum over active inputs of inputs[i].data.len()` — not the length of a
+/// single block. Multi-channel INTERLEAVED inputs, or blocks longer than 128
+/// frames from an offline/FFI caller, can therefore exceed it.
+///
+/// WHAT WENT WRONG (fixed here): this comment used to describe the bound as "a
+/// 128-frame block at the full MAX_CHANNELS interleave" and promise that an
+/// oversized block "only meters the reserved prefix". Both were false, and the
+/// second was the dangerous one — the staging clamp fed the TRUNCATED region
+/// straight into `dsp::mix_block`, so a single 8192-sample block came out as
+/// 4096 samples of audio followed by 4096 samples of DIGITAL SILENCE, and a
+/// second 4096-sample input vanished from the mix entirely with its level meter
+/// reading -inf. That is silent audio loss (a dropout / a missing source), not a
+/// cosmetic meter artifact, and the comment told every future maintainer not to
+/// guard against it. An input whose block does not fit the remaining scratch is
+/// now mixed RAW — straight from the caller's buffer, which costs it the
+/// per-input studio chain and its `gain.set` input trim for that block (we
+/// cannot process in place in the caller's memory) but drops NO audio. The one
+/// thing that still truncates is `mono_scratch`, and that IS metering-only: the
+/// program LUFS/spectrum see the monitored block's reserved prefix.
 const MAX_BLOCK_SAMPLES: usize = 4096;
 
 /// Capacity of the realtime clip-event accumulator (SPEC §6 `audio.clipping`).
@@ -84,10 +104,25 @@ pub struct Engine {
     spectrum: SpectrumState,
     /// The audio format the engine is configured for.
     format: AudioFormat,
-    /// Input trims in dB (SPEC §5 `gain.set` on inputs).
+    /// Input trims in dB (SPEC §5 `gain.set` on inputs). The authoritative
+    /// control-side value (what `state.get`/`audio.gain` would report); the
+    /// audio path reads the matching smoother below, never this.
     input_trim_db: [f32; MAX_CHANNELS],
-    /// Output trims in dB (SPEC §5 `gain.set` on outputs).
+    /// Output trims in dB (SPEC §5 `gain.set` on outputs). Same split.
     output_trim_db: [f32; MAX_CHANNELS],
+    /// The REALTIME form of the two trim arrays: one 5 ms [`dsp::Smoother`] per
+    /// input and per output, parked at the linear gain, so a `gain.set` ramps
+    /// instead of stepping (SPEC §2, no zipper noise — same discipline as the
+    /// studio chain's own output trim).
+    ///
+    /// WHAT WENT WRONG: `input_trim_db`/`output_trim_db` used to be written by
+    /// `set_input_trim`/`set_output_trim` and READ BY NOTHING — not the mix, not
+    /// the meters, not `state.get`. `gain.set` acked OK and main.py emitted an
+    /// `audio.gain` telemetry frame showing the new value while the audio was
+    /// BIT-IDENTICAL: a -40 dB trim and a +12 dB trim produced exactly the same
+    /// samples as no trim at all. These smoothers are what makes the op real.
+    input_trims: [dsp::Smoother; MAX_CHANNELS],
+    output_trims: [dsp::Smoother; MAX_CHANNELS],
 }
 
 impl Engine {
@@ -117,6 +152,9 @@ impl Engine {
             format,
             input_trim_db: [0.0; MAX_CHANNELS],
             output_trim_db: [0.0; MAX_CHANNELS],
+            // Parked at unity (0 dB), ramps timed to the real sample rate.
+            input_trims: [dsp::Smoother::with_rate(1.0, sample_rate); MAX_CHANNELS],
+            output_trims: [dsp::Smoother::with_rate(1.0, sample_rate); MAX_CHANNELS],
         })
     }
 
@@ -155,6 +193,9 @@ impl Engine {
             return Err(NexusError::InvalidParam { param: "gain_db", reason: "must be finite" });
         }
         self.input_trim_db[channel] = gain_db;
+        // Aim the realtime smoother at the new linear gain — WITHOUT this the op
+        // is a no-op that still acks OK (see the `input_trims` field comment).
+        self.input_trims[channel].set_target(db_to_linear(gain_db));
         Ok(())
     }
 
@@ -171,6 +212,7 @@ impl Engine {
             return Err(NexusError::InvalidParam { param: "gain_db", reason: "must be finite" });
         }
         self.output_trim_db[channel] = gain_db;
+        self.output_trims[channel].set_target(db_to_linear(gain_db));
         Ok(())
     }
 
@@ -206,6 +248,17 @@ impl Engine {
         }
         self.channel_dsp[channel] = dsp_params;
         Ok(())
+    }
+
+    /// The current input trim in dB (SPEC §5 `gain.set`), as last accepted by
+    /// [`Self::set_input_trim`]. Out-of-range channels read 0 dB (unity).
+    pub fn input_trim(&self, channel: usize) -> f32 {
+        self.input_trim_db.get(channel).copied().unwrap_or(0.0)
+    }
+
+    /// The current output trim in dB (SPEC §5 `gain.set`).
+    pub fn output_trim(&self, channel: usize) -> f32 {
+        self.output_trim_db.get(channel).copied().unwrap_or(0.0)
     }
 
     /// The current per-input DSP chain params.
@@ -275,9 +328,12 @@ impl Engine {
             let off = self.chain_scratch.len();
             // Bound the copy so the staged total never exceeds the reserved
             // capacity (degrade gracefully instead of reallocating on the audio
-            // path).
+            // path). The staged total is a SUM over inputs, so this can bite even
+            // when no single block is oversized — see `MAX_BLOCK_SAMPLES`. An
+            // input that does not fit ENTIRELY is not staged at all: it is mixed
+            // raw below, so it keeps every sample and only loses the chain.
             let room = self.chain_scratch.capacity().saturating_sub(off);
-            let n = inp.data.len().min(room);
+            let n = if inp.data.len() <= room { inp.data.len() } else { 0 };
             self.chain_scratch.extend_from_slice(&inp.data[..n]);
 
             // Run the chain in place over this input's staged region. The borrow is
@@ -288,6 +344,17 @@ impl Engine {
                 let params = &self.channel_dsp[ch];
                 dsp::process_channel_chain(params, state, region, inp.format.sample_rate);
             }
+
+            // SPEC §5 `gain.set` INPUT trim, applied to the staged (chain-processed)
+            // region so it reaches the mix, the monitored bus, the per-input level
+            // meter AND the clip detector — everything downstream reads this region.
+            // Smoothed over PARAM_RAMP_MS (5 ms) so a gain move never zippers. See
+            // the `input_trims` field comment for what this used to (not) do.
+            let trim = &mut self.input_trims[ch];
+            for s in region.iter_mut() {
+                *s *= trim.next();
+            }
+
             regions[ch] = (off, n);
         }
 
@@ -295,15 +362,39 @@ impl Engine {
         // the regions are disjoint slices of one `Vec`, we materialize them into a
         // fixed-size array of refs (no alloc) before the mutable scratch borrow is
         // needed again.
+        //
+        // OVERFLOW FALLBACK: an input whose block did not fit the remaining
+        // `chain_scratch` was staged with length 0 above; it is mixed RAW here,
+        // straight from the caller's buffer. It loses the studio chain and the
+        // input trim for that block (we cannot process in place in the caller's
+        // memory), but it keeps EVERY SAMPLE. The previous behavior — mixing the
+        // truncated staged prefix — turned the rest of the block into digital
+        // silence and made a whole over-budget input disappear from the bus.
         let processed_refs: [BlockRef<'_>; MAX_CHANNELS] = std::array::from_fn(|ch| {
             if ch < active_in {
                 let (off, n) = regions[ch];
-                BlockRef { data: &self.chain_scratch[off..off + n], format: inputs[ch].format }
+                if n == inputs[ch].data.len() {
+                    BlockRef { data: &self.chain_scratch[off..off + n], format: inputs[ch].format }
+                } else {
+                    inputs[ch]
+                }
             } else {
                 BlockRef { data: &[], format: inputs.get(ch).map(|b| b.format).unwrap_or_default() }
             }
         });
         dsp::mix_block(&snapshot, &processed_refs[..active_in], outputs);
+
+        // SPEC §5 `gain.set` OUTPUT trim: scale each output bus AFTER the mix and
+        // BEFORE the peak/program meters read it, so the trim reaches the bus, the
+        // monitored mix and the LUFS/spectrum taps. Smoothed like the input trim.
+        // (Muted / inactive outputs were cleared to silence by `mix_block`; scaling
+        // silence is still silence.)
+        for (o, out) in outputs.iter_mut().enumerate().take(MAX_CHANNELS) {
+            let trim = &mut self.output_trims[o];
+            for s in out.data.iter_mut() {
+                *s *= trim.next();
+            }
+        }
 
         // Per-input meter taps (SPEC §6 `audio.levels`) read the PROCESSED lane 0,
         // so the HUD level reflects gate/comp/trim/HPF, not the raw input.
@@ -654,6 +745,243 @@ mod tests {
             m_on.rms_dbfs,
             m_off.rms_dbfs
         );
+    }
+
+    // --- SPEC §5 `gain.set` trims actually reach the audio ---------------------
+    //     REGRESSION: `input_trim_db`/`output_trim_db` were written by
+    //     `set_input_trim`/`set_output_trim` and read by NOTHING. The op acked OK
+    //     and main.py emitted an `audio.gain` frame showing the new value while a
+    //     -40 dB trim produced BIT-IDENTICAL samples to no trim at all.
+
+    /// Stream `input` through a 1x1 engine (unity route, output 0 monitored) with
+    /// the given input/output trims, returning the concatenated monitored output.
+    fn monitored_output_with_trims(
+        input_trim_db: f32,
+        output_trim_db: f32,
+        input: &[f32],
+    ) -> Vec<f32> {
+        let mut e = Engine::new(1, 1, FS).unwrap();
+        e.set_crosspoint(0, 0, 0.0).unwrap();
+        e.set_monitor_output(Some(0)).unwrap();
+        e.set_input_trim(0, input_trim_db).unwrap();
+        e.set_output_trim(0, output_trim_db).unwrap();
+        let fmt = AudioFormat::new(1, FS);
+        let mut captured = Vec::with_capacity(input.len());
+        for chunk in input.chunks(BLK) {
+            let mut outbuf = vec![0.0f32; chunk.len()];
+            {
+                let inputs = [BlockRef { data: chunk, format: fmt }];
+                let mut outputs = [BlockMut { data: &mut outbuf, format: fmt }];
+                e.process_block(&inputs, &mut outputs);
+            }
+            captured.extend_from_slice(&outbuf);
+        }
+        captured
+    }
+
+    #[test]
+    fn input_trim_scales_the_monitored_bus() {
+        // -6 dB on the INPUT trim halves the amplitude at the monitored output.
+        // Measure the settled tail so the 5 ms parameter ramp is long past.
+        let input = sine(1000.0, 0.5, 9600, FS);
+        let flat = monitored_output_with_trims(0.0, 0.0, &input);
+        let trimmed = monitored_output_with_trims(-6.0, 0.0, &input);
+        let r_flat = rms(&flat[flat.len() - 2400..]);
+        let r_trim = rms(&trimmed[trimmed.len() - 2400..]);
+        let delta_db = linear_to_db(r_trim / r_flat);
+        assert!(
+            (delta_db + 6.0).abs() < 0.5,
+            "input trim did not reach the bus: {delta_db} dB (flat {r_flat}, trimmed {r_trim})"
+        );
+
+        // And it is a real gain control in BOTH directions, not a one-off.
+        let boosted = monitored_output_with_trims(6.0, 0.0, &input);
+        let r_boost = rms(&boosted[boosted.len() - 2400..]);
+        let boost_db = linear_to_db(r_boost / r_flat);
+        assert!((boost_db - 6.0).abs() < 0.5, "input boost did not reach the bus: {boost_db} dB");
+    }
+
+    #[test]
+    fn output_trim_scales_the_monitored_bus() {
+        // Same proof for the OUTPUT trim, applied after the crosspoint mix.
+        let input = sine(1000.0, 0.5, 9600, FS);
+        let flat = monitored_output_with_trims(0.0, 0.0, &input);
+        let trimmed = monitored_output_with_trims(0.0, -6.0, &input);
+        let r_flat = rms(&flat[flat.len() - 2400..]);
+        let r_trim = rms(&trimmed[trimmed.len() - 2400..]);
+        let delta_db = linear_to_db(r_trim / r_flat);
+        assert!(
+            (delta_db + 6.0).abs() < 0.5,
+            "output trim did not reach the bus: {delta_db} dB (flat {r_flat}, trimmed {r_trim})"
+        );
+    }
+
+    #[test]
+    fn input_trim_moves_the_per_input_level_meter() {
+        // `audio.levels` must follow `gain.set` too — the HUD meter is the only
+        // feedback a user gets that the trim landed.
+        let input = sine(1000.0, 0.5, 9600, FS);
+        let meter_for = |trim_db: f32| -> ChannelMeter {
+            let mut e = Engine::new(1, 1, FS).unwrap();
+            e.set_crosspoint(0, 0, 0.0).unwrap();
+            e.set_monitor_output(Some(0)).unwrap();
+            e.set_input_trim(0, trim_db).unwrap();
+            let fmt = AudioFormat::new(1, FS);
+            for chunk in input.chunks(BLK) {
+                let mut outbuf = vec![0.0f32; chunk.len()];
+                let inputs = [BlockRef { data: chunk, format: fmt }];
+                let mut outputs = [BlockMut { data: &mut outbuf, format: fmt }];
+                e.process_block(&inputs, &mut outputs);
+            }
+            e.channel_meter(0)
+        };
+        let flat = meter_for(0.0);
+        let cut = meter_for(-12.0);
+        let delta = cut.rms_dbfs - flat.rms_dbfs;
+        assert!(
+            (delta + 12.0).abs() < 1.0,
+            "per-input meter ignored the trim: {delta} dB (flat {}, cut {})",
+            flat.rms_dbfs,
+            cut.rms_dbfs
+        );
+    }
+
+    #[test]
+    fn a_trim_move_ramps_instead_of_stepping() {
+        // SPEC §2: parameter changes ramp over PARAM_RAMP_MS (5 ms) — a gain move
+        // must not produce a sample-to-sample jump (zipper noise). Drive DC so the
+        // output IS the gain curve, change the trim mid-stream, and assert the
+        // first block after the change starts at the OLD gain and walks to the new.
+        let mut e = Engine::new(1, 1, FS).unwrap();
+        e.set_crosspoint(0, 0, 0.0).unwrap();
+        e.set_monitor_output(Some(0)).unwrap();
+        let fmt = AudioFormat::new(1, FS);
+        let dc = vec![1.0f32; BLK];
+
+        // Settle at unity.
+        for _ in 0..4 {
+            let mut o = vec![0.0f32; BLK];
+            let inputs = [BlockRef { data: &dc, format: fmt }];
+            let mut outputs = [BlockMut { data: &mut o, format: fmt }];
+            e.process_block(&inputs, &mut outputs);
+            assert!((o[BLK - 1] - 1.0).abs() < 1e-6, "unity trim must be transparent");
+        }
+
+        e.set_input_trim(0, -20.0).unwrap(); // 0.1 linear
+        let mut o = vec![0.0f32; BLK];
+        {
+            let inputs = [BlockRef { data: &dc, format: fmt }];
+            let mut outputs = [BlockMut { data: &mut o, format: fmt }];
+            e.process_block(&inputs, &mut outputs);
+        }
+        assert!(o[0] > 0.9, "the trim STEPPED instead of ramping: first sample {}", o[0]);
+        assert!(o[BLK - 1] < 0.9, "the ramp never moved: last sample {}", o[BLK - 1]);
+        // Monotonically decreasing toward the target (a linear ramp).
+        for w in o.windows(2) {
+            assert!(w[1] <= w[0] + 1e-6, "ramp is not monotonic: {} -> {}", w[0], w[1]);
+        }
+    }
+
+    #[test]
+    fn trims_round_trip_through_the_control_side_getters() {
+        let mut e = Engine::new(2, 2, FS).unwrap();
+        assert_eq!(e.input_trim(0), 0.0);
+        assert_eq!(e.output_trim(1), 0.0);
+        e.set_input_trim(1, -3.5).unwrap();
+        e.set_output_trim(0, 4.25).unwrap();
+        assert_eq!(e.input_trim(1), -3.5);
+        assert_eq!(e.output_trim(0), 4.25);
+        // A rejected op leaves the stored value alone.
+        assert!(e.set_input_trim(1, f32::NAN).is_err());
+        assert_eq!(e.input_trim(1), -3.5);
+    }
+
+    // --- oversized blocks lose the CHAIN, never the AUDIO ----------------------
+    //     REGRESSION: `chain_scratch` stages every active input CONCATENATED, so
+    //     the 4096-sample reservation is a SUM over inputs. The old clamp fed the
+    //     TRUNCATED staged prefix into `dsp::mix_block`, so half an oversized
+    //     block became digital silence and a second over-budget input vanished
+    //     from the bus with its meter reading -inf. The doc comment called that
+    //     "it only meters the reserved prefix", which is why nobody guarded it.
+
+    #[test]
+    fn an_oversized_block_is_mixed_whole_not_truncated_to_silence() {
+        let mut e = Engine::new(1, 1, FS).unwrap();
+        e.set_crosspoint(0, 0, 0.0).unwrap();
+        e.set_monitor_output(Some(0)).unwrap();
+        let fmt = AudioFormat::new(1, FS);
+
+        // One block twice the reserved scratch.
+        let n = MAX_BLOCK_SAMPLES * 2;
+        let inbuf = vec![0.5f32; n];
+        let mut outbuf = vec![0.0f32; n];
+        {
+            let inputs = [BlockRef { data: &inbuf, format: fmt }];
+            let mut outputs = [BlockMut { data: &mut outbuf, format: fmt }];
+            e.process_block(&inputs, &mut outputs);
+        }
+        let silent = outbuf.iter().filter(|s| **s == 0.0).count();
+        assert_eq!(silent, 0, "{silent} of {n} output samples are digital silence");
+        for (i, s) in outbuf.iter().enumerate() {
+            assert!((s - 0.5).abs() < 1e-6, "sample {i} = {s}, expected the unity-routed 0.5");
+        }
+    }
+
+    #[test]
+    fn an_input_that_overflows_the_scratch_still_reaches_the_mix() {
+        // Two unity-routed inputs, each exactly the whole scratch: the second one
+        // cannot be staged, and used to disappear from the bus entirely.
+        let mut e = Engine::new(2, 1, FS).unwrap();
+        e.set_crosspoint(0, 0, 0.0).unwrap();
+        e.set_crosspoint(1, 0, 0.0).unwrap();
+        e.set_monitor_output(Some(0)).unwrap();
+        let fmt = AudioFormat::new(1, FS);
+
+        let n = MAX_BLOCK_SAMPLES;
+        let a = vec![0.25f32; n];
+        let b = vec![0.25f32; n];
+        let mut outbuf = vec![0.0f32; n];
+        {
+            let inputs = [
+                BlockRef { data: &a, format: fmt },
+                BlockRef { data: &b, format: fmt },
+            ];
+            let mut outputs = [BlockMut { data: &mut outbuf, format: fmt }];
+            e.process_block(&inputs, &mut outputs);
+        }
+        assert!(
+            (outbuf[0] - 0.5).abs() < 1e-6,
+            "input 1 vanished from the mix: out[0] = {} (expected both inputs, 0.5)",
+            outbuf[0]
+        );
+        // And it is still metered, not reported as silence.
+        let m1 = e.channel_meter(1);
+        assert!(
+            m1.peak_dbfs.is_finite(),
+            "the over-budget input metered as -inf: {:?}",
+            m1
+        );
+    }
+
+    #[test]
+    fn an_oversized_block_does_not_reallocate_the_scratch() {
+        // The degradation must stay alloc-free on the audio path: an over-budget
+        // input is mixed raw, so `chain_scratch` never grows past its reservation.
+        let mut e = Engine::new(1, 1, FS).unwrap();
+        e.set_crosspoint(0, 0, 0.0).unwrap();
+        e.set_monitor_output(Some(0)).unwrap();
+        let cap0 = e.chain_scratch.capacity();
+        let ptr0 = e.chain_scratch.as_ptr();
+        let fmt = AudioFormat::new(1, FS);
+        let inbuf = vec![0.5f32; MAX_BLOCK_SAMPLES * 3];
+        for _ in 0..8 {
+            let mut outbuf = vec![0.0f32; inbuf.len()];
+            let inputs = [BlockRef { data: &inbuf, format: fmt }];
+            let mut outputs = [BlockMut { data: &mut outbuf, format: fmt }];
+            e.process_block(&inputs, &mut outputs);
+        }
+        assert_eq!(e.chain_scratch.capacity(), cap0, "chain scratch reallocated");
+        assert_eq!(e.chain_scratch.as_ptr(), ptr0, "chain scratch pointer moved (realloc)");
     }
 
     // --- alloc-free proof (residual 2): the audio-thread scratch buffers are
