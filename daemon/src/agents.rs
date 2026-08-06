@@ -128,12 +128,37 @@ const ROLL_CALL_CUES: &[&str] = &[
 /// routing in the daemon.
 pub fn is_roll_call(text: &str) -> bool {
     let lower = text.to_lowercase();
+    // "assemble" is a roll call when it is the WHOLE request ("assemble", the
+    // Avengers sense) or when its object is the team. It is an ordinary transitive
+    // verb otherwise — "assemble the bookshelf", "assemble the report", "assemble
+    // a budget" — and as a bare whole-word cue anywhere in the utterance it
+    // claimed all of them.
+    let assemble_is_the_call = |l: &str| -> bool {
+        if !contains_word(l, "assemble") {
+            return false;
+        }
+        if crate::utterance::mentions_any_word(
+            l,
+            &["team", "crew", "roster", "constellation", "agents", "everyone", "specialists"],
+        ) {
+            return true;
+        }
+        // Bare imperative: nothing but address/politeness around the verb.
+        const FRAME: &[&str] =
+            &["assemble", "darwin", "hey", "ok", "okay", "please", "now", "everybody", "up"];
+        l.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .all(|w| FRAME.contains(&w))
+    };
     ROLL_CALL_CUES.iter().any(|cue| {
+        if cue == &"assemble" {
+            return assemble_is_the_call(&lower);
+        }
         if cue.contains(' ') {
-            // Multi-word cues: plain substring is enough (the phrase itself is
-            // already specific) — a contained space cannot bleed into another
-            // word the way a bare token can.
-            lower.contains(cue)
+            // A contained space does NOT make a phrase safe as a bare substring:
+            // "roll call" sits inside "payROLL CALL". Require word boundaries at
+            // both ends.
+            contains_phrase(&lower, cue)
         } else {
             contains_word(&lower, cue)
         }
@@ -862,11 +887,38 @@ fn is_translation_query(lower: &str) -> bool {
     }
     // The "<render verb> ... in/into <language>" shape: a language name plus a
     // rendering verb. "in"/"into" is implied by the verb+language pairing.
-    let has_language = BABEL_LANGUAGES.iter().any(|cue| contains_word(lower, cue));
-    if has_language {
+    // THE LANGUAGE MUST BE THE TARGET OF THE RENDER, not merely present in the
+    // same sentence. This was an unordered, unbounded AND — "any render verb
+    // anywhere" plus "any language name anywhere" — so ordinary turns were claimed
+    // by the translator: "write a post about greek life at my college", "I want to
+    // write about the spanish food we had in Madrid", "put the german shepherd
+    // photos in the album".
+    //
+    // The doc above already said "in/into is implied by the verb+language
+    // pairing". It was not checked. It is now: the language has to be introduced
+    // by in/into/to (a determiner may sit between), which is the actual shape of
+    // "say hello IN spanish" / "render this INTO french".
+    let target_language = BABEL_LANGUAGES.iter().any(|lang| {
+        let words: Vec<&str> = lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        words.iter().enumerate().any(|(i, w)| {
+            if w != lang {
+                return false;
+            }
+            // Walk back over an optional determiner to the introducing preposition.
+            let mut j = i;
+            if j > 0 && matches!(words[j - 1], "the" | "a" | "an") {
+                j -= 1;
+            }
+            j > 0 && matches!(words[j - 1], "in" | "into" | "to")
+        })
+    });
+    if target_language {
         let has_verb = BABEL_RENDER_VERBS.iter().any(|cue| {
             if cue.contains(' ') {
-                lower.contains(cue)
+                contains_phrase(lower, cue)
             } else {
                 contains_word(lower, cue)
             }
@@ -2251,6 +2303,31 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
 /// through the exact same word-boundary matcher the live router uses — an
 /// honest replay must score with the real matching rule, not a re-implemented
 /// one that could subtly disagree.
+/// Whole-PHRASE containment: `needle` appears in `haystack` with a non-alphanumeric
+/// boundary on each side. `contains_word` only covers single tokens, so multi-word
+/// cues fell back to a bare `contains` — and "roll call" is inside "payROLL CALL".
+pub(crate) fn contains_phrase(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let hb = haystack.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let left_ok = start == 0 || !(hb[start - 1] as char).is_alphanumeric();
+        let right_ok = end == hb.len() || !(hb[end] as char).is_alphanumeric();
+        if left_ok && right_ok {
+            return true;
+        }
+        from = start + 1;
+        if from >= haystack.len() {
+            break;
+        }
+    }
+    false
+}
+
 pub(crate) fn contains_word(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -3238,6 +3315,53 @@ mod tests {
     ///   VOYAGER   listed the phrase "find a", which opens almost every search a
     ///             person makes, so the travel agent claimed "find a dentist that
     ///             takes my insurance".
+    /// BABEL'S LANGUAGE MUST BE THE TARGET OF THE RENDER, and a roll-call phrase
+    /// must not hide inside a longer word.
+    ///
+    /// BABEL's gate was an unordered, unbounded AND — any render verb anywhere,
+    /// plus any language name anywhere — so ordinary turns were claimed by the
+    /// translator. Its own doc said "in/into is implied by the verb+language
+    /// pairing"; nothing checked it.
+    ///
+    /// `is_roll_call` matched its multi-word cues as bare substrings, and "roll
+    /// call" sits inside "payROLL CALL". Its bare "assemble" cue fired anywhere in
+    /// an utterance, claiming "assemble the bookshelf".
+    #[test]
+    fn a_cooccurring_word_does_not_make_a_translation_or_a_roll_call() {
+        let reg = AgentRegistry::canonical();
+        for q in [
+            "write a post about greek life at my college",
+            "i want to write about the spanish food we had in madrid",
+            "put the german shepherd photos in the album",
+            "say hi to my french bulldog for me",
+        ] {
+            assert_ne!(
+                reg.select("conversation", q, true).name,
+                "babel",
+                "{q:?} is not a translation request"
+            );
+        }
+        for q in [
+            "when does the payroll call close",
+            "assemble the bookshelf i bought",
+            "assemble the quarterly report",
+            "can you assemble a budget for me",
+        ] {
+            assert!(!super::is_roll_call(q), "{q:?} is not a roll call");
+        }
+        // ...and the real ones still work.
+        for q in ["say hello in spanish", "translate this into french", "put it in german"] {
+            assert_eq!(
+                reg.select("conversation", q, true).name,
+                "babel",
+                "{q:?} IS a translation request"
+            );
+        }
+        for q in ["assemble", "assemble the team", "roll call", "introduce yourselves"] {
+            assert!(super::is_roll_call(q), "{q:?} IS a roll call");
+        }
+    }
+
     #[test]
     fn an_ordinary_word_does_not_hijack_an_agent() {
         let reg = AgentRegistry::canonical();
