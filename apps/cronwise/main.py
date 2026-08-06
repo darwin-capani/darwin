@@ -58,6 +58,31 @@ _DOW_NAMES = {
 }
 
 
+def _cycle_len(unit, lo, hi):
+    """The length of ONE full turn of a field's cycle.
+
+    For every field but one this is the numeric width, hi - lo + 1. Day-of-week is
+    the exception: cron accepts 0-7 with BOTH 0 and 7 meaning Sunday, so its declared
+    range is 8 wide while a week is 7 days long.
+    """
+    if unit == "day-of-week":
+        return 7
+    return hi - lo + 1
+
+
+def _fired_set(unit, vals):
+    """The values a field ACTUALLY fires on, in cycle order.
+
+    Only day-of-week needs the treatment: because cron writes Sunday twice, an
+    expansion that reaches 7 lists the SAME DAY at both ends, so the raw arithmetic
+    list is not a firing set. Collapse 7 to 0 and de-duplicate before anything is
+    counted or phrased.
+    """
+    if unit != "day-of-week":
+        return vals
+    return sorted({0 if v == 7 else v for v in vals})
+
+
 def _resolve(token, names, lo, hi):
     """Resolve a single value token to an int within [lo, hi]. Raises ValueError on bad input."""
     key = token.strip().lower()
@@ -97,6 +122,23 @@ def _set_phrase(unit, vals):
     return "on %s %s" % (_UNIT_PLURAL[unit], listed)
 
 
+def _degenerate_range_phrase(unit, a, b, step, cycle_len):
+    """The phrase for a range whose two endpoints RENDER AS THE SAME VALUE.
+
+    "from X through X" names no interval at all. Only day-of-week can collide its
+    endpoints while still spanning days, because cron writes Sunday twice (0 and 7):
+    `0-7` is the WHOLE week and `7-7` is Sunday ALONE, yet both read "every
+    day-of-week from Sunday through Sunday" — one nonsense phrase covering two
+    completely different firing sets.
+    """
+    vals = _fired_set(unit, list(range(a, b + 1, step)))
+    if len(vals) == 1:
+        return _single_phrase(unit, vals[0])
+    if len(vals) == cycle_len:
+        return "every %s" % unit
+    return _set_phrase(unit, vals)
+
+
 def _describe_field(label, unit, lo, hi, names, raw):
     """Return a plain-English phrase for one cron field. Raises ValueError on invalid syntax.
 
@@ -126,15 +168,27 @@ def _describe_field(label, unit, lo, hi, names, raw):
         step = int(step_s)  # raises ValueError on non-numeric
         if step <= 0:
             raise ValueError("step must be positive")
+        # DAY-OF-WEEK's declared range LIES about the length of its cycle, and every
+        # branch below decides "cadence or enumeration" by arithmetic over that length.
+        # cron accepts 0-7 with BOTH 0 and 7 meaning Sunday, so hi - lo + 1 is 8 while a
+        # week is 7 days. Under the 8-day model EVERY day-of-week step claimed a rhythm
+        # cron does not perform: `* * * * */2` fires Sun, Tue, Thu, Sat and then Sunday
+        # again — the Sat->Sun gap is ONE day, not two — yet 4 * 2 == 8 "proved" the set
+        # evenly spaced and it read "every 2 days-of-week". `0/2` and `1/2` read the same
+        # way. Worse, an expansion that reaches 7 lists Sunday TWICE, so `*/7` — which
+        # fires on Sunday and nothing else — printed "on days-of-week Sunday, Sunday",
+        # which is not a firing set at all. So measure the cycle at 7 and collapse the
+        # duplicate Sunday out of every expanded list before it is counted or phrased.
+        cycle_len = _cycle_len(unit, lo, hi)
         if base == "*":
             if step == 1:
                 return "every %s" % unit
-            vals = list(range(lo, hi + 1, step))
+            vals = _fired_set(unit, list(range(lo, hi + 1, step)))
             # ONE match (step >= the field's width, e.g. */90 on minutes), or a
             # step that does NOT divide the field evenly (*/25 -> 0,25,50 then a
             # 10-minute gap at the wrap): enumerate the real firing set instead of
             # restating a cadence cron does not perform.
-            if len(vals) == 1 or (hi - lo + 1) % step != 0:
+            if len(vals) == 1 or cycle_len % step != 0:
                 return _set_phrase(unit, vals)
             return "every %d %s" % (step, plural)
         # THE SAME HONESTY RULE AS THE WILDCARD BRANCH ABOVE, which this function's own
@@ -154,7 +208,6 @@ def _describe_field(label, unit, lo, hi, names, raw):
         # A set is evenly spaced across the whole cycle only when it FILLS the cycle at
         # that stride: len(vals) * step == cycle length. 0/25 -> 3*25=75 != 60 (false),
         # 30/15 -> 2*15=30 != 60 (false), 5/15 -> 4*15=60 == 60 (true).
-        cycle_len = hi - lo + 1
 
         def evenly_spaced(vals):
             return len(vals) * step == cycle_len
@@ -165,7 +218,9 @@ def _describe_field(label, unit, lo, hi, names, raw):
             b = _resolve(b_s, names, lo, hi)
             if a > b:
                 raise ValueError("range start > end")
-            vals = list(range(a, b + 1, step))
+            if _pretty_value(unit, a) == _pretty_value(unit, b):
+                return _degenerate_range_phrase(unit, a, b, step, cycle_len)
+            vals = _fired_set(unit, list(range(a, b + 1, step)))
             if len(vals) == 1:
                 # e.g. 1-10/20 -> matches ONLY minute 1, never "every 20 minutes".
                 return _single_phrase(unit, vals[0])
@@ -182,7 +237,7 @@ def _describe_field(label, unit, lo, hi, names, raw):
                 step, plural, _pretty_value(unit, a), _pretty_value(unit, b))
         # base is a single value: e.g. 5/10 -> every 10 <unit> starting at <value>
         start = _resolve(base, names, lo, hi)
-        vals = list(range(start, hi + 1, step))
+        vals = _fired_set(unit, list(range(start, hi + 1, step)))
         if len(vals) == 1:
             # e.g. 5/70 -> matches ONLY minute 5, never "every 70 minutes".
             return _single_phrase(unit, vals[0])
@@ -202,6 +257,8 @@ def _describe_field(label, unit, lo, hi, names, raw):
         b = _resolve(b_s, names, lo, hi)
         if a > b:
             raise ValueError("range start > end")
+        if _pretty_value(unit, a) == _pretty_value(unit, b):
+            return _degenerate_range_phrase(unit, a, b, 1, _cycle_len(unit, lo, hi))
         return "every %s from %s through %s" % (
             unit, _pretty_value(unit, a), _pretty_value(unit, b))
 

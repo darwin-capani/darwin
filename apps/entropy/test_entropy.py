@@ -2,6 +2,8 @@
 """Plain tests for entropy.compute -- real cases plus hostile/empty inputs."""
 import json
 import math
+import pathlib
+import re
 
 from main import compute
 
@@ -192,19 +194,6 @@ def test_non_string_or_empty_id_is_treated_as_absent():
         assert conn.lines[0]["type"] == "items", f"id={bad_id!r} must not correlate"
 
 
-if __name__ == "__main__":
-    # Script-style runs exercise the framing tests too — they are plain
-    # functions the runner below would otherwise never call.
-    test_max_frame_bytes_is_8_mib()
-    test_oversized_frame_is_dropped_not_accumulated()
-    test_complete_lines_drain_and_partial_is_preserved()
-    print("framing: 3 checks ok")
-    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
-    for fn in fns:
-        fn()
-    print(f"ok: {len(fns)} tests passed")
-
-
 def test_repetitive_input_is_not_called_strong():
     """THE REGRESSION THIS EXISTS FOR. `length * log2(charset)` is the size of the
     keyspace a RANDOM password of this shape would come from - it is not the entropy
@@ -241,3 +230,40 @@ def test_a_varied_passphrase_is_still_rated_well():
     assert r["distinct_chars"] > 10
     assert r["bits"] > 60, r
     assert r["strength"] in ("strong", "very strong"), r
+
+
+def test_no_test_is_stranded_below_the_script_runner():
+    """REGRESSION: this file's `if __name__ == "__main__"` runner used to sit MID-FILE,
+    at line 195, with THREE `def test_` blocks below it — including
+    test_repetitive_input_is_not_called_strong, documented right above as "THE
+    REGRESSION THIS EXISTS FOR". Top-level statements execute in file order, so when the
+    runner globbed globals() for names starting with "test_", those three names did not
+    exist yet. `python3 test_entropy.py` — the command daemon/src/main.rs and
+    scaffold.rs both hand out, and the only runner installed on this machine — skipped
+    them and printed a green "ok: 13 tests passed" for a 16-test file. Sabotaging all
+    three with `assert False` still exited 0. The runner goes LAST now; this proves it
+    stayed there, in BOTH test styles."""
+    src = pathlib.Path(__file__).read_text(encoding="utf-8").splitlines()
+    runner = [i for i, ln in enumerate(src) if ln.startswith("if __name__ ==")]
+    assert len(runner) == 1, f"expected exactly one script runner, got {len(runner)}"
+    stranded = [ln for ln in src[runner[0]:] if ln.startswith("def test_")]
+    assert stranded == [], f"defined below the runner, so script runs skip them: {stranded}"
+
+
+if __name__ == "__main__":
+    # THE RUNNER MUST BE THE LAST THING IN THIS FILE. The glob below reads globals(),
+    # which holds only the names bound ABOVE this point, so a test function moved under
+    # it silently stops running while the printed count still reads green. The
+    # `missing` check re-derives the declared set from the source and refuses to report
+    # a pass while any of it went uncollected. (The framing tests used to be called
+    # explicitly here with a comment claiming the glob "would otherwise never call"
+    # them — it does call them, so they simply ran twice.)
+    fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
+    declared = re.findall(
+        r"^def (test_\w+)", pathlib.Path(__file__).read_text(encoding="utf-8"), re.M
+    )
+    missing = [n for n in declared if n not in {f.__name__ for f in fns}]
+    assert not missing, f"never collected (defined below the runner): {missing}"
+    for fn in fns:
+        fn()
+    print(f"ok: {len(fns)} tests passed ({len(declared)} declared in this file)")

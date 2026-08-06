@@ -128,6 +128,29 @@ def main():
 import main as _frame_mod  # noqa: E402 — deliberately mid-file, after the app's own imports
 
 
+def test_the_compute_docstring_matches_the_shape_it_returns():
+    """REGRESSION (doc drift left behind by the duplicate-collapse fix): compute()'s
+    contract advertised a relation the code has no branch to emit. `distinct` is keyed
+    on (version, network address, prefixlen) — which uniquely identifies a network —
+    BEFORE the pairwise scan, so a == b cannot occur among the scanned pairs and
+    "equal" became unreachable while the docstring kept promising it. The same
+    sentence claimed the scan covers "every input pair"; it covers every DISTINCT
+    pair and stops LISTING at MAX_OVERLAPS."""
+    doc = _frame_mod.compute.__doc__
+    assert '"equal"' not in doc, 'compute() has no branch that can emit an "equal" relation'
+    assert '"a-contains-b" or "b-contains-a"' in doc, "the two reachable relations"
+    assert "every input pair" not in doc, "the scan runs over distinct pairs, not input pairs"
+    # Every key the function actually returns is named in its own contract.
+    got = _frame_mod.compute({"cidrs": ["10.0.0.0/8", "10.1.0.0/16", "10.0.0.0/8"]})
+    for k in got:
+        assert k in doc, f"{k!r} is returned but undocumented"
+    assert got["duplicate_count"] == 1
+    # ...and the relations it can emit are exactly the two the contract now lists.
+    rels = {o["relation"] for o in got["overlaps"]}
+    assert rels == {"a-contains-b"}, rels
+    assert rels <= {"a-contains-b", "b-contains-a"}
+
+
 def test_max_frame_bytes_is_8_mib():
     assert _frame_mod.MAX_FRAME_BYTES == 8 * 1024 * 1024
 
@@ -197,4 +220,6 @@ if __name__ == "__main__":
     test_tool_op_without_id_keeps_the_legacy_items_line()
     test_non_string_or_empty_id_is_treated_as_absent()
     print("contract: 3 checks ok")
+    test_the_compute_docstring_matches_the_shape_it_returns()
+    print("compute contract: 1 check ok")
     main()

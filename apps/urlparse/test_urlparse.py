@@ -2,6 +2,7 @@
 """Plain-python tests for urlparse.compute — real cases plus hostile input that must not raise."""
 import sys
 
+import main as _doc_mod
 from main import compute
 
 
@@ -203,6 +204,47 @@ def main():
             "normalized keeps the path for %s (got %r)" % (u, r["normalized"]),
             rt.path == r["path"],
         )
+
+    # REGRESSION: the IP-literal shortcut used str.isdigit(), which is True for EVERY
+    # Unicode Nd/No digit — not just 0-9. A host of FULLWIDTH digits with three dots
+    # took the shortcut and was echoed back RAW as host_punycode: a non-ASCII value in
+    # the field that promises the encoded ASCII form, with is_idn=true telling the
+    # caller a punycode form should exist. UTS-46 (and a browser) maps that host to the
+    # real destination 1.2.3.4, so url.dissect — the tool for inspecting a URL WITHOUT
+    # visiting it — hid where a homograph actually goes, and an origin allow-list keyed
+    # on host_punycode got no match for a host that does resolve.
+    for u, want in [
+        ("https://１.２.３.４/p", "1.2.3.4"),   # fullwidth digits
+        ("https://².².².²/", "2.2.2.2"),    # superscript digits
+    ]:
+        r = compute({"url": u})
+        check("homograph %r is_idn" % u, r["is_idn"] is True)
+        check("homograph %r punycode is ASCII (got %r)" % (u, r["host_punycode"]),
+              isinstance(r["host_punycode"], str) and r["host_punycode"].isascii())
+        check("homograph %r resolves to %s" % (u, want), r["host_punycode"] == want)
+        check("homograph %r punycode is not the raw host" % u,
+              r["host_punycode"] != r["host"])
+    # Real IP literals still bypass IDNA entirely (no spurious note), and the IDN
+    # path is untouched.
+    for u, want in [("https://1.2.3.4/p", "1.2.3.4"),
+                    ("https://[2001:db8::1]:8443/p", "2001:db8::1"),
+                    ("https://münchen.de/", "xn--mnchen-3ya.de")]:
+        r = compute({"url": u})
+        check("literal/idn %s punycode" % u, r["host_punycode"] == want)
+        check("literal/idn %s no note" % u, r.get("host_idna_note") is None)
+
+    # REGRESSION (doc drift): the compute() docstring defined host_punycode as
+    # `host.encode("idna")` — the IDNA2003 codec the implementation below explicitly
+    # disclaims and PR #159 moved off. That codec folds U+00DF to "ss", so it maps
+    # faß.de to fass.de: a DIFFERENT, separately-registrable domain. A maintainer
+    # reading only the contract would "restore consistency" by putting the lossy call
+    # back — the exact change the code comment exists to prevent.
+    doc = _doc_mod.compute.__doc__
+    check("docstring drops the IDNA2003 expression", 'host.encode("idna") decoded' not in doc)
+    check("docstring names IDNA2008/UTS-46", "IDNA2008/UTS-46" in doc)
+    check("docstring points at host_idna_note", "host_idna_note" in doc)
+    check("faß.de is not folded to fass.de",
+          compute({"url": "https://faß.de/"})["host_punycode"] == "xn--fa-hia.de")
 
     print("all urlparse checks passed")
 

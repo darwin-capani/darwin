@@ -3,7 +3,7 @@
 import json
 import sys
 
-from main import compute
+from main import _parse_si, compute
 
 
 def check(name, cond):
@@ -114,6 +114,33 @@ def main():
     check("denormal wavelength guarded", "error" in r)
     r = compute({"mode": "rc", "resistance": 1e200, "capacitance": 1e200})
     check("rc tau overflow guarded", "error" in r)
+
+    # REGRESSION: a bare uppercase "M" is MEGA, not a case variant of the metre
+    # token. Unit tokens are matched case-INSENSITIVELY (people type "hz"/"Hz"/"HZ"),
+    # and that fold lower-cased the tail "M" onto the metre unit "m", stripped it and
+    # left the EMPTY prefix — multiplier 1.0. "150M" parsed as 150 Hz, and a 5 MHz LC
+    # tank asked for a 101 FARAD capacitor: no error dict, no warning, off by 10^6
+    # (10^12 once the frequency is squared in the LC solve). Every OTHER bare prefix
+    # already parsed, so the form was supported and only M was wrong.
+    check("bare M is mega", close(_parse_si("150M"), 1.5e8))
+    check("bare M em solve", close(compute({"frequency": "150M"})["frequency"], 1.5e8))
+    check("bare M matches the spelled-out unit",
+          close(compute({"frequency": "150M"})["wavelength"],
+                compute({"frequency": "150MHz"})["wavelength"]))
+    r = compute({"mode": "lc", "frequency": "5M", "inductance": "10uH"})
+    check("bare M lc capacitance", close(r["capacitance"], 1.0132118364233778e-10))
+    check("bare M rc resistance",
+          close(compute({"mode": "rc", "resistance": "2M", "capacitance": "1uF"})["time_constant"], 2.0))
+    # The rest of the table is unchanged: the other bare prefixes still parse, and the
+    # LOWER-case tokens that genuinely are units (metre "m", farad "f") are untouched —
+    # only a case-FOLDED match onto a different-cased prefix is refused.
+    for s, want in [("5k", 5e3), ("5K", 5e3), ("5G", 5e9), ("5T", 5e12),
+                    ("5n", 5e-9), ("5p", 5e-12), ("5u", 5e-6),
+                    ("5m", 5.0), ("5f", 5.0), ("5F", 5.0),
+                    ("5mm", 5e-3), ("5ms", 5e-3), ("5Ms", 5e6),
+                    ("5MHz", 5e6), ("5Mohm", 5e6), ("5MF", 5e6), ("5MH", 5e6),
+                    ("5kHz", 5e3), ("5uF", 5e-6), ("5ohm", 5.0), ("5V", 5.0), ("5A", 5.0)]:
+        check("si %s" % s, close(_parse_si(s), want))
 
     print("all freqwave checks passed")
 

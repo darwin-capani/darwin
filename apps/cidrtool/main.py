@@ -40,11 +40,17 @@ def compute(payload):
     strict=False). Aggregation is per family via ipaddress.collapse_addresses,
     giving the minimal covering prefix set.
 
-    Output dict: input_count, aggregated (sorted cidr strings), aggregated_count,
-    overlaps (list of {a, b, relation} for every input pair — same family — where
-    one is subnet/supernet of the other; relation is "equal" / "a-contains-b" /
-    "b-contains-a"), ipv4_addresses (int total over the aggregated IPv4 set) and
-    ipv6_addresses (that total for IPv6, as a STRING since it may exceed 2**63).
+    Output dict: input_count, distinct_count and duplicate_count (exact duplicates
+    are collapsed before the pairwise scan), aggregated (sorted cidr strings),
+    aggregated_count, overlaps (list of {a, b, relation} for every DISTINCT
+    same-family pair where one is a strict subnet/supernet of the other; relation
+    is "a-contains-b" or "b-contains-a", never an equality: the duplicate collapse
+    below keys on (version, network address, prefixlen), which uniquely identifies
+    a network, so no scanned pair can have a == b),
+    overlap_count and overlaps_truncated (the LISTED pairs stop at MAX_OVERLAPS;
+    overlap_count is the honest total), ipv4_addresses (int total over the
+    aggregated IPv4 set) and ipv6_addresses (that total for IPv6, as a STRING
+    since it may exceed 2**63).
 
     An empty list -> {"error"}; any unparseable/non-str entry -> {"error":
     "invalid: <x>"}.

@@ -262,6 +262,8 @@ def main_run():
     test_summary_still_stops_at_a_real_sentence_end()
     test_summary_still_respects_the_length_limit()
     print("summary: ok")
+    test_the_docs_describe_the_fetch_proxy_not_the_direct_egress_it_replaced()
+    print("docs match the shipped egress posture: ok")
     print("ALL PASSED")
 
 
@@ -295,6 +297,59 @@ def test_summary_still_stops_at_a_real_sentence_end():
 def test_summary_still_respects_the_length_limit():
     got = main._first_sentence("word " * 200)
     assert len(got) <= 220
+
+
+def test_the_docs_describe_the_fetch_proxy_not_the_direct_egress_it_replaced():
+    """REGRESSION (doc drift the fetch-proxy migration left behind). README.md was
+    still written for the app that had direct egress: it pointed maintainers at
+    `net_hosts` for "exactly the feed hostnames in feeds.toml" — that list is EMPTY,
+    the hostnames live in `fetch_hosts` — claimed the app "polls every feed over HTTPS
+    (stdlib urllib)" when main.py has no urllib and no direct network at all, and
+    advertised `--selftest` as a "real read-only fetch" when a standalone run does
+    ZERO network, resolves 0 feeds and exits 0. README.md is the entry point for
+    auditing this app's egress posture, so a reader either concludes the manifest is
+    broken or edits net_hosts back in and reopens the hole the migration closed.
+    feeds.toml carried the same stale pointer on its MarketWatch note."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    readme = open(os.path.join(here, "README.md"), encoding="utf-8").read()
+    manifest = open(os.path.join(here, "manifest.toml"), encoding="utf-8").read()
+    feeds_src = open(os.path.join(here, "feeds.toml"), encoding="utf-8").read()
+    app_src = open(os.path.join(here, "main.py"), encoding="utf-8").read()
+
+    # The app really has no direct egress and no urllib — the code is the authority.
+    assert "\nnet_hosts = []" in manifest, "this test's premise: net_hosts is empty"
+    assert "import urllib" not in app_src and "from urllib" not in app_src
+
+    # ...so the README must not send a reader to net_hosts for the feed hostnames,
+    # must not credit urllib, and must not promise a live fetch from --selftest.
+    assert "`net_hosts` lists exactly the feed hostnames" not in readme
+    assert "`fetch_hosts` lists exactly the feed hostnames" in readme
+    assert "stdlib `urllib`" not in readme
+    assert "state/ipc/apps/fetch.sock" in readme, "the README names the real transport"
+    assert "real read-only fetch" not in readme
+    assert "Read-only network." not in readme
+    assert "is the one in net_hosts" not in feeds_src, "the hosts live in fetch_hosts"
+
+    # And the lockstep the manifest header promises actually holds: every feed
+    # hostname is allow-listed for the proxy, and nothing extra is.
+    hosts = set()
+    for line in feeds_src.splitlines():
+        line = line.strip()
+        if line.startswith('"https://'):
+            hosts.add(line.split("//", 1)[1].split("/", 1)[0])
+    listed = set()
+    in_fetch = False
+    for line in manifest.splitlines():
+        if line.startswith("fetch_hosts"):
+            in_fetch = True
+            continue
+        if in_fetch:
+            if line.startswith("]"):
+                break
+            token = line.strip()
+            if token.startswith('"'):
+                listed.add(token.split('"')[1])
+    assert hosts and listed == hosts, f"feeds.toml {hosts} vs manifest fetch_hosts {listed}"
 
 
 if __name__ == "__main__":

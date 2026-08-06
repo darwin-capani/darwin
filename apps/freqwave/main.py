@@ -70,9 +70,28 @@ def _split_num(s):
 
 
 def _strip_unit(suffix):
+    """Drop a trailing unit token so what remains is the SI prefix alone.
+
+    Units are matched case-INSENSITIVELY because people type "hz"/"Hz"/"HZ" and
+    "ohm"/"Ohm". That fold has to stop short of a tail whose EXACT case is a different
+    SI prefix. A bare uppercase "M" is mega; lower-casing it to match the metre token
+    "m" invented a unit that shadowed the prefix, and since _PREFIX[""] is 1.0 the
+    value came back multiplied by ONE. {"frequency": "150M"} answered 150 Hz instead
+    of 150 MHz, and {"mode":"lc","frequency":"5M","inductance":"10uH"} answered a
+    101 FARAD capacitor instead of 101 pF — a silent, well-formed, error-free reply
+    off by 10^6 (10^12 once the frequency is squared in the LC solve). Only the BARE
+    form was wrong: with a unit letter present the unit is consumed first and the
+    prefix survives, which is why "150MHz", "5Mohm", "5MF" and "5MH" were all correct
+    and every other bare prefix (k, G, T, n, p, u) already parsed. So refuse a
+    case-FOLDED match whose consumed tail is itself an SI prefix; an exact-case match
+    ("5mm" = millimetre, "5Ms" = megasecond) is untouched.
+    """
     low = suffix.lower()
     for u in _UNITS:
         if len(suffix) >= len(u) and low.endswith(u):
+            tail = suffix[len(suffix) - len(u):]
+            if tail != u and tail in _PREFIX:
+                continue  # "M" is mega, NOT a case variant of the metre token "m"
             return suffix[:len(suffix) - len(u)]
     return suffix
 

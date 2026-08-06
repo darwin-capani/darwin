@@ -45,7 +45,9 @@ The redaction decision is a **pure, value-transform seam** — no OCR, no captur
 | `scrub.image` | `{path, artifact_id?}` | Confine `path` to the input dir, OCR it on-device, redact the recognized text, write the copy; emit `share.redactions`. |
 | `status` | `{}` | Emit a `share.status` snapshot. |
 
-**Artifact Registry integration (daemon-side, deferred).** "Scrub artifact `<id>` before I share it" is resolved by the daemon: it reads the `ArtifactRef` by id (`artifact::peek`), forwards its text as `scrub.text` (or stages its image under `state/tmp/share-guard/input/` and forwards `scrub.image`), and passes the artifact id along in `artifact_id` for HUD correlation. The app **never** reaches into the registry — keeping it sandbox-honest — and tags its `share.redactions` readout with the id it was given.
+**Artifact Registry integration (daemon-side, SHIPPED).** "Scrub artifact `<id>` before I share it" is resolved by the daemon: it reads the `ArtifactRef` by id (`artifact::resolve_for_scrub` → `artifact::peek`), forwards its text as `scrub.text` (or stages its image under `state/tmp/share-guard/input/` and forwards `scrub.image`), and passes the artifact id along in `artifact_id` for HUD correlation. The app **never** reaches into the registry — keeping it sandbox-honest — and tags its `share.redactions` readout with the id it was given.
+
+This paragraph said "deferred" long after the bridge landed, which reads as "Share Guard is unreachable in production". It is live: `artifact::scrub_forward` (`daemon/src/artifact.rs`) builds the forward, `share_guard_scrub_tool` (`daemon/src/anthropic.rs`) drives `resolve_for_scrub` → `scrub_forward` → `apps::start` → `apps::send_op`, and `share_guard_scrub` is a declared agent tool in Mnemosyne's live roster (`daemon/src/agents.rs`). One caveat the old text also omitted: the text path forwards the artifact's **`preview_payload`**, which is clamped to `MAX_PREVIEW_LEN` (600 bytes), not the full body.
 
 ## 4. Telemetry → HUD panel
 

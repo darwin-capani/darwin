@@ -60,6 +60,68 @@ class TestCronwiseExplain(unittest.TestCase):
             r2["day_of_week"], "every day-of-week from Friday through Sunday"
         )
 
+    def test_day_of_week_steps_do_not_model_the_week_as_eight_days(self):
+        # REGRESSION: day-of-week is the ONE field whose numeric range lies about the
+        # length of its cycle — cron accepts 0-7 with BOTH 0 and 7 meaning Sunday, so
+        # hi - lo + 1 is 8 while a week is 7 days. Every cadence decision is arithmetic
+        # over that length, so all three step branches claimed a rhythm cron does not
+        # perform: "*/2" fires Sun, Tue, Thu, Sat and then Sunday again — a ONE-day
+        # wrap — yet 4 * 2 == 8 "proved" it evenly spaced and it read "every 2
+        # days-of-week", the exact misconception this app exists to correct. And "*/7"
+        # fires on Sunday and nothing else, but its raw expansion is [0, 7], so it
+        # printed the duplicated non-set "on days-of-week Sunday, Sunday".
+        r = compute({"cron": "0 0 * * */2"})
+        self.assertTrue(r["valid"], r)
+        self.assertEqual(
+            r["day_of_week"], "on days-of-week Sunday, Tuesday, Thursday, Saturday"
+        )
+        self.assertEqual(compute({"cron": "0 0 * * */7"})["day_of_week"],
+                         "on day-of-week Sunday")
+        # The start-offset form and the range form share the same cycle.
+        self.assertEqual(
+            compute({"cron": "0 0 * * 0/2"})["day_of_week"],
+            "on days-of-week Sunday, Tuesday, Thursday, Saturday",
+        )
+        # 1/2 fires Mon, Wed, Fri and Sun (7 IS Sunday) — listed in cycle order.
+        self.assertEqual(
+            compute({"cron": "0 0 * * 1/2"})["day_of_week"],
+            "on days-of-week Sunday, Monday, Wednesday, Friday",
+        )
+        # A named start resolves to the same number, so it gets the same answer.
+        self.assertEqual(
+            compute({"cron": "0 0 * * mon/2"})["day_of_week"],
+            compute({"cron": "0 0 * * 1/2"})["day_of_week"],
+        )
+        self.assertEqual(compute({"cron": "0 0 * * 0-7/7"})["day_of_week"],
+                         "on day-of-week Sunday")
+        # None of these may name a cadence or list one day twice.
+        for expr in ["*/2", "*/7", "0/2", "1/2", "mon/2", "0-7/2", "0-7/7"]:
+            got = compute({"cron": "0 0 * * " + expr})["day_of_week"]
+            self.assertNotIn("Sunday, Sunday", got, expr)
+            self.assertFalse(got.startswith("every"), "%s -> %r" % (expr, got))
+
+    def test_a_range_whose_endpoints_name_the_same_value_is_not_an_interval(self):
+        # "from X through X" describes no interval. Day-of-week is the only field that
+        # can collide its endpoints while still spanning days, because cron writes
+        # Sunday twice: "0-7" is the WHOLE week and "7-7" is Sunday ALONE, yet both
+        # read "every day-of-week from Sunday through Sunday".
+        self.assertEqual(compute({"cron": "0 0 * * 0-7"})["day_of_week"],
+                         "every day-of-week")
+        self.assertEqual(compute({"cron": "0 0 * * 0-7/1"})["day_of_week"],
+                         "every day-of-week")
+        self.assertEqual(compute({"cron": "0 0 * * 7-7"})["day_of_week"],
+                         "on day-of-week Sunday")
+        self.assertEqual(compute({"cron": "5-5 * * * *"})["minute"], "at minute 5")
+        # A real interval is untouched, and so are the other fields' cadences.
+        self.assertEqual(
+            compute({"cron": "0 0 * * 5-7"})["day_of_week"],
+            "every day-of-week from Friday through Sunday",
+        )
+        self.assertEqual(compute({"cron": "*/5 * * * *"})["minute"], "every 5 minutes")
+        self.assertEqual(
+            compute({"cron": "0 0-23/2 * * *"})["hour"], "every 2 hours from 0 through 23"
+        )
+
     def test_step_variants(self):
         # Stepped range and stepped single-start.
         r = compute({"cron": "0 0-23/2 * * *"})

@@ -34,6 +34,6 @@ feeds = [
   "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
   # MarketWatch top stories. The feeds.marketwatch.com vanity URL 301s to this
   # Dow Jones content host; we point straight at the final URL so the host the
-  # app actually connects to (feeds.content.dowjones.io) is the one in net_hosts.
+  # fetch proxy authorizes (feeds.content.dowjones.io) is the one in fetch_hosts.
   "https://feeds.content.dowjones.io/public/rss/mw_topstories",
 ]

@@ -33,7 +33,10 @@ def compute(payload):
     http=80/https=443/ftp=21/ssh=22/ws=80/wss=443 else null), path, query,
     fragment, userinfo_present (bool), params ([{key,value}] from parse_qsl
     keep_blank_values=True), is_idn (host has non-ASCII), host_punycode
-    (host.encode("idna") decoded, or null when N/A), normalized (scheme +
+    (the IDNA2008/UTS-46 A-label from the `idna` package — NOT stdlib
+    str.encode("idna"), whose IDNA2003 mapping folds faß.de to the DIFFERENT,
+    separately-registrable fass.de; null when N/A or the host is not valid
+    IDNA2008, and host_idna_note then says why), normalized (scheme +
     host lowercased, default port dropped) and warnings ([...]). A URL with
     no scheme still parses (scheme=""). Empty/non-str url -> {"error": ...}."""
     try:
@@ -89,9 +92,22 @@ def compute(payload):
         # An IP literal is not a domain name and must never go through IDNA - an
         # IPv6 host like 2001:db8::1 is not a valid IDNA label and would come back
         # as None with a spurious "not valid IDNA2008" note.
+        #
+        # THE DOTTED-QUAD TEST HAS TO BE ASCII-ONLY. str.isdigit() is True for EVERY
+        # Unicode Nd/No digit, not just 0-9, so a host built from FULLWIDTH digits
+        # ("１.２.３.４") or superscripts ("².².².²") took this shortcut and was echoed
+        # back RAW as host_punycode — a non-ASCII value in the field whose whole
+        # contract is the encoded ASCII form, while is_idn=true told the caller a
+        # punycode form should exist. UTS-46 (and therefore a browser) maps those hosts
+        # to the real destination 1.2.3.4, so the one tool offered for inspecting a URL
+        # WITHOUT visiting it hid where a homograph actually goes, and a caller matching
+        # host_punycode against an ASCII origin allow-list got no match for a host that
+        # does resolve. Same failure shape as the IDNA2003 fold above: confusable pairs
+        # are exactly what an attacker picks.
+        _dotless = host.replace(".", "")
         _is_ip_literal = (
             ":" in host
-            or (host.replace(".", "").isdigit() and host.count(".") == 3)
+            or (_dotless.isascii() and _dotless.isdigit() and host.count(".") == 3)
         )
         if host and _is_ip_literal:
             host_punycode = host
