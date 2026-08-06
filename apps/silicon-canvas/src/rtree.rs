@@ -400,6 +400,7 @@ mod tests {
             shape: PadShape::Rect,
             pin_type: PinType::Passive,
             layer: LayerId::SCHEMATIC,
+            layer_to: LayerId::SCHEMATIC,
             net_id: NetId::NONE,
         });
         s.pads.push(Pad {
@@ -410,6 +411,7 @@ mod tests {
             shape: PadShape::Rect,
             pin_type: PinType::Passive,
             layer: LayerId::SCHEMATIC,
+            layer_to: LayerId::SCHEMATIC,
             net_id: NetId::NONE,
         });
         s.init_flags();
@@ -446,6 +448,7 @@ mod tests {
             shape: PadShape::Circle,
             pin_type: PinType::Passive,
             layer: cu,
+            layer_to: cu,
             net_id: NetId::new(1),
         });
         s.init_flags();
@@ -469,6 +472,7 @@ mod tests {
             shape: PadShape::Rect,
             pin_type: PinType::Passive,
             layer: front,
+            layer_to: front,
             net_id: NetId::NONE,
         });
         s.pads.push(Pad {
@@ -479,6 +483,7 @@ mod tests {
             shape: PadShape::Rect,
             pin_type: PinType::Passive,
             layer: back,
+            layer_to: back,
             net_id: NetId::NONE,
         });
         s.init_flags();

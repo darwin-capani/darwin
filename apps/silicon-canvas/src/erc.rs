@@ -527,6 +527,7 @@ mod tests {
             shape: PadShape::Circle,
             pin_type,
             layer: LayerId::SCHEMATIC,
+            layer_to: LayerId::SCHEMATIC,
             net_id: net,
         }
     }

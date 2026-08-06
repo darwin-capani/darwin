@@ -551,6 +551,7 @@ pub fn parse_schematic(path: &Path, root: &Value) -> Result<Scene> {
                 shape: PadShape::Circle,
                 pin_type: *ptype,
                 layer: LayerId::SCHEMATIC,
+                layer_to: LayerId::SCHEMATIC,
                 net_id,
             });
         }
@@ -728,6 +729,7 @@ pub fn parse_symbol_library(path: &Path, root: &Value) -> Result<Scene> {
                 shape: PadShape::Circle,
                 pin_type: lp.pin_type,
                 layer: LayerId::SCHEMATIC,
+                layer_to: LayerId::SCHEMATIC,
                 net_id: NetId::NONE,
             });
         }
@@ -756,6 +758,24 @@ impl LayerTable {
             index: HashMap::new(),
         }
     }
+    /// The inclusive `(top, bottom)` LayerIds of the seeded copper stack, or
+    /// None when no copper was seeded. `seed_copper_layers` interns copper FIRST
+    /// and in stackup order, so the copper ids are a dense contiguous prefix —
+    /// the same invariant `rtree::layer_span` and the via stitcher rely on.
+    fn copper_span(&self) -> Option<(LayerId, LayerId)> {
+        let mut last = None;
+        for (i, name) in self.names.iter().enumerate() {
+            if is_copper_layer(name) {
+                last = Some(i as u16);
+            } else if last.is_some() {
+                break; // copper is a contiguous prefix; stop at the first gap
+            }
+        }
+        let hi = last?;
+        let lo = self.names.iter().position(|n| is_copper_layer(n))? as u16;
+        Some((LayerId::new(lo), LayerId::new(hi)))
+    }
+
     fn intern(&mut self, name: &str) -> LayerId {
         if let Some(&i) = self.index.get(name) {
             return LayerId::new(i);
@@ -772,7 +792,18 @@ impl LayerTable {
 /// technical layers (`*.Mask`, `*.SilkS`, `*.Paste`, `Edge.Cuts`, …) never end
 /// in `.Cu`.
 fn is_copper_layer(name: &str) -> bool {
-    name.ends_with(".Cu")
+    // A leading `*` makes this a WILDCARD, not a layer. KiCad writes a
+    // through-hole pad's layer list as `(layers "*.Cu" "*.Mask")`, meaning "every
+    // copper layer" — and `"*.Cu".ends_with(".Cu")` was true, so the wildcard was
+    // interned as if it were a real layer of its own. Every THT pad then sat
+    // alone on a phantom layer no track, zone or via could reach.
+    !name.starts_with('*') && name.ends_with(".Cu")
+}
+
+/// Does this pad layer token mean "every copper layer" (a plated through-hole)?
+/// KiCad spells it `*.Cu`; `F&B.Cu` is the front-and-back form.
+fn is_copper_wildcard(name: &str) -> bool {
+    name == "*.Cu" || name == "F&B.Cu" || (name.starts_with('*') && name.ends_with(".Cu"))
 }
 
 /// Pre-seed `layers` with the board's copper stack in physical (top→bottom)
@@ -961,7 +992,19 @@ pub fn parse_pcb(path: &Path, root: &Value) -> Result<Scene> {
                 .and_then(Value::as_str)
                 .unwrap_or(&layer_name)
                 .to_string();
-            let pad_layer = layers.intern(&pad_layer_name);
+            // A wildcard means the pad is a plated barrel through the whole
+            // copper stack: span it from the top copper layer to the bottom,
+            // exactly as a through via is spanned. Otherwise it is a single-layer
+            // SMD pad and the span is degenerate.
+            let (pad_layer, pad_layer_to) = if is_copper_wildcard(&pad_layer_name) {
+                layers.copper_span().unwrap_or_else(|| {
+                    let l = layers.intern(&layer_name);
+                    (l, l)
+                })
+            } else {
+                let l = layers.intern(&pad_layer_name);
+                (l, l)
+            };
             let net_id = read_net(pad, &nets);
             bbox.expand_point(abs);
             scene.pads.push(Pad {
@@ -972,6 +1015,7 @@ pub fn parse_pcb(path: &Path, root: &Value) -> Result<Scene> {
                 shape,
                 pin_type: PinType::Passive,
                 layer: pad_layer,
+                layer_to: pad_layer_to,
                 net_id,
             });
         }
@@ -1138,7 +1182,15 @@ pub fn parse_footprint_library(path: &Path, root: &Value) -> Result<Scene> {
             .and_then(Value::as_str)
             .unwrap_or(&layer_name)
             .to_string();
-        let pad_layer = layers.intern(&pad_layer_name);
+        let (pad_layer, pad_layer_to) = if is_copper_wildcard(&pad_layer_name) {
+            layers.copper_span().unwrap_or_else(|| {
+                let l = layers.intern(&layer_name);
+                (l, l)
+            })
+        } else {
+            let l = layers.intern(&pad_layer_name);
+            (l, l)
+        };
         bbox.expand_point(off);
         scene.pads.push(Pad {
             component: comp_id,
@@ -1148,6 +1200,7 @@ pub fn parse_footprint_library(path: &Path, root: &Value) -> Result<Scene> {
             shape,
             pin_type: PinType::Passive,
             layer: pad_layer,
+            layer_to: pad_layer_to,
             net_id: NetId::NONE,
         });
     }

@@ -648,6 +648,7 @@ mod tests {
                 shape: PadShape::Circle,
                 pin_type: PinType::Passive,
                 layer: l0,
+                layer_to: l0,
                 net_id: if i < 2 { NetId::new(1) } else { NetId::new(2) },
             });
         }
@@ -960,6 +961,7 @@ mod tests {
             shape: PadShape::Circle,
             pin_type: PinType::Passive,
             layer: LayerId::new(0),
+            layer_to: LayerId::new(0),
             net_id: NetId::new(1),
         });
         scene.init_flags();

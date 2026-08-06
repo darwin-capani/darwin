@@ -194,6 +194,13 @@ impl LayerId {
     /// The single logical layer a schematic lives on.
     pub const SCHEMATIC: LayerId = LayerId(0);
 
+    /// serde default for `Pad::layer_to` when reading a scene written before the
+    /// span existed: SCHEMATIC, which `Pad::copper_span` normalizes back to
+    /// `layer` so an old scene keeps its single-layer meaning.
+    pub(crate) fn schematic_default() -> LayerId {
+        LayerId::SCHEMATIC
+    }
+
     #[inline]
     pub const fn new(raw: u16) -> Self {
         LayerId(raw)
@@ -292,7 +299,19 @@ pub struct Pad {
     /// counterpart this is `Passive`.
     pub pin_type: PinType,
     /// Layer the pad is on (the via/copper layer for PCB; SCHEMATIC otherwise).
+    /// For a pad with a copper SPAN this is the TOP of that span.
     pub layer: LayerId,
+    /// The BOTTOM of the pad's copper span, inclusive. Equal to `layer` for a
+    /// surface-mount pad, which touches exactly one layer.
+    ///
+    /// A THROUGH-HOLE pad is a plated barrel: it contacts copper on every layer
+    /// it passes through, exactly like a via. KiCad writes that as the wildcard
+    /// `(layers "*.Cu" ...)`, which used to be interned as if it were a real
+    /// stackup layer of its own — so every THT pad sat alone on a phantom layer
+    /// that no track, zone or via could ever reach. `layer`/`layer_to` give it
+    /// the same treatment `Via::layer_from`/`layer_to` already gets.
+    #[serde(default = "LayerId::schematic_default")]
+    pub layer_to: LayerId,
     /// The net this pad belongs to; [`NetId::NONE`] when unconnected.
     pub net_id: NetId,
 }

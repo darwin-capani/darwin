@@ -1156,6 +1156,7 @@ mod tests {
             shape: PadShape::Circle,
             pin_type,
             layer: LayerId::SCHEMATIC,
+            layer_to: LayerId::SCHEMATIC,
             net_id: NetId::NONE,
         }
     }
@@ -2235,6 +2236,7 @@ mod tests {
             shape: PadShape::Circle,
             pin_type: PinType::Passive,
             layer,
+            layer_to: layer,
             net_id: NetId::new(1),
         };
         s.pads.push(pad(0.0, l0)); // pad0 at (0,0)
