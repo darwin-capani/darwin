@@ -4907,8 +4907,12 @@ async fn handle_voice_clone(
                 // explicit confirmation. NOTHING leaves the device here.
                 let Some(sample) = voiceclone::default_owner_sample(root) else {
                     return Some(
-                        "I don't have an authorized voice sample to clone from. Enroll your \
-                         voice first (or add a sample), then ask me to clone it."
+                        // The old wording said "Enroll your voice first (or add a \
+                         // sample)" — but enrollment never writes a WAV, so that \
+                         // step can never produce one. Name the thing that works.
+                        "I don't have a recording of you to clone from. Put a WAV of your own \
+                         voice in state/voiceid/ — a clear thirty seconds is plenty — then ask \
+                         me again. I won't clone from a synthesized sample."
                             .to_string(),
                     );
                 };

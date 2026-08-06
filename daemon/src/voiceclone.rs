@@ -193,13 +193,26 @@ pub fn default_owner_sample(root: &Path) -> Option<PathBuf> {
             return Some(c);
         }
     }
-    // 2. A TTS audition sample under state/voice-samples/.
-    let samples_dir = root.join("state").join("voice-samples");
-    if let Some(s) = first_wav_in(&samples_dir) {
-        if let Some(c) = confine_sample(root, &s) {
-            return Some(c);
-        }
-    }
+    // THERE IS NO BRANCH 2, AND THERE USED TO BE.
+    //
+    // It fell back to `state/voice-samples/`, which holds the TTS engine's OWN
+    // OUTPUT — Kokoro audition WAVs written by the documented audition workflow
+    // and by tts_eval.py. That is not a recording of the owner; it is a synthesized
+    // clip of a stock voice.
+    //
+    // On any tree that had ever run an audition (the dev tree has), "clone my
+    // voice" therefore uploaded a SYNTHESIZED sample to ElevenLabs /v1/voices/add,
+    // stored the returned id as the user's cloned voice, and announced "Your voice
+    // is cloned and saved." The user got a clone of the TTS engine. The consent
+    // prompt had just asserted the sample was their own voice, and this is the one
+    // path in the entire voice stack where audio leaves the device — so it
+    // egressed the wrong audio, for nothing.
+    //
+    // Branch 1 above is currently INERT: `voiceid.rs` persists only owner.json and
+    // owner.enc.db and never writes a WAV, so enrollment produces no candidate.
+    // Returning None is the honest state — the feature is ON but inert without a
+    // sample the owner actually supplied, which is this project's normal shape.
+    // Falling back to synthesized audio to avoid saying "I don't have one" is not.
     None
 }
 
@@ -365,9 +378,11 @@ fn set_mode(_path: &Path, _mode: u32) {}
 /// that a clone requires authorization (no impersonating others).
 pub fn consent_prompt(sample_display: &str) -> String {
     format!(
-        "To clone your voice I'll upload an audio sample ({sample_display}) to ElevenLabs — \
-         that sample LEAVES this device. Only clone a voice you're authorized to use, which is \
-         your own. Say \"yes\" to go ahead, or anything else to cancel."
+        "To clone your voice I'll upload this audio sample ({sample_display}) to ElevenLabs — \
+         that sample LEAVES this device, and it is the only thing in the voice stack that does. \
+         Check it is a recording of YOU before you agree: whatever is in that file is what gets \
+         cloned. Only clone a voice you're authorized to use. Say \"yes\" to go ahead, or \
+         anything else to cancel."
     )
 }
 
@@ -497,26 +512,39 @@ mod tests {
     }
 
     #[test]
-    fn default_owner_sample_prefers_voiceid_then_voice_samples() {
+    fn a_synthesized_audition_clip_is_never_offered_as_the_owners_voice() {
         let root = tmp_dir("default-sample");
-        // Nothing yet -> None (the caller asks the user to point at a sample).
+        // Nothing yet -> None (the caller asks the user to supply a recording).
         assert!(default_owner_sample(&root).is_none());
 
-        // A voice-samples wav is found.
+        // A TTS AUDITION WAV IS NOT THE OWNER'S VOICE.
+        //
+        // This test previously asserted the opposite — that a wav under
+        // state/voice-samples/ IS a valid owner sample, and even named the
+        // fallback in its own title. That directory holds the TTS engine's own
+        // output (Kokoro audition clips, written by the documented audition
+        // workflow and by tts_eval.py). So on any tree that had ever run an
+        // audition, "clone my voice" uploaded a SYNTHESIZED clip to ElevenLabs,
+        // saved the result as the user's cloned voice, and said "Your voice is
+        // cloned and saved" — after a consent prompt asserting the sample was
+        // theirs. It is the one path in the voice stack where audio leaves the
+        // device.
         let samples = root.join("state").join("voice-samples");
         std::fs::create_dir_all(&samples).unwrap();
         std::fs::write(samples.join("kokoro-bm_george.wav"), b"RIFFstub").unwrap();
-        let picked = default_owner_sample(&root).expect("voice-samples wav found");
-        assert!(picked.to_string_lossy().contains("voice-samples"));
+        assert!(
+            default_owner_sample(&root).is_none(),
+            "a Kokoro audition clip must NOT be offered as the owner's voice"
+        );
 
-        // A voice-id enrollment wav takes PRIORITY (the owner's authorized audio).
+        // A recording the owner actually supplied IS used.
         let vid = root.join("state").join("voiceid");
         std::fs::create_dir_all(&vid).unwrap();
         std::fs::write(vid.join("owner.wav"), b"RIFFstub").unwrap();
-        let preferred = default_owner_sample(&root).expect("voiceid wav found");
+        let picked = default_owner_sample(&root).expect("an owner recording is usable");
         assert!(
-            preferred.to_string_lossy().contains("voiceid"),
-            "voice-id enrollment audio must be preferred: {preferred:?}"
+            picked.to_string_lossy().contains("voiceid"),
+            "the owner's own recording is the only acceptable sample: {picked:?}"
         );
 
         std::fs::remove_dir_all(&root).ok();
