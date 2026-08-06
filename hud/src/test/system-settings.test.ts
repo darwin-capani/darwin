@@ -44,6 +44,7 @@ import {
   isDangerousChange,
   pendingChanges,
   sameValue,
+  readBoolSetting,
   valueMapFromStates,
 } from "../core/systemSettings";
 import type { Change, SettingState, SettingValue } from "../tauri/configSettings";
@@ -861,5 +862,37 @@ describe("SystemSettingsPanel render (no daemon)", () => {
     const voiceId: VoiceIdStatus = { ...voiceIdInitial(), enabled: true, enrolled: true };
     const html = renderToStaticMarkup(createElement(SystemSettingsPanel, { voiceId }));
     expect(html).toContain("Reading config/darwin.toml");
+  });
+});
+
+describe("readBoolSetting — the id/key drift that killed three panels", () => {
+  // The SHAPE the daemon actually sends: `id` is dotted, `key` is bare.
+  // config_settings.rs build_get: id: s.id() -> "voice.cloud_sfx",
+  //                               key: s.key.to_string() -> "cloud_sfx".
+  const states = [
+    { id: "voice.cloud_sfx", section: "voice", key: "cloud_sfx", value: true },
+    { id: "voice.cloud_tier", section: "voice", key: "cloud_tier", value: true },
+    { id: "voice.cloud_music", section: "voice", key: "cloud_music", value: false },
+  ] as unknown as Parameters<typeof readBoolSetting>[0];
+
+  it("reads a setting by its dotted id", () => {
+    expect(readBoolSetting(states, "voice.cloud_sfx")).toBe(true);
+    expect(readBoolSetting(states, "voice.cloud_tier")).toBe(true);
+    expect(readBoolSetting(states, "voice.cloud_music")).toBe(false);
+  });
+
+  it("does NOT match the bare key, which is what the panels used to do", () => {
+    // AudioIoPanel searched `s.key === "voice.cloud_sfx"`. No record has that,
+    // because `key` holds "cloud_sfx". Every gate read false forever, so the SFX
+    // cue buttons, Voice Lab and Compose Music were dead WITH the dependency
+    // present — and the copy told the user to enable something already enabled.
+    expect(states.some((s) => (s as { key: string }).key === "voice.cloud_sfx")).toBe(false);
+    // ...and the helper still finds it, because it looks at the right field.
+    expect(readBoolSetting(states, "voice.cloud_sfx")).toBe(true);
+  });
+
+  it("is false for an unknown id rather than throwing", () => {
+    expect(readBoolSetting(states, "voice.nope")).toBe(false);
+    expect(readBoolSetting([] as unknown as typeof states, "voice.cloud_sfx")).toBe(false);
   });
 });
