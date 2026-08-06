@@ -188,6 +188,33 @@ impl NetSummaries {
             f.connection_points += 2;
         }
 
+        // BOARD COPPER. On a PCB these are the only things that carry a net —
+        // there are no wires or junctions. The tally counted just the SCHEMATIC
+        // entities, so a pad whose net continued into a track, a via or a zone
+        // (rather than into a second pad) had occupancy 1 and was reported
+        // `unconnected_pin` on a fully routed board.
+        //
+        // A track contributes 2 (its two endpoints, like a wire); a via and a
+        // zone contribute 1 each.
+        for t in &scene.tracks {
+            if t.net_id.is_none() {
+                continue;
+            }
+            facts.entry(t.net_id.raw()).or_default().connection_points += 2;
+        }
+        for v in &scene.vias {
+            if v.net_id.is_none() {
+                continue;
+            }
+            facts.entry(v.net_id.raw()).or_default().connection_points += 1;
+        }
+        for z in &scene.zones {
+            if z.net_id.is_none() {
+                continue;
+            }
+            facts.entry(z.net_id.raw()).or_default().connection_points += 1;
+        }
+
         // Junctions.
         for j in &scene.junctions {
             if j.net_id.is_none() {
