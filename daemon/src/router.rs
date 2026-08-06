@@ -140,9 +140,17 @@ pub async fn route(
     // `lockdown::unlock` — there is NO route from the model tool loop, an MCP
     // server, or injected/agent text. It clears the flag (every gate returns to
     // its CONFIGURED value — lockdown was an overlay, nothing was clobbered) and
-    // removes the marker (the next restart comes up normal). Recognized here on
-    // the user voice path, before normal routing, so it can lift a live lockdown
-    // even though most surfaces are forced off.
+    // removes the marker (the next restart comes up normal).
+    //
+    // THIS ARM CANNOT LIFT A LIVE LOCKDOWN, and it used to claim it could. A
+    // panic suppresses the microphone (`audio.rs`: mic_capture_suppressed drops
+    // every chunk ahead of the VAD), so while locked no utterance is ever
+    // produced and `route` is never called. What this arm actually handles is an
+    // unlock spoken when NOTHING is locked — which `lockdown::unlock` now answers
+    // honestly instead of announcing a lift that did not happen.
+    //
+    // Recovery from a live lockdown is the HUD `Command::Unlock` verb, which is
+    // what PANIC_CONFIRMATION now tells the user.
     if crate::lockdown::is_unlock_intent(text) {
         let msg = crate::lockdown::unlock().await;
         telemetry::emit("system", "lockdown.unlock", json!({"via": "voice"}));
