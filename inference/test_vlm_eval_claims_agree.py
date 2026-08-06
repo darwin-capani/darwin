@@ -23,15 +23,22 @@ already disowned, and the shipped model was on the verge of being swapped out ov
 import json
 import pathlib
 import re
+import sys
+import tempfile
 import unittest
 
 EVAL = pathlib.Path(__file__).resolve().parent / "benchmarks" / "vlm_eval"
+sys.path.insert(0, str(EVAL))  # the harness itself is import-light (no mlx, no PIL)
 RETRACTED = "2/12 to 4/12"
 # A line may still contain the retracted figure if it is visibly retracting it.
 RETRACTION_MARKERS = (
     "previously said", "ORIGINAL_TEXT", "CORRECTION_TO", "retracted",
     "SUPERSEDED", "asserted", "left standing",
 )
+# The disowned HEADLINE (as opposed to the disowned NUMBER above). README's verdict
+# block legitimately QUOTES it inside the blockquote that retracts it, so the check
+# looks only at lines that are asserting rather than retracting.
+RETRACTED_VERDICT = "not reliable at reading screens"
 
 
 def _measured_accuracy():
@@ -80,10 +87,68 @@ class TheArtifactsAgree(unittest.TestCase):
             f"{pct:.1f}%", verdict,
             f"README's verdict does not quote the measured {pct:.1f}% from results.json",
         )
+        # THE CONTRADICTION GUARD WAS A TAUTOLOGY. It searched for a needle CONTAINING
+        # SPACES ("NOT\nreliable at reading screens") inside `verdict.replace(" ",
+        # "\n")` — a haystack from which every space had just been removed — so it
+        # could not match under ANY README text at all. Pasting the disowned headline
+        # straight back into the verdict block passed this whole file, which exists
+        # for nothing else. Normalize the HAYSTACK instead: collapse whitespace so a
+        # line wrap cannot hide the sentence, casefold so capitalisation cannot, and
+        # drop the lines that visibly RETRACT it (the blockquote README quotes it in)
+        # rather than assert it.
+        asserted = [
+            ln for ln in verdict.splitlines()
+            if not ln.lstrip().startswith(">")
+            and not any(m in ln for m in RETRACTION_MARKERS)
+        ]
         self.assertNotIn(
-            "NOT\nreliable at reading screens", verdict.replace(" ", "\n"),
+            RETRACTED_VERDICT, " ".join(" ".join(asserted).split()).lower(),
             "the README verdict still contradicts the measurement",
         )
+
+    def test_a_missing_fixture_is_refused_not_scored_as_wrong_answers(self):
+        """A MISSING IMAGE IS NOT A WRONG ANSWER. `screenshot_fixture.png` is
+        git-ignored and only `measure.py` builds it, so on a fresh clone the 4 of 12
+        CASES pointing at it had no image — and absent did not fail: `_shipped_path`
+        swallows the PIL open error and returns the nonexistent path, `generate`
+        raises on it, and that exception became an ANSWER STRING which was then
+        scored 0. At the README's SAMPLES=6 that is 24 of 72 evaluations recorded as
+        the model getting it wrong, capping any candidate at 66.7% — a third of the
+        accuracy number fabricated, and this harness exists to judge candidates
+        against the pin."""
+        import compare_models as cm
+
+        saved = cm.HERE
+        empty = pathlib.Path(tempfile.mkdtemp())
+        try:
+            cm.HERE = empty
+            with self.assertRaises(SystemExit) as ctx:
+                cm._ensure_fixtures()
+            still_missing = [
+                f for f in sorted({c[0] for c in cm.CASES}) if not (empty / f).exists()
+            ]
+        finally:
+            cm.HERE = saved
+        self.assertTrue(
+            still_missing, "nothing was missing, so this proved nothing"
+        )
+        msg = str(ctx.exception)
+        for fixture in still_missing:
+            self.assertIn(fixture, msg, f"{fixture} is absent but unnamed in the refusal")
+
+    def test_a_generate_that_raised_is_not_scored_as_a_wrong_answer(self):
+        """The exception was stringified into `ans` and handed to the predicate, so a
+        broken harness and a bad answer were the same number. It gets its own bucket
+        now, excluded from accuracy."""
+        # assertFalse/assertTrue, not assertNotIn/assertIn: the latter dump the whole
+        # harness source into the failure output. Needle carries the angle bracket so
+        # this guard cannot SELF-MATCH the comment in compare_models that describes it.
+        src = (EVAL / "compare_models.py").read_text(encoding="utf-8")
+        self.assertFalse(
+            "<generate failed" in src,
+            "a generate failure is being turned into an answer string and scored",
+        )
+        self.assertTrue('"errors": errors' in src, "the error bucket is gone")
 
     def test_the_losing_candidates_are_still_recorded(self):
         """The pin is justified by a comparison; if that vanishes the pin becomes a

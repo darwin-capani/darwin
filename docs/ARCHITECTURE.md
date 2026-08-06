@@ -43,7 +43,7 @@ This is the maximum achievable boot integration on Apple Silicon today. iBoot ca
 ```
                 ┌──────────────────────────── darwind (Rust, LaunchAgent) ────────────────────────────┐
                 │                                                                                      │
- mic ──▶ audio loop ──▶ VAD (RMS gate: rms_threshold / silence_ms / min_speech_ms)                     │
+ mic ──▶ audio loop ──▶ VAD (learned in-process Silero; RMS gate = fallback)                           │
                 │             │ utterance WAV → state/tmp/                                             │
                 │             ▼                                                                        │
                 │   ┌──── inference IPC client ────┐        ┌── telemetry WS server 127.0.0.1:7177 ──┐ │
@@ -72,7 +72,7 @@ Canonical file: `config/darwin.toml`. Both `darwind` and the inference server re
 
 | Section | Keys |
 |---|---|
-| `[audio]` | `rms_threshold = 0.015`, `silence_ms = 350`, `min_speech_ms = 250` |
+| `[audio]` | `vad = "silero"` (per-frame VAD backend — the learned in-process Silero VAD is the shipped default; `"rms"` is the explicit opt-out, and the RMS gate is also the honest fallback until the Silero weights exist), `rms_threshold = 0.015`, `silence_ms = 350`, `min_speech_ms = 250` (the three RMS-gate knobs; they do not affect segmentation while the learned VAD is running) |
 | `[models]` | `llm = "mlx-community/Qwen3-4B-Instruct-2507-4bit"`, `stt` (MLX Whisper model; config-driven, benchmark-selected), `classifier = ""` (dedicated small resident model for `classify`; empty reuses the main LLM — see Routing policy) |
 | `[router]` | `cloud_confidence_threshold = 0.6`, `conversation_route = "cloud_heavy"` (where the `conversation` intent is answered: `"cloud_heavy"` cloud Opus / `"cloud_fast"` cloud Haiku / `"local"` the 4B — see Routing policy) |
 | `[cloud]` | `fast_model = "claude-haiku-4-5"`, `heavy_model = "claude-opus-4-8"`, `max_tokens = 4096` |

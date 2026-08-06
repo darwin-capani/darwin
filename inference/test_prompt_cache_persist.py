@@ -125,6 +125,10 @@ class PersistenceIsNeverFatal(unittest.TestCase):
         self.assertFalse(ok)
 
     def test_saving_leaves_no_temp_file_behind_on_failure(self):
+        """A save that fails BEFORE the temp write: mlx_lm's save_prompt_cache raises
+        on the unusable cache object ('str' object has no attribute 'state'), so no
+        file is ever created and this half holds trivially. The half that bites is
+        below - this one is kept as its paired control."""
         root = tempfile.mkdtemp()
         # A cache containing something unserializable makes save_prompt_cache raise
         # AFTER the temp path is chosen.
@@ -134,8 +138,36 @@ class PersistenceIsNeverFatal(unittest.TestCase):
         d = os.path.join(root, server.PROMPT_CACHE_DIRNAME)
         strays = [f for f in os.listdir(d)] if os.path.isdir(d) else []
         self.assertEqual(
-            [f for f in strays if f.endswith(".tmp")], [],
+            [f for f in strays if ".tmp." in f], [],
             f"a failed save left a temp file behind: {strays}",
+        )
+
+    def test_a_failure_after_the_temp_write_leaves_no_temp_file(self):
+        """THE INVARIANT THIS PAIR CLAIMS, ACTUALLY EXERCISED. It was unverified twice
+        over:
+          (a) the scenario above dies inside mlx_lm before any file exists, so the
+              directory is empty whatever the code does; and
+          (b) the filter was `f.endswith(".tmp")`, while the real temp file is
+              `<name>.<pid>.tmp.safetensors` - it MUST end in .safetensors because
+              mx.save_safetensors validates the extension - so the filter could not
+              see a stray even when one was left.
+        Here the temp write SUCCEEDS and the PUBLISH fails: the destination is a
+        directory, so os.replace raises. That is the shape of every real mid-write
+        failure (cross-device replace, disk full, a kill between write and rename),
+        and it is the only shape that can leak a partially written cache into the
+        managed model-cache root."""
+        root = tempfile.mkdtemp()
+        d = os.path.join(root, server.PROMPT_CACHE_DIRNAME)
+        os.makedirs(d, exist_ok=True)
+        # A DIRECTORY where the published file belongs: os.replace onto it raises.
+        os.makedirs(server._prompt_cache_path(root, "persona"))
+        ok = server.save_prompt_cache_fingerprinted(
+            root, "persona", _cache(), "m/x", "4bit", "p"
+        )
+        self.assertFalse(ok, "a failed publish must report False, never raise")
+        strays = [f for f in os.listdir(d) if ".tmp." in f]
+        self.assertEqual(
+            strays, [], f"a failed save left a temp file behind: {strays}"
         )
 
     def test_a_loaded_cache_is_still_trimmable(self):

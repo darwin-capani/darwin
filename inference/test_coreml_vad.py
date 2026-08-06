@@ -12,7 +12,10 @@ are DEVICE/DEP-gated and exercised by the once-run smoke
 
   Run: .venv/bin/python inference/test_coreml_vad.py   (from the repo root)
 """
+import os
 import sys
+import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -20,6 +23,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import coreml_shared  # noqa: E402
 import coreml_vad as cv  # noqa: E402
 
 
@@ -160,6 +164,39 @@ class GeometryConstantsTests(unittest.TestCase):
         self.assertAlmostEqual(1000.0 * cv.CHUNK / cv.SAMPLE_RATE, 32.0)
 
 
+class ConversionSerializationTests(unittest.TestCase):
+    """coremltools keeps global MIL state, so two overlapping conversions corrupt each
+    other — reproduced on the real converters, and it is what broke the first deploy of
+    the short-graph fast path. coreml_shared's contract is that EVERY conversion in the
+    process takes CONVERT_LOCK; this backend was the one that did not, so warming the
+    VAD beside the embedder/reranker (both of which start background rebuild threads at
+    preload) would have reproduced that crash with no guard."""
+
+    def test_conversions_are_serialized_process_wide(self):
+        self.assertIs(cv.CONVERT_LOCK, coreml_shared.CONVERT_LOCK)
+        # Behavioural, not textual: a COMMENT naming CONVERT_LOCK must not satisfy
+        # this. Hold the lock, then prove _convert_atomic actually blocks on it.
+        entered = threading.Event()
+        o = cv.CoreMLVAD.__new__(cv.CoreMLVAD)
+        with tempfile.TemporaryDirectory() as tmp:
+            o._dir = os.path.join(tmp, "vad")
+            o._convert_into = lambda d: entered.set()
+            coreml_shared.CONVERT_LOCK.acquire()
+            try:
+                t = threading.Thread(target=lambda: o._convert_atomic(), daemon=True)
+                t.start()
+                t.join(timeout=0.5)
+                self.assertFalse(
+                    entered.is_set(),
+                    "_convert_atomic converted while CONVERT_LOCK was held - "
+                    "concurrent coremltools conversions corrupt each other",
+                )
+            finally:
+                coreml_shared.CONVERT_LOCK.release()
+            t.join(timeout=5)
+            self.assertTrue(entered.is_set(), "it never converted after release")
+
+
 def _fake_native_blob():
     """A structurally-valid native weights blob (zeros) per NATIVE_TENSORS —
     the exact byte layout daemon/src/silero.rs parses (lockstep contract)."""
@@ -217,6 +254,102 @@ class NativeWeightsFormatTests(unittest.TestCase):
         # 309,633 fp32 values -> the exported file is exactly 1,238,604 bytes
         # (8 magic + 4 count + 15*4 length prefixes + 4*total data).
         self.assertEqual(total, 309_633, "total fp32 parameter count is pinned")
+
+
+class PerFrameConfusionCoversEveryLabeledRegion(unittest.TestCase):
+    """The committed VAD eval's per-frame confusion must label every frame it says it
+    labels. inference/benchmarks/vad_eval/eval_vad.py documents it in its own comment —
+    "speech clips' body frames = speech; noise clips' frames + speech clips' LEAD/TRAIL
+    frames = non-speech" — but the loop under it had no arm for `idx >= body_end`, so
+    the whole TRAILING non-speech region was counted nowhere: 40 clips x 15 frames =
+    600 labeled frames, roughly HALF the non-speech denominator, and exactly the region
+    where a learned VAD's probability HANGOVER shows up. A verdict source with a 100%
+    false-accept rate on the trail scored 0.0.
+
+    `evaluate()` takes a per-frame verdict function and plain clip dicts, so this runs
+    with NO model and NO audio. (The clip-level false_accept_rate_clips that
+    daemon/src/vad.rs cites as adoption evidence is computed separately and was never
+    affected.)"""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(Path(__file__).resolve().parent / "benchmarks" / "vad_eval"))
+        import eval_vad
+
+        cls.ev = eval_vad
+        cls.FRAMES = 50
+        cls.ONSET = 15                                              # leading non-speech
+        cls.TRAIL = int(eval_vad.SR * eval_vad.TRAIL_MS / 1000) // eval_vad.CHUNK
+        cls.BODY_END = cls.FRAMES - cls.TRAIL
+
+    def setUp(self):
+        self.assertGreater(self.TRAIL, 0, "the trailing region must be non-empty or "
+                                          "this class proves nothing")
+        self.assertLess(self.ONSET, self.BODY_END, "the body region must be non-empty")
+
+    def _clip(self):
+        """One speech clip: [0, ONSET) lead, [ONSET, BODY_END) speech, then trail. The
+        signal is never inspected by `evaluate` — only its length and our verdicts."""
+        return {
+            "signal": np.zeros(self.FRAMES * self.ev.CHUNK, dtype=np.float32),
+            "onset_frame": self.ONSET,
+            "category": "clean",
+        }
+
+    def _verdict(self, voiced_idx):
+        want = set(voiced_idx)
+        return lambda sig: [i in want for i in range(len(sig) // self.ev.CHUNK)]
+
+    def test_the_trailing_region_is_scored_as_non_speech(self):
+        """THE REGRESSION. Voiced on EVERY trailing frame and nothing else — a 100%
+        false-accept rate over that region, reported as 0.0."""
+        got = self.ev.evaluate(
+            self._verdict(range(self.BODY_END, self.FRAMES)), [self._clip()], []
+        )
+        self.assertEqual(
+            got["labeled_non_speech_frames"], self.ONSET + self.TRAIL,
+            "the trailing non-speech frames are missing from the denominator",
+        )
+        self.assertAlmostEqual(
+            got["frame_false_accept_rate"],
+            self.TRAIL / (self.ONSET + self.TRAIL), places=4,
+            msg="every trailing frame was voiced and none of it reached the metric",
+        )
+
+    def test_the_leading_region_is_still_scored_as_non_speech(self):
+        """The arm that always worked — the fix must not have moved it."""
+        got = self.ev.evaluate(
+            self._verdict(range(0, self.ONSET)), [self._clip()], []
+        )
+        self.assertAlmostEqual(
+            got["frame_false_accept_rate"],
+            self.ONSET / (self.ONSET + self.TRAIL), places=4,
+        )
+
+    def test_the_body_is_scored_as_speech(self):
+        """Silent through the body -> every body frame is a false reject, and the body
+        must NOT leak into the non-speech denominator."""
+        got = self.ev.evaluate(self._verdict([]), [self._clip()], [])
+        self.assertEqual(got["labeled_speech_frames"], self.BODY_END - self.ONSET)
+        self.assertAlmostEqual(got["frame_false_reject_rate"], 1.0, places=4)
+        self.assertAlmostEqual(got["frame_false_accept_rate"], 0.0, places=4)
+
+    def test_a_perfect_verdict_source_scores_zero_on_both(self):
+        got = self.ev.evaluate(
+            self._verdict(range(self.ONSET, self.BODY_END)), [self._clip()], []
+        )
+        self.assertAlmostEqual(got["frame_false_accept_rate"], 0.0, places=4)
+        self.assertAlmostEqual(got["frame_false_reject_rate"], 0.0, places=4)
+
+    def test_every_labeled_frame_of_a_clip_is_accounted_for(self):
+        """lead + body + trail must be the whole clip: no frame counted twice, none
+        dropped. This is the invariant whose violation was invisible before."""
+        got = self.ev.evaluate(self._verdict([]), [self._clip()], [])
+        self.assertEqual(
+            got["labeled_non_speech_frames"] + got["labeled_speech_frames"],
+            self.FRAMES,
+            "the confusion covers fewer frames than the clip has",
+        )
 
 
 if __name__ == "__main__":

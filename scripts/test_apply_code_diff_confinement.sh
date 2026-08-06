@@ -20,10 +20,19 @@
 # sqlite, a model, or any network. It exercises (a) the script's strengthened
 # pre-scan (sliced verbatim from the live script) and (b) the real
 # `confined_patch` sandbox helper against a fake codebase layout in a temp dir —
-# proving each escape ('..'/symlink/X-prefix/absolute) leaves the out-of-tree
-# victim byte-for-byte UNCHANGED, while a legit confined apply still succeeds.
-# Invoked by the script's own `--selftest` hook so the defense cannot silently
-# regress.
+# proving each escape leaves the out-of-tree victim byte-for-byte UNCHANGED,
+# while a legit confined apply still succeeds. Invoked by the script's own
+# `--selftest` hook so the defense cannot silently regress.
+#
+# EVERY case is CLASSIFIED against raw, unsandboxed /usr/bin/patch first, and the
+# classification is asserted, not assumed: `escapable` means raw patch really does
+# clobber the out-of-tree victim, so the sandbox is what closes it; `benign` means
+# raw patch already fails to reach it, so "the victim is unchanged" proves nothing
+# about the sandbox and the case says so. Two cases used to skip that step and
+# assert a defense that was never exercised — the symlinked-FILE case (BSD patch
+# renames over the link rather than following it) and the absolute-header case
+# (`-p1` strips the leading `/`, making the target a nonexistent relative path).
+# Both printed `ok` with the sandbox removed entirely.
 #
 # Run:  scripts/test_apply_code_diff_confinement.sh   (or apply_code_diff.sh --selftest)
 # Exit: 0 = all cases pass, 1 = a case regressed.
@@ -245,26 +254,59 @@ malicious_case "mixed ws+char ' X' '..' header" " X" "dashes" "reject" "escapabl
 malicious_case "mixed tab+char '..' header" "$(printf '\t')X" "dashes" "reject" "escapable"
 
 echo
-echo "== absolute-path escape: DENIED under the sandbox =="
+echo "== absolute-path escape: BENIGN under raw patch; the PRE-SCAN is what closes it =="
 
-# An ABSOLUTE header that, after -p1, still targets an out-of-tree absolute path.
-# The pre-scan rejects an absolute-after-p1 header; the sandbox denies the write
-# regardless (writes are confined to CODE).
+# An ABSOLUTE `---`/`+++` header. The pre-scan rejects an absolute-after-p1
+# header, and the sandbox confines writes to CODE regardless.
+#
+# WHAT THIS BLOCK USED TO CLAIM, AND WHY IT WAS WRONG: the comment read "An
+# ABSOLUTE header that, after -p1, still targets an out-of-tree absolute path",
+# and the only assertion was that the sandbox left the victim unchanged. MEASURED,
+# the premise is false. macOS `patch -p1` strips the leading `/` — and keeps
+# stripping leading slashes after the component it removes — so
+# `--- //abs/path/victim` reaches patch as the RELATIVE path `abs/path/victim`
+# under CODE, which does not exist:
+#     No file to patch.  Skipping...
+#     1 out of 1 hunks ignored--saving rejects to 'abs/path/victim.rej'
+# Raw /usr/bin/patch with ZERO confinement never even attempts the out-of-tree
+# write. So "the victim is unchanged" could not fail: this case printed `ok` with
+# the sandbox helper replaced by a bare /usr/bin/patch. (Prefixing a component to
+# keep the remainder absolute — `--- x//abs/...` — was measured too and is
+# stripped the same way.) The class is BENIGN and is now labeled as such, with
+# the raw behavior asserted rather than assumed; the load-bearing assertion here
+# is the PRE-SCAN one below, and the real out-of-tree escapes are the `..` cases
+# above and the symlinked-DIRECTORY case below.
+abs_diff_body() {   # $1 = victim path, $2 = destination file
+  printf '%s\n' \
+    "--- /$1" \
+    "+++ /$1" \
+    '@@ -1,2 +1,2 @@' \
+    '-ORIGINAL OUTSIDE FILE' \
+    '+INJECTED_ABS' \
+    ' keep' > "$2"
+}
+
+# 1. Classify honestly: raw, unsandboxed patch in a throwaway clone.
+make_repo "case_absolute_rawproof"
+abs_diff_body "$VICTIM" "$REPO/abs.diff"
+before="$(cat "$VICTIM")"
+( cd "$CODE" && "$PATCH_BIN" -p1 --batch < "$REPO/abs.diff" ) >/dev/null 2>&1
+if [ "$before" = "$(cat "$VICTIM")" ]; then
+  ok "absolute-path header: RAW patch already fails to reach the victim (-p1 makes it relative) — a benign class, so the sandbox assertion below proves nothing on its own"
+else
+  bad "absolute-path header: RAW patch DID escape — reclassify as escapable and make the sandbox the load-bearing assertion"
+fi
+
+# 2. The sandbox must still leave the victim untouched (it has nothing to deny).
 make_repo "case_absolute"
 ABS="$REPO/abs.diff"
 ABS_VICTIM="$REPO/outside/victim"
-printf '%s\n' \
-  "--- /$ABS_VICTIM" \
-  "+++ /$ABS_VICTIM" \
-  '@@ -1,2 +1,2 @@' \
-  '-ORIGINAL OUTSIDE FILE' \
-  '+INJECTED_ABS' \
-  ' keep' > "$ABS"
+abs_diff_body "$ABS_VICTIM" "$ABS"
 before="$(cat "$ABS_VICTIM")"
 sandbox_apply "$CODE" "$ABS" >/dev/null 2>&1
 after="$(cat "$ABS_VICTIM")"
 if [ "$before" = "$after" ]; then
-  ok "absolute-path header: sandbox kept the out-of-tree victim unchanged"
+  ok "absolute-path header: out-of-tree victim still unchanged under the sandbox"
 else
   bad "absolute-path header: out-of-tree victim WAS modified -> escape reachable"
 fi
@@ -286,11 +328,22 @@ esac
 echo
 echo "== symlink escape: a symlinked codebase entry cannot redirect a write out =="
 
-# A symlink INSIDE the codebase root pointing at the out-of-tree victim. A diff
-# targeting the symlink's path would, without confinement, follow the link and
-# clobber the victim. The sandbox confines writes to the canonicalized CODE
-# subtree; the link's REAL target is outside, so the write is DENIED.
-make_repo "case_symlink"
+# --- S1: a symlinked FILE (BENIGN — and now labeled so) ----------------------
+# A symlink INSIDE the codebase root pointing at the out-of-tree victim.
+#
+# WHAT THIS USED TO CLAIM, AND WHY IT WAS WRONG: the comment said a diff
+# targeting the link "would, without confinement, follow the link and clobber the
+# victim" and that "the write is DENIED". MEASURED, BOTH halves are false.
+# macOS /usr/bin/patch writes a temp file and RENAMES it onto the target, so it
+# REPLACES the symlink with a regular in-tree file and never follows it: raw
+# patch with zero confinement leaves the victim byte-for-byte unchanged. And
+# under the sandbox the write SUCCEEDS (rc=0) precisely because it lands inside
+# CODE — nothing is denied, so the recorded conclusion described a defense that
+# was never exercised. The assertion could not fail: it printed `ok` with the
+# sandbox helper replaced by a bare /usr/bin/patch. It is kept because it pins
+# that rename-over-the-link behavior, but it is now asserted, not assumed. The
+# load-bearing symlink case is S2 below.
+make_repo "case_symlink_file"
 SYM_VICTIM="$REPO/outside/victim"
 ln -s "$SYM_VICTIM" "$CODE/src/link"
 SYM="$REPO/sym.diff"
@@ -304,11 +357,71 @@ printf '%s\n' \
 before="$(cat "$SYM_VICTIM")"
 sandbox_apply "$CODE" "$SYM" >/dev/null 2>&1
 after="$(cat "$SYM_VICTIM")"
-if [ "$before" = "$after" ]; then
-  ok "symlink-escape: sandbox kept the out-of-tree victim unchanged (the link's real target is outside CODE)"
+if [ "$before" != "$after" ]; then
+  bad "symlinked-FILE: out-of-tree victim WAS modified through the symlink -> escape reachable"
+elif [ -L "$CODE/src/link" ]; then
+  bad "symlinked-FILE: the link survived the patch — BSD patch's rename-over-the-link behavior changed; re-derive this case"
+elif grep -q INJECTED_VIA_SYMLINK "$CODE/src/link" 2>/dev/null; then
+  ok "symlinked-FILE (benign): BSD patch REPLACED the link with a regular in-tree file instead of following it — the write is allowed, not denied, and the victim is untouched"
 else
-  bad "symlink-escape: out-of-tree victim WAS modified through the symlink -> escape reachable"
+  bad "symlinked-FILE: the in-tree write did not land either — the case no longer exercises anything"
 fi
+
+# --- S2: a symlinked DIRECTORY component (a REAL escape the sandbox closes) ---
+# `src/linkdir/victim` where `linkdir` is a symlink to an out-of-tree directory.
+# patch resolves the link during path traversal, so the write genuinely lands
+# outside CODE. Raw /usr/bin/patch DOES clobber the victim here (asserted below,
+# the same regression proof `malicious_case` applies to the `..` classes), and
+# the kernel seatbelt denies it because the canonicalized write target is outside
+# the confinement subpath. This is what the symlink section was supposed to be
+# testing all along.
+make_symdir_case() {
+  local root="$1" diff="$2"
+  rm -rf "$root"
+  mkdir -p "$root/project/src" "$root/outside"
+  printf 'ORIGINAL OUTSIDE FILE\nkeep\n' > "$root/outside/victim"
+  printf 'placeholder\n' > "$root/project/src/lib.rs"
+  ln -s "$root/outside" "$root/project/src/linkdir"
+  printf '%s\n' \
+    '--- a/src/linkdir/victim' \
+    '+++ b/src/linkdir/victim' \
+    '@@ -1,2 +1,2 @@' \
+    '-ORIGINAL OUTSIDE FILE' \
+    '+INJECTED_VIA_SYMLINKED_DIR' \
+    ' keep' > "$diff"
+}
+
+# 1. Regression proof: raw, unsandboxed patch really does escape through the link.
+SYMD_PROOF="$WORK/symdir_proof"
+make_symdir_case "$SYMD_PROOF" "$SYMD_PROOF/symdir.diff"
+( cd "$SYMD_PROOF/project" && "$PATCH_BIN" -p1 --batch < "$SYMD_PROOF/symdir.diff" ) >/dev/null 2>&1
+if grep -q INJECTED_VIA_SYMLINKED_DIR "$SYMD_PROOF/outside/victim" 2>/dev/null; then
+  ok "symlinked-DIR: RAW patch DOES write through the link to the out-of-tree victim (a real residual)"
+else
+  bad "symlinked-DIR: RAW patch did NOT escape — this case is not a faithful residual"
+fi
+
+# 2. The load-bearing assertion: under the sandbox the victim is untouched.
+SYMD_LIVE="$WORK/symdir_live"
+make_symdir_case "$SYMD_LIVE" "$SYMD_LIVE/symdir.diff"
+before="$(cat "$SYMD_LIVE/outside/victim")"
+sandbox_apply "$SYMD_LIVE/project" "$SYMD_LIVE/symdir.diff" >/dev/null 2>&1
+after="$(cat "$SYMD_LIVE/outside/victim")"
+if [ "$before" = "$after" ]; then
+  ok "symlinked-DIR: sandbox DENIED the write through the link (victim unchanged, was escapable raw)"
+else
+  bad "symlinked-DIR: out-of-tree victim WAS modified through the symlinked directory -> escape reachable"
+fi
+
+# 3. And state plainly that the header pre-scan is NOT what closes this: the
+#    header `a/src/linkdir/victim` is a perfectly ordinary relative path with no
+#    `..` and no absolute component, so the pre-scan accepts it. The kernel
+#    seatbelt is the only thing standing between this diff and the victim.
+out="$(run_gate "$SYMD_LIVE/symdir.diff")"
+case "$out" in
+  ACCEPTED) ok "symlinked-DIR: the header pre-scan CANNOT see this (an ordinary relative path) — the sandbox is the only defense" ;;
+  *)        bad "symlinked-DIR: the pre-scan rejected [$out]; if that is now intended, re-derive what this case proves" ;;
+esac
 
 echo
 echo "== legit case: a confined apply must still SUCCEED under the sandbox =="

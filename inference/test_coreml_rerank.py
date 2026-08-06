@@ -122,10 +122,46 @@ class ConfigDefaultTests(unittest.TestCase):
         settings = server.load_config()
         self.assertTrue(settings["reranker"])
 
+    def _load(self, toml_text):
+        """Run the REAL load_config over a temp TOML — the pattern
+        test_local_warm.ConfigParsing._load already uses. Reading the SHIPPED config
+        cannot reach the branch this class is named for."""
+        import logging
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".toml", delete=False) as f:
+            f.write(toml_text)
+            path = Path(f.name)
+        orig = server.CONFIG_PATH
+        server.CONFIG_PATH = path
+        try:
+            prev = server.log.level
+            server.log.setLevel(logging.CRITICAL)  # silence the EXPECTED warning
+            try:
+                return server.load_config()
+            finally:
+                server.log.setLevel(prev)
+        finally:
+            server.CONFIG_PATH = orig
+            path.unlink()
+
     def test_non_boolean_reranker_keeps_default(self):
-        # Parsed like preload/speculative: a non-boolean value keeps the default.
-        eng_settings = server.load_config()
-        self.assertIsInstance(eng_settings["reranker"], bool)
+        """Parsed like preload/speculative: a non-boolean value keeps the default.
+
+        IT NEVER SUPPLIED ONE. This read the SHIPPED config (reranker = true), so the
+        non-boolean branch was never entered, and `settings["reranker"]` is a bool for
+        every possible input anyway — the default is a bool and the only assignment is
+        already inside `if isinstance(raw, bool)`. Deleting that isinstance guard left
+        the whole suite green while `reranker = 'yes'` flowed into the engine as a
+        truthy STRING."""
+        got = self._load("[inference]\nreranker = 'yes'\n")
+        self.assertIs(
+            got["reranker"], server.DEFAULT_RERANKER_ENABLED,
+            "a non-boolean [inference].reranker must keep the default, not the value",
+        )
+        # And a real boolean still lands, so the guard did not just swallow the key.
+        self.assertIs(self._load("[inference]\nreranker = false\n")["reranker"], False)
+        self.assertIs(self._load("[inference]\nreranker = true\n")["reranker"], True)
 
 
 class RerankFallbackTests(unittest.TestCase):
@@ -468,9 +504,73 @@ class FastGraphUpgrade(unittest.TestCase):
                 total += o.converts
             self.assertEqual(
                 total, coreml_shared.MAX_FAST_ATTEMPTS,
-                f"{{total}} rebuilds; the budget is coreml_shared.MAX_FAST_ATTEMPTS",
+                f"{total} rebuilds; the budget is {coreml_shared.MAX_FAST_ATTEMPTS}",
             )
             self.assertTrue(coreml_shared.fast_upgrade_exhausted(tmp))
+
+    def _real_publish_obj(self, cache_dir, fast_conversion_raises):
+        """Like `_obj` but running the REAL `_convert_atomic`: only the two HEAVY seams
+        (`_convert_into`, `_load_from`) are stubbed, so the publish that moves the whole
+        cache dir aside and rmtree-s it actually happens. `_obj`'s counter stub cannot
+        observe this class of bug - it never touches the directory the budget lives in,
+        which is exactly why the budget shipped unreachable."""
+        o = cr.CoreMLReranker.__new__(cr.CoreMLReranker)
+        o._dir = cache_dir
+        o._lock = threading.Lock()
+        o._loaded = False
+        o._upgrade_started = False
+        o._tokenizer = o._model = o._model_fast = None
+
+        def _convert_into(target):
+            os.makedirs(target, exist_ok=True)
+            with open(os.path.join(target, "model.mlpackage"), "w", encoding="utf-8") as fh:
+                fh.write("stub")
+            if fast_conversion_raises:
+                # What the real `_convert_into` does when the OPTIONAL short graph
+                # fails to convert: keep the seq=SEQ cache, note the attempt in the
+                # TEMP dir it is writing (coreml_rerank.py, `trace_and_convert` guard).
+                coreml_shared.note_fast_attempt(target, "short graph did not convert here")
+
+        o._convert_into = _convert_into
+        # Always loads, NEVER with a usable short graph - the deterministic failure.
+        o._load_from = lambda d: ("t", "m", None)
+        return o
+
+    def test_the_budget_survives_the_real_publish(self):
+        """THE REGRESSION. The budget is a file INSIDE the cache dir and `_convert_atomic`
+        publishes by moving that whole dir aside and rmtree-ing it, so every rebuild used
+        to discard the accumulated count: MEASURED at 2 attempts after start #1 and still
+        2 after start #7, `fast_upgrade_exhausted` never True, a full ~43.8 s background
+        reconversion scheduled on EVERY server start FOREVER - the unbounded outcome
+        MAX_FAST_ATTEMPTS exists to cap. Drives the real publish because the stubbed one
+        above cannot see it."""
+        for raises in (True, False):
+            with self.subTest(fast_conversion_raises=raises):
+                with tempfile.TemporaryDirectory() as root:
+                    cache = os.path.join(root, "darwin-coreml", "bge-reranker")
+                    starts = 0
+                    for _ in range(coreml_shared.MAX_FAST_ATTEMPTS + 5):
+                        if coreml_shared.fast_upgrade_exhausted(cache):
+                            break
+                        o = self._real_publish_obj(cache, raises)
+                        o.ensure_loaded()
+                        for t in threading.enumerate():
+                            if t.name.endswith("-fast-upgrade") and t is not threading.current_thread():
+                                t.join(timeout=30)
+                        starts += 1
+                    self.assertTrue(
+                        coreml_shared.fast_upgrade_exhausted(cache),
+                        f"after {starts} starts the budget is still not spent "
+                        f"({coreml_shared.fast_attempts(cache)} of "
+                        f"{coreml_shared.MAX_FAST_ATTEMPTS} attempts) - every start "
+                        f"reconverts the cache again",
+                    )
+                    # And it must not have slammed shut on the FIRST failure either:
+                    # that is the permanent sentinel the counter replaced.
+                    self.assertGreater(
+                        starts, 1,
+                        "a transient failure must still get another go before the cap",
+                    )
 
     def test_conversions_are_serialized_process_wide(self):
         """coremltools keeps global MIL state, so two overlapping conversions corrupt
@@ -523,5 +623,119 @@ class SentinelWriteIsNeverFatal(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
+def _eval_rerank():
+    """The committed adoption-gate harness for THIS backend
+    (inference/benchmarks/coreml_rerank_eval/eval_rerank.py). Import-light: json +
+    numpy and the committed eval set, no models."""
+    sys.path.insert(
+        0, str(Path(__file__).resolve().parent / "benchmarks" / "coreml_rerank_eval")
+    )
+    import eval_rerank
+
+    return eval_rerank
+
+
+def _summary(ndcg, r1, r5, mrr, r3=0.9):
+    return {"nDCG@10": ndcg, "recall@1": r1, "recall@3": r3, "recall@5": r5, "MRR": mrr}
+
+
+class AdoptionGateVerdict(unittest.TestCase):
+    """eval_rerank.py is the adoption gate for this backend, and its own comment says
+    the verdict is "derived from the numbers, not hand-set". IT DERIVED THE GO AND THE
+    RECOMMENDED DEPTH BY DIFFERENT CRITERIA: `best_k` was `max(KS, key=nDCG@10)` and
+    never consulted `wins()`, so it could emit "GO ... (best at K=20)" naming the exact
+    depth its own win-test had REJECTED for regressing recall@5 — with that regression
+    printed in `deltas_best_minus_A` two lines above. inference/benchmark.py copies the
+    verdict verbatim into the committed baseline, so the wrong recommendation
+    propagates. `derive_verdict` was lifted out of the device-gated probe precisely so
+    the decision could be unit-tested."""
+
+    KS = (20, 50)
+
+    def test_the_recommended_depth_must_have_passed_the_win_test(self):
+        """THE REGRESSION. K=20 has the higher nDCG@10 but drops recall@5 below stage A
+        (0.95 < 0.98), which the win test vetoes; K=50 passes every guard. The GO rests
+        on K=50, so the recommendation must be K=50."""
+        a = _summary(0.9000, 0.8000, 0.9800, 0.80)
+        b = {20: _summary(0.9600, 0.8800, 0.9500, 0.86),   # best nDCG, REJECTED
+             50: _summary(0.9400, 0.8500, 0.9900, 0.85)}   # accepted
+        go, winners, best_k = _eval_rerank().derive_verdict(a, b, self.KS)
+        self.assertTrue(go)
+        self.assertEqual(winners, [50])
+        self.assertEqual(
+            best_k, 50,
+            "the harness recommended a depth its own win-test rejected for "
+            "regressing top-5 recall",
+        )
+
+    def test_the_best_of_several_winners_is_still_the_strongest(self):
+        """When both depths pass, the tie-break is unchanged: highest nDCG@10, then
+        recall@1. The fix must not turn a real preference into 'the first winner'."""
+        a = _summary(0.9000, 0.8000, 0.9000, 0.80)
+        b = {20: _summary(0.9600, 0.8800, 0.9800, 0.86),
+             50: _summary(0.9400, 0.8500, 0.9900, 0.85)}
+        go, winners, best_k = _eval_rerank().derive_verdict(a, b, self.KS)
+        self.assertTrue(go)
+        self.assertEqual(winners, [20, 50])
+        self.assertEqual(best_k, 20)
+
+    def test_a_no_go_still_reports_a_best_looking_depth(self):
+        """With no winner the gate is NO-GO; best_K stays as INFORMATION and the `call`
+        string says outright that it is not a recommendation."""
+        a = _summary(0.9900, 0.9900, 0.9900, 0.99)
+        b = {20: _summary(0.9000, 0.8000, 0.8000, 0.80),
+             50: _summary(0.9500, 0.8500, 0.8500, 0.85)}
+        go, winners, best_k = _eval_rerank().derive_verdict(a, b, self.KS)
+        self.assertFalse(go)
+        self.assertEqual(winners, [])
+        self.assertEqual(best_k, 50)
+
+    def test_a_recall5_regression_alone_vetoes_a_depth(self):
+        """The guard that caught the case above: everything improves except top-5
+        recall, which is exactly the trade this gate exists to refuse."""
+        a = _summary(0.9000, 0.8000, 0.9800, 0.80)
+        b = {20: _summary(0.9900, 0.9500, 0.9700, 0.95),
+             50: _summary(0.9900, 0.9500, 0.9700, 0.95)}
+        go, winners, _ = _eval_rerank().derive_verdict(a, b, self.KS)
+        self.assertFalse(go, "a recall@5 regression must veto the depth")
+        self.assertEqual(winners, [])
+
+    def test_the_probe_derives_its_verdict_through_that_helper(self):
+        """A pure helper nothing calls proves nothing (this repo has shipped that
+        twice). probe() must actually route through it."""
+        path = Path(_eval_rerank().__file__)
+        src = path.read_text(encoding="utf-8")
+        body = src[src.index("def probe("):src.index("\ndef main(")]
+        self.assertIn(
+            "derive_verdict(", body,
+            "probe() no longer derives its verdict through the tested helper",
+        )
+        self.assertNotIn(
+            "max(KS, key=", body,
+            "probe() is picking best_K by nDCG@10 again, without consulting wins()",
+        )
+
+
+class EvalLatencyIsLabelledWithTheGraphItRan(unittest.TestCase):
+    """eval_meta reported `stage_b_seq: 512` beside a 1.86 ms/pair figure while every
+    pair in that corpus (worst case ~40 tokens) routes through the (1, 128) fast graph.
+    This module records 10.88 ms/pair for the 512 graph and 1.12 ms for the 128 one, so
+    the committed record paired the number with the ONE configuration in which it is
+    unattainable — and inference/benchmark.py forwards the field straight into the
+    baseline every performance claim is diffed against."""
+
+    def test_the_meta_reports_both_graphs_and_the_actual_routing(self):
+        src = Path(_eval_rerank().__file__).read_text(encoding="utf-8")
+        meta = src[src.index('"eval_meta"'):src.index('"A_dense"')]
+        for key in ('"stage_b_seq"', '"stage_b_seq_fast"', '"stage_b_seq_used"',
+                    '"stage_b_pairs_at_seq_fast"', '"stage_b_pairs_at_seq"'):
+            self.assertIn(key, meta, f"eval_meta no longer records {key}")
+
+    def test_the_routing_counts_are_measured_not_assumed(self):
+        """Counted from the tokenized pair lengths during the run, so a corpus that
+        DOES exceed SEQ_FAST reports honestly instead of inheriting an assumption."""
+        src = Path(_eval_rerank().__file__).read_text(encoding="utf-8")
+        body = src[src.index("def probe("):src.index("\ndef main(")]
+        self.assertIn("SEQ_FAST", body)
+        self.assertIn('routed["fast"]', body)
     unittest.main(verbosity=2)

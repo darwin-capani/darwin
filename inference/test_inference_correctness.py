@@ -139,6 +139,22 @@ class HabitEvidenceCountsConceptsNotSpellings(unittest.TestCase):
             out = subprocess.run(
                 [sys.executable, "-c", code], capture_output=True, text=True, env=env,
             )
+            # CHECK THE CHILD RAN. Neither returncode nor stderr was inspected and the
+            # output was never asserted non-empty, so any failure of the spawned
+            # interpreter — a moved inference/ path, a new import-time dependency
+            # missing under the plain interpreter, a typo in the probe string — gave
+            # six empty stdouts, `seen` collapsed to {''}, and len(seen) == 1 reported
+            # GREEN while verifying nothing. This is the ONLY check that
+            # _habit_stem_groups is stable under hash randomisation, i.e. that
+            # habit_supported cannot answer differently per server boot.
+            self.assertEqual(
+                out.returncode, 0,
+                f"the probe interpreter failed at PYTHONHASHSEED={seed}: {out.stderr}",
+            )
+            self.assertTrue(
+                out.stdout.strip(),
+                f"the probe printed nothing at PYTHONHASHSEED={seed}: {out.stderr}",
+            )
             seen.add(out.stdout.strip())
         self.assertEqual(
             len(seen), 1,

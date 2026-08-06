@@ -138,6 +138,42 @@ def dense_recall_at(dense_order, k):
     return round(float(np.mean(vals)), 4)
 
 
+def derive_verdict(summary_A, summary_B, ks):
+    """PURE adoption gate: returns (go, winning_Ks, best_K) from the measured
+    summaries. No models, no I/O — so it can be unit-tested, which is how the defect
+    below is now pinned.
+
+    A depth WINS iff the rerank measurably improves ranking there without regressing
+    top-5 recall: nDCG@10 up AND (recall@1 up OR MRR up), recall@5 not worse.
+
+    THE GO VERDICT AND THE RECOMMENDED DEPTH WERE COMPUTED BY DIFFERENT CRITERIA.
+    `best_k` was a plain `max(KS, key=nDCG@10)` that never consulted `wins()`, so a
+    run where the SHALLOWER depth had the higher nDCG@10 but dropped recall@5 below
+    stage A — while the DEEPER depth passed every guard — emitted
+    "GO ... (best at K=20)" and named the exact depth its own win-test had REJECTED,
+    with that depth's -0.03 recall@5 printed in deltas_best_minus_A right beside it.
+    Physically reachable, not a contrived case: a deeper shortlist gives the
+    cross-encoder more passages to promote, so top-5 composition genuinely differs
+    between K=20 and K=50. benchmark.py copies this verdict verbatim into the
+    committed baseline, so the wrong recommendation propagates.
+
+    On a NO-GO there are no winners; best_K is then the best-LOOKING depth, kept as
+    information and explicitly not a ship recommendation (see the `call` string)."""
+    def wins(b):
+        return (
+            b["nDCG@10"] > summary_A["nDCG@10"]
+            and (b["recall@1"] > summary_A["recall@1"] or b["MRR"] > summary_A["MRR"])
+            and b["recall@5"] >= summary_A["recall@5"] - 1e-9
+        )
+
+    winners = [k for k in ks if wins(summary_B[k])]
+    best_k = max(
+        winners or ks,
+        key=lambda k: (summary_B[k]["nDCG@10"], summary_B[k]["recall@1"]),
+    )
+    return bool(winners), winners, best_k
+
+
 def probe(emb, rr, note=None):
     """MEASURE stage A (dense) vs stage B (dense top-K + rerank) over the committed
     corpus and return the full results dict (no file I/O, no printing). `emb` is a
@@ -145,7 +181,7 @@ def probe(emb, rr, note=None):
     Reused by both this harness's main() and inference/benchmark.py so the baseline
     re-measures the SAME two-stage numbers, never a stale copy."""
     from coreml_rerank import MODEL_ID as RERANK_MODEL_ID
-    from coreml_rerank import RERANKER_ID, SEQ
+    from coreml_rerank import RERANKER_ID, SEQ, SEQ_FAST
     from coreml_embed import EMBEDDER_ID, MODEL_ID as EMBED_MODEL_ID
 
     if note:
@@ -165,12 +201,26 @@ def probe(emb, rr, note=None):
 
     reranked_order = {k: {} for k in KS}
     rerank_latencies = {k: [] for k in KS}
+    # ROUTING CENSUS. `rerank()` sends each PAIR to the (1, SEQ_FAST) graph when it
+    # fits and to the (1, SEQ) graph otherwise, so "the sequence length this latency
+    # was measured at" is a per-pair fact, not the constant SEQ. eval_meta reported
+    # only SEQ (512) beside a 1.86 ms/pair figure that is provably unattainable there
+    # (coreml_rerank records 10.88 ms for the 512 graph and 1.12 ms for the 128 one),
+    # and every pair in this corpus is ~40 tokens — the 128 branch, every time. Count
+    # it rather than assert it.
+    fast_graph = getattr(rr, "_model_fast", None) is not None
+    routed = {"fast": 0, "full": 0}
     for q in QUERIES:
         qid = q["id"]
         full = dense_order[qid]
         for k in KS:
             shortlist = full[:k]
             passages = [FACT_TEXTS[FACT_POS[fid]] for fid in shortlist]
+            # Counted OUTSIDE the timed region: this is bookkeeping, not the measurement.
+            id_rows, _ = rr._encode(q["text"], passages)
+            n_fast = sum(1 for row in id_rows if len(row) <= SEQ_FAST) if fast_graph else 0
+            routed["fast"] += n_fast
+            routed["full"] += len(id_rows) - n_fast
             t = time.perf_counter()
             scores = rr.rerank(q["text"], passages)
             rerank_latencies[k].append((time.perf_counter() - t) * 1000.0)
@@ -191,16 +241,7 @@ def probe(emb, rr, note=None):
     } for k in KS}
 
     # ---- verdict derived from the numbers, not hand-set ------------------
-    # GO iff the rerank MEASURABLY improves ranking at some K without regressing the
-    # top-5 recall: nDCG@10 up AND (recall@1 up OR MRR up), recall@5 not worse.
-    def wins(b):
-        return (
-            b["nDCG@10"] > summary_A["nDCG@10"]
-            and (b["recall@1"] > summary_A["recall@1"] or b["MRR"] > summary_A["MRR"])
-            and b["recall@5"] >= summary_A["recall@5"] - 1e-9
-        )
-    go = any(wins(summary_B[k]) for k in KS)
-    best_k = max(KS, key=lambda k: (summary_B[k]["nDCG@10"], summary_B[k]["recall@1"]))
+    go, winners, best_k = derive_verdict(summary_A, summary_B, KS)
 
     results = {
         "eval_meta": {
@@ -217,6 +258,15 @@ def probe(emb, rr, note=None):
             "stage_b_reranker": RERANKER_ID,
             "stage_b_model": RERANK_MODEL_ID,
             "stage_b_seq": SEQ,
+            "stage_b_seq_fast": SEQ_FAST,
+            "stage_b_seq_used": (
+                f"PER-PAIR ROUTING: a pair of <= {SEQ_FAST} tokens runs the "
+                f"(1, {SEQ_FAST}) graph, anything longer the (1, {SEQ}) graph. The "
+                f"counts below are what this run actually did — do not read "
+                f"rerank_latency against stage_b_seq alone."
+            ),
+            "stage_b_pairs_at_seq_fast": routed["fast"],
+            "stage_b_pairs_at_seq": routed["full"],
             "rerank_depths_K": list(KS),
             "compute_units": "ComputeUnit.ALL (ANE-eligible; latency is measured "
                              "end-to-end, never a claim any op ran on the ANE)",
@@ -243,6 +293,9 @@ def probe(emb, rr, note=None):
         "verdict": {
             "go": bool(go),
             "best_K": best_k,
+            # The depths that PASSED wins(). Empty on a NO-GO, in which case best_K
+            # above is the best-looking depth and NOT a ship recommendation.
+            "winning_K": list(winners),
             "deltas_best_minus_A": {
                 m: round(summary_B[best_k][m] - summary_A[m], 4)
                 for m in ("nDCG@10", "recall@1", "recall@3", "recall@5", "MRR")
@@ -254,7 +307,9 @@ def probe(emb, rr, note=None):
                 if go else
                 "NO-GO: the cross-encoder rerank does NOT measurably improve ranking "
                 "over the bge dense order on this eval; the latency cost is not worth "
-                "it. Do NOT ship (same discipline that dropped speculative decoding)."
+                "it. Do NOT ship (same discipline that dropped speculative decoding). "
+                f"best_K={best_k} below is the best-LOOKING depth, not a "
+                "recommendation — no depth passed the win test."
             ),
             "honesty": ("SYNTHETIC-but-representative eval, directional evidence not a "
                         "production guarantee. recall@k (k<=K) after rerank is bounded "

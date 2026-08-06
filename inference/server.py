@@ -422,7 +422,10 @@ ELEVENLABS_MULTILINGUAL_MODEL = "eleven_multilingual_v2"
 # on flash/multilingual the daemon never SENDS those fields (they are EL-v3-gated
 # on the daemon side too), and this server-side check is defense in depth so a
 # stray tag can never be spoken literally on a non-v3 model. The COARSE rate/gain
-# hints are honoured on every backend.
+# hints are honoured on every backend — BOTH of them, applied to the produced audio
+# (`_apply_rate` / `_apply_gain`). `rate` used to be dropped on the ElevenLabs leg,
+# which made #33 a total no-op there: on a non-v3 model rate is the ONLY signal the
+# daemon sends, since the rich surface is v3-gated on both sides.
 ELEVENLABS_V3_MODEL = "eleven_v3"
 # Coarse delivery-hint bounds, mirrored on the daemon side. The daemon clamps
 # before sending; the server clamps again (defense in depth) so a degenerate
@@ -567,8 +570,9 @@ def _normalize_speak_shape(req):
     posture for the shipped-OFF default, where the daemon sends none of these. The
     rich EL-v3 fields (audio_tag/stability/style) are CARRIED THROUGH here but only
     ACTED ON when the resolved model is the EL-v3 model (the speak op enforces that);
-    rate/volume are coarse hints honoured on every backend. This is the seam the
-    daemon's shaped params flow through — there is NO network call here."""
+    rate/volume are coarse hints honoured on every backend — both applied to the
+    produced audio, on the Kokoro leg and the ElevenLabs leg alike. This is the seam
+    the daemon's shaped params flow through — there is NO network call here."""
     audio_tag = req.get("audio_tag")
     if not (isinstance(audio_tag, str) and audio_tag.strip()):
         audio_tag = None
@@ -4011,8 +4015,18 @@ class InferenceEngine:
                 threading.Thread(
                     target=_warm_ocr, name="ocr-warm", daemon=True).start()
             except Exception:
-                # GUARDED START. An unguarded Thread.start() that fails here would
-                # abort the rest of preload, leaving the VAD weights unexported.
+                # GUARDED START. This is the LAST statement in preload, and the
+                # learned-VAD native-weights export already ran ~80 lines above, so a
+                # failed start() cannot strand a later step. The comment here used to
+                # say it would "abort the rest of preload, leaving the VAD weights
+                # unexported" — true when #168 wrote it with the OCR warm ahead of the
+                # export, and silently false from #169, which moved this block to the
+                # end and carried the justification verbatim. The guard stays for the
+                # reason that IS still live: Thread.start() raises RuntimeError at the
+                # per-process thread ceiling, and that must be LOGGED here rather than
+                # propagate out of preload and be swallowed by the preload thread's own
+                # top level. If this block is ever moved back ahead of the VAD export,
+                # the old justification becomes true again.
                 log.exception("preload: could not start the OCR warm thread")
 
     # -- classifier prompt cache ----------------------------------------
@@ -4515,17 +4529,31 @@ class InferenceEngine:
         released in slices — prefill_chunk prompt tokens or decode_chunk
         generated tokens at a time — instead of held for the whole pass.
 
-        op=consolidate is the only caller: its uncached prefill (up to 40
-        transcript exchanges + the facts table + the ~470-word system text)
-        plus up to CONSOLIDATE_MAX_TOKENS of decode would otherwise hold the
-        GPU lock for many seconds in one blocking call, queueing every
-        interactive op (classify/converse/speak/transcribe) behind the 20h
-        reflection pass — opener plays, then silence until it finishes.
-        Slicing lets an arriving utterance interleave at the next slice
-        boundary. It costs the background pass a little wall time and
-        nothing else: the pass owns a private prompt cache so slices are
-        independent, and greedy decode is deterministic regardless of how
-        the work is sliced."""
+        TWO callers, and they are not the same kind of work. This docstring
+        named op=consolidate as the sole caller for four commits after the
+        second one landed, which matters because the whole rationale below
+        was written for a background pass:
+
+          * `consolidate` (BACKGROUND, the 20h reflection pass). Its uncached
+            prefill (up to 40 transcript exchanges + the facts table + the
+            ~470-word system text) plus up to CONSOLIDATE_MAX_TOKENS of decode
+            would otherwise hold the GPU lock for many seconds in one blocking
+            call, queueing every interactive op (classify/converse/speak/
+            transcribe) behind it — opener plays, then silence until it
+            finishes. Slicing lets an arriving utterance interleave at the
+            next slice boundary. It costs that pass a little wall time and
+            nothing else.
+          * `_answer_from_transcript` (INTERACTIVE, op=describe_image's
+            OCR-first answer leg). Also a multi-thousand-token uncached
+            prefill — the screen transcript — but it runs inside a user-facing
+            screen question, so the per-slice yields and lock hand-offs are
+            paid in that latency. Anyone tuning prefill_chunk / decode_chunk
+            or the fairness sleeps must weigh THAT, not just background
+            throughput.
+
+        Slicing is safe for both: each caller owns a private prompt cache so
+        slices are independent, and greedy decode is deterministic regardless
+        of how the work is sliced."""
         import mlx.core as mx
         from mlx_lm import stream_generate
         from mlx_lm.models.cache import make_prompt_cache
@@ -5845,11 +5873,15 @@ class InferenceEngine:
 
     @staticmethod
     def _apply_rate(audio, sample_rate, rate):
-        """COARSE speaking-rate change (#33 prosody) for the on-device path, honoured
-        by time-stretching via nearest-sample resampling at the SAME output sample
-        rate (faster rate -> fewer samples -> quicker speech). A None/1.0/out-of-range
-        `rate` leaves the audio UNTOUCHED (byte-for-byte today's). PURE; no network.
-        This is the honest coarse rate the backend honours — never a fabricated tag."""
+        """COARSE speaking-rate change (#33 prosody), applied to the produced audio on
+        EVERY backend (Kokoro via `_synthesize_to_wav`, ElevenLabs via
+        `_elevenlabs_to_wav`) by nearest-sample RESAMPLING at the SAME output sample
+        rate: faster rate -> fewer samples -> quicker speech. It is a RESAMPLE, not a
+        pitch-preserving time-stretch — which is what this docstring used to call it —
+        so rate and PITCH move together (r=1.2 is ~3 semitones up). Coarse by design;
+        the shipped nudges are 0.95/1.08. A None/1.0/out-of-range `rate` leaves the
+        audio UNTOUCHED (byte-for-byte today's). PURE; no network. This is the honest
+        coarse rate the backend honours — never a fabricated tag."""
         import numpy as np
 
         if not isinstance(rate, (int, float)) or isinstance(rate, bool):
@@ -6200,8 +6232,8 @@ class InferenceEngine:
         )
 
     def _elevenlabs_to_wav(self, text, voice_id, model, api_key, lang=None,
-                           audio_tag=None, stability=None, style=None, volume=None,
-                           locators=None, stream=False):
+                           audio_tag=None, stability=None, style=None, rate=None,
+                           volume=None, locators=None, stream=False):
         """Synthesize `text` through the ElevenLabs cloud voice tier and write it
         to the SAME pipeline WAV the daemon expects (under state/tmp/). Returns the
         absolute path, or None when ElevenLabs produced no usable audio.
@@ -6215,9 +6247,23 @@ class InferenceEngine:
         DEFAULT model slot for a non-English turn.
 
         #33/#34 EXPRESSIVENESS: `audio_tag`/`stability`/`style` are the EL-v3 rich
-        surface (EL-v3-gated inside `_elevenlabs_synth_pcm`); `volume` is the coarse
-        whisper gain applied to the produced WAV on EVERY backend. With nothing set
-        (the OFF default) the path is byte-for-byte today's.
+        surface (EL-v3-gated inside `_elevenlabs_synth_pcm`); `rate` and `volume` are
+        the COARSE hints applied to the produced WAV on EVERY backend. With nothing
+        set (the OFF default) the path is byte-for-byte today's.
+
+        `rate` WAS SILENTLY DROPPED HERE. This method had no `rate` parameter at all
+        and `speak` never passed one, while the contract block at the top of this file
+        and `_normalize_speak_shape` both promised "rate/volume are coarse hints
+        honoured on every backend" — and so does the daemon (prosody.rs's SpeakShape
+        calls rate "honoured on EVERY backend" and its telemetry reports the value as
+        applied). On the SHIPPED cloud config that made the whole #33 adaptive-prosody
+        feature inert: `prosody::shape_coarse` sets ONLY `rate` (audio_tag/stability/
+        style are v3-gated on both sides and volume stays 1.0), so on
+        eleven_flash_v2_5 every Alert/Wellness reply produced a 1.08/0.95 nudge that
+        was computed, clamped, reported — and thrown away. It is applied in the SAMPLE
+        DOMAIN next to the gain, exactly as on Kokoro; nothing is sent to the cloud
+        model, which keeps its own pacing. See `_apply_rate` for what that does to
+        pitch.
 
         Raises on any network/HTTP error: the caller (`speak`) catches EVERYTHING
         and falls back to on-device Kokoro, so a cloud failure NEVER fails a turn.
@@ -6245,6 +6291,10 @@ class InferenceEngine:
         audio = self._trim_silence(audio, ELEVENLABS_SAMPLE_RATE)
         if audio is None:
             return None
+        # Coarse rate then gain — the SAME pair, in the same order, that
+        # `_synthesize_to_wav` applies on the Kokoro path. Both are no-ops at the
+        # neutral default, so the OFF wire stays byte-for-byte today's.
+        audio = self._apply_rate(audio, ELEVENLABS_SAMPLE_RATE, rate)
         audio = self._apply_gain(audio, volume)
         return self._write_wav(audio, ELEVENLABS_SAMPLE_RATE)
 
@@ -6275,10 +6325,15 @@ class InferenceEngine:
           - `audio_tag`/`stability`/`style`: the EL-v3 RICH surface — consumed ONLY
             on the EL-v3 model (EL-v3-gated in `_elevenlabs_synth_pcm`), so a tag
             never reaches a non-v3 model or the Kokoro path.
-          - `rate`/`volume`: COARSE delivery hints honoured on every backend. `volume`
-            is a gain applied to the produced WAV (the real "speak softly" on Kokoro
-            too). `rate` is a coarse speaking-rate hint — applied to Kokoro by nudging
-            the request speed within bounds; the EL leg keeps its model's pacing.
+          - `rate`/`volume`: COARSE delivery hints honoured on every backend, both
+            applied to the PRODUCED AUDIO rather than to an engine request. `volume`
+            is a gain (the real "speak softly" on Kokoro too). `rate` is a coarse
+            speaking-rate change applied AFTER synthesis by nearest-sample resampling
+            (`_apply_rate`) — to Kokoro's output and to the audio ElevenLabs returns
+            alike. It touches NEITHER engine's own speed parameter: Kokoro's `speed`
+            comes from [voice].speed, and nothing extra is sent to the cloud model,
+            which keeps its own pacing. Resampling moves rate AND pitch together (see
+            `_apply_rate`) — this is not a pitch-preserving time-stretch.
         PRONUNCIATION DICTIONARIES: `locators` is the OPTIONAL list of pronunciation-
         dictionary locators ([{pronunciation_dictionary_id[, version_id]}]) the daemon
         threads through; under the ElevenLabs backend they are folded ADDITIVELY into
@@ -6308,13 +6363,16 @@ class InferenceEngine:
                 # (sound_effect/compose_music/isolate_audio, and the Scribe leg of
                 # transcribe) already run lock-free for exactly this reason; only
                 # the Kokoro fallback below touches the GPU and keeps the lock.
-                # EL-v3 rich surface (audio_tag/stability/style) + coarse whisper
-                # gain (volume) thread in here; the EL leg keeps its own pacing so
-                # `rate` is not forwarded to the cloud model.
+                # EL-v3 rich surface (audio_tag/stability/style) + BOTH coarse hints
+                # (rate, volume) thread in here. `rate` is not forwarded to the cloud
+                # model — it keeps its own pacing — it is applied to the returned
+                # audio, the same way it is on Kokoro. It used to be dropped entirely
+                # on this leg, which made #33 adaptive prosody a total no-op on the
+                # shipped non-v3 EL model where rate is the ONLY signal sent.
                 path = self._elevenlabs_to_wav(
                     text, voice_id, model, el_key, lang,
                     audio_tag=audio_tag, stability=stability, style=style,
-                    volume=volume, locators=locators, stream=use_stream,
+                    rate=rate, volume=volume, locators=locators, stream=use_stream,
                 )
                 if path is not None:
                     return path
@@ -8073,8 +8131,27 @@ def _selftest_runtime_knobs():
 
     # --- defaults are OFF/neutral (off => today's runtime) -----------------
     # A config-less load_config keeps speculative OFF + no draft + quant "auto".
-    # The Engine reads these straight from settings; prove the neutral defaults
-    # the loader would produce.
+    # The Engine reads these straight from settings, so this IS the whole "#37/#39
+    # ship inert == today's exact runtime" contract, and it must be asserted on the
+    # LOADED SETTINGS. It was not: the block claimed to "prove the neutral defaults
+    # the loader would produce" while its one assertion only checked the ordering of
+    # the ALLOWED_QUANT literal, so flipping all three real defaults in load_config
+    # (speculative True, a populated draft_model, quant "int4") still printed
+    # "server selftest OK". A comment stating a rule is not the rule.
+    # CONFIG_PATH is redirected at an absent file for the call so this stays
+    # HERMETIC — it reads the hardcoded contract defaults rather than whatever
+    # config/darwin.toml happens to say on the machine running the selftest.
+    _saved_config_path = CONFIG_PATH
+    logging.disable(logging.WARNING)  # the absent-config warning below is EXPECTED
+    try:
+        globals()["CONFIG_PATH"] = PROJECT_ROOT / "config" / "__selftest_no_such_config__.toml"
+        neutral = load_config()
+    finally:
+        logging.disable(logging.NOTSET)
+        globals()["CONFIG_PATH"] = _saved_config_path
+    assert neutral["speculative"] is False, "#37 speculative decoding must ship OFF"
+    assert neutral["draft_model"] == "", "#37 must ship with NO draft model"
+    assert neutral["quant"] == "auto", "#39 quant must default to the neutral auto"
     assert ALLOWED_QUANT[0] == "auto", "auto must be the neutral default quant"
 
 
@@ -8300,7 +8377,11 @@ def _selftest_local_warm():
     # Re-touch tiny so fast1b is the LRU non-base resident, then load a NEW one.
     m4.select("tiny", loader)
     m4.resident["fast1b"]  # fast1b still present, but now LRU
-    m4.select("base4b", loader)  # base re-touch (pinned) must not evict tiny
+    # The base is deliberately left as the OLDEST resident here. A
+    # `m4.select("base4b", loader)` used to sit on this line and made the pin
+    # assertion below unfalsifiable: a cache hit move_to_end's the base to MRU, and
+    # _insert's eviction loop walks oldest-first, so the `k != self.base_id` pin was
+    # never reached — deleting the pin outright still printed "server selftest OK".
     # Insert a fresh resident directly to trigger _insert eviction logic.
     ev = m4._insert("newmodel", "m", "t")
     assert "base4b" not in ev, "base is pinned, never evicted"

@@ -46,9 +46,12 @@ class _FakeCT:
     class ComputeUnit:
         ALL = "ALL"
 
-    def __init__(self, compile_ok=True, compiled_load_ok=True):
+    def __init__(self, compile_ok=True, compiled_load_ok=True, partial_write=False):
         self.compile_ok = compile_ok
         self.compiled_load_ok = compiled_load_ok
+        # `partial_write` models the failure the plain compile_ok=False stub CANNOT:
+        # a compile that dies AFTER it has begun materialising destination_path.
+        self.partial_write = partial_write
         self.compiled_dests = []
         self.package_loads = []
         self.compiled_loads = []
@@ -66,6 +69,14 @@ class _FakeCT:
                         "file extension."
                     )
                 if not outer.compile_ok:
+                    if outer.partial_write:
+                        # The REAL compile_model shutil.move()s its result into
+                        # destination_path, which COPIES when the cache root is on
+                        # another volume — so it can fail with the destination half
+                        # written. Anything left here is a stray the caller must sweep.
+                        os.makedirs(destination_path, exist_ok=True)
+                        with open(os.path.join(destination_path, "partial"), "w") as fh:
+                            fh.write("half a compiled model")
                     raise RuntimeError("compile failed")
                 os.makedirs(destination_path, exist_ok=True)
                 with open(os.path.join(destination_path, "model"), "w") as fh:
@@ -126,10 +137,27 @@ class LoadModelFast(unittest.TestCase):
     def test_the_temp_destination_ends_in_mlmodelc(self):
         """MUTATION GUARD. A temp name not ending in .mlmodelc makes compile_model
         raise, which silently costs the whole optimization - it shipped that way once
-        and only the fallback hid it."""
+        and only the fallback hid it.
+
+        IT PASSED UNDER ITS OWN MUTATION. Under exactly the name it names, the stub's
+        compile_model raises, load_model_fast swallows that and falls back, so
+        `compiled_dests` is EMPTY and `all([])` is True - the one test written to catch
+        that regression reported ok while the whole compiled-model cache was dead
+        (every load back on the 4.4 s .mlpackage path instead of 65 ms). Assert
+        something was compiled, and that no silent fallback happened, BEFORE asserting
+        what the destinations look like."""
         fake = _FakeCT()
         self._install(fake)
         cs.load_model_fast(self.pkg)
+        self.assertTrue(
+            fake.compiled_dests,
+            "nothing was compiled at all - the optimization is dead and the "
+            "all(...) below would vacuously pass",
+        )
+        self.assertEqual(
+            fake.package_loads, [],
+            "it fell back to loading the .mlpackage - the compile did not happen",
+        )
         self.assertTrue(
             all(d.endswith(".mlmodelc") for d in fake.compiled_dests),
             f"compile destinations must end in .mlmodelc: {fake.compiled_dests}",
@@ -155,11 +183,33 @@ class LoadModelFast(unittest.TestCase):
         )
 
     def test_a_failed_compile_leaves_no_temp_directory_behind(self):
+        """The compile dies BEFORE it writes anything. Trivially satisfied - kept only
+        as the paired half of the test below, which is the one that bites."""
         fake = _FakeCT(compile_ok=False)
         self._install(fake)
         cs.load_model_fast(self.pkg)
         strays = [n for n in os.listdir(self.d) if ".tmp" in n]
         self.assertEqual(strays, [], f"temp dirs left behind: {strays}")
+
+    def test_a_compile_that_fails_after_writing_leaves_no_temp_directory(self):
+        """THE CASE THE TEST ABOVE COULD NOT SEE. Its stub raises before
+        `os.makedirs(destination_path)`, so no temp dir could exist whatever the code
+        did - it asserted a cleanup `load_model_fast` did not have. The failure path
+        removed only `_compiled_sibling(pkg_path)`, the FINAL name. A real
+        compile_model that dies mid-write (HF_HOME on another volume, so the
+        shutil.move inside it copies) therefore left `<name>.<pid>.tmp.mlmodelc` in
+        the model-cache dir: PID-scoped, so no later process sweeps it, and repeated
+        failures accumulate compiled-model-sized directories."""
+        fake = _FakeCT(compile_ok=False, partial_write=True)
+        self._install(fake)
+        kind, path = cs.load_model_fast(self.pkg)
+        self.assertEqual(kind, "MLModel", "it must still fall back to the package")
+        self.assertEqual(path, self.pkg)
+        strays = [n for n in os.listdir(self.d) if ".tmp" in n]
+        self.assertEqual(
+            strays, [],
+            f"a half-written compile left temp dirs behind: {strays}",
+        )
 
     def test_a_racing_writer_does_not_lose_the_load(self):
         """If another process claims the final name first, we discard our own copy and

@@ -41,9 +41,27 @@ if ! printf '%s' "$EXCLUDES_SRC" | grep -q 'EXCLUDE_DIRS=('; then
     echo "  FAIL  could not extract the exclude list from install.sh"
     exit 1
 fi
-# The extracted lines must be assignments and nothing else.
-if printf '%s' "$EXCLUDES_SRC" | grep -qvE '^(EXCLUDE_DIRS=\(|RSYNC_EXCLUDES(=\(\)|\+=\(|.*for d in))'; then
-    :  # the `for d in ...` line is a loop over EXCLUDE_DIRS and is expected
+# The extracted lines must be PLAIN LITERAL assignments and nothing else, because
+# the `eval` below runs whatever the extraction returned.
+#
+# WHAT WAS WRONG BEFORE: this check re-used the extraction's own prefix pattern
+# (plus an unreachable `.*for d in` alternative), so `grep -v` was testing the
+# extracted lines against a SUPERSET of the pattern that produced them and could
+# never find a non-matching line; and its then-branch was a bare `:` with no else,
+# so even a match did nothing. Two independent reasons it could not fire, under a
+# comment presenting it as the sanity check that stops an eval of the installer.
+#
+# The extraction only ever anchored the line's PREFIX, so the part it never
+# bounded is the REST of the line — `EXCLUDE_DIRS=($(some_command))`, a backtick,
+# a `;` chaining a second command, all match `^EXCLUDE_DIRS=\(` and would be
+# EXECUTED here. That is what this now checks, on the whole line, and it is FATAL.
+BAD_SHAPE="$(printf '%s\n' "$EXCLUDES_SRC" \
+    | grep -vE '^(EXCLUDE_DIRS|RSYNC_EXCLUDES)(=|\+=)\([^`$;&|<>()]*\)$' || true)"
+if [ -n "$BAD_SHAPE" ]; then
+    echo "  FAIL  install.sh's exclude extraction picked up a line that is not a plain literal assignment;"
+    echo "        refusing to eval it (that would execute the installer):"
+    printf '%s\n' "$BAD_SHAPE" | sed 's/^/          /'
+    exit 1
 fi
 RSYNC_EXCLUDES=()
 eval "$EXCLUDES_SRC"

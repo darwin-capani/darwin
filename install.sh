@@ -198,7 +198,18 @@ while [ "$#" -gt 0 ]; do
         -h|--help)
             # Print the header comment block (the doc lines above `set -euo
             # pipefail`) as the help text, stripping the leading "# ".
-            sed -n '2,65p' "${BASH_SOURCE[0]:-$SRC_ROOT/install.sh}" | sed 's/^# \{0,1\}//'
+            #
+            # DERIVE the end; never hard-code it. This was `sed -n '2,65p'` while
+            # the doc block ran to line 67, so --help stopped mid-clause on
+            # "MCP/webhooks need a" and silently dropped the two closing lines —
+            # the promise that no secret, key, state DB, venv, model or build
+            # artifact is ever written into the source repo. Someone auditing the
+            # installer before piping it to bash never saw that claim, and the
+            # comment right here asserted the opposite of what the range did.
+            # Printing every leading comment line and stopping at the first
+            # non-comment cannot drift the next time the header grows a line.
+            awk 'NR > 1 { if (substr($0, 1, 1) != "#") exit; print }' \
+                "${BASH_SOURCE[0]:-$SRC_ROOT/install.sh}" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -1156,18 +1167,25 @@ ui_info "VLM   : $VLM_ID            (vision describe — multi-GB)"
 ui_info "IMAGE : $IMG_ID    (text->image — LARGE, multi-GB)"
 
 if [ "$DO_MODELS" -eq 0 ]; then
-    ui_warn "--no-models: skipping ALL model pre-downloads (LLM, STT, TTS, VLM, DRAFT,"
-    ui_note "and the IMAGE model). Features that need a model fetch it on first use,"
-    ui_note "gated on enough RAM; nothing is downloaded now."
+    # Name only what MODELS above actually contains. This listed a DRAFT model
+    # long after the #37 speculative-decoding checkpoint was deliberately removed
+    # from the download set, so --no-models told the operator it was skipping a
+    # fetch that never happens in ANY mode.
+    ui_warn "--no-models: skipping ALL model pre-downloads (LLM, STT, TTS, VLM, OCR,"
+    ui_note "the embed/rerank Core ML sources, and the IMAGE model). Features that need"
+    ui_note "a model fetch it on first use, gated on enough RAM; nothing is downloaded now."
 elif [ "$MODE" = "check" ]; then
     plan "mkdir -p \"$HF_HOME_DIR\""
     for m in "${MODELS[@]}"; do
         plan "HF_HOME=\"$HF_HOME_DIR\" \"$VENV/bin/hf\" download \"$m\"   # (or the snapshot_download API if 'hf' is absent)"
     done
+    # The plan loop right above prints one `hf download` line per MODELS entry and
+    # there is no draft repo among them, so describing the DRAFT model's size here
+    # contradicted the plan inside a single screen.
     ui_note "Total download is LARGE, multi-GB (the VLM and especially the IMAGE"
-    ui_note "diffusion model dominate; the DRAFT model is small). Each download shows"
-    ui_note "progress and is cache-first (resumable); already-downloaded models are"
-    ui_note "skipped. Pass --no-models to skip ALL of these."
+    ui_note "diffusion model dominate). Each download shows progress and is"
+    ui_note "cache-first (resumable); already-downloaded models are skipped."
+    ui_note "Pass --no-models to skip ALL of these."
 else
     mkdir -p "$HF_HOME_DIR"
     export HF_HOME="$HF_HOME_DIR"
@@ -1190,8 +1208,8 @@ else
         # BEST-EFFORT: a single model failing (a renamed/removed repo, an HF hiccup,
         # a rate-limit) must NOT abort the whole multi-GB install after the others
         # already downloaded. Warn + continue; the daemon fetches a missing model on
-        # first use, or the dependent feature stays honestly inert (e.g. speculative
-        # decoding without the DRAFT model). Downloads are cache-first, so re-running
+        # first use, or the dependent feature stays honestly inert (e.g. text->image
+        # without the gated FLUX weights). Downloads are cache-first, so re-running
         # the installer resumes cheaply.
         if ui_spin "download $m" -- "${DL[@]}" "$m"; then
             :
@@ -1481,7 +1499,23 @@ else
         fi
     done
     case "$_mcount" in ''|*[!0-9]*) _mcount=0 ;; esac
-    if [ "$_mcount" -gt 0 ]; then MODELS_TAG="$_mcount RESIDENT"; else MODELS_TAG="RESIDENT"; fi
+    # ZERO IS NOT SUCCESS. The else-branch used to emit the bare "RESIDENT" tag on
+    # a count of 0, so an install whose downloads never landed — offline, proxied,
+    # an HF outage or rate-limit; the loop above is deliberately best-effort and
+    # only ui_warn's, far enough up to have scrolled away — ended by telling the
+    # operator the on-device models are RESIDENT on a machine holding none. That
+    # is the same lie the count fix above was written to kill, just at n=0: the
+    # operator starts DARWIN believing inference is provisioned and the first op
+    # blocks on a full snapshot_download (or fails outright offline). Zero
+    # weight-bearing repos is a known, honest NONE; a hub/ we cannot READ is the
+    # genuinely unknown layout the comment above meant, and says so separately.
+    if [ "$_mcount" -gt 0 ]; then
+        MODELS_TAG="$_mcount RESIDENT"
+    elif [ -d "$HF_HOME_DIR/hub" ] && [ ! -r "$HF_HOME_DIR/hub" ]; then
+        MODELS_TAG="CACHE UNREADABLE"
+    else
+        MODELS_TAG="NONE RESIDENT"
+    fi
 fi
 
 # HUD INTERFACE: the Tauri bundle. INSTALLED if place_hud_app put DARWIN.app into

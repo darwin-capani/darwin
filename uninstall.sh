@@ -13,13 +13,22 @@
 #   - the installed HUD app  /Applications/DARWIN.app  and  ~/Applications/DARWIN.app —
 #     each removed ONLY after its Info.plist verifies bundle id com.darwin.hud
 #   - the DARWIN Keychain items (ONLY the service "com.darwin.daemon") — your stored keys/tokens
-#   - the logs  ~/Library/Logs/DARWIN
+#   - the HUD's per-bundle WebKit state, which macOS keeps OUTSIDE both the app bundle
+#     and the install home — each is exactly the com.darwin.hud directory under
+#     ~/Library/WebKit, ~/Library/Caches, ~/Library/HTTPStorages and
+#     ~/Library/Saved Application State (plus com.darwin.hud.savedState there)
+# DARWIN's logs are NOT a separate footprint item: they live in the install home at
+# state/logs/ (see boot/*.plist StandardOutPath), so removing the home removes them.
 # It removes the INSTALLED OS. A source clone you may have elsewhere is left untouched.
 #
 # Usage:
 #   ~/Library/Application\ Support/DARWIN/uninstall.sh   # interactive, two-step confirm
 #   ./uninstall.sh --dry-run                             # show what WOULD be removed; delete nothing
 #   ./uninstall.sh --help
+#
+# $HOME must be the invoking user's real home (the guard below verifies it against
+# the directory service, not against $HOME itself). Set DARWIN_ALLOW_FOREIGN_HOME=1
+# only if you deliberately installed under a different $HOME.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -48,7 +57,6 @@ ui_init
 
 # --- the DARWIN footprint (specific, hard-coded paths) ---------------------------
 DARWIN_HOME="$HOME/Library/Application Support/DARWIN"
-LOG_DIR="$HOME/Library/Logs/DARWIN"
 AGENT_DIR="$HOME/Library/LaunchAgents"
 KEYCHAIN_SERVICE="com.darwin.daemon"
 # Teardown order: unload the visible HUD first, then the daemon, then inference.
@@ -66,23 +74,81 @@ APP_PATHS=("/Applications/DARWIN.app" "$HOME/Applications/DARWIN.app")
 DRY_RUN=0
 case "${1:-}" in
     --dry-run|--check) DRY_RUN=1 ;;
-    -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    # --help IS the header block above. DERIVE its end (the first non-comment
+    # line) instead of hard-coding a range: this was `sed -n '2,22p'`, so every
+    # line the footprint list grows would silently fall off the only in-band
+    # documentation of what this destructive script deletes.
+    -h|--help) awk 'NR > 1 { if (substr($0, 1, 1) != "#") exit; print }' "${BASH_SOURCE[0]}"; exit 0 ;;
     "") : ;;
     *) printf 'uninstall.sh: unknown argument %q (use --dry-run or --help)\n' "$1" >&2; exit 2 ;;
 esac
 
-# --- SAFETY GUARD: refuse to act unless the home is EXACTLY the expected path. ----
-# Makes a broad/accidental delete impossible even if $HOME were malformed: the only
-# directory this script will ever rm -rf is literally ~/Library/Application Support/DARWIN.
+# --- SAFETY GUARD: refuse to act unless $HOME really is this user's home. ---------
+# WHAT WENT WRONG: this guard advertised that it "makes a broad/accidental delete
+# impossible even if $HOME were malformed", and it could not fire at all. It built
+# `base="$HOME/Library/Application Support/DARWIN"` and compared it to DARWIN_HOME,
+# which line 50 builds from the SAME expression — so the `!=` branch was
+# unreachable; and DARWIN_HOME always ends in "/DARWIN", so it could never equal
+# any protected path in the case list either. Both exit paths were dead code. Under
+# HOME='' , HOME=/, HOME=/tmp or HOME=/System the guard PASSED, and the run then
+# deleted the one target that is not $HOME-derived (/Applications/DARWIN.app),
+# left the real install home, the three LaunchAgents and the Keychain secrets in
+# place, and still printed "D.A.R.W.I.N. has been completely removed from this
+# machine" while the daemon, inference server and autostart agents kept running.
+#
+# Comparing $HOME-derived strings to each other can never detect a wrong $HOME. So
+# resolve the real home INDEPENDENTLY of the environment and compare against that.
+# The structural check on DARWIN_HOME is kept as an invariant for a future edit
+# that stops deriving it from $HOME — it is not, and never was, the $HOME check.
+real_home() {
+    local u h=""
+    u="$(id -un 2>/dev/null || true)"
+    [ -n "$u" ] || return 1
+    h="$(dscl . -read "/Users/$u" NFSHomeDirectory 2>/dev/null | sed -n 's/^NFSHomeDirectory: //p')"
+    if [ -z "$h" ]; then
+        h="$(eval echo "~$u" 2>/dev/null || true)"
+        case "$h" in "~"*) h="" ;; esac   # unexpanded => no such user record
+    fi
+    [ -n "$h" ] || return 1
+    printf '%s\n' "$h"
+}
+
 guard_home() {
-    local base="$HOME/Library/Application Support/DARWIN"
+    # 1. $HOME must be a usable ABSOLUTE path. Empty / "/" / relative are never
+    #    legitimate and have no override: an empty $HOME also makes remove_home's
+    #    `cd "$HOME"` a silent no-op (bash `cd ""` returns 0 without moving).
+    case "$HOME" in
+        "" | "/") ui_err "Refusing to run: \$HOME is empty or \"/\"." ; exit 1 ;;
+        /*) : ;;
+        *) ui_err "Refusing to run: \$HOME (\"$HOME\") is not an absolute path." ; exit 1 ;;
+    esac
+    # 2. THE ACTUAL GUARD: $HOME must be this user's real home, per the directory
+    #    service — not per $HOME.
+    local rh
+    if rh="$(real_home)"; then
+        if [ "${HOME%/}" != "${rh%/}" ]; then
+            if [ "${DARWIN_ALLOW_FOREIGN_HOME:-0}" = "1" ]; then
+                ui_warn "\$HOME ($HOME) is not $(id -un)'s home ($rh) — proceeding because DARWIN_ALLOW_FOREIGN_HOME=1."
+            else
+                ui_err "Refusing to run: \$HOME (\"$HOME\") is not $(id -un)'s home directory (\"$rh\")."
+                ui_note "Everything this script removes except /Applications/DARWIN.app is derived from"
+                ui_note "\$HOME, so running like this would half-uninstall and report success."
+                ui_note "Re-run without overriding \$HOME (e.g. not under sudo/su with always_set_home),"
+                ui_note "or set DARWIN_ALLOW_FOREIGN_HOME=1 if you really installed under this \$HOME."
+                exit 1
+            fi
+        fi
+    else
+        ui_warn "Could not resolve $(id -un 2>/dev/null || echo 'this user')'s home from the directory service; trusting \$HOME."
+    fi
+    # 3. Structural invariant on the install path itself.
     case "$DARWIN_HOME" in
         "" | "/" | "$HOME" | "$HOME/" | "$HOME/Library" | "$HOME/Library/" \
             | "$HOME/Library/Application Support" | "$HOME/Library/Application Support/")
             ui_err "Refusing to run: the install path resolves to a protected directory."
             exit 1 ;;
     esac
-    if [ "$DARWIN_HOME" != "$base" ]; then
+    if [ "$DARWIN_HOME" != "$HOME/Library/Application Support/DARWIN" ]; then
         ui_err "Refusing to run: install path is not the expected ~/Library/Application Support/DARWIN."
         exit 1
     fi
@@ -128,8 +194,8 @@ present_targets() {
         [ -d "$app" ] && ui_note "HUD app: $app  (removed only if it verifies as bundle $HUD_BUNDLE_ID)"
     done
     ui_note "Keychain items under service \"$KEYCHAIN_SERVICE\"  (your stored API keys / tokens)"
-    ui_note "Logs: $LOG_DIR"
     ui_note "HUD support data: ~/Library/{WebKit,Caches,HTTPStorages,Saved Application State}/$HUD_BUNDLE_ID"
+    ui_note "Logs live in the install home at state/logs/ and go with it (no separate log dir)."
     ui_hr
     ui_info "This removes the INSTALLED OS (~/Library/...). A source clone elsewhere is untouched."
     ui_hr
@@ -202,8 +268,10 @@ remove_home() {
         ui_note "[dry run] would: rm -rf \"$DARWIN_HOME\""
         return 0
     fi
-    guard_home   # re-assert the guard immediately before the only rm -rf
-    cd "$HOME"   # never rm -rf the directory we are standing in
+    guard_home   # re-assert the guard immediately before removing the install home
+    cd "$HOME"   # never rm -rf the directory we are standing in ($HOME is
+                 # guaranteed absolute and non-empty by guard_home; bash `cd ""`
+                 # would silently return 0 without moving)
     if [ -d "$DARWIN_HOME" ]; then
         rm -rf "$DARWIN_HOME"
         ui_ok "Removed the install home."
@@ -256,9 +324,16 @@ remove_hud_support_dirs() {
             ui_ok "Removed HUD support data ($d)."
         fi
     done
-    # Saved Application State uses a .savedState suffix.
+    # Saved Application State uses a .savedState suffix. It gets the SAME shape
+    # guard as the loop above — the comment on this function claims "each is
+    # checked to be exactly the bundle-named directory", and this path used to
+    # skip the check, so the claim did not hold for one of the five targets.
     d="$HOME/Library/Saved Application State/$HUD_BUNDLE_ID.savedState"
-    if [ -d "$d" ]; then
+    case "$d" in
+        "$HOME/Library/"*"/$HUD_BUNDLE_ID.savedState") ;;
+        *) ui_note "refusing to remove an unexpected path: $d"; d="" ;;
+    esac
+    if [ -n "$d" ] && [ -d "$d" ]; then
         if [ "$DRY_RUN" -eq 1 ]; then
             ui_note "[dry run] would: rm -rf \"$d\""
         else
@@ -268,16 +343,16 @@ remove_hud_support_dirs() {
     fi
 }
 
-remove_logs() {
-    if [ "$DRY_RUN" -eq 1 ]; then
-        ui_note "[dry run] would: rm -rf \"$LOG_DIR\""
-        return 0
-    fi
-    if [ -d "$LOG_DIR" ]; then
-        rm -rf "$LOG_DIR"
-        ui_ok "Removed logs."
-    fi
-}
+# There is deliberately NO remove_logs(). It targeted ~/Library/Logs/DARWIN, a
+# directory NOTHING in this product ever creates: a repo-wide grep for
+# "Library/Logs" found only uninstall.sh itself, and no source constructs the path
+# piecewise either. DARWIN's real logs go to $DARWIN_HOME/state/logs/ —
+# boot/com.darwin.daemon.plist's StandardOutPath is
+# __DARWIN_ROOT__/state/logs/launchd-daemon.log and boot/run_daemon.sh rotates
+# state/logs/*.log (same for inference and the HUD) — which is inside the install
+# home remove_home already deletes. The removal was a guaranteed no-op, while the
+# two-step confirmation window and --help told the user their DARWIN logs live at a
+# path that does not exist and never names where they actually are.
 
 # --- main ------------------------------------------------------------------------
 clear 2>/dev/null || true
@@ -308,7 +383,6 @@ remove_hud_app
 remove_home
 remove_keychain_items
 remove_hud_support_dirs
-remove_logs
 ui_hr
 if [ "$DRY_RUN" -eq 1 ]; then
     ui_ok "Dry run complete — the above is exactly what a real run would remove. Nothing was deleted."

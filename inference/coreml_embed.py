@@ -484,6 +484,13 @@ class CoreMLEmbedder:
             # VALIDATE-LOAD in the temp dir BEFORE publishing: a partial/corrupt
             # write is caught here and never becomes the trusted cache.
             self._load_from(tmp)
+            # Carry the fast-graph attempt count ACROSS the publish. It lives in a
+            # file inside the cache dir and the publish below replaces that whole dir,
+            # so without this every rebuild reset the budget to zero and
+            # `fast_upgrade_exhausted` could never become True — a machine that cannot
+            # build the seq=SEQ_FAST graph reconverted in the background on EVERY
+            # start, forever. Must run BEFORE the vacate: self._dir is gone after it.
+            coreml_shared.carry_fast_attempts(self._dir, tmp)
             # Publish. `os.replace` of a directory is atomic within one
             # filesystem (tmp is a sibling of self._dir), BUT os.replace onto a
             # NON-EMPTY dir raises ENOTEMPTY — and .mlpackage IS a directory. So

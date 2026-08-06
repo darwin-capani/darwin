@@ -14,10 +14,12 @@
 # privileged mutation of the daemon, so this script RE-VALIDATES from scratch
 # before it ever touches daemon/src:
 #   - verify state/heal/proposals/<ts>/ exists,
-#   - stage a FRESH copy of the daemon sources (src/, Cargo.toml, Cargo.lock —
-#     never target/) under state/heal/apply-staging-<ts>/,
+#   - stage a FRESH copy of the WHOLE daemon crate (everything but target/ and
+#     dotfiles) plus every repo-root sibling the sources reach into with an
+#     out-of-crate include_str!, as a miniature repo root under
+#     state/heal/apply-staging-<ts>/ — the crate lands at .../<ts>/daemon/,
 #   - apply patch.diff with /usr/bin/patch -p1 --batch (dry-run, then real),
-#   - cargo check && cargo test in the staging copy,
+#   - cargo check && cargo test in the staged CRATE dir,
 #   - and ONLY on green apply the same patch to the real daemon/, rebuild the
 #     release binary, and clear the meta.heal_pending marker.
 # Any gate failure exits non-zero and leaves daemon/src untouched.
@@ -127,6 +129,89 @@ confined_patch() {
   return "$rc"
 }
 
+# ------------------------------------------------------------- crate staging
+# Mirror every file the crate's sources name with an `include_str!` /
+# `include_bytes!` whose relative path climbs OUT of the crate into the staging
+# ROOT at the same repo-relative path, so those macros resolve under staging
+# exactly as they do under the real repo root.
+#
+# Existence-gated and best-effort by design: a literal that names no real file is
+# skipped (a mention of the macro inside a COMMENT is not a compilation input,
+# and a genuinely missing include is the compiler's to report, honestly), and so
+# is anything that resolves outside the repo root — staging never reaches out of
+# the tree it was asked to stage.
+mirror_out_of_crate_includes() {
+  local daemon_dir="$1" staging="$2"
+  local crate_abs repo_root src_file lit lit_dir lit_base abs_dir abs rel
+  crate_abs="$(cd "$daemon_dir" && pwd -P)"
+  repo_root="$(cd "$daemon_dir/.." && pwd -P)"
+  while IFS= read -r src_file; do
+    while IFS= read -r lit; do
+      # In-crate includes came along with the crate copy; only `../` climbs out.
+      case "$lit" in ../*) ;; *) continue ;; esac
+      lit_dir="$(dirname "$lit")"
+      lit_base="$(basename "$lit")"
+      # include_str! resolves relative to the SOURCE FILE, so resolve from the
+      # real file's dir (the staged copy cannot resolve it — that is the bug).
+      abs_dir="$(cd "$(dirname "$src_file")" && cd "$lit_dir" 2>/dev/null && pwd -P)" || continue
+      abs="$abs_dir/$lit_base"
+      [ -f "$abs" ] || continue
+      case "$abs" in
+        "$crate_abs"/*) continue ;;
+        "$repo_root"/*) rel="${abs#"$repo_root"/}" ;;
+        *) continue ;;
+      esac
+      mkdir -p "$staging/$(dirname "$rel")"
+      cp "$abs" "$staging/$rel"
+    done < <(grep -oE 'include_(str|bytes)!\("[^"]*"' "$src_file" 2>/dev/null | sed -E 's/^include_(str|bytes)!\("//; s/"$//')
+  done < <(find "$daemon_dir/src" -type f -name '*.rs')
+}
+
+# Stage the daemon crate for re-validation. `$2` (the staging root) becomes a
+# miniature REPO ROOT and the crate is copied to `<staging>/<crate-dir-name>/`;
+# the CRATE ROOT is echoed on stdout — that, NOT the staging root, is the dir
+# `patch -p1` and cargo must run in.
+#
+# WHAT WENT WRONG BEFORE: staging copied exactly three things — src/, Cargo.toml
+# and Cargo.lock — straight into the staging root, and the real darwin-core TEST
+# target needs more inputs than that:
+#   * daemon/build.rs + daemon/csrc/thermal_shim.m, which produce the static lib
+#     power.rs links with #[link(name = "darwin_thermal_shim", ...)];
+#   * three test-only `include_str!("../../…")` that reach OUTSIDE the crate
+#     (inference/server.py, config/darwin.toml, apps/vision/manifest.toml).
+# `cargo check` neither links nor reads those `#[cfg(test)]` macro inputs, so the
+# FIRST gate passed and the SECOND could not even COMPILE:
+#     error: couldn't read `src/../../config/darwin.toml`: No such file or directory
+# So EVERY apply of EVERY proposal — interactive, --yes, or the HUD Accept button
+# — ended in `RESULT: failed cargo test failed in staging` and exit 1, no matter
+# how good the patch was. The apply path was dead, and the message told the
+# operator the AI had drafted a failing patch when in fact the harness could not
+# build at all. scripts/test_apply_heal_confinement.sh only exercised the patch
+# header pre-scan and the sandbox, never the build gates, which is why it shipped.
+#
+# The fix: copy the WHOLE crate directory (so the next file the crate grows is
+# staged automatically) and MIRROR the repo-root siblings the sources actually
+# name, discovered by SCANNING them — so a new `include_str!("../../…")` cannot
+# silently break the gate again. Same shape as the daemon's own stage_sources()
+# in daemon/src/heal.rs; the two staging paths must stay in lockstep.
+stage_crate() {
+  local daemon_dir="$1" staging="$2"
+  local crate_name crate_dir entry name
+  crate_name="$(basename "$daemon_dir")"
+  crate_dir="$staging/$crate_name"
+  mkdir -p "$crate_dir"
+  # Everything except target/ (gigabytes of build output) and dotfiles (.git,
+  # .DS_Store, .gitignore — never build inputs); the unquoted glob skips dotfiles.
+  for entry in "$daemon_dir"/*; do
+    [ -e "$entry" ] || continue
+    name="${entry##*/}"
+    case "$name" in target) continue ;; esac
+    cp -R "$entry" "$crate_dir/$name"
+  done
+  mirror_out_of_crate_includes "$daemon_dir" "$staging"
+  printf '%s\n' "$crate_dir"
+}
+
 TS="${1:-}"
 MODE_YES=0
 # Parse the optional --yes flag (position-independent among args 2+).
@@ -196,11 +281,11 @@ if [ "$MODE_YES" -eq 0 ]; then
 fi
 
 # ----------------------------------------------------------- RE-VALIDATION gate
-# Stage a fresh copy of the daemon sources and re-run patch + cargo check +
+# Stage a fresh copy of the daemon crate and re-run patch + cargo check +
 # cargo test there. NOTHING touches daemon/src until this is green. This mirrors
-# the daemon's draft-time staging (src/, Cargo.toml, Cargo.lock — never target/)
-# so a patch that no longer applies, no longer compiles, or fails a test is
-# refused here, regardless of what was true when it was drafted.
+# the daemon's draft-time staging (daemon/src/heal.rs::stage_sources) so a patch
+# that no longer applies, no longer compiles, or fails a test is refused here,
+# regardless of what was true when it was drafted.
 stage "revalidating"
 
 STAGING="$HEAL_ROOT/apply-staging-$TS"
@@ -210,9 +295,11 @@ mkdir -p "$STAGING"
 if [ ! -d "$DAEMON/src" ]; then
   fail "daemon sources not found at $DAEMON/src"
 fi
-cp -R "$DAEMON/src" "$STAGING/src"
-[ -f "$DAEMON/Cargo.toml" ] && cp "$DAEMON/Cargo.toml" "$STAGING/Cargo.toml"
-[ -f "$DAEMON/Cargo.lock" ] && cp "$DAEMON/Cargo.lock" "$STAGING/Cargo.lock"
+# $STAGING is a miniature REPO ROOT; the crate lands one level down, at
+# $STAGING/daemon. Both `patch -p1` (whose headers are `a/src/...`) and cargo run
+# against $CRATE — running them in $STAGING would leave the crate's out-of-crate
+# `include_str!("../../…")` targets unresolvable and the test gate uncompilable.
+CRATE="$(stage_crate "$DAEMON" "$STAGING")"
 
 # Path-confinement: /usr/bin/patch is run with `-p1` and cwd = the target dir,
 # and macOS patch honors `..` in `---`/`+++` hunk headers — so a header like
@@ -302,20 +389,20 @@ done < <(grep -E '^[[:space:]]*(---|\+\+\+|Index:) ' "$PATCH_FILE" | sed -E 's/^
 
 # Apply to the STAGING copy: dry-run first (so a bad hunk is caught before any
 # file is written), then for real. A failed hunk -> refuse.
-if ! confined_patch "$STAGING" -p1 --batch --dry-run <"$PATCH_FILE" >/dev/null 2>&1; then
+if ! confined_patch "$CRATE" -p1 --batch --dry-run <"$PATCH_FILE" >/dev/null 2>&1; then
   fail "patch does not apply cleanly to a fresh staging copy (hunk reject)"
 fi
-if ! confined_patch "$STAGING" -p1 --batch <"$PATCH_FILE"; then
+if ! confined_patch "$CRATE" -p1 --batch <"$PATCH_FILE"; then
   fail "patch application to staging failed"
 fi
 
-# cargo check + cargo test in staging. These are the SAME gates the daemon ran
-# at draft time and they are never weakened. Either failing -> refuse to touch
-# the live tree.
-if ! (cd "$STAGING" && cargo check); then
+# cargo check + cargo test in the staged CRATE. These are the SAME gates the
+# daemon ran at draft time and they are never weakened. Either failing -> refuse
+# to touch the live tree.
+if ! (cd "$CRATE" && cargo check); then
   fail "cargo check failed in staging — live daemon/src NOT modified"
 fi
-if ! (cd "$STAGING" && cargo test); then
+if ! (cd "$CRATE" && cargo test); then
   fail "cargo test failed in staging — live daemon/src NOT modified"
 fi
 

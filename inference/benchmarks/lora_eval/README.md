@@ -29,6 +29,16 @@ numbers.
 | improvement | 5.723 nats/token |
 | gate decision | **promote** (≥ 0.05 margin) |
 
+> **Provenance of the two loss numbers above: SUPERSEDED BATCHING.** They were
+> measured before this harness passed `--batch-size 1` to the eval subprocesses, so
+> both ran at mlx_lm's default of 4. `iterate_batches` walks
+> `range(0, len(idx) - batch_size + 1, batch_size)` over a length-sorted index, so on
+> the 6-row held-out split that is ONE batch — 4 of the 6 rows scored, the shortest
+> four — while the daemon's `eval_command` uses `--batch-size 1` and scores all six.
+> The argv now matches (pinned by `inference/test_benchmark.py::LoraSmokeArgvMirrorsTheDaemon`); re-run the
+> smoke on the device to regenerate this table. The gate MECHANISM this file exists to
+> verify is unaffected — the decision path is the same either way.
+
 **This is a MECHANISM verification — does train → measure → gate work — NOT a
 quality claim on real user data.** The improvement is large because the synthetic
 style is trivially learnable and the base essentially never produces it; real

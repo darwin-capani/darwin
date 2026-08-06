@@ -16,6 +16,7 @@
       "Fred"
     ],
     "synthetic_note": "macOS `say` speech + synthesized noise adversaries; SYNTHETIC-but-representative, directional build evidence, NOT ground-truth production data.",
+    "frame_metric_scope_note": "SUPERSEDED SCOPE for the two frame_* rates BELOW. They were computed before eval_vad.py counted speech clips' TRAILING non-speech region: its per-frame confusion loop had no arm for idx >= body_end, so 40 clips x 15 frames = 600 labeled non-speech frames were counted nowhere and frame_false_accept_rate ran over roughly HALF the denominator the harness documented -- the half where a learned VAD's probability hangover would show. The clip-level false_accept_rate_clips / false_reject_rate_clips are computed correctly, were never affected, and are what daemon/src/vad.rs cites as adoption evidence. Re-run eval_vad.py on the device to regenerate the frame_* rates; the harness now also emits labeled_non_speech_frames / labeled_speech_frames so a rate can never again be read without its denominator.",
     "coreml_per_frame_latency_ms": {
       "median": 0.076,
       "p90": 0.086,

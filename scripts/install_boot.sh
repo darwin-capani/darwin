@@ -10,7 +10,7 @@
 # Usage:
 #   scripts/install_boot.sh              # DRY RUN: print the plan, change nothing
 #   scripts/install_boot.sh --install    # preflight, build daemon, render, lint, bootstrap
-#   scripts/install_boot.sh --uninstall  # bootout both agents and remove rendered plists
+#   scripts/install_boot.sh --uninstall  # bootout all three agents and remove rendered plists
 set -euo pipefail
 
 DARWIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -44,7 +44,12 @@ case "${1:-}" in
     --install)     MODE="install" ;;
     --uninstall)   MODE="uninstall" ;;
     -h|--help)
-        sed -n '2,11p' "${BASH_SOURCE[0]}"
+        # DERIVE the end (the first non-comment line); never hard-code a range.
+        # This was `sed -n '2,11p'` while the usage list runs to line 13, so
+        # --help stopped after the no-op dry-run line and never showed --install
+        # or --uninstall — the only two flags that do anything. The error path
+        # right below names them; the help path did not.
+        awk 'NR > 1 { if (substr($0, 1, 1) != "#") exit; print }' "${BASH_SOURCE[0]}"
         exit 0
         ;;
     *)
@@ -136,7 +141,7 @@ fi
 
 # --- MODE = install -----------------------------------------------------------
 
-# Preflight: both agents run KeepAlive=true, so a missing executable becomes a
+# Preflight: all three agents run KeepAlive=true, so a missing executable becomes a
 # silent ~10s crash-loop behind a successful-looking install. Fail early instead.
 echo "==> Preflight checks"
 VENV_PYTHON="$DARWIN_ROOT/.venv/bin/python"

@@ -307,6 +307,15 @@ def evaluate(voiced_fn, speech_clips, noise_clips):
     # Per-frame verdict confusion (debounce-independent), over labeled frames:
     # speech clips' body frames = speech; noise clips' frames + speech clips'
     # lead/trail frames = non-speech.
+    #
+    # THE TRAILING REGION WAS SILENTLY DROPPED. The loop below had no arm for
+    # idx >= body_end, so per speech clip the 15 LEAD frames were scored and the 15
+    # TRAIL frames were counted nowhere — 40 x 15 = 600 labeled non-speech frames,
+    # roughly HALF the denominator this comment claims, and precisely the region where
+    # a learned VAD's probability HANGOVER shows up. A verdict source firing on every
+    # single trailing frame scored frame_false_accept_rate = 0.0. (The clip-level
+    # false_accept_rate_clips that daemon/src/vad.rs cites as adoption evidence is
+    # computed above and was never affected.)
     fp = tot_non = fn = tot_sp = 0
     for c in speech_clips:
         v = voiced_fn(c["signal"])
@@ -321,6 +330,9 @@ def evaluate(voiced_fn, speech_clips, noise_clips):
             elif idx < body_end:  # speech
                 tot_sp += 1
                 fn += int(not vv)
+            else:  # TRAILING non-speech (the arm that was missing)
+                tot_non += 1
+                fp += int(vv)
     for c in noise_clips:
         v = voiced_fn(c["signal"])
         tot_non += len(v)
@@ -345,6 +357,11 @@ def evaluate(voiced_fn, speech_clips, noise_clips):
                                   if latencies else None),
         "frame_false_accept_rate": round(fp / tot_non, 4) if tot_non else None,
         "frame_false_reject_rate": round(fn / tot_sp, 4) if tot_sp else None,
+        # The DENOMINATORS, so a rate can never again be read without knowing what it
+        # was taken over — the trailing non-speech region was missing from
+        # labeled_non_speech_frames for every run before this one.
+        "labeled_non_speech_frames": tot_non,
+        "labeled_speech_frames": tot_sp,
         "by_category": {k: summ(k) for k in ("clean", "snr10", "snr5", "snr0", "quiet")},
     }
 

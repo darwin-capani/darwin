@@ -18,6 +18,9 @@ backend modules rather than duplicated per module.
    concurrency failure above as PERMANENT, pinning a machine to the slow path for
    good over a transient fault that a retry would have cleared. The counter lets a
    transient failure heal on the next start while still capping a deterministic one.
+   The count is a file INSIDE the cache dir, and publishing a rebuild REPLACES that
+   whole dir - so a rebuild used to throw the count away and the cap could never be
+   reached. `carry_fast_attempts` moves it across the publish; see its docstring.
 """
 import logging
 import os
@@ -73,6 +76,38 @@ def fast_upgrade_exhausted(d):
     """True once `d` has burned its rebuild budget, so the upgrade must stop trying."""
     return fast_attempts(d) >= MAX_FAST_ATTEMPTS
 
+
+def carry_fast_attempts(old_dir, new_dir):
+    """Carry the attempt count from a cache dir that is ABOUT TO BE REPLACED into the
+    freshly converted dir that replaces it, returning the new total.
+
+    THE BUDGET SHIPPED UNREACHABLE WITHOUT THIS. The counter is a file inside the
+    cache dir, but `_convert_atomic` publishes by moving the whole old dir aside and
+    rmtree-ing it - so every rebuild discarded the accumulated count and started over.
+    MEASURED on the real `_convert_atomic` with only the two heavy seams stubbed: on a
+    machine whose short graph cannot be built the count sat at 2 (or 1) after start #1
+    and was STILL 2 (or 1) after start #7, `fast_upgrade_exhausted` never became True,
+    and every single server start scheduled another full background reconversion of
+    the ~200 MB cache - forever. That is exactly the "unbounded is not [affordable]"
+    outcome MAX_FAST_ATTEMPTS was added to cap. The stubbed `_convert_atomic` in the
+    budget tests hid it: a publish that never touches the directory cannot lose a
+    marker that lives in the directory.
+
+    ADDS rather than overwrites: `_convert_into` charges THIS attempt by writing the
+    marker into the temp dir it is converting, and the old dir carries every earlier
+    one, so the total is the sum. BEST-EFFORT like `note_fast_attempt` - never raises,
+    because an unwritable count must never cost the publish it rides along with."""
+    n = fast_attempts(old_dir) + fast_attempts(new_dir)
+    if n <= 0:
+        return 0
+    try:
+        with open(os.path.join(new_dir, FAST_ABSENT_MARK), "w", encoding="utf-8") as fh:
+            fh.write(f"{n} attempts\ncarried across a cache rebuild\n")
+        return n
+    except Exception as e:  # noqa: BLE001 - advisory only
+        log.warning("could not carry the short-graph attempt count into %s (%s)", new_dir, e)
+        return 0
+
 # ---------------------------------------------------------------------------
 # COMPILED-MODEL CACHE
 # ---------------------------------------------------------------------------
@@ -108,6 +143,7 @@ def load_model_fast(pkg_path, compute_units=None):
 
     units = ct.ComputeUnit.ALL if compute_units is None else compute_units
     mlmodelc = _compiled_sibling(pkg_path)
+    tmp = None  # bound BEFORE the try: the except below has to clean it up
     try:
         if not os.path.isdir(mlmodelc):
             # Compile to a UNIQUE temp sibling, then claim the final name only if it is
@@ -135,4 +171,13 @@ def load_model_fast(pkg_path, compute_units=None):
             os.path.basename(pkg_path), e,
         )
         shutil.rmtree(_compiled_sibling(pkg_path), ignore_errors=True)
+        # ... AND the temp destination. This cleaned only the FINAL name, so a
+        # compile_model that fails AFTER it has begun writing destination_path left
+        # `<name>.<pid>.tmp.mlmodelc` in the model-cache dir forever: the name is
+        # PID-scoped, so no later process ever sweeps it and repeated failures pile up
+        # compiled-model-sized directories in $HF_HOME. Reachable in the ordinary way —
+        # compile_model shutil.move()s its result into place, which COPIES (and can
+        # fail part-way) when the cache root is on another volume.
+        if tmp is not None:
+            shutil.rmtree(tmp, ignore_errors=True)
     return ct.models.MLModel(pkg_path, compute_units=units)

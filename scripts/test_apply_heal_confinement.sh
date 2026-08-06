@@ -29,7 +29,9 @@
 # (sliced verbatim from the live script) and (b) the real `confined_patch`
 # sandbox helper against a fake repo layout in a temp dir — proving each escape
 # leaves the sibling victim byte-for-byte UNCHANGED, while the legit confined
-# applies still succeed. Invoked by the script's own `--selftest` hook so the
+# applies still succeed — and (c) the script's real `stage_crate`, against the
+# repo's real daemon crate, proving the STAGED tree can compile its TESTS and not
+# merely pass `cargo check`. Invoked by the script's own `--selftest` hook so the
 # defense cannot silently regress.
 #
 # Run:  scripts/test_apply_heal_confinement.sh
@@ -114,14 +116,19 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
 # Build a faithful fake repo for a given test name and return its parts via
-# globals: REPO, STAGING (the patch cwd, == ROOT/state/heal/apply-staging-123),
-# VICTIM (the OUT-OF-TREE sibling target ROOT/daemon/src/victim.rs).
-# STAGING/src is the dir -p1 paths resolve against; victim.rs is a SIBLING of
-# the staging tree, reachable only via a `..`-escape.
+# globals: REPO, STAGING (the patch cwd, == the staged CRATE dir
+# ROOT/state/heal/apply-staging-123/daemon), VICTIM (the OUT-OF-TREE sibling
+# target ROOT/daemon/src/victim.rs). STAGING/src is the dir -p1 paths resolve
+# against; victim.rs is a SIBLING of the staging tree, reachable only via a
+# `..`-escape.
+#
+# The crate sits one level BELOW the staging root because the staging root is a
+# miniature repo root (see stage_crate in apply_heal.sh) — that extra level is
+# why the escape headers below need FIVE `..`, not four.
 make_repo() {
   local name="$1"
   REPO="$WORK/$name"
-  STAGING="$REPO/state/heal/apply-staging-123"
+  STAGING="$REPO/state/heal/apply-staging-123/daemon"
   VICTIM="$REPO/daemon/src/victim.rs"
   rm -rf "$REPO"
   mkdir -p "$STAGING/src" "$REPO/daemon/src"
@@ -133,16 +140,18 @@ make_repo() {
 # sibling victim. $1 = leading-prefix string prepended to EVERY line (the
 # de-indent tamper: '' = column-0, 'X' = the residual, $'\t' = tab, 'ZZ' =
 # multi-char). The target after -p1 + de-indent resolves to ROOT/daemon/src/...
-# Relative to STAGING (the patch cwd): src/../../../../daemon/src/victim.rs ==
-#   src/..(=STAGING) /..(=heal) /..(=state) /..(=ROOT) /daemon/src/victim.rs.
+# Relative to STAGING (the patch cwd = the staged CRATE dir):
+#   src/../../../../../daemon/src/victim.rs ==
+#   src/..(=CRATE) /..(=apply-staging-123) /..(=heal) /..(=state) /..(=ROOT)
+#   /daemon/src/victim.rs.
 write_escape_diff() {
   local file="$1" prefix="$2" header_kind="${3:-dashes}"
   local h1 h2
   case "$header_kind" in
-    dashes) h1='--- a/src/../../../../daemon/src/victim.rs'
-            h2='+++ a/src/../../../../daemon/src/victim.rs' ;;
-    index)  h1='Index: src/../../../../daemon/src/victim.rs'
-            h2='+++ a/src/../../../../daemon/src/victim.rs' ;;
+    dashes) h1='--- a/src/../../../../../daemon/src/victim.rs'
+            h2='+++ a/src/../../../../../daemon/src/victim.rs' ;;
+    index)  h1='Index: src/../../../../../daemon/src/victim.rs'
+            h2='+++ a/src/../../../../../daemon/src/victim.rs' ;;
   esac
   {
     printf '%s%s\n' "$prefix" "$h1"
@@ -161,7 +170,7 @@ write_escape_diff() {
 prove_old_escapes() {
   local diff="$1"
   local clone="$WORK/oldproof-$RANDOM"
-  local cstg="$clone/state/heal/apply-staging-123"
+  local cstg="$clone/state/heal/apply-staging-123/daemon"
   local cvic="$clone/daemon/src/victim.rs"
   mkdir -p "$cstg/src" "$clone/daemon/src"
   printf 'ORIGINAL DAEMON FILE\nkeep\n' > "$cvic"
@@ -338,6 +347,130 @@ case "$out" in
   ACCEPTED) ok "content lines starting with '+'/'-'/'+++'/'---' are NOT false-rejected by the prefix scan" ;;
   *)        bad "legit content lines were false-rejected by the strengthened pre-scan [$out]" ;;
 esac
+
+echo
+echo "== staging completeness: the STAGED crate must be able to compile its TESTS =="
+
+# ---------------------------------------------------------------------------
+# Part C: the staging COPY (the build gates' input).
+# ---------------------------------------------------------------------------
+# WHAT WENT WRONG: staging copied exactly three things — src/, Cargo.toml and
+# Cargo.lock — into a bare dir. `cargo check` neither links nor reads the inputs
+# of `#[cfg(test)]` macros, so gate 1 passed and gate 2 could not even COMPILE:
+#   error: couldn't read `src/../../config/darwin.toml`: No such file or directory
+# Every apply of every proposal died at `cargo test failed in staging` — the
+# whole propose->apply path was dead, and the operator was told the patch failed
+# the test gate. Parts A and B never touch the staging copy or the build gates,
+# so nothing in this suite could catch it.
+#
+# Still HERMETIC: no cargo, no daemon, no network. We run the script's REAL
+# `stage_crate` (sliced verbatim, so the test cannot drift from the script)
+# against the repo's real daemon crate into a temp dir, then assert the two
+# properties `cargo test` needs and `cargo check` does not:
+#   1. every out-of-crate include_str!/include_bytes! target RESOLVES from the
+#      STAGED source file's own directory — that is the compiler's rule, and
+#   2. the native link inputs (build.rs + csrc/) came along.
+# Both are derived from the real crate, so a new out-of-crate include is covered
+# the day it lands rather than when someone remembers to update a list here.
+
+# Slice a top-level function verbatim out of the live script, by name.
+load_fn() {
+  local fn="$1"
+  awk -v want="$fn() {" '
+    index($0, want) == 1 { capture = 1 }
+    capture { print }
+    capture && /^\}$/ { exit }
+  ' "$SCRIPT"
+}
+
+# Enumerate the `include_str!`/`include_bytes!` literals in one .rs file.
+include_literals() {
+  grep -oE 'include_(str|bytes)!\("[^"]*"' "$1" 2>/dev/null \
+    | sed -E 's/^include_(str|bytes)!\("//; s/"$//'
+}
+
+REPO_ROOT="$(cd "$HERE/.." && pwd -P)"
+REAL_CRATE="$REPO_ROOT/daemon"
+STAGE_ROOT="$WORK/stagecheck"
+
+STAGE_FNS="$(load_fn stage_crate)"$'\n'"$(load_fn mirror_out_of_crate_includes)"
+case "$STAGE_FNS" in
+  *"stage_crate() {"*"mirror_out_of_crate_includes() {"*) ;;
+  *) bad "could not slice stage_crate + mirror_out_of_crate_includes out of apply_heal.sh" ;;
+esac
+
+if [ ! -d "$REAL_CRATE/src" ]; then
+  bad "staging completeness: no daemon crate at $REAL_CRATE (cannot verify the staging copy)"
+elif [ -z "$STAGE_FNS" ]; then
+  : # already reported by the slice guard above
+else
+  CRATE_OUT="$(DAEMON_DIR="$REAL_CRATE" STAGE="$STAGE_ROOT" bash -c '
+    set -euo pipefail
+    '"$STAGE_FNS"'
+    stage_crate "$DAEMON_DIR" "$STAGE"
+  ' 2>/dev/null)" || CRATE_OUT=""
+
+  if [ "$CRATE_OUT" = "$STAGE_ROOT/daemon" ]; then
+    ok "stage_crate stages the crate one level down ($STAGE_ROOT/daemon) and returns that CRATE dir"
+  else
+    bad "stage_crate returned '$CRATE_OUT', expected '$STAGE_ROOT/daemon' (cargo/patch would run in the wrong dir)"
+  fi
+
+  if [ -n "$CRATE_OUT" ] && [ -d "$CRATE_OUT/src" ]; then
+    # (1) THE COMPILER'S RULE, applied independently of how stage_crate works:
+    #     resolve each out-of-crate literal from the STAGED file's own directory.
+    inc_checked=0
+    inc_missing=""
+    while IFS= read -r rs; do
+      rel_rs="${rs#"$REAL_CRATE"/}"
+      while IFS= read -r lit; do
+        case "$lit" in ../*) ;; *) continue ;; esac
+        # Only literals naming a file that REALLY exists are compilation inputs:
+        # a mention inside a comment is not, and a genuinely absent include is
+        # the compiler's to report.
+        real_dir="$(cd "$(dirname "$rs")" && cd "$(dirname "$lit")" 2>/dev/null && pwd -P)" || continue
+        [ -f "$real_dir/$(basename "$lit")" ] || continue
+        inc_checked=$((inc_checked + 1))
+        staged_rs="$CRATE_OUT/$rel_rs"
+        staged_dir="$(cd "$(dirname "$staged_rs")" && cd "$(dirname "$lit")" 2>/dev/null && pwd -P)" || staged_dir=""
+        if [ -z "$staged_dir" ] || [ ! -f "$staged_dir/$(basename "$lit")" ]; then
+          inc_missing="$inc_missing $rel_rs -> $lit"
+        fi
+      done < <(include_literals "$rs")
+    done < <(find "$REAL_CRATE/src" -type f -name '*.rs')
+
+    if [ "$inc_checked" -eq 0 ]; then
+      # Never report a pass on an empty set — that is how a vacuous assertion
+      # looks exactly like a real one.
+      bad "staging completeness: found ZERO out-of-crate includes to check — the enumeration broke, not the crate"
+    elif [ -n "$inc_missing" ]; then
+      bad "staged tree cannot compile its tests: unresolvable out-of-crate include(s):$inc_missing"
+    else
+      ok "all $inc_checked out-of-crate include_str!/include_bytes! targets resolve from the STAGED sources"
+    fi
+
+    # (2) The native link inputs cargo test needs and cargo check does not.
+    link_missing=""
+    for want in build.rs csrc; do
+      if [ -e "$REAL_CRATE/$want" ] && [ ! -e "$CRATE_OUT/$want" ]; then
+        link_missing="$link_missing $want"
+      fi
+    done
+    if [ -n "$link_missing" ]; then
+      bad "staged tree is missing the crate's native link input(s):$link_missing (cargo check does not link; cargo test does)"
+    else
+      ok "the crate's native link inputs (build.rs, csrc/) are staged"
+    fi
+
+    # (3) target/ is gigabytes of build output and is never a build input.
+    if [ -e "$CRATE_OUT/target" ]; then
+      bad "staging copied daemon/target/ (gigabytes of build output)"
+    else
+      ok "staging skipped daemon/target/"
+    fi
+  fi
+  rm -rf "$STAGE_ROOT"
+fi
 
 echo
 echo "apply_heal confinement: $PASS passed, $FAIL failed"

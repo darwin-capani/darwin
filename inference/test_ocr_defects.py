@@ -15,9 +15,18 @@ held to the contracts every other model in this server already obeys.
   3. The refusal detector matched bare substrings like "does not contain" anywhere in
      the reply. That is ordinary English that appears in real screen text, so it fired
      on CORRECT answers and threw them away in favour of the measured-worse VLM path.
-  4. The model was loaded lazily inside the request, under the engine lock. The live
-     log shows a 19,536 ms hold against 2,952 ms warm; classify/speak/transcribe all
-     block on that lock and the daemon times out at 30 s.
+  4. The model was loaded lazily inside the request, under the engine lock, so the
+     first screen question paid the load with classify/speak/transcribe queued behind
+     it against the daemon's 30 s timeout.
+     THE NUMBER THIS USED TO CITE IS RETRACTED. Three earlier commits (and the four
+     places in this file) justified the warm with "a 19,536 ms hold against 2,952 ms
+     warm". That pair was misread off the server's own log: BOTH figures are
+     TRANSCRIPTIONS of the same image after the model was already resident, and the
+     spread between them is contention, not loading. The load is ~1.0-1.2 s, so the
+     warm buys about a second off the first screen question — worth doing, and free
+     since boot is not blocked, but not sixteen seconds. The long lock hold is the
+     TRANSCRIPTION and is STILL THERE. See the correction at inference/server.py's
+     OCR-warm block, which is what this file's assertions pin.
 
   Run: .venv/bin/python inference/test_ocr_defects.py   (from the repo root)
 """
@@ -30,6 +39,15 @@ import server as S
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SRC = (REPO / "inference" / "server.py").read_text(encoding="utf-8")
+
+# The OCR load figures server.py RETRACTED (a pair of transcriptions misread as a
+# load — see item 4 of the module docstring). They survived in these two test files
+# for two commits after the correction landed, stated as fact. Any surviving mention
+# must sit next to the retraction; none may assert the number.
+RETRACTED_OCR_FIGURES = ("19,536", "19536", "19.5 s", "~16 s")
+RETRACTION_MARKERS = ("retract", "misread", "used to")
+# How far a mention may sit from a marker before it reads as a bare claim.
+RETRACTION_WINDOW = 8
 
 
 class OcrModelIdIsConfigurable(unittest.TestCase):
@@ -245,7 +263,13 @@ class AFailedOcrLoadLatches(unittest.TestCase):
 
 
 class TheOcrModelIsWarmedNotLoadedInsideARequest(unittest.TestCase):
-    """DEFECT 4: a cold load inside the request held the engine lock for 19.5 s."""
+    """DEFECT 4: the model was loaded lazily INSIDE the request, under the engine lock.
+    NOT the "19.5 s" this used to claim — that figure was a transcription misread as a
+    load and server.py's OCR-warm block retracts it; the load is ~1.0-1.2 s. The warm
+    is still right (it takes that second off the first screen question and boot is not
+    blocked), and its ORDERING is justified by a separate MEASURED cost: the warm
+    contends for the same GPU lock, and ahead of TTS it pushed the TTS warm
+    3.1s -> 4.3s and the whole preload 12s -> 19s."""
 
     @staticmethod
     def _preload_src():
@@ -255,16 +279,20 @@ class TheOcrModelIsWarmedNotLoadedInsideARequest(unittest.TestCase):
     def test_preload_warms_ocr(self):
         self.assertIn(
             "self._on_vlm_worker(self._ensure_ocr)", self._preload_src(),
-            "preload() must warm the OCR model. Loaded lazily it runs INSIDE the "
-            "request while the engine lock is held -- measured at 19,536 ms against "
-            "2,952 ms warm -- which blocks classify/speak/transcribe and exceeds the "
-            "daemon's 30 s timeout",
+            "preload() must warm the OCR model. Loaded lazily, the ~1.0-1.2 s load "
+            "runs INSIDE the request while the engine lock is held, so it blocks "
+            "classify/speak/transcribe against the daemon's 30 s timeout (the "
+            "'19,536 ms against 2,952 ms warm' this message used to cite was two "
+            "TRANSCRIPTIONS under contention, not a load -- retracted in server.py)",
         )
 
     def test_the_warm_does_not_block_boot(self):
-        """The warm must be BACKGROUND. Inline, the same ~16 s load lands on startup
-        instead -- against a boot this campaign brought from 63 s to 8.96 s. preload
-        does not warm the VLM either, for the same reason."""
+        """The warm must be BACKGROUND. Inline, the load lands on startup instead --
+        against a boot this campaign brought from 63 s to 8.96 s. (It is ~1.0-1.2 s,
+        not the "~16 s" this used to say: that came from the retracted 19,536 ms
+        reading. The measured reason the ordering matters is contention for the GPU
+        lock -- ahead of TTS the warm pushed the TTS warm 3.1s -> 4.3s.) preload does
+        not warm the VLM either, for the same reason."""
         pre = self._preload_src()
         warm = pre[pre.index("def _warm_ocr"):]
         self.assertIn(
@@ -278,15 +306,28 @@ class TheOcrModelIsWarmedNotLoadedInsideARequest(unittest.TestCase):
         )
 
     def test_the_warm_thread_start_is_guarded(self):
-        """An unguarded Thread.start() that fails would abort the rest of preload,
-        leaving the learned-VAD weights unexported. This repo has shipped that exact
-        bug before, in the Core ML fast-graph upgrade."""
+        """An unguarded Thread.start() that fails would propagate out of preload and be
+        swallowed by the preload thread's own top level, so it is guarded. This repo has
+        shipped that exact bug before, in the Core ML fast-graph upgrade.
+
+        It does NOT strand the learned-VAD export, which this docstring and server.py's
+        comment both used to claim: #168 wrote that justification with the OCR warm
+        AHEAD of the export, #169 moved the warm to the END of preload and carried the
+        words verbatim, so it named a consequence that had become impossible. The
+        ordering the corrected comment now relies on is pinned below — move the warm
+        back ahead of the export and the old justification is true again."""
         pre = self._preload_src()
         start = pre.index("threading.Thread(")
         head = pre[:start]
         self.assertRegex(
             head[-200:], r"try:\s*$|try:\s*\n[^\n]*$",
             "threading.Thread(target=_warm_ocr).start() must sit inside a try/except",
+        )
+        self.assertLess(
+            pre.index("export_native_weights(dest)"), start,
+            "the learned-VAD native-weights export must run BEFORE the OCR warm "
+            "thread is started -- server.py's guard comment says a failed start() "
+            "cannot strand it, and that is only true in this order",
         )
 
     def test_the_warm_starts_after_the_other_models(self):
@@ -365,17 +406,114 @@ class TheOcrModelIsWarmedNotLoadedInsideARequest(unittest.TestCase):
             "renamed the installer silently falls back to a hard-coded id",
         )
 
+    def test_the_interruptible_decode_names_every_caller(self):
+        """`_run_llm_interruptible`'s docstring said "op=consolidate is the only
+        caller" while describe_image's OCR-first answer leg (`_answer_from_transcript`)
+        had been a second caller for four commits. That is not a cosmetic slip: the
+        docstring's entire design rationale ("it costs the background pass a little
+        wall time and nothing else") is scoped to a 20 h BACKGROUND pass, so anyone
+        tuning prefill_chunk / decode_chunk or the fairness yields on that premise
+        silently regresses an INTERACTIVE screen question. Self-maintaining: every
+        method that calls it must be named in it."""
+        doc_at = SRC.index("def _run_llm_interruptible(")
+        doc = SRC[doc_at:SRC.index('"""', SRC.index('"""', doc_at) + 3)]
+        callers = set()
+        current = None
+        for line in SRC.splitlines():
+            m = re.match(r"    def (\w+)\(", line)
+            if m:
+                current = m.group(1)
+            if "self._run_llm_interruptible(" in line and current:
+                callers.add(current)
+        self.assertTrue(callers, "no call sites found -- this test guards nothing")
+        # assertTrue/assertFalse rather than assertIn/assertNotIn: the latter dump the
+        # whole docstring into the failure output and bury the actual complaint.
+        self.assertFalse(
+            "the only caller" in doc,
+            f"the docstring still claims a single caller; there are {len(callers)}: "
+            f"{sorted(callers)}",
+        )
+        for name in sorted(callers):
+            self.assertTrue(
+                name in doc,
+                f"{name}() calls _run_llm_interruptible but the docstring never "
+                f"mentions it; its slicing rationale is per-caller and one of the "
+                f"two callers is INTERACTIVE",
+            )
+
+    def test_the_retracted_load_figure_is_not_restated_as_fact(self):
+        """THE SAME DEFECT CLASS COMMIT #176 FIXED ELSEWHERE, and the reason
+        test_vlm_eval_claims_agree.py was written: a measurement the project has
+        DISOWNED left standing in a sibling artifact. server.py says the pair was
+        misread off its own log and the load is ~1.0-1.2 s; this file and
+        test_vlm_thread_affinity.py went on asserting it in five places, which also
+        carries the wrong causal story (that the warm removed a 19.5 s lock hold —
+        the long hold is the transcription and is still there)."""
+        # assertTrue, not assertIn: assertIn's failure message would dump the whole
+        # 440 KB of server.py into the test output.
+        self.assertTrue(
+            "misread off this server's own log" in SRC,
+            "server.py's retraction is gone — re-check what this test pins before "
+            "editing it; a mention with nothing to point at is worse than none",
+        )
+        here = pathlib.Path(__file__)
+        for art in (here, here.with_name("test_vlm_thread_affinity.py")):
+            lines = art.read_text(encoding="utf-8").splitlines()
+            marks = [
+                i for i, ln in enumerate(lines)
+                if any(m in ln.lower() for m in RETRACTION_MARKERS)
+            ]
+            for i, ln in enumerate(lines):
+                if not any(f in ln for f in RETRACTED_OCR_FIGURES):
+                    continue
+                near = any(abs(i - m) <= RETRACTION_WINDOW for m in marks)
+                self.assertTrue(
+                    near,
+                    f"{art.name}:{i + 1} restates a RETRACTED OCR load figure with no "
+                    f"retraction in sight: {ln.strip()!r}",
+                )
+
     def test_the_transcription_holds_the_lock_but_the_answer_does_not(self):
         """The two-critical-section split must survive. _run_llm_interruptible takes
         the same NON-REENTRANT lock, so answering inside the transcription's lock is
-        a deadlock, and answering inside a second acquisition doubles the hold."""
+        a deadlock, and answering inside a second acquisition doubles the hold.
+
+        SCOPED TO THE CRITICAL SECTION, NOT TO ONE LINE. This searched
+        `tail[:tail.index("\\n", tail.index("_answer_from_transcript"))]` — but `tail`
+        already STARTS at that token, so the inner index was 0 and the window was just
+        the REMAINDER OF THAT ONE LINE. Python cannot put a compound `with` statement
+        there under any source at all, so the assertNotIn could never fail: re-indenting
+        the call into the transcription's `with self._lock:` block — the whole-server
+        deadlock this test names — still reported OK. Track the open lock blocks by
+        INDENTATION instead."""
         d = SRC[SRC.index("def describe_image("):]
         d = d[:d.index("\n    def ")] if "\n    def " in d else d
-        answer = d.index("_answer_from_transcript")
-        tail = d[answer:]
-        self.assertNotIn(
-            "with self._lock", tail[:tail.index("\n", tail.index("_answer_from_transcript"))],
-            "the transcript answer must be generated OUTSIDE the engine lock",
+        open_locks = []  # indents of `with self._lock:` blocks still open here
+        offenders = []
+        seen = 0
+        for line in d.splitlines():
+            body = line.strip()
+            if not body or body.startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip())
+            # A block closes as soon as a line dedents to (or past) its own indent.
+            open_locks = [i for i in open_locks if indent > i]
+            if "self._answer_from_transcript(" in body:
+                seen += 1
+                if open_locks:
+                    offenders.append(body)
+            if body.startswith("with self._lock"):
+                open_locks.append(indent)
+        self.assertTrue(
+            seen, "no self._answer_from_transcript(...) call in describe_image — this "
+            "test no longer guards anything (renamed? moved?)",
+        )
+        self.assertEqual(
+            offenders, [],
+            "the transcript answer must be generated OUTSIDE the engine lock: "
+            f"{offenders} sits inside a `with self._lock:` block, and "
+            "_run_llm_interruptible takes that same NON-REENTRANT lock — a "
+            "whole-server deadlock on every screen question",
         )
 
 

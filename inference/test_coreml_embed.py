@@ -480,9 +480,73 @@ class FastGraphUpgrade(unittest.TestCase):
                 total += o.converts
             self.assertEqual(
                 total, coreml_shared.MAX_FAST_ATTEMPTS,
-                f"{{total}} rebuilds; the budget is coreml_shared.MAX_FAST_ATTEMPTS",
+                f"{total} rebuilds; the budget is {coreml_shared.MAX_FAST_ATTEMPTS}",
             )
             self.assertTrue(coreml_shared.fast_upgrade_exhausted(tmp))
+
+    def _real_publish_obj(self, cache_dir, fast_conversion_raises):
+        """Like `_obj` but running the REAL `_convert_atomic`: only the two HEAVY seams
+        (`_convert_into`, `_load_from`) are stubbed, so the publish that moves the whole
+        cache dir aside and rmtree-s it actually happens. `_obj`'s counter stub cannot
+        observe this class of bug - it never touches the directory the budget lives in,
+        which is exactly why the budget shipped unreachable."""
+        o = ce.CoreMLEmbedder.__new__(ce.CoreMLEmbedder)
+        o._dir = cache_dir
+        o._lock = threading.Lock()
+        o._loaded = False
+        o._upgrade_started = False
+        o._tokenizer = o._model = o._model_fast = None
+
+        def _convert_into(target):
+            os.makedirs(target, exist_ok=True)
+            with open(os.path.join(target, "model.mlpackage"), "w", encoding="utf-8") as fh:
+                fh.write("stub")
+            if fast_conversion_raises:
+                # What the real `_convert_into` does when the OPTIONAL fast graph
+                # fails to convert: keep the seq=SEQ cache, note the attempt in the
+                # TEMP dir it is writing (coreml_embed.py, `trace_and_convert` guard).
+                coreml_shared.note_fast_attempt(target, "fast graph did not convert here")
+
+        o._convert_into = _convert_into
+        # Always loads, NEVER with a usable fast graph - the deterministic failure.
+        o._load_from = lambda d: ("t", "m", None)
+        return o
+
+    def test_the_budget_survives_the_real_publish(self):
+        """THE REGRESSION. The budget is a file INSIDE the cache dir and `_convert_atomic`
+        publishes by moving that whole dir aside and rmtree-ing it, so every rebuild used
+        to discard the accumulated count: MEASURED at 2 attempts after start #1 and still
+        2 after start #7, `fast_upgrade_exhausted` never True, a full ~37 s background
+        reconversion scheduled on EVERY server start FOREVER - the unbounded outcome
+        MAX_FAST_ATTEMPTS exists to cap. Drives the real publish because the stubbed one
+        above cannot see it."""
+        for raises in (True, False):
+            with self.subTest(fast_conversion_raises=raises):
+                with tempfile.TemporaryDirectory() as root:
+                    cache = os.path.join(root, "darwin-coreml", "bge-small")
+                    starts = 0
+                    for _ in range(coreml_shared.MAX_FAST_ATTEMPTS + 5):
+                        if coreml_shared.fast_upgrade_exhausted(cache):
+                            break
+                        o = self._real_publish_obj(cache, raises)
+                        o.ensure_loaded()
+                        for t in threading.enumerate():
+                            if t.name.endswith("-fast-upgrade") and t is not threading.current_thread():
+                                t.join(timeout=30)
+                        starts += 1
+                    self.assertTrue(
+                        coreml_shared.fast_upgrade_exhausted(cache),
+                        f"after {starts} starts the budget is still not spent "
+                        f"({coreml_shared.fast_attempts(cache)} of "
+                        f"{coreml_shared.MAX_FAST_ATTEMPTS} attempts) - every start "
+                        f"reconverts the cache again",
+                    )
+                    # And it must not have slammed shut on the FIRST failure either:
+                    # that is the permanent sentinel the counter replaced.
+                    self.assertGreater(
+                        starts, 1,
+                        "a transient failure must still get another go before the cap",
+                    )
 
     def test_conversions_are_serialized_process_wide(self):
         """coremltools keeps global MIL state, so two overlapping conversions corrupt

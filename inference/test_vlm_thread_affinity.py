@@ -11,8 +11,10 @@ description -- were one scheduling decision away from failing outright. They app
 to work only because a lightly loaded pool tends to reuse the same idle thread.
 
 This was not theoretical. Warming the OCR model on its own background thread (a
-perfectly reasonable-looking fix for a 19.5 s lock hold) made EVERY OCR call fail and
-silently fall back to the VLM. It shipped and deployed, because every test written for
+perfectly reasonable-looking fix for what was then believed to be a 19.5 s lock hold --
+that figure has since been RETRACTED: it was a transcription misread as a load, see
+server.py's OCR-warm block) made EVERY OCR call fail and silently fall back to the
+VLM. It shipped and deployed, because every test written for
 it was structural -- they asserted the shape of preload's source, and a source-shape
 assertion cannot observe a thread boundary. It was caught by driving the deployed
 server over its socket and noticing `path='vlm'` in the reply.

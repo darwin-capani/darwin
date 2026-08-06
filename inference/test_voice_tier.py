@@ -303,5 +303,91 @@ class KeyHygieneAndDecoding(unittest.TestCase):
         self.assertNotIn("?", server._ELEVENLABS_HEADER)
 
 
-if __name__ == "__main__":
+class CoarseDeliveryHintsOnTheCloudLeg(unittest.TestCase):
+    """#33 ADAPTIVE PROSODY ON THE SHIPPED CLOUD CONFIG. `rate` was validated, clamped
+    and then DROPPED on the ElevenLabs leg: `_elevenlabs_to_wav` had no `rate`
+    parameter at all and `speak` never passed one, while this server's contract block
+    and `_normalize_speak_shape` both promised "rate/volume are coarse hints honoured
+    on every backend" — and so does the daemon, whose telemetry reports the value as
+    applied. On [voice].model = eleven_flash_v2_5 (what ships) that made the whole
+    feature INERT: prosody::shape_coarse sets ONLY rate — audio_tag/stability/style
+    are v3-gated on both sides and volume stays 1.0 — so every Alert/Wellness reply
+    computed a 1.08/0.95 nudge that went nowhere. `volume` was applied all along, so
+    only `rate` was the false claim."""
+
+    def _cloud_speak_samples(self, **shape):
+        """Run one op=speak over the ElevenLabs leg (network seam stubbed) and return
+        the number of samples handed to _write_wav — the only observable that shows
+        whether the coarse rate landed."""
+        engine = _make_engine()
+        rec = _Recorder()
+        restore = _install_stubs(engine, rec, el_pcm=_canned_pcm())
+        seen = {}
+
+        def capture(audio, sr, out_path=None):
+            seen["n"] = int(audio.shape[0])
+            seen["sr"] = sr
+            return "/tmp/elevenlabs-stub.wav"
+
+        engine._write_wav = capture
+        try:
+            path = engine.speak(
+                "hello there",
+                voice="bm_george",
+                backend="elevenlabs",
+                voice_id="EL_VOICE",
+                model="eleven_flash_v2_5",
+                el_key="sk-secret",
+                **shape,
+            )
+        finally:
+            restore()
+        self.assertEqual(path, "/tmp/elevenlabs-stub.wav", "the cloud leg must produce the WAV")
+        self.assertEqual(rec.kokoro_calls, 0, "it must not have fallen back to Kokoro")
+        self.assertEqual(seen["sr"], server.ELEVENLABS_SAMPLE_RATE)
+        return seen["n"]
+
+    def test_the_coarse_rate_reaches_the_cloud_audio(self):
+        base = self._cloud_speak_samples()
+        faster = self._cloud_speak_samples(rate=2.0)
+        slower = self._cloud_speak_samples(rate=0.5)
+        # `_apply_rate` resamples at the SAME output rate: faster -> fewer samples.
+        self.assertAlmostEqual(
+            faster / base, 0.5, delta=0.02,
+            msg=f"rate=2.0 must halve the cloud audio ({faster} vs {base} samples)",
+        )
+        self.assertAlmostEqual(
+            slower / base, 2.0, delta=0.02,
+            msg=f"rate=0.5 must double the cloud audio ({slower} vs {base} samples)",
+        )
+
+    def test_the_shipped_prosody_nudges_are_not_a_no_op_on_the_cloud_leg(self):
+        """THE REGRESSION, at the values that actually ship. daemon
+        prosody::shape_coarse emits exactly these for Urgent/Calm, and on a non-v3 EL
+        model they are the ONLY prosody signal sent. A generous rate=2.0 test would
+        pass on an implementation that silently floors small nudges."""
+        base = self._cloud_speak_samples()
+        for r in (1.08, 0.95):
+            with self.subTest(rate=r):
+                self.assertNotEqual(
+                    self._cloud_speak_samples(rate=r), base,
+                    f"the shipped rate={r} nudge changed nothing on the cloud leg — "
+                    f"#33 adaptive prosody is inert on eleven_flash_v2_5",
+                )
+
+    def test_the_neutral_default_leaves_the_cloud_audio_byte_for_byte(self):
+        """The OFF default must stay untouched: the daemon sends nothing, and an
+        explicit neutral 1.0 is a no-op inside `_apply_rate`."""
+        base = self._cloud_speak_samples()
+        self.assertEqual(self._cloud_speak_samples(rate=1.0), base)
+        self.assertEqual(self._cloud_speak_samples(rate=None), base)
+
+    def test_the_cloud_seam_itself_is_never_sent_a_rate(self):
+        """The rate is applied to the RETURNED audio; the cloud model keeps its own
+        pacing. Nothing new goes on the wire — the seam's signature is the contract."""
+        import inspect
+
+        params = inspect.signature(server._elevenlabs_synth_pcm).parameters
+        self.assertNotIn("rate", params, "rate must not be forwarded to ElevenLabs")
+        self.assertNotIn("speed", params)
     unittest.main(verbosity=2)

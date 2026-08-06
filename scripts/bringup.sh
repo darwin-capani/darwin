@@ -125,9 +125,25 @@ probe_python() {
     fi
 }
 
+# Set to 1 the first time unix_connectable has to fall back to the existence
+# test. Read by probe_note() so a PASS reported off that probe never over-claims
+# what was actually verified.
+PROBE_DEGRADED=0
+
 # Connect-probe a Unix socket (connect + immediate close; spends NO model call).
-# Returns 0 iff a connection established. Honest: with no python available we
-# fall back to a mere existence test and SAY so via the caller.
+# With a python available this returns 0 iff a connection was ESTABLISHED. With
+# none it degrades to "the socket INODE exists" and sets PROBE_DEGRADED=1; the
+# callers append probe_note() so the difference reaches the operator.
+#
+# WHAT WENT WRONG: the comment here said the degraded branch was announced "via
+# the caller", and no caller announced anything — the string "existence" appeared
+# nowhere else in the file, and the first line claimed "returns 0 iff a connection
+# established", which is false on that branch. On a tree with no .venv and no
+# python3 on PATH, a STALE socket inode left by a crashed inference server or
+# daemon made bringup print "inference server already reachable" / "daemon command
+# channel already up" and mark INF_STAGE/DMN_STAGE as pass with nothing connected
+# — in a script whose stated HONESTY CONTRACT is that a stage which did not
+# actually verify is never printed as healthy.
 unix_connectable() {
     local sock="$1" py
     py="$(probe_python)"
@@ -144,7 +160,20 @@ except OSError:
     sys.exit(1)
 PY
     else
+        # NO PYTHON: we cannot open a connection, so this is only "a socket file
+        # is there" — a stale inode from a crashed process passes it. Mark the run
+        # so every PASS derived from this probe says which probe it was.
+        PROBE_DEGRADED=1
         [ -S "$sock" ]
+    fi
+}
+
+# The suffix that keeps a unix_connectable-derived PASS honest: empty while the
+# real connect probe is in use, and a plain statement of the degradation once the
+# existence-only fallback has been taken.
+probe_note() {
+    if [ "${PROBE_DEGRADED:-0}" -eq 1 ]; then
+        printf '%s' " (existence-only probe: no python available to connect — a stale socket file passes this)"
     fi
 }
 
@@ -251,7 +280,7 @@ fi
 if [ "$PREFLIGHT_OK" -eq 1 ]; then
 if [ "$_UI" -eq 1 ]; then ui_stage 2 4 "INFERENCE" 2>/dev/null || say_hr; else say_hr; fi
 if unix_connectable "$INF_SOCK"; then
-    say_ok "inference server already reachable at $INF_SOCK (leaving it running)"
+    say_ok "inference server already reachable at $INF_SOCK (leaving it running)$(probe_note)"
     INF_STAGE="pass"
 elif [ "$MODE" = "no-start" ]; then
     say_skip "inference server not reachable and --no-start given — not starting it"
@@ -263,7 +292,7 @@ elif [ "$HAVE_VENV" -eq 1 ] && [ "$HAVE_SERVER" -eq 1 ]; then
     STARTED_INF_PID=$!
     say_info "inference pid $STARTED_INF_PID — waiting up to ${INF_TIMEOUT}s for readiness (cold model load)"
     if poll_until "$INF_TIMEOUT" unix_connectable "$INF_SOCK"; then
-        say_ok "inference server is reachable at $INF_SOCK"
+        say_ok "inference server is reachable at $INF_SOCK$(probe_note)"
         INF_STAGE="pass"
     else
         # Honest: the server refuses to bind without numpy/mlx (exit 2). The
@@ -288,7 +317,7 @@ fi
 if [ "$PREFLIGHT_OK" -eq 1 ]; then
 if [ "$_UI" -eq 1 ]; then ui_stage 3 4 "DAEMON" 2>/dev/null || say_hr; else say_hr; fi
 if unix_connectable "$CMD_SOCK" && [ -f "$CMD_TOKEN" ]; then
-    say_ok "daemon command channel already up at $CMD_SOCK (leaving it running)"
+    say_ok "daemon command channel already up at $CMD_SOCK (leaving it running)$(probe_note)"
     DMN_STAGE="pass"
 elif [ "$MODE" = "no-start" ]; then
     say_skip "daemon command channel not up and --no-start given — not starting it"
@@ -303,7 +332,7 @@ elif [ "$HAVE_BIN" -eq 1 ]; then
     # shellcheck disable=SC2329
     cmd_ready() { unix_connectable "$CMD_SOCK" && [ -f "$CMD_TOKEN" ]; }
     if poll_until "$DMN_TIMEOUT" cmd_ready; then
-        say_ok "daemon command channel up at $CMD_SOCK (token handed off)"
+        say_ok "daemon command channel up at $CMD_SOCK (token handed off)$(probe_note)"
         DMN_STAGE="pass"
     else
         if kill -0 "$STARTED_DMN_PID" 2>/dev/null; then

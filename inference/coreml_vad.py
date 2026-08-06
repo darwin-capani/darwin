@@ -89,6 +89,8 @@ import threading
 
 import numpy as np
 
+from coreml_shared import CONVERT_LOCK
+
 log = logging.getLogger("darwin.coreml_vad")
 
 # The learned VAD this backend converts. Silero VAD v5 ships bundled inside the
@@ -328,7 +330,15 @@ class CoreMLVAD:
         tmp = tempfile.mkdtemp(prefix=".convert-vad-", dir=parent)
         trash = None
         try:
-            self._convert_into(tmp)
+            # coremltools keeps global MIL state, so two overlapping conversions
+            # corrupt each other. See coreml_shared.CONVERT_LOCK — whose contract is
+            # that EVERY conversion in this process takes it. THIS BACKEND DID NOT:
+            # it was the one ct.convert() call in the tree outside the lock, so the
+            # first caller to warm the VAD beside the embedder/reranker (both of
+            # which start background rebuild threads at preload) would have
+            # reproduced the exact double-conversion crash that lock was added for.
+            with CONVERT_LOCK:
+                self._convert_into(tmp)
             self._load_from(tmp)  # validate BEFORE publishing
             if os.path.exists(self._dir):
                 trash = tempfile.mkdtemp(prefix=".stale-vad-", dir=parent)

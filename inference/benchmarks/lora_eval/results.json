@@ -7,5 +7,6 @@
   "held_out_adapter_loss": 0.686,
   "improvement": 5.723,
   "gate_decision": "promote",
-  "note": "MECHANISM smoke (train->measure->gate) on a learnable style; not a quality claim on user data."
+  "note": "MECHANISM smoke (train->measure->gate) on a learnable style; not a quality claim on user data.",
+  "provenance_note": "SUPERSEDED BATCHING for held_out_base_loss / held_out_adapter_loss / improvement. They were measured before smoke.py passed --batch-size 1 to the eval subprocesses, so both ran at mlx_lm's default of 4: iterate_batches walks range(0, len(idx) - batch_size + 1, batch_size) over a length-sorted index, which on the 6-row held-out split is ONE batch, scoring 4 of the 6 rows (the shortest four). The daemon's distill.rs::eval_command uses --batch-size 1 and scores all six, so these numbers came from a different batching path than the argv this harness claims to mirror. The argv now matches (pinned by inference/test_benchmark.py::LoraSmokeArgvMirrorsTheDaemon); re-run smoke.py on the device to regenerate. gate_decision is unaffected -- the decision path is the same either way."
 }

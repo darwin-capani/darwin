@@ -7,12 +7,16 @@ weights. The model runs are the device-gated part, exercised by actually running
 
 Run: .venv/bin/python inference/test_benchmark.py   (from the repo root)
 """
+import ast
+import re
 import sys
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import benchmark  # noqa: E402
+
+SRC = Path(benchmark.__file__).read_text(encoding="utf-8")
 
 
 class MedianTests(unittest.TestCase):
@@ -164,6 +168,173 @@ class CosineTests(unittest.TestCase):
     def test_zero_norm_side_is_honest_zero_not_nan(self):
         self.assertEqual(benchmark.cosine([0.0, 0.0], [1.0, 2.0]), 0.0)
         self.assertEqual(benchmark.cosine([1.0, 2.0], [0.0, 0.0]), 0.0)
+
+
+class HeaderMatchesTheSections(unittest.TestCase):
+    """THE HEADER IS THE REFERENCE THE COMMITTED BASELINES ARE READ AGAINST, and it
+    drifted from the code twice:
+      * the Embeddings bullet named "the 4B-forward mean-pooled op=embed path", but
+        `bench_embed` measures whatever [inference].embedder selects and
+        server.DEFAULT_EMBEDDER is the Core ML bge embedder — a different model with a
+        different dim. baseline_m1_pro.json records coreml-bge-small-en-v1.5 / 384-d,
+        so a reader trusting the header read a bge number as a 4B one.
+      * `rerank` was registered as a full section in run_all with NO bullet in WHAT IT
+        MEASURES and NO entry in the USAGE --skip list, so an operator copying that
+        line to skip everything still ran a model-loading section.
+    Derived from run_all's own section table, so it cannot drift again."""
+
+    def _sections(self):
+        for node in ast.walk(ast.parse(SRC)):
+            if not (isinstance(node, ast.FunctionDef) and node.name == "run_all"):
+                continue
+            for stmt in ast.walk(node):
+                if (isinstance(stmt, ast.Assign)
+                        and isinstance(stmt.value, ast.Dict)
+                        and any(getattr(t, "id", None) == "sections" for t in stmt.targets)):
+                    return [k.value for k in stmt.value.keys]
+        self.fail("run_all no longer builds a `sections` dict; this test sees nothing")
+
+    def test_the_usage_skip_list_names_every_section(self):
+        m = re.search(r"--skip ([a-z,]+)\]", benchmark.__doc__)
+        self.assertTrue(m, "the USAGE line no longer shows a --skip list")
+        self.assertEqual(
+            sorted(m.group(1).split(",")), sorted(self._sections()),
+            "USAGE's --skip list and run_all's sections disagree; copying that line "
+            "would still run a section it claims to skip",
+        )
+
+    def test_the_argparse_skip_help_names_every_section(self):
+        m = re.search(r'"--skip".*?help="comma list: ([a-z,]+)"', SRC)
+        self.assertTrue(m, "the --skip argument no longer lists its sections")
+        self.assertEqual(sorted(m.group(1).split(",")), sorted(self._sections()))
+
+    def _bullets(self):
+        """WHAT IT MEASURES as {bullet label (lowercased): bullet body}. Keyed on the
+        LABEL, not on the whole block: the word "rerank" occurs in prose there too, so
+        a block-wide substring search would still pass with the bullet deleted."""
+        doc = benchmark.__doc__
+        block = doc[doc.index("WHAT IT MEASURES"):doc.index("METHODOLOGY")]
+        bullets, label = {}, None
+        for line in block.splitlines():
+            m = re.match(r"\s*\* (\S+)", line)
+            if m:
+                label = m.group(1).rstrip(":").lower()
+                bullets[label] = ""
+            if label is not None:
+                bullets[label] += line + "\n"
+        return bullets
+
+    def test_what_it_measures_has_a_bullet_for_every_section(self):
+        labels = self._bullets()
+        for name in self._sections():
+            self.assertTrue(
+                any(name in label for label in labels),
+                f"the {name} section runs (and loads models) but WHAT IT MEASURES "
+                f"has no bullet for it; bullets are {sorted(labels)}",
+            )
+
+    def test_the_embed_bullet_names_the_selector_not_one_backend(self):
+        """The bullet must describe the ACTIVE backend, not hardcode a path — naming
+        one of the two is how it came to describe a model the harness does not run."""
+        bullets = self._bullets()
+        embed = next(v for k, v in bullets.items() if "embed" in k)
+        self.assertIn(
+            "[inference].embedder", embed,
+            "the Embeddings bullet must name the selector that decides which "
+            "backend is measured, not one of the two backends",
+        )
+
+
+REPO = Path(__file__).resolve().parent.parent
+LORA_SMOKE_DIR = REPO / "inference" / "benchmarks" / "lora_eval"
+DISTILL_RS = REPO / "daemon" / "src" / "distill.rs"
+
+
+def _lora_smoke():
+    """The sibling harness under inference/benchmarks/ (this file's other resident
+    harness tests live here too). Import-light: no training, no model."""
+    sys.path.insert(0, str(LORA_SMOKE_DIR))
+    import smoke
+
+    return smoke
+
+
+def _daemon_argv_flags(fn_name):
+    """The `--flag` literals, IN ORDER, from a distill.rs command builder's
+    `args: vec![...]`. Flags only — the values beside them are Rust variables
+    (base_model, data_dir, ...) with no counterpart on the Python side."""
+    src = DISTILL_RS.read_text(encoding="utf-8")
+    start = src.index(f"pub fn {fn_name}(")
+    body = src[start:src.index("\n}\n", start)]
+    vec = body[body.index("args: vec!["):]
+    return re.findall(r'"(--[a-z-]+)"', vec)
+
+
+@unittest.skipUnless(DISTILL_RS.is_file(), "daemon/src/distill.rs is not in this tree")
+class LoraSmokeArgvMirrorsTheDaemon(unittest.TestCase):
+    """inference/benchmarks/lora_eval/smoke.py says it evaluates BASE vs ADAPTER with
+    "the SAME `mlx_lm.lora --test [...]` argv" as the daemon, and its README says the
+    harness "mirrors the daemon exactly". The TRAIN argv did match
+    distill.rs::train_command byte for byte; the EVAL argv was MISSING
+    `--batch-size 1`, which is what made the omission look deliberate.
+
+    Not cosmetic: mlx_lm 0.31.3's CONFIG_DEFAULTS batch_size is 4, and
+    `tuner.trainer.iterate_batches` walks `range(0, len(idx) - batch_size + 1,
+    batch_size)` over a length-sorted index — so the smoke's 6-row held-out split gave
+    ONE batch and scored 4 of the 6 rows (the shortest four), where the daemon's
+    `--batch-size 1` gives six batches and scores all six. The harness measured a
+    different batching path from the shipped `eval_command` and could not catch a
+    regression that only appears at 1."""
+
+    def test_the_eval_argv_matches_eval_command(self):
+        """THE REGRESSION: --batch-size was absent here and present in the daemon."""
+        smoke = _lora_smoke()
+        self.assertEqual(
+            [a for a in smoke.eval_argv("") if a.startswith("--")],
+            _daemon_argv_flags("eval_command"),
+            "the smoke's eval argv and distill.rs::eval_command have drifted; the "
+            "harness's entire claim is that it reproduces the daemon's measurement",
+        )
+
+    def test_the_train_argv_matches_train_command(self):
+        smoke = _lora_smoke()
+        self.assertEqual(
+            [a for a in smoke.train_argv(smoke.RUN, 120) if a.startswith("--")],
+            _daemon_argv_flags("train_command"),
+            "the smoke's train argv and distill.rs::train_command have drifted",
+        )
+
+    def test_both_evals_pin_batch_size_one(self):
+        """Explicit, because this is the value whose ABSENCE was invisible: at the
+        mlx_lm default of 4 the 6-row held-out split scores only 4 rows."""
+        smoke = _lora_smoke()
+        for adapter in ("", smoke.RUN):
+            argv = smoke.eval_argv(adapter)
+            self.assertIn("--batch-size", argv)
+            self.assertEqual(
+                argv[argv.index("--batch-size") + 1], "1",
+                "the daemon evaluates at --batch-size 1; anything else scores a "
+                "different subset of the held-out split",
+            )
+
+    def test_the_base_eval_uses_the_empty_adapter_path(self):
+        """mlx_lm's "test without LoRA layers". An OMITTED flag defaults to the dir
+        `adapters` and fails, which is how an earlier run produced
+        reject:unmeasurable."""
+        argv = _lora_smoke().eval_argv("")
+        self.assertEqual(argv[argv.index("--adapter-path") + 1], "")
+
+    def test_the_smoke_builds_its_argv_through_the_shared_builders(self):
+        """A builder nothing calls proves nothing: main() must go through them, or the
+        two can drift again with these tests still green."""
+        src = (LORA_SMOKE_DIR / "smoke.py").read_text(encoding="utf-8")
+        body = src[src.index("def main("):]
+        self.assertIn("eval_argv(", body)
+        self.assertIn("train_argv(", body)
+        self.assertNotIn(
+            '"--test"', body,
+            "main() is hand-rolling an mlx_lm argv again instead of using eval_argv",
+        )
 
 
 if __name__ == "__main__":

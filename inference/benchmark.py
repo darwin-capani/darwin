@@ -19,7 +19,24 @@ WHAT IT MEASURES
   * STT        whisper transcribe latency on a short synthesized speech clip.
   * TTS        Kokoro real-time factor (RTF = synth_seconds / audio_seconds).
   * Embeddings: single-text latency AND single-vs-batched throughput for the
-    4B-forward mean-pooled op=embed path (the batched path is the MNEMOSYNE shape).
+               ACTIVE op=embed backend — [inference].embedder, which DEFAULTS to the
+               Core ML bge sentence embedder (server.DEFAULT_EMBEDDER), else the
+               legacy 4B-forward mean-pool path. This bullet used to name the 4B
+               mean-pool path outright, which is NOT what ships and not what the
+               committed baseline measured: the two are different models with
+               different vector spaces (baseline_m1_pro.json records
+               coreml-bge-small-en-v1.5 at 384-d, not the 4B's 2560-d), so reading
+               its embed median as a 4B number is off by roughly the ~6.3x the tree
+               claims between them. The results therefore carry the embedder id +
+               dim actually measured. Only the mean-pool path amortizes a batch
+               across ONE forward (the MNEMOSYNE shape); the Core ML path loops one
+               (1,SEQ) predict per text, so its single ≈ batched per-text cost —
+               which is why the baseline shows 20.65 vs 19.49 ms/text.
+  * Rerank     stage two of the two-stage retrieval stack: the reranker id + the
+               MEASURED nDCG@10 / recall / MRR (stage A dense vs stage B rerank)
+               and rerank latency at K=20/50, by re-running the committed
+               coreml_rerank_eval probe so the baseline never carries a stale copy.
+               Honest available=false when the cross-encoder cannot build/load.
 
 METHODOLOGY (why the numbers are trustworthy)
   * WARM: every model is loaded and a warm-up run is executed and DISCARDED
@@ -35,7 +52,7 @@ METHODOLOGY (why the numbers are trustworthy)
 
 USAGE
   .venv/bin/python inference/benchmark.py [--runs N] [--warmup K] [--max-tokens M]
-      [--json] [--out PATH] [--skip llm,speculative,stt,tts,embed]
+      [--json] [--out PATH] [--skip llm,speculative,stt,tts,embed,rerank]
 
   --json     print the full result document to stdout as JSON
   --out      write the result document to PATH (default: a chip-named file under
@@ -756,7 +773,15 @@ def bench_rerank(eng, runs, warmup):
         "fell_back": False,
         "reranker": results["eval_meta"]["stage_b_reranker"],
         "model": results["eval_meta"]["stage_b_model"],
+        # BOTH graphs, plus what the run actually did. This carried only `seq` = 512
+        # beside rerank_latency_ms, and every pair in the eval corpus routes through
+        # the (1, 128) graph — so the baseline paired a ~1.86 ms/pair figure with the
+        # one configuration where it is unattainable (~11 ms/pair at 512).
         "seq": results["eval_meta"]["stage_b_seq"],
+        "seq_fast": results["eval_meta"]["stage_b_seq_fast"],
+        "seq_routing": results["eval_meta"]["stage_b_seq_used"],
+        "pairs_at_seq_fast": results["eval_meta"]["stage_b_pairs_at_seq_fast"],
+        "pairs_at_seq": results["eval_meta"]["stage_b_pairs_at_seq"],
         "eval": {
             "path": "inference/benchmarks/coreml_rerank_eval/",
             "corpus_facts": results["eval_meta"]["corpus_facts"],
