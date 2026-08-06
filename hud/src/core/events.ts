@@ -1668,7 +1668,11 @@ export function parseCanvasRenderMs(
 
 /** Parse a canvas.viewport payload. Returns null unless x/y/scale are finite
  *  numbers; `layer_visibility` is coerced item-by-item (non-conforming entries
- *  dropped, never throwing) and defaults to [] when absent (a schematic). */
+ *  dropped, never throwing) and defaults to [] when absent. "Absent" is the
+ *  malformed-payload case only, NOT the schematic case as this once claimed:
+ *  Silicon Canvas always sends the field, and a schematic sends a one-entry
+ *  ["schematic"] list (its single logical layer), so the layer-chip row below
+ *  renders for schematics too. */
 export function parseCanvasViewport(
   data: Record<string, unknown>,
 ): CanvasViewport | null {

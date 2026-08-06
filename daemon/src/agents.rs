@@ -97,10 +97,22 @@ impl Agent {
 /// after the first line beginning "INTRO:" (case-insensitive), trimmed. None
 /// when no such line exists or it is blank.
 fn parse_intro(contents: &str) -> Option<String> {
+    const MARKER: &str = "INTRO:";
     contents.lines().find_map(|line| {
         let trimmed = line.trim_start();
-        let rest = trimmed.strip_prefix("INTRO:").or_else(|| trimmed.strip_prefix("intro:"))?;
-        let intro = rest.trim();
+        // ASCII case-insensitive, as the doc above says. This used to try exactly
+        // two hard-coded literals — "INTRO:" then "intro:" — so a persona file
+        // authored with the ordinary sentence-case "Intro:" matched NEITHER and
+        // silently lost its self-introduction: intro() warns and falls back to the
+        // generic "<Name>. <role>." sentence, and roll-call speaks the placeholder
+        // instead of the line the author wrote. The doc and the test both claimed
+        // case-insensitivity, and the test only ever exercised the two casings that
+        // happened to be hard-coded, so nothing caught it.
+        let head = trimmed.get(..MARKER.len())?;
+        if !head.eq_ignore_ascii_case(MARKER) {
+            return None;
+        }
+        let intro = trimmed[MARKER.len()..].trim();
         (!intro.is_empty()).then(|| intro.to_string())
     })
 }
@@ -4322,8 +4334,13 @@ mod tests {
             parse_intro(body),
             Some("Friday on intel, briefs and the news.".to_string())
         );
-        // Case-insensitive prefix, leading whitespace tolerated.
+        // Case-insensitive prefix, leading whitespace tolerated. The two casings
+        // below are the ones the old two-literal implementation happened to accept;
+        // the MIXED casings after them are the ones it silently dropped, so this
+        // comment claimed a contract the code did not keep.
         assert_eq!(parse_intro("  intro:   hello there  "), Some("hello there".to_string()));
+        assert_eq!(parse_intro("Intro: hi"), Some("hi".to_string()));
+        assert_eq!(parse_intro("iNtRo: hi"), Some("hi".to_string()));
         // No INTRO line, or a blank one.
         assert_eq!(parse_intro("You are DARWIN, with no intro marker."), None);
         assert_eq!(parse_intro("INTRO:   "), None);

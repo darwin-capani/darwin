@@ -1083,9 +1083,33 @@ mod tests {
             parse_https_handler(plist).as_deref(),
             Some("ai.perplexity.comet")
         );
-        // No https block -> None; placeholder-only roles -> None.
-        assert_eq!(parse_https_handler("( { LSHandlerURLScheme = http; } )"), None);
-        let placeholder = "( { LSHandlerRoleAll = \"-\"; LSHandlerURLScheme = https; } )";
+        // The negative cases MUST be multi-line too. They used to be written as
+        // one-liners ("( { LSHandlerRoleAll = \"-\"; LSHandlerURLScheme = https; } )"),
+        // and the parser walks LINES: a single line starting with '(' matches no
+        // branch at all, so it returned None no matter what the body did. Both
+        // assertions passed against a parser with the "-" placeholder guard DELETED,
+        // which is the one thing they exist to protect.
+        //
+        // No https block -> None (every branch runs; we simply never see https).
+        let no_https = r#"(
+    {
+        LSHandlerRoleAll = "com.google.chrome";
+        LSHandlerURLScheme = http;
+    }
+)"#;
+        assert_eq!(parse_https_handler(no_https), None);
+        // The https block carries ONLY the nested PreferredVersions placeholder and
+        // no block-level role. "-" is not a bundle id: without the guard this
+        // returns Some("-"), browser_name_for_bundle("-") yields "-", and open_url
+        // speaks "Opened apple.com in - (the default browser)."
+        let placeholder = r#"(
+    {
+        LSHandlerPreferredVersions =             {
+            LSHandlerRoleAll = "-";
+        };
+        LSHandlerURLScheme = https;
+    }
+)"#;
         assert_eq!(parse_https_handler(placeholder), None);
     }
 

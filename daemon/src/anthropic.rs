@@ -12150,15 +12150,23 @@ async fn unified_search_tool(
 /// LIST, so the anchor honestly names the channel-list read (no message
 /// coordinate is claimed, because none exists). The snippet is the real summary
 /// line the gated read returned. Ranked by the shared lexical scorer against the
-/// query so a non-matching summary scores 0 (and is dropped by `fold`), never
-/// surfaced as an irrelevant hit. Empty/"no … found" summaries yield no
-/// candidate.
+/// query; a summary with NO query overlap is still surfaced — "search my gmail"
+/// has to see the recent items — but it is marked
+/// [`crate::unified_search::Candidate::unmatched`], which makes `fold` rank it
+/// BELOW every real match instead of among them. (This rustdoc used to claim such
+/// a summary "scores 0 and is dropped by fold, never surfaced"; it was never
+/// dropped — the code floors it — and it ranked FIRST, so the doc was wrong in
+/// both directions.) Empty/"no … found" summaries yield no candidate.
 fn cloud_summary_candidates(
     source: crate::unified_search::Source,
     query: &str,
     summary: &str,
 ) -> Vec<crate::unified_search::Candidate> {
     use crate::unified_search::{Candidate, Citation, Source};
+    /// The positive relevance an UNMATCHED cloud summary carries so `fold` does not
+    /// drop it. Its magnitude never orders anything (see below) — the `unmatched`
+    /// flag is what keeps it under the real matches.
+    const CLOUD_SUMMARY_FLOOR: f64 = 0.05;
     let s = summary.trim();
     if s.is_empty() {
         return Vec::new();
@@ -12172,9 +12180,8 @@ fn cloud_summary_candidates(
         return Vec::new();
     }
     // Relevance: lexical score of the summary against the query (shared BM25). A
-    // summary with no query-term overlap scores 0 -> dropped by fold (no
-    // irrelevant cloud noise). We compute it via a one-fact rank so cloud + on-
-    // device candidates share the same relevance scale family.
+    // summary with no query-term overlap scores 0. We compute it via a one-fact
+    // rank so cloud + on-device candidates share the same relevance scale family.
     use crate::recall::{Bm25Params, EmbeddingProvider, Fact, LexicalProvider};
     let provider = LexicalProvider { params: Bm25Params::default() };
     let relevance = provider
@@ -12182,11 +12189,21 @@ fn cloud_summary_candidates(
         .into_iter()
         .next()
         .unwrap_or(0.0);
-    // A connected cloud read with content but zero query overlap: still surface a
-    // small floor so "search my gmail" type queries see the recent items, but
-    // keep it BELOW any real on-device match. The floor is honest (the read DID
-    // return these items), just low-priority.
-    let relevance = if relevance > 0.0 { relevance } else { 0.05 };
+    // A connected cloud read with content but ZERO query overlap: still surface it
+    // (the read DID return these items, and a "search my gmail" style ask has to see
+    // them), but mark it UNMATCHED so `fold` places it below every real match.
+    //
+    // The mark is what does the work — the floor number cannot. `fold` max-
+    // normalizes relevance WITHIN each source, and this function returns exactly ONE
+    // candidate per cloud source, so whatever number sits here normalizes to 1.0.
+    // The floor shipped as "keep it BELOW any real on-device match": it did the
+    // opposite. 0.05 became rel_norm 1.0 -> score 0.85, TYING the best docsearch hit
+    // and beating every other one, so a Gmail summary sharing no word with the query
+    // came back as the #2 "most relevant" result and pushed real matches out of the
+    // top-k. The floor's only remaining job is to be positive, so `fold`'s
+    // drop-the-irrelevant filter keeps the candidate at all.
+    let unmatched = !relevance.is_finite() || relevance <= 0.0;
+    let relevance = if unmatched { CLOUD_SUMMARY_FLOOR } else { relevance };
     // HONEST SOURCE-LEVEL citation: name the specific gated read that produced
     // this summary (the user can reproduce it), never a fabricated per-item id.
     // The `read` label matches the actual live read for each source.
@@ -12210,6 +12227,7 @@ fn cloud_summary_candidates(
         snippet: s.to_string(),
         relevance,
         ts: None,
+        unmatched,
     }]
 }
 
@@ -12844,16 +12862,71 @@ async fn mission_resume_tool(memory: &Memory, id: &str) -> String {
         // refuse. The owner does live web work interactively instead.
         context_trusted: false,
     };
-    // A resumed mission sent ONLY its id, so the HUD kept the status it already had —
-    // PAUSED — forever, for a mission that is now running.
-    telemetry::emit(
-        "system",
-        "mission.resumed",
-        json!({"id": id.trim(), "status": "running"}),
-    );
-    match crate::durable_missions::resume(memory, id, &registry, &planner, &dispatcher, cloud_reachable)
-        .await
+    // The HUD folds this event into the mission row it already has and REPLACES that
+    // row wholesale (state.ts upserts by id), so every field the payload omits is
+    // BLANKED, and a status token the parser does not recognise is coerced to the
+    // SAFE default — "paused". Both halves of this emit were wrong:
+    //   * the status was "running", a token that is in NO MissionStatus anywhere
+    //     (the HUD's union is active|paused|done|cancelled, and durable_missions
+    //     only ever produces those four), so coerceMissionStatus turned it straight
+    //     back into the very PAUSED pill this emit exists to clear;
+    //   * goal/done/total were omitted, so resuming a mission wiped its goal to
+    //     "(no goal)" and reset its progress readout to 0/0.
+    // Load the record first and send what the panel actually renders — the same
+    // payload shape mission_save_tool sends. A mission that does not exist, or is
+    // already terminal, emits NOTHING: resume() below refuses it, and a row for a
+    // run that never happened would be its own lie.
+    let record = crate::durable_missions::load(memory, id).await.ok().flatten();
+    if let Some(m) = record
+        .as_ref()
+        .filter(|m| matches!(m.status, crate::durable_missions::MissionStatus::Paused))
     {
+        telemetry::emit(
+            "system",
+            "mission.resumed",
+            json!({
+                "id": m.id,
+                "goal": m.goal,
+                // MissionStatus::as_str() is the ONE producer of the wire tokens;
+                // hand-writing the string here is exactly how "running" got in.
+                "status": crate::durable_missions::MissionStatus::Active.as_str(),
+                "done": m.steps.iter().filter(|s| matches!(s.status, crate::durable_missions::StepStatus::Done)).count(),
+                "total": m.steps.len(),
+            }),
+        );
+    }
+    let outcome =
+        crate::durable_missions::resume(memory, id, &registry, &planner, &dispatcher, cloud_reachable)
+            .await;
+    // SETTLE the row. durable_missions emits no telemetry of its own, so with only
+    // the ACTIVE emit above the panel would show a finished mission as ACTIVE
+    // forever. Re-read the record so the status is the one actually persisted
+    // (resume() stamps Done); a resume that ERRORED is reported PAUSED — it is not
+    // running, and claiming otherwise is the same class of lie we just fixed.
+    let settled = if record.is_some() {
+        crate::durable_missions::load(memory, id).await.ok().flatten()
+    } else {
+        None
+    };
+    if let Some(m) = settled {
+        let status = if outcome.is_ok() {
+            m.status
+        } else {
+            crate::durable_missions::MissionStatus::Paused
+        };
+        telemetry::emit(
+            "system",
+            "mission.resumed",
+            json!({
+                "id": m.id,
+                "goal": m.goal,
+                "status": status.as_str(),
+                "done": m.steps.iter().filter(|s| matches!(s.status, crate::durable_missions::StepStatus::Done)).count(),
+                "total": m.steps.len(),
+            }),
+        );
+    }
+    match outcome {
         Ok(answer) => answer,
         Err(e) => format!("I couldn't resume that durable mission: {e}"),
     }
@@ -12861,12 +12934,35 @@ async fn mission_resume_tool(memory: &Memory, id: &str) -> String {
 
 /// `mission_cancel`: delete a saved durable mission by id. Reversible -> not gated.
 async fn mission_cancel_tool(memory: &Memory, id: &str) -> String {
+    // Read the record BEFORE deleting it: the HUD REPLACES the mission row from this
+    // payload, so an emit without `goal` (and without the progress pair) blanks the
+    // row it lands on — a CANCELLED pill next to "(no goal)" and an empty progress
+    // readout, for a mission the user can still see named in the transcript.
+    let record = crate::durable_missions::load(memory, id).await.ok().flatten();
     match crate::durable_missions::cancel(memory, id).await {
         Ok(true) => {
+            let (goal, done, total) = match &record {
+                Some(m) => (
+                    m.goal.clone(),
+                    m.steps.iter().filter(|s| matches!(s.status, crate::durable_missions::StepStatus::Done)).count(),
+                    m.steps.len(),
+                ),
+                // The row existed (cancel deleted it) but was unreadable: send no
+                // invented goal — an empty one renders honestly as "(no goal)".
+                None => (String::new(), 0, 0),
+            };
             telemetry::emit(
                 "system",
                 "mission.cancelled",
-                json!({"id": id.trim(), "status": "cancelled"}),
+                json!({
+                    "id": id.trim(),
+                    "goal": goal,
+                    // The event name is authoritative HUD-side, but keep the payload
+                    // self-describing — and sourced from MissionStatus, not a literal.
+                    "status": crate::durable_missions::MissionStatus::Cancelled.as_str(),
+                    "done": done,
+                    "total": total,
+                }),
             );
             format!("Cancelled durable mission {}.", id.trim())
         }
@@ -21201,6 +21297,44 @@ mod tests {
         );
     }
 
+    /// A cloud read that returned CONTENT but shares no word with the query is still
+    /// surfaced — the read DID happen and a "search my gmail" ask has to see it — but
+    /// it is marked UNMATCHED so the merge ranks it below every real match. It used
+    /// to be floored with NO mark, and per-source max-normalization turned that floor
+    /// into a top score (single candidate -> rel_norm 1.0), so a zero-overlap Gmail
+    /// summary came back #2. The rustdoc meanwhile said it was dropped entirely.
+    /// Neither description matched the code.
+    #[test]
+    fn a_zero_overlap_cloud_summary_is_marked_unmatched_not_ranked_as_a_match() {
+        use crate::unified_search::Source;
+        let unmatched = cloud_summary_candidates(
+            Source::Gmail,
+            "quarterly revenue projections",
+            "3 recent message(s): lunch thursday — sam; gym renewal — front desk",
+        );
+        assert_eq!(unmatched.len(), 1, "a connected read with content still surfaces");
+        assert!(
+            unmatched[0].unmatched,
+            "no query term appears in that summary, so it is not a match"
+        );
+        assert!(
+            unmatched[0].relevance > 0.0,
+            "the floor must stay positive or fold drops the candidate outright"
+        );
+        // A summary that DOES share a query term is a real hit — never marked.
+        let matched = cloud_summary_candidates(
+            Source::Gmail,
+            "launch",
+            "3 recent message(s): Re: launch plan — alice; budget — bob",
+        );
+        assert_eq!(matched.len(), 1);
+        assert!(
+            !matched[0].unmatched,
+            "a real lexical match must not be demoted as unmatched"
+        );
+        assert!(matched[0].relevance > 0.0);
+    }
+
     // ====================================================================
     // ANSWER ANNOTATIONS (#5 always-cite + #8 confidence) — hermetic tests.
     // NO real model call: the source-tracking + cite/from-my-knowledge labeling
@@ -22578,14 +22712,91 @@ mod hud_frame_field_tests {
         }
     }
 
+    /// The four tokens hud/src/core/events.ts `MissionStatus` accepts. It is a
+    /// CLOSED union, and `coerceMissionStatus` maps anything else to the SAFE
+    /// default — "paused".
+    const HUD_MISSION_STATUSES: [&str; 4] = ["active", "paused", "done", "cancelled"];
+
+    /// The SOURCE TEXT of a payload's `"status":` value, so a guard can check the
+    /// VALUE and not merely that the key is present.
+    fn status_expr(payload: &str) -> String {
+        let i = payload
+            .find("\"status\":")
+            .expect("payload carries no status field");
+        let rest = &payload[i + "\"status\":".len()..];
+        let end = rest.find(',').unwrap_or(rest.len());
+        rest[..end].trim().to_string()
+    }
+
+    /// A status VALUE the HUD folds without silently rewriting it: either a literal
+    /// from the closed union, or a token produced by `MissionStatus::as_str()` —
+    /// the one function that can emit those four and nothing else.
+    fn assert_hud_foldable_status(event: &str, payload: &str) {
+        let expr = status_expr(payload);
+        if let Some(lit) = expr.strip_prefix('"').and_then(|e| e.strip_suffix('"')) {
+            assert!(
+                HUD_MISSION_STATUSES.contains(&lit),
+                "{event} emits status {lit:?}, which is in NO MissionStatus — the HUD \
+                 coerces it to the SAFE default and the row reads PAUSED"
+            );
+        } else {
+            assert!(
+                expr.contains("MissionStatus::") && expr.ends_with(".as_str()"),
+                "{event} builds its status from {expr:?}; it must come from \
+                 MissionStatus::as_str(), the only producer of the four wire tokens"
+            );
+        }
+    }
+
+    /// mission.resumed shipped `"status": "running"` — a token that appears in no
+    /// MissionStatus anywhere — so the HUD's coercer turned a just-resumed mission
+    /// straight back into the PAUSED pill this emit exists to clear. The old guard
+    /// asserted only that the KEY was present, which could never see it: the key was
+    /// always there, the VALUE was the bug. It also omitted goal/done/total, and the
+    /// panel REPLACES the row from this payload, so resuming blanked the goal to
+    /// "(no goal)" and the progress readout to 0/0.
     #[test]
-    fn a_resumed_mission_stops_reporting_paused() {
+    fn a_resumed_mission_reports_a_status_the_hud_accepts() {
         let p = emit_payload("mission.resumed");
+        for key in ["\"goal\"", "\"status\"", "\"done\"", "\"total\""] {
+            assert!(
+                p.contains(key),
+                "mission.resumed omits {key}; the HUD replaces the row from this \
+                 payload, so resuming a mission blanks what it already showed"
+            );
+        }
+        assert_hud_foldable_status("mission.resumed", &p);
+    }
+
+    /// The same wholesale-replace applies to a cancellation: without `goal` the
+    /// cancelled row renders "(no goal)" for a mission the user just named.
+    #[test]
+    fn a_cancelled_mission_keeps_the_goal_on_its_row() {
+        let p = emit_payload("mission.cancelled");
         assert!(
-            p.contains("\"status\""),
-            "mission.resumed sends only an id, so the HUD keeps the status it already \
-             had — PAUSED — for a mission that is now running"
+            p.contains("\"goal\""),
+            "mission.cancelled omits the goal; the row it replaces renders \"(no goal)\""
         );
+        assert_hud_foldable_status("mission.cancelled", &p);
+    }
+
+    /// The daemon-side half of the contract the guards above lean on: every token
+    /// MissionStatus can put on the wire is one the HUD's closed union accepts.
+    #[test]
+    fn every_mission_status_token_is_one_the_hud_accepts() {
+        use crate::durable_missions::MissionStatus;
+        for st in [
+            MissionStatus::Paused,
+            MissionStatus::Active,
+            MissionStatus::Done,
+            MissionStatus::Cancelled,
+        ] {
+            assert!(
+                HUD_MISSION_STATUSES.contains(&st.as_str()),
+                "MissionStatus::{st:?} serializes as {:?}, which the HUD coerces away",
+                st.as_str()
+            );
+        }
     }
 
     #[test]

@@ -318,6 +318,14 @@ pub struct Candidate {
     /// RFC3339 timestamp when the source carries one (episodes / cloud items);
     /// `None` for the timeless sources (facts / world), and for docsearch.
     pub ts: Option<String>,
+    /// TRUE when `relevance` is a positive FLOOR meaning "this source was read and
+    /// returned content, but NOTHING in it matched the query" — not a real match.
+    /// Such a candidate is still surfaced (the read did return these items) but
+    /// [`fold`] ranks it BELOW every real match. The flag is needed because the
+    /// floor's MAGNITUDE cannot express that: relevance is max-normalized WITHIN a
+    /// source, so a source carrying exactly one candidate always normalizes to 1.0
+    /// no matter how small its raw score. Every real hit sets this `false`.
+    pub unmatched: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +476,10 @@ pub struct FanoutInputs {
 /// `(1-RECENCY_WEIGHT)*relevance_norm + RECENCY_WEIGHT*recency_norm`. The merged
 /// hits are sorted by final score DESC, with a STABLE deterministic tie-break
 /// (source order, then citation anchor) so the ranking is reproducible. Capped
-/// at `k`.
+/// at `k`. A candidate marked [`Candidate::unmatched`] (read, but nothing in it
+/// matched the query) is placed strictly BELOW every real match rather than
+/// scored against them — see the ranking body for why its raw score cannot do
+/// that on its own.
 pub fn fold(inputs: &FanoutInputs, k: usize) -> UnifiedResult {
     let k = k.clamp(1, UNIFIED_MAX_K);
     let mut coverage = Coverage::default();
@@ -628,7 +639,7 @@ fn rank_candidates(candidates: Vec<Candidate>, k: usize) -> Vec<UnifiedHit> {
 
     // 3. Blend, drop non-positive (irrelevant) candidates so we never surface a
     //    zero-relevance item, build the cited hit.
-    let mut hits: Vec<UnifiedHit> = candidates
+    let mut scored: Vec<(bool, UnifiedHit)> = candidates
         .into_iter()
         .filter(|c| c.relevance.is_finite() && c.relevance > 0.0)
         .map(|c| {
@@ -636,16 +647,45 @@ fn rank_candidates(candidates: Vec<Candidate>, k: usize) -> Vec<UnifiedHit> {
             let rel_norm = if src_max > 0.0 { c.relevance / src_max } else { 0.0 };
             let rec_norm = recency_of(c.ts.as_deref());
             let score = (1.0 - RECENCY_WEIGHT) * rel_norm + RECENCY_WEIGHT * rec_norm;
-            UnifiedHit {
-                source: c.source,
-                citation: c.citation,
-                title: c.title,
-                snippet: c.snippet,
-                score,
-                ts: c.ts,
-            }
+            (
+                c.unmatched,
+                UnifiedHit {
+                    source: c.source,
+                    citation: c.citation,
+                    title: c.title,
+                    snippet: c.snippet,
+                    score,
+                    ts: c.ts,
+                },
+            )
         })
         .collect();
+
+    // 3b. UNMATCHED candidates rank BELOW every real match. Their relevance is a
+    //     deliberate positive FLOOR ("this source was read and returned content, but
+    //     none of it matched") and the floor's magnitude is erased right above: step
+    //     1 max-normalizes WITHIN a source, so a source carrying a single candidate
+    //     — which is all the cloud-summary adapter ever produces — gets rel_norm 1.0
+    //     whatever its raw score. A 0.05 floor therefore scored 0.85, exactly TYING
+    //     the best docsearch hit, and a Gmail summary with zero query overlap came
+    //     back #2 in an answer headed "most relevant first", pushing real matches out
+    //     of the top-k. Placing them under the lowest real score keeps the read
+    //     visible (which is the point of the floor) without letting it outrank
+    //     anything that actually matched. With no real match to sit under, the
+    //     blended score stands.
+    let lowest_real = scored
+        .iter()
+        .filter(|(unmatched, _)| !*unmatched)
+        .map(|(_, h)| h.score)
+        .fold(f64::INFINITY, f64::min);
+    if lowest_real.is_finite() {
+        for (unmatched, h) in scored.iter_mut() {
+            if *unmatched {
+                h.score = lowest_real * 0.5;
+            }
+        }
+    }
+    let mut hits: Vec<UnifiedHit> = scored.into_iter().map(|(_, h)| h).collect();
 
     // 4. Deterministic sort: score DESC, then source order ASC, then citation
     //    anchor ASC — fully reproducible (no float-equality ambiguity left to
@@ -700,6 +740,7 @@ pub fn docsearch_candidates(hits: &[DocHit]) -> Vec<Candidate> {
             snippet: h.snippet.clone(),
             relevance: h.score,
             ts: None,
+            unmatched: false,
         })
         .collect()
 }
@@ -744,6 +785,7 @@ pub fn episodic_candidates(episodes: &[Episode], query: &str) -> Vec<Candidate> 
             },
             relevance: score,
             ts: Some(ep.ts.clone()),
+            unmatched: false,
         })
         .collect()
 }
@@ -773,6 +815,7 @@ pub fn facts_candidates(rows: &[(String, String)], query: &str) -> Vec<Candidate
             snippet: value.clone(),
             relevance: score,
             ts: None,
+            unmatched: false,
         })
         .collect()
 }
@@ -832,6 +875,7 @@ pub fn world_candidates(
             snippet: if attrs.is_empty() { e.name.clone() } else { attrs },
             relevance: scores[i],
             ts: None,
+            unmatched: false,
         });
     }
     for (j, r) in relationships.iter().enumerate() {
@@ -849,6 +893,7 @@ pub fn world_candidates(
             },
             relevance: scores[entity_count + j],
             ts: None,
+            unmatched: false,
         });
     }
     out
@@ -926,6 +971,7 @@ mod tests {
             snippet: text.to_string(),
             relevance,
             ts: Some(ts.to_string()),
+            unmatched: false,
         }
     }
 
@@ -1315,6 +1361,7 @@ mod tests {
             snippet: "3 recent message(s) about the launch".to_string(),
             relevance: 1.5,
             ts: None,
+            unmatched: false,
         };
         let inputs = FanoutInputs {
             gmail: Some(CloudInput::connected(vec![cloud])),
@@ -1328,6 +1375,54 @@ mod tests {
             Citation::CloudSource { read, .. } if read == "gmail recent messages"
         ));
         assert!(res.coverage.searched.contains(&Source::Gmail));
+    }
+
+    /// RANKING HONESTY: a cloud summary that matched NOTHING must not outrank a
+    /// real on-device hit. Its relevance is a deliberate positive FLOOR, and step 1
+    /// of the ranking max-normalizes WITHIN a source — the cloud-summary adapter
+    /// returns exactly one candidate, so the floor normalized to 1.0 and scored
+    /// 0.85: it TIED the best docsearch hit and came back #2, above three real
+    /// matches, in an answer headed "most relevant first".
+    #[test]
+    fn an_unmatched_cloud_summary_ranks_below_every_real_match() {
+        let cloud = Candidate {
+            source: Source::Gmail,
+            citation: Citation::CloudSource {
+                source: Source::Gmail,
+                read: "gmail recent messages".to_string(),
+                query: "quarterly revenue projections".to_string(),
+            },
+            title: "Gmail".to_string(),
+            snippet: "3 recent message(s): lunch thursday; gym renewal".to_string(),
+            // The floor: the read happened and returned content, but nothing in it
+            // matched the query.
+            relevance: 0.05,
+            ts: None,
+            unmatched: true,
+        };
+        let inputs = FanoutInputs {
+            docsearch: Some(DeviceInput::searched(docsearch_candidates(&[
+                doc("/notes/q3.md", "quarterly revenue projections for Q3", 3.2),
+                doc("/notes/plan.md", "the revenue plan", 1.1),
+                doc("/notes/misc.md", "projections appendix", 0.8),
+            ]))),
+            gmail: Some(CloudInput::connected(vec![cloud])),
+            ..Default::default()
+        };
+        let res = fold(&inputs, UNIFIED_DEFAULT_K);
+        let order: Vec<(Source, f64)> = res.hits.iter().map(|h| (h.source, h.score)).collect();
+        assert_eq!(res.hits.len(), 4, "the floored read is surfaced, not dropped: {order:?}");
+        // Every real match first; the unmatched read LAST...
+        assert_eq!(
+            res.hits[3].source,
+            Source::Gmail,
+            "an unmatched cloud read outranked a real on-device match: {order:?}"
+        );
+        // ...and strictly below the weakest of them, not merely tied with the best.
+        assert!(
+            res.hits[3].score < res.hits[2].score,
+            "the unmatched read must sit UNDER the lowest real score: {order:?}"
+        );
     }
 
     #[test]
