@@ -1180,4 +1180,65 @@ mod tests {
         );
     }
 
+    /// A PAD WIRED ONLY BY BOARD COPPER IS STILL WIRED.
+    ///
+    /// The ERC occupancy tally counts pads, wires, junctions and labels — the
+    /// SCHEMATIC entities. It never counted tracks, vias or zones, which are the
+    /// only things that carry a net on a PCB. So a pad whose net continues into
+    /// board copper (rather than into a second pad) had occupancy 1 and was
+    /// reported unconnected on a fully routed board.
+    ///
+    /// The two-pad case hides this — two pads make occupancy 2 on their own — so
+    /// this fixture has ONE pad and a track running away from it.
+    #[test]
+    fn a_pad_wired_only_to_a_track_is_not_unconnected() {
+        const ONE_PAD_ONE_TRACK: &str = r#"(kicad_pcb (version 20221018) (generator pcbnew)
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (net 0 "") (net 1 "GND")
+  (footprint "C:R" (layer "F.Cu") (at 100 100 0)
+    (pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (net 1 "GND")))
+  (segment (start 100 100) (end 120 100) (width 0.25) (layer "F.Cu") (net 1)))"#;
+        let mut scene = pcb(ONE_PAD_ONE_TRACK);
+        assert_eq!(scene.pads.len(), 1, "one pad");
+        assert_eq!(scene.tracks.len(), 1, "one track leaving it");
+        let g = build_pcb(&scene);
+        g.apply_nets(&mut scene);
+        // PRECONDITION: the pad and the track must actually share a net, or this
+        // is testing the wrong thing.
+        assert_eq!(
+            g.node_net(EntityRef::pad(0u32.into())),
+            g.node_net(EntityRef::track(0u32.into())),
+            "the pad and the track it lands on are one net"
+        );
+        let markers = crate::erc::run(&scene);
+        let unconnected: Vec<_> = markers
+            .iter()
+            .filter(|m| m.code == crate::ops::ErcCode::UnconnectedPin.as_str())
+            .collect();
+        assert!(
+            unconnected.is_empty(),
+            "the pad is wired to a track; ERC must not call it unconnected: {unconnected:?}"
+        );
+    }
+
+    /// ...and a genuinely floating pin still warns. Widening the occupancy tally
+    /// could have suppressed the rule entirely; this is the other direction.
+    #[test]
+    fn a_truly_floating_pin_is_still_reported() {
+        const LONE_PAD: &str = r#"(kicad_pcb (version 20221018) (generator pcbnew)
+  (layers (0 "F.Cu" signal) (31 "B.Cu" signal))
+  (net 0 "") (net 1 "GND")
+  (footprint "C:R" (layer "F.Cu") (at 100 100 0)
+    (pad "1" thru_hole circle (at 0 0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (net 1 "GND"))))"#;
+        let mut scene = pcb(LONE_PAD);
+        assert_eq!(scene.tracks.len(), 0, "nothing is wired to it");
+        let g = build_pcb(&scene);
+        g.apply_nets(&mut scene);
+        let markers = crate::erc::run(&scene);
+        assert!(
+            markers.iter().any(|m| m.code == crate::ops::ErcCode::UnconnectedPin.as_str()),
+            "a pad with no copper on its net IS unconnected and must be reported"
+        );
+    }
+
 }
