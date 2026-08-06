@@ -945,8 +945,58 @@ pub fn resolve_belief(profile: &Profile, key_or_term: &str) -> Vec<ProfileEntry>
     if query_terms(q).is_empty() {
         return Vec::new();
     }
-    filter_profile(profile.clone(), q).entries
+    // WHOLE-WORD, CONTENT-BEARING TERMS ONLY — the destructive path cannot use
+    // `filter_profile`'s substring match.
+    //
+    // WHAT WENT WRONG: this fell through to `filter_profile`, which tests
+    // `subject.contains(term) || observation.contains(term)`, and `query_terms`
+    // keeps every token of length >= 2. Every mined recurring-topic observation is
+    // "keeps coming back to <x>" — and "com-IN-g" contains "in".
+    //
+    // So "you're wrong about my interest in rust" tokenized to
+    // ["interest", "in", "rust"], the bare "in" matched EVERY recurring-topic
+    // belief, and `contest_belief` deleted and wrote a permanent suppression
+    // tombstone for each. router.rs calls it with no confirmation gate, and the
+    // spoken reply names only the beliefs it meant to drop — so the user heard "I
+    // have dropped that" and never learned what else went.
+    //
+    // `query()` keeps the looser behavior: over-collecting on a READ is a slightly
+    // noisy answer, while over-collecting here destroys learned data irreversibly.
+    let terms: Vec<String> = query_terms(q)
+        .into_iter()
+        .filter(|t| !RESOLVE_STOPWORDS.contains(&t.as_str()))
+        .collect();
+    if terms.is_empty() {
+        // Nothing but stopwords: the utterance named no belief. Resolving to
+        // everything here would be the whole-profile wipe this guard exists for.
+        return Vec::new();
+    }
+    profile
+        .entries
+        .iter()
+        .filter(|e| {
+            let subject = e.subject.replace('_', " ").to_lowercase();
+            let obs = e.observation.to_lowercase();
+            terms.iter().any(|t| {
+                crate::utterance::mentions_word(&subject, t)
+                    || crate::utterance::mentions_word(&obs, t)
+            })
+        })
+        .cloned()
+        .collect()
 }
+
+/// Tokens that carry no subject on the DESTRUCTIVE resolve path. A contest whose
+/// only terms are these names no belief, and must resolve to none rather than to
+/// all of them. Deliberately small: these are function words that appear inside
+/// the mined observation templates ("keeps coming back to …", "prefers … over …"),
+/// which is how a stray one collected the whole profile.
+const RESOLVE_STOPWORDS: &[&str] = &[
+    "the", "a", "an", "my", "me", "it", "its", "that", "this", "those", "these",
+    "in", "on", "at", "to", "of", "for", "is", "am", "are", "was", "were", "be",
+    "about", "with", "and", "or", "but", "so", "up", "back", "over", "keeps",
+    "keep", "coming", "come", "you", "your", "youre", "im", "ive",
+];
 
 /// One belief's EXPLANATION — the STORED observation, provenance, and observed-count
 /// for a belief the user asked about. Carries ONLY what is stored; an unknown belief
@@ -2062,4 +2112,92 @@ mod tests {
         assert_eq!(beliefs[0]["observed_count"], 5);
         assert_eq!(frame["suppressed"][0], "style_tone");
     }
+    /// A CONTEST MUST NOT TAKE BELIEFS IT DID NOT NAME.
+    ///
+    /// `resolve_belief` falls through to `filter_profile`, which matches by
+    /// SUBSTRING, and `query_terms` keeps every token of length >= 2. Every mined
+    /// recurring-topic observation is `"keeps coming back to <x>"` — and "com-IN-g"
+    /// contains "in".
+    ///
+    /// So "you're wrong about my interest in rust" tokenizes to
+    /// ["interest", "in", "rust"], the bare "in" matches EVERY recurring-topic
+    /// belief, and `contest_belief` deletes and writes a permanent suppression
+    /// tombstone for each one. router.rs calls it directly — there is no
+    /// confirmation gate — and the spoken reply names only the beliefs it meant to
+    /// drop, so the user never learns the others went with them.
+    #[test]
+    fn a_contest_does_not_collect_beliefs_by_a_stray_short_token() {
+        let profile = Profile {
+            entries: vec![
+                ProfileEntry {
+                    facet: Facet::Topic,
+                    subject: "rust".to_string(),
+                    observation: "keeps coming back to rust".to_string(),
+                    observed_count: 5,
+                    provenance: vec!["ep:1".to_string()],
+                },
+                ProfileEntry {
+                    facet: Facet::Topic,
+                    subject: "kubernetes".to_string(),
+                    observation: "keeps coming back to kubernetes".to_string(),
+                    observed_count: 3,
+                    provenance: vec!["ep:2".to_string()],
+                },
+            ],
+        };
+
+        // PRECONDITION: the stray token really is a substring of the OTHER
+        // belief's observation. If this stops holding the test proves nothing.
+        assert!(
+            profile.entries[1].observation.contains("in"),
+            "\"coming\" contains \"in\" — that is the whole mechanism"
+        );
+
+        let hit = resolve_belief(&profile, "my interest in rust");
+        let subjects: Vec<&str> = hit.iter().map(|e| e.subject.as_str()).collect();
+        assert!(
+            !subjects.contains(&"kubernetes"),
+            "contesting a belief about RUST must not also delete and permanently \
+             suppress the one about kubernetes: resolved {subjects:?}"
+        );
+        assert_eq!(subjects, vec!["rust"], "it should resolve exactly the one named");
+    }
+
+    /// ...and a contest that names nothing resolvable takes NOTHING, rather than
+    /// falling through to the whole profile.
+    #[test]
+    fn a_contest_of_pure_stopwords_resolves_nothing() {
+        let profile = Profile {
+            entries: vec![ProfileEntry {
+                facet: Facet::Topic,
+                subject: "rust".to_string(),
+                observation: "keeps coming back to rust".to_string(),
+                observed_count: 5,
+                provenance: vec!["ep:1".to_string()],
+            }],
+        };
+        for q in ["it", "that", "in", "of it", "about it"] {
+            assert!(
+                resolve_belief(&profile, q).is_empty(),
+                "{q:?} names no belief; it must not resolve (and delete) any"
+            );
+        }
+        // THE CASE WHOLE-WORD MATCHING ALONE DOES NOT CATCH. The mined
+        // observations are built from a template — "keeps coming back to <x>" —
+        // so its own words appear as WHOLE WORDS in every recurring-topic belief.
+        // Without the stopword filter, an utterance that happens to use one of
+        // them collects the entire set and deletes it.
+        assert!(
+            profile.entries[0].observation.split(' ').any(|w| w == "keeps"),
+            "the template word really is a whole word in the observation"
+        );
+        for q in ["what keeps coming up", "that thing you keep coming back to"] {
+            assert!(
+                resolve_belief(&profile, q).is_empty(),
+                "{q:?} names no SUBJECT — it only echoes the observation template, \
+                 and must not resolve (and delete) every mined belief"
+            );
+        }
+    }
+
 }
