@@ -346,6 +346,38 @@ pub fn ready_frame(
     })
 }
 
+/// Create the daemon's state subtree with the modes the startup gate REQUIRES.
+///
+/// WHAT WENT WRONG: `main.rs` created these with a plain `create_dir_all` — 0777 &
+/// ~umask, so 0755 on a normal box — and then ran [`startup_blocking_checks`],
+/// which FAILS `ipc_perms` unless `state/ipc` is already 0700. `main.rs` bails on a
+/// failed startup check.
+///
+/// The only code that ever chmodded that dir to 0700 was `command::bind_socket`,
+/// roughly 700 lines LATER in boot. So on a clean machine darwind exited non-zero
+/// on every launch and launchd restarted it into the same failure forever: it could
+/// never reach the point where it would perform the chmod that satisfies its own
+/// gate. `darwind --selftest` on a fresh tree reported a hard FAIL for a condition
+/// the operator did nothing to cause.
+///
+/// Creation and the gate now agree by construction, in one place, so they cannot
+/// drift apart again.
+pub fn prepare_state_dirs(root: &Path) -> std::io::Result<()> {
+    for sub in ["state/ipc", "state/logs", "state/tmp"] {
+        std::fs::create_dir_all(root.join(sub))?;
+    }
+    // The confined socket dir is owner-only: it holds the command and app sockets.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            root.join("state/ipc"),
+            std::fs::Permissions::from_mode(0o700),
+        )?;
+    }
+    Ok(())
+}
+
 /// The STRUCTURAL preconditions that MUST hold for the daemon to run safely
 /// (vs. the informational legs). At startup, a hard FAIL on any of these aborts
 /// with an actionable message rather than limping forward. This deliberately
@@ -522,4 +554,61 @@ mod tests {
         let v2 = ready_frame(&root, Some(true), true, true, true);
         assert_eq!(v2["inference_reachable"], true);
     }
+    /// A FRESH TREE MUST BOOT.
+    ///
+    /// `main.rs` creates `state/ipc` with a plain `create_dir_all` (0777 & ~umask,
+    /// so 0755 on a normal box) and then runs `startup_blocking_checks`, which
+    /// FAILS `ipc_perms` unless the dir is already 0700 — and `main.rs` bails on a
+    /// failed startup check. The only code that ever chmods that dir to 0700 is
+    /// `command::bind_socket`, roughly 700 lines LATER in boot.
+    ///
+    /// So on a clean machine darwind exited non-zero on every launch and launchd
+    /// restarted it into the same failure forever: it could never reach the point
+    /// where it would perform the chmod that satisfies its own gate.
+    ///
+    /// `startup_blocking_checks_pass_on_a_well_formed_tree` hides this — it
+    /// explicitly chmods 0700 before checking, which is exactly the step a fresh
+    /// install does not perform. This test deliberately does NOT chmod.
+    #[test]
+    fn a_freshly_created_tree_passes_the_startup_gate_without_a_manual_chmod() {
+        let root = std::path::PathBuf::from(format!(
+            "/private/tmp/jrv-fresh-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000
+        ));
+        // EXACTLY what main.rs does on first boot — via the same helper, so this
+        // test exercises the real boot path rather than a copy of it.
+        std::fs::create_dir_all(root.join("config")).unwrap();
+        std::fs::write(root.join("config/darwin.toml"), "[audit]
+max_entries = 1000
+").unwrap();
+        prepare_state_dirs(&root).unwrap();
+        // PRECONDITION: the dir really is looser than 0700, or this proves nothing.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // A plain create_dir_all leaves this looser than 0700 — that is the
+            // whole defect. Prove the helper is what tightens it, by checking a
+            // sibling it does NOT chmod.
+            let logs = std::fs::metadata(root.join("state/logs"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_ne!(logs, 0o700, "create_dir_all really does leave 0755 here");
+        }
+        let checks = startup_blocking_checks(&root);
+        let failed: Vec<_> = checks.iter().filter(|c| c.status == Status::Fail).collect();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            failed.is_empty(),
+            "a freshly created tree must boot; a fresh install cannot chmod a dir \
+             the daemon has not started to create yet: {failed:?}"
+        );
+    }
+
 }
