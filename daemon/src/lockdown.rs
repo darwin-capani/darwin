@@ -68,12 +68,24 @@ const MARKER_FILE: &str = "lockdown";
 
 /// The honest spoken confirmation [`panic`] returns. Names exactly what the stop
 /// does — and, critically, what it does NOT do. The HUD echoes the same copy.
+/// WHAT WENT WRONG: this used to end "Say 'unlock' or use the panic control in
+/// Settings to resume." The first half is impossible, and the same sentence says
+/// so two clauses earlier — the panic stops THE MICROPHONE. `audio.rs` drops
+/// every chunk while locked (`mic_capture_suppressed(is_locked_down())`), ahead
+/// of the VAD, so no utterance is ever produced and `router`'s spoken-unlock arm
+/// is never reached. The user was told to speak to a mic that had just been shut
+/// off, and got no response at all — not even a refusal, because nothing was
+/// listening. Recovery has only ever been possible through the HUD.
 pub const PANIC_CONFIRMATION: &str = "Lockdown engaged. I've stopped all future outward actions, \
      all autonomy, and the microphone immediately, and this persists across a restart until you \
-     unlock. I can't undo anything already done — a sent message stays sent. Say 'unlock' or use \
-     the panic control in Settings to resume.";
+     unlock. I can't undo anything already done — a sent message stays sent. Use the panic \
+     control in Settings to resume — I've stopped listening, so I won't hear you say it.";
 
 /// The honest spoken confirmation [`unlock`] returns.
+/// The honest answer when an unlock arrives with no lockdown engaged.
+pub const NOTHING_TO_UNLOCK: &str =
+    "There's no lockdown engaged, sir — nothing to lift. Your settings are as you left them.";
+
 pub const UNLOCK_CONFIRMATION: &str =
     "Lockdown lifted. Your configured settings are restored — nothing was changed underneath them.";
 
@@ -302,6 +314,14 @@ pub async fn panic() -> &'static str {
 ///   3. Best-effort AUDIT the unlock event.
 ///   4. Return the honest spoken confirmation.
 pub async fn unlock() -> &'static str {
+    // Nothing was locked: say so rather than announcing a lift that did not
+    // happen. The arm is reachable when NOT locked down (the HUD verb, and the
+    // spoken intent on a normal turn), where it used to answer "Lockdown lifted.
+    // Your configured settings are restored" — describing an event that never
+    // occurred.
+    if !is_locked_down() {
+        return NOTHING_TO_UNLOCK;
+    }
     set_flag(false);
     remove_marker();
     // The authoritative HUD posture event — the twin of panic()'s emit, so the
@@ -823,4 +843,46 @@ mod tests {
             "off default: the gate is exactly its configured value, no lockdown effect"
         );
     }
+    /// THE PANIC CONFIRMATION MUST NOT TELL THE USER TO SPEAK TO A DEAD MIC.
+    ///
+    /// It used to end "Say 'unlock' or use the panic control in Settings to
+    /// resume" — while the same sentence, two clauses earlier, says the panic
+    /// stopped THE MICROPHONE. `audio.rs` drops every chunk while locked
+    /// (`mic_capture_suppressed(is_locked_down())`) ahead of the VAD, so no
+    /// utterance is produced and router's spoken-unlock arm is never reached.
+    ///
+    /// The user said "panic", was told to say "unlock", and got NOTHING — not even
+    /// a refusal, because nothing was listening.
+    #[test]
+    fn the_panic_confirmation_names_only_a_surface_that_works() {
+        let msg = PANIC_CONFIRMATION.to_lowercase();
+        assert!(
+            msg.contains("settings"),
+            "it must name the HUD control, which is the only working recovery"
+        );
+        assert!(
+            !msg.contains("say 'unlock'") && !msg.contains("say \"unlock\""),
+            "it must NOT tell the user to speak: the same message says the mic was \
+             just stopped, and audio.rs drops every chunk while locked"
+        );
+        // The mic really is suppressed while locked — the premise of the above.
+        assert!(
+            crate::audio::mic_capture_suppressed_for_test(true),
+            "a live lockdown suppresses capture; if this changes, voice unlock may \
+             become possible and this message should be revisited"
+        );
+        assert!(!crate::audio::mic_capture_suppressed_for_test(false));
+    }
+
+    /// An unlock with nothing locked must not announce a lift that never happened.
+    #[tokio::test]
+    async fn unlocking_when_nothing_is_locked_says_so() {
+        set_flag(false);
+        assert_eq!(
+            unlock().await,
+            NOTHING_TO_UNLOCK,
+            "no lockdown engaged -> say so, do not claim settings were restored"
+        );
+    }
+
 }

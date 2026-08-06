@@ -1117,6 +1117,14 @@ fn mic_capture_suppressed(locked: bool) -> bool {
     locked
 }
 
+/// Test-only view of the capture gate, so `lockdown`'s messaging test can assert
+/// the premise it depends on: that a live lockdown really does stop the mic, and
+/// therefore that telling the user to SAY "unlock" would be a lie.
+#[cfg(test)]
+pub(crate) fn mic_capture_suppressed_for_test(locked: bool) -> bool {
+    mic_capture_suppressed(locked)
+}
+
 /// Mono RMS of one interleaved chunk (channels averaged) — for barge-in
 /// detection. One cheap pass, no allocation.
 fn chunk_rms(chunk: &[f32], channels: usize) -> f32 {
