@@ -1439,7 +1439,7 @@ pub async fn route(
     // isolation holds (no agent acts through another agent's exclusive tool).
     // The final selection is announced as agent.active so the HUD highlights
     // it and the core color shifts to its hue.
-    let agent = select_agent(agents, &class.intent, text, cloud_reachable, to_cloud);
+    let agent = select_agent(agents, &class.intent, text, cloud_reachable);
     emit_agent_active(agent);
     // OBOL: note the handling agent so a cloud spend row this turn attributes cost
     // to it (a secret-free agent NAME, never an utterance). No-op accounting seam.
@@ -2666,9 +2666,29 @@ fn cloud_model_for_world_update() -> &'static str {
 
 /// Darwin-Prime delegation wrapper: pick the agent for this turn. Cloud
 /// reachability gates the offline-survival route (hulk owns conversational
-/// turns when the cloud is unreachable). `to_cloud` is whether THIS turn is
-/// already heading to the cloud — if it is, the cloud is by definition
-/// reachable for this turn, so the offline route never fires spuriously.
+/// turns when the cloud is unreachable).
+///
+/// WHAT WENT WRONG: this used to take a `to_cloud` flag and compute
+/// `effective_cloud = cloud_reachable || to_cloud`, justified by "if THIS turn is
+/// already heading to the cloud, the cloud is by definition reachable for it".
+/// The call site establishes no such thing. `to_cloud` is
+/// `deny_cloud(deny_cloud(wants_cloud(class, cfg)))`, and `wants_cloud` reads
+/// ONLY the classifier's complexity/confidence — while `cloud_reachable` is
+/// `resolve_api_key().is_some()`. So on a KEYLESS install every heavy (or
+/// below-threshold) turn had `to_cloud = true, cloud_reachable = false`, the OR
+/// forced `effective_cloud = true`, and HULK — the agent that exists precisely
+/// for "the cloud is unreachable" — was never selected. The turn was attributed
+/// to darwin, recorded in the wrong memory namespace, spoken in the wrong
+/// persona, and (for the heavy+confident case) route() first made a
+/// guaranteed-to-fail `complete_with_tools` call that logged
+/// `error!("cloud completion failed; degrading to local generate")` on EVERY such
+/// turn — the exact ERROR level the self-heal burst detector counts.
+///
+/// The `to_cloud` argument is gone rather than ANDed in: `cloud_reachable && to_cloud`
+/// would send an ordinary LIGHT conversation turn (to_cloud=false) to hulk even
+/// with a working key, which is a different wrong answer. Reachability alone is
+/// the right gate, and it is the only thing `AgentRegistry::select`'s offline
+/// route ever meant to read.
 ///
 /// SMARTER ROUTING: the deterministic intent map + keyword cues
 /// (`AgentRegistry::select`) stay the fast, authoritative FIRST PASS. A SEMANTIC
@@ -2688,10 +2708,8 @@ fn select_agent<'a>(
     intent: &str,
     text: &str,
     cloud_reachable: bool,
-    to_cloud: bool,
 ) -> &'a Agent {
-    let effective_cloud = cloud_reachable || to_cloud;
-    agents.select_with_fallback(intent, text, effective_cloud, &crate::agents::LexicalAgentScorer)
+    agents.select_with_fallback(intent, text, cloud_reachable, &crate::agents::LexicalAgentScorer)
 }
 
 /// Handle a RUNBOOK voice command (runbook.rs): PLAN (PURE, read-only render of the
@@ -2870,7 +2888,10 @@ async fn handle_runbook_command(
 }
 
 /// Handle a non-replay MACRO control command (#27): start/stop recording, list, or
-/// forget. Gated by [macros].enabled (OFF by default): with it off every verb
+/// forget. Gated by [macros].enabled, which SHIPS ON (full-power default; replay
+/// re-gates each step) — this line said "OFF by default" long after the flag
+/// flipped, which is the same stale sentence macros.rs already had to correct in
+/// its own header. With the switch explicitly off every verb
 /// reports the subsystem is off and changes NOTHING. Recording captures only the
 /// utterance + intent (redacted at persist time), so a secret is never stored, and
 /// it never changes a gate. Emits HUD telemetry. (Replay is driven by the turn loop
@@ -3067,7 +3088,30 @@ pub fn classify_music_intent(text: &str) -> Option<String> {
     let lower = lower.trim();
 
     const OBJECTS: &[&str] = &["song", "track", "tune", "beat", "jingle", "melody", "riff"];
-    let has_object = OBJECTS.iter().any(|o| lower.contains(o));
+    // WHAT WENT WRONG: the verb side was already word-anchored but the OBJECT side
+    // was a bare `contains`, so "tracking", "track record", "heartbeat", "beaten",
+    // "fortune" and "tuner" all counted as a music object. With `[voice]
+    // .cloud_music` shipping true, "write down my tracking number" therefore never
+    // reached memory.store: route() spawned a JEROME composition on the prompt
+    // "down my tracking number" and replied "Composing your track now, sir" — the
+    // user's note simply lost, with no error. Same for "make a note about the
+    // heartbeat monitor" and "write down the tuner settings". The same
+    // misclassification also made `guest_denied_fast_path` refuse those turns as
+    // "music generation". Whole-word matching, the same primitive the destructive-
+    // verb classifiers use.
+    //
+    // Whole words are still not enough for a fixed compound in which the music
+    // noun is the MODIFIER — "my track record" contains the standalone word
+    // "track". Those are a short, closed list, so blank them before the scan
+    // rather than widening the rule.
+    const OBJECT_COMPOUNDS: &[&str] = &["track record", "track records", "beat cop"];
+    let mut scan = lower.to_string();
+    for c in OBJECT_COMPOUNDS {
+        if scan.contains(c) {
+            scan = scan.replace(c, " ");
+        }
+    }
+    let has_object = crate::utterance::mentions_any_word(&scan, OBJECTS);
 
     // The creation verb must appear as a leading/standalone word, not buried in a
     // longer token. `compose` anchors on its own (inherently musical); the broader
@@ -3387,6 +3431,21 @@ fn guest_denied_fast_path(text: &str, cfg: &Config) -> Option<&'static str> {
     }
     if crate::macros::classify_macro_command(text).is_some() {
         return Some("saved macros");
+    }
+    // WHAT WENT WRONG: the RUNBOOK arm was the ONE route() fast path missing from
+    // this mirror, and it is the only one that EXECUTES TOOLS. `route()` reaches
+    // `handle_runbook_command` -> `runbook::run` -> `LiveRunbookRouter::route_step`
+    // -> `anthropic::execute_tool` under the ORCHESTRATOR's `["*"]` allowlist, so
+    // an unrecognized speaker under an auto-installed guest scope could say "run
+    // the runbook morning" and drive the owner's automation DAG — benign steps
+    // outright, and "plan the runbook <name>" leaks the owner's runbook structure
+    // to a bystander. `macros::classify_macro_command` does NOT cover it (it only
+    // strips "run the macro "/"run macro "), and the analogous macro REPLAY path
+    // was hand-guarded one level up in main.rs while this one was not. Refused
+    // here regardless of `[runbook].enabled` — the gate is deny-by-default and
+    // must not depend on a config the guest can't see.
+    if crate::runbook::classify_runbook_command(text).is_some() {
+        return Some("runbooks");
     }
     if crate::journal::classify_undo_command(text).is_some() {
         return Some("undo history");
@@ -4141,6 +4200,39 @@ fn project_root() -> std::path::PathBuf {
 /// 100% on-device: file contents + embeddings never leave the device, and when the
 /// on-device embedder is down the chunks are stored vector-less so search falls
 /// back to BM25. Returns an honest status line (or the off/not-configured message).
+/// The honest spoken reply for a completed reindex. PURE over the three counts,
+/// so the diagnosis it hands the user is unit-testable.
+///
+/// WHAT WENT WRONG: this was two inline arms — "on-device embeddings" when
+/// `embedded_chunks == chunks && chunks > 0`, else "the on-device embedder was
+/// unavailable". `DocIndex::reindex` returns WHOLE-STORE counts, so a root with
+/// nothing indexable in it yields files=0, chunks=0, embedded_chunks=0: `0 == 0`
+/// holds but `chunks > 0` does not, so the EMPTY case fell into the embedder-
+/// failure arm. The user was told, specifically and falsely, that the on-device
+/// embedder was down — about an embedder that was never even asked — and went off
+/// to debug the inference server when the real problem was an allowlist matching
+/// no indexable file. In a subsystem whose whole contract is honest status
+/// reporting, that is a wrong answer the user acts on.
+fn reindex_reply(files: u64, chunks: u64, embedded_chunks: u64) -> String {
+    if chunks == 0 {
+        return format!(
+            "I found nothing to index in your allowlisted folders, sir — {files} file(s), \
+             0 chunks. Nothing left the machine. Check `[docsearch].roots`: the folders \
+             listed there hold no indexable text (the embedder was never asked, so this \
+             is not an embedder problem)."
+        );
+    }
+    let method = if embedded_chunks == chunks {
+        "on-device embeddings"
+    } else {
+        "lexical BM25 (the on-device embedder was unavailable, so search will be keyword-based)"
+    };
+    format!(
+        "Indexed {files} file(s) into {chunks} chunk(s) from your allowlisted folders — \
+         all on-device, nothing left the machine. Search will use {method}."
+    )
+}
+
 async fn handle_docsearch_index() -> String {
     use crate::docsearch::index_documents;
     let root = project_root();
@@ -4176,16 +4268,7 @@ async fn handle_docsearch_index() -> String {
                     "embedded_chunks": status.embedded_chunks,
                 }),
             );
-            let method = if status.embedded_chunks == status.chunks && status.chunks > 0 {
-                "on-device embeddings"
-            } else {
-                "lexical BM25 (the on-device embedder was unavailable, so search will be keyword-based)"
-            };
-            format!(
-                "Indexed {} file(s) into {} chunk(s) from your allowlisted folders — all on-device, \
-                 nothing left the machine. Search will use {}.",
-                status.files, status.chunks, method
-            )
+            reindex_reply(status.files, status.chunks, status.embedded_chunks)
         }
         Ok(None) => "On-device file search isn't configured to index anything yet.".to_string(),
         Err(e) => {
@@ -5973,11 +6056,23 @@ fn asks_what_is_on_screen(lower: &str) -> bool {
 /// this for me", "read that out", "read this to me"). An OBJECT after it ("read
 /// this BOOK", "read that EMAIL", "read this MORNING") means the user is talking
 /// about something else entirely.
+///
+/// WHAT WENT WRONG, AGAIN: the paragraph above listed "can you read that back to
+/// me" as one of the sentences the two locks had closed — and it had not. "can"
+/// is a modal, so `vision_verb_in_command_position` forgives the bare subject
+/// "you" and the verb still reads as a command; then "back" was in OK_TAIL, so
+/// the tail lock passed too. The user dictates a message, asks DARWIN to repeat
+/// it, and instead the daemon fires a whole-screen ScreenCaptureKit OCR
+/// (`read.screen`), answers "Reading your screen now, sir…", and — because the
+/// dispatch is an else-if chain — never answers what was actually asked. "read
+/// that back (to me)" is the REPEAT-WHAT-I-SAID idiom in English, never a request
+/// to OCR the display, so "back" is not a directional tail and is no longer
+/// accepted as one.
 fn reads_this_or_that(lower: &str) -> bool {
     if !vision_verb_in_command_position(lower, &["read"]) {
         return false;
     }
-    const OK_TAIL: &[&str] = &["for", "out", "aloud", "please", "now", "again", "back"];
+    const OK_TAIL: &[&str] = &["for", "out", "aloud", "please", "now", "again"];
     let mut it = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty());
     for w in it.by_ref() {
         if w == "read" {
@@ -6279,27 +6374,70 @@ fn extract_video_path(lower: &str) -> Option<String> {
 /// Extract a sensitivity value in 0..=1 from a "set sensitivity to <X>" phrase.
 /// Accepts a bare 0..1 float ("0.7"), a percent ("70 percent"/"70%"), or the
 /// words low/medium/high. None when no value is present. Clamped to 0..=1.
+///
+/// WHAT WENT WRONG: the word arms ran FIRST and matched with `contains`, so the
+/// VERB supplied the value and the user's explicit number was never read. "lower
+/// the sensitivity to 0.1" wrote 0.25 — 2.5x what was asked for, on the ONE
+/// state-mutating op in the whole Vision seam — and "lower the sensitivity to 30
+/// percent" wrote the same 0.25. The gate above already knows about this reading
+/// ("`extract_sensitivity` reads 'lower' as 'low'"), but the earlier fix only
+/// tightened the GATE; the extractor was left alone, so every utterance the
+/// tightened gate now admits with the verb "lower" still got the wrong value. The
+/// acknowledgment says nothing about the value, so the user could not tell.
+///
+/// Three passes, in this order:
+///   1. a number INTRODUCED BY A VALUE CONNECTOR ("to 0.1", "at 70%") — what the
+///      user explicitly asked for always beats a word the verb happens to carry;
+///   2. the word forms, matched WHOLE-WORD so "below"/"allow"/"slow" cannot
+///      supply a threshold (the comparatives are listed by hand because "set the
+///      sensitivity higher/lower" is a real supported phrasing — see
+///      VISION_OBJECT_TAILS — that bare "high"/"low" would drop);
+///   3. any remaining number, for the connector-free "set sensitivity 0.3".
+///
+/// Pass 1 is anchored on the connector rather than simply run first so that a
+/// stray count elsewhere in the sentence ("set the sensitivity to high on camera
+/// 2") cannot be mistaken for the threshold.
 fn extract_sensitivity(lower: &str) -> Option<f64> {
-    if lower.contains("low") {
+    // Percent if the utterance carries a '%' or the word "percent"; a value > 1
+    // is also read as a percent (nobody means a sensitivity of 70.0).
+    let is_percent = lower.contains('%') || lower.contains("percent");
+    let as_value = |n: f64| {
+        let v = if is_percent || n > 1.0 { n / 100.0 } else { n };
+        v.clamp(0.0, 1.0)
+    };
+    // The tokens, with '%' as a boundary so "70%" yields "70".
+    let toks: Vec<&str> = lower
+        .split(|c: char| c.is_whitespace() || c == '%')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+
+    // (1) A number the user introduced with a connector.
+    const VALUE_CONNECTORS: &[&str] = &["to", "at", "of"];
+    for w in toks.windows(2) {
+        if VALUE_CONNECTORS.contains(&w[0]) {
+            if let Ok(n) = w[1].parse::<f64>() {
+                return Some(as_value(n));
+            }
+        }
+    }
+
+    // (2) The word forms, WHOLE-WORD.
+    if crate::utterance::mentions_any_word(lower, &["low", "lower", "lowest", "min", "minimum"]) {
         return Some(0.25);
     }
-    if lower.contains("medium") || lower.contains("normal") {
+    if crate::utterance::mentions_any_word(lower, &["medium", "normal", "mid", "moderate"]) {
         return Some(0.5);
     }
-    if lower.contains("high") || lower.contains("max") {
+    if crate::utterance::mentions_any_word(lower, &["high", "higher", "highest", "max", "maximum"])
+    {
         return Some(0.85);
     }
-    // A numeric token: percent if it has a '%' or the word "percent" follows, or
-    // is > 1; otherwise a bare 0..1 float.
-    let is_percent = lower.contains('%') || lower.contains("percent");
-    for tok in lower.split(|c: char| c.is_whitespace() || c == '%') {
-        let t = tok.trim();
-        if t.is_empty() {
-            continue;
-        }
+
+    // (3) Any remaining number ("set sensitivity 0.3").
+    for t in toks {
         if let Ok(n) = t.parse::<f64>() {
-            let v = if is_percent || n > 1.0 { n / 100.0 } else { n };
-            return Some(v.clamp(0.0, 1.0));
+            return Some(as_value(n));
         }
     }
     None
@@ -7314,22 +7452,59 @@ fn extract_image_prompt(text: &str) -> Option<String> {
     // with that mismatched offset could land mid-codepoint (or past the end) and
     // PANIC the whole daemon on an STT transcript carrying such a character.
     let bytes = text.as_bytes();
-    let mut best_start: Option<usize> = None;
-    for (i, _) in text.char_indices() {
-        for c in CONNECTORS {
-            let cb = c.as_bytes(); // connectors are ASCII
-            if i + cb.len() <= bytes.len() && bytes[i..i + cb.len()].eq_ignore_ascii_case(cb) {
-                // ASCII connector -> `i + cb.len()` is a valid char boundary.
-                let tail = i + cb.len();
-                // Prefer the EARLIEST connector so "a picture of X with Y" keeps
-                // the full "X with Y" subject rather than starting at " with ".
-                if best_start.is_none_or(|b| tail < b) {
-                    best_start = Some(tail);
+    // WHAT WENT WRONG: this scanned the WHOLE utterance and kept the earliest
+    // connector, while the caller's comment promised "the first such connector
+    // AFTER an image noun is where the subject begins". For "instead of a photo,
+    // make a drawing of the house" the earliest connector is the "of" in "instead
+    // of", so the prompt handed to the on-device diffusion model was "a photo,
+    // make a drawing of the house" — the user got an image of something they did
+    // not ask for. Both halves of the gate pass for that sentence ("make" +
+    // "photo") and `describe_command` returns None, so it really did route.
+    //
+    // Only connectors that START AT OR AFTER the first image noun are considered;
+    // with no image noun before any connector this falls back to the old
+    // whole-text scan, so nothing that used to extract stops extracting.
+    const IMAGE_NOUNS: &[&str] = &[
+        "image", "picture", "photo", "drawing", "painting", "illustration", "artwork", "art ",
+    ];
+    let first_noun = {
+        let mut best: Option<usize> = None;
+        for (i, _) in text.char_indices() {
+            for n in IMAGE_NOUNS {
+                let nb = n.as_bytes(); // image nouns are ASCII
+                if i + nb.len() <= bytes.len() && bytes[i..i + nb.len()].eq_ignore_ascii_case(nb) {
+                    best = Some(best.map_or(i, |b: usize| b.min(i)));
                 }
             }
         }
-    }
-    let start = best_start?;
+        best
+    };
+    let scan = |floor: usize| -> Option<usize> {
+        let mut best_start: Option<usize> = None;
+        for (i, _) in text.char_indices() {
+            if i < floor {
+                continue;
+            }
+            for c in CONNECTORS {
+                let cb = c.as_bytes(); // connectors are ASCII
+                if i + cb.len() <= bytes.len() && bytes[i..i + cb.len()].eq_ignore_ascii_case(cb) {
+                    // ASCII connector -> `i + cb.len()` is a valid char boundary.
+                    let tail = i + cb.len();
+                    // Prefer the EARLIEST qualifying connector so "a picture of X
+                    // with Y" keeps the full "X with Y" subject rather than
+                    // starting at " with ".
+                    if best_start.is_none_or(|b| tail < b) {
+                        best_start = Some(tail);
+                    }
+                }
+            }
+        }
+        best_start
+    };
+    let start = match first_noun {
+        Some(n) => scan(n).or_else(|| scan(0))?,
+        None => scan(0)?,
+    };
     Some(text[start..].to_string())
 }
 
@@ -7571,8 +7746,10 @@ async fn capture_screen_frame(
 //     vision.error, never a fabricated label.
 //   * The one-shot "what was that sound" intent runs on a clip the daemon ALREADY
 //     has — it opens NO new microphone. CONTINUOUS ambient monitoring is the
-//     SEPARATE opt-in [audio].sound_monitor path (OFF + pinned, TCC/mic-gated,
-//     never always-on without consent — see `ambient_monitor_should_start`).
+//     SEPARATE [audio].sound_monitor path, which SHIPS ON (opt-OUT, not opt-in —
+//     this line used to say "OFF", which was simply wrong) and is TCC/mic-gated:
+//     macOS consent, not the flag, is what keeps it inert on a fresh install.
+//     See `ambient_monitor_should_start`.
 // ===========================================================================
 
 /// An "identify this sound" turn: the SOUND-identify intent fired, carrying the
@@ -7765,10 +7942,18 @@ async fn handle_identify_sound(
 /// returns true, the actual ambient capture is device-gated and is NOT exercised
 /// here (the one-shot intent + this gate are what the tests cover).
 ///
-/// PRIVACY: continuous ambient listening without explicit consent is a liability
-/// — so the ONLY path to a running monitor is this opt-in switch. There is no
-/// tool/agent/model route that can flip it (it lives in the user-owned config),
-/// and no default-on / auto-arm anywhere.
+/// PRIVACY — READ THIS CAREFULLY, BECAUSE IT USED TO SAY THE OPPOSITE. This
+/// paragraph claimed the switch was "opt-in" with "no default-on / auto-arm
+/// anywhere". That was FALSE, and it inverted the load-bearing privacy fact about
+/// the daemon's CONTINUOUS ambient-microphone path in the first place an auditor
+/// looks: `[audio].sound_monitor` ships **true** (config.rs `impl Default for
+/// AudioConfig`, `config/darwin.toml`, and this file's own
+/// `sound_monitor_ships_on_and_keys_are_known` test all say so), so on a default
+/// config this function returns TRUE and main.rs takes the OPTED-IN branch. The
+/// switch is therefore opt-OUT, and the only thing keeping the monitor inert on a
+/// fresh install is macOS mic/TCC consent — NOT the flag. What IS true: the flag
+/// lives in the user-owned config, so no tool/agent/model route can flip it, and
+/// an operator who sets `sound_monitor = false` gets a monitor that never starts.
 pub fn ambient_monitor_should_start(sound_monitor_enabled: bool) -> bool {
     sound_monitor_enabled
 }
@@ -7870,8 +8055,23 @@ pub fn nexus_command(text: &str) -> Option<NexusCommand> {
         && (nexus_hardware_context(&lower) || nexus_bare_mute_phrase(&lower))
     {
         let unmute = mentions_word(&lower, "unmute") || lower.contains("un-mute");
-        let channel = extract_channel(&lower, "input").unwrap_or(NEXUS_MIC_INPUT);
-        return Some(NexusCommand::Op(op_gain_mute(channel, !unmute)));
+        // WHAT WENT WRONG: the stage was hard-coded "input" and the channel was
+        // always resolved against "input", while NEXUS_BARE_MUTE_VOCAB
+        // deliberately admits the OUTPUT-side nouns ("speaker(s)",
+        // "headphone(s)", "monitor", "output(s)"). So "mute the speakers" muted
+        // the SM7dB MICROPHONE and left the speakers playing — an unrequested mic
+        // mute reached through a legitimate command, which is the exact failure
+        // this file spends paragraphs preventing elsewhere — and a later "unmute
+        // the speakers" un-muted the mic. `set_output_mute` was unreachable from
+        // voice at all, even though the app dispatches on the stage
+        // (apps/nexus/main.py `_gain_set`). Same stage resolution as the gain
+        // branch now.
+        let (stage, channel) = if mentions_output(&lower) {
+            ("output", extract_channel(&lower, "output").unwrap_or(NEXUS_MONITOR_OUT))
+        } else {
+            ("input", extract_channel(&lower, "input").unwrap_or(NEXUS_MIC_INPUT))
+        };
+        return Some(NexusCommand::Op(op_gain_mute(channel, !unmute, stage)));
     }
 
     // --- gain set ----------------------------------------------------------
@@ -8641,15 +8841,32 @@ fn nexus_bare_levels_read(lower: &str) -> bool {
     })
 }
 
-/// Whether the utterance names an OUTPUT channel (so a gain.set targets the
-/// output stage rather than the default input). "output", "out", "speaker(s)",
-/// "headphone(s)", "monitor" all name the output side.
+/// Whether the utterance names an OUTPUT channel (so a gain.set / a mute targets
+/// the output stage rather than the default input).
+///
+/// WHAT WENT WRONG: this doc used to claim that "output", "out", "speaker(s)",
+/// "headphone(s)" and "monitor" "all name the output side" — but the body checked
+/// only five words, and "monitor" was not one of them. That is not academic:
+/// `NEXUS_GAIN_NOUNS` deliberately lists "monitor"/"monitors" (its own comment
+/// says the gain idioms name the monitor side), so "set the monitor gain to -12
+/// db" passed `nexus_head_names_a_channel`, fired the gain branch, fell to the
+/// INPUT arm, and attenuated the SM7dB microphone 12 dB. The user turns down what
+/// they hear and instead their voice goes quiet to everyone else — decided purely
+/// by whether they said "monitor" or "speaker".
+///
+/// "monitor"/"monitors" are now checked. "out" deliberately is NOT: it is far too
+/// common a word to bind a stage on ("check it out", "the mic cut out"), and no
+/// shipped idiom needs it — that half of the old claim is simply dropped rather
+/// than implemented.
 fn mentions_output(lower: &str) -> bool {
     contains_word(lower, "output")
+        || contains_word(lower, "outputs")
         || contains_word(lower, "speaker")
         || contains_word(lower, "speakers")
         || contains_word(lower, "headphone")
         || contains_word(lower, "headphones")
+        || contains_word(lower, "monitor")
+        || contains_word(lower, "monitors")
 }
 
 /// Extract the integer channel index following a `kind` keyword ("input" /
@@ -8743,11 +8960,27 @@ fn extract_preset_name(lower: &str) -> Option<String> {
                 | "presets" | "please" | "to" | "for" | "me" | "up"
         )
     };
-    // Prefer the token AFTER "preset" ("load preset vocal"); else the token
-    // BEFORE it ("load the vocal preset").
-    if let Some(after) = words.get(pos + 1) {
-        if is_name(after) {
-            return Some((*after).to_string());
+    // WHAT WENT WRONG: this preferred the token AFTER "preset" UNCONDITIONALLY,
+    // and `is_name` only rejects a short command/politeness list — so any trailing
+    // word became the preset name. "load the vocal preset now" loaded a preset
+    // called "now", "…preset again" -> "again", "…preset thanks" -> "thanks",
+    // "load the podcast preset darwin" -> "darwin". Nexus then rejects the unknown
+    // name, but `handle_nexus` has already said "Forwarded that to the mixer", so
+    // the user believes the vocal preset is live while the routing/gain is
+    // unchanged — and if a preset ever WERE named after a filler word, the wrong
+    // one would load and rewrite the whole matrix.
+    //
+    // The doc above always described the right rule: take the following token
+    // only when "preset" LEADS ("load preset vocal"). Otherwise the name is the
+    // token BEFORE it, which is what "load the <name> preset" means. `pos == 0`
+    // is not enough on its own — "load preset vocal" has "load" in front — so
+    // "leads" means: nothing but command/filler words precede it.
+    let preset_leads = words[..pos].iter().all(|w| !is_name(w));
+    if preset_leads {
+        if let Some(after) = words.get(pos + 1) {
+            if is_name(after) {
+                return Some((*after).to_string());
+            }
         }
     }
     if pos > 0 {
@@ -8771,8 +9004,8 @@ fn extract_preset_name(lower: &str) -> Option<String> {
 // NOT the Vision `{"type":"op"}` envelope). serde_json builds each so a preset
 // name with a quote can never break the JSON framing.
 
-fn op_gain_mute(channel: u32, mute: bool) -> String {
-    json!({"op": "gain.set", "channel": channel, "mute": mute, "stage": "input"}).to_string()
+fn op_gain_mute(channel: u32, mute: bool, stage: &str) -> String {
+    json!({"op": "gain.set", "channel": channel, "mute": mute, "stage": stage}).to_string()
 }
 fn op_gain_set(channel: u32, gain_db: f64, stage: &str) -> String {
     json!({"op": "gain.set", "channel": channel, "gain_db": gain_db, "stage": stage}).to_string()
@@ -8871,6 +9104,22 @@ pub enum MarkForgeCommand {
 /// forge", "the physics sandbox", "the simulation", "the sandbox"). Used to gate
 /// the bare launch verb so an unrelated "open safari" is never captured, and to
 /// disambiguate "reset"/"pause" so they only fire in a physics context.
+/// The BARE spawn idiom's closed vocabulary — "drop a box", "throw a ball",
+/// "spawn a marble", "add a crate". The whole utterance must be drawn from this
+/// list (numbers allowed, for "drop two boxes"). See the spawn branch in
+/// [`mark_forge_command`] for why a co-occurring verb + shape noun was not
+/// enough. Deliberately holds no verb/noun that is not part of the idiom itself:
+/// the point is that it CANNOT be satisfied by adding words.
+const MARK_FORGE_BARE_SPAWN_VOCAB: &[&str] = &[
+    "drop", "drops", "spawn", "spawns", "add", "adds", "throw", "throws", "toss", "tosses",
+    "a", "an", "the", "another", "one", "two", "three", "four", "five", "more", "some", "couple",
+    "of", "in", "into", "onto", "on", "here", "there",
+    "ball", "balls", "sphere", "spheres", "marble", "marbles",
+    "box", "boxes", "cube", "cubes", "crate", "crates", "block", "blocks",
+    "please", "darwin", "hey", "ok", "okay", "now", "just", "can", "could", "would", "you",
+    "and", "for", "me", "us",
+];
+
 fn mentions_mark_forge(lower: &str) -> bool {
     lower.contains("mark forge")
         || lower.contains("mark-forge")
@@ -8924,7 +9173,31 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
         || lower.contains("add a ")
         || lower.contains("add an ")
         || lower.contains("throw");
-    if spawn_verb {
+    // WHAT WENT WRONG: this branch — checked FIRST, and terminal, because route()
+    // dispatches through an else-if chain — was the ONLY Mark-Forge branch with no
+    // physics-context gate. Reset needs a world/scene/bodies co-word, gravity needs
+    // `gravity_commanded`, step/pause need `physics_ctx`; spawn needed nothing but
+    // a verb substring and a shape noun ANYWHERE in the sentence. So:
+    //   "can you add a block to my calendar at 3"        -> body.spawn{cuboid}
+    //   "did you drop the boxes off at the post office"  -> body.spawn{cuboid}
+    //   "throw the ball for the dog"                     -> body.spawn{sphere}
+    //   "what time does the ball drop on new year's eve" -> body.spawn{sphere}
+    // Each of those never reaches its real handler; with the sandbox closed the
+    // user gets "I couldn't reach the physics sandbox: … Open it first, sir", and
+    // with it open a 1 kg body is silently dropped into their scene. The existing
+    // negative tests only covered spawn verbs with NO shape noun ("drop me an
+    // email"), so the co-occurrence hole was untested.
+    //
+    // Two ways in now, both of which the shipped phrasings satisfy: the utterance
+    // NAMES a physics context ("drop a box in the sandbox"), or the WHOLE
+    // utterance is nothing but the bare spawn idiom ("drop a box", "throw a
+    // ball") — the same closed-vocabulary shape the Nexus bare idioms use, chosen
+    // because it cannot be satisfied by adding words. One content word from
+    // outside the list ("calendar", "post", "office", "dog", "eve") and it is
+    // somebody talking about their life, not driving a physics engine.
+    let spawn_context =
+        mentions_mark_forge(&lower) || nexus_closed_vocabulary(&lower, MARK_FORGE_BARE_SPAWN_VOCAB, true);
+    if spawn_verb && spawn_context {
         if mentions_word(&lower, "ball")
             || mentions_word(&lower, "balls")
             || mentions_word(&lower, "sphere")
@@ -9148,7 +9421,8 @@ mod tests {
         ambient_monitor_should_start, arg_str, classify_app_request, clear_roll_call_interrupt,
         cloud_model, conversation_brain, describe_command, describe_confined_path, enforce_tool,
         local_model_for_turn, local_sub_for_turn,
-        extract_app_name, extract_content_words, extract_image_path, extract_web_query,
+        extract_app_name, extract_content_words, extract_image_path, extract_sensitivity,
+        extract_web_query,
         extract_image_prompt, generate_image_command, handle_describe, handle_generate_image,
         vqa_question,
         handle_identify_sound, identify_sound_clip_or_request,
@@ -9462,21 +9736,54 @@ mod tests {
         assert!(!is_uncertain_fallback(&classification("conversation", "light", 0.6), &cfg));
     }
 
-    /// Darwin-Prime delegation via the router wrapper: the offline-survival
-    /// route only fires when the cloud is truly unreachable for this turn
-    /// (cloud_reachable=false AND the turn is not already heading to cloud).
+    /// Darwin-Prime delegation via the router wrapper: the offline-survival route
+    /// fires exactly when the cloud is unreachable.
+    ///
+    /// WHAT WENT WRONG — AND WHAT THIS TEST USED TO ASSERT: `select_agent` took a
+    /// `to_cloud` flag and OR-ed it into reachability, and this test pinned
+    /// `(cloud_reachable=false, to_cloud=true) -> darwin` with the comment "the
+    /// cloud is reachable for it". It is not. `to_cloud` comes from
+    /// `wants_cloud(class, cfg)`, which reads only the classifier's
+    /// complexity/confidence, while `cloud_reachable` is "an API key resolves".
+    /// On a KEYLESS install every heavy conversation turn is exactly that pair —
+    /// so hulk, the offline-survival agent, was never selected on the one install
+    /// where it is the whole point, and route() went on to make a
+    /// guaranteed-to-fail cloud call first. The test encoded the defect: it passed
+    /// `to_cloud` as a literal and never exercised the caller's computation.
     #[test]
-    fn select_agent_gates_offline_route_on_effective_cloud() {
+    fn select_agent_gates_offline_route_on_cloud_reachability() {
         let reg = AgentRegistry::canonical();
         // Cloud up: conversational turn is the orchestrator's.
-        assert_eq!(select_agent(&reg, "conversation", "tell me about mars", true, false).name, "darwin");
-        // Cloud down AND not routing to cloud this turn: hulk survives.
-        assert_eq!(select_agent(&reg, "conversation", "tell me about mars", false, false).name, "hulk");
-        // Cloud down but THIS turn goes to cloud anyway (to_cloud=true): the
-        // cloud is reachable for it, so no offline fallback.
-        assert_eq!(select_agent(&reg, "conversation", "tell me about mars", false, true).name, "darwin");
+        assert_eq!(select_agent(&reg, "conversation", "tell me about mars", true).name, "darwin");
+        // Cloud down: hulk survives — INCLUDING the heavy/uncertain turns the old
+        // `|| to_cloud` used to steal back for darwin.
+        assert_eq!(select_agent(&reg, "conversation", "tell me about mars", false).name, "hulk");
         // Local action intents are unaffected by cloud state.
-        assert_eq!(select_agent(&reg, "app.launch", "open safari", false, false).name, "oracle");
+        assert_eq!(select_agent(&reg, "app.launch", "open safari", false).name, "oracle");
+    }
+
+    /// The CALLER'S computation, not a literal: on a keyless install a heavy
+    /// conversation turn really does produce `to_cloud = true` while
+    /// `cloud_reachable = false`, and hulk must still be chosen. This is the half
+    /// the old test never covered.
+    #[test]
+    fn a_heavy_conversation_turn_without_a_cloud_key_still_reaches_hulk() {
+        let cfg = Config::default();
+        let reg = AgentRegistry::canonical();
+        let heavy = classification("conversation", "heavy", 0.9);
+        // PRECONDITION: this really is the cloud-bound shape the caller computes.
+        assert!(
+            super::wants_cloud(&heavy, &cfg),
+            "precondition: a heavy conversation turn is cloud-bound by classification"
+        );
+        // …and with no key resolving, reachability is false. The two are
+        // independent, which is the whole finding.
+        assert_eq!(
+            select_agent(&reg, &heavy.intent, "explain how photosynthesis works in detail", false)
+                .name,
+            "hulk",
+            "with no cloud key the offline-survival agent must handle the turn"
+        );
     }
 
     /// Tool-allowlist isolation at the router boundary: an agent that lacks the
@@ -10328,6 +10635,57 @@ mod tests {
         }
     }
 
+    /// An EXPLICIT sensitivity value wins over the verb that carries a word form.
+    ///
+    /// WHAT WENT WRONG: `extract_sensitivity` ran its word arms first and matched
+    /// with `contains`, so "lower" satisfied `contains("low")` and returned 0.25
+    /// before the number was ever parsed. "lower the sensitivity to 0.1" wrote
+    /// 0.25 — 2.5x the requested threshold, and in the OPPOSITE direction from the
+    /// request — on the one state-mutating op in the Vision seam, with an
+    /// acknowledgment that never names the value, so the user could not notice.
+    #[test]
+    fn a_spoken_sensitivity_number_beats_the_verbs_own_word_form() {
+        let value_of = |text: &str| -> f64 {
+            match vision_command(text) {
+                Some(VisionCommand::Op(line)) => {
+                    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(v["op"], "set.sensitivity", "for {text:?}");
+                    v["value"].as_f64().unwrap()
+                }
+                other => panic!("expected set.sensitivity for {text:?}, got {other:?}"),
+            }
+        };
+        for (text, want) in [
+            ("lower the sensitivity to 0.1", 0.1),
+            ("lower the sensitivity to 30 percent", 0.3),
+            ("raise the sensitivity to 0.9", 0.9),
+            ("set the sensitivity to 0.3", 0.3),
+        ] {
+            let got = value_of(text);
+            assert!(
+                (got - want).abs() < 1e-9,
+                "{text:?} must write {want}, wrote {got}"
+            );
+        }
+        // No number: the word form still supplies the value, both plain and
+        // comparative ("set the sensitivity higher" is a supported phrasing).
+        assert!((value_of("set the sensitivity to low") - 0.25).abs() < 1e-9);
+        assert!((value_of("set the sensitivity higher") - 0.85).abs() < 1e-9);
+        assert!((value_of("set the sensitivity to medium") - 0.5).abs() < 1e-9);
+
+        // The extractor's own three passes, exercised directly (the gate above
+        // does not admit every phrasing the extractor must still handle):
+        //   pass 1 — a connector-introduced number beats a word form anywhere;
+        //   pass 2 — whole-word forms, so "below"/"allow"/"slow" supply nothing;
+        //   pass 3 — the connector-free number, unchanged from before.
+        assert_eq!(extract_sensitivity("lower it to 0.1"), Some(0.1));
+        assert_eq!(extract_sensitivity("set it to high on camera 2"), Some(0.85));
+        assert_eq!(extract_sensitivity("sensitivity 0.4"), Some(0.4));
+        assert_eq!(extract_sensitivity("keep it below the alarm"), None);
+        assert_eq!(extract_sensitivity("allow the slow flowchart"), None);
+        assert_eq!(extract_sensitivity("to 70 percent"), Some(0.7));
+    }
+
     /// "what's on my screen" / "read my screen" / "read this" -> the read.screen
     /// OCR op, on-wire byte-identical to the FROZEN default the Swift
     /// testFrozenOpWireNamesUnchanged pins ({"type":"op","op":"read.screen"}, no
@@ -10356,6 +10714,42 @@ mod tests {
             } else {
                 panic!("expected a read.screen op for {text:?}");
             }
+        }
+    }
+
+    /// "read that back to me" is the REPEAT-WHAT-I-SAID idiom, NOT a screen OCR.
+    ///
+    /// WHAT WENT WRONG: `reads_this_or_that`'s own doc block listed "can you read
+    /// that back to me" among the sentences its two locks had closed — and it had
+    /// not. The modal "can" lets `vision_verb_in_command_position` forgive the
+    /// bare subject "you", and "back" sat in OK_TAIL, so both locks passed. The
+    /// user dictates something, asks DARWIN to read it back, and gets a
+    /// whole-screen ScreenCaptureKit capture plus "Reading your screen now, sir…"
+    /// — and, because the vision arm captured the turn, no answer to the actual
+    /// request.
+    #[test]
+    fn read_that_back_to_me_is_the_repeat_idiom_not_a_screen_capture() {
+        for text in [
+            "can you read that back to me",
+            "could you read that back to me",
+            "read that back to me please",
+            "read this back",
+            "read that back",
+        ] {
+            assert!(
+                !is_screen_read(text),
+                "{text:?} must not be treated as a screen read"
+            );
+            assert_eq!(
+                vision_command(text),
+                None,
+                "{text:?} must not become a Vision op"
+            );
+        }
+        // PRECONDITION + narrowness: the genuine bare/directional forms still
+        // route, so this fix did not close the seam it was protecting.
+        for text in ["read this", "read that for me", "read this out", "read that to me"] {
+            assert!(is_screen_read(text), "{text:?} must still be a screen read");
         }
     }
 
@@ -10835,6 +11229,35 @@ mod tests {
         }
     }
 
+    /// An EMPTY reindex must not be blamed on the on-device embedder.
+    ///
+    /// WHAT WENT WRONG: the reply had two arms — "on-device embeddings" when
+    /// `embedded_chunks == chunks && chunks > 0`, else "the on-device embedder was
+    /// unavailable". `reindex` returns whole-store counts, so a root with nothing
+    /// indexable gives 0/0/0: `0 == 0` holds but `chunks > 0` does not, and the
+    /// empty case fell into the embedder-failure arm. The user was handed a
+    /// specific, false diagnosis about an embedder that was never asked, and went
+    /// off to debug the inference server instead of the allowlist.
+    #[test]
+    fn an_empty_reindex_does_not_blame_the_embedder() {
+        let empty = super::reindex_reply(0, 0, 0);
+        assert!(
+            !empty.contains("embedder was unavailable"),
+            "an empty index is not an embedder failure: {empty}"
+        );
+        assert!(
+            empty.contains("docsearch].roots"),
+            "the honest reply must point at the allowlist: {empty}"
+        );
+
+        // The two real arms are unchanged.
+        let all = super::reindex_reply(12, 340, 340);
+        assert!(all.contains("on-device embeddings"), "{all}");
+        let partial = super::reindex_reply(12, 340, 100);
+        assert!(partial.contains("embedder was unavailable"), "{partial}");
+        assert!(partial.contains("lexical BM25"), "{partial}");
+    }
+
     // ----- IMAGE GENERATION (task #18) — on-device text->image, OFF/opt-in ----
 
     /// "generate/make/draw/create an image of X" maps to a GenerateImageRequest
@@ -10858,6 +11281,28 @@ mod tests {
         assert_eq!(
             extract_image_prompt("draw a picture of a dog with a hat").as_deref(),
             Some("a dog with a hat")
+        );
+
+        // WHAT WENT WRONG: the extractor scanned the WHOLE utterance for the
+        // earliest connector, while the caller's comment promised "the first such
+        // connector AFTER an image noun". A connector before the image noun
+        // therefore captured the prompt: "instead of a photo, make a drawing of
+        // the house" handed the diffusion model "a photo, make a drawing of the
+        // house" and the user got an image of something they never asked for.
+        assert_eq!(
+            extract_image_prompt("instead of a photo, make a drawing of the house").as_deref(),
+            Some("the house")
+        );
+        assert_eq!(
+            generate_image_command("instead of a photo, make a drawing of the house")
+                .expect("still an image request")
+                .prompt,
+            "the house"
+        );
+        // With NO image noun before any connector the behaviour is unchanged.
+        assert_eq!(
+            extract_image_prompt("draw a picture of a red bicycle").as_deref(),
+            Some("a red bicycle")
         );
     }
 
@@ -11422,6 +11867,29 @@ mod tests {
             "unmute input 1",
             r#"{"op":"gain.set","channel":1,"mute":false,"stage":"input"}"#,
         );
+
+        // WHAT WENT WRONG: the mute op hard-coded `stage: "input"` while
+        // NEXUS_BARE_MUTE_VOCAB deliberately admits the OUTPUT-side nouns, so
+        // "mute the speakers" muted the SM7dB MICROPHONE and the speakers kept
+        // playing — an unrequested mic mute reached through a legitimate command.
+        // `set_output_mute` was unreachable from voice entirely.
+        for u in [
+            "mute the speakers",
+            "mute the monitor",
+            "mute the output",
+            "mute the headphones",
+        ] {
+            assert_nexus_op(u, r#"{"op":"gain.set","channel":0,"mute":true,"stage":"output"}"#);
+        }
+        assert_nexus_op(
+            "unmute the speakers",
+            r#"{"op":"gain.set","channel":0,"mute":false,"stage":"output"}"#,
+        );
+        // An explicit output channel still overrides the monitor default.
+        assert_nexus_op(
+            "mute output 2",
+            r#"{"op":"gain.set","channel":2,"mute":true,"stage":"output"}"#,
+        );
     }
 
     /// "set input gain to -18" -> gain.set {gain_db:-18, stage:input}; an output
@@ -11446,6 +11914,30 @@ mod tests {
         assert_nexus_op(
             "set output 1 gain to -3",
             r#"{"op":"gain.set","channel":1,"gain_db":-3.0,"stage":"output"}"#,
+        );
+        // WHAT WENT WRONG: `mentions_output`'s doc listed "monitor" as naming the
+        // output side and the body never checked it, while NEXUS_GAIN_NOUNS
+        // deliberately lists "monitor"/"monitors" so the monitor side can be
+        // named. "set the monitor gain to -12 db" therefore attenuated the SM7dB
+        // MICROPHONE by 12 dB: the user turns down what they hear and their own
+        // voice goes quiet to everyone else — the same sentence with "speaker"
+        // did the right thing.
+        assert_nexus_op(
+            "set the monitor gain to -12 db",
+            r#"{"op":"gain.set","channel":0,"gain_db":-12.0,"stage":"output"}"#,
+        );
+        assert_nexus_op(
+            "turn the monitor gain down to -12 db",
+            r#"{"op":"gain.set","channel":0,"gain_db":-12.0,"stage":"output"}"#,
+        );
+        // The forms that were already right must stay right.
+        assert_nexus_op(
+            "set the speaker gain to -12 db",
+            r#"{"op":"gain.set","channel":0,"gain_db":-12.0,"stage":"output"}"#,
+        );
+        assert_nexus_op(
+            "set the headphone gain to -6 db",
+            r#"{"op":"gain.set","channel":0,"gain_db":-6.0,"stage":"output"}"#,
         );
         // "the gain" with no number is NOT a gain.set (no dB value -> falls
         // through to normal routing).
@@ -11515,6 +12007,31 @@ mod tests {
         );
         // "load a preset" with no name -> not actionable, falls through.
         assert!(nexus_command("load a preset").is_none());
+
+        // WHAT WENT WRONG: the token AFTER "preset" was preferred
+        // UNCONDITIONALLY, so any trailing word became the preset NAME — "load
+        // the vocal preset now" loaded a preset called "now". Nexus rejects the
+        // unknown name, but handle_nexus has already said "Forwarded that to the
+        // mixer", so the user believes the vocal preset is live while nothing
+        // changed.
+        for (utter, want) in [
+            ("load the vocal preset now", "vocal"),
+            ("load the vocal preset again", "vocal"),
+            ("recall the streaming preset thanks", "streaming"),
+            ("load the podcast preset darwin", "podcast"),
+            ("load the vocal preset please", "vocal"),
+        ] {
+            assert_nexus_op(
+                utter,
+                &format!(r#"{{"op":"preset.load","name":"{want}"}}"#),
+            );
+        }
+        // The "preset LEADS" form still takes the FOLLOWING token, which is the
+        // whole reason that branch exists.
+        assert_nexus_op(
+            "load preset voice-over now",
+            r#"{"op":"preset.load","name":"voice-over"}"#,
+        );
     }
 
     /// "what are the levels" / "show me the meters" / "what's the routing state"
@@ -12191,6 +12708,18 @@ mod tests {
             "open apple.com",
             "drop me an email",            // "drop" without a shape noun
             "drop everything and call me", // "drop" without a shape noun
+            // WHAT WENT WRONG: the spawn branch was the ONE Mark-Forge branch
+            // with no physics-context gate, so a spawn verb CO-OCCURRING with a
+            // shape noun anywhere in the sentence was enough. Each of these was
+            // answered by the physics sandbox (terminal — route()'s else-if chain
+            // never reached the real handler) and, with the sandbox open, silently
+            // dropped a 1 kg body into the user's scene.
+            "can you add a block to my calendar at 3",
+            "did you drop the boxes off at the post office",
+            "drop the kids off at the block party",
+            "throw the ball for the dog",
+            "what time does the ball drop on new year's eve",
+            "remind me to drop the boxes off at the post office",
             "pause the music",             // pause outside a physics context
             "reset my password",           // reset outside a physics context
             // Other apps' phrases must NOT be captured by Mark-Forge.
@@ -12492,12 +13021,33 @@ mod tests {
             "who's on the team",               // agent roster (finding 2)
             "list my agents",                  // agent query (finding 2)
             "what agents do you have",         // agent query (finding 2)
+            // RUNBOOKS — the arm this mirror was MISSING, and the only route()
+            // fast path that executes tools (handle_runbook_command ->
+            // runbook::run -> route_step -> execute_tool under the orchestrator's
+            // ["*"] allowlist). A guest could drive the owner's automation DAG.
+            "run the runbook morning",
+            "run runbook morning",
+            "execute the runbook deploy",
+            // PLAN is read-only but still leaks the owner's runbook structure.
+            "plan the runbook morning",
+            "preview runbook deploy",
         ] {
             assert!(
                 super::guest_denied_fast_path(u, &cfg).is_some(),
                 "{u:?} must be refused for a guest (owner-data or consequential fast path)"
             );
         }
+        // PRECONDITION for the runbook cases above: they really do classify as
+        // runbook commands (so the assertion is testing the mirror, not a typo
+        // that happens to be caught by some other arm).
+        assert!(
+            crate::runbook::classify_runbook_command("run the runbook morning").is_some(),
+            "precondition: this utterance must reach the runbook arm in route()"
+        );
+        assert!(
+            crate::macros::classify_macro_command("run the runbook morning").is_none(),
+            "precondition: the macro classifier does NOT already cover runbooks"
+        );
         // Guest-safe turns -> None (they flow to the guest-gated conversational path).
         for u in [
             "hello, how are you",
@@ -12698,6 +13248,18 @@ mod tests {
         // Empty / whitespace.
         assert!(c("").is_none());
         assert!(c("   ").is_none());
+        // REGRESSION: the OBJECT side used to be a bare `contains`, so an ordinary
+        // request that merely CONTAINS a music noun inside a longer word — or uses
+        // one as a compound modifier — was swallowed by JEROME. "write down my
+        // tracking number" was composed as a song called "down my tracking number"
+        // and the note was silently lost.
+        assert!(c("write down my tracking number").is_none());
+        assert!(c("make a note about the heartbeat monitor").is_none());
+        assert!(c("write a note about my track record").is_none());
+        assert!(c("generate the beaten path itinerary").is_none());
+        assert!(c("make a note of the fortune 500 list").is_none());
+        assert!(c("write down the tuner settings").is_none());
+        assert!(c("write up the sprint retrospective").is_none());
     }
 
     #[test]
@@ -12717,18 +13279,46 @@ mod tests {
         };
         let spec = crate::chart::chart_from_snapshot(Some(snap));
         let mut rx = crate::telemetry::subscribe_for_test();
+        // WHAT WENT WRONG: the drain below used to break on the FIRST `chart.data`
+        // frame, and its comment justified that with "the only chart.data emitter
+        // in a test run". That was false — chart.rs's
+        // `emit_chart_publishes_a_chart_data_envelope` publishes a 3-point
+        // `line_spec()` on this same process-global bus, and under `cargo test
+        // chart` that sibling's frame could be buffered ahead of ours. The test
+        // then asserted against a DIFFERENT test's chart: it failed with
+        // "left: 3, right: 2" on a defect that did not exist, and — far worse —
+        // could silently PASS on a foreign frame, so a real regression in the
+        // router's chart composition would go unnoticed.
+        //
+        // Rather than leave that to scheduling luck, plant the decoy ourselves:
+        // emit a frame shaped exactly like the sibling's BEFORE our own, so the
+        // drain is always forced to skip a foreign `chart.data`. The loop now
+        // identifies OUR frame by the snapshot chart's title/label (never by the
+        // points, which are the thing under test).
+        crate::chart::emit_chart(&crate::chart::ChartSpec::new(
+            crate::chart::ChartKind::Line,
+            vec![crate::chart::ChartSeries::new(
+                "cpu",
+                vec![(0.0, 12.0), (1.0, 30.5), (2.0, 18.0)],
+            )],
+            "t (s)",
+            "cpu %",
+            "CPU over time",
+        ));
         crate::chart::emit_chart(&spec);
         // The telemetry hub is a SHARED broadcast bus, so under parallel test load
         // OTHER tests' frames interleave into this receiver. Drain and pick OUR
-        // `chart.data` frame (the only chart.data emitter in a test run) instead of
-        // assuming it arrives first — the previous single try_recv() flaked when a
-        // sibling test's frame was buffered ahead of ours.
+        // `chart.data` frame — the snapshot chart, identified by its title and
+        // series label — instead of assuming it arrives first.
         let mut env: Option<serde_json::Value> = None;
         for _ in 0..512 {
             match rx.try_recv() {
                 Ok(raw) => {
                     let e: serde_json::Value = serde_json::from_str(&raw).unwrap();
-                    if e["event"] == "chart.data" {
+                    if e["event"] == "chart.data"
+                        && e["data"]["title"] == "System load"
+                        && e["data"]["series"][0]["label"] == "load %"
+                    {
                         env = Some(e);
                         break;
                     }

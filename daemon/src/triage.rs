@@ -401,10 +401,7 @@ async fn gather_processes() -> (Section, Section) {
     };
 
     // Bounded signing assessment (READ-ONLY: codesign -dv never executes).
-    let mut sign_body = String::from(
-        "path | signing (codesign -dv, READ-ONLY assessment — the binary is never executed)\n",
-    );
-    let mut assessed = 0usize;
+    let mut verdicts: Vec<(String, Signing)> = Vec::new();
     for path in distinct_exec_paths(&rows, MAX_SIGN_ASSESS) {
         let verdict = match run_real(
             CODESIGN,
@@ -416,22 +413,41 @@ async fn gather_processes() -> (Section, Section) {
             ReadOutput::Text(t) => classify_codesign(&t),
             ReadOutput::Unavailable(_) => Signing::Unknown,
         };
-        let line = format!("{path} | {}\n", verdict.label());
-        // Route through the SAME redaction as every other section — home-strip THEN
-        // token/PII redaction. signing.txt was previously home-stripped only, so a
-        // secret-shaped path component (or a non-$HOME user path) landed verbatim
-        // while the identical path in processes.txt was collapsed to [redacted] (the
-        // review caught the inconsistency + the module-header invariant it violated).
-        sign_body.push_str(&crate::optimize::redact(&crate::introspect::redact_home(&line)));
-        assessed += 1;
+        verdicts.push((path, verdict));
     }
     let signing = Section {
         name: "signing",
         filename: "signing.txt",
-        body: truncate_on_char_boundary(sign_body, PER_SECTION_CAP),
-        item_count: assessed,
+        body: signing_body(&verdicts),
+        item_count: verdicts.len(),
     };
     (processes, signing)
+}
+
+/// PURE: the `signing.txt` body — a header plus one `path | verdict` line per
+/// assessed binary — routed through [`redact_section`], the SAME line-by-line
+/// choke every other section uses, and truncated at [`PER_SECTION_CAP`].
+///
+/// WHAT WENT WRONG BEFORE: the signing loop bypassed `redact_section` and instead
+/// called `crate::optimize::redact` DIRECTLY on a string that carried its own
+/// trailing '\n'. `redact` rebuilds its input from `split_whitespace()` tokens
+/// joined by a single SPACE, so its output can never contain a newline — every
+/// line break was eaten and each verdict was fused onto the NEXT binary's path
+/// ("/sbin/launchd | signed/usr/libexec/logd | UNSIGNED…"). With MAX_SIGN_ASSESS
+/// = 48 the whole assessment — the most decision-relevant part of the evidence
+/// bundle, and the thing that flags an UNSIGNED resident binary — landed on one
+/// unbroken line, and the per-section cap then cut mid-record instead of at a row
+/// boundary. `redact_section` iterates `text.lines()` and re-emits '\n' itself,
+/// which is exactly why it exists and why the module header can claim "every
+/// captured value passes through redact_section".
+fn signing_body(verdicts: &[(String, Signing)]) -> String {
+    let mut raw = String::from(
+        "path | signing (codesign -dv, READ-ONLY assessment — the binary is never executed)\n",
+    );
+    for (path, verdict) in verdicts {
+        raw.push_str(&format!("{path} | {}\n", verdict.label()));
+    }
+    redact_section(&raw, PER_SECTION_CAP)
 }
 
 /// Capture the socket table (`netstat -an`), redacted, with a secret-free count.
@@ -924,5 +940,40 @@ mod tests {
         assert_eq!(a, sha256_hex(b"darwin"));
         assert_eq!(a.len(), 64);
         assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// REGRESSION: signing.txt keeps ONE LINE PER ASSESSED BINARY.
+    ///
+    /// The section used to be built by calling `optimize::redact` on a string that
+    /// carried its own trailing '\n'. `redact` rebuilds from `split_whitespace()`
+    /// joined by single spaces, so it cannot emit a newline: all 48 verdicts fused
+    /// onto one line and each verdict was glued to the NEXT binary's path
+    /// ("/sbin/launchd | signed/usr/libexec/logd | UNSIGNED"), making the whole
+    /// assessment unattributable to a binary.
+    #[test]
+    fn signing_body_keeps_one_line_per_assessed_binary() {
+        let verdicts = vec![
+            ("/sbin/launchd".to_string(), Signing::Signed),
+            ("/usr/libexec/logd".to_string(), Signing::Unsigned),
+            ("/Applications/Evil.app/Contents/MacOS/Evil".to_string(), Signing::Adhoc),
+        ];
+        let body = signing_body(&verdicts);
+        assert_eq!(
+            body.lines().count(),
+            verdicts.len() + 1,
+            "a header + exactly one line per assessed binary:\n{body}"
+        );
+        // No verdict may be fused onto the next path.
+        for (path, verdict) in &verdicts {
+            let want = format!("{path} | {}", verdict.label());
+            assert!(
+                body.lines().any(|l| l == want),
+                "each row stands alone as {want:?}:\n{body}"
+            );
+        }
+        assert!(
+            !body.contains("signed/usr/libexec/logd"),
+            "a verdict must never be concatenated onto the next binary's path:\n{body}"
+        );
     }
 }

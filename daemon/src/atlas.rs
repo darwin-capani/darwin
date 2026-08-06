@@ -225,6 +225,33 @@ pub fn snapshot(entries: &[CapEntry]) -> Value {
     })
 }
 
+/// Fold the REAL cloud-key resolution into the Keychain presence set. PURE, so
+/// the composition is testable without a Keychain or an env var.
+///
+/// WHAT WENT WRONG: the only presence probe was `integrations::resolve_secret`,
+/// which is KEYCHAIN-ONLY — it shells out to `security find-generic-password` and
+/// consults nothing else. But the daemon's real cloud-key resolution is
+/// ENV-FIRST: `anthropic::resolve_api_key` reads `ANTHROPIC_API_KEY` and only then
+/// the Keychain. `install.sh` tells the user to `export ANTHROPIC_API_KEY=...` in
+/// `state/env.sh` and the boot wrappers source it — so on the install the
+/// installer itself recommends, the daemon ran fully cloud-armed while the atlas
+/// reported "Cloud (Anthropic) — inert — add in Settings: anthropic_api_key" in
+/// the HUD panel and in every DLS hover, with the armed/total counter short by
+/// one. The user was told their working cloud tier was dead and instructed to
+/// paste a duplicate key into the Keychain — while `--selftest`, which uses the
+/// real resolution, said PASS on the same machine at the same moment. That
+/// directly contradicts this module's header promise to mirror selfcheck's honest
+/// Pass/Skip shape.
+fn with_cloud_key_presence(
+    mut keychain_present: HashSet<String>,
+    cloud_key_resolves: bool,
+) -> HashSet<String> {
+    if cloud_key_resolves {
+        keychain_present.insert("anthropic_api_key".to_string());
+    }
+    keychain_present
+}
+
 /// LIVE wrapper: gather the four enumeration surfaces (one async credential probe
 /// per unique required account) and return the assembled [`CapEntry`] rows. Run
 /// from a spawned task at startup — the Keychain probes must never block the boot
@@ -262,6 +289,11 @@ pub async fn build_entries(cfg: &Config, agents: &AgentRegistry, apps: &AppRegis
             present.insert(acct.to_string());
         }
     }
+
+    let present = with_cloud_key_presence(
+        present,
+        crate::anthropic::resolve_api_key().await.is_some(),
+    );
 
     assemble(&skill_rows, skills_enabled, &agent_rows, &app_rows, &present)
 }
@@ -336,6 +368,52 @@ mod tests {
         // No credentials -> every integration inert.
         let none = assemble(&[], true, &[], &[], &present(&[]));
         assert!(none.iter().filter(|e| e.kind == CapKind::Integration).all(|e| !e.armed));
+    }
+
+    /// An `ANTHROPIC_API_KEY` supplied the way the INSTALLER recommends must arm
+    /// the Cloud row.
+    ///
+    /// WHAT WENT WRONG: the only presence probe was Keychain-only
+    /// (`integrations::resolve_secret` -> `security find-generic-password`), while
+    /// the daemon resolves the cloud key ENV-FIRST. install.sh tells the user to
+    /// `export ANTHROPIC_API_KEY=...` in `state/env.sh` and the boot wrappers
+    /// source it — so on that install the atlas said "Cloud (Anthropic) — inert —
+    /// add in Settings: anthropic_api_key" (HUD panel + every DLS hover, and the
+    /// armed/total counter short by one) about a cloud tier that was working, at
+    /// the same moment `--selftest` reported PASS.
+    #[test]
+    fn a_cloud_key_from_the_environment_arms_the_cloud_row() {
+        // PRECONDITION: the Keychain probe found NOTHING — this is exactly the
+        // env-var install, and it is what used to report inert.
+        let keychain_only = present(&[]);
+        let inert = assemble(&[], true, &[], &[], &keychain_only);
+        let cloud = inert
+            .iter()
+            .find(|e| e.name == "Cloud (Anthropic)")
+            .expect("the Cloud row exists");
+        assert!(!cloud.armed, "precondition: with nothing anywhere, the row is inert");
+
+        // The daemon's REAL resolution found the key (env var). The row must arm.
+        let resolved = with_cloud_key_presence(keychain_only, true);
+        let entries = assemble(&[], true, &[], &[], &resolved);
+        let cloud = entries
+            .iter()
+            .find(|e| e.name == "Cloud (Anthropic)")
+            .expect("the Cloud row exists");
+        assert!(
+            cloud.armed,
+            "a key the daemon really resolves must arm the row: {}",
+            cloud.detail
+        );
+        assert_eq!(cloud.detail, "connected");
+        // …and nothing else was invented by the fold.
+        assert!(
+            entries
+                .iter()
+                .filter(|e| e.kind == CapKind::Integration && e.name != "Cloud (Anthropic)")
+                .all(|e| !e.armed),
+            "the cloud fold must not arm any other integration"
+        );
     }
 
     #[test]

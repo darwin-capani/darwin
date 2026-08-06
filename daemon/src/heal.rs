@@ -1067,9 +1067,20 @@ async fn run_pipeline(
     let daemon_dir = root.join("daemon");
     let heal_root = root.join("state").join("heal");
     match run_attempt(&daemon_dir, &heal_root, ts, &cfg.cloud.heavy_model, brain, scan).await {
-        AttemptResult::Proposed { diff, report, files, confidence, .. } => match action {
+        AttemptResult::Proposed { diff, report, files, confidence, extra } => match action {
             HealAction::Propose => {
-                propose(memory, &heal_root, ts, &diff, &report, &files, confidence).await;
+                // Pass `extra` THROUGH. It used to be swallowed by the `..` in this
+                // destructuring pattern and the no-extra `propose` wrapper hard-coded
+                // `None`, so diagnosis.json / candidates.md / review.md were computed,
+                // carried out of run_attempt, and then thrown away on the ONLY path
+                // that ships (mode="propose" is the default). The operator reviewing a
+                // real proposal got patch.diff + report.md and nothing else, while the
+                // module doc, docs/ARCHITECTURE.md and the HUD's SelfHealPanel all
+                // promised five files — so the alternative candidates and their
+                // per-gate fates, the entire point of the multi-candidate v2 design,
+                // were invisible. The only writer of those three files was the
+                // #[ignore]d cloud drill and the REJECTED path.
+                propose(memory, &heal_root, ts, &diff, &report, &files, confidence, &extra).await;
                 // CHANGE QUEUE (changeq.rs): ALSO register this propose-only artifact
                 // into the unified git-native review lane. Pure bookkeeping — the
                 // validated patch was already written to state/heal/proposals/<ts>/;
@@ -1316,6 +1327,20 @@ fn diagnosis_json(d: &Diagnosis) -> String {
 
 /// (8a) Propose: artifacts + meta.heal_pending + heal.proposal. The
 /// first-contact brief reads meta.heal_pending, so DARWIN tells the user.
+///
+/// `extra` carries the v2 supplementary artifacts (diagnosis.json /
+/// candidates.md / review.md) and is REQUIRED, not `Option`.
+///
+/// WHAT WENT WRONG WHEN IT WAS OPTIONAL: a no-extra `propose` wrapper sat in
+/// front of this function hard-coding `None`, and run_pipeline's Propose arm
+/// destructured `AttemptResult::Proposed { .., .. }` — the `..` swallowed
+/// `extra`. So on the ONLY path that ships (mode="propose" is the default) the
+/// three v2 artifacts were computed, carried out of run_attempt, and thrown away:
+/// the operator reviewing a real proposal saw patch.diff + report.md while
+/// heal.rs's own module doc, docs/ARCHITECTURE.md and hud SelfHealPanel all named
+/// five files. Making the parameter non-optional means that regression can no
+/// longer compile. The drill and the rejected path write their own artifact sets
+/// directly and never call this.
 #[allow(clippy::too_many_arguments)]
 async fn propose(
     memory: &Memory,
@@ -1325,32 +1350,11 @@ async fn propose(
     report: &str,
     files: &[String],
     confidence: f64,
-) {
-    propose_with_extra(memory, heal_root, ts, diff, report, files, confidence, None).await;
-}
-
-/// Shared propose body; `extra` carries the v2 supplementary artifacts (the
-/// watchdog supplies them; kept Optional so the surface is small).
-#[allow(clippy::too_many_arguments)]
-async fn propose_with_extra(
-    memory: &Memory,
-    heal_root: &Path,
-    ts: u64,
-    diff: &str,
-    report: &str,
-    files: &[String],
-    confidence: f64,
-    extra: Option<&ProposalArtifacts>,
+    extra: &ProposalArtifacts,
 ) {
     let dir = heal_root.join("proposals");
-    if record_artifact(&dir, ts, "patch.diff", diff).is_none() {
+    if !write_proposal_artifacts(&dir, ts, diff, report, extra) {
         return; // already warned
-    }
-    record_artifact(&dir, ts, "report.md", report);
-    if let Some(extra) = extra {
-        record_artifact(&dir, ts, "diagnosis.json", &extra.diagnosis_json);
-        record_artifact(&dir, ts, "candidates.md", &extra.candidates_md);
-        record_artifact(&dir, ts, "review.md", &extra.review_md);
     }
     if let Err(e) = memory.upsert_fact(META_HEAL_PENDING, &ts.to_string()).await {
         warn!(error = %e, "heal: proposal written but meta.heal_pending could not be stamped");
@@ -1361,6 +1365,28 @@ async fn propose_with_extra(
         "heal.proposal",
         json!({"ts": ts, "files": files, "validated": true, "confidence": confidence}),
     );
+}
+
+/// Write the FIVE files a propose-mode proposal is documented to contain into
+/// `<proposals>/<ts>/`: patch.diff, report.md, diagnosis.json, candidates.md and
+/// review.md. Returns false (already warned) when the patch itself could not be
+/// written, which is the only case the caller aborts on. Store-free so the
+/// artifact set is directly unit-testable.
+fn write_proposal_artifacts(
+    dir: &Path,
+    ts: u64,
+    diff: &str,
+    report: &str,
+    extra: &ProposalArtifacts,
+) -> bool {
+    if record_artifact(dir, ts, "patch.diff", diff).is_none() {
+        return false;
+    }
+    record_artifact(dir, ts, "report.md", report);
+    record_artifact(dir, ts, "diagnosis.json", &extra.diagnosis_json);
+    record_artifact(dir, ts, "candidates.md", &extra.candidates_md);
+    record_artifact(dir, ts, "review.md", &extra.review_md);
+    true
 }
 
 /// (8b) Auto: apply the validated diff to the REAL daemon/, rebuild release,
@@ -1487,9 +1513,12 @@ async fn stage_and_validate_inner(
     diff: &str,
 ) -> anyhow::Result<StageResult> {
     let staging = heal_root.join(staging_dir_name(ts, candidate));
-    stage_sources(source_dir, &staging)?;
+    // `staging` is a miniature REPO ROOT; the crate itself lands one level down.
+    // Both `patch -p1` (whose headers are `a/src/...`) and cargo run against the
+    // CRATE dir, not the staging root.
+    let crate_dir = stage_sources(source_dir, &staging)?;
 
-    let patched = apply_patch(&staging, diff).await?;
+    let patched = apply_patch(&crate_dir, diff).await?;
     if !patched.ok {
         return Ok(StageResult::Rejected {
             stage: "patch",
@@ -1507,7 +1536,7 @@ async fn stage_and_validate_inner(
                 detail: format!("{combined}\n[validation deadline exhausted before cargo {stage}]"),
             });
         }
-        match run_cargo(&staging, &args, remaining).await {
+        match run_cargo(&crate_dir, &args, remaining).await {
             Ok(out) => {
                 combined.push_str(&format!("\n$ cargo {stage}\n"));
                 combined.push_str(&out.output);
@@ -1528,17 +1557,163 @@ async fn stage_and_validate_inner(
     })
 }
 
-/// Copy src/ (recursively), Cargo.toml, and Cargo.lock (when present) from
-/// `source_dir` into `staging`. target/ is never touched.
-fn stage_sources(source_dir: &Path, staging: &Path) -> anyhow::Result<()> {
-    std::fs::create_dir_all(staging)?;
-    copy_tree(&source_dir.join("src"), &staging.join("src"))?;
-    std::fs::copy(source_dir.join("Cargo.toml"), staging.join("Cargo.toml"))?;
-    let lock = source_dir.join("Cargo.lock");
-    if lock.exists() {
-        std::fs::copy(&lock, staging.join("Cargo.lock"))?;
+/// Stage the crate for validation. `staging` becomes a miniature REPO ROOT and
+/// the crate is copied to `<staging>/<crate-dir-name>/`; the returned path is that
+/// CRATE ROOT (what `patch -p1` and cargo must run in). `target/` and dotfiles are
+/// never copied.
+///
+/// WHAT WENT WRONG BEFORE: this copied exactly three things — `src/`, `Cargo.toml`
+/// and `Cargo.lock` — straight into `staging`, and the real darwin-core TEST target
+/// needs four more inputs that were never staged:
+///   * `daemon/build.rs` + `daemon/csrc/thermal_shim.m`, which produce the static
+///     lib `power.rs` links with `#[link(name = "darwin_thermal_shim", ...)]`;
+///   * three test-only `include_str!("../../…")` that reach OUTSIDE the crate
+///     (`inference/server.py`, `config/darwin.toml`, `apps/vision/manifest.toml`).
+///
+/// `cargo check` does not link and does not evaluate those `#[cfg(test)]` macros,
+/// so the FIRST gate passed and the second could not even COMPILE — every
+/// candidate died with `StageResult::Rejected { stage: "test" }` no matter what
+/// the patch was. Self-heal therefore never proposed and never applied, while its
+/// report told the operator "no candidate passed the staged cargo check + cargo
+/// test gates", i.e. "the model drafted three bad patches" rather than "the gate
+/// cannot run". Every one of the in-module pipeline tests and `--heal-drill` uses
+/// a synthetic ONE-FILE crate with no build.rs, no csrc and no out-of-crate
+/// includes, so none of them could ever catch it.
+///
+/// The fix is to copy the WHOLE crate directory (so the next file the crate grows
+/// is staged automatically) and to MIRROR the repo-root siblings that the staged
+/// sources actually name — discovered by scanning them, so a new
+/// `include_str!("../../…")` cannot silently break the gate again.
+fn stage_sources(source_dir: &Path, staging: &Path) -> anyhow::Result<PathBuf> {
+    let crate_name = source_dir
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_else(|| std::ffi::OsString::from("crate"));
+    let crate_dir = staging.join(&crate_name);
+    std::fs::create_dir_all(&crate_dir)?;
+    copy_crate_tree(source_dir, &crate_dir)?;
+    mirror_out_of_crate_includes(source_dir, &crate_dir, staging);
+    Ok(crate_dir)
+}
+
+/// Copy every entry of the crate dir except `target/` and dotfiles (.git, .DS_Store,
+/// .gitignore — build inputs never live there and `target/` is gigabytes).
+fn copy_crate_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str == "target" || name_str.starts_with('.') {
+            continue;
+        }
+        let dest = to.join(&name);
+        if entry.file_type()?.is_dir() {
+            copy_tree(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+        }
     }
     Ok(())
+}
+
+/// Mirror every file the STAGED sources reference with an `include_str!`/
+/// `include_bytes!` whose relative path escapes the crate, so those macros resolve
+/// under `staging` exactly as they do under the repo root. Best-effort: a target
+/// that is not present in the real tree is skipped (the compiler then reports it,
+/// which is the honest outcome), and a path that would escape `staging` is
+/// refused.
+fn mirror_out_of_crate_includes(source_dir: &Path, crate_dir: &Path, staging: &Path) {
+    let repo_root = match source_dir.parent() {
+        Some(p) => p.to_path_buf(),
+        None => return,
+    };
+    for rel in out_of_crate_includes(&crate_dir.join("src"), crate_dir, &repo_root) {
+        let src = repo_root.join(&rel);
+        let dest = staging.join(&rel);
+        if !dest.starts_with(staging) {
+            continue;
+        }
+        if let Some(parent) = dest.parent() {
+            if std::fs::create_dir_all(parent).is_err() {
+                continue;
+            }
+        }
+        if let Err(e) = std::fs::copy(&src, &dest) {
+            warn!(path = %src.display(), error = %e, "heal: could not stage an out-of-crate include");
+        }
+    }
+}
+
+/// Scan every `.rs` file under `src_dir` for an `include_str!` / `include_bytes!`
+/// string literal that resolves OUTSIDE `crate_dir`, and return each such target as
+/// a path relative to the crate's PARENT. Only literals that name a file which
+/// actually EXISTS under `repo_root` are returned — that is what keeps a mention of
+/// the macro inside a COMMENT (this module's own doc comments name one) from being
+/// mistaken for a real compilation input, and a genuinely missing include is left
+/// for the compiler to report honestly. Deterministic + deduped.
+fn out_of_crate_includes(src_dir: &Path, crate_dir: &Path, repo_root: &Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let mut files: Vec<PathBuf> = Vec::new();
+    collect_rs(src_dir, &mut files);
+    files.sort();
+    for file in files {
+        let Ok(body) = std::fs::read_to_string(&file) else { continue };
+        let Some(dir) = file.parent() else { continue };
+        for macro_name in ["include_str!(\"", "include_bytes!(\""] {
+            let mut rest = body.as_str();
+            while let Some(idx) = rest.find(macro_name) {
+                rest = &rest[idx + macro_name.len()..];
+                let Some(end) = rest.find('"') else { break };
+                let literal = &rest[..end];
+                rest = &rest[end..];
+                if !literal.starts_with("../") {
+                    continue; // in-crate: already copied with the tree
+                }
+                let Some(abs) = normalize_lexically(&dir.join(literal)) else { continue };
+                if abs.starts_with(crate_dir) {
+                    continue;
+                }
+                if let Ok(rel) = abs.strip_prefix(crate_dir.parent().unwrap_or(crate_dir)) {
+                    let rel = rel.to_path_buf();
+                    if repo_root.join(&rel).is_file() && !out.contains(&rel) {
+                        out.push(rel);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// Resolve `.` / `..` components LEXICALLY (the file need not exist yet, so
+/// `canonicalize` is unusable). `None` when the path climbs above its own root.
+fn normalize_lexically(p: &Path) -> Option<PathBuf> {
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            std::path::Component::ParentDir => {
+                if !out.pop() {
+                    return None;
+                }
+            }
+            std::path::Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    Some(out)
 }
 
 fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
@@ -2521,6 +2696,123 @@ mod tests {
             p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with("darwin-heal-drill-"))
         }) {
             let _ = std::fs::remove_dir_all(sandbox);
+        }
+    }
+
+    // -- the staged gate must be able to compile the REAL crate ---------------
+
+    /// REGRESSION: staging the REAL daemon crate carries every input the staged
+    /// `cargo test` gate needs.
+    ///
+    /// `stage_sources` used to copy exactly `src/` + `Cargo.toml` + `Cargo.lock`.
+    /// `cargo check` neither links nor expands `#[cfg(test)]` macros, so the first
+    /// gate passed — and the second could not COMPILE, for two independent reasons:
+    /// three test-only `include_str!("../../…")` reach outside the crate, and
+    /// `build.rs` + `csrc/` (which produce the static lib `power.rs` links with
+    /// `#[link(name = "darwin_thermal_shim")]`) were never staged. Every candidate
+    /// was rejected at stage "test" no matter what the patch was, and the report
+    /// blamed the model. EVERY other test in this module runs against a synthetic
+    /// one-file crate, which is exactly why none of them noticed.
+    #[test]
+    fn staging_the_real_crate_carries_every_compilation_input() {
+        let root = TempRoot::new("stage-real-crate");
+        let staging = root.0.join("staging");
+        let real = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let crate_dir = stage_sources(real, &staging).expect("staging the real crate");
+
+        assert!(crate_dir.join("Cargo.toml").is_file(), "the manifest is staged");
+        assert!(crate_dir.join("src").join("heal.rs").is_file(), "src/ is staged");
+        assert!(
+            crate_dir.join("build.rs").is_file(),
+            "build.rs must be staged — it produces the static lib power.rs links against"
+        );
+        assert!(
+            crate_dir.join("csrc").join("thermal_shim.m").is_file(),
+            "csrc/ must be staged — build.rs compiles it"
+        );
+        assert!(
+            !crate_dir.join("target").exists(),
+            "target/ must NEVER be staged (gigabytes, and the staged build makes its own)"
+        );
+
+        // Every out-of-crate include the staged sources name must resolve under the
+        // staging root, or `cargo test` cannot expand it.
+        let includes = out_of_crate_includes(&crate_dir.join("src"), &crate_dir, real.parent().unwrap());
+        assert!(
+            includes.len() >= 3,
+            "the real crate has out-of-crate include_str! targets; found {includes:?}"
+        );
+        for rel in &includes {
+            assert!(
+                staging.join(rel).is_file(),
+                "the staged tree is missing {rel:?} — the staged `cargo test` cannot expand \
+                 its include_str! and rejects every candidate at stage \"test\""
+            );
+        }
+    }
+
+    /// The out-of-crate include scanner finds a `../../` target and ignores an
+    /// in-crate one (so the mirror step stays minimal and deterministic).
+    #[test]
+    fn out_of_crate_include_scan_finds_only_escaping_literals() {
+        let root = TempRoot::new("include-scan");
+        let crate_dir = root.0.join("daemon");
+        std::fs::create_dir_all(crate_dir.join("src").join("deep")).unwrap();
+        std::fs::create_dir_all(root.0.join("config")).unwrap();
+        std::fs::create_dir_all(root.0.join("inference")).unwrap();
+        std::fs::write(root.0.join("config").join("darwin.toml"), "# shipped").unwrap();
+        std::fs::write(root.0.join("inference").join("server.py"), "# server").unwrap();
+        std::fs::write(
+            crate_dir.join("src").join("a.rs"),
+            "const A: &str = include_str!(\"../../config/darwin.toml\");\n\
+             const B: &str = include_str!(\"fixtures/in_crate.txt\");\n\
+             // a COMMENT naming include_str!(\"../../nowhere/absent.txt\") is not an input\n",
+        )
+        .unwrap();
+        std::fs::write(
+            crate_dir.join("src").join("deep").join("b.rs"),
+            "const C: &[u8] = include_bytes!(\"../../../inference/server.py\");\n",
+        )
+        .unwrap();
+        let found = out_of_crate_includes(&crate_dir.join("src"), &crate_dir, &root.0);
+        assert!(found.contains(&PathBuf::from("config/darwin.toml")), "{found:?}");
+        assert!(found.contains(&PathBuf::from("inference/server.py")), "{found:?}");
+        assert_eq!(
+            found.len(),
+            2,
+            "an in-crate include and a non-existent (comment-only) target are not mirrored: {found:?}"
+        );
+    }
+
+    /// REGRESSION: a propose writes ALL FIVE documented artifacts.
+    ///
+    /// The live propose path used to discard `extra` (run_pipeline's `..` plus a
+    /// wrapper hard-coding `None`), so diagnosis.json / candidates.md / review.md
+    /// were computed and then thrown away while the module doc, ARCHITECTURE.md and
+    /// the HUD all promised them. `extra` is now non-optional, so that regression
+    /// cannot compile; this pins the write itself.
+    #[test]
+    fn a_proposal_writes_all_five_documented_artifacts() {
+        let root = TempRoot::new("propose-artifacts");
+        let dir = root.0.join("proposals");
+        let ts = 1_760_000_500u64;
+        let extra = ProposalArtifacts {
+            diagnosis_json: "{\"subsystem\":\"audio\"}".to_string(),
+            candidates_md: "# candidates\nCandidate #1 — VALIDATED".to_string(),
+            review_md: "# review\nCONFIDENCE: 0.9".to_string(),
+        };
+        assert!(write_proposal_artifacts(&dir, ts, "the diff", "the report", &extra));
+        for name in [
+            "patch.diff",
+            "report.md",
+            "diagnosis.json",
+            "candidates.md",
+            "review.md",
+        ] {
+            assert!(
+                dir.join(ts.to_string()).join(name).is_file(),
+                "a propose-mode proposal must contain {name}; the operator is told it is there"
+            );
         }
     }
 }

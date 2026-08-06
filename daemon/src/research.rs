@@ -46,14 +46,18 @@ use anyhow::Result;
 /// crawl.
 pub const MAX_SUBQUERIES: usize = 5;
 
-/// Per-sub-query cap on how many search hits are fetched. Keeps each sub-query's
-/// fan-out bounded independent of how many results the search provider returns.
+/// Per-sub-query cap on how many search hits are ATTEMPTED. Keeps each
+/// sub-query's fan-out bounded independent of how many results the search
+/// provider returns. Counts ATTEMPTS, not successes — a fetch that 403s, times
+/// out, or is refused by the SSRF guard is outward work too, and counting only
+/// successes is what let one run issue 150 requests against a cap of 8.
 pub const MAX_RESULTS_PER_QUERY: usize = 3;
 
-/// Whole-run cap on the TOTAL number of document fetches, across all
+/// Whole-run cap on the TOTAL number of document fetch ATTEMPTS, across all
 /// sub-queries. The binding budget on outward work: even at the max sub-query
-/// count and the max per-query top-k, no run fetches more than this many
-/// documents. Exceeding it stops fetching and is signalled as truncation.
+/// count and the max per-query top-k, no run makes more than this many outward
+/// requests, whether or not they succeed. Exceeding it stops fetching and is
+/// signalled as truncation.
 pub const MAX_FETCHES: usize = 8;
 
 /// The default and maximum research "depth" the tool exposes: depth scales the
@@ -540,11 +544,27 @@ pub async fn run_research_report(
                 continue;
             }
 
+            // WHAT WENT WRONG: the budget was charged ONLY on the Ok arm. A run
+            // whose fetches all fail therefore never reached
+            // `taken_this_query >= MAX_RESULTS_PER_QUERY` or `fetch_budget == 0`,
+            // so it attempted EVERY candidate the searcher returned, for EVERY
+            // sub-query — and `parse_ddg_results` is unbounded over a 2 MiB body.
+            // Measured with 5 sub-queries x 30 https candidates (the size of a
+            // real DDG results page): 150 outward HTTP requests against a
+            // documented cap of 8, each carrying the live 20s SAGE_FETCH_TIMEOUT,
+            // i.e. up to ~50 minutes inside one `sage_research` tool call that is
+            // awaited inline with no outer timeout — and it then returned "I
+            // retrieved no usable sources" with `truncated` still false, so the
+            // rendered answer disclosed none of it. Exactly the shape produced by
+            // a topic whose top hits 403, time out, or fail the SSRF guard.
+            //
+            // Charge the budget per ATTEMPT, and record the URL as seen either
+            // way so a dead host is not re-attempted on the next sub-query.
+            seen_urls.push(r.url.clone());
+            fetch_budget -= 1;
+            taken_this_query += 1;
             match fetcher.fetch(&r.url).await {
                 Ok(text) => {
-                    seen_urls.push(r.url.clone());
-                    fetch_budget -= 1;
-                    taken_this_query += 1;
                     let id = sources.len() + 1;
                     sources.push(Source {
                         id,
@@ -1007,6 +1027,97 @@ mod tests {
         assert_eq!(fetcher.fetched(), vec!["https://good.test"], "only the good URL was fetched");
         assert!(answer.contains("https://good.test"), "the surviving source is cited: {answer}");
         assert!(!answer.contains("https://bad.test"), "the failed source is never cited: {answer}");
+    }
+
+    /// The fetch budget must bound OUTWARD REQUESTS, not successes.
+    ///
+    /// WHAT WENT WRONG: `fetch_budget -= 1` and `taken_this_query += 1` lived only
+    /// in the `Ok` arm, so on a run whose fetches all fail neither cap could ever
+    /// fire and the loop attempted EVERY candidate the searcher returned, for
+    /// EVERY sub-query — and the live `parse_ddg_results` is unbounded over a
+    /// 2 MiB body. Measured with 5 sub-queries x 30 candidates: 150 outward HTTP
+    /// requests against a documented cap of 8, each carrying the live 20s
+    /// SAGE_FETCH_TIMEOUT — up to ~50 minutes inside one `sage_research` tool call
+    /// that is awaited inline with no outer timeout — and then "I retrieved no
+    /// usable sources" with `truncated` still false. The module's own failure test
+    /// used a SINGLE failing URL, so the multiplier was never exercised.
+    #[tokio::test]
+    async fn a_failing_host_cannot_multiply_outward_fetches_past_the_budget() {
+        /// Records every ATTEMPT (the shipped MockFetcher only records successes,
+        /// which is exactly the blind spot that hid this).
+        struct AttemptCountingFetcher {
+            attempts: Mutex<Vec<String>>,
+        }
+        impl Fetcher for AttemptCountingFetcher {
+            fn fetch<'a>(&'a self, url: &'a str) -> FetchFuture<'a> {
+                Box::pin(async move {
+                    self.attempts.lock().unwrap().push(url.to_string());
+                    Err(anyhow::anyhow!("403 for {url}"))
+                })
+            }
+        }
+        struct BoomBrain;
+        impl Brain for BoomBrain {
+            fn synthesize<'a>(&'a self, _q: &'a str, _s: &'a [Source]) -> SynthFuture<'a> {
+                Box::pin(async move { panic!("brain must NOT run with zero sources") })
+            }
+        }
+
+        // MAX_SUBQUERIES sub-queries, each returning a full results page.
+        let subs: Vec<SubQuery> = (0..MAX_SUBQUERIES)
+            .map(|i| SubQuery::new(format!("q{i}")))
+            .collect();
+        let per_query: Vec<(String, Vec<SearchResult>)> = (0..MAX_SUBQUERIES)
+            .map(|i| {
+                let hits: Vec<SearchResult> = (0..30)
+                    .map(|j| {
+                        SearchResult::new(
+                            format!("hit {i}-{j}"),
+                            format!("https://blocked{i}-{j}.test"),
+                        )
+                    })
+                    .collect();
+                (format!("q{i}"), hits)
+            })
+            .collect();
+        let searcher = MockSearcher::new(
+            per_query.iter().map(|(q, r)| (q.as_str(), r.clone())).collect(),
+        );
+        let planner = MockPlanner::new(subs);
+        let fetcher = AttemptCountingFetcher { attempts: Mutex::new(Vec::new()) };
+
+        let answer = run_research(
+            "a topic whose top hits all block scrapers",
+            MAX_SUBQUERIES,
+            true,
+            &planner,
+            &searcher,
+            &fetcher,
+            &BoomBrain,
+        )
+        .await;
+
+        let attempts = fetcher.attempts.lock().unwrap().len();
+        assert!(
+            attempts <= MAX_FETCHES,
+            "a run must never make more than MAX_FETCHES ({MAX_FETCHES}) outward \
+             requests; it made {attempts}"
+        );
+        // PRECONDITION: the candidate pool really was far larger than the budget,
+        // so this test could actually have caught the multiplier.
+        const { assert!(MAX_SUBQUERIES * 30 > MAX_FETCHES * 4) };
+        // A dead URL must never be re-attempted on a later sub-query.
+        let attempted = fetcher.attempts.lock().unwrap().clone();
+        let mut uniq = attempted.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), attempted.len(), "a dead URL was re-attempted: {attempted:?}");
+        // …and the run still ends honestly.
+        assert!(
+            answer.to_lowercase().contains("no usable sources")
+                || answer.to_lowercase().contains("couldn't put together"),
+            "no fetched sources -> honest message: {answer}"
+        );
     }
 
     #[tokio::test]

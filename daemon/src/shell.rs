@@ -24,9 +24,18 @@
 //!      **and** `!is_locked_down()` **and** the voice-id owner gate passed. It
 //!      NEVER auto-runs.
 //!
-//!   4. CONFIG GATE ([`shell_permitted`]) — `[shell].enabled` ships **false**.
-//!      With it off, the shell intent is not even classified and the tool is
-//!      inert (an honest "off" reply); nothing is parked, nothing runs.
+//!   4. CONFIG GATE ([`shell_permitted`]) — `[shell].enabled` ships **true**
+//!      (full-power default). This header used to say "ships **false**", which
+//!      told an auditor that arbitrary command execution was OPT-IN out of the
+//!      box for the highest-risk capability in the daemon. It is not: the switch
+//!      is ON, and layers 1-3 above are what stand between a tool call and an
+//!      exec (`shell_run` is in CONSEQUENTIAL_TOOLS + NEVER_AUTO_APPROVE_TOOLS,
+//!      so it ALWAYS parks per-action, even under an `Always` policy). It is also
+//!      INERT WITHOUT DEVICE SUPPORT — exec needs `/usr/bin/sandbox-exec` +
+//!      `/bin/sh`. An operator who sets it false makes the shell intent
+//!      unclassifiable and the tool inert (an honest "off" reply); nothing is
+//!      parked, nothing runs. Mirrors `config.rs`'s `ShellConfig` default and
+//!      `anthropic.rs`'s `shell_run` doc, which both had it right.
 //!
 //!   5. EXEC SEAM ([`run_sandboxed`], DEVICE-gated) — would invoke
 //!      `/usr/bin/sandbox-exec -f <profile> /bin/sh -c <cmd>` with bounded output,
@@ -44,14 +53,20 @@ use std::path::Path;
 
 // ---------------------------------------------------------------------------
 // (0) GATE — may the shell run at all? Mirrors code::code_permitted: the master
-// `[shell].enabled` switch (ships false). With it off the feature is inert.
+// `[shell].enabled` switch, which SHIPS ON (full-power default). With it
+// explicitly set false the feature is inert.
 // ---------------------------------------------------------------------------
 
-/// Whether the sandboxed shell may run: the `[shell].enabled` switch is on. With
-/// it false (the shipped default) the shell intent is never classified and the
+/// Whether the sandboxed shell may run: the `[shell].enabled` switch is on. It
+/// SHIPS ON (full-power default) — this doc used to call false "the shipped
+/// default", which is the opposite of `config.rs`'s `ShellConfig::default` and of
+/// this file's own tests ("ships ON; this pins the explicit-disable path"). With
+/// it explicitly set false the shell intent is never classified and the
 /// `shell_run` tool is inert — exactly like `code::code_permitted`. This is the
 /// CONFIG gate; it is independent of (and ANDed beneath) the master switch +
-/// confirm + voice-id + lockdown gates the gate routing enforces.
+/// confirm + voice-id + lockdown gates the gate routing enforces, and ON it still
+/// never auto-runs (`shell_run` is in CONSEQUENTIAL_TOOLS +
+/// NEVER_AUTO_APPROVE_TOOLS, so it parks per-action even under an `Always`).
 pub fn shell_permitted(enabled: bool) -> bool {
     enabled
 }
@@ -396,9 +411,6 @@ fn normalize_for_classify(cmd: &str) -> String {
 // apps::generate_sbpl. PURE: returns the profile TEXT; never writes/execs it.
 // ---------------------------------------------------------------------------
 
-/// `/usr/bin/sandbox-exec` — the macOS seatbelt CLI. Same constant the micro-app
-/// runtime + apply_heal.sh use. Deprecated-but-functional; the kernel enforcement
-/// is live.
 /// Read `reader` to EOF, RETAINING only the first `cap + 1` bytes.
 ///
 /// The +1 is what lets the caller distinguish "exactly cap bytes" from "more than
@@ -427,6 +439,14 @@ where
     kept
 }
 
+/// `/usr/bin/sandbox-exec` — the macOS seatbelt CLI. Same constant the micro-app
+/// runtime + apply_heal.sh use, and the on-device availability probe every caller
+/// (realm.rs / forge.rs / ui_automation.rs) checks before it tries to run
+/// anything. Deprecated-but-functional; the kernel enforcement is live.
+///
+/// (This paragraph had drifted UP onto `drain_capped` — a byte-draining reader
+/// with nothing to do with a seatbelt CLI — leaving the public constant every
+/// caller depends on with no doc at all.)
 pub const SANDBOX_EXEC: &str = "/usr/bin/sandbox-exec";
 
 /// Apple's baseline BSD profile: the syscalls + dyld/framework boot reads EVERY
@@ -448,7 +468,12 @@ pub const BSD_BASE_PROFILE: &str = "/System/Library/Sandbox/Profiles/bsd.sb";
 ///     stores are EXPLICITLY denied (read + write) — last-match-wins SBPL means
 ///     these denies sit AFTER the broad read allow so they win,
 ///   * file-WRITE is confined to the single canonicalized `scratch_dir` ONLY;
-///     every other write target stays denied.
+///     every other write target stays denied,
+///   * file-READ is then RE-ALLOWED for the `scratch_dir` subtree as the LAST
+///     rule — every caller nests the scratch dir under the denied daemon
+///     `state/`, so without that line a command could write its own working
+///     directory and not read it back (`ls`/`cat` -> "Operation not permitted").
+///     The rest of `state/` (db + secrets) stays denied for read AND write.
 ///
 /// `scratch_dir` is the absolute, canonicalized scratch directory the command may
 /// write to (the caller creates + canonicalizes it). `home` is the user's home
@@ -524,14 +549,56 @@ pub fn generate_shell_sbpl(scratch_dir: &Path, home: &Path, daemon_state: &Path)
     // --- file writes (scratch ONLY) ------------------------------------
     // The SINGLE load-bearing write grant: writes confined to the canonicalized
     // scratch dir subtree. Every other write target stays denied by the opener.
-    // This grant comes LAST so it wins for the scratch subtree, but the secret
-    // denies above are MORE SPECIFIC subpaths and a scratch dir never overlaps a
-    // secret store (the caller roots scratch under state/shell/scratch, distinct
-    // from the denied state/darwin db + secrets).
+    // This grant comes LAST so it wins for the scratch subtree.
     s.push_str("\n;; Writes: confined to the scratch dir ONLY. Every other write target\n");
     s.push_str(";; stays denied. This is the single by-construction write confinement.\n");
     s.push_str(&format!(
         "(allow file-write* (subpath \"{}\"))\n",
+        sbpl_path(scratch_dir)
+    ));
+
+    // --- READ back into the scratch dir (the shadowing fix) -------------
+    // WHAT WENT WRONG: the comment here used to claim "the secret denies above
+    // are MORE SPECIFIC subpaths and a scratch dir never overlaps a secret store
+    // (the caller roots scratch under state/shell/scratch, distinct from the
+    // denied state/darwin db + secrets)". That was FALSE. Every shipped caller
+    // nests the scratch dir INSIDE the denied daemon state:
+    //     shell_run  -> <root>/state/shell/scratch/<ts>
+    //     realm.rs   -> <root>/state/realms/<ts>
+    //     forge.rs   -> <root>/state/forge/staging-<ts>
+    // and `daemon_state` is <root>/state — a strict ANCESTOR of all three.
+    // "Distinct from the db + secrets" is NOT the same as "outside the denied
+    // subpath". Because SBPL is last-match-wins and the grant above is
+    // file-WRITE* only, the daemon-state `(deny file-read* file-write* ...)`
+    // stayed the LAST matching rule for every READ inside the scratch subtree.
+    //
+    // MEASURED under the real /usr/bin/sandbox-exec with the shipped layout:
+    //     echo hello > f.txt   -> rc=0
+    //     cat f.txt            -> "Operation not permitted"
+    //     ls .                 -> "Operation not permitted"
+    // With the same profile and the scratch dir moved OUT of state/, all three
+    // succeed — the overlap was the whole cause.
+    //
+    // So the sandboxed shell could write its one writable directory and then not
+    // read it back: `ls`, `cat f`, `echo x > f && cat f` all failed on a command
+    // the user had explicitly confirmed. Worse, realm.rs hands the COW-copied
+    // repo in as `scratch_dir`, so the realm's build/test could not read a SINGLE
+    // source file and a perfectly good diff came back "FAILED (exit 2)" —
+    // RealmVerdict::Passed was unreachable for any verify command that reads a
+    // file. forge.rs's `cargo check`/`cargo test` validation was in the same hole.
+    //
+    // The fix is the one this repo already uses for /etc in
+    // forge.rs::forge_validation_sbpl: append the re-allow AFTER the denies so
+    // last-match-wins re-opens exactly this and nothing else. READ only, scratch
+    // subtree only — the scratch dir is a throwaway the caller just created and
+    // holds no secret, while the rest of state/ (the db + the secret store) stays
+    // denied for BOTH read and write, as do the Keychain, ~/.claude, ~/.ssh,
+    // ~/.aws, /etc and the network.
+    s.push_str("\n;; Reads INSIDE the scratch dir: re-allowed AFTER the secret denies.\n");
+    s.push_str(";; The callers nest scratch under the denied state/ dir, so without this\n");
+    s.push_str(";; last-match-wins line a command cannot read back what it just wrote.\n");
+    s.push_str(&format!(
+        "(allow file-read* (subpath \"{}\"))\n",
         sbpl_path(scratch_dir)
     ));
 
@@ -954,6 +1021,60 @@ mod tests {
         assert!(profile.contains("(allow file-write* (subpath \"/proj/state/shell/scratch/42\"))"));
         // And the daemon state is denied read+write.
         assert!(profile.contains("(deny file-read* file-write* (subpath \"/proj/state\"))"));
+    }
+
+    #[test]
+    fn scratch_reads_survive_the_daemon_state_deny_that_contains_the_scratch_dir() {
+        // WHAT WENT WRONG: every shipped caller nests the scratch dir INSIDE the
+        // denied daemon state — shell_run uses <root>/state/shell/scratch/<ts>,
+        // realm.rs uses <root>/state/realms/<ts>, forge.rs uses
+        // <root>/state/forge/staging-<ts>, and daemon_state is <root>/state. The
+        // profile granted file-WRITE* on the scratch subtree but nothing re-opened
+        // file-READ*, so under last-match-wins the daemon-state deny stayed the
+        // last matching rule for every read: measured under the real
+        // /usr/bin/sandbox-exec, `echo hello > f.txt` succeeded and both
+        // `cat f.txt` and `ls .` came back "Operation not permitted". That broke
+        // the shell tool on its own cwd and made realm.rs report a good diff as
+        // FAILED because the build could not read a single source file.
+        //
+        // This pins the ORDERING, which is the whole fix: the read re-allow for
+        // the scratch subtree must come AFTER the daemon-state deny.
+        let scratch = PathBuf::from("/proj/state/shell/scratch/42");
+        let home = PathBuf::from("/home/u");
+        let daemon_state = PathBuf::from("/proj/state");
+        let profile = generate_shell_sbpl(&scratch, &home, &daemon_state);
+
+        let deny_pos = profile
+            .find("(deny file-read* file-write* (subpath \"/proj/state\"))")
+            .expect("the daemon state must still be denied read+write");
+        let read_allow_pos = profile
+            .find("(allow file-read* (subpath \"/proj/state/shell/scratch/42\"))")
+            .unwrap_or_else(|| {
+                panic!("the scratch subtree must re-allow file-read*: {profile}")
+            });
+        assert!(
+            read_allow_pos > deny_pos,
+            "the scratch read re-allow must come AFTER the daemon-state deny \
+             (SBPL is last-match-wins; before it, reads inside the scratch dir \
+             are still denied): {profile}"
+        );
+
+        // The re-allow is READ-scoped and scratch-scoped: it must not hand back
+        // read of the whole state dir, and the secret stores stay denied.
+        assert!(
+            !profile.contains("(allow file-read* (subpath \"/proj/state\"))"),
+            "only the scratch SUBTREE may be re-opened, never the state dir: {profile}"
+        );
+        assert!(
+            profile.contains("(deny file-read* file-write* (subpath \"/home/u/.claude\"))"),
+            "~/.claude stays denied: {profile}"
+        );
+        // And write confinement is unchanged: still exactly one write allow.
+        assert_eq!(
+            profile.matches("(allow file-write*").count(),
+            1,
+            "exactly one write-allow (scratch only): {profile}"
+        );
     }
 
     #[test]

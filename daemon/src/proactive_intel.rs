@@ -31,8 +31,10 @@
 //!      master switch and ships TRUE (config.rs default + darwin.toml pin),
 //!      mirroring `[proactive].speak` — it is deliberately NOT `[proactive].enabled`
 //!      (which ships ON only to power the unrelated first-contact brief). So with
-//!      the shipped config NO suggestion surfaces. Even with `suggest` on, a
-//!      suggestion is only SURFACED (HUD feed / proactive brief), never acted; the
+//!      the shipped config suggestions DO surface — main.rs's anticipation loop
+//!      calls `surface_pass` every 60s and emits every returned suggestion as a
+//!      `proactive.suggestion` card. A suggestion is only ever SURFACED (HUD feed /
+//!      proactive brief), never acted; the
 //!      ACTION (accepting a habit offer) still needs accept + the standing gate.
 //!   4. AGENT-SCOPED. Detection runs over ONE agent's episodes (the namespace it
 //!      is called with); a pattern mined from agent A never surfaces under agent
@@ -328,8 +330,9 @@ fn proposed_mission_for(topic: &str) -> StandingMission {
 /// reads no store and no clock — the caller passes the agent's already-recalled
 /// episodes (agent-scoped at the Db) and the dismiss-ledger. Returns an EMPTY
 /// vec — never a fabricated suggestion — whenever:
-///   * `[proactive].suggest` is off (the gate, which SHIPS OFF; with it off
-///     NOTHING surfaces — this is the suggester's own ships-off switch);
+///   * `[proactive].suggest` is off (the gate, which SHIPS **ON** — config.rs
+///     default `true` + darwin.toml pin; turning it off is what makes NOTHING
+///     surface, and it is the suggester's OWN switch, not `[proactive].enabled`);
 ///   * the history is sparse/empty/contradictory (no topic clears the floor);
 ///   * every candidate is already in `dismissed` (dedup).
 ///
@@ -353,8 +356,9 @@ pub fn detect(
     // suggester's OWN master switch — `[proactive].suggest` — which SHIPS ON
     // (config.rs default true + darwin.toml `suggest = true`), mirroring
     // `[proactive].speak`. It is deliberately NOT `[proactive].enabled` (which
-    // ships ON only for the first-contact brief), so the suggestion feed is gated
-    // by a flag that actually ships off, not by being dead code.
+    // ships ON only for the first-contact brief), so the suggestion feed has its
+    // OWN switch — one the operator can close without losing the brief. That switch
+    // ships ON, so this is a LIVE surface on a default install, not dead code.
     if !cfg.suggest {
         return Vec::new();
     }
@@ -580,8 +584,10 @@ mod tests {
         ProactiveConfig { suggest: true, speak: false, ..Default::default() }
     }
 
-    /// A config with the suggester OFF — its master gate; with it off NO
-    /// suggestion surfaces. Uses the DEFAULT (which ships `suggest = false`).
+    /// A config with the suggester explicitly OFF — its master gate; with it off NO
+    /// suggestion surfaces. NOT the default: the shipped default is
+    /// `suggest = true` (see `the_suggester_gate_ships_on`), which is why this
+    /// helper writes the flag rather than relying on `Default`.
     fn cfg_off() -> ProactiveConfig {
         ProactiveConfig { suggest: false, ..Default::default() }
     }
@@ -840,9 +846,9 @@ mod tests {
     #[test]
     fn enabled_on_does_not_open_the_suggestion_gate() {
         // The suggester does NOT piggyback on `enabled` (which ships ON for the
-        // first-contact brief). With enabled=true but suggest=false (the shipped
-        // posture), a strong pattern still surfaces nothing — only `suggest` opens
-        // the feed.
+        // first-contact brief). With enabled=true but suggest=false — an OPERATOR
+        // choice, not the shipped posture, which is suggest=true — a strong pattern
+        // still surfaces nothing; only `suggest` opens the feed.
         let cfg = ProactiveConfig { enabled: true, suggest: false, ..Default::default() };
         let eps: Vec<Episode> = (1..=6).map(|d| ep("agent.darwin", "budget.review", &morning_ts(d))).collect();
         let out = detect(&cfg, "agent.darwin", &eps, &DismissLedger::default());
@@ -1078,9 +1084,10 @@ mod tests {
 
     #[tokio::test]
     async fn live_pass_with_the_gate_off_surfaces_nothing() {
-        // [proactive].suggest off (the SHIPPED default) => the live pass is a true
-        // no-op even with a strong pattern. This is the ships-OFF contract at the
-        // wiring boundary (not just inside the pure detector).
+        // [proactive].suggest off (an OPERATOR choice — the SHIPPED default is ON)
+        // => the live pass is a true no-op even with a strong pattern. This is the
+        // gate-closed contract at the wiring boundary, not just inside the pure
+        // detector.
         let db = TempDb::new("gate-off");
         let memory = Memory::open(&db.0).expect("open mem");
         seed(&memory, "agent.darwin", "budget.review", 6).await;

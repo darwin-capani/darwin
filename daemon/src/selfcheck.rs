@@ -93,7 +93,7 @@ pub fn tally(checks: &[Check]) -> (usize, usize, usize) {
 }
 
 /// The structural FILESYSTEM checks: root resolution, the daemon binary, the
-/// venv python, config readability, the four state subdirs, and the 0700 perms
+/// venv python, config readability, the three state subdirs, and the 0700 perms
 /// on `state/ipc`. PURE w.r.t. the clock/network — it only stats the tree — so
 /// it is the same logic the startup self-check uses to decide whether to abort.
 /// `is_dev` is true when the resolver fell back to a tree that is NOT an install
@@ -170,7 +170,11 @@ pub fn filesystem_checks(root: &Path) -> Vec<Check> {
         ));
     }
 
-    // The four runtime state subdirs (created at startup; here we report).
+    // The THREE runtime state subdirs the daemon actually creates at startup
+    // (main.rs makes exactly state/ipc, state/logs, state/tmp); here we report.
+    // This said "four", which implied a fourth directory was validated at startup
+    // — scripts/init_memory.py does list a fourth (state/ipc/apps), and that is
+    // precisely the thing a reader would then assume is gated here. It is not.
     for sub in ["ipc", "logs", "tmp"] {
         let d = root.join("state").join(sub);
         if d.is_dir() {

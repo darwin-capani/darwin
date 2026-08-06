@@ -595,13 +595,16 @@ fn glyph_rows(c: char) -> [&'static str; 5] {
         '7' => ["#####", "    #", "   # ", "  #  ", "  #  "],
         '8' => [" ### ", "#   #", " ### ", "#   #", " ### "],
         '9' => [" ### ", "#   #", " ####", "    #", " ### "],
-        _ => ["     ", "     ", "     ", "     ", "     "], // space / unsupported
+        _ => ["     ", "     ", "     ", "     ", "     "], // space (the only char reaching this arm)
     }
 }
 
 /// `ascii_banner {text}` -> a 5-row ASCII-art rendering of `text`. Supports A-Z,
-/// 0-9, and space (case-insensitive; unsupported characters render as blank
-/// columns). Bounded to 20 characters so the output stays readable. Pure + total.
+/// 0-9, and space (case-insensitive); ANY other character is a friendly ERROR
+/// naming it, never a silent blank column — the caller asked for punctuation to
+/// render, so quietly dropping it would be a lie about the output (see the
+/// validation loop below and `ascii_banner_validates_alphabet_and_bounds`).
+/// Bounded to 20 characters so the output stays readable. Pure + total.
 fn ascii_banner(args: &Value) -> Result<String> {
     let text = args
         .get("text")

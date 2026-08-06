@@ -533,19 +533,45 @@ mod tests {
         assert!(!is_snake_case("a b"), "space");
     }
 
+    /// The PRODUCTION uniqueness guard rejects a duplicate skill name.
+    ///
+    /// This test used to build two `SkillDef`s, use only their `.name` field, and
+    /// assert that `std::collections::HashSet::insert` returns false the second
+    /// time you insert the same `&'static str`. That is std behaviour: it holds no
+    /// matter what this module contains, so deleting the guard from
+    /// `Registry::new` left the suite green — and `every_skill_name_is_snake_case_
+    /// and_unique` re-implements the uniqueness check over `reg.all()` in the test
+    /// itself, so it catches a duplicate SHIPPING but not deletion of the check.
+    /// The guard matters because `Registry::get` returns the FIRST match, so a
+    /// duplicate silently shadows a skill in `skill_invoke` dispatch. The comment
+    /// was also wrong that injection is impossible: `from_skills_for_test` exists
+    /// for exactly this and runs the same guard.
     #[test]
     fn duplicate_name_trips_the_guard() {
-        // Build a tiny registry by hand to prove the guard rejects a dup — we
-        // can't inject into the real category modules, so exercise the same
-        // invariant the guard enforces via a constructed pair.
         fn noop(_: &Value) -> Result<String> {
             Ok(String::new())
         }
-        let a = SkillDef::new("dup_name", Category::Utilities, "d", &[], noop);
-        let b = SkillDef::new("dup_name", Category::Text, "d", &[], noop);
-        let mut seen = std::collections::HashSet::new();
-        assert!(seen.insert(a.name));
-        assert!(!seen.insert(b.name), "the guard's HashSet must reject the dup");
+        let dup = Registry::from_skills_for_test(vec![
+            SkillDef::new("dup_name", Category::Utilities, "d", &[], noop),
+            SkillDef::new("dup_name", Category::Text, "d", &[], noop),
+        ]);
+        let err = match dup {
+            Ok(_) => panic!("the guard must reject a duplicate skill name"),
+            Err(e) => e.to_string(),
+        };
+        assert!(err.contains("dup_name"), "the reason must name the skill: {err}");
+        // The positive case, so the assertion above is not trivially satisfiable.
+        assert!(
+            Registry::from_skills_for_test(vec![SkillDef::new(
+                "dup_name",
+                Category::Utilities,
+                "d",
+                &[],
+                noop
+            )])
+            .is_ok(),
+            "a single well-named skill must still build"
+        );
     }
 
     #[test]

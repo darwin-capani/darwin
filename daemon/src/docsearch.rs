@@ -484,8 +484,20 @@ fn docx_wants(name: &str) -> bool {
 }
 
 fn xlsx_wants(name: &str) -> bool {
-    // Shared strings hold most cell text; worksheets hold inline strings + the
-    // (numeric/string) cell values. Both expose visible text via `<t>`.
+    // Shared strings hold most cell text; worksheets are mined ONLY for INLINE
+    // strings (`<is><t>`), because `<t>` is the only element the extractor treats as
+    // text (see `office_spec`).
+    //
+    // OUT OF SCOPE, STATED PLAINLY: a numeric/date/formula-result cell is written by
+    // Excel as `<c r="A1"><v>42424242</v></c>`, and `<v>` never increments
+    // `depth_in_text`, so its content is DISCARDED. Those values are therefore not
+    // chunked and cannot be retrieved or cited — a user searching an indexed .xlsx
+    // for an invoice amount or a date gets an honest-looking empty result. String
+    // cell content is NOT lost: it lives in `xl/sharedStrings.xml`, which is mined.
+    // (This comment used to claim worksheets' "(numeric/string) cell values" were
+    // mined via `<t>`; they are not. Mining `<v>` too would also pull shared-string
+    // INDEX integers into the text unless cells carrying `t="s"` are skipped, which
+    // the generic SAX extractor cannot currently do.)
     name == "xl/sharedStrings.xml"
         || (name.starts_with("xl/worksheets/sheet") && name.ends_with(".xml"))
 }
@@ -2589,7 +2601,13 @@ pub async fn index_documents(
 /// contains a `..` component (a relative or traversing root is a misconfiguration
 /// that could widen the surface). The walk additionally canonicalizes every root,
 /// but this catches an obviously-unsafe entry early for an honest config warning.
-#[allow(dead_code)] // surfaced by the HUD/config validation path; unit-tested here
+///
+/// CALLED BY the config parse (`Config::load_with_issues`, which pushes one issue
+/// per failing `[docsearch].roots` entry). It previously carried an
+/// `#[allow(dead_code)]` claiming it was "surfaced by the HUD/config validation
+/// path" — there was no such caller anywhere in the repo, so an unsafe root got no
+/// warning at all and `std::fs::canonicalize` quietly resolved it against the
+/// daemon's working directory (the install root per the launchd plists).
 pub fn root_is_safe(root: &str) -> bool {
     let p = Path::new(root);
     p.is_absolute() && !p.components().any(|c| matches!(c, Component::ParentDir))
@@ -4012,7 +4030,10 @@ mod tests {
             ),
             (
                 "xl/worksheets/sheet1.xml",
-                r#"<?xml version="1.0"?><worksheet><sheetData><row><c t="inlineStr"><is><t>inline cell text</t></is></c></row></sheetData></worksheet>"#,
+                // A `<v>` CELL VALUE is included deliberately: it pins the extractor's
+                // actual scope. `<v>` is NOT mined (only `<t>` is), so 42424242 must
+                // NOT appear in the extracted text — see `xlsx_wants`.
+                r#"<?xml version="1.0"?><worksheet><sheetData><row><c r="A1"><v>42424242</v></c><c t="inlineStr"><is><t>inline cell text</t></is></c></row></sheetData></worksheet>"#,
             ),
         ])
     }
@@ -4109,6 +4130,16 @@ mod tests {
         assert!(xlsx.contains("Revenue"), "xlsx shared string: {xlsx:?}");
         assert!(xlsx.contains("quarterly forecast 2026"), "xlsx: {xlsx:?}");
         assert!(xlsx.contains("inline cell text"), "xlsx inline string: {xlsx:?}");
+        // SCOPE PIN: a `<v>` cell value is NOT extracted. Excel writes every
+        // numeric/date/formula-result cell that way, so those values are
+        // unsearchable — `xlsx_wants` documents this as out of scope, and the
+        // fixture used to contain no `<v>` cell at all, so nothing pinned it either
+        // way. If `<v>` is ever mined, flip this assertion and handle `t="s"` cells
+        // (whose `<v>` holds a shared-string INDEX, not text).
+        assert!(
+            !xlsx.contains("42424242"),
+            "a <v> cell value is out of scope for the extractor: {xlsx:?}"
+        );
 
         let pptx = office_text(&make_pptx(), OfficeKind::Pptx, 1 << 20).unwrap();
         assert!(pptx.contains("Project DARWIN"), "pptx: {pptx:?}");
@@ -4227,13 +4258,21 @@ mod tests {
         assert_eq!(ok.as_deref(), Some("real extracted text"));
     }
 
-    /// A scanned/image-only PDF (no text layer) is HONEST-SKIPPED, never indexed
-    /// empty. We model "no text layer" with a valid PDF whose page has no text show
-    /// operator at all.
+    /// A PDF that yields NO text is HONEST-SKIPPED, never indexed empty.
+    ///
+    /// SCOPE, HONESTLY: `make_pdf("")` does NOT model a scanned/image-only page.
+    /// `make_pdf` unconditionally emits `BT /F1 24 Tf 72 700 Td ({body}) Tj ET`, so
+    /// with an empty body the content stream is 31 bytes and DOES carry a `Tj` show
+    /// operator — with an empty string operand. That is the "show operator whose
+    /// string is empty" path, a different `pdf-extract` route from "a page with no
+    /// text operators at all", which is what a genuinely scanned page looks like.
+    /// The comments here used to claim the latter. The honest-skip assertion below
+    /// is sound either way; only the coverage claim was wrong.
     #[tokio::test]
     async fn image_only_pdf_yields_no_text_and_is_skipped() {
         let t = TempTree::new("scanned-pdf");
-        // A structurally-valid PDF with an empty content stream (no Tj) -> no text.
+        // A structurally-valid PDF whose single show operator has an EMPTY string
+        // operand -> no glyphs -> no text.
         let no_text = make_pdf("");
         t.write_bytes("docs/scan.pdf", &no_text);
         t.write("docs/real.md", "a real note so the index is not empty");
@@ -4708,9 +4747,18 @@ mod tests {
         // And the CHUNK ceiling: a file whose chunks cannot ALL fit the
         // remaining budget is skipped WHOLE (per-file all-or-nothing — never a
         // partial index entry), so the store stays exactly where it was.
+        //
+        // max_chunks MUST leave the store room, or this proves nothing. It used to
+        // be 3 against a store already holding exactly 3 chunks, so `chunk_budget`
+        // was ZERO and `absorb_candidates` returned at its plan-time short circuit
+        // (`if file_budget == 0 || chunk_budget == 0 { return Ok(0) }`) — the
+        // candidate was never stat'd, read, extracted or chunked, and the
+        // all-or-nothing branch the comment names was NEVER EXECUTED. Deleting that
+        // branch outright left this test green. The precondition assert below makes
+        // that regression impossible to reintroduce silently.
         let chunk_tight = IndexBounds {
             max_files: 100,
-            max_chunks: 3,
+            max_chunks: 5,
             chunk_chars: 64,
             chunk_overlap: 8,
             ..IndexBounds::default()
@@ -4718,6 +4766,15 @@ mod tests {
         idx.forget().await.unwrap();
         idx.reindex(&roots, &chunk_tight, &KeywordEmbedder).await.unwrap();
         let before = idx.status().await.unwrap().chunks;
+        assert!(
+            before < chunk_tight.max_chunks as u64,
+            "PRECONDITION: the store must have chunk budget LEFT ({before} of {}), else \
+             absorb_candidates short-circuits at chunk_budget == 0 and the per-file \
+             all-or-nothing branch is never reached",
+            chunk_tight.max_chunks
+        );
+        // ~1050 chars at chunk_chars = 64 -> far more chunks than the remaining
+        // budget of 2, so the file must be rejected by the PER-FILE branch.
         let long = t.write("docs/long.md", &"words and more words ".repeat(50));
         let absorbed = idx
             .absorb_candidates(&roots, vec![discovered(&t, "docs", &long)], &chunk_tight, &KeywordEmbedder)

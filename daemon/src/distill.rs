@@ -1236,7 +1236,18 @@ mod tests {
         .await;
 
         assert!(reply.contains("STAGED"), "reply says staged-not-live: {reply}");
-        assert!(reply.to_lowercase().contains("not live") || reply.contains("STAGED"));
+        // WHAT THIS USED TO BE: `contains("not live") || contains("STAGED")`. The
+        // reply says "not yet live", so the FIRST disjunct is false, and the second
+        // is byte-for-byte the assertion on the line above — which already passed.
+        // The line therefore could not fail for any reply that reached it: deleting
+        // ", not yet live" from the message, leaving only "STAGED" (which a user
+        // could reasonably read as "deployed"), kept this test green. The module's
+        // rule #2 — training NEVER promotes — was unprotected at exactly the point
+        // it is spoken to the user.
+        assert!(
+            reply.to_lowercase().contains("not yet live"),
+            "the reply must say the adapter is NOT live yet: {reply}"
+        );
         // The dataset + a Trained manifest were staged under state/lora, promoted=false.
         let last: Manifest =
             serde_json::from_slice(&std::fs::read(staging_root(&root_path).join("last.json")).unwrap()).unwrap();

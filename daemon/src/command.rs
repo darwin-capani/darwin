@@ -41,8 +41,9 @@
 //!
 //! [`decide`] is a PURE function: parse + size-check + structural allowlist +
 //! token presence, with no I/O — the security tests drive it directly. The
-//! routing INTO the heavy pipeline (`route()`, `edith_brief`, `fury_mission`,
-//! roster/state) is behind the [`CommandPipeline`] trait so the tests inject a
+//! routing INTO the heavy pipeline (`complete_with_tools`, `edith_brief_now`,
+//! `run_fury_mission`, roster/state — NOT `router::route()`; see
+//! [`CommandPipeline`]) is behind the [`CommandPipeline`] trait so the tests inject a
 //! hermetic mock instead of a live daemon, while the confirmation-gate and
 //! forge-dismiss logic is exercised against the REAL `confirm` / forge state.
 
@@ -133,7 +134,9 @@ struct RawCommand {
     length_ms: Option<u32>,
     /// `vault`: the desired vault mode — `true` engages ("go dark"), `false` lifts.
     /// REQUIRED for the `vault` verb (absent => a `BadRequest`, never a silent
-    /// default) so the HUD toggle is always explicit about which way it points.
+    /// default) so the caller is always explicit about which way it points. (This
+    /// said "the HUD toggle"; see [`Command::Vault`] — the shipped HUD cannot send
+    /// this verb at all.)
     #[serde(default)]
     on: Option<bool>,
 }
@@ -213,7 +216,23 @@ pub enum Command {
     /// the ONLY way to `lockdown::unlock()` (gates return to their configured
     /// values; the marker is removed). NEVER model-routed.
     Unlock,
-    /// TOGGLE VAULT MODE ("go dark", vault.rs) — the HUD's vault switch. A DEDICATED
+    /// TOGGLE VAULT MODE ("go dark", vault.rs) — a CHANNEL-LEVEL control with NO
+    /// caller in the shipped clients.
+    ///
+    /// WHAT WENT WRONG: four comments in this file called this "the HUD's vault
+    /// switch" / "the HUD VAULT toggle". No such control exists, and the HUD
+    /// cannot even name the verb: `hud/src-tauri/src/command.rs`'s
+    /// `ALLOWED_COMMANDS` does not contain "vault", so `build_request` returns
+    /// `Err("unknown_command")` before the socket (with a second identical check
+    /// in `send_command`), the TS verb union omits it, and there is no dedicated
+    /// `#[tauri::command]` for it. The only HUD vault surface is the READ-ONLY
+    /// `VaultIndicator` chip, whose own tooltip tells the user to say "go dark".
+    /// The other shipped socket client (scripts/bringup.sh) sends only `roster`.
+    /// This is NOT the project's "ON but inert without its dependency" pattern —
+    /// there is no dependency to supply; no client can reach the arm. The vault
+    /// FEATURE works, but through the spoken path (router.rs), not this verb.
+    ///
+    /// A DEDICATED
     /// verb, NOT `ask` — it NEVER reaches the model/tool loop; the daemon flips the
     /// process-global vault mode directly (`vault::set`). NOTHING CONSEQUENTIAL: it
     /// only ever TIGHTENS (forces LOCAL-ONLY routing + the maximal CUSTOMS trim),
@@ -371,7 +390,9 @@ fn decide(raw: &str) -> Decision {
         // the model. They still pass the SAME token + rate gate every command does.
         "panic" => Command::Panic,
         "unlock" => Command::Unlock,
-        // VAULT MODE toggle (vault.rs) — the HUD's "go dark" switch. A DEDICATED
+        // VAULT MODE toggle (vault.rs) — a channel-level "go dark" control with no
+        // shipped client (see Command::Vault; the HUD's ALLOWED_COMMANDS omits it).
+        // A DEDICATED
         // verb; the daemon flips the process-global mode directly (never the model).
         // `on` is REQUIRED: an absent/garbled flag is a BadRequest, never a silent
         // default, so the toggle can never accidentally engage OR lift.
@@ -511,13 +532,32 @@ impl RateLimiter {
 
 /// The seam to the heavy gated pipeline, abstracted so the unit tests run with a
 /// hermetic mock instead of a live daemon (no model, no socket, no network). The
-/// PRODUCTION impl ([`crate::main`]'s wiring) routes each call through the SAME
-/// pipeline the voice path uses:
-///   * [`ask`] -> `router::route()` (delegation, RAG, cloud tool-loop) — a
-///     consequential tool STILL parks via the confirmation gate,
-///   * [`brief`] -> `anticipate::on_demand_brief` (Edith's on-demand brief),
-///   * [`mission`] -> `mission::run_mission` (bounded),
+/// PRODUCTION impl is [`LivePipeline`] below:
+///   * [`ask`] -> `anthropic::complete_with_tools` (the cloud tool-loop) — a
+///     consequential tool STILL parks via the confirmation gate inside
+///     `execute_tool`, and the agent's own allowlist is what is offered,
+///   * [`brief`] -> `anthropic::edith_brief_now` (Edith's on-demand brief),
+///   * [`mission`] -> `anthropic::run_fury_mission` (bounded),
 ///   * [`roster`] / [`state`] -> read-only registry/state snapshots.
+///
+/// WHAT WENT WRONG: this block used to say the production impl "routes each call
+/// through the SAME pipeline the voice path uses" and that `ask` goes to
+/// `router::route()`. It does not — the string `router::` appears nowhere in this
+/// file except in that claim, and `LivePipeline::ask` calls
+/// `anthropic::complete_with_tools` directly. That matters because it is exactly
+/// the guarantee a reviewer would lean on: the `ask` verb therefore does NOT
+/// inherit any ROUTER-level gate, specifically
+///   * `route()`'s two `deny_cloud` seams (vault "go dark" + THRESHOLD guest
+///     mode), which force a turn local — the command channel reaches the cloud
+///     regardless of either,
+///   * intent classification / agent delegation / the RAG feed,
+///   * the router's lockdown-first fast path and its guest fast-path mirror.
+///
+/// What it DOES inherit is everything inside `execute_tool`: the consequential
+/// park, the master switch, voice-id, lockdown and per-action policy. A new
+/// ROUTER-level gate does not reach this channel for free and must be added here
+/// too. ([`LivePipeline`]'s own doc, ~600 lines down, always described this
+/// correctly; the two contradicted each other and this was the wrong one.)
 ///
 /// The confirm/deny-by-id and dismiss_forge commands do NOT go through this
 /// trait — they act on the REAL `confirm` slot and forge marker (via
@@ -951,7 +991,9 @@ where
             json!({"ok": true, "reply": reply, "locked": crate::lockdown::is_locked_down()})
         }
         Command::Vault { on } => {
-            // The HUD VAULT toggle ("go dark"): flip the process-global vault mode
+            // The VAULT toggle ("go dark") — reachable over the command socket
+            // only; the shipped HUD cannot send it (see Command::Vault). Flip the
+            // process-global vault mode
             // directly (vault::set) — never the model. NOTHING CONSEQUENTIAL: it only
             // ever TIGHTENS (LOCAL-ONLY routing + the maximal CUSTOMS trim). Emit the
             // secret-free vault.status frame so the HUD indicator flips immediately,
@@ -1355,8 +1397,11 @@ impl CommandPipeline for LivePipeline {
     }
 
     async fn state(&self) -> String {
-        // Read-only: the live constellation plus whether a confirmation is parked
-        // and whether a forge proposal is pending. No secrets, no replay material.
+        // Read-only: the live constellation plus whether a confirmation is parked.
+        // NOT the forge marker — this comment used to claim "and whether a forge
+        // proposal is pending", and nothing here (nor in `roster_spoken()`) reads
+        // `meta.forge_pending`. `LiveDispatcher::list_pending` is the arm that
+        // does. No secrets, no replay material.
         let pending = crate::confirm::peek_pending(Instant::now())
             .map(|p| format!("A {} action is awaiting confirmation (id {}).", p.tool, p.id))
             .unwrap_or_else(|| "Nothing awaiting confirmation.".to_string());

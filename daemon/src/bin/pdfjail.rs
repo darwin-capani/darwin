@@ -19,7 +19,17 @@
 //!      `catch_unwind` so a parser panic becomes a clean non-zero exit too.
 //!   3. EMIT — write the extracted UTF-8 text to stdout and `exit(0)`.
 //!
-//! Any error at any step => `exit(1)` (an honest skip at the parent). The result
+//! Any error in step 2 or 3 => `exit(1)` (an honest skip at the parent).
+//!
+//! STEP 1 IS THE EXCEPTION, AND IT FAILS OPEN — DELIBERATELY. If
+//! `setrlimit(RLIMIT_AS, ...)` (or the mach `task_info` baseline read) fails, the
+//! child prints a stderr diagnostic and CONTINUES UNJAILED, degrading to process
+//! isolation plus the parent's timeout: a bomb then drives THIS child to the OS
+//! memory-pressure killer instead of to a bounded allocation failure, and the
+//! parent still honest-skips. The alternative — failing every PDF because one
+//! syscall was refused — was judged worse. Note the non-unix arm of
+//! `arm_address_space_limit` returns `Unsupported` unconditionally, so on any
+//! non-unix build the jail is never armed at all. The result
 //! channel (stdout) is kept PRISTINE by construction: during extraction FD 1 is
 //! pointed at stderr so any stray diagnostic a PDF library might print cannot
 //! corrupt the extracted text; the real text is written to a saved stdout FD.

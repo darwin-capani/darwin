@@ -159,9 +159,13 @@ struct TalkerKey {
 }
 
 /// One talker's longitudinal record: its rising-edge timestamps (bounded ring)
-/// and when it was last seen (for pruning + LRU eviction).
+/// and when it was last OBSERVED (for pruning + LRU eviction).
 struct TalkerRecord {
     key: TalkerKey,
+    /// When this talker was last seen in a sample — refreshed on EVERY sample it
+    /// appears in, not just on a rising edge. (It used to be written only by
+    /// `record_edge`, i.e. only on a rising edge, which made `prune` drop
+    /// connections that had never gone away. See `ingest_sample`.)
     last_seen: u64,
     /// Rising-edge sample times (absent→present transitions), oldest-first,
     /// bounded to `max_samples_per_talker`.
@@ -227,6 +231,27 @@ impl BaselineStore {
                 self.record_edge(key.clone(), now);
             }
         }
+        // REFRESH `last_seen` for EVERY talker present in this sample, not only for
+        // the ones that just rose.
+        //
+        // WHAT WENT WRONG WITHOUT THIS: `record_edge` was the sole writer of
+        // `last_seen`, and it only runs on an absent->present transition — so
+        // `last_seen` was the time of the last RISING EDGE, while `prune` reads it
+        // as "last observed". One outbound socket held continuously open (a VPN
+        // tunnel, an IMAP IDLE connection, a chat/websocket keepalive) therefore got
+        // pruned at t = retention_secs (24h by default) even though it was
+        // ESTABLISHED in every single sample. Its `(process, host)` pair then left
+        // the baseline, so the very next sample reported it as a FIRST-SEEN outbound
+        // talker — a false `egress.newhost` security alert complete with a rendered
+        // pfctl block-rule proposal — and kept doing so once per cooldown window for
+        // as long as the connection lived. This is precisely the long-lived case the
+        // module header claims to handle ("one socket held open -> a single edge, no
+        // series").
+        for rec in self.talkers.iter_mut() {
+            if current.contains(&rec.key) {
+                rec.last_seen = now;
+            }
+        }
         self.present = current;
         self.prune(now);
     }
@@ -262,11 +287,20 @@ impl BaselineStore {
         });
     }
 
-    /// Drop talkers unseen for longer than `retention_secs`.
+    /// Drop talkers unseen for longer than `retention_secs`, and forget them from
+    /// `present` too so the pair can be re-recorded if it ever comes back. Without
+    /// the `present` cleanup a pruned-but-still-open socket could NEVER be
+    /// re-recorded (no absent->present transition would ever occur again), leaving
+    /// the cadence classifier permanently blind to it.
     fn prune(&mut self, now: u64) {
         let cutoff = self.retention.retention_secs;
+        let before: HashSet<TalkerKey> = self.talkers.iter().map(|r| r.key.clone()).collect();
         self.talkers
             .retain(|r| now.saturating_sub(r.last_seen) <= cutoff);
+        let after: HashSet<TalkerKey> = self.talkers.iter().map(|r| r.key.clone()).collect();
+        for key in before.difference(&after) {
+            self.present.remove(key);
+        }
     }
 }
 
@@ -278,14 +312,29 @@ impl BaselineStore {
 /// NOT in the baseline `known` set — first-seen talkers. At most one
 /// observation per new pair is returned (the first), so several ports to one new
 /// host raise a single finding.
-/// DARWIN's own process names — never alarm on the daemon's own outbound (esp. its
-/// api.anthropic.com cloud lifeline). Mirrors persistence.rs's SELF_LABELS: self is
-/// recognized, never flagged.
-const SELF_PROCESSES: &[&str] = &["darwind", "darwin-inference"];
+/// DARWIN's own process names AS `lsof` REPORTS THEM — never alarm on the daemon's
+/// own outbound (esp. its api.anthropic.com cloud lifeline).
+///
+/// SCOPE, HONESTLY — THE DAEMON ONLY. The inference sidecar is NOT covered and
+/// cannot be by name: `boot/run_inference.sh` ends in
+/// `exec "$PYTHON" "$DARWIN_ROOT/inference/server.py"`, so lsof's COMMAND for it is
+/// `Python`, and excluding that would silence every python process on the machine.
+/// A `"darwin-inference"` entry used to sit in this list; the string existed in no
+/// other file in the repository — not a binary, not a plist Label, not a script —
+/// and macOS lsof truncates COMMAND to 9 characters anyway, so even a binary with
+/// that name would arrive as `darwin-in`. The comment claimed this "mirrors
+/// persistence.rs's SELF_LABELS", but those are launchd LABELS
+/// (`com.darwin.inference`), a different namespace; the mirror only ever held for
+/// `darwind`. Consequence, stated plainly: the sidecar's own egress (model fetches,
+/// the ElevenLabs calls in server.py) IS flagged as a third-party talker. Fixing
+/// that needs a PID-based exclusion resolved from the launchd label/pidfile, not a
+/// name that cannot appear.
+const SELF_PROCESSES: &[&str] = &["darwind"];
 
 /// Whether a (process, host) is DARWIN itself or a loopback peer, and so must never
 /// be alarmed on. PURE — unit-tested. Loopback covers the HUD/telemetry socket
-/// (127.0.0.1 / ::1); the self-process check covers the daemon's cloud lifeline.
+/// (127.0.0.1 / ::1); the self-process check covers the DAEMON's cloud lifeline
+/// only (see [`SELF_PROCESSES`] — the inference sidecar is not name-matchable).
 pub fn is_self_or_loopback(process: &str, host: &str) -> bool {
     SELF_PROCESSES.contains(&process)
         || host == "::1"
@@ -783,6 +832,72 @@ mod tests {
         assert!(!classify_cadence(&series, &thresholds()).is_beacon);
     }
 
+    /// REGRESSION: a connection that is ESTABLISHED in every sample past
+    /// `retention_secs` is never re-flagged as a first-seen talker.
+    ///
+    /// `last_seen` was written ONLY by `record_edge`, i.e. only on an
+    /// absent->present transition, while `prune` read it as "last observed". So a
+    /// socket held continuously open (VPN tunnel, IMAP IDLE, websocket keepalive)
+    /// was pruned at t = retention_secs even though it never went away — and the
+    /// next sample then reported it as a brand-new outbound talker, raising a false
+    /// `egress.newhost` alert with a pfctl block-rule proposal, once per cooldown
+    /// window, forever. Its rising-edge series was wiped at the same moment and
+    /// could never be rebuilt while the socket stayed up. The pre-existing
+    /// persistent-talker test only ran 6 ticks (300s), far under retention.
+    #[test]
+    fn a_continuously_present_talker_is_never_re_flagged_after_retention() {
+        let policy = retention(); // retention_secs = 86_400, i.e. the shipped 24h
+        let mut store = BaselineStore::new(policy);
+        let mut new_host_ticks: Vec<u64> = Vec::new();
+        // 30h of 60s samples, the connection ESTABLISHED in every single one.
+        for tick in 0..1800u64 {
+            let now = tick * 60;
+            let sample = vec![obs("vpn", "10.0.0.1", 443, now)];
+            // Exactly run_task's order: baseline read -> diff -> ingest.
+            let known = store.known_host_pairs();
+            if !diff_new_hosts(&sample, &known).is_empty() {
+                new_host_ticks.push(now);
+            }
+            store.ingest_sample(&sample, now);
+        }
+        assert_eq!(
+            new_host_ticks,
+            vec![0],
+            "the ONLY first-seen report may be the very first sample; a still-open \
+             connection must never be re-alerted: {new_host_ticks:?}"
+        );
+        assert_eq!(
+            store.edge_timestamps("vpn", "10.0.0.1"),
+            vec![0],
+            "the rising-edge series must survive too — the cadence classifier reads it"
+        );
+        assert!(
+            store.known_host_pairs().contains(&("vpn".to_string(), "10.0.0.1".to_string())),
+            "the talker must still be in the baseline after 30h of being connected"
+        );
+    }
+
+    /// A talker that GENUINELY goes away for longer than retention is still pruned
+    /// (the fix must not turn the retention bound into a leak), and it can be
+    /// re-recorded afterwards — `present` is cleaned up alongside `talkers`.
+    #[test]
+    fn a_talker_that_really_disappears_is_still_pruned_and_can_return() {
+        let mut store = BaselineStore::new(retention());
+        store.ingest_sample(&[obs("curl", "203.0.113.7", 443, 0)], 0);
+        assert!(store.known_host_pairs().contains(&("curl".to_string(), "203.0.113.7".to_string())));
+        // Gone, and time passes beyond retention_secs.
+        store.ingest_sample(&[], 60);
+        store.ingest_sample(&[], 86_400 + 120);
+        assert!(
+            !store.known_host_pairs().contains(&("curl".to_string(), "203.0.113.7".to_string())),
+            "a genuinely absent talker must still be pruned at the retention bound"
+        );
+        // It comes back: a rising edge is recorded again.
+        let now = 86_400 + 180;
+        store.ingest_sample(&[obs("curl", "203.0.113.7", 443, now)], now);
+        assert_eq!(store.edge_timestamps("curl", "203.0.113.7"), vec![now]);
+    }
+
     #[test]
     fn store_accumulates_a_regular_series_for_a_reappearing_beacon() {
         // A short-lived beacon: present on even ticks, gone on odd ticks. Each
@@ -962,7 +1077,20 @@ mod tests {
         // DARWIN's own cloud lifeline (darwind -> api.anthropic.com) must never be
         // flagged or proposed for a block; the HUD/telemetry loopback socket likewise.
         assert!(is_self_or_loopback("darwind", "160.79.104.10"), "own cloud egress excluded");
-        assert!(is_self_or_loopback("darwin-inference", "1.2.3.4"), "inference sidecar excluded");
+        // HONEST SCOPE: the inference SIDECAR is NOT name-excluded, and this test
+        // used to assert it was — with the input `"darwin-inference"`, a COMMAND
+        // string `egress::sample_talkers()` can never produce (the sidecar is
+        // `exec python inference/server.py`, so lsof reports `Python`, and lsof
+        // truncates COMMAND to 9 chars regardless). That gave false confidence in a
+        // gate that was always false. See SELF_PROCESSES.
+        assert!(
+            !is_self_or_loopback("Python", "1.2.3.4"),
+            "the sidecar is NOT name-excluded — do not silence every python process"
+        );
+        assert!(
+            !is_self_or_loopback("darwin-inference", "1.2.3.4"),
+            "a name lsof can never report must not be in SELF_PROCESSES"
+        );
         assert!(is_self_or_loopback("anything", "127.0.0.1"), "loopback excluded");
         assert!(is_self_or_loopback("anything", "127.5.5.5"), "127/8 loopback excluded");
         assert!(is_self_or_loopback("anything", "::1"), "ipv6 loopback excluded");

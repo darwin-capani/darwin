@@ -535,7 +535,16 @@ pub fn status_payload(
         // and the transport remains the on-device-verified leg.
         "key_present": key_present,
         "peer_configured": peer_configured,
-        "transport_inert": true,
+        // WHAT WENT WRONG: this field was PINNED `true`. `sync_now` fires the real
+        // network leg (`transport_push` -> a reqwest POST of the sealed bundle)
+        // whenever `[sync].peer_endpoint` is non-empty, so the ONE status surface
+        // that tells the user whether their facts leave the machine asserted they
+        // do not, at exactly the moment they do. The rest of the codebase already
+        // agrees that "inert" means "no peer configured" — config.rs documents
+        // `peer_endpoint` as "Empty until paired, which keeps the transport
+        // inert", and `sync_now`'s spoken line only claims inertness on the
+        // empty-endpoint branch. Derived, not pinned.
+        "transport_inert": !peer_configured,
         "syncable_facts": syncable_facts,
         "pending_conflicts": pending_conflicts,
         // Honest scope limit: deletions don't propagate (no tombstones).
@@ -713,10 +722,24 @@ mod tests {
         let armed = status_payload(true, true, true, 120, 3);
         assert_eq!(armed["key_present"], true);
         assert_eq!(armed["peer_configured"], true);
+        // WHAT WENT WRONG: `transport_inert` was PINNED true. With a peer
+        // configured, `sync_now` really does `transport_push` — a reqwest POST of
+        // the sealed bundle of the user's facts — so the one surface that tells
+        // the user whether their data leaves the machine claimed it does not at
+        // exactly the moment it does.
+        assert_eq!(
+            armed["transport_inert"], false,
+            "with a peer configured the network leg is LIVE, not inert"
+        );
         assert_eq!(armed["syncable_facts"], 120);
         assert_eq!(armed["pending_conflicts"], 3);
         // No secret ever on the wire.
         assert!(!armed.to_string().contains("Darwin"));
+
+        // An armed [sync] with NO peer is still honestly inert (the shipped
+        // unpaired state — this is the case the pinned `true` was written for).
+        let unpaired = status_payload(true, true, false, 5, 0);
+        assert_eq!(unpaired["transport_inert"], true);
     }
 
     // -- orchestrator (hermetic: TempDb + tempdir + injected key) --------------

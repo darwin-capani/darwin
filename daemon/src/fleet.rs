@@ -37,10 +37,18 @@
 //!
 //! ## Ships OFF (with sync OFF)
 //!
-//! `[fleet].enabled` defaults false. Off, [`load_and_install`] is a no-op (no
-//! Keychain touch, no disk read), no baseline is installed, and
+//! `[fleet].enabled` defaults false. Off AT STARTUP, [`load_and_install`] is a
+//! no-op (no Keychain touch, no disk read), no baseline is installed, and
 //! [`harden_global`] returns its input verbatim — so `evaluate_global` is
 //! byte-for-byte today. This layer only ever ADDS a floor; it never loosens.
+//!
+//! INSTALL-ONCE, so the flag is read AT STARTUP ONLY. Turning `[fleet].enabled`
+//! off in `config/darwin.toml` while the daemon runs does NOT remove an installed
+//! baseline — `harden_global` reads `ACTIVE`, never the config — and the change
+//! takes effect on the next daemon start (same contract as `[policy]`).
+//! [`emit_status`] therefore reports the INSTALLED state rather than the live
+//! flag; reporting the live flag is what produced the split-brain where the HUD
+//! said "off, 0 rules" while every named tool was still being hard-blocked.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -419,11 +427,29 @@ pub fn status_payload(enabled: bool, baseline: Option<&FleetBaseline>) -> Value 
 /// never touches the Keychain or opens a file on the tick. OFF (the shipped
 /// default) emits the honest off payload. Fail-open.
 pub async fn emit_status(cfg: &crate::config::Config, _root: &std::path::Path) {
-    let baseline = if cfg.fleet.enabled { active_snapshot() } else { None };
+    // WHAT WENT WRONG: this read the LIVE, hot-reloaded `cfg.fleet.enabled` and
+    // suppressed the snapshot when it was false — but ENFORCEMENT is install-once
+    // and reads no config at all (`harden_global` folds `ACTIVE` into every
+    // `policy::evaluate_global` call regardless). So an operator who set
+    // `[fleet].enabled = false` in `config/darwin.toml` without restarting saw the
+    // FleetPanel flip to `enabled:false, baseline_active:false, rule_count:0,
+    // rules:[]` within one 15s tick while the baseline kept hard-blocking /
+    // force-parking every named tool. `policy.snapshot` carries only the LOCAL
+    // rules, so the ceiling became invisible on BOTH panels: a consequential tool
+    // was blocked with no rule shown anywhere and the operator's explicit "turn
+    // the fleet policy off" appeared to take and had not. The direction is
+    // fail-safe (over-strict, never a grant), but the status was a lie and the
+    // block was unexplainable from the UI.
+    //
+    // Report what is ENFORCED, not what the file currently says: take the
+    // installed snapshot unconditionally, and report enabled when either the live
+    // flag is on OR a baseline is actually installed. (Like `[policy]`, a change
+    // to `[fleet].enabled` takes effect on the next daemon start.)
+    let baseline = active_snapshot();
     crate::telemetry::emit(
         "system",
         "fleet.status",
-        status_payload(cfg.fleet.enabled, baseline.as_ref()),
+        status_payload(cfg.fleet.enabled || baseline.is_some(), baseline.as_ref()),
     );
 }
 
@@ -623,6 +649,61 @@ mod tests {
         assert_eq!(on["rules"][1]["decision"], "never");
         // The status carries no key material.
         assert!(!on.to_string().contains("0707"), "no key bytes on the wire");
+    }
+
+    /// The status must report what is ENFORCED, not what the live config file
+    /// currently says.
+    ///
+    /// WHAT WENT WRONG: `emit_status` read the hot-reloaded `cfg.fleet.enabled`
+    /// and suppressed the snapshot when it was false — but enforcement is
+    /// install-once and reads no config (`harden_global` folds `ACTIVE` into every
+    /// `evaluate_global` call). An operator who turned `[fleet].enabled` off
+    /// without restarting saw the FleetPanel flip to "off, 0 rules" within one 15s
+    /// tick while the baseline kept hard-blocking every named tool, and
+    /// `policy.snapshot` carries only LOCAL rules, so the ceiling was invisible on
+    /// both panels. The block became unexplainable from the UI.
+    #[tokio::test]
+    async fn status_reports_the_installed_baseline_even_when_the_live_flag_is_off() {
+        let b = baseline("mac-studio", vec![rule("gmail_send", FleetDecision::Never)]);
+        let _f = FleetOverride::force(b);
+        let mut cfg = crate::config::Config::default();
+        cfg.fleet.enabled = false; // the operator's live edit, no restart
+
+        // PRECONDITION: the floor really is still being enforced right now.
+        let _p = crate::policy::PolicyOverride::force(true, crate::policy::PolicyStore::empty());
+        assert_eq!(
+            crate::policy::evaluate_global("gmail_send", "agent.pepper", ""),
+            Decision::Never,
+            "precondition: the installed baseline is still hard-blocking"
+        );
+
+        let mut rx = crate::telemetry::subscribe_for_test();
+        emit_status(&cfg, std::path::Path::new("/proj")).await;
+
+        let mut frame: Option<Value> = None;
+        for _ in 0..512 {
+            match rx.try_recv() {
+                Ok(raw) => {
+                    let v: Value = serde_json::from_str(&raw).unwrap();
+                    if v["event"] == "fleet.status" {
+                        frame = Some(v);
+                        break;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(_) => break,
+            }
+        }
+        let frame = frame.expect("a fleet.status frame was published");
+        assert_eq!(
+            frame["data"]["baseline_active"], true,
+            "the installed baseline must be reported while it is enforced: {frame}"
+        );
+        assert_eq!(frame["data"]["rule_count"], 1, "its ceilings must be visible: {frame}");
+        assert_eq!(
+            frame["data"]["enabled"], true,
+            "the status reports the ENFORCED state, not the live flag: {frame}"
+        );
     }
 
     // -- OFF is a no-op (no Keychain touch, no disk read, no install) ----------

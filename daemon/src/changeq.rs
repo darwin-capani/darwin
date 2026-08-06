@@ -21,7 +21,12 @@
 //!   3. A uniform `changeq_apply` resolves a chosen proposal to THAT type's
 //!      EXISTING apply script ([`ChangeKind::apply_script`]) — it routes to the
 //!      existing, human-gated re-validation; it does NOT invent a new authority.
-//!   4. Rollback is a safe `git revert` on the review branch ([`revert_command`]).
+//!   4. [`revert_command`] renders a history-preserving `git revert` for a
+//!      mirrored commit. SCOPE, HONESTLY: it names no branch, so it only does
+//!      anything with `darwin/changeq` actually checked out (which this module
+//!      deliberately never does), and the mirror holds gitignored `state/`
+//!      artifacts — so rolling it back is COSMETIC. It is not an undo for an
+//!      applied change; that stays each type's own apply-script route.
 //!
 //! ## Contract (non-negotiable)
 //!   * PURE, TESTABLE SEAM. The queue model ([`ChangeQueue`]), the provenance
@@ -684,9 +689,20 @@ pub fn update_ref_command(new: &str, expected_old: Option<&str>) -> GitCommand {
     GitCommand { args }
 }
 
-/// `git revert --no-edit <commit>` — the SAFE rollback: it creates a NEW commit
-/// that inverts `commit` on the review branch (history-preserving), never a
-/// destructive reset. This is how a mirrored proposal is rolled back.
+/// `git revert --no-edit <commit>` — a history-preserving inverse commit, never a
+/// destructive reset.
+///
+/// PRECONDITION THE ARGV DOES NOT CARRY, stated plainly: nothing here targets
+/// [`BRANCH_REF`], so this runs against WHATEVER BRANCH IS CHECKED OUT. The review
+/// branch is by design "never checked out — so it never disturbs the user's working
+/// tree", and every mirrored file lives under `state/`, which .gitignore excludes,
+/// so running this from the user's normal checkout produces an EMPTY inverse patch:
+/// git exits 1 with "nothing added to commit", creates nothing, and leaves the
+/// `darwin/changeq` tip exactly where it was. To actually roll a mirrored proposal
+/// back the user must have `darwin/changeq` checked out (e.g. `git worktree add`),
+/// and even then the rollback is COSMETIC — the mirror holds gitignored artifacts,
+/// not the applied change. The real undo for an applied proposal is that type's own
+/// apply-script route, not this.
 pub fn revert_command(commit: &str) -> GitCommand {
     GitCommand::new(["revert", "--no-edit", commit])
 }

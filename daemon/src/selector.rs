@@ -355,7 +355,47 @@ fn has_world_update_cue(text: &str) -> bool {
         " owns ",
         " is responsible for ",
     ];
-    mentions_entity && CHANGE_VERBS.iter().any(|v| text.contains(v))
+    if !mentions_entity {
+        return false;
+    }
+    let matched: Vec<&&str> = CHANGE_VERBS.iter().filter(|v| text.contains(**v)).collect();
+    if matched.is_empty() {
+        return false;
+    }
+    // A handful of CHANGE_VERBS are equally READ-shaped: "X owns Y" is a statement,
+    // but "WHO owns Y" is a question. `classify_mode` checks WorldUpdate BEFORE
+    // WorldQuery, so an interrogative carrying only those verbs used to be handed to
+    // the cloud tool loop as a fact to RECORD — the WorldUpdate directive is
+    // literally "Fold this stated fact into the shared world model using the
+    // world_update tool, then confirm what you recorded". "who owns the launch
+    // project" therefore spent a cloud call writing the QUESTION into `user.world.*`
+    // and reported back what it had "recorded" instead of answering, and offline it
+    // replied "I won't record a half-understood fact offline" to an utterance that
+    // asked for nothing to be recorded. It also made `has_world_query_cue`'s own
+    // "who owns " / "who is responsible for" STATE_PHRASES unreachable for exactly
+    // the utterances they were written for. (The split was accidental, not designed:
+    // the contraction "who's responsible for" already fell through to WorldQuery
+    // because no CHANGE_VERB matches it.)
+    const READ_SHAPED_VERBS: &[&str] =
+        &[" joined ", " left ", " owns ", " is owned by ", " is responsible for "];
+    if is_interrogative(text) && matched.iter().all(|v| READ_SHAPED_VERBS.contains(*v)) {
+        return false;
+    }
+    true
+}
+
+/// Whether the utterance OPENS with a question frame ("who …", "what …", "when …",
+/// "where …", "which …", "whose …"). Deliberately anchored at the front and
+/// deliberately NOT "ends with a question mark": a leading frame is the reliable
+/// signal that the speaker is ASKING rather than stating, and spoken transcripts
+/// carry no punctuation. Pure.
+fn is_interrogative(text: &str) -> bool {
+    const FRAMES: &[&str] = &[
+        "who ", "who's ", "whos ", "whose ", "what ", "what's ", "whats ", "when ",
+        "when's ", "whens ", "where ", "where's ", "wheres ", "which ",
+    ];
+    let t = text.trim_start();
+    FRAMES.iter().any(|f| t.starts_with(f))
 }
 
 /// World-READ cues -> WorldQuery. A question about the tracked world's STATE: the
@@ -388,6 +428,12 @@ fn has_world_query_cue(text: &str) -> bool {
         "who owns ",
         "who is responsible for",
         "who's responsible for",
+        // Membership READS. Their statement forms (" joined " / " left ") are
+        // CHANGE_VERBS, and the update check runs first — so without these the
+        // question forms fall through past WorldQuery entirely once the interrogative
+        // guard in `has_world_update_cue` correctly declines to record them.
+        "who joined ",
+        "who left ",
         "what's due",
         "what is due",
         "whats due",
@@ -676,6 +722,52 @@ mod tests {
                 classify_mode(q, &no_signal()),
                 Selection::Route(Mode::WorldUpdate),
                 "should be world_update: {q}"
+            );
+        }
+    }
+
+    /// REGRESSION: a READ question that happens to carry a read-shaped change verb
+    /// routes to WorldQuery, not the cloud WRITE.
+    ///
+    /// `classify_mode` checks WorldUpdate before WorldQuery, and CHANGE_VERBS holds
+    /// " owns ", " is responsible for ", " joined " and " left " — verbs that are
+    /// equally read-shaped. So "who owns the launch project" was handed to the tool
+    /// loop with the directive "Fold this stated fact into the shared world model
+    /// using the world_update tool, then confirm what you recorded": DARWIN spent a
+    /// cloud call writing the QUESTION into `user.world.*` and reported what it had
+    /// "recorded" instead of answering, and offline it said "I won't record a
+    /// half-understood fact offline" to an utterance that asked for nothing to be
+    /// recorded. `has_world_query_cue`'s own "who owns " / "who is responsible for"
+    /// STATE_PHRASES were unreachable for exactly those utterances. The split was
+    /// accidental: the CONTRACTION "who's responsible for" already fell through to
+    /// WorldQuery because no CHANGE_VERB matches it.
+    #[test]
+    fn a_read_question_with_a_read_shaped_change_verb_is_a_query_not_a_write() {
+        for q in [
+            "who owns the launch project",
+            "who owns the migration",
+            "who is responsible for the release",
+            "who's responsible for the deadline",
+            "who joined the project",
+            "who left the team",
+        ] {
+            assert_eq!(
+                classify_mode(q, &no_signal()),
+                Selection::Route(Mode::WorldQuery),
+                "a question must never be recorded as a stated fact: {q}"
+            );
+        }
+        // The STATEMENT forms of the same verbs are still WRITES.
+        for q in [
+            "sam owns the launch project",
+            "priya is responsible for the release",
+            "sam joined the project",
+            "priya left the team",
+        ] {
+            assert_eq!(
+                classify_mode(q, &no_signal()),
+                Selection::Route(Mode::WorldUpdate),
+                "a stated fact must still be a write: {q}"
             );
         }
     }

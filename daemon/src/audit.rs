@@ -34,13 +34,16 @@
 //!
 //! ## BOUNDED
 //!
-//! Retention is capped at [`MAX_ENTRIES`]. When the cap is exceeded, the oldest
-//! entries are pruned and the chain is RE-ROOTED from the new oldest surviving
-//! entry: its `prev_hash` is reset to the genesis sentinel and its `entry_hash`
-//! recomputed, and the chain re-links forward from there, so `verify_chain` stays
-//! consistent after truncation (it verifies the surviving suffix as a fresh
-//! chain). A `truncated` flag + a telemetry note record that a prune happened, so
-//! the gap is explicit, not silent.
+//! Retention is capped at [`MAX_ENTRIES`]. When the cap is exceeded the oldest
+//! entries are DELETED and nothing else is touched: a survivor's stored
+//! `prev_hash`/`entry_hash` are immutable for the entry's whole lifetime, which is
+//! what lets the external Keychain anchor (`verify_against_anchor`, which witnesses
+//! `hash_at_seq`) keep meaning anything across a prune. `verify_entries` therefore
+//! seeds its expected root FROM THE RETAINED SUFFIX rather than demanding
+//! [`GENESIS_PREV`], so a truncated log still verifies and a front seq gap is
+//! retention doing its job, not a break. An `audit.truncated` telemetry event
+//! records that a prune happened, so the gap is explicit, not silent. (There is no
+//! `truncated` flag on any wire payload — `snapshot_json` emits no such key.)
 //!
 //! Some of this module's public surface (the `recent`/`verify_chain`/`len` read
 //! API, the `ChainStatus` indicator, the `global()` borrow, the
@@ -234,8 +237,9 @@ impl ChainStatus {
 /// prune ever DELETEs, and nothing UPDATEs a stored entry's content.
 pub struct AuditLog {
     conn: Mutex<Connection>,
-    /// Retention cap: past this many entries the oldest are pruned and the chain
-    /// deleted. Defaults to [`MAX_ENTRIES`]; overridden from `[audit].max_entries`
+    /// Retention cap: past this many entries the oldest are DELETED (delete-only —
+    /// a survivor's stored hashes are never rewritten; see the module header).
+    /// Defaults to [`MAX_ENTRIES`]; overridden from `[audit].max_entries`
     /// via [`with_max_entries`](AuditLog::with_max_entries) at construction.
     max_entries: usize,
 }
@@ -548,14 +552,11 @@ impl AuditLog {
         }
     }
 
-    /// Keep the newest `keep` entries; drop the rest and RE-ROOT the surviving
-    /// suffix so it verifies as a fresh chain: the new oldest entry's `prev_hash`
-    /// becomes [`GENESIS_PREV`] and every surviving entry's `entry_hash` is
-    /// recomputed forward. The seq numbers are preserved (the gap is the visible
-    /// evidence a prune happened); `verify_chain` treats the first surviving entry
-    /// as the new root. Emits a secret-free telemetry note so truncation is
-    /// explicit. Synchronous — runs under the held connection lock.
-    /// Retention: drop the oldest entries, keeping the newest `keep`.
+    /// Retention: drop the oldest entries, keeping the newest `keep`. The seq
+    /// numbers of the survivors are preserved (the gap at the front is the visible
+    /// evidence a prune happened) and `verify_entries` seeds its expected root from
+    /// the retained suffix. Emits a secret-free `audit.truncated` telemetry note so
+    /// a prune is explicit. Synchronous — runs under the held connection lock.
     ///
     /// DELETE-ONLY. This used to RE-ROOT: after deleting, it recomputed every
     /// surviving entry's `prev_hash`/`entry_hash` so the retained suffix started
@@ -600,11 +601,22 @@ impl AuditLog {
     ///   * a MUTATED field (recomputed `entry_hash` != stored),
     ///   * a broken PREV-LINK (an entry's `prev_hash` != the prior `entry_hash`,
     ///     i.e. a reorder or a mid-chain DELETE/INSERT),
-    ///   * a wrong root anchor (the first entry's `prev_hash` != [`GENESIS_PREV`]),
     ///   * a non-contiguous seq WITHIN the retained range (a deletion mid-chain).
     ///     A gap at the FRONT is retention doing its job and is not a break: the
     ///     root is seeded from the retained suffix, not from GENESIS.
     ///     Read-only.
+    ///
+    /// WHAT IT DOES **NOT** CATCH — a wrong ROOT ANCHOR. `verify_entries` seeds
+    /// `expected_prev` from the FIRST retained entry's own `prev_hash`, so the
+    /// first comparison is `x != x` and is structurally always false; a
+    /// single-entry log whose `prev_hash` was forged and whose `entry_hash` was
+    /// recomputed to match verifies `Ok`. That is deliberate — delete-only
+    /// retention means the root is whatever the retained suffix links to, not
+    /// necessarily [`GENESIS_PREV`] (see `verify_entries`) — and it means a
+    /// rewritten prefix is caught ONLY by the external witness,
+    /// [`AuditLog::verify_against_anchor`], never here. This doc used to claim the
+    /// opposite, so a reader believed a forged root link turned the HUD's chain-OK
+    /// indicator red; it does not.
     pub async fn verify_chain(&self) -> Result<ChainStatus> {
         let conn = self.conn.lock().await;
         let mut stmt = conn.prepare(

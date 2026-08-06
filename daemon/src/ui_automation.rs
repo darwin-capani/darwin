@@ -18,9 +18,20 @@
 //!      actuation. ONE plan = ONE actuation.
 //!
 //!   2. CONFIG GATE ([`ui_automation_permitted`]) — `[ui_automation].enabled`
-//!      ships **false**. With it off the actuate intent is never classified and
-//!      the `ui_actuate` tool is inert (an honest "off" reply); nothing is
-//!      planned, parked, or actuated.
+//!      ships **true** (full-power default). This header used to say "ships
+//!      **false**" — for the capability this same file calls the single most
+//!      dangerous one DARWIN has — which told an operator that UI actuation was
+//!      opt-in out of the box and that they need not harden the config. It is
+//!      armed by default; `config.rs`'s `UiAutomationConfig::default`,
+//!      `config/darwin.toml` and this file's OWN test module ("ships ON; this
+//!      pins the explicit-disable path") all say so. What actually holds it back
+//!      is layer 3 below plus Accessibility TCC: `ui_actuate` is in
+//!      CONSEQUENTIAL_TOOLS + NEVER_AUTO_APPROVE_TOOLS, so it parks PER ACTION
+//!      (one confirm = one actuation) even under an `Always`, and the CGEvent/AX
+//!      post is inert without TCC consent and a real display. An operator who
+//!      sets it false makes the actuate intent unclassifiable and the
+//!      `ui_actuate` tool inert (an honest "off" reply); nothing is planned,
+//!      parked, or actuated.
 //!
 //!   3. GATE ROUTING (the safety spine, wired in `anthropic`/`confirm`) — the
 //!      actuate tool (`ui_actuate`) is in [`crate::confirm::CONSEQUENTIAL_TOOLS`],
@@ -51,13 +62,16 @@
 
 // ---------------------------------------------------------------------------
 // (2) CONFIG GATE — may UI automation actuate at all? Mirrors shell::
-// shell_permitted: the master `[ui_automation].enabled` switch (ships false).
-// With it off the feature is inert.
+// shell_permitted: the master `[ui_automation].enabled` switch, which SHIPS ON
+// (full-power default). With it explicitly set false the feature is inert.
 // ---------------------------------------------------------------------------
 
 /// Whether gated UI automation may actuate: the `[ui_automation].enabled` switch
-/// is on. With it false (the shipped default) the actuate intent is never
-/// classified and the `ui_actuate` tool is inert — exactly like
+/// is on. It SHIPS ON (full-power default) — this doc used to call false "the
+/// shipped default", contradicting `config.rs`'s `UiAutomationConfig::default`,
+/// `config/darwin.toml` and this file's own test module. With it explicitly set
+/// false the actuate intent is never classified and the `ui_actuate` tool is
+/// inert — exactly like
 /// `shell::shell_permitted` / `code::code_permitted`. This is the CONFIG gate; it
 /// is independent of (and ANDed beneath) the master switch + confirm + voice-id +
 /// lockdown gates the gate routing enforces, AND the device Accessibility-TCC
@@ -968,9 +982,18 @@ fn post_type(text: &str) -> Result<(), ActuateError> {
 /// (`Carbon/HIToolbox/Events.h`). HONESTY OVER COMPLETENESS: if the base key cannot
 /// be mapped to a correct keycode, this returns `None` and the caller posts NO event
 /// (an honest [`ActuateError::PostFailed`]) — it NEVER guesses a wrong/fabricated
-/// key. Modifiers (`cmd`/`command`/`ctrl`/`control`/`opt`/`option`/`alt`/`shift`)
-/// in any order are folded into the flag mask; the LAST non-modifier token is the
-/// base key. Case-insensitive.
+/// key. Modifiers in any order are folded into the flag mask; EXACTLY ONE
+/// non-modifier token is allowed and it is the base key — a SECOND non-modifier
+/// token is a malformed combo and is REFUSED (`None`), never guessed, so
+/// `map_combo("ctrl+a+b")` is None and `post_key` posts nothing.
+/// Case-insensitive.
+///
+/// WHAT WENT WRONG: this said "the LAST non-modifier token is the base key",
+/// which the code has never done — the arm six lines into the match returns None
+/// the moment a base key is already set, and its own inline comment says so.
+/// The runtime behaviour is the safe one (a refusal, never a wrong keypress that
+/// gets physically typed on the user's machine); it was the CONTRACT that was
+/// wrong, for a function whose whole doc is about not guessing.
 #[cfg(target_os = "macos")]
 #[allow(dead_code)] // device-gated: reached only from post_key (never run in a test)
 fn map_combo(combo: &str) -> Option<(u16, u64)> {
@@ -1402,9 +1425,25 @@ mod tests {
 
     #[test]
     fn parse_actuate_reply_ok_false_empty_detail_is_still_honest() {
+        // WHAT THIS USED TO ASSERT: `contains("declined") || !reason().is_empty()`.
+        // `AppActuatorUnavailable(d).reason()` formats a non-empty string LITERAL
+        // around `d`, so the right-hand disjunct is ALWAYS true and the whole
+        // assertion could never fail — proven by deleting the honest-default branch
+        // in `parse_actuate_reply` entirely and watching this test stay green. The
+        // one guard on "an ok=false reply with NO detail still produces an honest
+        // spoken reason" guarded nothing, so DARWIN saying "...but it did not land:"
+        // with an empty trailing reason after a refused UI actuation would ship
+        // undetected. No escape hatch now — the default itself is asserted.
         let err = parse_actuate_reply("{\"ok\":false,\"detail\":\"\"}").unwrap_err();
-        assert!(matches!(err, ActuateError::AppActuatorUnavailable(_)));
-        assert!(err.reason().to_lowercase().contains("declined") || !err.reason().is_empty());
+        assert!(
+            matches!(&err, ActuateError::AppActuatorUnavailable(d) if d.contains("no reason given")),
+            "an empty detail must be replaced by the honest default: {err:?}"
+        );
+        assert!(
+            err.reason().to_lowercase().contains("declined"),
+            "the spoken reason must say the app declined: {}",
+            err.reason()
+        );
     }
 
     #[test]

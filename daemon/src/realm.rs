@@ -412,7 +412,16 @@ const CP: &str = "/bin/cp";
 const GIT: &str = "git";
 
 /// Wall-clock ceiling for a single realm-setup subprocess (the COW copy / the diff
-/// apply). The build/test itself is bounded by [`crate::shell::EXEC_TIMEOUT`].
+/// apply).
+///
+/// The build/test itself is bounded by [`RealmSpec::verify_timeout_secs`]
+/// (`[realm].timeout_secs`, default 300s), passed to
+/// `crate::shell::run_sandboxed_with_timeout`. It is NOT bounded by
+/// `crate::shell::EXEC_TIMEOUT` — this line said so, which is a stale claim from
+/// before `run_sandboxed_with_timeout` existed, and it is 15x wrong: EXEC_TIMEOUT
+/// is 20s and belongs to the parameterless `run_sandboxed`. `RealmSpec`'s own doc
+/// two screens up already says the realm needs "long enough for a real compile (a
+/// quick-command timeout would make every real build time out to Unverified)".
 const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The device-gated production runner. Materializes a confined COW copy of the
@@ -486,10 +495,22 @@ impl SandboxedRealmRunner {
         // DENIED shell sandbox whose ONLY writable location is the realm itself.
         // CANONICALIZE the realm first: macOS seatbelt matches file ops against the
         // symlink-resolved path, so if state/ resolves through a symlink (e.g.
-        // /tmp -> /private/tmp) the SBPL write-allow subpath must be the resolved path
-        // or the build's writes are denied and every realm silently fails/Unverifies
+        // /tmp -> /private/tmp) the SBPL subpath filters must name the resolved path
+        // or the build's file ops are denied and every realm silently fails/Unverifies
         // (mirrors the shell tool's canonicalize discipline). Falls back to the
         // as-given path if canonicalize fails.
+        //
+        // WHAT WENT WRONG (fixed in shell.rs, pinned by
+        // `the_realm_profile_re_allows_reads_inside_the_realm` below): the realm is
+        // materialized INSIDE `daemon_state` (`realms_root` = <state>/realms), and
+        // the profile denies that whole subtree read+write before granting the realm
+        // back. It used to grant back file-WRITE* only, so under last-match-wins the
+        // deny remained the last matching rule for every READ inside the realm: the
+        // build/test could not read a single file of the tree it exists to verify,
+        // exited non-zero, and a perfectly applyable diff was reported to the user as
+        // "FAILED". Note the failure mode is READS, not writes — an earlier version
+        // of this very comment claimed the opposite. generate_shell_sbpl now appends
+        // a read re-allow for the scratch/realm subtree after the denies.
         let realm_canon = std::fs::canonicalize(realm).unwrap_or_else(|_| realm.to_path_buf());
         let profile =
             crate::shell::generate_shell_sbpl(&realm_canon, &self.home, &self.daemon_state);
@@ -884,6 +905,50 @@ mod tests {
         assert!(
             matches!(v, RealmVerdict::Unverified { .. }),
             "no verify command => Unverified (never a faked pass), got {v:?}"
+        );
+    }
+
+    #[test]
+    fn the_realm_profile_re_allows_reads_inside_the_realm() {
+        // WHAT WENT WRONG: the realm lives INSIDE the daemon state dir
+        // (`realms_root` = <state>/realms), and `generate_shell_sbpl` denies the
+        // whole daemon-state subtree read+write before granting the realm back.
+        // The grant used to be file-WRITE* only, so under last-match-wins SBPL the
+        // deny stayed the last matching rule for every READ inside the realm. The
+        // build/test therefore could not read a single file of the COW-copied tree
+        // it exists to verify: measured under the real /usr/bin/sandbox-exec, a
+        // trivially-passing 2-file repo came back
+        //   "python3: can't open file 'test_app.py': [Errno 1] Operation not permitted"
+        //   EXIT=2
+        // which `verdict_from_outcome` maps to Failed{exit_code:2} — so a correct
+        // diff was reported to the user as "the change does NOT verify as-is" and
+        // `RealmVerdict::Passed` was unreachable for any command that reads a file.
+        //
+        // The 12 orchestration tests could never catch this: they all use
+        // MockRunner/PanicRunner and never generate the SBPL profile. The profile
+        // is a pure string, so this guard needs no device gating.
+        let state = Path::new("/proj/state");
+        let realm = realm_dir(state, 1700); // /proj/state/realms/1700 — inside state
+        assert!(
+            realm.starts_with(state),
+            "precondition: the realm must be nested inside the denied daemon state, \
+             otherwise this test proves nothing about the shadowing"
+        );
+        let profile =
+            crate::shell::generate_shell_sbpl(&realm, Path::new("/home/u"), state);
+
+        let deny_pos = profile
+            .find("(deny file-read* file-write* (subpath \"/proj/state\"))")
+            .expect("the daemon state must still be denied read+write");
+        let read_allow_pos = profile
+            .find("(allow file-read* (subpath \"/proj/state/realms/1700\"))")
+            .unwrap_or_else(|| {
+                panic!("the realm subtree must re-allow file-read*: {profile}")
+            });
+        assert!(
+            read_allow_pos > deny_pos,
+            "SBPL is last-match-wins: the realm read re-allow must come AFTER the \
+             daemon-state deny or the build cannot read the tree it verifies: {profile}"
         );
     }
 

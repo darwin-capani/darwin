@@ -748,10 +748,28 @@ pub(crate) fn redact_home(s: &str) -> String {
 /// Retain one already-safe (SECRET-FREE) finding line for the status query.
 pub fn record_finding(line: String) {
     if let Ok(mut q) = findings().lock() {
-        q.push_front(line);
-        while q.len() > MAX_FINDINGS {
-            q.pop_back();
-        }
+        push_bounded(&mut q, line);
+    }
+}
+
+/// PURE over the ring it is handed: push newest-first and evict past
+/// [`MAX_FINDINGS`]. Split out of [`record_finding`] so the BOUND can be tested
+/// against a LOCALLY-OWNED `VecDeque`.
+///
+/// WHAT WENT WRONG WHEN THE TEST USED THE GLOBAL: the bound test pushed
+/// `MAX_FINDINGS + 5` lines into the one process-global ring, which evicts
+/// everything else in it — including the `wx_violation:` line
+/// `ingest_security_event_records_a_finding_for_a_violation` had just written. The
+/// two raced under the default parallel test threads and the suite failed about 1
+/// run in 40, naming the OTHER test — the correct one — so whoever hit it went
+/// debugging the ES ingestion seam. Its comment ("Isolated key space so other
+/// tests' findings don't interfere with counts") isolated the KEY, not the RING.
+/// Local `cargo test` is this repo's only merge gate, so a 2.5% spurious failure
+/// teaches people to distrust it.
+fn push_bounded(q: &mut VecDeque<String>, line: String) {
+    q.push_front(line);
+    while q.len() > MAX_FINDINGS {
+        q.pop_back();
     }
 }
 
@@ -1370,13 +1388,22 @@ mod tests {
 
     #[test]
     fn record_finding_is_bounded_and_newest_first() {
-        // Isolated key space so other tests' findings don't interfere with counts.
+        // A LOCALLY-OWNED ring: this test must never touch the process-global one.
+        // It used to push MAX_FINDINGS + 5 lines into the global ring, evicting
+        // everything else in it — including the wx_violation line
+        // `ingest_security_event_records_a_finding_for_a_violation` writes — so the
+        // two raced and the suite failed ~1 run in 40, naming the innocent test.
+        let mut q: VecDeque<String> = VecDeque::new();
         for i in 0..(MAX_FINDINGS + 5) {
-            record_finding(format!("rf-test-{i}"));
+            push_bounded(&mut q, format!("rf-test-{i}"));
         }
-        let q = findings().lock().unwrap();
         assert_eq!(q.len(), MAX_FINDINGS, "the ring is capped");
         assert_eq!(q.front().unwrap(), &format!("rf-test-{}", MAX_FINDINGS + 4));
+        assert_eq!(
+            q.back().unwrap(),
+            &format!("rf-test-{}", 5),
+            "the oldest survivors are evicted, newest-first order preserved"
+        );
     }
 
     // -- security-event classification (the ES seam) -------------------------

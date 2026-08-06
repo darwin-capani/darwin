@@ -30,9 +30,26 @@ pub fn is_speaking() -> bool {
 /// Set true when the user BARGES IN — speaks over DARWIN to cut him off. The
 /// audio capture loop sets it (via [`request_barge_in`]) the instant it detects
 /// the user talking over playback; the reply loops below check it and stop
-/// synthesizing further sentences, and it keeps the mic-drop gate OPEN so the
-/// user's interrupting utterance is captured instead of dropped. Cleared at the
-/// start of the next turn ([`clear_barge_in`]).
+/// synthesizing further sentences.
+///
+/// WHAT IT DOES **NOT** DO: this doc used to say the flag "keeps the mic-drop gate
+/// OPEN so the user's interrupting utterance is captured instead of dropped". The
+/// capture loop does the exact OPPOSITE, deliberately — that behaviour was RC-1,
+/// the echo-feedback / "triple-open" bug in which DARWIN transcribed his own
+/// draining audio and re-ran the action. See `audio.rs`'s `gate_decision`, which
+/// does not take a barge-requested input at all:
+///   * while `is_speaking()` holds, EVERY chunk is dropped and the VAD is reset —
+///     no exception for a pending barge;
+///   * after DARWIN goes quiet, a pending barge keeps the gate CLOSED **longer**
+///     (through the BARGE_SETTLE_MS echo-settle window);
+///   * the first capturable chunk resets the VAD, so the interrupting utterance
+///     itself is discarded and the user has to say it again.
+///
+/// The one place `audio.rs` reads this flag is to stop the barge detector
+/// re-firing. BARGE_IN means "stop synthesizing the rest of THIS reply and cut
+/// the audio", never "start capturing".
+///
+/// Cleared at the start of the next turn ([`clear_barge_in`]).
 static BARGE_IN: AtomicBool = AtomicBool::new(false);
 
 /// Whether the user has barged in over the current reply.
@@ -41,8 +58,12 @@ pub fn barge_in_requested() -> bool {
 }
 
 /// Cut DARWIN off NOW: flag the barge-in, stop the audio mid-clip, and halt any
-/// roll-call in progress. The reply loops see the flag and stop; the capture
-/// loop stops dropping so it can hear the user out. Called from the audio thread.
+/// roll-call in progress. The reply loops see the flag and stop. The capture loop
+/// does NOT "stop dropping so it can hear the user out" — that sentence used to
+/// be here and describes the RC-1 echo-feedback behaviour that was removed; the
+/// gate stays closed while DARWIN is speaking AND through the echo-settle window
+/// after, and the interrupting utterance is discarded (see [`BARGE_IN`] and
+/// `audio.rs`'s `gate_decision`). Called from the audio thread.
 pub fn request_barge_in() {
     BARGE_IN.store(true, Ordering::Relaxed);
     playback::cancel_all();
@@ -607,30 +628,25 @@ pub async fn speak(
     // NO target-language hint — exactly today's behavior. The reply kind defaults to
     // Routine (=> Neutral prosody): the conservative classification for an ordinary
     // spoken reply. The few callers that KNOW the kind (an alert/heal, a wellness
-    // reply, a greeting) use `speak_kind` to colour the delivery.
+    // reply, a greeting) call `speak_in_lang` directly with that kind.
     speak_in_lang(text, None, infer, cfg, pipeline_started, reply, crate::prosody::ReplyKind::Routine).await
 }
 
-/// Speak a reply whose CONTEXT (alert/heal vs wellness vs greeting vs routine) is
-/// known to the caller, so #33 adaptive prosody can colour the delivery. Identical to
-/// [`speak`] except the caller passes the [`crate::prosody::ReplyKind`]; with
-/// `[voice].adaptive_prosody` OFF (the default) the kind is ignored and the request is
-/// byte-for-byte today's neutral request on every backend. The base [`speak`] is the
-/// Routine entry; this is the kind-aware entry for the few callers that know a more
-/// specific context (a wellness reply, an alert/heal). The roll-call path shapes
-/// Greeting inline (it resolves a per-agent backend), so this convenience entry is
-/// exercised by the hermetic test rather than a current single caller.
-#[allow(dead_code)] // kind-aware speak entry; exercised by tests, kept for specific-kind callers
-pub async fn speak_kind(
-    text: &str,
-    infer: &mut InferenceClient,
-    cfg: &Config,
-    pipeline_started: Instant,
-    reply: &mut ReplySession,
-    kind: crate::prosody::ReplyKind,
-) -> SpeakReport {
-    speak_in_lang(text, None, infer, cfg, pipeline_started, reply, kind).await
-}
+// REMOVED: `speak_kind`, a kind-aware convenience wrapper over `speak_in_lang`.
+//
+// WHAT WENT WRONG: it had ZERO callers and ZERO tests anywhere in the repo — a
+// full-tree grep found only its own definition and the comment above — while its
+// rustdoc claimed "this convenience entry is exercised by the hermetic test
+// rather than a current single caller" and its `#[allow(dead_code)]` note said
+// "exercised by tests". The `allow` was itself the compiler's proof that nothing,
+// including `#[cfg(test)]` code, used it. So an unreachable public entry point was
+// documented as covered, which both hid the fact that the prosody-shaping path it
+// wrapped had no coverage through it and discouraged anyone from adding that
+// coverage or deleting the function.
+//
+// It is deleted rather than re-documented because `speak_in_lang` already takes
+// the `ReplyKind` and is what interpret.rs / main.rs / anthropic.rs actually call;
+// a caller that knows its kind should pass it there, as they all already do.
 
 /// Speak a response aloud in a specific TARGET LANGUAGE (Babel, build 2/2). Same
 /// echo-safe pipeline as [`speak`], but `lang` is threaded to the speak op so the
@@ -823,23 +839,42 @@ pub async fn converse_speak(
     };
     let done_at = Instant::now();
     // INFERENCE DECODE telemetry (Wave A): forward the server's mlx_lm-measured
-    // decode throughput + peak GPU memory + the path that actually ran, so the
-    // already-measured numbers reach the HUD's inference-perf surface instead of
-    // being dropped at the converse parser. HONEST: emitted ONLY when the server
-    // measured something — the speculative/uncached single-shot paths report
-    // None (no per-token stream) and emit nothing, never a fabricated figure.
+    // decode throughput + peak GPU memory, so the already-measured numbers reach
+    // the HUD's inference-perf surface instead of being dropped at the converse
+    // parser. HONEST: emitted ONLY when the server measured something — the
+    // speculative/uncached single-shot paths report None (no per-token stream)
+    // and emit nothing, never a fabricated figure.
+    //
+    // WHAT WENT WRONG: this also claimed to forward "the path that actually ran"
+    // and emitted `speculative`/`quant`, gated on `|| d.speculative.is_some()`.
+    // The server's CONVERSE `done` payload carries no such fields — only
+    // {id, event, ok, text, sentences, first_sentence_ms, metrics, latency_ms};
+    // `speculative`/`quant` live exclusively in the `op == "generate"` response
+    // (which feeds the model.tier surface). `ConverseLine`'s fields are
+    // `#[serde(default)] Option<...>`, so both deserialized to None on EVERY
+    // converse turn: the disjunct was permanently false and both emitted fields
+    // were permanently null. Harmless at runtime — the HUD keeps its prior value
+    // for an absent field — but it documented a data flow that does not exist and
+    // invited a "fix" at the wrong end. Gated on the measurement alone now, and
+    // the two never-populated fields are gone.
     if let Ok(d) = &done {
-        if d.metrics.is_measured() || d.speculative.is_some() {
-            crate::telemetry::emit(
-                "system",
-                "inference.decode",
-                serde_json::json!({
-                    "generation_tps": d.metrics.generation_tps,
-                    "peak_memory_gb": d.metrics.peak_memory_gb,
-                    "speculative": d.speculative,
-                    "quant": d.quant,
-                }),
-            );
+        if d.metrics.is_measured() {
+            let mut payload = serde_json::json!({
+                "generation_tps": d.metrics.generation_tps,
+                "peak_memory_gb": d.metrics.peak_memory_gb,
+            });
+            // Present-only: the converse `done` line never carries these, so they
+            // are simply ABSENT rather than emitted as permanent nulls. (The HUD's
+            // applyInferenceDecode keeps its prior value for an absent field, so
+            // an absent key is the honest encoding of "this path did not report
+            // it".) If the server ever does add them to converse, they flow.
+            if let Some(spec) = d.speculative {
+                payload["speculative"] = serde_json::json!(spec);
+            }
+            if let Some(quant) = &d.quant {
+                payload["quant"] = serde_json::json!(quant);
+            }
+            crate::telemetry::emit("system", "inference.decode", payload);
         }
     }
     // Sentences that landed in the channel while the done line was read.
@@ -1057,7 +1092,19 @@ fn normalize_for_speech(text: &str) -> String {
     out
 }
 
-/// Long answers are for the HUD/log; speech gets the first few sentences.
+/// Speech reads the WHOLE answer; MAX_SENTENCES / MAX_CHARS below are a SANITY
+/// CEILING for a pathological wall of text (the clipped result is suffixed "More
+/// in the log."), not a "first few sentences" cap.
+///
+/// WHAT WENT WRONG: this header said "speech gets the first few sentences" —
+/// contradicting the body comment six lines below it, the code, and
+/// `reads_full_answers_and_only_clips_a_pathological_wall`, which asserts a
+/// four-sentence reply comes back byte-identical. Reading the full reply (the
+/// whole agent roster, a paragraph) was the user-facing FIX; the rustdoc — the
+/// part an IDE hover and `cargo doc` show — still described the truncation that
+/// fix removed, so anyone debugging "why was my reply cut off" was pointed at the
+/// wrong function and anyone "restoring" the documented behaviour would regress it.
+///
 /// Still applied to the cloud/speak path — converse replies are NOT clipped
 /// (the persona keeps them short; the server's 5-sentence synthesis cap
 /// guards the rest).
@@ -1122,8 +1169,11 @@ mod tests {
 
         let root = temp_root();
         let mut cfg = crate::config::Config::default();
-        // This test asserts the COLD begin path (no opener), so disable the
-        // now-ON-by-default instant_opener explicitly.
+        // This test asserts the COLD begin path (no opener). instant_opener
+        // SHIPS OFF (`config.rs` sets `instant_opener: false`), so this line is
+        // belt-and-braces rather than a change of default — the comment used to
+        // call it "now-ON-by-default", which is the opposite of what ships and of
+        // what this same file says 1200 lines earlier.
         cfg.speech.instant_opener = false;
         cfg.speech.opener_delay_ms = 0;
 
@@ -1364,9 +1414,18 @@ mod tests {
     async fn instant_opener_off_fires_no_opener_and_skips_the_breath() {
         let root = temp_root();
         let mut cfg = crate::config::Config::default();
-        // The shipped DEFAULT is now ON (full-power); disable explicitly to exercise
-        // the off path (no opener fires, the breath is skipped).
+        // instant_opener SHIPS OFF (`config.rs` sets `instant_opener: false`, and
+        // the rustdoc above says so); this line is belt-and-braces. The comment
+        // used to claim "the shipped DEFAULT is now ON (full-power)", which is the
+        // opposite of what ships and of what the doc four lines up already said.
+        // Set explicitly so the off path (no opener, breath skipped) is exercised
+        // regardless of any future default change.
         cfg.speech.instant_opener = false;
+        assert!(
+            !crate::config::Config::default().speech.instant_opener,
+            "[speech].instant_opener SHIPS OFF — if this ever flips, the docs in \
+             this file and in config.rs must flip with it"
+        );
         // A breath this long would dominate the measurement IF it were taken.
         cfg.speech.opener_delay_ms = 5_000;
 

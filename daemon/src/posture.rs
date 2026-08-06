@@ -310,9 +310,16 @@ pub fn re_emit_cached() {
 
 /// Spawn one read-only posture command with explicit args (never a shell string),
 /// capture its combined stdout+stderr as text, and bound it with its timeout +
-/// kill_on_drop — mirroring actions.rs::run_command. A spawn error, non-UTF8
-/// output, or timeout becomes a `ReadOutput::Unavailable` so the builder degrades
-/// to a "couldn't read" line for that one check rather than failing the report.
+/// kill_on_drop — mirroring actions.rs::run_command. A spawn error or a timeout
+/// becomes a `ReadOutput::Unavailable` so the builder degrades to a "couldn't
+/// read" line for that one check rather than failing the report.
+///
+/// NON-UTF8 output does NOT degrade to Unavailable — this doc used to say it did.
+/// The body uses `String::from_utf8_lossy`, which never fails, so non-UTF8 bytes
+/// come back as `ReadOutput::Text` (and are then classified, `Unclear` at worst)
+/// rather than as "couldn't read". Stated here rather than changed, because a
+/// lossy read of a posture command's output is the more useful behaviour; what was
+/// wrong was the contract claim the report's honesty argument rested on.
 async fn run_real_command(
     program: &'static str,
     args: &'static [&'static str],

@@ -75,13 +75,32 @@ pub fn topic_key(topic: &str) -> String {
     normalized_topic(rest)
 }
 
-/// Normalize an ALREADY-CUT subject into the shape a notebook is keyed by:
-/// single-spaced, no trailing question mark. This is the tail of [`topic_key`],
-/// split out so the subject [`parse_notebook_command`] cuts out of an utterance is
-/// normalized IDENTICALLY without being run through the lead-in stripper a SECOND
-/// time. Re-running `topic_key` over an already-cut subject DOUBLE-strips it:
-/// "save my research on what i found on the beach" would lose its subject down to
-/// "the beach" and file the run under a notebook the user never named.
+/// Normalize a subject into the shape a notebook is keyed by: single-spaced, no
+/// trailing question mark. This is the tail of [`topic_key`], split out so the
+/// whitespace/`?` normalization can be reused without the lead-in table.
+///
+/// IT IS NOT A SECOND KEYING PATH. Every storage/lookup site keys by
+/// [`topic_key`] — `entry_from_report` (the Save route), `revisit`, and the Forget
+/// dispatch all call `topic_key(topic)` on the subject
+/// [`parse_notebook_command`] already cut out of the utterance, so the lead-in
+/// stripper DOES run a second time and the cut subject IS double-stripped. The
+/// consequence, stated plainly rather than wished away: "save my research on what
+/// i found on the beach" is classified with subject "what i found on the beach"
+/// and then STORED under topic_key "the beach", the same key a run saved as "the
+/// beach" gets — the two notebooks merge, so a later "forget my research on the
+/// beach" (a hard transactional DELETE with no confirmation and no undo) destroys
+/// both. A subject that normalizes to the EMPTY key (e.g. "my research") is
+/// persisted under "" while `revisit` early-returns on an empty key, making that
+/// entry unreadable and un-forgettable and making Save report "(0 runs total)" for
+/// a save that did persist.
+///
+/// This doc previously claimed the opposite — that the split existed so the cut
+/// subject is "normalized IDENTICALLY without being run through the lead-in
+/// stripper a SECOND time". Changing the code to match that claim means giving the
+/// store key-taking entry points (`save_run_with_key` / `revisit_by_key`) so a
+/// tool-supplied topic and an utterance-cut subject can be keyed differently; that
+/// is a store-surface change, not a rename, and is deliberately left as a decision
+/// rather than smuggled in behind a comment fix.
 fn normalized_topic(subject: &str) -> String {
     // Collapse internal whitespace and drop a trailing question mark.
     let collapsed: String = subject.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1018,6 +1037,35 @@ mod tests {
         assert_eq!(a, b, "lead-in + whitespace + case + ? normalize alike");
         assert_eq!(a, c, "the bare subject lands in the same notebook");
         assert_eq!(topic_key("   "), "", "empty topic -> empty key");
+    }
+
+    /// PINS the ACTUAL keying behavior of an already-cut subject, which
+    /// `normalized_topic`'s doc used to describe backwards.
+    ///
+    /// Every storage/lookup site re-applies `topic_key` to the subject
+    /// `parse_notebook_command` cut out, so the lead-in stripper runs a SECOND time
+    /// and the subject is double-stripped. If someone gives the store key-taking
+    /// entry points so the cut subject is keyed verbatim, this test must be updated
+    /// deliberately — which is the point of pinning it.
+    #[test]
+    fn an_already_cut_subject_is_double_stripped_by_the_storage_key() {
+        // The subject the classifier hands the storage path...
+        match classify_notebook_intent("save my research on what i found on the beach") {
+            Some(NotebookIntent::Save { topic: Some(t) }) => {
+                assert_eq!(t, "what i found on the beach", "the classifier cuts the full subject");
+                // ...is re-stripped to a DIFFERENT key by every storage site.
+                assert_eq!(topic_key(&t), "the beach");
+                assert_eq!(
+                    topic_key(&t),
+                    topic_key("the beach"),
+                    "so it MERGES with a notebook the user named 'the beach'"
+                );
+            }
+            other => panic!("expected a Save with a subject, got {other:?}"),
+        }
+        // And a subject that strips to nothing is stored under the EMPTY key, which
+        // `revisit` cannot read back.
+        assert_eq!(topic_key("my research"), "");
     }
 
     // ---- cite-discipline: only grounded sources become citations ----------

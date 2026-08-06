@@ -195,15 +195,36 @@ fn is_slack_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '-'
 }
 
+/// The longest tail [`scan_prefixed`] will read after a vendor prefix. Every real
+/// credential of every shape this module knows is far under this; anything longer
+/// is not a token, it is a run of charset-legal bytes.
+const MAX_TAIL_CHARS: usize = 128;
+
 /// Every `prefix<tail>` token on the line whose tail (chars matching `cs`) is at
 /// least `min_tail` long. Returns the FULL tokens (prefix included).
+///
+/// BOUNDED PER MATCH — this used to be QUADRATIC in line length. Each match
+/// re-walked and re-ALLOCATED the entire remaining tail, so k matches inside an
+/// N-char run of charset-legal bytes cost O(k*N) time and allocation. Measured on a
+/// single line: 4 KB -> 2.6 ms, 16 KB -> 36 ms, 64 KB -> 550 ms, 256 KB -> 8.4 s —
+/// clean 16x-per-4x growth, extrapolating to roughly 134 s and ~35 GB of cumulative
+/// String allocation for one line at the 1 MiB `MAX_FILE_BYTES` cap. One
+/// pathological file (e.g. "AKIA" or "ghp_" repeated, entirely plausible in a
+/// cloned third-party repo) therefore pinned a tokio blocking-pool thread for
+/// minutes while the tool call looked like a hang, and the module header's
+/// "CONFINED + BOUNDED … so a huge tree cannot wedge or flood it" bounded none of
+/// it: MAX_FINDINGS only truncates AFTER `scan_line` has computed every hit.
 fn scan_prefixed(line: &str, prefix: &str, min_tail: usize, cs: Charset) -> Vec<String> {
     let mut out = Vec::new();
     for (idx, _) in line.match_indices(prefix) {
         let rest = &line[idx + prefix.len()..];
-        let tail: String = rest.chars().take_while(|c| cs(*c)).collect();
+        let tail: String = rest.chars().take(MAX_TAIL_CHARS).take_while(|c| cs(*c)).collect();
         if tail.len() >= min_tail {
             out.push(format!("{prefix}{tail}"));
+        }
+        // A line cannot contribute more findings than the whole scan can keep.
+        if out.len() >= MAX_FINDINGS {
+            break;
         }
     }
     out
@@ -368,11 +389,107 @@ mod tests {
         assert!(out.contains("changed nothing"));
     }
 
+    /// REGRESSION: the CONFINEMENT guard is exercised against the real walk.
+    ///
+    /// This test used to assert `std::path::Path::starts_with` on two hardcoded
+    /// literals and never called `scan_file`, `walk_dir`, `walk_and_scan` or `scan`
+    /// — pure std behaviour that holds no matter what this module contains. Deleting
+    /// `scan_file`'s `if !canon.starts_with(root) { return; }` left the whole suite
+    /// green, so the module's stated invariant ("a symlink cannot walk it out") had
+    /// ZERO coverage.
     #[test]
-    fn resolve_confinement_predicate_holds() {
-        // A path that canonicalizes outside the root is rejected by scan_file's
-        // starts_with guard; here we assert the underlying predicate directly.
-        assert!(Path::new("/proj/src/a.rs").starts_with(Path::new("/proj")));
-        assert!(!Path::new("/etc/passwd").starts_with(Path::new("/proj")));
+    fn a_symlink_pointing_outside_the_root_is_never_read() {
+        let base = std::env::temp_dir().join(format!("darwin-secret-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("proj");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // An in-root file with a planted token, and an OUTSIDE file with a
+        // different one that must never be reached.
+        let inside_token = format!("AKIA{}", "A".repeat(16));
+        let outside_token = format!("AKIA{}", "B".repeat(16));
+        std::fs::write(root.join("config.rs"), format!("let k = \"{inside_token}\";\n")).unwrap();
+        std::fs::write(outside.join("secrets.rs"), format!("let k = \"{outside_token}\";\n")).unwrap();
+
+        // A symlink INSIDE the root that resolves OUTSIDE it.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(outside.join("secrets.rs"), root.join("escape.rs")).unwrap();
+
+        let root_canon = root.canonicalize().unwrap();
+        let hits = walk_and_scan(&root_canon);
+
+        assert!(
+            hits.iter().any(|h| h.path.contains("config.rs") && h.kind == "aws-access-key"),
+            "the in-root planted token must be found: {hits:?}"
+        );
+        assert!(
+            !hits.iter().any(|h| h.path.contains("secrets.rs") || h.path.contains("escape.rs")),
+            "a symlink resolving outside the root must never be read: {hits:?}"
+        );
+        // Belt and braces: nothing reported may sit outside the root.
+        for h in &hits {
+            assert!(
+                !h.path.starts_with('/') && !h.path.contains(".."),
+                "every located path is root-relative: {h:?}"
+            );
+        }
+
+        // And the guard ITSELF, driven directly. `walk_dir` never hands a symlink to
+        // `scan_file` (a symlink's own file_type is neither is_dir nor is_file), so
+        // the walk alone cannot exercise `scan_file`'s
+        // `if !canon.starts_with(root) { return }` — the defense-in-depth line that
+        // catches an escaping path from ANY future caller.
+        #[cfg(unix)]
+        {
+            let mut direct: Vec<Located> = Vec::new();
+            scan_file(&root_canon, &root.join("escape.rs"), &mut direct);
+            assert!(
+                direct.is_empty(),
+                "scan_file must refuse a path that canonicalizes outside the root: {direct:?}"
+            );
+            // The same call on an in-root file DOES produce the hit, so the
+            // assertion above is not trivially satisfiable.
+            let mut ok: Vec<Located> = Vec::new();
+            scan_file(&root_canon, &root.join("config.rs"), &mut ok);
+            assert_eq!(ok.len(), 1, "an in-root file is still scanned: {ok:?}");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// REGRESSION: a single long line with many prefix matches stays BOUNDED.
+    ///
+    /// `scan_prefixed` re-walked and re-allocated the whole remaining tail at every
+    /// match, so it was quadratic in line length: 256 KB of "AKIA…" took 8.4 s, and
+    /// the 1 MiB file cap extrapolated to ~134 s and ~35 GB of cumulative String
+    /// allocation — one file wedging a tokio blocking-pool thread for minutes while
+    /// the tool call looked like a hang. MAX_FINDINGS did not bound it; it only
+    /// truncates AFTER scan_line has computed every hit for the line.
+    #[test]
+    fn a_long_line_of_prefix_matches_is_bounded_per_hit_and_per_line() {
+        // 64 KB of an unbroken charset-legal run, ~16k overlapping "AKIA" matches.
+        let line = "AKIAAAAA".repeat(8 * 1024);
+        let started = std::time::Instant::now();
+        let hits = scan_line(&line);
+        let elapsed = started.elapsed();
+        assert!(
+            hits.len() <= MAX_FINDINGS,
+            "one line cannot produce more hits than the whole scan keeps: {}",
+            hits.len()
+        );
+        for h in &hits {
+            assert!(
+                h.redacted.len() <= 64,
+                "a redacted hit must be a token, not a whole-line copy: {} chars",
+                h.redacted.len()
+            );
+        }
+        // The quadratic version took ~550 ms for 64 KB on this machine; the bounded
+        // one is sub-millisecond. A generous ceiling still separates them by 100x.
+        assert!(
+            elapsed < std::time::Duration::from_millis(100),
+            "scanning one 64 KB line must not take {elapsed:?} — that is the quadratic path"
+        );
     }
 }

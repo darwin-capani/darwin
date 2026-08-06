@@ -463,7 +463,14 @@ mod tests {
         c
     }
 
-    // -- STT (a) ships OFF (pinned): whisper regardless of key/tier ----------
+    // -- STT (a) explicit OFF: whisper regardless of key/tier ---------------
+    // (The DEFAULT ships ON — `[voice].cloud_stt = true` — inert without a key.
+    // The banner used to read "ships OFF (pinned)", which inverts the most
+    // privacy-sensitive default in the module: cloud_stt is the switch that
+    // decides whether the user's raw VOICE AUDIO goes to ElevenLabs Scribe. The
+    // "(pinned)" also implied a regression test guarded an OFF default; none
+    // does — the test below writes `cloud_stt = false` itself and proves only the
+    // explicit-off path, exactly like the TTS banner says of its own.)
 
     #[test]
     fn stt_tier_when_disabled_picks_whisper() {

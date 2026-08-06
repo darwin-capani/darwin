@@ -75,7 +75,9 @@ use crate::telemetry;
 const DRAFT_MAX_TOKENS: u32 = 8192;
 const DRAFT_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// Staging build+test deadline (cargo check && cargo test, or py_compile).
+/// Staging build+test deadline for the RUST arm (cargo check && cargo test).
+/// The python arm does NOT consult this — see [`validate_python`], where each file
+/// gets its own fixed 60s `py_compile` cap and there is no aggregate deadline.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Report tail kept from validation output (chars).
@@ -167,8 +169,10 @@ fn draft_prompt(goal: &str) -> String {
          - [app].name: lowercase letters, digits and single hyphens only (a safe identifier), \
            and it MUST equal the app directory name.\n\
          - Request the MINIMAL permissions the goal truly needs. Default to NONE.\n\
-         - You may NOT request device permissions: audio, gpu, camera, screen MUST all be false \
-           (a forged app cannot be born with hardware/privacy access).\n\
+         - You may NOT request device/capability permissions: audio, gpu, camera, screen and jit \
+           MUST all be false (a forged app cannot be born with hardware/privacy access, and \
+           `jit` — dynamic code generation — is a consequential declaration only a human may \
+           author).\n\
          - fs_write: at most the app's own state dir, exactly \"state/apps/<name>\". Nothing else.\n\
          - fs_read: only paths inside the project (relative, no \"..\", no leading \"/\"). Prefer none.\n\
          - net_hosts: only the exact hostnames the app must reach (at most {MAX_NET_HOSTS}); prefer none.\n\
@@ -240,6 +244,27 @@ pub fn parse_authored_app(raw: &str) -> Result<AuthoredApp> {
 
     // Pull the manifest out (matched by basename so apps/<name>/manifest.toml
     // or a bare manifest.toml both work).
+    //
+    // A bundle carrying MORE THAN ONE manifest.toml is rejected outright. Only the
+    // FIRST was pulled out and validated; any other stayed in `files`, and both
+    // writers (stage_files and write_proposal) write the validated manifest FIRST
+    // and every authored file AFTER it with no dedupe — so the leftover CLOBBERED
+    // the validated one at `proposals/<ts>/app/<name>/manifest.toml`, the very
+    // payload apply_forge.sh deploys. report.md meanwhile rendered the permissions
+    // of the FIRST manifest under "permissions (MINIMAL, validated)", so the
+    // reviewer was certifying a file that is not the one on disk. The drafter is
+    // untrusted and emitting two blocks is entirely within its control; a clean
+    // parse-stage rejection is the honest answer.
+    let manifest_blocks = blocks
+        .iter()
+        .filter(|f| basename(&f.path) == "manifest.toml")
+        .count();
+    if manifest_blocks > 1 {
+        bail!(
+            "authored bundle contains {manifest_blocks} manifest.toml blocks; exactly one is \
+             allowed (a second would overwrite the validated manifest in the proposal)"
+        );
+    }
     let manifest_idx = blocks
         .iter()
         .position(|f| basename(&f.path) == "manifest.toml")
@@ -352,6 +377,21 @@ fn validate_permissions(name: &str, p: &PermissionsSection) -> Result<()> {
     }
     if p.screen {
         bail!("over-broad permission: a forged app may not request `screen`");
+    }
+    // `jit` is the NINTH PermissionsSection bit and it used to slip straight past
+    // this gate — the one gate whose entire job is permission minimization. A
+    // manifest with nothing but `[permissions]\njit = true` was accepted by BOTH
+    // shipped binaries (`--validate-forge-manifest` exited 0) and by
+    // apply_forge.sh, and the deployed app's generated SBPL then carried
+    // `(allow dynamic-code-generation)`. apps.rs states the project rule outright:
+    // "Treating `jit = true` as a CONSEQUENTIAL capability declaration (an authored
+    // manifest edit, never a runtime auto-grant) is the project rule" — a
+    // MODEL-authored manifest is not an authored manifest edit. (Honest bound:
+    // apps.rs also documents that `jit = true` alone does not enable RWX under the
+    // current unsigned-interpreter launch, so this was a capability-declaration and
+    // audit hole rather than a demonstrated JIT grant.)
+    if p.jit {
+        bail!("over-broad permission: a forged app may not request `jit` (dynamic code generation)");
     }
 
     let own_state = format!("state/apps/{name}");
@@ -539,9 +579,15 @@ fn render_report(
     validation_tail: &str,
 ) -> String {
     let p = &manifest.permissions;
+    // EVERY PermissionsSection bit, `jit` included. This line is the ONE human
+    // review surface for a forged app's capabilities (apply_forge.sh --yes never
+    // prints the manifest), and it used to hand-roll a list that simply omitted
+    // `jit` — so a grant the daemon treats as consequential was invisible to the
+    // reviewer clicking Accept. Anything added to PermissionsSection must appear
+    // here; keep this list exhaustive.
     let perms = format!(
-        "audio={}, gpu={}, camera={}, screen={}, net_hosts={:?}, fetch_hosts={:?}, fs_read={:?}, fs_write={:?}",
-        p.audio, p.gpu, p.camera, p.screen, p.net_hosts, p.fetch_hosts, p.fs_read, p.fs_write
+        "audio={}, gpu={}, camera={}, screen={}, jit={}, net_hosts={:?}, fetch_hosts={:?}, fs_read={:?}, fs_write={:?}",
+        p.audio, p.gpu, p.camera, p.screen, p.jit, p.net_hosts, p.fetch_hosts, p.fs_read, p.fs_write
     );
     let file_list = files
         .iter()
@@ -757,15 +803,28 @@ fn stage_files(staging: &Path, app: &AuthoredApp) -> Result<()> {
     Ok(())
 }
 
-/// Write `<base>/<rel>` after a final defense-in-depth confinement check (the
-/// written path must canonicalize/normalize to within `base`). `rel` is already
-/// validated by the caller; this is belt-and-braces.
+/// Write `<base>/<rel>`. The real confinement decision is the caller-side
+/// [`is_confined_relpath`] screen, re-run here so no caller can skip it.
+///
+/// SCOPE, HONESTLY: the `starts_with` line below is a cheap LEXICAL assertion that
+/// `rel` stayed relative — `Path::starts_with` compares components and never
+/// touches the filesystem, and `base.join(rel)` for any relative `rel` always
+/// begins with `base`, so for every input that already passed
+/// `is_confined_relpath` that branch is unreachable. This function does NOT
+/// canonicalize and is NOT symlink-resistant: a symlinked component inside `base`
+/// would be followed by `std::fs::write`. Nothing in the pipeline can create a
+/// symlink inside the staging/proposal dir, so there is no exploit today — but the
+/// doc used to promise "the written path must canonicalize/normalize to within
+/// `base`" and "no symlink/.. trickery", neither of which is implemented. If a
+/// future change lets an app influence the staging dir, add a real
+/// `std::fs::canonicalize` comparison here; do not rely on the line below for it.
 fn write_confined(base: &Path, rel: &str, body: &str) -> Result<()> {
     if !is_confined_relpath(rel) {
         bail!("refusing to write non-confined path {:?}", rel);
     }
     let dest = base.join(rel);
-    // The joined path must still start with base (no symlink/.. trickery).
+    // Lexical belt-and-braces only (see the doc above): asserts `rel` stayed
+    // relative. NOT a symlink guard.
     if !dest.starts_with(base) {
         bail!("path {:?} escapes the staging dir", rel);
     }
@@ -843,9 +902,18 @@ async fn validate_cargo(staging: &Path) -> Result<ValidationOutcome> {
     })
 }
 
-/// py_compile every .py under the staging dir (recursively) under the deadline.
+/// py_compile every .py under the staging dir (recursively).
 /// A python app's "tests" are at least syntactically validated; the daemon
 /// never executes the python (that would run generated code live).
+///
+/// BOUND, HONESTLY: there is NO aggregate deadline on this arm. Unlike
+/// [`validate_cargo`], which computes one `Instant::now() + VALIDATE_TIMEOUT` and
+/// bails with "[validation deadline exhausted before cargo …]", each file here gets
+/// its OWN fixed 60s cap inside [`run_python_compile`], so the wall-clock bound is
+/// 60s x (number of authored .py files), not the 600s `VALIDATE_TIMEOUT` the
+/// constant and the module header describe. In practice the drafter's 8192-token
+/// budget bounds the file count, so the real ceiling is a few minutes — but the
+/// single-deadline contract stated elsewhere does not exist on this path.
 async fn validate_python(staging: &Path) -> Result<ValidationOutcome> {
     let mut py_files: Vec<PathBuf> = Vec::new();
     collect_py(staging, &mut py_files);
@@ -1541,6 +1609,40 @@ mod tests {
         assert!(parse_authored_app(no_manifest).is_err(), "no manifest -> error");
     }
 
+    /// REGRESSION: a bundle with TWO manifest.toml blocks is rejected at parse.
+    ///
+    /// Only the FIRST was pulled out and validated; the second stayed in `files`,
+    /// and both writers write the validated manifest first and every authored file
+    /// after it with no dedupe — so the leftover CLOBBERED the validated manifest at
+    /// `proposals/<ts>/app/<name>/manifest.toml`, the payload apply_forge.sh
+    /// deploys, while report.md certified the OTHER manifest's permissions as
+    /// "MINIMAL, validated". The drafter is untrusted and emitting two blocks is
+    /// entirely within its control.
+    #[test]
+    fn parse_authored_app_rejects_a_second_manifest_that_would_clobber_the_validated_one() {
+        let two_bare = "=== FILE: manifest.toml ===\n[app]\nname = \"tool\"\n[permissions]\n\
+            === FILE: main.py ===\nprint(1)\n\
+            === FILE: manifest.toml ===\n[app]\nname = \"tool\"\n[permissions]\ngpu = true\n";
+        let err = parse_authored_app(two_bare)
+            .expect_err("two manifest blocks must be a clean parse-stage rejection")
+            .to_string();
+        assert!(err.contains("manifest.toml"), "the reason must name the file: {err}");
+
+        // The same holds for `app/<name>/manifest.toml` beside a bare one — the
+        // manifest is matched by BASENAME, so both land in the same slot.
+        let nested_plus_bare = "=== FILE: app/tool/manifest.toml ===\n[app]\nname = \"tool\"\n[permissions]\n\
+            === FILE: manifest.toml ===\n[app]\nname = \"tool\"\n[permissions]\nfs_write = [\"/\"]\n";
+        assert!(
+            parse_authored_app(nested_plus_bare).is_err(),
+            "a nested + bare manifest pair must also be rejected"
+        );
+
+        // One manifest still parses (the guard must not disarm the normal case).
+        let one = "=== FILE: manifest.toml ===\n[app]\nname = \"tool\"\n[permissions]\n\
+            === FILE: main.py ===\nprint(1)\n";
+        assert!(parse_authored_app(one).is_ok());
+    }
+
     // -- (3) name + path + PERMISSION minimization ---------------------------
 
     #[test]
@@ -1590,6 +1692,14 @@ mod tests {
         assert!(validate_permissions("tool", &perms(|p| p.gpu = true)).is_err());
         assert!(validate_permissions("tool", &perms(|p| p.camera = true)).is_err());
         assert!(validate_permissions("tool", &perms(|p| p.screen = true)).is_err());
+        // REGRESSION: `jit` — the NINTH PermissionsSection bit — used to slip past
+        // this gate entirely. `--validate-forge-manifest` exited 0 on a manifest
+        // whose only permission was `jit = true`, and the deployed SBPL then carried
+        // `(allow dynamic-code-generation)`.
+        let err = validate_permissions("tool", &perms(|p| p.jit = true))
+            .expect_err("a forged app may not be born with `jit`")
+            .to_string();
+        assert!(err.contains("jit"), "the reason must name the bit: {err}");
 
         // fs_write outside the app's own state dir -> rejected.
         assert!(validate_permissions("tool", &perms(|p| p.fs_write = vec!["state/apps/other".into()])).is_err());
@@ -1749,6 +1859,16 @@ mod tests {
         assert!(report.contains("VALIDATED"));
         assert!(report.contains("scripts/apply_forge.sh 1770000000"), "exact deploy command");
         assert!(report.contains("NOT in apps/"), "must state it is not deployed");
+        // REGRESSION: the reviewer's ONE capability surface must list EVERY
+        // PermissionsSection bit. The hand-rolled list used to omit `jit`, so a
+        // grant the daemon treats as consequential was invisible to the human
+        // clicking Accept (apply_forge.sh --yes never prints the manifest).
+        for bit in ["audio=", "gpu=", "camera=", "screen=", "jit=", "net_hosts=", "fetch_hosts=", "fs_read=", "fs_write="] {
+            assert!(
+                report.contains(bit),
+                "the reviewed permission line must name {bit}:\n{report}"
+            );
+        }
     }
 
     // -- (4) MOCK-BRAIN drills: stage -> validate (REAL build/test of a

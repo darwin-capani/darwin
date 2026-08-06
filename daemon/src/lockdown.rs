@@ -510,9 +510,29 @@ mod tests {
 
     #[test]
     fn default_is_unlocked() {
-        // Read the REAL atomic (no thread-local override) so this asserts the
-        // shipped default, not a test seam.
-        let _g = init_guard();
+        // WHAT WENT WRONG: this took `init_guard()`, whose whole job is to install
+        // `LockdownOverride::force(false)` — and `is_locked_down()` returns from
+        // that thread-local BEFORE ever touching the atomic under `cfg(test)`. So
+        // the assertion read back the `false` the guard had just installed two
+        // lines earlier, while the comment claimed "Read the REAL atomic (no
+        // thread-local override)". Proven: with the real
+        // `static LOCKDOWN: AtomicBool` forced to TRUE — i.e. shipping the daemon
+        // permanently locked down — this test still passed. The ONE test that
+        // exists to pin "the shipped default is unlocked (every gate byte-for-byte
+        // today)" was a tautology.
+        //
+        // Take ONLY the serialization lock, and explicitly CLEAR the thread-local
+        // seam so the read falls through to the atomic. This stays hermetic
+        // because no test ever writes the real atomic: every panic/unlock test
+        // runs under an override, and command.rs's routing test mocks the
+        // dispatcher rather than calling `lockdown::panic`.
+        let _serial = TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        LOCKDOWN_TL.with(|c| c.set(None));
+        MARKER_PATH_TL.with(|c| *c.borrow_mut() = None);
+        assert!(
+            LOCKDOWN_TL.with(|c| c.get()).is_none(),
+            "precondition: the test seam must be OFF, or this asserts nothing"
+        );
         assert!(!is_locked_down(), "the shipped default is unlocked — every gate byte-for-byte today");
     }
 

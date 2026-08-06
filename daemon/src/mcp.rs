@@ -8,9 +8,16 @@
 //! offers tools an agent can call. The whole module is built to be SAFE BY
 //! DEFAULT:
 //!
-//!   * SHIPS OFF. `[mcp].enabled = false` is the shipped default; with it false
-//!     [`McpManager::connect_all`] connects to NOTHING and [`McpManager::tools`]
-//!     is empty. No server connects, no tool exists. (config.rs + a pinned test.)
+//!   * SHIPS ON, INERT WITHOUT SERVERS. `[mcp].enabled = true` is the shipped
+//!     default (config.rs `McpConfig::default`, config/darwin.toml, and the pinned
+//!     `config::tests::mcp_defaults_on_with_no_servers_and_finite_bounds`). What
+//!     actually keeps a default install inert is that `servers` ships EMPTY: with
+//!     no `[[mcp.servers]]` entry [`McpManager::connect_all`] connects to NOTHING
+//!     and [`McpManager::tools`] is empty. Adding ONE server entry (which
+//!     `connector_add` writes) is therefore sufficient to bring the surface live —
+//!     the master switch is not a second gate the user must also flip. With
+//!     `enabled = false` the subsystem does nothing at all; that part is true, it
+//!     is just not the default.
 //!
 //!   * GATED. Every discovered tool carries a [`ToolClass`]; an unknown/mutating
 //!     tool is CONSEQUENTIAL (fail-safe). [`McpManager::call_tool`] takes an
@@ -982,6 +989,29 @@ impl McpClient {
                     continue;
                 }
             };
+            // The tool NAME is the one piece of this that comes from the untrusted
+            // external server, and it goes VERBATIM into the Anthropic tool-def
+            // `name` via `flat_tool_name`. That field must match
+            // `^[a-zA-Z0-9_-]{1,128}$`; the MCP spec forbids none of `.`, `/`, `:`
+            // or space in `Tool.name`. One non-conforming tool used to poison the
+            // WHOLE `tools` array: the Messages API 400s the entire request, so
+            // every cloud turn for every agent allowlisted to that server failed —
+            // not just calls to that one tool. Skip-with-WARN is the same fail-safe
+            // already applied to a nameless tool and keeps the rest of the server
+            // usable. (Sanitizing instead — apps.rs-style dot flattening — is not
+            // injective and would need a dedupe or two tools could collide onto one
+            // wire id and misroute.)
+            if !is_wire_safe_tool_name(&tname)
+                || flat_tool_name(&self.name, &tname).len() > MAX_WIRE_TOOL_NAME
+            {
+                warn!(
+                    server = %self.name,
+                    tool = %tname,
+                    "mcp: skipping tool whose name cannot be a Messages API tool id \
+                     ([a-zA-Z0-9_-], and mcp__<server>__<tool> <= 128 bytes)"
+                );
+                continue;
+            }
             let description = t
                 .get("description")
                 .and_then(Value::as_str)
@@ -1131,7 +1161,9 @@ async fn bounded<T>(timeout: Duration, fut: impl std::future::Future<Output = Mc
 /// per-agent allowlist, and routes `call_tool` through the gate.
 ///
 /// INERT WHEN DISABLED: [`McpManager::new`] with `[mcp].enabled = false` builds a
-/// manager that connects to nothing and offers no tools — the shipped state.
+/// manager that connects to nothing and offers no tools. That is NOT the shipped
+/// state — `enabled` ships TRUE; what ships inert is the EMPTY `servers` list (see
+/// the module header).
 pub struct McpManager {
     cfg: McpConfig,
     /// Connected clients, keyed by server name. Empty when disabled or when no
@@ -1154,6 +1186,12 @@ impl McpManager {
     /// (task #12 lockdown overlay), so every reader of the master gate sees the
     /// MCP host OFF when locked. With lockdown OFF this is byte-for-byte
     /// `self.cfg.enabled`.
+    ///
+    /// CALL-TIME, and that matters: [`crate::lockdown::is_locked_down`] reads a
+    /// process-global flag that `lockdown::init` sets from the on-disk marker at
+    /// startup. If a connect gate runs BEFORE `lockdown::init`, this returns true
+    /// even on a daemon that came up locked. The connect path is the one place that
+    /// ordering is load-bearing — see the note in `connect_all`.
     pub fn enabled(&self) -> bool {
         self.cfg.enabled && !crate::lockdown::is_locked_down()
     }
@@ -1163,7 +1201,17 @@ impl McpManager {
     /// whose names are valid. Pure (no IO), so the gating is unit-testable without
     /// spawning anything.
     pub fn connectable_servers(&self) -> Vec<&McpServerConfig> {
-        if !self.cfg.enabled {
+        // `self.enabled()`, NOT `self.cfg.enabled` — the lockdown overlay must
+        // cover the CONNECT path too. `call_tool` and `tool_defs_for_agent` were
+        // already lockdown-gated, but the two readers that actually run at startup
+        // read the raw config bit, so `McpManager::enabled()` had no production
+        // caller at all and its "every reader of the master gate sees the MCP host
+        // OFF when locked" doc described nothing. What that let through: with the
+        // emergency stop engaged and persisted, a restart still spawned every
+        // configured stdio server and still POSTed the user's Keychain bearer token
+        // to every configured remote endpoint — the exact opposite of what
+        // lockdown::PANIC_CONFIRMATION promises persists across a restart.
+        if !self.enabled() {
             return Vec::new();
         }
         self.cfg
@@ -1184,8 +1232,17 @@ impl McpManager {
     /// disabled. A single server failing to connect is logged and skipped — one
     /// bad server never blocks the rest.
     pub async fn connect_all(&mut self, project_root: &Path) -> McpResult<()> {
-        if !self.cfg.enabled {
-            info!("mcp: disabled — no server connected");
+        // Lockdown-aware (see `connectable_servers`): a locked-down daemon connects
+        // NOTHING, so no subprocess is spawned and no bearer token leaves the host.
+        //
+        // ORDERING CAVEAT — STILL OPEN AT THE CALL SITE: `lockdown::is_locked_down`
+        // reads a flag that `lockdown::init` populates from the on-disk marker, and
+        // main.rs currently calls `connect_all` ~30 lines BEFORE `lockdown::init`.
+        // Until that init is moved above the MCP block, a restart on a locked-down
+        // machine still sees the flag false here. This gate is correct and is the
+        // half that belongs in this module; the startup ordering is the other half.
+        if !self.enabled() {
+            info!("mcp: disabled (config or lockdown) — no server connected");
             return Ok(());
         }
         let timeout = Duration::from_millis(self.cfg.call_timeout_ms);
@@ -1541,6 +1598,21 @@ impl McpManager {
 /// double-underscore delimiter unambiguous.
 pub fn flat_tool_name(server: &str, tool: &str) -> String {
     format!("mcp__{server}__{tool}")
+}
+
+/// The Messages API's hard ceiling on a tool `name` (`^[a-zA-Z0-9_-]{1,128}$`).
+/// Enforced against the FLAT id, since that is what goes on the wire.
+pub const MAX_WIRE_TOOL_NAME: usize = 128;
+
+/// Whether a SERVER-REPORTED tool name can appear in a Messages API tool id at
+/// all: non-empty and `[a-zA-Z0-9_-]` only. PURE. Used at discovery so a
+/// non-conforming tool is dropped with a warning instead of 400-ing every cloud
+/// turn for every agent allowlisted to that server.
+pub fn is_wire_safe_tool_name(tool: &str) -> bool {
+    !tool.is_empty()
+        && tool
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// Recover `(server, tool)` from a flat `mcp__<server>__<tool>` id, or `None` when
@@ -2176,6 +2248,70 @@ mod tests {
         assert_eq!(tools.len(), 5, "tools/list must truncate at max_tools");
     }
 
+    /// REGRESSION: a server-reported tool name that cannot be a Messages API tool
+    /// id is SKIPPED, not registered.
+    ///
+    /// The name is the one field an untrusted external server controls, and it went
+    /// verbatim into the wire tool-def `name`, which must match
+    /// `^[a-zA-Z0-9_-]{1,128}$`. The MCP spec forbids none of `.`, `/`, `:` or space
+    /// in `Tool.name`, so one such tool poisoned the WHOLE `tools` array: the
+    /// Messages API rejects the entire request with a 400, so EVERY cloud turn for
+    /// EVERY agent allowlisted to that server failed — not just calls to that tool.
+    #[tokio::test]
+    async fn a_tool_name_that_cannot_be_a_wire_id_is_skipped_not_registered() {
+        let long_tail = "a".repeat(MAX_WIRE_TOOL_NAME);
+        let reported = json!({
+            "tools": [
+                { "name": "get.forecast", "description": "dotted" },
+                { "name": "repo/search", "description": "slashed" },
+                { "name": "do it now", "description": "spaced" },
+                { "name": "ns:call", "description": "coloned" },
+                { "name": long_tail, "description": "over the 128-byte wire cap" },
+                { "name": "get_forecast", "description": "the one usable tool" },
+            ]
+        });
+        let mock = Arc::new(
+            MockTransport::new()
+                .on("initialize", ok_result(json!({})))
+                .on("tools/list", ok_result(reported)),
+        );
+        struct ArcT(Arc<MockTransport>);
+        impl McpTransport for ArcT {
+            fn request<'a>(&'a self, m: Value) -> BoxFuture<'a, McpResult<Value>> {
+                self.0.request(m)
+            }
+            fn notify<'a>(&'a self, m: Value) -> BoxFuture<'a, McpResult<()>> {
+                self.0.notify(m)
+            }
+        }
+        let mut client = McpClient::handshake(
+            "weather",
+            Box::new(ArcT(mock)),
+            Duration::from_secs(5),
+            64,
+            ToolClass::Consequential,
+            vec![],
+        )
+        .await
+        .unwrap();
+        let tools = client.list_tools().await.unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["get_forecast"],
+            "only a wire-safe tool may be registered; the rest 400 every cloud turn: {names:?}"
+        );
+        // And every registered tool's FLAT id really is a legal Messages API name.
+        for t in tools {
+            let flat = flat_tool_name(&t.server, &t.name);
+            assert!(flat.len() <= MAX_WIRE_TOOL_NAME, "flat id over the cap: {flat}");
+            assert!(
+                flat.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+                "flat id carries an illegal char: {flat}"
+            );
+        }
+    }
+
     // -- stdio framing: id correlation + desync poison -------------------
     //
     // These drive the REAL stdio read/write halves over in-memory IO (a byte
@@ -2343,6 +2479,35 @@ mod tests {
             .await
             .expect("noop");
         assert!(mgr.tools().is_empty());
+    }
+
+    /// REGRESSION: LOCKDOWN gates the CONNECT path, not just the call path.
+    ///
+    /// `connectable_servers` and `connect_all` read `self.cfg.enabled` directly, so
+    /// `McpManager::enabled()` — the lockdown-aware gate whose doc promised "every
+    /// reader of the master gate sees the MCP host OFF when locked" — had NO
+    /// production caller at all. With the emergency stop engaged, connect_all still
+    /// spawned every configured stdio subprocess and still POSTed the user's
+    /// Keychain bearer token to every configured remote endpoint, which is exactly
+    /// what lockdown::PANIC_CONFIRMATION tells the user persists across a restart.
+    #[tokio::test]
+    async fn a_locked_down_manager_connects_to_nothing() {
+        let _lock = crate::lockdown::LockdownOverride::force(true);
+        let cfg = McpConfig {
+            enabled: true, // configured ON — lockdown must override it
+            servers: vec![server("files"), server("weather")],
+            ..Default::default()
+        };
+        let mut mgr = McpManager::new(cfg);
+        assert!(!mgr.enabled(), "lockdown forces the master gate off");
+        assert!(
+            mgr.connectable_servers().is_empty(),
+            "a locked-down daemon must offer NO server to connect"
+        );
+        mgr.connect_all(Path::new("/tmp/darwin-test-root"))
+            .await
+            .expect("connect_all is a no-op under lockdown");
+        assert!(mgr.tools().is_empty(), "no tool may exist under lockdown");
     }
 
     #[test]

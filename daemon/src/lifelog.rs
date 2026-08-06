@@ -316,6 +316,27 @@ pub enum LifeLogIntent {
 /// question never trips it. Pure — unit-tested. Defaults to [`Period::Week`] when
 /// a "life log" is requested without an explicit day/week word (the browsable
 /// default).
+/// Whether an own-activity phrase ("what did i do", ...) present in `lower` is
+/// asking about a PERIOD rather than about a specific thing.
+///
+/// True when the phrase ENDS the request ("what did I do?" — a bare digest ask)
+/// or when what follows it names a period/recency ("today", "this week", "all
+/// day", "lately"). False when the phrase takes a real object — "what did I do
+/// WRONG", "what did I do WITH THE SPARE KEYS", "what did I do ABOUT THE
+/// INVOICE" — which is an ordinary question the model must answer, not a request
+/// for a digest of the day. Pure.
+fn own_activity_asks_about_a_period(lower: &str, phrase: &str) -> bool {
+    const PERIOD_CUES: &[&str] = &[
+        "today", "day", "week", "weekend", "yesterday", "morning", "afternoon",
+        "evening", "tonight", "lately", "recently", "far", "month",
+    ];
+    let Some(idx) = lower.find(phrase) else {
+        return false;
+    };
+    let tail = lower[idx + phrase.len()..].trim_matches(|c: char| !c.is_alphanumeric());
+    tail.is_empty() || crate::utterance::mentions_any_word(tail, PERIOD_CUES)
+}
+
 pub fn classify_lifelog_intent(utterance: &str) -> Option<LifeLogIntent> {
     let lower = utterance.to_lowercase();
     let lower = lower.trim();
@@ -323,25 +344,46 @@ pub fn classify_lifelog_intent(utterance: &str) -> Option<LifeLogIntent> {
     let about_my_activity = lower.contains("life log")
         || lower.contains("lifelog")
         || lower.contains("life-log")
-        || lower.contains("what did i do")
-        || lower.contains("what have i done")
+        // "what did I do" and friends are a digest request only when they are
+        // asking about a PERIOD.
+        //
+        // WHAT WENT WRONG: these were bare substrings, so "what did I do WRONG",
+        // "what did I do with the spare keys" and "remind me what did I do about
+        // the invoice" all rendered a week digest. The router handles this intent
+        // BEFORE model routing and returns early, so the user's actual question
+        // never reached the model — they got "Here's your life log for this week,
+        // sir" instead. `[lifelog].enabled` ships true and no earlier router arm
+        // claims these utterances, so the hijack was total.
+        || own_activity_asks_about_a_period(lower, "what did i do")
+        || own_activity_asks_about_a_period(lower, "what i did")
+        || own_activity_asks_about_a_period(lower, "what have i done")
         || lower.contains("what have i been up to")
         || lower.contains("what i've been doing")
-        || lower.contains("what i did")
         || lower.contains("my activity")
         // "my week" / "my day" ALONE are not a request for a digest. They are how
         // people talk about their lives: "why does it always rain on MY DAY off",
         // "a nice compliment from a stranger MADE MY WEEK". Both rendered a
         // lifelog digest. The possessive needs a RECALL cue beside it — the same
         // thing every other limb of this gate already carries.
+        //
+        // AND THE CUE MUST BE PAST-LOOKING. A bare "how"/"what" used to count,
+        // which swallowed the two commonest SCHEDULE questions in English: "how
+        // does my day look" and "what's on my day" both rendered a digest of what
+        // had already happened instead of reaching the calendar. The verb-anchored
+        // phrases below keep "how was my day" / "what did my day look like" while
+        // letting a forward-looking question through to the model.
         || ((lower.contains("my week") || lower.contains("my day"))
-            && crate::utterance::mentions_any_word(
+            && (crate::utterance::mentions_any_word(
                 lower,
                 &[
                     "recap", "summarize", "summarise", "summary", "digest", "review",
-                    "rundown", "walk", "tell", "show", "how", "what",
+                    "rundown", "walk", "tell", "show",
                 ],
-            ));
+            ) || lower.contains("how was my")
+                || lower.contains("how did my")
+                || lower.contains("what was my")
+                || lower.contains("what did my")
+                || lower.contains("what happened")));
     if !about_my_activity {
         return None;
     }
@@ -407,6 +449,56 @@ mod tests {
         // A real recall still works.
         for u in ["what did i do today", "recap my week", "show me my activity"] {
             assert!(classify_lifelog_intent(u).is_some(), "{u:?} IS a lifelog request");
+        }
+    }
+
+    /// The own-activity phrases must be PERIOD-scoped, and the possessive-period
+    /// arm must be PAST-looking.
+    ///
+    /// WHAT WENT WRONG: `contains("what did i do")` and a cue list containing bare
+    /// "how"/"what" made this intent swallow ordinary requests. The router handles
+    /// lifelog BEFORE model routing and RETURNS EARLY, so the user's real question
+    /// never reached the model — "what did I do wrong" came back as "Here's your
+    /// life log for this week, sir", and "how does my day look" (a calendar
+    /// question) came back as a digest of what had already happened.
+    #[test]
+    fn an_ordinary_question_that_merely_contains_the_cue_is_not_a_digest() {
+        for u in [
+            // The phrase takes a real object — a specific question, not a digest.
+            "what did i do wrong",
+            "what did i do with the spare keys",
+            "remind me what did i do about the invoice",
+            "what did i do to deserve this",
+            // Forward-looking SCHEDULE questions about the same possessive period.
+            "how does my day look",
+            "what's on my day",
+            "plan my day",
+            "clear my day",
+            "book my week out for the offsite",
+        ] {
+            assert_eq!(
+                classify_lifelog_intent(u),
+                None,
+                "{u:?} is an ordinary request, not a life-log digest"
+            );
+        }
+        // …and every genuine phrasing still classifies (the fix is narrow).
+        for u in [
+            "what did i do today",
+            "what did i do this week",
+            "what did i do",
+            "what did i do all day",
+            "what have i been up to",
+            "how was my day",
+            "what did my day look like",
+            "recap my day",
+            "summarize my week",
+            "show me my life log",
+        ] {
+            assert!(
+                classify_lifelog_intent(u).is_some(),
+                "{u:?} IS a life-log request and must still classify"
+            );
         }
     }
     use super::*;

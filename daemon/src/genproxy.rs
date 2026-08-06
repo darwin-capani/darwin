@@ -89,7 +89,9 @@ struct ProxyRequest {
 /// The proxy's decision for one inbound line, BEFORE any token check or
 /// forward. Pure and exhaustively unit-tested: the op gate and the clamp live
 /// here so the tests prove a privileged op can never reach a forward and that
-/// `max_tokens` is always within `[PROXY_MIN_TOKENS, PROXY_MAX_TOKENS]`.
+/// `max_tokens` never exceeds [`PROXY_MAX_TOKENS`]. That CEILING is the guard
+/// that matters and it always holds; there is no matching FLOOR — see
+/// [`clamp_tokens`].
 #[derive(Debug, PartialEq)]
 enum Decision {
     /// op == generate and shape is sane: verify the token, rate-limit, then
@@ -103,9 +105,17 @@ enum Decision {
     Malformed,
 }
 
-/// Clamp a requested token budget into `[PROXY_MIN_TOKENS, PROXY_MAX_TOKENS]`.
-/// A missing / zero / negative request floors to the default; anything above
-/// the cap is pinned to the cap.
+/// Cap a requested token budget at [`PROXY_MAX_TOKENS`]; a MISSING / zero /
+/// negative request falls back to [`PROXY_MIN_TOKENS`].
+///
+/// NOT a two-sided clamp, despite the name: a POSITIVE request below
+/// `PROXY_MIN_TOKENS` passes through UNCHANGED, so `clamp_tokens(Some(1))` is 1,
+/// not 64. That is deliberate — a caller that deliberately asks for a very short
+/// generation gets it — but two comments here used to advertise the interval
+/// `[PROXY_MIN_TOKENS, PROXY_MAX_TOKENS]` as a postcondition, which would have led
+/// a reader either to rely on a floor that is not there or to "fix" this into a
+/// real `.clamp()` and change the wire behavior of every such caller.
+/// `PROXY_MIN_TOKENS` is a DEFAULT, not a minimum.
 fn clamp_tokens(requested: Option<i64>) -> u32 {
     match requested {
         Some(n) if n > 0 => (n as u64).min(PROXY_MAX_TOKENS as u64) as u32,
@@ -425,6 +435,16 @@ mod tests {
         assert_eq!(clamp_tokens(Some(0)), PROXY_MIN_TOKENS);
         assert_eq!(clamp_tokens(None), PROXY_MIN_TOKENS);
         assert_eq!(clamp_tokens(Some(128)), 128);
+        // NO FLOOR on a POSITIVE request: `PROXY_MIN_TOKENS` is a DEFAULT for a
+        // missing/zero/negative field, not a minimum. A caller that deliberately
+        // asks for a very short generation gets exactly what it asked for. Two
+        // comments here used to advertise the interval
+        // [PROXY_MIN_TOKENS, PROXY_MAX_TOKENS] as a postcondition while this range
+        // (1..=63) went untested, so the discrepancy could not be caught. Pinned so
+        // that turning this into a real two-sided `.clamp()` is a DELIBERATE wire
+        // behavior change, not a silent one.
+        assert_eq!(clamp_tokens(Some(1)), 1, "a positive request below the default passes through");
+        assert_eq!(clamp_tokens(Some(PROXY_MIN_TOKENS as i64 - 1)), PROXY_MIN_TOKENS - 1);
         // And through the full decode path: a huge request clamps in Forward.
         let raw = json!({"name": "a", "token": "t", "op": "generate", "text": "x", "max_tokens": 99999})
             .to_string();

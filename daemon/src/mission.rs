@@ -21,11 +21,16 @@
 //!   a sub-task its own scope, and a sub-task can never reach a tool outside the
 //!   owning specialist's allowlist (the cloud loop's `agent_may_use` is the same
 //!   gate the direct path uses).
-//! - **Bounded.** At most [`MAX_SUBTASKS`] sub-tasks, depth exactly 1 (a
-//!   sub-task can never launch its own mission — `fury_mission` is not in any
-//!   specialist's allowlist, and the dispatcher refuses it defensively), and an
+//! - **Bounded.** At most [`MAX_SUBTASKS`] sub-tasks, depth exactly 1, and an
 //!   overall iteration budget. Exceeding a bound TRUNCATES with a clear note in
-//!   the synthesis — never a silent drop, never an unbounded run.
+//!   the synthesis — never a silent drop, never an unbounded run. Depth 1 is
+//!   enforced by a TASK-LOCAL counter [`run_mission`] scopes around the whole
+//!   mission: a sub-task that calls `fury_mission` re-enters `run_mission` on the
+//!   same task, sees the enclosing mission, and is refused before it plans or
+//!   spends a token. It is NOT enforced by the tool allowlist — the orchestrator
+//!   (darwin), which is exactly where a fury-resolved or unmatched sub-task
+//!   lands, holds the wildcard `["*"]` and IS offered the mission tool. See
+//!   [`MAX_DEPTH`] for the hole that used to leave open.
 //! - **Honest about cost.** A real mission needs the cloud reachable and costs
 //!   tokens. Offline, [`run_mission`] degrades to a friendly "missions need the
 //!   cloud" line and does NOT pretend it ran.
@@ -50,10 +55,61 @@ pub const MAX_SUBTASKS: usize = 6;
 
 /// Mission depth is exactly 1: a mission dispatches sub-tasks to specialists, and
 /// a sub-task is a SINGLE delegated turn that can never itself launch a mission.
-/// Enforced two ways — `fury_mission` is in no specialist's allowlist (so the
-/// cloud loop would refuse it), and the dispatcher refuses it defensively
-/// regardless of the agent. This constant documents the contract the tests pin.
+///
+/// WHAT WENT WRONG: this used to claim the bound was "enforced two ways —
+/// `fury_mission` is in no specialist's allowlist (so the cloud loop would refuse
+/// it), and the dispatcher refuses it defensively regardless of the agent."
+/// NEITHER held for the one agent that matters. `route_plan` deliberately
+/// re-points a fury-resolved sub-task at the ORCHESTRATOR (darwin), and
+/// `AgentRegistry::select`'s step-4 fallback sends every unmatched plan line
+/// there too — and darwin's roster allowlist is the WILDCARD `["*"]`. The
+/// dispatcher's "defensive" strip was `tools.filter(|t| *t != "fury_mission")`,
+/// which leaves `["*"]` untouched; `tools_for_agent` then returns EVERY tool def
+/// for a wildcard, and `agent_may_use` passes anything for a wildcard. So a
+/// darwin sub-task was offered `fury_mission`, could call it, and
+/// `run_fury_mission` -> `run_mission` started a whole new plan of up to six more
+/// sub-tasks — 6^depth nested cloud tool loops with no termination condition and
+/// no ceiling on real API spend. The one guard that should have caught it was
+/// dead: `run_mission` always passes the literal `0` to `dispatch`, so
+/// `depth >= MAX_DEPTH` reduced to `0 >= 1`.
+///
+/// It is now enforced for real, and in ONE place that cannot be bypassed by any
+/// tool-surface detail: [`run_mission`] scopes a TASK-LOCAL depth counter around
+/// the whole mission, and a nested `run_mission` reached from inside a sub-task
+/// (the `fury_mission` tool arm awaits inline on the same task) sees
+/// `depth >= MAX_DEPTH` and refuses BEFORE planning — no tokens, no dispatch.
 pub const MAX_DEPTH: usize = 1;
+
+tokio::task_local! {
+    /// How many missions are already RUNNING on this task. [`run_mission`] scopes
+    /// this to `depth + 1` around its whole body, so anything it awaits in-line —
+    /// including a sub-task's cloud tool loop and therefore the `fury_mission`
+    /// tool arm — observes the enclosing mission.
+    ///
+    /// TASK-local, not a process global, for the same reason `obol::SCOPED_AGENT`
+    /// is: two missions can run concurrently (an interactive one and a standing
+    /// one at 09:00), and a global would make either one's depth leak into the
+    /// other and refuse a perfectly legitimate top-level mission.
+    static MISSION_DEPTH: usize;
+}
+
+/// How many missions are already running on this task (0 when none). Pure read of
+/// the task-local; safe outside any scope.
+pub fn current_mission_depth() -> usize {
+    MISSION_DEPTH.try_with(|d| *d).unwrap_or(0)
+}
+
+/// The honest line a NESTED mission gets back: it did not run, and we say so
+/// rather than pretending. This is what the sub-task's cloud loop receives as the
+/// `fury_mission` tool result, so the model is told plainly that the recursion is
+/// refused instead of being handed a fabricated campaign report. Pure.
+pub fn nested_mission_refused(goal: &str) -> String {
+    format!(
+        "A sub-task can't launch its own mission, sir — missions run exactly one level deep. \
+         I did not start \"{}\"; ask me for it as a mission of its own and I'll run it.",
+        goal.trim()
+    )
+}
 
 /// Whole-mission iteration budget: the maximum number of sub-task DISPATCHES one
 /// mission may perform, independent of [`MAX_SUBTASKS`]. With the per-sub-task
@@ -300,6 +356,34 @@ pub async fn run_mission(
     dispatcher: &dyn Dispatcher,
     cloud_reachable: bool,
 ) -> String {
+    // THE DEPTH BOUND, enforced here and nowhere else. A sub-task's cloud tool
+    // loop is awaited IN-LINE on this task (execute_tool -> the `fury_mission`
+    // arm -> run_fury_mission -> back into this function), so a nested mission
+    // observes the task-local this call scopes below. Refuse BEFORE planning:
+    // the whole point is that a recursive mission costs nothing and fans out
+    // nothing. See MAX_DEPTH for what used to (not) enforce this.
+    let depth = current_mission_depth();
+    if depth >= MAX_DEPTH {
+        return nested_mission_refused(goal);
+    }
+    MISSION_DEPTH
+        .scope(
+            depth + 1,
+            run_mission_inner(goal, registry, planner, dispatcher, cloud_reachable),
+        )
+        .await
+}
+
+/// The mission body, run INSIDE the [`MISSION_DEPTH`] scope [`run_mission`] opens.
+/// Split out only so the task-local wraps the entire plan/dispatch/synthesize
+/// pipeline — every behaviour here is documented on `run_mission`.
+async fn run_mission_inner(
+    goal: &str,
+    registry: &AgentRegistry,
+    planner: &dyn Planner,
+    dispatcher: &dyn Dispatcher,
+    cloud_reachable: bool,
+) -> String {
     // Cost/offline honesty: a mission is real cloud work. Don't even plan offline.
     if !cloud_reachable {
         return offline_degrade(goal);
@@ -511,9 +595,20 @@ impl Dispatcher for CloudDispatcher<'_> {
                     "a sub-task cannot launch its own mission (depth guard)"
                 ));
             }
-            // A sub-task must NEVER be handed the mission tool, even if a roster
-            // edit someday adds it to a specialist — strip it so a sub-task can't
+            // Strip the mission tool from an EXPLICIT allowlist, so a roster edit
+            // that adds `fury_mission` to a specialist cannot let a sub-task
             // recurse through the tool surface.
+            //
+            // HONEST LIMIT: this filter is a literal name match and therefore does
+            // NOT bind the orchestrator's wildcard `["*"]` — and darwin is exactly
+            // where `route_plan` re-points a fury-resolved sub-task and where
+            // `select`'s fallback sends every unmatched plan line. A wildcard
+            // sub-task IS offered `fury_mission`. That breadth is deliberate (a
+            // darwin sub-task needs the orchestrator's reach), so the depth bound
+            // is NOT delegated to the allowlist: `run_mission`'s task-local
+            // MISSION_DEPTH refuses the nested mission when the tool is actually
+            // called. This comment used to claim the strip made recursion
+            // impossible; it never did for the wildcard.
             let scoped: Vec<String> = tools
                 .iter()
                 .filter(|t| t.as_str() != "fury_mission")
@@ -591,7 +686,8 @@ impl Dispatcher for CloudDispatcher<'_> {
 mod tests {
     use super::*;
     use crate::agents::AgentRegistry;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     // ---- Mock planner + dispatcher (NO network, NO cloud) ------------------
 
@@ -656,8 +752,12 @@ mod tests {
                     instruction: instruction.to_string(),
                     depth,
                 });
-                // Defense-in-depth: the dispatcher must NEVER be handed the
-                // mission tool (no recursion through the tool surface).
+                // Defense-in-depth: an EXPLICIT allowlist must never name the
+                // mission tool. This assertion is honest about its reach — it
+                // cannot bind the orchestrator's wildcard `["*"]`, which does
+                // carry fury_mission through. The depth-1 bound for a wildcard
+                // sub-task is pinned by
+                // `a_subtask_that_calls_fury_mission_cannot_start_a_nested_mission`.
                 assert!(
                     !tools.iter().any(|t| t == "fury_mission"),
                     "a sub-task must never receive fury_mission"
@@ -890,6 +990,120 @@ mod tests {
             answer.contains("cannot launch its own mission"),
             "the refusal is surfaced, not silent: {answer}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_subtask_that_calls_fury_mission_cannot_start_a_nested_mission() {
+        // WHAT WENT WRONG: `route_plan` re-points a fury-resolved sub-task at the
+        // ORCHESTRATOR, and `select`'s fallback sends every unmatched plan line
+        // there too — and darwin's roster allowlist is the wildcard `["*"]`. The
+        // dispatcher's "defensive" strip only removed the LITERAL string
+        // "fury_mission", so `["*"]` passed through untouched; `tools_for_agent`
+        // hands a wildcard EVERY tool def and `agent_may_use` passes anything for
+        // a wildcard. A darwin sub-task was therefore offered `fury_mission`, and
+        // calling it re-entered `run_mission` with a fresh plan of up to six more
+        // sub-tasks, each free to recurse again — unbounded fan-out and unbounded
+        // API spend, while four separate comments claimed depth was "exactly 1".
+        // The `depth >= MAX_DEPTH` check could never fire because `run_mission`
+        // hard-codes `0` for its own sub-tasks.
+        //
+        // This models the real recursion path exactly: a dispatcher that, like a
+        // wildcard sub-task's cloud loop, calls `run_mission` again from INSIDE
+        // the enclosing mission's await chain. It recurses at most three times so
+        // a regression FAILS the assertion instead of hanging the suite.
+
+        /// Counts how many times a plan was actually requested — i.e. how many
+        /// missions really got past the depth guard and started spending.
+        struct CountingPlanner {
+            plans_requested: Arc<AtomicUsize>,
+        }
+        impl Planner for CountingPlanner {
+            fn plan<'a>(&'a self, _goal: &'a str) -> PlanFuture<'a> {
+                Box::pin(async move {
+                    self.plans_requested.fetch_add(1, Ordering::SeqCst);
+                    Ok(vec![PlannedTask::new("conversation", "handle the rest")])
+                })
+            }
+        }
+
+        /// A sub-task that does what a wildcard sub-task can really do: call
+        /// `fury_mission`, which lands back in `run_mission` on THIS task.
+        struct NestingDispatcher {
+            plans_requested: Arc<AtomicUsize>,
+            hops: AtomicUsize,
+        }
+        impl Dispatcher for NestingDispatcher {
+            fn dispatch<'a>(
+                &'a self,
+                _agent: &'a str,
+                _tools: &'a [String],
+                _instruction: &'a str,
+                _depth: usize,
+            ) -> DispatchFuture<'a> {
+                Box::pin(async move {
+                    if self.hops.fetch_add(1, Ordering::SeqCst) >= 3 {
+                        return Ok("stopped recursing".to_string());
+                    }
+                    let registry = AgentRegistry::canonical();
+                    let planner = CountingPlanner {
+                        plans_requested: self.plans_requested.clone(),
+                    };
+                    Ok(run_mission("a nested campaign", &registry, &planner, self, true).await)
+                })
+            }
+        }
+
+        let plans_requested = Arc::new(AtomicUsize::new(0));
+        let registry = reg();
+        let planner = CountingPlanner {
+            plans_requested: plans_requested.clone(),
+        };
+        let dispatcher = NestingDispatcher {
+            plans_requested: plans_requested.clone(),
+            hops: AtomicUsize::new(0),
+        };
+
+        // Precondition for this test to mean anything: the sub-task really is
+        // routed to the wildcard orchestrator, which really does hold `["*"]`.
+        let routed = route_plan(&registry, &[PlannedTask::new("conversation", "handle the rest")], true);
+        assert_eq!(routed[0].agent, "darwin", "precondition: unmatched plan lines land on darwin");
+        assert!(
+            registry.get("darwin").unwrap().tools.iter().any(|t| t == "*"),
+            "precondition: darwin holds the wildcard, so the literal-name strip cannot bind it"
+        );
+
+        let answer = run_mission("the outer campaign", &registry, &planner, &dispatcher, true).await;
+
+        // EXACTLY ONE mission planned: the outer one. The nested call was refused
+        // before it planned, so it cost nothing.
+        assert_eq!(
+            plans_requested.load(Ordering::SeqCst),
+            1,
+            "a nested mission must be refused BEFORE it plans — a second plan means \
+             the depth bound is not enforced: {answer}"
+        );
+        // …and the refusal is surfaced honestly, not swallowed or faked.
+        assert!(
+            answer.contains("exactly one level deep"),
+            "the nested refusal must reach the synthesis: {answer}"
+        );
+        // The depth counter does not leak past the mission.
+        assert_eq!(current_mission_depth(), 0, "MISSION_DEPTH escaped its scope");
+    }
+
+    #[tokio::test]
+    async fn a_top_level_mission_still_runs_after_an_earlier_one_finished() {
+        // The depth guard must be SCOPED, not sticky: two ordinary missions in a
+        // row on the same task both run. (A process-global counter, or one that
+        // is never unwound, would refuse the second one.)
+        let registry = reg();
+        let first = MockPlanner::new(vec![PlannedTask::say("give me the morning brief")]);
+        let d1 = MockDispatcher::new();
+        let _ = run_mission("first", &registry, &first, &d1, true).await;
+        let second = MockPlanner::new(vec![PlannedTask::say("give me the morning brief")]);
+        let d2 = MockDispatcher::new();
+        let _ = run_mission("second", &registry, &second, &d2, true).await;
+        assert_eq!(d2.calls().len(), 1, "the second top-level mission must still dispatch");
     }
 
     #[test]

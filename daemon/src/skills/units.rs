@@ -66,7 +66,22 @@ pub fn skills() -> Vec<SkillDef> {
         SkillDef::new(
             "convert_data_size",
             Category::Units,
-            "Convert a digital data size between units (B, KB/MB/GB/TB decimal SI, KiB/MiB/GiB/TiB binary, and bits b/Kib/Mib/Gib). Use for file-size/bandwidth conversions.",
+            // WHAT WENT WRONG: this line is exactly what the model sees
+            // (`SkillDef::catalog_line` embeds it), and it advertised units the
+            // table resolves to something ELSE. `req_unit` case-folds, so the
+            // advertised byte unit `B` collided with `b` = BIT, and the advertised
+            // bit units `Kib/Mib/Gib` collided with `kib/mib/gib` = binary BYTES.
+            // Measured: {"value":1,"from":"MB","to":"B"} answered "8000000 b"
+            // instead of 1000000 bytes, and {"value":8000,"from":"B","to":"KB"}
+            // answered "1 kb" instead of 8 KB — every such answer wrong by 8x or
+            // 8.39x, echoing the lowercased unit so it looked self-consistent. The
+            // units that really ARE bits (kbit/mbit/gbit) appeared nowhere.
+            // Case-folding cannot express the `KiB` vs `Kib` distinction, so the
+            // description no longer pretends it can.
+            "Convert a digital data size between units: byte/bytes, KB/MB/GB/TB/PB (decimal SI), \
+             KiB/MiB/GiB/TiB/PiB (binary), and bits (bit/bits, kbit/mbit/gbit). \
+             NOTE: units are case-insensitive, so 'b' means BITS — write 'byte' for bytes, never 'B'. \
+             Use for file-size/bandwidth conversions.",
             &["convert data size", "mb to gb", "gib to gb", "megabytes to bits", "kilobytes"],
             convert_data_size,
         ),
@@ -142,12 +157,48 @@ fn req_unit(args: &Value, key: &str, skill: &str) -> Result<String> {
 }
 
 /// Format an `f64` result without a trailing `.0` for whole numbers, and without
-/// a stray "-0". Six significant-ish decimals then trimmed, ample for conversions.
+/// a stray "-0".
+///
+/// WHAT WENT WRONG: this formatted with `{x:.6}` — SIX FIXED DECIMAL PLACES, not
+/// six significant digits, despite its own doc claiming the latter — so every
+/// magnitude below 5e-7 rendered as the string "0", and 5e-7..1e-6 rounded to
+/// "0.000001". Measured:
+///   scientific_notation {mantissa:1, exp:-7}  -> "1 x 10^-7 = 0"
+///   scientific_notation {value:1e-7}          -> "0 = 1 x 10^-7"   (the ECHOED INPUT was 0)
+///   convert_length 1 nm -> m                  -> "1 nm = 0 m"
+///   convert_mass   1 ug -> kg                 -> "1 ug = 0 kg"
+///   convert_length 500 nm -> m                -> "500 nm = 0.000001 m"  (truth 5e-7, 2x off)
+/// So `scientific_notation` — the skill whose stated job is "very large/small
+/// numbers" — answered 0 for every physically interesting constant (Planck,
+/// electron charge, optical wavelengths), and the module header's claim that
+/// results "are correct, not approximations that lie" was false. The answer is
+/// delivered as a confident equality, so nothing signals the loss.
+///
+/// Outside the decimal-friendly middle band the number is now rendered in
+/// SCIENTIFIC form at six significant digits, with the mantissa trimmed — so
+/// 1e-7 is "1e-7", not "0". `out_num`'s `str::parse::<f64>` reads that form
+/// natively, as does every downstream consumer.
 fn fmt_num(x: f64) -> String {
     if x == 0.0 {
         return "0".to_string(); // collapse -0.0
     }
-    // Up to 6 decimal places, trim trailing zeros and a bare trailing dot.
+    if !x.is_finite() {
+        return format!("{x}"); // inf / NaN render as themselves, never as a number
+    }
+    let mag = x.abs();
+    if !(1e-4..1e15).contains(&mag) {
+        // Six significant digits in scientific form, mantissa trimmed:
+        // 1e-7 -> "1.00000e-7" -> "1e-7"; 6.626e-34 -> "6.626e-34".
+        let s = format!("{x:.5e}");
+        let (mant, exp) = match s.split_once('e') {
+            Some((m, e)) => (m, e),
+            None => return s,
+        };
+        let mant = mant.trim_end_matches('0').trim_end_matches('.');
+        return format!("{mant}e{exp}");
+    }
+    // The middle band, unchanged: up to 6 decimal places, trailing zeros and a
+    // bare trailing dot trimmed.
     let s = format!("{x:.6}");
     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
     trimmed.to_string()
@@ -381,7 +432,10 @@ fn convert_area(args: &Value) -> Result<String> {
 /// IEC are kept distinct so `gb` != `gib`).
 const DATA: &[(&str, f64)] = &[
     ("b", 1.0 / 8.0),       // bit
+    ("bit", 1.0 / 8.0),
+    ("bits", 1.0 / 8.0),
     ("byte", 1.0),
+    ("bytes", 1.0),
     ("kb", 1e3),
     ("mb", 1e6),
     ("gb", 1e9),
@@ -393,12 +447,32 @@ const DATA: &[(&str, f64)] = &[
     ("tib", 1_099_511_627_776.0),         // 1024^4
     ("pib", 1_125_899_906_842_624.0),     // 1024^5
     ("kbit", 1e3 / 8.0),
+    ("kbits", 1e3 / 8.0),
     ("mbit", 1e6 / 8.0),
+    ("mbits", 1e6 / 8.0),
     ("gbit", 1e9 / 8.0),
+    ("gbits", 1e9 / 8.0),
 ];
+
+/// Refuse the one unit string that CANNOT be resolved honestly: a bare uppercase
+/// `B`. Everywhere in computing that means BYTES, but this table case-folds and
+/// `b` is BITS — so silently accepting it answers every question 8x wrong while
+/// echoing the lowercased unit back, which looks self-consistent to both the
+/// model and the user. An actionable error is the only honest option.
+fn reject_ambiguous_byte_abbreviation(args: &Value, key: &str) -> Result<()> {
+    if args.get(key).and_then(Value::as_str).map(str::trim) == Some("B") {
+        return Err(anyhow!(
+            "convert_data_size: '{key}' is \"B\", which is ambiguous here — units are \
+             case-insensitive and 'b' means BITS. Use \"byte\" for bytes, or \"bit\" for bits."
+        ));
+    }
+    Ok(())
+}
 
 fn convert_data_size(args: &Value) -> Result<String> {
     let value = req_f64(args, "value", "convert_data_size")?;
+    reject_ambiguous_byte_abbreviation(args, "from")?;
+    reject_ambiguous_byte_abbreviation(args, "to")?;
     let from = req_unit(args, "from", "convert_data_size")?;
     let to = req_unit(args, "to", "convert_data_size")?;
     let out = factor_convert("convert_data_size", DATA, value, &from, &to)?;
@@ -913,6 +987,99 @@ mod tests {
     #[test]
     fn data_size_errors() {
         assert!(convert_data_size(&json!({"value": 1, "from": "nibble", "to": "byte"})).is_err());
+    }
+
+    /// The catalog description must only advertise units the table really
+    /// resolves, and the one string that cannot be resolved honestly is refused.
+    ///
+    /// WHAT WENT WRONG: the description said "B" was bytes and "Kib/Mib/Gib" were
+    /// bits. `req_unit` case-folds, so `B` collided with `b` = BIT and
+    /// `Kib/Mib/Gib` collided with binary BYTES. A model picking a unit straight
+    /// out of the skill's own catalog line got answers wrong by 8x
+    /// ({"from":"MB","to":"B"} -> "8000000 b" instead of 1000000 bytes) or 8.39x,
+    /// with the lowercased unit echoed back so the answer looked self-consistent.
+    #[test]
+    fn the_data_size_catalog_line_matches_the_table_it_documents() {
+        let defs = skills();
+        let desc = defs
+            .iter()
+            .find(|d| d.name == "convert_data_size")
+            .expect("the skill is in the catalog")
+            .description;
+
+        // The bit units the table REALLY has are the ones advertised…
+        for unit in ["kbit", "mbit", "gbit", "byte"] {
+            assert!(
+                desc.contains(unit),
+                "the description must name the real unit {unit:?}: {desc}"
+            );
+            assert!(
+                DATA.iter().any(|(u, _)| *u == unit),
+                "the table must hold the advertised unit {unit:?}"
+            );
+        }
+        // …and the case-folding collisions are no longer advertised as bits.
+        assert!(
+            !desc.contains("Kib/Mib/Gib"),
+            "'Kib/Mib/Gib' case-fold to BINARY BYTES, not bits: {desc}"
+        );
+        assert!(
+            desc.contains("'b' means BITS"),
+            "the folding hazard must be stated outright: {desc}"
+        );
+
+        // A bare uppercase "B" is REFUSED rather than silently read as a bit.
+        let e = convert_data_size(&json!({"value": 1, "from": "MB", "to": "B"}))
+            .expect_err("an ambiguous \"B\" must be refused, not answered 8x wrong");
+        assert!(
+            e.to_string().contains("byte"),
+            "the refusal must say what to write instead: {e}"
+        );
+        // The unambiguous spellings work and are exact.
+        let o = convert_data_size(&json!({"value": 1, "from": "mb", "to": "byte"})).unwrap();
+        assert!(approx(out_num(&o), 1e6, 1e-6), "{o}");
+        let o = convert_data_size(&json!({"value": 8000, "from": "bytes", "to": "kb"})).unwrap();
+        assert!(approx(out_num(&o), 8.0, 1e-9), "{o}");
+        let o = convert_data_size(&json!({"value": 1, "from": "mbit", "to": "kb"})).unwrap();
+        assert!(approx(out_num(&o), 125.0, 1e-9), "{o}");
+    }
+
+    /// Small magnitudes must not collapse to "0".
+    ///
+    /// WHAT WENT WRONG: `fmt_num` used `{x:.6}` — six FIXED decimals, not six
+    /// significant digits — so everything below 5e-7 rendered as "0" and
+    /// 5e-7..1e-6 rounded to "0.000001". `scientific_notation`, the skill whose
+    /// stated job is very large/small numbers, answered "1 x 10^-7 = 0", and every
+    /// factor converter answered 0 for nm/ug-scale results — delivered as a
+    /// confident equality with nothing to signal the loss.
+    #[test]
+    fn a_very_small_result_is_rendered_not_collapsed_to_zero() {
+        // The exact reported cases.
+        let o = scientific_notation(&json!({"mantissa": 1.0, "exp": -7})).unwrap();
+        assert!(!o.ends_with("= 0"), "1 x 10^-7 must not expand to 0: {o}");
+        assert!(approx(out_num(&o), 1e-7, 1e-20), "{o}");
+
+        let o = scientific_notation(&json!({"value": 1e-7})).unwrap();
+        assert!(!o.starts_with("0 ="), "the echoed input must not be 0: {o}");
+
+        let o = scientific_notation(&json!({"mantissa": 6.626, "exp": -34})).unwrap();
+        assert!(approx(out_num(&o), 6.626e-34, 1e-40), "Planck must survive: {o}");
+
+        let o = convert_length(&json!({"value": 1, "from": "nm", "to": "m"})).unwrap();
+        assert!(approx(out_num(&o), 1e-9, 1e-20), "{o}");
+        let o = convert_mass(&json!({"value": 1, "from": "ug", "to": "kg"})).unwrap();
+        assert!(approx(out_num(&o), 1e-9, 1e-20), "{o}");
+
+        // The 5e-7..1e-6 band used to round 2x wrong.
+        let o = convert_length(&json!({"value": 500, "from": "nm", "to": "m"})).unwrap();
+        assert!(approx(out_num(&o), 5e-7, 1e-15), "500 nm is 5e-7 m, not 1e-6: {o}");
+
+        // …and the ordinary middle band is UNCHANGED (the fix is narrow).
+        assert_eq!(fmt_num(0.0), "0");
+        assert_eq!(fmt_num(1.0), "1");
+        assert_eq!(fmt_num(0.375), "0.375");
+        assert_eq!(fmt_num(1609.344), "1609.344");
+        assert_eq!(fmt_num(-0.0), "0");
     }
 
     // ----- number base ------------------------------------------------------

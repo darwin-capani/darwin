@@ -365,9 +365,22 @@ fn fmt_num(v: f64) -> String {
     if v == v.trunc() && v.abs() < 1e15 {
         format!("{}", v as i64)
     } else {
-        // Up to 10 significant decimals, trailing zeros trimmed.
+        // Up to 10 decimals, trailing zeros trimmed.
         let s = format!("{v:.10}");
         let s = s.trim_end_matches('0').trim_end_matches('.');
+        // MAGNITUDE FALLBACK. A fixed 10 decimals renders anything smaller than
+        // 5e-11 as "0.0000000000", which trims to "0" — so `eval_expression`
+        // answered a plain "0" to `1 / 100000000000` (1e-11) and to `2 ^ -40`
+        // (9.09e-13), with no error and no hedge, because its only output guard is
+        // `is_finite()`. A non-zero quantity reported as zero is worse than
+        // refusing: the model relays it as the computed result. fmt_num is shared by
+        // eval_expression, percentage, stats_summary, quadratic and round_number, so
+        // every one of them collapsed a small result. Fall back to scientific
+        // notation, which preserves the magnitude honestly. (Exact zero still takes
+        // the integral branch above and prints "0".)
+        if v != 0.0 && s.parse::<f64>().is_ok_and(|p| p == 0.0) {
+            return format!("{v:e}");
+        }
         s.to_string()
     }
 }
@@ -803,7 +816,9 @@ fn quadratic(args: &Value) -> Result<String> {
 
 /// `round_number {value, places?, mode?}` -> `value` rounded to `places` decimals
 /// (default 0) under `mode` (default half_up). Modes: half_up, half_even
-/// (banker's), floor, ceil, trunc. Pure + total; `places` is bounded 0..=15.
+/// (banker's), floor, ceil, trunc. Pure + total; `places` is bounded 0..=15 and the
+/// result is rendered at the REQUESTED precision ([`fmt_places`], not [`fmt_num`]'s
+/// fixed 10 decimals).
 fn round_number(args: &Value) -> Result<String> {
     let value = args
         .get("value")
@@ -819,6 +834,13 @@ fn round_number(args: &Value) -> Result<String> {
     let mode = args.get("mode").and_then(Value::as_str).unwrap_or("half_up");
     let scale = 10f64.powi(places as i32);
     let scaled = value * scale;
+    // `value * scale` can overflow to infinity for a huge value at a high `places`
+    // (1e300 at places=15), and the old code then formatted that as the literal
+    // string "inf". Rounding a number that large to a few decimals is a no-op, so
+    // return the value itself rather than an infinity that was never the answer.
+    if !scaled.is_finite() {
+        return Ok(fmt_places(value, places as usize));
+    }
     let rounded = match mode {
         "half_up" => {
             // Round half away from zero (the common "round 2.5 -> 3" rule).
@@ -834,7 +856,33 @@ fn round_number(args: &Value) -> Result<String> {
             ))
         }
     };
-    Ok(fmt_num(rounded / scale))
+    Ok(fmt_places(rounded / scale, places as usize))
+}
+
+/// Render `v` at exactly `places` decimals, trailing zeros trimmed (an integral
+/// result prints without a decimal point at all).
+///
+/// WHAT WENT WRONG WITHOUT THIS: `round_number` validated and documented
+/// `places` as 0..=15, computed the rounded value CORRECTLY at every one of them,
+/// and then rendered it through [`fmt_num`], which hard-codes `{:.10}`. So a
+/// `places=12` request came back with 10 decimals — "round pi to 12 places"
+/// answered 3.1415926536, and 1/3 at 15 places answered 0.3333333333 — silently
+/// over-rounded, with no signal that anything was dropped, from the one skill whose
+/// entire reason to exist is "when the rounding rule matters".
+fn fmt_places(v: f64, places: usize) -> String {
+    if !v.is_finite() {
+        return fmt_num(v);
+    }
+    let s = format!("{v:.places$}");
+    if s.contains('.') {
+        let t = s.trim_end_matches('0').trim_end_matches('.');
+        // "-0" / "0" normalize to "0" like the integral branch of fmt_num.
+        if t == "-0" || t.is_empty() {
+            return "0".to_string();
+        }
+        return t.to_string();
+    }
+    s
 }
 
 /// Round-half-to-even (banker's rounding) on an already-scaled value. Pure.
@@ -1238,6 +1286,63 @@ mod tests {
         assert_eq!(round_number(&json!({"value": 2.1, "mode": "ceil"})).unwrap(), "3");
         assert_eq!(round_number(&json!({"value": 2.99, "mode": "trunc"})).unwrap(), "2");
         assert_eq!(round_number(&json!({"value": -2.5})).unwrap(), "-3"); // half away from zero
+    }
+
+    /// REGRESSION: `places` ABOVE 10 returns the requested precision.
+    ///
+    /// The arithmetic was always right; the result was then rendered through
+    /// `fmt_num`'s hard-coded `{:.10}`, so "round pi to 12 places" answered
+    /// 3.1415926536 and 1/3 at 15 places answered 0.3333333333 — silently
+    /// over-rounded, with the argument accepted and nothing signalling the loss.
+    /// The old `rounding_modes` only ever used places 0 and 2.
+    #[test]
+    fn rounding_honours_places_above_ten() {
+        assert_eq!(
+            round_number(&json!({"value": std::f64::consts::PI, "places": 12})).unwrap(),
+            "3.14159265359",
+            "pi to 12 places (trailing zero trimmed), not 10"
+        );
+        assert_eq!(
+            round_number(&json!({"value": 2.0 / 3.0, "places": 12})).unwrap(),
+            "0.666666666667"
+        );
+        assert_eq!(
+            round_number(&json!({"value": 1.0 / 3.0, "places": 15})).unwrap(),
+            "0.333333333333333"
+        );
+        assert_eq!(
+            round_number(&json!({"value": 0.5, "places": 11})).unwrap(),
+            "0.5",
+            "trailing zeros are still trimmed"
+        );
+        // A huge value at a high `places` overflows value*scale to infinity; the
+        // answer is the value, never the literal string "inf".
+        let big = round_number(&json!({"value": 1e300, "places": 15})).unwrap();
+        assert!(!big.contains("inf"), "an overflowing scale must not answer inf: {big}");
+    }
+
+    /// REGRESSION: a small non-zero result is not reported as exactly "0".
+    ///
+    /// `fmt_num` formatted with a fixed 10 decimals and trimmed, so anything below
+    /// 5e-11 became "0.0000000000" -> "0". `eval_expression`'s only output guard is
+    /// `is_finite()`, so `1 / 100000000000` came back as a confident plain "0" —
+    /// a wrong answer the model relays as the computed result.
+    #[test]
+    fn a_small_nonzero_result_is_never_reported_as_zero() {
+        for expr in [
+            "1 / 100000000000",
+            "2 ^ -40",
+            "1 / 3000000000000",
+            "0.00000000001 + 0",
+        ] {
+            let out = eval_expression(&json!({ "expr": expr })).unwrap();
+            assert_ne!(out, "0", "{expr} is not zero, but was reported as {out:?}");
+            let parsed: f64 = out.parse().unwrap_or_else(|_| panic!("unparseable answer {out:?}"));
+            assert!(parsed != 0.0, "{expr} -> {out:?} still parses back to zero");
+        }
+        // Exact zero is still plain "0" (no scientific notation for a real zero).
+        assert_eq!(eval_expression(&json!({"expr": "1 - 1"})).unwrap(), "0");
+        assert_eq!(eval_expression(&json!({"expr": "0 * 5"})).unwrap(), "0");
     }
 
     #[test]

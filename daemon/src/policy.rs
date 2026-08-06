@@ -201,8 +201,15 @@ pub struct PolicyRule {
 
 /// Max rules the store will hold/persist (bounded retention). A user editing
 /// policies by hand will never approach this; the cap only stops a corrupted or
-/// hostile file from growing unbounded. When a load exceeds it, the excess is
-/// dropped (oldest first) with a warning.
+/// hostile file from growing unbounded.
+///
+/// When a load exceeds it, the excess is dropped IN STORED (KEY) ORDER, with a
+/// warning naming the dropped count. This doc used to promise "oldest first",
+/// which the loader never did and the file format cannot express: `persist`
+/// writes `self.rules.values()`, i.e. BTreeMap (tool, agent, recipient) order, so
+/// `take(MAX_RULES)` keeps the alphabetically-FIRST 256 and drops the rest —
+/// which can include `Never` hard blocks. And no `warn!` was emitted at all, only
+/// an unconditional `info!` count, so a user could lose a hard block silently.
 pub const MAX_RULES: usize = 256;
 
 /// The serialized on-disk shape: a versioned list of rules. JSON so it is
@@ -258,6 +265,20 @@ impl PolicyStore {
         match std::fs::read_to_string(path) {
             Ok(raw) => match serde_json::from_str::<PolicyFile>(&raw) {
                 Ok(file) => {
+                    // Truncation is LOSS — of a `Never` hard block, potentially —
+                    // so say so out loud. It used to be silent (only the
+                    // unconditional info! below), while MAX_RULES's doc promised a
+                    // warning.
+                    let total = file.rules.len();
+                    if total > MAX_RULES {
+                        warn!(
+                            total,
+                            kept = MAX_RULES,
+                            dropped = total - MAX_RULES,
+                            "policy: policy file exceeds the rule cap; the excess is dropped in \
+                             stored (key) order — a dropped rule may be a `never` hard block"
+                        );
+                    }
                     let mut loaded = 0usize;
                     for rule in file.rules.into_iter().take(MAX_RULES) {
                         store.rules.insert(rule.scope.key(), rule);
@@ -590,13 +611,52 @@ pub fn classify_policy_command(text: &str) -> Option<PolicyCommand> {
     })
 }
 
+/// What a [`PolicyCommand`] write actually did. Three OUTCOMES, not a bool.
+///
+/// WHAT WENT WRONG: `apply_global` used to return a bare `bool` meaning "was the
+/// store mutated", and `handle_user_policy_text` read `false` as "the layer is
+/// off". Those are different things. A `Clear` for a tool that has no rule
+/// mutates nothing and is a perfectly successful no-op — but the user was told
+/// "the policy layer is off, so nothing changed. Enable [policy] to set
+/// per-action rules", while `[policy].enabled` ships TRUE and the HUD pill
+/// directly above the editor read "EMPTY · ASK EVERYWHERE". Worse, clicking the ✕
+/// on a rule row sends the TOOL-ONLY clear phrase, so clearing a rule stored with
+/// an agent/recipient scope removed nothing, reported the layer as off, and left
+/// the auto-approve rule IN FORCE — the user got no signal at all that the
+/// consequential-gate loosening had survived their click.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PolicyWrite {
+    /// The store was mutated (a rule was set, or a real rule was removed).
+    Applied,
+    /// A `Clear` that matched no rule for that exact scope. NOT a failure: the
+    /// action already asks each time — unless a NARROWER scoped rule is still set,
+    /// which the caller says out loud.
+    NoRuleToClear,
+    /// The layer is disabled, or no global store was ever installed. The ONLY
+    /// case in which "the policy layer is off" is a true statement.
+    LayerOff,
+    /// A `Set` for a NEW tool refused because the store already holds
+    /// [`MAX_RULES`]. Nothing was written.
+    ///
+    /// WHAT WENT WRONG: `PolicyStore::set` refuses silently past the cap and
+    /// returns false without inserting, and `apply_to_store` threw that away and
+    /// reported success unconditionally. With a store at the cap (reachable via a
+    /// hand-edited or imported `state/policy.json`), "never allow the gmail_send
+    /// action" was acked "Set: I'll never run the gmail_send action. A 'never'
+    /// rule wins even with consequential actions enabled and a fresh
+    /// confirmation." — while `evaluate_global` still returned `Ask`. The user
+    /// believed a tool was hard-blocked when it was only parked for a
+    /// confirmation they might well approve.
+    RuleCapReached,
+}
+
 /// Apply a parsed [`PolicyCommand`] to the installed global store. USER-SET ONLY:
 /// the ONLY callers are the command channel's `policy` dispatcher arm and the
-/// post-voice-id router classifier. Refuses (no-op, `false`) when the global was
-/// never installed OR the layer is DISABLED — so a disabled layer can never be
-/// loosened by a write, and a unit-test binary that never installed the global is
-/// untouched. Returns whether the store was mutated. The store persists itself.
-pub fn apply_global(command: PolicyCommand) -> bool {
+/// post-voice-id router classifier. Refuses (no-op, [`PolicyWrite::LayerOff`])
+/// when the global was never installed OR the layer is DISABLED — so a disabled
+/// layer can never be loosened by a write, and a unit-test binary that never
+/// installed the global is untouched. The store persists itself.
+pub fn apply_global(command: PolicyCommand) -> PolicyWrite {
     // `#[cfg(test)]` seam: when a test has forced an (enabled, store) override on
     // this thread, the write lands in THAT store (so the user write path is
     // exercisable without poisoning the set-once GLOBAL other tests depend on).
@@ -612,11 +672,11 @@ pub fn apply_global(command: PolicyCommand) -> bool {
     }
     let Some((enabled, lock)) = GLOBAL.get() else {
         warn!("policy: write ignored — no policy store installed");
-        return false;
+        return PolicyWrite::LayerOff;
     };
     if !*enabled {
         warn!("policy: write ignored — the policy layer is disabled");
-        return false;
+        return PolicyWrite::LayerOff;
     }
     let mut store = lock.write().unwrap_or_else(|p| p.into_inner());
     apply_to_store(true, &mut store, &command)
@@ -624,24 +684,73 @@ pub fn apply_global(command: PolicyCommand) -> bool {
 
 /// Apply one [`PolicyCommand`] to a store, honoring the layer-enabled flag (a
 /// write to a disabled layer is refused so it can never be loosened). Shared by
-/// the production GLOBAL path and the test override seam. Returns whether the
-/// store was mutated.
-fn apply_to_store(enabled: bool, store: &mut PolicyStore, command: &PolicyCommand) -> bool {
+/// the production GLOBAL path and the test override seam. Returns WHICH of the
+/// three [`PolicyWrite`] outcomes happened — a `Clear` that matched nothing is
+/// distinct from a disabled layer, and conflating them is what produced a false
+/// "the policy layer is off" for a user whose layer was on.
+fn apply_to_store(
+    enabled: bool,
+    store: &mut PolicyStore,
+    command: &PolicyCommand,
+) -> PolicyWrite {
     if !enabled {
         warn!("policy: write ignored — the policy layer is disabled");
-        return false;
+        return PolicyWrite::LayerOff;
     }
     match command {
         PolicyCommand::Set { scope, decision } => {
-            store.set(scope.clone(), *decision);
+            // `set` returns whether it REPLACED an existing rule — and it also
+            // returns false when it REFUSED the write past MAX_RULES, so the
+            // return value alone cannot tell success from refusal. The store's
+            // size can: a refused write leaves it unchanged.
+            let before = store.len();
+            let replaced = store.set(scope.clone(), *decision);
+            if !replaced && store.len() == before {
+                warn!(tool = %scope.tool, "policy: rule cap reached; the user's rule was NOT stored");
+                return PolicyWrite::RuleCapReached;
+            }
             info!(tool = %scope.tool, decision = decision.as_str(), "policy: user set a rule");
-            true
+            PolicyWrite::Applied
         }
         PolicyCommand::Clear { scope } => {
             let removed = store.clear(scope);
             info!(tool = %scope.tool, removed, "policy: user cleared a rule");
-            removed
+            if removed {
+                PolicyWrite::Applied
+            } else {
+                PolicyWrite::NoRuleToClear
+            }
         }
+    }
+}
+
+/// How many rules the installed global store holds for `tool`, at ANY scope
+/// (tool-only, agent-scoped, recipient-scoped). Used ONLY to make the "nothing to
+/// clear" acknowledgement honest: the HUD's ✕ button and the spoken "always ask
+/// before the <tool> action" phrase both send a TOOL-ONLY clear, which does not
+/// remove a narrower agent/recipient-scoped rule — so the user must be told the
+/// loosening is still in force rather than being told the layer is off.
+fn global_rules_for_tool(tool: &str) -> usize {
+    #[cfg(test)]
+    {
+        if let Some(n) = POLICY_OVERRIDE.with(|c| {
+            c.borrow().as_ref().map(|(enabled, store)| {
+                if *enabled {
+                    store.rules().iter().filter(|r| r.scope.tool == tool).count()
+                } else {
+                    0
+                }
+            })
+        }) {
+            return n;
+        }
+    }
+    match GLOBAL.get() {
+        Some((true, lock)) => {
+            let store = lock.read().unwrap_or_else(|p| p.into_inner());
+            store.rules().iter().filter(|r| r.scope.tool == tool).count()
+        }
+        _ => 0,
     }
 }
 
@@ -691,17 +800,47 @@ pub fn handle_user_policy_text(text: &str) -> Option<String> {
             scope.tool
         ),
     };
-    let applied = apply_global(command);
-    if !applied {
+    // Keep the tool name for the honest no-rule line before the command moves.
+    let tool = match &command {
+        PolicyCommand::Set { scope, .. } | PolicyCommand::Clear { scope } => scope.tool.clone(),
+    };
+    match apply_global(command) {
+        PolicyWrite::Applied => Some(ack),
         // The classifier matched but the layer is off / not installed — be honest
-        // rather than reporting a phantom success.
-        return Some(
+        // rather than reporting a phantom success. This line is now reserved for
+        // that ONE case; it used to also be returned for a clear that matched no
+        // rule, telling a user whose layer ships ON to "enable [policy]".
+        PolicyWrite::LayerOff => Some(
             "I understood that as a policy command, but the policy layer is off, so nothing \
              changed. Enable [policy] to set per-action rules."
                 .to_string(),
-        );
+        ),
+        // A clear that removed nothing. Successful and harmless when there was no
+        // rule at all — but NOT harmless when a narrower agent/recipient-scoped
+        // rule is still set, because a tool-only clear (what both the HUD ✕ and
+        // the spoken phrase send) does not touch it. Say which one it is.
+        // The cap refused the write. Never report a hard block that is not in force.
+        PolicyWrite::RuleCapReached => Some(format!(
+            "I couldn't store that rule, sir — the policy store is already at its \
+             {MAX_RULES}-rule cap, so nothing changed and the {tool} action still asks each \
+             time. Clear a rule you no longer need and say it again."
+        )),
+        PolicyWrite::NoRuleToClear => {
+            if global_rules_for_tool(&tool) > 0 {
+                Some(format!(
+                    "I didn't clear anything, sir — the rule on the {tool} action is scoped \
+                     more narrowly (to a specific agent or recipient), and that scoped rule is \
+                     STILL in force. Clear that exact rule from the policy editor, or name the \
+                     same scope."
+                ))
+            } else {
+                Some(format!(
+                    "There was no rule for the {tool} action, sir — it already asks for a \
+                     spoken confirmation each time. Nothing changed."
+                ))
+            }
+        }
     }
-    Some(ack)
 }
 
 /// `#[cfg(test)]`-only RAII guard that forces [`evaluate_global`] to read a given
@@ -1018,21 +1157,33 @@ mod tests {
     // -- USER-SET ONLY: the tool loop cannot write a policy -------------------
 
     /// The model-driven chokepoints hold `&PolicyStore` and call ONLY `evaluate`.
-    /// This compile-time/contract test pins that an `&PolicyStore` (what the tool
-    /// loop holds) exposes NO way to mutate: `set`/`clear`/`clear_all` all take
-    /// `&mut self`, so a read-only borrow — which is all the tool loop ever gets —
-    /// cannot reach them. There is no policy-write TOOL, so an injected
-    /// "set policy allow X" has nothing to call.
+    /// This test pins — at COMPILE TIME, via fn-pointer coercions — that
+    /// `set`/`clear`/`clear_all` all take `&mut self`, so a read-only borrow (all
+    /// the tool loop ever gets) cannot reach them. There is no policy-write TOOL,
+    /// so an injected "set policy allow X" has nothing to call.
     #[test]
     fn no_model_path_can_write_a_policy() {
+        // WHAT THIS USED TO BE: three lines that called `evaluate`/`rules` on a
+        // shared ref and asserted the stored decision came back, with a comment
+        // claiming the invariant was "asserted by the fact this compiles while a
+        // `read_only.set(...)` line would NOT". Nothing in the test exercised
+        // that. Moving the rules behind interior mutability — making `set` take
+        // `&self` — would have left it green while opening a `&PolicyStore` write
+        // path, and the module doc leans on this test by name.
+        //
+        // THE REAL PIN, and it is a COMPILE-TIME one: these coercions only typecheck
+        // while every mutator takes `&mut self`. Change any of them to `&self` and
+        // this line fails to compile, which fails the build — no runtime assertion
+        // can do that, and no extra dev-dependency is needed for it.
+        let _set: fn(&mut PolicyStore, PolicyScope, Decision) -> bool = PolicyStore::set;
+        let _clear: fn(&mut PolicyStore, &PolicyScope) -> bool = PolicyStore::clear;
+        let _clear_all: fn(&mut PolicyStore) = PolicyStore::clear_all;
+
+        // …and the read-only surface a chokepoint actually holds still answers
+        // with the user's stored decision.
         let s = store_with(&[(PolicyScope::tool("gmail_send"), Decision::Always)]);
         let read_only: &PolicyStore = &s; // exactly what a chokepoint holds
-        // Only evaluate/rules/len/is_empty are callable on a shared ref. The
-        // mutators require &mut, unreachable from here — asserted by the fact this
-        // compiles while a `read_only.set(...)` line would NOT (it needs &mut).
-        let _ = read_only.evaluate("gmail_send", "agent.pepper", "");
         let _ = read_only.rules();
-        // Confirm the decision the user set is honored read-only.
         assert_eq!(read_only.evaluate("gmail_send", "agent.pepper", ""), Decision::Always);
     }
 
@@ -1197,6 +1348,113 @@ mod tests {
         assert!(ack2.to_lowercase().contains("ask"), "honest CLEAR ack: {ack2}");
         // Back to ASK.
         assert_eq!(evaluate_global("gmail_send", "agent.pepper", ""), Decision::Ask);
+    }
+
+    /// Clearing a rule that is not set must NOT claim the policy layer is off.
+    ///
+    /// WHAT WENT WRONG: `apply_global` returned a bare bool meaning "the store was
+    /// mutated", and `handle_user_policy_text` read `false` as "the layer is off /
+    /// not installed". A `Clear` for a tool with no rule mutates nothing, so a
+    /// user whose layer was ON — `[policy].enabled` ships TRUE, and the HUD pill
+    /// directly above the editor reads "EMPTY · ASK EVERYWHERE" — was told "the
+    /// policy layer is off, so nothing changed. Enable [policy] to set per-action
+    /// rules." A false cause, plus an instruction to enable something already
+    /// enabled.
+    #[test]
+    fn clearing_an_unset_rule_does_not_claim_the_layer_is_off() {
+        let _g = PolicyOverride::force(true, PolicyStore::empty());
+        // PRECONDITION: the layer really is ON with no rule for this tool.
+        assert_eq!(evaluate_global("gmail_send", "agent.pepper", ""), Decision::Ask);
+
+        let ack = handle_user_policy_text("always ask before the gmail_send action")
+            .expect("a real policy phrase is recognized");
+        assert!(
+            !ack.to_lowercase().contains("policy layer is off"),
+            "the layer is ON — the ack must not blame it: {ack}"
+        );
+        assert!(
+            !ack.to_lowercase().contains("enable [policy]"),
+            "must not tell the user to enable an already-enabled layer: {ack}"
+        );
+        assert!(
+            ack.contains("no rule for the gmail_send action"),
+            "the ack must name the real outcome: {ack}"
+        );
+    }
+
+    /// The WORSE half: the HUD's ✕ and the spoken phrase both send a TOOL-ONLY
+    /// clear, which does not remove a narrower agent/recipient-scoped rule. The
+    /// auto-approve therefore SURVIVES the click — and the old message blamed the
+    /// policy layer, so the user had no signal that the consequential-gate
+    /// loosening was still in force.
+    #[test]
+    fn a_tool_only_clear_that_misses_a_scoped_rule_says_the_rule_still_stands() {
+        let scoped = PolicyScope {
+            tool: "slack_post_message".to_string(),
+            agent: None,
+            recipient: Some("#ops".to_string()),
+        };
+        let _g = PolicyOverride::force(true, store_with(&[(scoped, Decision::Always)]));
+        // PRECONDITION: the scoped Always really is in force.
+        assert_eq!(
+            evaluate_global("slack_post_message", "agent.pepper", "#ops"),
+            Decision::Always
+        );
+
+        let ack = handle_user_policy_text("always ask before the slack_post_message action")
+            .expect("a real policy phrase is recognized");
+        assert!(
+            !ack.to_lowercase().contains("policy layer is off"),
+            "the layer is ON — the ack must not blame it: {ack}"
+        );
+        assert!(
+            ack.contains("STILL in force"),
+            "the surviving scoped rule must be surfaced: {ack}"
+        );
+        // …and it really did survive, which is why the message matters.
+        assert_eq!(
+            evaluate_global("slack_post_message", "agent.pepper", "#ops"),
+            Decision::Always,
+            "a tool-only clear does not remove a recipient-scoped rule"
+        );
+    }
+
+    /// A Set the rule cap REFUSED must never be acked as a success.
+    ///
+    /// WHAT WENT WRONG: `PolicyStore::set` refuses silently past MAX_RULES and
+    /// returns false without inserting, and `apply_to_store` threw that away and
+    /// always returned "applied". With a store at the cap (reachable through a
+    /// hand-edited or imported `state/policy.json`), "never allow the gmail_send
+    /// action" was acked "Set: I'll never run the gmail_send action. A 'never'
+    /// rule wins…" while `evaluate_global` still returned `Ask` — the user
+    /// believed a tool was hard-blocked when it was only parked for a
+    /// confirmation they might well approve.
+    #[test]
+    fn a_set_refused_by_the_rule_cap_is_not_acked_as_success() {
+        let mut store = PolicyStore::empty();
+        for i in 0..MAX_RULES {
+            store.set(PolicyScope::tool(format!("filler_tool_{i}")), Decision::Ask);
+        }
+        // PRECONDITION: the store really is at the cap.
+        assert_eq!(store.len(), MAX_RULES);
+        let _g = PolicyOverride::force(true, store);
+
+        let ack = handle_user_policy_text("never allow the gmail_send action")
+            .expect("a real policy phrase is recognized");
+        assert!(
+            !ack.starts_with("Set:"),
+            "a refused write must not be acked as a set: {ack}"
+        );
+        assert!(
+            ack.contains(&MAX_RULES.to_string()),
+            "the ack must name the cap that refused it: {ack}"
+        );
+        // …and the block really is NOT in force, which is the whole point.
+        assert_eq!(
+            evaluate_global("gmail_send", "agent.pepper", ""),
+            Decision::Ask,
+            "nothing was stored, so the tool still asks"
+        );
     }
 
     /// A `never` phrase installs a hard block that wins.

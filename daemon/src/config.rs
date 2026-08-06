@@ -532,9 +532,11 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
         ],
     ),
     // [inference] — server-side runtime knobs. `preload` is the existing
-    // contract key. SPECULATIVE DECODING (#37): `speculative` SHIPS ON (full-power
-    // default) — INERT WITHOUT a loadable `draft_model` (ships ""), in which case
-    // generate falls back to normal gen + reports speculative=false. SELECTABLE
+    // contract key. SPECULATIVE DECODING (#37): `speculative` SHIPS OFF on our own
+    // measurement (a 27% decode loss where it runs, unreachable on the KV-cached
+    // path), and `draft_model` ships "" — so NEITHER half is armed by default. With
+    // it turned on but no loadable draft, generate falls back to normal gen +
+    // reports speculative=false. SELECTABLE
     // QUANTIZATION (#39): `quant` ships "auto" (== today's behavior; validated against
     // InferenceConfig::ALLOWED_QUANT, an unknown value falls back to "auto"). op=embed
     // BACKEND: `embedder` ships "coreml-bge-small-en-v1.5" (the Core ML bge sentence
@@ -1456,10 +1458,11 @@ impl Default for CloudConfig {
 /// passes `voice`, maps opener WAV indices back to `openers` text, and paces
 /// clips with `sentence_pause_ms`; `engine` and `speed` are consumed
 /// server-side but are mirrored here so the Default impl stays in lockstep
-/// with darwin.toml. `instant_opener` (SHIPS ON, full-power default) gates the
-/// canned instant acknowledgment: a task-ack WAV plays the instant an utterance
-/// ends while STT runs concurrently. Pure UX, no safety surface (set false for
-/// warmer, varied greetings instead).
+/// with darwin.toml. `instant_opener` (SHIPS OFF — owner preference) gates the
+/// canned instant acknowledgment: with it TRUE a task-ack WAV plays the instant an
+/// utterance ends while STT runs concurrently. Pure UX, no safety surface; it ships
+/// off so the persona greets/answers naturally from its first word (set true to
+/// bring the instant ack back).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct SpeechConfig {
@@ -1485,8 +1488,10 @@ pub struct SpeechConfig {
     /// transcription (never serialized in front of STT); first_audio_ms
     /// includes it naturally. Only consulted when `instant_opener` is true.
     pub opener_delay_ms: u64,
-    /// Master gate for the instant acknowledgment. SHIPS ON (full-power
-    /// default): ReplySession::begin breathes `opener_delay_ms`, plays one
+    /// Master gate for the instant acknowledgment. SHIPS OFF (owner preference;
+    /// config/darwin.toml pins `instant_opener = false` and
+    /// `instant_opener_defaults_off_and_is_a_known_key` asserts it). When TRUE:
+    /// ReplySession::begin breathes `opener_delay_ms`, plays one
     /// `openers` clip the instant an utterance ends (STT runs concurrently),
     /// and passes opener_spoken to converse so the model continues from it.
     /// Pure UX feature, no safety surface. When false the converse stream IS
@@ -1514,12 +1519,6 @@ impl Default for SpeechConfig {
             .to_vec(),
             sentence_pause_ms: 250,
             opener_delay_ms: 300,
-            // SHIPS ON (full-power default). Pure UX feature: plays a task-ack WAV
-            // the instant an utterance ends while STT runs concurrently — no safety
-            // surface. (Owner tradeoff: some prefer it OFF for warmer, varied
-            // greetings instead of a canned acknowledgment; set false to restore
-            // that. All the opener machinery stays intact either way.)
-            //
             // SHIPS OFF (owner preference): the canned "Right away, sir." ack is off
             // by default so the persona greets/answers naturally from its first word
             // (no robotic fixed opener). Set true to bring the instant ack back.
@@ -1595,8 +1594,10 @@ pub struct VoiceConfig {
     /// #34 WHISPER / DISCREET MODE (prosody.rs). SHIPS ON (full-power default). An
     /// EXPLICIT command ("whisper mode" / "speak quietly" / "back to normal") toggles
     /// a terse + SOFT (low-volume) delivery. Whisper changes DELIVERY ONLY — it NEVER
-    /// suppresses a safety confirmation the gate requires (a required confirm still
-    /// speaks, just softly/tersely).
+    /// suppresses a safety confirmation the gate requires, and it does not attenuate
+    /// one either: `prosody::apply_whisper` returns the request UNSHAPED on that
+    /// branch, so a required confirm still speaks at FULL volume and is never
+    /// trimmed (pinned by prosody.rs's own test; inference.rs states the same rule).
     pub whisper: bool,
     /// #34 OPTIONAL auto-engage of whisper mode by SUSTAINED low-amplitude input — a
     /// PURE energy-series heuristic. SHIPS ON (full-power default) and gated
@@ -1794,9 +1795,10 @@ impl Default for WakeConfig {
 /// [interpret] — CONTINUOUS LIVE INTERPRETATION (#30, interpret.rs). When `live` is ON the
 /// DEVICE-GATED mic loop feeds each VAD segment through the PURE interpret_segment pipeline
 /// (transcribe -> on-device-LLM translate -> render/optionally speak); offline/unavailable
-/// degrades HONESTLY (never a fabricated translation). SHIPS ON (full-power default) but
-/// INERT WITHOUT TCC/MIC — without Microphone consent the device-gated loop interprets
-/// nothing.
+/// degrades HONESTLY (never a fabricated translation). `live` SHIPS OFF (see its field doc
+/// below — it shipped ON once and every spoken COMMAND came back as a translation), and it
+/// is INERT WITHOUT TCC/MIC either way — without Microphone consent the device-gated loop
+/// interprets nothing.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct InterpretConfig {
@@ -1910,10 +1912,12 @@ pub struct CaptionsConfig {
 pub struct InferenceConfig {
     #[allow(dead_code)] // shared contract; read by the inference server
     pub preload: bool,
-    /// SPECULATIVE/DRAFT decoding master gate (#37). SHIPS ON (full-power default)
-    /// and the SHIPPED config also carries a real `draft_model`, so a default
-    /// install has BOTH halves armed. Without a loadable draft it degrades to
-    /// normal gen + `speculative=false` reported, never faked. Read by the
+    /// SPECULATIVE/DRAFT decoding master gate (#37). SHIPS OFF, on our own
+    /// MEASUREMENT (see the struct doc above): a 27% decode LOSS where it runs, and
+    /// unreachable entirely on the KV-cached path DARWIN generates on. The SHIPPED
+    /// config also carries an EMPTY `draft_model`, so a default install has NEITHER
+    /// half armed. Without a loadable draft it degrades to normal gen +
+    /// `speculative=false` reported, never faked. Read by the
     /// inference server's generate path AND by the daemon's
     /// `should_use_speculative` decision / HUD telemetry. The actual speedup is
     /// device/model-gated, never claimed headlessly.
@@ -1979,11 +1983,15 @@ impl Default for InferenceConfig {
             // (baseline_m1_pro.json, results.speculative). An unloadable draft still
             // degrades to normal gen and HONESTLY reports speculative=false.
             speculative: false,
-            // EMPTY here only because this key is a PASSTHROUGH the daemon never
-            // reads — the PYTHON server owns the real default (server.py
-            // DEFAULT_DRAFT = "mlx-community/Qwen3-0.6B-4bit", the id the installer
-            // pre-downloads and config/darwin.toml ships). NOT evidence that
-            // speculative decoding ships inert.
+            // EMPTY, and that IS the whole story: speculative decoding measured as a
+            // LOSS and is unreachable on the KV-cached generate path, so
+            // config/darwin.toml ships `draft_model = ""` too and install.sh
+            // DELIBERATELY no longer pre-downloads the checkpoint (install.sh:
+            // "the #37 speculative-decoding DRAFT model is deliberately NOT
+            // pre-downloaded any more"). server.py's DEFAULT_DRAFT
+            // ("mlx-community/Qwen3-0.6B-4bit") is only the canonical id for someone
+            // re-enabling by hand — they must set both keys AND fetch it themselves.
+            // The key stays a PASSTHROUGH the daemon never reads.
             draft_model: String::new(),
             // "auto" == today's behavior (load the model as configured); an
             // explicit quant is opt-in and device-gated.
@@ -3672,9 +3680,13 @@ impl Default for ThresholdConfig {
 /// from a goal. The SAME gated-codegen contract as [self_heal], generalized
 /// from "patch the daemon" to "author an app":
 ///
-///   - `enabled` (ships false): master gate. With it false the forge does
-///     NOTHING — no cloud draft, no staging, no proposal — exactly like
-///     self_heal/allow_consequential.
+///   - `enabled` (SHIPS ON, full-power default) — INERT WITHOUT A CLOUD KEY:
+///     the master gate. `forge_draft` needs the cloud key and emits
+///     `forge.blocked{reason:"no_api_key"}` without one, so a default install is
+///     ARMED but idle. With it false the forge does NOTHING — no cloud draft, no
+///     staging, no proposal. (Sibling gates `self_heal.enabled` and
+///     `integrations.allow_consequential` also ship ON, so "like them" no longer
+///     means "off"; the Default impl below and config/darwin.toml are the truth.)
 ///   - `mode` ("propose" default; "auto" requires enabled = true): controls
 ///     what happens to the forge's OWN staged artifact. CRUCIAL DIFFERENCE
 ///     from self_heal: there is NO auto-DEPLOY path. Even in "auto" the forge
@@ -5061,6 +5073,29 @@ impl Config {
             issues.push(issue);
             cfg.inference.quant = "auto".to_string();
         }
+        // [docsearch].roots value validation. An entry that is RELATIVE or carries a
+        // `..` component is a misconfiguration the operator cannot see otherwise:
+        // `canonical_roots` resolves a relative root against the DAEMON'S WORKING
+        // DIRECTORY (the install root, per the launchd plists' `WorkingDirectory`),
+        // so `roots = ["."]` or `roots = ["config"]` silently allowlists DARWIN's own
+        // install tree and indexes/cites its .toml/.json/.log/.sh files, and a
+        // `..` widens the allowlist to a parent directory. `docsearch::root_is_safe`
+        // was written for exactly this warning and had NO caller at all — its
+        // `#[allow(dead_code)]` said "surfaced by the HUD/config validation path",
+        // which did not exist. This is that path. REPORT ONLY: the root is left
+        // as configured (canonicalize-based confinement still applies), so no
+        // existing install changes behavior — the operator just gets told.
+        for root in &cfg.docsearch.roots {
+            if !crate::docsearch::root_is_safe(root) {
+                let issue = format!(
+                    "docsearch.roots entry {root:?} is not an absolute path without `..`; \
+                     it resolves against the daemon's working directory, which widens the \
+                     indexed surface beyond what you named"
+                );
+                warn!("{issue}");
+                issues.push(issue);
+            }
+        }
         (cfg, issues)
     }
 }
@@ -5129,6 +5164,36 @@ mod tests {
         assert_eq!(cfg.audio.rms_threshold, 0.015, "typo'd key never applies");
         assert!(issues.iter().any(|i| i.contains("audio.rms_treshold")), "{issues:?}");
         assert!(issues.iter().any(|i| i.contains("[telemtry]")), "{issues:?}");
+    }
+
+    /// REGRESSION: an unsafe `[docsearch].roots` entry is REPORTED.
+    ///
+    /// `docsearch::root_is_safe` existed, was unit-tested, and had NO caller — its
+    /// `#[allow(dead_code)]` claimed "surfaced by the HUD/config validation path",
+    /// which did not exist. So a relative or `..`-bearing root produced no warning
+    /// and `canonicalize` silently resolved it against the daemon's working
+    /// directory (the install root per the launchd plists): `roots = ["."]` quietly
+    /// allowlisted DARWIN's own install tree.
+    #[test]
+    fn an_unsafe_docsearch_root_is_reported_as_a_config_issue() {
+        let raw = r#"
+            [docsearch]
+            roots = ["/Users/me/Documents", "config", "/Users/me/Documents/../.."]
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        assert_eq!(cfg.docsearch.roots.len(), 3, "the roots are kept as configured");
+        assert!(
+            issues.iter().any(|i| i.contains("\"config\"")),
+            "a RELATIVE root must be reported: {issues:?}"
+        );
+        assert!(
+            issues.iter().any(|i| i.contains("..")),
+            "a `..`-bearing root must be reported: {issues:?}"
+        );
+        assert!(
+            !issues.iter().any(|i| i.contains("/Users/me/Documents\"")),
+            "a safe absolute root must NOT be reported: {issues:?}"
+        );
     }
 
     #[test]
@@ -5470,9 +5535,21 @@ mod tests {
         assert_eq!(cfg.proactive.quiet_end, 6);
     }
 
-    /// Lockstep with the SHIPPED file: config/darwin.toml must parse with
-    /// zero diagnostics and carry exactly the contract defaults the structs
-    /// fall back to — if either side drifts, this fails.
+    /// The SHIPPED file parses with zero diagnostics, and the NAMED contract fields
+    /// below match their compiled defaults.
+    ///
+    /// SCOPE (honest): this is NOT a whole-file lockstep. `Config` is
+    /// Deserialize-only, so there is no cheap whole-struct comparison (the sibling
+    /// `shipped_aperture_config_matches_the_compiled_default` states the same and is
+    /// the per-section pattern to copy). Only the ~16 fields hand-checked here are
+    /// compared; drift in any other shipped key does NOT fail this test. Three
+    /// DELIBERATE installer-bundled overrides already differ today — [vision].model,
+    /// [vision].ocr_model and [image].model name a checkpoint while the compiled
+    /// defaults are empty (documented at their Default impls) — which is exactly why
+    /// the old "if either side drifts, this fails" wording was wrong. A new key whose
+    /// shipped value must match its default needs its OWN pin here or in a
+    /// per-section test; that is how the [aperture] poll_interval_secs 5-vs-20 drift
+    /// (a 4x change to a privacy-sensitive sampling cadence) was finally caught.
     #[test]
     fn shipped_config_file_parses_cleanly_and_matches_defaults() {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

@@ -140,8 +140,28 @@ pub fn clean_code_diff(raw: &str) -> Option<String> {
     let mut started = false;
     for line in raw.lines() {
         let trimmed = line.trim_end();
-        if trimmed.trim_start().starts_with("```") {
-            continue; // fence open/close
+        // WHAT WENT WRONG: this stripped ANY line that started with ``` after a
+        // `trim_start()` — and `trim_start()` eats the unified-diff CONTEXT
+        // marker, which is a single leading space. So a context line whose
+        // content is a code fence was deleted along with the model's own wrapper.
+        // A correct, applyable diff over any fenced file (README.md, docs/*.md,
+        // any source with ``` in a docstring) came back with lines missing: the
+        // stored patch.diff's body no longer matched its own `@@ -1,6 +1,6 @@`
+        // header, and `/usr/bin/patch --dry-run` in scripts/apply_code_diff.sh
+        // refused it with "1 out of 1 hunks failed" -> "patch does not apply
+        // cleanly to the codebase ... codebase NOT modified". The capability
+        // simply could not propose a change to a markdown file, with no
+        // diagnostic pointing at the cause. (`-```/`+``` ` survived because `-`
+        // and `+` are not whitespace — only context lines were eaten, which is
+        // precisely what broke the counts.)
+        //
+        // Once the diff body has STARTED, a line beginning with the unified-diff
+        // markers ` `/`+`/`-`/`@`/`\` is DIFF CONTENT whatever its text. Only a
+        // fence at column 0 is the model's wrapper.
+        let is_diff_body_line = started
+            && matches!(line.chars().next(), Some(' ') | Some('+') | Some('-') | Some('@') | Some('\\'));
+        if !is_diff_body_line && trimmed.trim_start().starts_with("```") {
+            continue; // fence open/close (the model's wrapper, never diff content)
         }
         if !started {
             if trimmed.starts_with("--- ")
@@ -540,12 +560,25 @@ mod tests {
     // =====================================================================
 
     #[tokio::test]
-    async fn explain_and_propose_are_off_by_default_and_need_a_root() {
+    async fn explain_and_propose_are_inert_when_off_or_without_a_root() {
+        // WHAT WENT WRONG: this test was named "..._are_off_by_default_..." and its
+        // comment below called `enabled: false` "the shipped default". It is not —
+        // `CodeConfig::default()` sets `enabled: true` ("SHIPS ON (full-power
+        // default) — INERT WITHOUT ROOTS"), and this file's own module doc says so
+        // at line 6. A maintainer reading the test name concluded the
+        // code-intelligence tools ship disabled; they ship enabled and are inert
+        // only until a root is allowlisted. Pinned rather than restated:
+        assert!(
+            crate::config::CodeConfig::default().enabled,
+            "[code].enabled SHIPS ON (inert without roots) — this test exercises the \
+             EXPLICIT-off path, not a default"
+        );
         let t = TempTree::new("gate");
         t.write("src/config.rs", "fn parse_config() {}");
         let idx = indexed(&t, "src", &DownEmbedder).await;
 
-        // OFF (the shipped default) with a real root + real index -> Disabled.
+        // Explicitly OFF (the shipped default is ON) with a real root + real
+        // index -> Disabled.
         let off = CodeConfig { enabled: false, roots: roots_of(&t, "src"), ..CodeConfig::default() };
         assert_eq!(
             code_explain(&off, &idx, &DownEmbedder, &scripted(), "where is config parsed").await,
@@ -767,6 +800,70 @@ mod tests {
         assert!(clean_code_diff(ok).is_some(), "a confined a/src diff survives");
         let newf = "--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1,1 @@\n+hello\n";
         assert!(clean_code_diff(newf).is_some(), "a confined /dev/null new-file diff survives");
+    }
+
+    #[test]
+    fn a_hunk_containing_a_code_fence_survives_cleaning_intact() {
+        // WHAT WENT WRONG: the fence strip ran `trim_start()` first, which eats
+        // the unified-diff CONTEXT marker (a single leading space) — so a context
+        // line whose content is ``` was deleted along with the model's own
+        // wrapper. The stored patch.diff's body then no longer matched its `@@`
+        // header, and /usr/bin/patch refused it ("1 out of 1 hunks failed"), so
+        // code_propose_diff could not touch any fenced file (README.md, docs/*,
+        // any source with ``` in a docstring) and the user was told the patch
+        // "does not apply cleanly to the codebase".
+        let raw = "Here you go:\n```diff\n\
+                   --- a/README.md\n\
+                   +++ b/README.md\n\
+                   @@ -1,6 +1,6 @@\n\
+                   \x20# Title\n\
+                   \x20\n\
+                   \x20```bash\n\
+                   -cargo buidl\n\
+                   +cargo build\n\
+                   \x20```\n\
+                   \x20done\n\
+                   ```\nHope that helps.";
+        let cleaned = clean_code_diff(raw).expect("a real diff must survive");
+
+        // The wrapper fences are gone; the prose is gone.
+        assert!(cleaned.starts_with("--- a/README.md"), "wrapper/prose stripped: {cleaned}");
+        assert!(!cleaned.contains("Here you go"), "leading prose stripped: {cleaned}");
+        assert!(!cleaned.contains("```diff"), "the opening wrapper fence is stripped: {cleaned}");
+        // (Trailing prose after the closing fence is retained, unchanged from
+        // before — `patch` ignores trailing garbage and that is not this finding.)
+
+        // The two CONTEXT lines that happen to be code fences survived.
+        let body: Vec<&str> = cleaned.lines().collect();
+        assert_eq!(
+            body.iter().filter(|l| **l == " ```bash").count(),
+            1,
+            "the opening in-hunk fence is diff content, not a wrapper: {cleaned}"
+        );
+        assert_eq!(
+            body.iter().filter(|l| **l == " ```").count(),
+            1,
+            "the closing in-hunk fence is diff content, not a wrapper: {cleaned}"
+        );
+
+        // THE THING THAT ACTUALLY BROKE: the hunk body must still match its own
+        // `@@ -1,6 +1,6 @@` header, or /usr/bin/patch rejects the whole file.
+        let hdr = body.iter().find(|l| l.starts_with("@@")).expect("a hunk header");
+        assert_eq!(*hdr, "@@ -1,6 +1,6 @@");
+        let after_hdr = body
+            .iter()
+            .skip_while(|l| !l.starts_with("@@"))
+            .skip(1)
+            .collect::<Vec<_>>();
+        let old = after_hdr
+            .iter()
+            .filter(|l| l.starts_with(' ') || l.starts_with('-'))
+            .count();
+        let new = after_hdr
+            .iter()
+            .filter(|l| l.starts_with(' ') || l.starts_with('+'))
+            .count();
+        assert_eq!((old, new), (6, 6), "hunk counts must match the header: {cleaned}");
     }
 
     #[test]

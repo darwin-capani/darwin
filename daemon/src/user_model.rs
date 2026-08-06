@@ -388,13 +388,32 @@ fn query_terms(about: &str) -> Vec<String> {
 
 // -- WRITE path (correct / forget) -------------------------------------------
 
+/// The provenance id stamped on an entry the USER stated, rather than one the
+/// consolidation pass derived. Also the marker [`consolidate`] consults so a
+/// reflection pass never overwrites a stated correction.
+pub const CORRECTION_PROVENANCE: &str = "user:correction";
+
 /// CORRECT one entry: OVERRIDE its observation (when `new_observation` is
 /// non-empty) or DELETE it (when empty). The correctable contract — the user can
 /// fix or remove anything DARWIN believes about them. An override keeps the
 /// entry's slug + facet but REPLACES the observation, RESETS the observed-count
-/// to 1, and stamps the provenance as a user correction (`user:correction`) so
-/// the profile honestly records that this entry is now a stated correction, not a
-/// consolidated observation. Returns whether a row was changed/removed.
+/// to 1, and stamps the provenance as a user correction
+/// ([`CORRECTION_PROVENANCE`]) so the profile honestly records that this entry is
+/// now a stated correction, not a consolidated observation. Returns whether a row
+/// was changed/removed.
+///
+/// A correction STICKS, in both forms, because the source signal it corrects
+/// (a stored `user.<facet>.*` fact, or episodes still inside the recall window) is
+/// NOT removed and would otherwise be re-mined within one reflection cycle:
+///   * OVERRIDE — the `user:correction` stamp is the marker [`consolidate`]'s
+///     apply loop refuses to write over.
+///   * DELETE — writes the SAME suppression tombstone [`contest_belief`] writes,
+///     so the consolidation pass's mirror consult drops the re-derived entry
+///     before it can be re-created. Without it the deleted entry simply came back
+///     on the next pass.
+///
+/// The user lifts either by re-correcting, by [`clear_suppression`], or by
+/// [`forget`].
 pub async fn correct(
     memory: &Memory,
     facet: Facet,
@@ -406,11 +425,18 @@ pub async fn correct(
     let key = entry_key(facet, &slug);
     let trimmed = new_observation.trim();
     if trimmed.is_empty() {
-        // Delete = forget this one entry.
-        return memory.delete_fact(&key).await;
+        // Delete = forget this one entry, AND suppress its re-derivation.
+        let removed = memory.delete_fact(&key).await?;
+        let tomb_key = suppressed_key(facet, &slug);
+        if is_model_key(&tomb_key) {
+            memory
+                .upsert_user_fact(&tomb_key, &encode_tombstone(facet, &slug, now_secs()))
+                .await?;
+        }
+        return Ok(removed);
     }
     let observation = bound_observation(trimmed);
-    let value = encode_value(1, &["user:correction".to_string()], &observation);
+    let value = encode_value(1, &[CORRECTION_PROVENANCE.to_string()], &observation);
     memory.upsert_user_fact(&key, &value).await?;
     Ok(true)
 }
@@ -596,11 +622,27 @@ pub struct Consolidation {
 ///   * `existing` (the current observed-counts, keyed by (facet, subject)) lets a
 ///     repeated observation COMPOUND onto the prior count rather than resetting —
 ///     so the model strengthens over time, bounded by the entry cap at write.
+///   * `existing_prov` (the provenance ids ALREADY counted into those priors) is
+///     what keeps the compounding HONEST — see below.
 ///     Deterministic; exposed for direct unit testing.
+///
+/// WHAT WENT WRONG WITHOUT `existing_prov`: the final count was `prior + this
+/// pass`, and the reflection pass re-reads THE SAME window every cycle
+/// (`episodes_recent(..)` + `all_user_facts(..)`). Re-reading one unchanged fact
+/// therefore counted as a fresh observation every time, so a single never-restated
+/// `user.preference.editor` fact climbed +2 every ~20h — roughly +876/year — and
+/// `render()` printed "(observed 12x; from fact:user.preference.editor)", a count
+/// that contradicted its own one-item provenance list. Now only provenance ids
+/// that are NOT already recorded on the stored entry add to the count, so
+/// re-reading the same evidence is a no-op. Residual (bounded, documented): an id
+/// evicted by the [`MAX_PROVENANCE`] cap can be counted a second time if it is
+/// still in the input window — an over-count of at most the pass size, never the
+/// old unbounded drift.
 pub fn consolidate_inputs(
     episodes: &[Episode],
     facts: &[(String, String)],
     existing: &std::collections::HashMap<(Facet, String), u32>,
+    existing_prov: &std::collections::HashMap<(Facet, String), Vec<String>>,
 ) -> Consolidation {
     // 1. Mine every signal from every input.
     let mut signals: Vec<Signal> = Vec::new();
@@ -636,11 +678,24 @@ pub fn consolidate_inputs(
 
     // 3. Emit only the groups that MET the threshold (this pass alone OR with the
     //    prior observed-count folded in — so a signal seen once now plus once
-    //    before clears it). Compounding: final count = prior + this pass.
+    //    before clears it). Compounding: final count = prior + the evidence in this
+    //    pass that is NOT ALREADY counted into that prior. Re-reading the same
+    //    episode/fact window (which the reflection pass does every cycle) therefore
+    //    adds NOTHING; only genuinely new provenance moves the count.
     let mut entries: Vec<(Facet, String, u32, Vec<String>, String)> = Vec::new();
     for ((facet, subject), agg) in groups {
         let prior = existing.get(&(facet, subject.clone())).copied().unwrap_or(0);
-        let total = prior.saturating_add(agg.count);
+        let already = existing_prov
+            .get(&(facet, subject.clone()))
+            .map(|v| v.as_slice())
+            .unwrap_or(&[]);
+        let total = if prior == 0 {
+            // No stored entry yet: this pass IS the whole evidence.
+            agg.count
+        } else {
+            let fresh = agg.provenance.iter().filter(|id| !already.contains(id)).count() as u32;
+            prior.saturating_add(fresh)
+        };
         if total < MIN_OBSERVATIONS {
             continue; // sub-threshold -> no entry (never fabricate)
         }
@@ -694,8 +749,9 @@ pub async fn consolidate(
         existing_prov.insert((e.facet, e.subject.clone()), e.provenance.clone());
     }
 
-    // 2. Pure consolidation against the existing counts (compounding).
-    let result = consolidate_inputs(episodes, facts, &existing_counts);
+    // 2. Pure consolidation against the existing counts + the provenance already
+    //    counted into them (compounding, but only on NEW evidence).
+    let result = consolidate_inputs(episodes, facts, &existing_counts, &existing_prov);
 
     // 2b. MIRROR CONSULT (the load-bearing behavior): NEVER re-derive a belief the
     // user CONTESTED. The reflection/consolidation pass calls THIS function, so this
@@ -709,6 +765,25 @@ pub async fn consolidate(
     // 3. Apply, enforcing the entry cap for NEW entries and merging provenance.
     let mut written = 0u64;
     for (facet, subject, count, new_prov, observation) in result.entries {
+        // CORRECTION CONSULT (same class as the MIRROR consult above): NEVER
+        // overwrite an entry the user has explicitly CORRECTED.
+        //
+        // WHAT WENT WRONG WITHOUT THIS: `correct()` upserts the user's stated
+        // observation but writes no tombstone, and the source signal it corrected
+        // (the stored `user.preference.*` fact, or episodes still inside the recall
+        // window) is untouched — so the very next reflection pass re-mined that
+        // signal, saw the entry already exists, and upserted the MACHINE-derived
+        // observation straight back over the user's correction. It then MERGED the
+        // stored provenance in, so the resurrected machine observation carried the
+        // `user:correction` stamp: `render()` told the user their own correction was
+        // the source of the statement they had corrected away from. A correction that
+        // silently reverts within a day is not a correctable model.
+        let corrected = existing_prov
+            .get(&(facet, subject.clone()))
+            .is_some_and(|p| p.iter().any(|id| id == CORRECTION_PROVENANCE));
+        if corrected {
+            continue;
+        }
         let exists = existing_counts.contains_key(&(facet, subject.clone()));
         if !exists {
             let count_now = entry_count(memory).await?;
@@ -1343,21 +1418,57 @@ pub fn classify_mirror_intent(text: &str) -> Option<MirrorIntent> {
     let lowered = text.trim().to_lowercase();
     let lower = lowered.trim_end_matches(['.', '!', '?', ',']).trim();
     for cue in MIRROR_EXPLAIN_CUES {
-        if let Some(idx) = lower.find(cue) {
-            let phrase = clean_subject_phrase(&lower[idx + cue.len()..]);
+        if let Some(end) = cue_match_end(lower, cue) {
+            let phrase = clean_subject_phrase(&lower[end..]);
             return Some(MirrorIntent::Explain(phrase));
         }
     }
     for cue in MIRROR_CLEAR_CUES {
-        if let Some(idx) = lower.find(cue) {
-            let phrase = clean_subject_phrase(&lower[idx + cue.len()..]);
+        if let Some(end) = cue_match_end(lower, cue) {
+            let phrase = clean_subject_phrase(&lower[end..]);
             return Some(MirrorIntent::Clear(phrase));
         }
     }
     for cue in MIRROR_CONTEST_CUES {
-        if let Some(idx) = lower.find(cue) {
-            let phrase = clean_subject_phrase(&lower[idx + cue.len()..]);
+        if let Some(end) = cue_match_end(lower, cue) {
+            let phrase = clean_subject_phrase(&lower[end..]);
             return Some(MirrorIntent::Contest(phrase));
+        }
+    }
+    None
+}
+
+/// Find `cue` inside `lower` at a WORD BOUNDARY, returning the byte index just PAST
+/// the cue. The boundary rule: the character immediately after the cue must be
+/// absent (end of utterance) or a non-word character — not alphanumeric and not an
+/// apostrophe. Pure.
+///
+/// WHAT WENT WRONG WITHOUT THIS: the cue tables were matched with a raw
+/// `str::find`, and MOST cues end in the bare pronoun `i` ("why do you think i",
+/// "how do you know i", "what makes you think i", "stop thinking i", "i never said
+/// i", …). A raw substring search therefore also fired on "it", "is", "if", "in",
+/// "i'll" — so ordinary questions were HIJACKED into the self-model surface. "why
+/// do you think it will rain tomorrow?" classified as Explain("t will rain
+/// tomorrow") and the router returned "I have no recorded belief about \"t will
+/// rain tomorrow\"" instead of ever reaching the model; worse, the DESTRUCTIVE
+/// variants ("stop thinking it's a good idea", "i never said it was fine") ran
+/// `contest_belief` — a delete plus a permanent suppression tombstone — against
+/// that mangled subject. Every neighbouring router arm is conservatively anchored
+/// (`explain::classify_explain_intent` compares WHOLE strings for exactly this
+/// reason); MIRROR was the one surface that was not.
+///
+/// ALL occurrences are checked, not just the first, so a boundary-failing earlier
+/// hit ("why do you think it's odd … why do you think i prefer vim") cannot mask a
+/// genuine cue later in the utterance.
+fn cue_match_end(lower: &str, cue: &str) -> Option<usize> {
+    for (idx, _) in lower.match_indices(cue) {
+        let end = idx + cue.len();
+        let boundary = lower[end..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '\'');
+        if boundary {
+            return Some(end);
         }
     }
     None
@@ -1441,6 +1552,11 @@ mod tests {
         HashMap::new()
     }
 
+    /// No PRIOR provenance — the shape of a first-ever consolidation pass.
+    fn no_prov() -> HashMap<(Facet, String), Vec<String>> {
+        HashMap::new()
+    }
+
     // ===================================================================
     // SLUG / KEY / VALUE round-trips (pure)
     // ===================================================================
@@ -1490,7 +1606,7 @@ mod tests {
             ep(1, "i was working on rust today", &["rust", "working"]),
             ep(2, "more rust debugging", &["rust", "debugging"]),
         ];
-        let c = consolidate_inputs(&episodes, &[], &no_existing());
+        let c = consolidate_inputs(&episodes, &[], &no_existing(), &no_prov());
         let topic = c
             .entries
             .iter()
@@ -1507,7 +1623,7 @@ mod tests {
     fn a_single_stray_mention_is_not_recorded_never_fabricates() {
         // "working" appears in only ONE episode -> sub-threshold -> no entry.
         let episodes = vec![ep(1, "i was working on rust", &["rust", "working"])];
-        let c = consolidate_inputs(&episodes, &[], &no_existing());
+        let c = consolidate_inputs(&episodes, &[], &no_existing(), &no_prov());
         assert!(
             c.entries.is_empty(),
             "one mention each is below the threshold; nothing is invented: {:?}",
@@ -1518,14 +1634,14 @@ mod tests {
     #[test]
     fn empty_and_contradictory_inputs_invent_nothing() {
         // Empty inputs.
-        assert!(consolidate_inputs(&[], &[], &no_existing()).entries.is_empty());
+        assert!(consolidate_inputs(&[], &[], &no_existing(), &no_prov()).entries.is_empty());
         // "Contradictory" single mentions of unrelated subjects, each seen once:
         // none clears the threshold, so NO preference is fabricated.
         let episodes = vec![
             ep(1, "i prefer tea", &["tea"]),
             ep(2, "i prefer coffee", &["coffee"]),
         ];
-        let c = consolidate_inputs(&episodes, &[], &no_existing());
+        let c = consolidate_inputs(&episodes, &[], &no_existing(), &no_prov());
         // tea and coffee each appear once -> below threshold -> nothing.
         assert!(
             c.entries.iter().all(|(_, s, _, _, _)| s != "tea" && s != "coffee"),
@@ -1543,7 +1659,7 @@ mod tests {
             // A NON-facet fact must NOT become a profile entry (never invent).
             ("user.name".to_string(), "Darwin".to_string()),
         ];
-        let c = consolidate_inputs(&[], &facts, &no_existing());
+        let c = consolidate_inputs(&[], &facts, &no_existing(), &no_prov());
         let editor = c
             .entries
             .iter()
@@ -1569,13 +1685,77 @@ mod tests {
         let mut existing = HashMap::new();
         existing.insert((Facet::Topic, "rust".to_string()), 3u32);
         let episodes = vec![ep(9, "rust again", &["rust"])];
-        let c = consolidate_inputs(&episodes, &[], &existing);
+        let c = consolidate_inputs(&episodes, &[], &existing, &no_prov());
         let topic = c
             .entries
             .iter()
             .find(|(f, s, _, _, _)| *f == Facet::Topic && s == "rust")
             .expect("rust still recorded");
         assert_eq!(topic.2, 4, "prior 3 + this pass 1 = compounded count 4");
+    }
+
+    /// REGRESSION: re-reading the SAME unchanged inputs does not inflate the count.
+    ///
+    /// The reflection pass hands `consolidate` the same `episodes_recent(..)` +
+    /// `all_user_facts(..)` window every cycle. The count used to be
+    /// `prior + this pass` with no provenance dedupe, so one never-restated fact
+    /// climbed +2 every ~20h (~+876/year) and `render()` printed "(observed 12x;
+    /// from fact:user.preference.editor)" — a count contradicting its own
+    /// single-item provenance list.
+    #[test]
+    fn re_reading_the_same_inputs_does_not_inflate_the_observed_count() {
+        let facts = vec![("user.preference.editor".to_string(), "neovim".to_string())];
+        // Pass 1: nothing stored yet.
+        let first = consolidate_inputs(&[], &facts, &no_existing(), &no_prov());
+        let (_, _, count1, prov1, _) = first
+            .entries
+            .iter()
+            .find(|(f, s, _, _, _)| *f == Facet::Preference && s == "editor")
+            .cloned()
+            .expect("the editor preference is earned on the first pass");
+
+        // Passes 2..=5 replay the SAME inputs against the stored state.
+        let mut count = count1;
+        let mut prov = prov1;
+        for pass in 2..=5u32 {
+            let mut existing = HashMap::new();
+            existing.insert((Facet::Preference, "editor".to_string()), count);
+            let mut existing_prov = HashMap::new();
+            existing_prov.insert((Facet::Preference, "editor".to_string()), prov.clone());
+            let c = consolidate_inputs(&[], &facts, &existing, &existing_prov);
+            let e = c
+                .entries
+                .iter()
+                .find(|(f, s, _, _, _)| *f == Facet::Preference && s == "editor")
+                .cloned()
+                .expect("still recorded");
+            assert_eq!(
+                e.2, count1,
+                "pass {pass} re-read the SAME evidence; the count must not move ({count1} -> {})",
+                e.2
+            );
+            count = e.2;
+            prov = e.3;
+        }
+
+        // A genuinely NEW piece of evidence still compounds.
+        let mut existing = HashMap::new();
+        existing.insert((Facet::Preference, "editor".to_string()), count);
+        let mut existing_prov = HashMap::new();
+        existing_prov.insert((Facet::Preference, "editor".to_string()), prov);
+        let mut more = facts.clone();
+        more.push(("user.preference.shell".to_string(), "fish".to_string()));
+        let episodes = vec![ep(7, "i prefer neovim", &["neovim"])];
+        let c = consolidate_inputs(&episodes, &more, &existing, &existing_prov);
+        let editor = c
+            .entries
+            .iter()
+            .find(|(f, s, _, _, _)| *f == Facet::Preference && s == "editor")
+            .expect("still recorded");
+        assert_eq!(
+            editor.2, count,
+            "the editor fact is unchanged evidence, so its count still must not move"
+        );
     }
 
     // ===================================================================
@@ -1661,6 +1841,62 @@ mod tests {
         assert!(
             profile.entries.iter().all(|e| e.subject != "editor"),
             "the entry is gone after the empty correction"
+        );
+    }
+
+    /// REGRESSION: a user's correction SURVIVES the next reflection pass.
+    ///
+    /// `correct` used to write no tombstone and no marker, while the source signal
+    /// it corrected (the stored `user.preference.editor` fact) stayed in the input
+    /// window. The very next `consolidate` re-mined that fact, saw the entry
+    /// already existed, and upserted the machine-derived observation back over the
+    /// user's words — merging the stored provenance in, so the resurrected
+    /// observation carried the `user:correction` stamp and `render()` told the user
+    /// their correction was the source of the statement they had corrected away
+    /// from. Both forms are covered: OVERRIDE and DELETE.
+    #[tokio::test]
+    async fn a_correction_is_not_reverted_by_the_next_consolidation_pass() {
+        let db = TempDb::new("correction-sticks");
+        let mem = Memory::open(&db.0).unwrap();
+        // The SAME inputs every pass — exactly what reflect.rs hands consolidate.
+        let facts = vec![("user.preference.editor".to_string(), "neovim".to_string())];
+        consolidate(&mem, &[], &facts).await.unwrap();
+
+        // OVERRIDE form.
+        correct(&mem, Facet::Preference, "editor", "actually I use VS Code now")
+            .await
+            .unwrap();
+        consolidate(&mem, &[], &facts).await.unwrap();
+        let e = query(&mem, "editor")
+            .await
+            .unwrap()
+            .entries
+            .into_iter()
+            .find(|e| e.subject == "editor")
+            .expect("the corrected entry is still there");
+        assert!(
+            e.observation.contains("VS Code"),
+            "the user's correction must survive the reflection pass, got {:?}",
+            e.observation
+        );
+        assert!(
+            !e.observation.contains("neovim"),
+            "the machine observation must NOT be written back over the correction: {:?}",
+            e.observation
+        );
+
+        // DELETE form: the entry stays gone, it is not re-derived from the
+        // still-present source fact.
+        correct(&mem, Facet::Preference, "editor", "").await.unwrap();
+        consolidate(&mem, &[], &facts).await.unwrap();
+        assert!(
+            query(&mem, "editor")
+                .await
+                .unwrap()
+                .entries
+                .iter()
+                .all(|e| e.subject != "editor"),
+            "a deleted entry must not come back on the next pass"
         );
     }
 
@@ -2076,6 +2312,55 @@ mod tests {
         // A plain question is NOT a mirror intent (must not steal ordinary turns).
         assert!(classify_mirror_intent("why did you do that").is_none());
         assert!(classify_mirror_intent("what's the weather").is_none());
+    }
+
+    /// REGRESSION: the cue tables are matched at a WORD BOUNDARY, so an ordinary
+    /// question is never hijacked into the self-model surface.
+    ///
+    /// Most cues end in the bare pronoun `i`, and a raw `str::find` also matched
+    /// "it"/"is"/"if"/"in"/"i'll". "why do you think it will rain tomorrow?" came
+    /// back as Explain("t will rain tomorrow") — the router returns that arm
+    /// immediately, so the question never reached the model — and the DESTRUCTIVE
+    /// variants ("stop thinking it's a good idea") ran contest_belief (delete +
+    /// permanent tombstone) on the mangled subject.
+    #[test]
+    fn a_cue_only_matches_at_a_word_boundary_so_ordinary_questions_are_not_hijacked() {
+        for utterance in [
+            "why do you think it will rain tomorrow?",
+            "why do you think it's slow?",
+            "how do you know it's safe?",
+            "what makes you think it failed?",
+            "why do you believe its going to work",
+            "stop thinking it's a good idea",
+            "i never said it was fine",
+            "how do you know if the build passed",
+            "what makes you think in the long run this helps",
+        ] {
+            assert!(
+                classify_mirror_intent(utterance).is_none(),
+                "an ordinary utterance must NOT become a mirror intent: {utterance:?} -> {:?}",
+                classify_mirror_intent(utterance)
+            );
+        }
+        // The genuine cues still classify (the anchor must not disarm MIRROR).
+        match classify_mirror_intent("why do you think i prefer neovim") {
+            Some(MirrorIntent::Explain(s)) => assert_eq!(s, "neovim"),
+            other => panic!("a real EXPLAIN must still classify, got {other:?}"),
+        }
+        match classify_mirror_intent("why do you think i'm terse") {
+            Some(MirrorIntent::Explain(s)) => assert_eq!(s, "terse"),
+            other => panic!("the i'm cue must still classify, got {other:?}"),
+        }
+        match classify_mirror_intent("stop thinking i like tea") {
+            Some(MirrorIntent::Contest(s)) => assert_eq!(s, "tea"),
+            other => panic!("a real CONTEST must still classify, got {other:?}"),
+        }
+        // A boundary-failing hit EARLIER in the utterance must not mask a real cue
+        // later in it.
+        match classify_mirror_intent("why do you think it's odd, why do you think i use vim") {
+            Some(MirrorIntent::Explain(s)) => assert_eq!(s, "use vim"),
+            other => panic!("a later genuine cue must still win, got {other:?}"),
+        }
     }
 
     #[test]

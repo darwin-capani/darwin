@@ -683,9 +683,15 @@ pub async fn mark_ran(memory: &Memory, mission: &StandingMission, now: u64) -> R
 /// in `now`/`local_hour`/`local_minute`/`local_midnight` from the injected/system
 /// clock (see [`local_midnight`] for the DST-aware midnight).
 ///
-/// SAFETY: with `master_enabled == false` (the shipped default) NOTHING is ever
-/// due — the master switch gates the whole subsystem on top of each mission's own
-/// `enabled` flag. A disabled INDIVIDUAL mission is also never due.
+/// SAFETY: with `master_enabled == false` NOTHING is ever due — the master switch
+/// gates the whole subsystem on top of each mission's own `enabled` flag. NOTE
+/// `[standing].enabled` SHIPS TRUE (full-power default; every consequential step
+/// still parks), so on a fresh install the scheduler IS armed and due missions run
+/// FURY on the tick. This doc used to call false "the shipped default", inverting
+/// a safety-relevant fact in the one comment a reader auditing the recurring-
+/// autonomy surface would consult — and contradicting this file's own module
+/// header. `master_enabled` is false only when the operator turns it off or
+/// lockdown forces it (main.rs ANDs `!is_locked_down()`). A disabled INDIVIDUAL mission is also never due.
 pub fn due_missions<'a>(
     missions: &'a [StandingMission],
     now: u64,
@@ -833,7 +839,32 @@ pub fn tripwire_step(
     // Rate limit: never re-fire within the debounce cooldown of the last fire.
     let debounce = clamp_debounce(debounce_secs);
     let cooled = last_run == 0 || now.saturating_sub(last_run) >= debounce;
-    (cooled, next_latched)
+    if !cooled {
+        // DEFER THE EDGE, DO NOT CONSUME IT.
+        //
+        // WHAT WENT WRONG: this returned `(cooled, next_latched)`, so a rising
+        // edge suppressed by the cooldown STILL set the latch — and
+        // `due_condition_missions` writes that latch back unconditionally
+        // (`ledger.set(&m.id, next)`). On every later tick `was_latched == true`
+        // took the early return above, so the `cooled` branch was never
+        // re-evaluated. `m.last_run` only moves in `mark_ran` after an ACTUAL run,
+        // so it never advanced either: the tripwire LATCHED FOREVER and never
+        // fired again for the rest of the daemon's uptime. Measured with
+        // UnreadAtLeast{5} at debounce=3600 — fires at t=0, clears at t=300,
+        // re-crosses at t=600 inside the cooldown, and then does not fire at
+        // t=900, t=3900, t=86400 or t=604800. Nothing is logged and
+        // `standing_list` still shows the mission enabled, so a user-established,
+        // confirmation-gated tripwire ("when free disk drops below 10%, review
+        // large files") silently stopped working.
+        //
+        // The rate limit is a DEFERRAL, exactly as its doc says ("fires only once
+        // the cooldown has elapsed"), so leave the latch UNSET and let the next
+        // tick re-evaluate the same edge. Both anti-spam properties survive: after
+        // an actual fire the latch IS set (no re-fire while continuously true),
+        // and nothing fires inside the cooldown.
+        return (false, was_latched);
+    }
+    (true, next_latched)
 }
 
 /// PURE tripwire scheduler: given the verified `signals` snapshot, the clock, the
@@ -1686,13 +1717,78 @@ mod tests {
         let (fire, latched) = tripwire_step(false, true, true, now + 120, now, debounce);
         assert!(!fire);
         assert!(!latched, "clears once cleared");
-        // Re-crosses within the debounce cooldown -> RATE-LIMITED, no fire (but relatches).
+        // Re-crosses within the debounce cooldown -> RATE-LIMITED, no fire.
+        //
+        // WHAT THIS USED TO ASSERT — AND WHY IT WAS WRONG: it asserted the latch
+        // SETS here (`assert!(latched)`), then called the next step with
+        // `was_latched` hand-reset to `false`, a state the ledger it had just
+        // asserted could never be in. Threading the real latch forward is what
+        // exposes the defect: with the latch set, the `!holds || was_latched`
+        // early return fires on every later tick and the cooldown branch is never
+        // re-evaluated, so the tripwire LATCHES FOREVER. The rate limit is a
+        // deferral, so the edge must be left UNCONSUMED.
         let (fire, latched) = tripwire_step(true, false, false, now + 200, now, debounce);
         assert!(!fire, "a re-cross within the debounce cooldown is rate-limited");
-        assert!(latched);
-        // Re-crosses AFTER the cooldown -> fires again.
-        let (fire, _l) = tripwire_step(true, false, false, now + debounce, now, debounce);
-        assert!(fire, "after the cooldown a fresh rising edge fires again");
+        assert!(
+            !latched,
+            "a suppressed edge must NOT be consumed — latching here strands the \
+             tripwire forever, because a latched tripwire never re-evaluates the cooldown"
+        );
+        // …and THREADING THAT LATCH FORWARD, the same edge fires once the cooldown
+        // expires. (No hand-reset: this is the state the ledger really holds.)
+        let (fire, latched) = tripwire_step(true, false, latched, now + debounce, now, debounce);
+        assert!(fire, "after the cooldown the deferred rising edge fires");
+        assert!(latched, "and NOW the latch is consumed by the actual fire");
+    }
+
+    /// The multi-tick sequence the pure step is really used in: fire -> clear ->
+    /// re-cross inside the cooldown -> still true long after. The tripwire must
+    /// fire again; it used to go dead for the rest of the daemon's uptime.
+    #[test]
+    fn a_tripwire_suppressed_by_the_cooldown_still_fires_later() {
+        let debounce = 3_600u64;
+        let t0 = 1_000_000u64;
+        // The ledger's latch, threaded exactly as due_condition_missions threads it.
+        let mut latched = false;
+        let mut last_run = 0u64;
+
+        // t0: rising edge, never fired -> FIRES.
+        let (fire, next) = tripwire_step(true, false, latched, t0, last_run, debounce);
+        assert!(fire, "the first rising edge fires");
+        latched = next;
+        last_run = t0; // mark_ran
+
+        // t0+300: metric clears past the dead-band -> latch clears.
+        let (fire, next) = tripwire_step(false, true, latched, t0 + 300, last_run, debounce);
+        assert!(!fire);
+        latched = next;
+        assert!(!latched);
+
+        // t0+600: re-crosses INSIDE the cooldown -> suppressed, edge deferred.
+        let (fire, next) = tripwire_step(true, false, latched, t0 + 600, last_run, debounce);
+        assert!(!fire, "inside the cooldown nothing fires");
+        latched = next;
+
+        // t0+900: still true, still inside the cooldown -> still nothing.
+        let (fire, next) = tripwire_step(true, false, latched, t0 + 900, last_run, debounce);
+        assert!(!fire);
+        latched = next;
+
+        // t0+debounce+1: the cooldown has expired and the condition still holds.
+        // THIS is the tick that used to be unreachable forever.
+        let (fire, next) = tripwire_step(true, false, latched, t0 + debounce + 1, last_run, debounce);
+        assert!(
+            fire,
+            "once the cooldown expires the still-true condition must fire again — \
+             it used to stay latched and never fire for the rest of the daemon's uptime"
+        );
+        latched = next;
+        assert!(latched, "the fire consumes the edge");
+
+        // …and it does NOT re-fire on the very next tick while still continuously
+        // true — the anti-spam property the latch exists for is intact.
+        let (fire, _) = tripwire_step(true, false, latched, t0 + debounce + 61, t0 + debounce + 1, debounce);
+        assert!(!fire, "no re-fire while the condition stays continuously true");
     }
 
     #[test]
