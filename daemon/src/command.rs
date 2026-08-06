@@ -1266,6 +1266,55 @@ impl CommandPipeline for LivePipeline {
         let personalization = crate::anthropic::grounded_personalization_live(mem).await;
         let persona =
             crate::anthropic::agent_persona_text(&agent.name, agent.is_orchestrator());
+        // VAULT / GUEST: is the cloud reachable for THIS turn at all?
+        //
+        // WHAT WENT WRONG: this arm called the cloud loop directly, with no
+        // reachability gate. The spoken path closes exactly this at router.rs:110
+        //
+        //     threshold::deny_cloud(vault::deny_cloud(cloud_reachable))
+        //
+        // so a user who said "go dark" — or a guest turn, which is local-only —
+        // had their utterance, the shared world-model context and the observed
+        // personalization profile sent to api.anthropic.com under the owner's key
+        // the moment they typed into the HUD command deck instead of speaking.
+        //
+        // That also made this module's own opening claim false. It says the
+        // channel "is JUST ANOTHER INPUT into the SAME pipeline the voice path
+        // uses — it can do NOTHING the spoken path cannot". Under vault the
+        // spoken path cannot reach the cloud, and this one could.
+        //
+        // Restrict-only, exactly like the spoken gate: with vault off and no guest
+        // turn this is byte-for-byte the old behavior.
+        let cloud_ok = crate::threshold::deny_cloud(crate::vault::deny_cloud(true));
+        if !cloud_ok {
+            // Degrade to the LOCAL tool loop — the same fallback the spoken path
+            // takes — rather than refusing the turn outright.
+            let mut infer = crate::inference::InferenceClient::new(self.inference_sock.clone());
+            // The cloud loop takes grounded facts as (key, value) pairs; the local
+            // loop takes them already rendered. Same facts, different shape.
+            let local_facts: Vec<String> =
+                facts.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+            if let Some(outcome) = crate::anthropic::complete_with_local_tools(
+                &self.cfg,
+                &mut infer,
+                self.max_tokens,
+                text,
+                &[],
+                &local_facts,
+                mem,
+                &agent.tools,
+                &agent.namespace,
+            )
+            .await
+            {
+                if !outcome.data.trim().is_empty() {
+                    return outcome.data;
+                }
+            }
+            return "I'm in vault mode, sir — this one stays on the device, so I \
+                    answered it locally."
+                .to_string();
+        }
         // Stateless turn: empty history. A consequential tool parks inside the
         // loop (execute_tool) and the returned text is the confirmation prompt —
         // the channel never fires it.
@@ -1633,6 +1682,85 @@ pub fn write_command_token(root: &Path, token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// ...AND THE `ask` ARM ACTUALLY BRANCHES ON IT.
+    ///
+    /// The test above checks the PREDICATE. Deleting the gate from the call site
+    /// leaves it green, because a correct predicate nobody consults is exactly the
+    /// bug that was here. `ask` reaches the network, so it cannot be driven from a
+    /// unit test; this pins the call site by SOURCE instead.
+    ///
+    /// Scoped to the `ask` function body ONLY — a file-wide search would match the
+    /// gate in this very test and pass vacuously — and it asserts ORDER: the gate
+    /// must appear BEFORE the cloud call, since a check after the egress is not a
+    /// check.
+    #[test]
+    fn the_ask_arm_consults_the_cloud_gate_before_the_cloud_call() {
+        let src = include_str!("command.rs");
+        let start = src
+            .find("    async fn ask(&self, text: &str, agent: Option<&str>) -> String {")
+            .expect("the ask arm must exist under this signature");
+        // Bound the window at the next same-indent `fn` so this cannot drift into
+        // a neighbouring method and pass on ITS code.
+        let rest = &src[start + 40..];
+        let end = rest.find("\n    async fn ").or_else(|| rest.find("\n    fn ")).unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let gate = body
+            .find("crate::threshold::deny_cloud(crate::vault::deny_cloud(")
+            .expect(
+                "ask must consult the SAME reachability gate the spoken path uses \
+                 (router.rs: threshold::deny_cloud(vault::deny_cloud(..))) — without \
+                 it, a 'go dark' turn typed into the HUD is sent to the cloud",
+            );
+        let cloud = body
+            .find("crate::anthropic::complete_with_tools(")
+            .expect("ask still calls the cloud loop");
+        assert!(
+            gate < cloud,
+            "the reachability gate must be consulted BEFORE the cloud call, not after it"
+        );
+    }
+
+    /// THE HUD'S `ask` MUST NOT REACH THE CLOUD UNDER VAULT.
+    ///
+    /// `LivePipeline::ask` called `complete_with_tools` directly, with no
+    /// reachability gate. The spoken path closes exactly this at router.rs:110 —
+    /// `threshold::deny_cloud(vault::deny_cloud(cloud_reachable))` — so a user who
+    /// said "go dark", or a guest (whose turns are local-only), had their
+    /// utterance, the shared world-model context and the observed personalization
+    /// profile sent to api.anthropic.com under the OWNER's key the moment they
+    /// typed into the HUD command deck instead of speaking.
+    ///
+    /// This asserts the PREDICATE the arm now branches on, not the reply text: a
+    /// test that only checked for a local-sounding answer would pass against a
+    /// build that phoned home first and then said something reassuring.
+    #[test]
+    fn the_command_channels_cloud_gate_matches_the_spoken_paths() {
+        let prior = crate::vault::active();
+
+        crate::vault::set(false);
+        assert!(
+            crate::threshold::deny_cloud(crate::vault::deny_cloud(true)),
+            "vault off + owner turn: the cloud stays reachable (restrict-only)"
+        );
+
+        crate::vault::set(true);
+        assert!(
+            !crate::threshold::deny_cloud(crate::vault::deny_cloud(true)),
+            "vault ON: the command channel must not reach the cloud, exactly as \
+             the spoken path does not"
+        );
+
+        // ...and the gate is the SAME expression the router uses, so the two
+        // surfaces cannot drift apart: both fold vault inside threshold.
+        crate::vault::set(true);
+        let spoken = crate::threshold::deny_cloud(crate::vault::deny_cloud(true));
+        let typed = crate::threshold::deny_cloud(crate::vault::deny_cloud(true));
+        assert_eq!(spoken, typed, "typed and spoken must agree on reachability");
+
+        crate::vault::set(prior);
+    }
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex as StdMutex;
