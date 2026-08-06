@@ -2122,10 +2122,11 @@ async fn main() -> Result<()> {
     }
 
     let root = resolve_root();
-    for sub in ["state/ipc", "state/logs", "state/tmp"] {
-        std::fs::create_dir_all(root.join(sub))
-            .with_context(|| format!("creating {sub} under {}", root.display()))?;
-    }
+    // Creates the subtree AND sets state/ipc to 0700 — the mode the startup gate
+    // below requires. These two used to disagree, so a fresh install could never
+    // boot; see `selfcheck::prepare_state_dirs`.
+    selfcheck::prepare_state_dirs(&root)
+        .with_context(|| format!("creating the state subtree under {}", root.display()))?;
     init_tracing(&root)?;
     // Build marker — a visible "which binary am I" line so a stale daemon is
     // obvious at a glance (this has bitten restarts repeatedly). Bump the tag
