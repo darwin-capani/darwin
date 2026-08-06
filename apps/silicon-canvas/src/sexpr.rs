@@ -183,9 +183,10 @@ impl<'a> Lexer<'a> {
     }
 
     /// Lex one quoted string starting AT the opening quote. Decodes `\"`, `\\`,
-    /// `\n`, `\t`, `\r`; any other `\x` keeps the literal `x` (KiCad does not
-    /// emit other escapes, and dropping the backslash is the least-surprising
-    /// recovery). Errors only on an unterminated string.
+    /// `\n`, `\t`, `\r`; any other `\x` keeps the literal `x` — the whole
+    /// CHARACTER, multi-byte or not (KiCad does not emit other escapes, and
+    /// dropping the backslash is the least-surprising recovery). Errors only on
+    /// an unterminated string.
     fn lex_string(&mut self) -> Result<Token, SexprError> {
         debug_assert_eq!(self.src[self.pos], b'"');
         let start = self.pos;
@@ -205,15 +206,50 @@ impl<'a> Lexer<'a> {
                     }
                     let e = self.src[self.pos];
                     match e {
-                        b'n' => out.push('\n'),
-                        b't' => out.push('\t'),
-                        b'r' => out.push('\r'),
-                        b'"' => out.push('"'),
-                        b'\\' => out.push('\\'),
-                        // Unknown escape: keep the escaped byte literally.
-                        other => out.push(other as char),
+                        b'n' => {
+                            out.push('\n');
+                            self.pos += 1;
+                        }
+                        b't' => {
+                            out.push('\t');
+                            self.pos += 1;
+                        }
+                        b'r' => {
+                            out.push('\r');
+                            self.pos += 1;
+                        }
+                        b'"' => {
+                            out.push('"');
+                            self.pos += 1;
+                        }
+                        b'\\' => {
+                            out.push('\\');
+                            self.pos += 1;
+                        }
+                        // Unknown escape: keep the escaped CHARACTER literally.
+                        //
+                        // This used to be `out.push(other as char)`, which is a
+                        // BYTE reinterpreted as a Latin-1 code point. For an
+                        // escaped multi-byte character that consumed only the
+                        // LEAD byte and mis-mapped it, and the orphaned
+                        // continuation bytes then fell into the normal-run branch
+                        // below where `from_utf8_lossy` turned each into U+FFFD:
+                        // `"C:\élan"` decoded to `"C:Ã\u{fffd}lan"` — one source
+                        // character silently became two wrong ones, and the
+                        // mojibake rode into whatever the string became (a
+                        // component value/reference, a net label, a sheet file
+                        // path). Copy the whole UTF-8 scalar instead, which is
+                        // what both this fn's doc and the old inline comment
+                        // ("keep the escaped byte literally") always promised.
+                        // Narrow in practice: KiCad's own writer escapes `\` as
+                        // `\\`, so only a hand-edited or third-party file has a
+                        // bare backslash before a non-ASCII character.
+                        other => {
+                            let end = (self.pos + utf8_char_len(other)).min(self.src.len());
+                            out.push_str(&String::from_utf8_lossy(&self.src[self.pos..end]));
+                            self.pos = end;
+                        }
                     }
-                    self.pos += 1;
                 }
                 _ => {
                     // Copy a run of normal bytes. We rebuild from bytes; KiCad
@@ -266,13 +302,37 @@ impl<'a> Lexer<'a> {
     }
 }
 
+/// Length in bytes of the UTF-8 scalar whose LEAD byte is `b` (1 for ASCII, 2-4
+/// for multi-byte). A continuation byte or an invalid lead reports 1, so a caller
+/// stepping over malformed bytes always advances and never slices backwards —
+/// this layer is fed arbitrary bytes by the fuzz target and must stay total.
+#[inline]
+fn utf8_char_len(b: u8) -> usize {
+    match b {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF7 => 4,
+        _ => 1,
+    }
+}
+
 /// Parse an S-expression source into a single [`Value`].
 ///
 /// KiCad files are exactly one top-level list `(kicad_sch ...)`. This entry:
 ///   - errors on empty input ([`SexprError::Empty`]),
-///   - errors on a leaf-only document (a bare atom is not a KiCad document),
 ///   - errors on unbalanced parens or trailing tokens after the first complete
 ///     value.
+///
+/// It does NOT reject a leaf-only document. `parse("hello")` returns
+/// `Ok(Value::Atom("hello"))`, `parse("42")` returns `Ok(Value::Number(42.0))`.
+/// This doc used to claim a leaf errored; it never did, and [`SexprError`] — a
+/// frozen, deliberately total contract (`error.rs`: "the lexer/parser can only
+/// ever produce these") — has no variant that could say so. "The root is a KiCad
+/// document" is `parser.rs`'s check, not this layer's: `parse_schematic` /
+/// `parse_pcb` reject a root whose head is not `kicad_sch` / `kicad_pcb`, and
+/// that is the only thing standing between a bare-atom file and a "successful"
+/// import. Do not delete it on the strength of a guarantee made here.
 ///
 /// For the more permissive "parse every top-level form" need (a `.kicad_sym`
 /// library can hold multiple), use [`parse_many`].
@@ -443,6 +503,50 @@ mod tests {
     fn string_escapes_decode() {
         let v = parse(r#"(t "a\"b\\c\nd")"#).unwrap();
         assert_eq!(v.list().unwrap()[1], Value::Str("a\"b\\c\nd".to_string()));
+    }
+
+    #[test]
+    fn unknown_escape_keeps_the_whole_character_not_its_lead_byte() {
+        // `\é` — an unknown escape in front of a MULTI-BYTE character. The doc
+        // and the inline comment both promise the escaped character survives
+        // verbatim; `out.push(other as char)` pushed the lead byte as a Latin-1
+        // code point and left the continuation byte to be lossy-decoded, so one
+        // source character became two wrong ones ("C:Ã\u{fffd}lan").
+        let v = parse("(property \"Value\" \"C:\\\u{e9}lan\")").unwrap();
+        assert_eq!(
+            v.list().unwrap()[2],
+            Value::Str("C:\u{e9}lan".to_string()),
+            "the escaped character must round-trip intact"
+        );
+        // A 3-byte and a 4-byte scalar too (BMP + astral).
+        let v3 = parse("(t \"\\\u{20ac}\")").unwrap();
+        assert_eq!(v3.list().unwrap()[1], Value::Str("\u{20ac}".to_string()));
+        let v4 = parse("(t \"\\\u{1F600}\")").unwrap();
+        assert_eq!(v4.list().unwrap()[1], Value::Str("\u{1F600}".to_string()));
+        // The ASCII unknown-escape case is unchanged: `\q` -> `q`.
+        let a = parse(r#"(t "\q")"#).unwrap();
+        assert_eq!(a.list().unwrap()[1], Value::Str("q".to_string()));
+    }
+
+    #[test]
+    fn parse_accepts_a_leaf_only_document() {
+        // `parse`'s doc claimed it "errors on a leaf-only document". It never
+        // has, and SexprError (frozen, total) has no variant that could express
+        // it. Pin the real contract so the doc cannot drift back and so nobody
+        // deletes parser.rs's root-head check believing this layer covers it.
+        assert_eq!(parse("hello").unwrap(), Value::Atom("hello".to_string()));
+        assert_eq!(parse("42").unwrap(), Value::Number(42.0));
+        assert_eq!(parse(r#""quoted""#).unwrap(), Value::Str("quoted".to_string()));
+        // ...and parser.rs is what actually rejects such a file.
+        let err = crate::parser::parse_document(
+            std::path::Path::new("bare.kicad_sch"),
+            "kicad_sch",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, crate::error::CanvasError::Parse { .. }),
+            "the KiCad layer rejects a leaf-only document: {err:?}"
+        );
     }
 
     #[test]

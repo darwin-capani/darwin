@@ -120,16 +120,25 @@ fn read_at(parent: &Value) -> (Point, f64) {
     }
 }
 
-/// Read a `(layer "F.Cu")` or first layer name from a `(layers ...)` node.
+/// Read a `(layer "F.Cu")` or the first layer name from a `(layers ...)` node.
+///
+/// The `(layers ...)` half of that sentence was documented but never implemented:
+/// the body only ever looked for a child whose head is exactly `layer`, and
+/// [`Value::get`] compares the head string exactly, so a node using KiCad's
+/// PLURAL form got `None` and every caller silently fell back to its own default
+/// ("F.Cu" at the footprint/segment/root sites) — i.e. the entity landed on the
+/// wrong layer. The zone caller had grown its own hand-written `.or_else` for
+/// exactly this, which was the proof the fallback was missing; that workaround is
+/// gone now that the fallback lives here.
+///
+/// Singular wins when a node carries both. Only the FIRST name of a plural list
+/// is returned — a multi-layer entity is placed on one layer by this helper; a
+/// caller that needs the full span (vias, which read `(layers "F.Cu" "B.Cu")` as
+/// a range) reads the node itself.
 fn read_layer_name(parent: &Value) -> Option<String> {
-    if let Some(node) = parent.get("layer") {
-        if let Some(items) = node.list() {
-            if let Some(name) = items.get(1).and_then(Value::as_str) {
-                return Some(name.to_string());
-            }
-        }
-    }
-    None
+    let node = parent.get("layer").or_else(|| parent.get("layers"))?;
+    let items = node.list()?;
+    items.get(1).and_then(Value::as_str).map(|s| s.to_string())
 }
 
 /// Apply a 2-D rotation (degrees, KiCad's CCW-positive convention is irrelevant
@@ -323,7 +332,24 @@ pub fn parse_schematic(path: &Path, root: &Value) -> Result<Scene> {
 
     // --- pass 1: collect raw geometry, register endpoints in the union-find ---
 
-    // Wires (and bus segments treated as wires for geometry).
+    // Wires. NOT bus segments — see KNOWN GAP below.
+    //
+    // KNOWN GAP (import breadth, SPEC §1): `(bus ...)` and `(bus_entry ...)`
+    // nodes are NOT imported. Nothing in this file ever reads them — the only
+    // `bus` token here is this comment — so a bus-drawn sheet renders with the
+    // bus missing, the R-tree cannot hit-test it, and `scene.bounds` stops short
+    // of it, which mis-frames the fit-on-open / `view.set {fit:"all"}` camera on
+    // a bus-heavy sheet. This comment used to say "(and bus segments treated as
+    // wires for geometry)", which was the kind of lie that keeps a gap from
+    // being noticed: no such code was ever written.
+    //
+    // The cheap-looking fix — push a bus into `raw_wires` — is WRONG as stated.
+    // These raw wires are unioned into the [`NetBuilder`] below AND land in
+    // `scene.wires`, which `graph::Graph::build` treats as electrical segments;
+    // a bus is a bundle of many nets, not one node, so importing it as a wire
+    // would short every net it touches together in the graph, in ERC, and in the
+    // trace walk. Drawing buses needs a geometry-only class the net builder and
+    // the graph both skip.
     struct RawWire {
         a: Point,
         b: Point,
@@ -1084,16 +1110,10 @@ pub fn parse_pcb(path: &Path, root: &Value) -> Result<Scene> {
 
     // Zones: (zone (net n) (layer "F.Cu") (polygon (pts (xy ..) ..))).
     for zone in root.get_all("zone") {
-        let layer_name = read_layer_name(zone)
-            .or_else(|| {
-                // KiCad 8 multi-layer zones use (layers "F.Cu" ...): take first.
-                zone.get("layers")
-                    .and_then(|n| n.list())
-                    .and_then(|l| l.get(1))
-                    .and_then(Value::as_str)
-                    .map(|s| s.to_string())
-            })
-            .unwrap_or_else(|| "F.Cu".to_string());
+        // KiCad 8 multi-layer zones use (layers "F.Cu" ...): read_layer_name now
+        // reads that plural form itself (it always claimed to), so the hand-written
+        // `.or_else` that used to sit here is gone.
+        let layer_name = read_layer_name(zone).unwrap_or_else(|| "F.Cu".to_string());
         let layer = layers.intern(&layer_name);
         let net_id = read_net(zone, &nets);
         // Outline lives under (polygon (pts ...)).
@@ -1339,6 +1359,80 @@ mod tests {
         (name "~" (effects (font (size 1.27 1.27))))
         (number "2" (effects (font (size 1.27 1.27))))))))
 "#;
+
+    #[test]
+    fn bus_segments_are_a_known_gap_not_imported_as_wires() {
+        // The wire loop's comment claimed "(and bus segments treated as wires for
+        // geometry)". No such code exists — `get_all("bus")` appears nowhere — so
+        // a bus-drawn sheet silently loses its bus geometry AND its bounds. This
+        // test pins the real behaviour so the gap is visible: if someone wires
+        // buses up they must do it deliberately (and NOT through `raw_wires`,
+        // which is unioned into the net builder and lands in `scene.wires`, where
+        // the graph would short every net the bus touches).
+        const BUS_SCH: &str = r#"
+(kicad_sch (version 20230121) (generator eeschema)
+  (wire (pts (xy 0 0) (xy 10 0)) (stroke (width 0)))
+  (bus  (pts (xy 0 20) (xy 50 20)) (stroke (width 0.4)))
+  (bus  (pts (xy 50 20) (xy 50 60)) (stroke (width 0.4)))
+  (bus_entry (at 10 20) (size 2.54 2.54))
+  (label "D[0..7]" (at 25 20 0)))
+"#;
+        let scene = parse_document(Path::new("bus.kicad_sch"), BUS_SCH).unwrap();
+        assert_eq!(
+            scene.wires.len(),
+            1,
+            "only the (wire ...) is imported; the two (bus ...) segments are not"
+        );
+        assert_eq!(scene.wires[0].a, Point::new(0.0, 0.0));
+        assert_eq!(scene.wires[0].b, Point::new(10.0, 0.0));
+        // The bus reaches x=50/y=60; the bounds stop at the label at (25,20).
+        assert!(
+            scene.bounds.max.x < 50.0 && scene.bounds.max.y < 60.0,
+            "bus geometry is outside the imported bounds: {:?}",
+            scene.bounds
+        );
+    }
+
+    #[test]
+    fn read_layer_name_reads_the_plural_layers_form_too() {
+        // The doc promised a `(layers ...)` fallback the body never had, so a
+        // node using KiCad's plural form returned None and the caller silently
+        // defaulted the entity onto "F.Cu" — the wrong layer.
+        let plural = sexpr::parse(r#"(zone (layers "In1.Cu" "In2.Cu"))"#).unwrap();
+        assert_eq!(
+            read_layer_name(&plural).as_deref(),
+            Some("In1.Cu"),
+            "the first name of a plural (layers ...) node"
+        );
+        let singular = sexpr::parse(r#"(segment (layer "B.Cu"))"#).unwrap();
+        assert_eq!(read_layer_name(&singular).as_deref(), Some("B.Cu"));
+        // Singular wins when a node carries both.
+        let both = sexpr::parse(r#"(zone (layer "F.Cu") (layers "In1.Cu"))"#).unwrap();
+        assert_eq!(read_layer_name(&both).as_deref(), Some("F.Cu"));
+        // Neither form present, and a malformed node, stay None (never panic).
+        assert_eq!(read_layer_name(&sexpr::parse("(zone (net 1))").unwrap()), None);
+        assert_eq!(read_layer_name(&sexpr::parse("(zone (layers))").unwrap()), None);
+    }
+
+    #[test]
+    fn multi_layer_zone_lands_on_its_first_declared_layer() {
+        // The end-to-end consequence of the fallback: a KiCad 8 multi-layer zone
+        // is placed on In1.Cu, not on the "F.Cu" default. (This used to work only
+        // because the zone site carried its own hand-written `.or_else`; that
+        // workaround is gone, so this test now covers the shared helper.)
+        const ZONE_PCB: &str = r#"
+(kicad_pcb (version 20221018) (generator pcbnew)
+  (layers (0 "F.Cu" signal) (1 "In1.Cu" signal) (31 "B.Cu" signal))
+  (net 0 "")
+  (net 1 "GND")
+  (zone (net 1) (layers "In1.Cu" "B.Cu")
+    (polygon (pts (xy 0 0) (xy 10 0) (xy 10 10) (xy 0 10)))))
+"#;
+        let scene = parse_document(Path::new("zone.kicad_pcb"), ZONE_PCB).unwrap();
+        assert_eq!(scene.zones.len(), 1, "one zone imported");
+        let name = &scene.layer_names[scene.zones[0].layer.raw() as usize];
+        assert_eq!(name, "In1.Cu", "multi-layer zone takes its first layer");
+    }
 
     #[test]
     fn parses_symbol_library() {

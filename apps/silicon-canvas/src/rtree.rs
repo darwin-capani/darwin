@@ -2,6 +2,17 @@
 //! hit-testing (point query, layer-priority order; SPEC §3) and viewport culling
 //! (rectangle query; SPEC §2). Built once at import, immutable afterward.
 //!
+//! WHO BUILDS IT, WHO QUERIES IT: `ipc::dispatch_project_open` builds it into
+//! `ipc::AppState::index` right after `Graph::build`/`apply_nets`, which is what
+//! makes "built once at import" and `Op::ProjectOpen`'s "build the graph +
+//! spatial index" true. They were BOTH false for a long time — `Index::build`
+//! had no caller outside this file's own `#[cfg(test)]` module, so the index
+//! described here was never constructed on any reachable path. The QUERY side is
+//! still open and this doc will not pretend otherwise: SPEC §6's op table has no
+//! hit-test op (pointer input is HUD-side), and `render.rs` culls by LOD feature
+//! size only, never by [`Index::query_rect`]. Nothing calls [`Index::hit_test`]
+//! or [`Index::query_rect`] in production yet.
+//!
 //! Layout: one [`rstar::RTree`] per [`LayerId`] (the `u16` raw value is the map
 //! key). Every entity is reduced to a small `Copy` payload ([`Spatial`]) holding
 //! its [`EntityRef`], its layer, and its scene-space [`Aabb`]. The R-tree
@@ -9,10 +20,19 @@
 //! [`Aabb::corners`], so deep-zoom hit-tests stay f64-precise (SPEC §3).
 //!
 //! Hit-test priority (SPEC §3, "layer-priority order"): the caller passes the
-//! layers in priority order; within one layer the *tightest* containing box wins
-//! (a pad sitting on a track is selected over the track), with a stable per-kind
-//! tiebreak. Viewport culling ([`Index::query_rect`]) is an envelope-intersection
-//! query and returns every entity whose box touches the rectangle.
+//! layers in priority order; within one layer the entity CLASS decides first
+//! ([`kind_rank`] — terminals and connections beat area entities, so a pad
+//! sitting on a track is selected over the track), and the *tightest* containing
+//! box breaks a tie within one class, then the entity index. Viewport culling
+//! ([`Index::query_rect`]) is an envelope-intersection query and returns every
+//! entity whose box touches the rectangle.
+//!
+//! That order used to be the other way round — area first, `kind_rank` only on
+//! an EXACT area tie — which defeats the rule it exists to enforce: a 3x3 mm
+//! thermal/BGA pad (9 mm² box) crossed by a 0.5 x 0.25 mm stub (0.19 mm² box)
+//! resolved to the STUB, so a click dead-centre on the pad reported the track.
+//! "Smallest box wins" only happens to name the pad when the pad is the smaller
+//! entity, which is exactly the case the one test covered.
 
 use std::collections::HashMap;
 
@@ -22,8 +42,17 @@ use crate::ids::{EntityKind, EntityRef};
 use crate::scene::{Aabb, LayerId, Point, Scene};
 
 /// A tiny inflation (mm) applied to zero-area entity boxes (junctions, labels,
-/// schematic pin points) so a point query can land on them. Far below the
-/// schematic placement grid (0.0254 mm) yet large enough to be hittable.
+/// schematic pin points) so a point query can land on them. It is a HALF-extent:
+/// [`point_bbox`] spans centre ± this, so the hit box is 0.1 mm across.
+///
+/// It is sized for CLICK TOLERANCE, not for grid separation, and it is LARGER
+/// than the finest KiCad schematic placement grid (0.0254 mm) — ~2x as a
+/// half-extent, ~4x as a box span. This comment used to claim the opposite
+/// ("far below the schematic placement grid"), which mattered because it is the
+/// sentence a maintainer reads before changing the constant: two point-like
+/// entities one grid step apart DO get overlapping hit boxes, and where they
+/// overlap the winner comes from [`Index::hit_test`]'s kind/area/index ordering,
+/// not from proximity to the click.
 const HIT_PAD_MM: f64 = 0.05;
 
 /// One R-tree payload: a scene entity reduced to its spatial footprint. `Copy`
@@ -87,9 +116,12 @@ fn clamp_axis(v: f64, lo: f64, hi: f64) -> f64 {
     }
 }
 
-/// Per-kind tiebreak when two boxes of equal area contain the same point. Lower
-/// rank wins. Small terminal/connection entities beat large area entities so a
-/// click on a pad lands on the pad, not the courtyard or copper under it.
+/// Per-kind PRIMARY ordering when several boxes contain the same point on one
+/// layer. Lower rank wins. Small terminal/connection entities beat large area
+/// entities so a click on a pad lands on the pad, not the courtyard or copper
+/// under it — and, being primary, it does so regardless of which box happens to
+/// be smaller (it was applied only on an exact area tie, i.e. essentially never,
+/// so a big pad lost to any short segment crossing it).
 #[inline]
 fn kind_rank(kind: EntityKind) -> u8 {
     match kind {
@@ -211,23 +243,32 @@ impl Index {
     }
 
     /// Topmost entity at `point`, searched in the given layer-priority order
-    /// (SPEC §3). The first layer with any containing box wins; within it the
-    /// tightest (smallest-area) box wins, tiebroken by [`kind_rank`] so a pad is
-    /// selected over the track beneath it. Returns `None` if nothing is hit on
-    /// any of the requested layers.
+    /// (SPEC §3). The first layer with any containing box wins; within it
+    /// [`kind_rank`] decides (a pad is selected over the track beneath it), the
+    /// tightest (smallest-area) box breaks a tie within one class, and the entity
+    /// index breaks that. Returns `None` if nothing is hit on any of the
+    /// requested layers.
     pub fn hit_test(&self, point: Point, layers: &[LayerId]) -> Option<EntityRef> {
         let p = [point.x, point.y];
         for layer in layers {
             let Some(tree) = self.trees.get(&layer.raw()) else {
                 continue;
             };
+            // Kind FIRST, then area. The two keys used to be the other way round,
+            // which made kind_rank unreachable in practice (it only ran on an
+            // exact f64 area tie) and inverted the documented rule for every pad
+            // bigger than the copper crossing it — a click on a 3x3 mm thermal pad
+            // with a 0.5 mm stub over it reported the stub.
             let best = tree
                 .locate_all_at_point(&p)
                 .min_by(|a, b| {
-                    a.area()
-                        .partial_cmp(&b.area())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                        .then(kind_rank(a.entity.kind).cmp(&kind_rank(b.entity.kind)))
+                    kind_rank(a.entity.kind)
+                        .cmp(&kind_rank(b.entity.kind))
+                        .then(
+                            a.area()
+                                .partial_cmp(&b.area())
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                        )
                         .then(a.entity.index.cmp(&b.entity.index))
                 });
             if let Some(s) = best {
@@ -455,6 +496,111 @@ mod tests {
         let idx = Index::build(&s);
         let hit = idx.hit_test(Point::new(0.0, 0.0), &[cu]).unwrap();
         assert_eq!(hit.kind, EntityKind::Pad, "pad should win over the track it sits on");
+    }
+
+    #[test]
+    fn pad_wins_over_a_smaller_track_stub_crossing_it() {
+        // The size relation `pad_wins_over_track_underneath` does NOT cover: a
+        // big thermal/BGA pad with a short stub across its centre, where the
+        // TRACK has the smaller box. Under the old area-first ordering the stub
+        // won and a click dead-centre on the pad reported the track — the exact
+        // opposite of what the module doc and `kind_rank`'s doc promise.
+        let mut s = Scene::new(SceneKind::Pcb);
+        let cu = LayerId::new(0);
+        s.pads.push(Pad {
+            component: 0u32.into(),
+            name: "TH".into(),
+            position: Point::new(0.0, 0.0),
+            size: (3.0, 3.0), // 9.0 mm^2 box
+            shape: PadShape::Rect,
+            pin_type: PinType::Passive,
+            layer: cu,
+            layer_to: cu,
+            net_id: NetId::new(1),
+        });
+        s.tracks.push(Track {
+            a: Point::new(-0.25, 0.0),
+            b: Point::new(0.25, 0.0),
+            width: 0.25, // 0.5 x 0.25 -> 0.1875 mm^2 box, far tighter than the pad
+            layer: cu,
+            net_id: NetId::new(1),
+        });
+        s.init_flags();
+        let idx = Index::build(&s);
+        let hit = idx.hit_test(Point::new(0.0, 0.0), &[cu]).unwrap();
+        assert_eq!(
+            hit.kind,
+            EntityKind::Pad,
+            "a terminal outranks copper crossing it whichever box is tighter"
+        );
+    }
+
+    #[test]
+    fn area_still_breaks_a_tie_within_one_kind() {
+        // Kind-first must not cost the tightest-box rule INSIDE a class: two pads
+        // containing the same point resolve to the tighter one.
+        let mut s = Scene::new(SceneKind::Pcb);
+        let cu = LayerId::new(0);
+        let pad = |name: &str, size: (f64, f64)| Pad {
+            component: 0u32.into(),
+            name: name.into(),
+            position: Point::new(0.0, 0.0),
+            size,
+            shape: PadShape::Rect,
+            pin_type: PinType::Passive,
+            layer: cu,
+            layer_to: cu,
+            net_id: NetId::NONE,
+        };
+        s.pads.push(pad("big", (4.0, 4.0)));
+        s.pads.push(pad("small", (1.0, 1.0)));
+        s.init_flags();
+        let idx = Index::build(&s);
+        let hit = idx.hit_test(Point::new(0.0, 0.0), &[cu]).unwrap();
+        assert_eq!(hit.index, 1, "the tighter pad wins the intra-class tie");
+    }
+
+    #[test]
+    fn hit_pad_is_click_tolerance_not_a_sub_grid_inflation() {
+        // HIT_PAD_MM's comment claimed it was "far below the schematic placement
+        // grid (0.0254 mm)". It is ~2x that as a half-extent and ~4x as a box
+        // span, so two point-like entities one grid step apart overlap. Pin the
+        // real relationship the corrected comment states.
+        const FINEST_SCHEMATIC_GRID_MM: f64 = 0.0254;
+        // Measured off the box the index actually builds, not off the constant —
+        // the half-extent IS the observable quantity.
+        let bb = point_bbox(Point::new(0.0, 0.0));
+        let half_extent = bb.width() * 0.5;
+        assert!(
+            (bb.width() - 2.0 * HIT_PAD_MM).abs() < 1e-12,
+            "point_bbox spans centre +/- HIT_PAD_MM: {bb:?}"
+        );
+        assert!(
+            half_extent > FINEST_SCHEMATIC_GRID_MM,
+            "the inflation ({half_extent} mm) is NOT below the \
+             {FINEST_SCHEMATIC_GRID_MM} mm grid the comment used to compare it to"
+        );
+        // Two junctions one grid step apart: their hit boxes DO overlap, and the
+        // click is therefore resolved by ordering, not proximity.
+        let mut s = schem();
+        s.junctions.push(Junction {
+            position: Point::new(0.0, 0.0),
+            net_id: NetId::NONE,
+        });
+        s.junctions.push(Junction {
+            position: Point::new(FINEST_SCHEMATIC_GRID_MM, 0.0),
+            net_id: NetId::NONE,
+        });
+        s.init_flags();
+        let idx = Index::build(&s);
+        // A point that sits inside BOTH inflated boxes.
+        let both = Point::new(FINEST_SCHEMATIC_GRID_MM * 0.5, 0.0);
+        let hit = idx.hit_test(both, &[LayerId::SCHEMATIC]).unwrap();
+        assert_eq!(hit.kind, EntityKind::Junction);
+        assert_eq!(
+            hit.index, 0,
+            "overlapping equal-area boxes fall through to the index tiebreak"
+        );
     }
 
     #[test]

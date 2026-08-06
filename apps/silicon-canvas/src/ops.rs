@@ -158,7 +158,14 @@ pub struct Viewport {
     pub x: f64,
     pub y: f64,
     pub scale: f64,
-    /// Layer name → visible. Empty for a schematic (single logical layer).
+    /// Layer name → visible, in the scene's declared layer order. A PCB carries
+    /// its copper/technical stackup; a SCHEMATIC carries exactly ONE entry,
+    /// `"schematic"` — its single logical layer — not an empty list. (This said
+    /// "Empty for a schematic" for a long time; `project.open` has always seeded
+    /// the list from `scene.layer_names`, and the parser always names that one
+    /// layer, so the HUD's minimap chip row — gated on a non-empty list — has
+    /// always shown it. The one layer IS toggleable: `layer.set` validates
+    /// against the same `layer_names`.)
     pub layer_visibility: Vec<LayerVisibility>,
 }
 

@@ -281,16 +281,31 @@ pub struct LineVertex {
 /// component bounding boxes only. Thresholds in screen-space feature size
 /// (< 2 px = culled class)." The thresholds below are expressed as the
 /// pixels-per-mm at which a *typical* feature of that class falls under ~2 px:
-///   - text glyph height ~1.27 mm: drop below ~1.6 px/mm,
-///   - pad ~0.6 mm: drop below ~0.33 px/mm,
-///   - below the pad threshold, draw only component bboxes.
+///   - text glyph height ~1.27 mm: drop below ~1.6 px/mm (2.0 / 1.27 = 1.575),
+///   - pad ~0.6 mm: drop below ~3.3 px/mm (2.0 / 0.6 = 3.333),
+///   - below the pad threshold, draw only component bboxes (plus text, if the
+///     zoom is still above the text threshold — see the ordering note).
+///
+/// ORDERING NOTE — the SPEC's "drop text THEN drop pads" ladder does NOT come out
+/// of these numbers, and this doc printed the pad bullet with the decimal point
+/// one place to the left (0.33 where the code culls at 3.33) for a long time,
+/// which made the ladder look consistent when it is not. The crate's own test
+/// spelled the real figure out the whole time: "pads should cull below ~3.33
+/// px/mm". A pad (0.6 mm) is SMALLER than a glyph (1.27 mm),
+/// so it falls under 2 px FIRST: zooming out, pads/tracks/vias cull at 3.33 px/mm
+/// while text survives down to 1.575 px/mm. There is no zoom at which text is
+/// culled but pads still draw. Size a new feature class against 2.0 px / its own
+/// millimetre extent, not against the SPEC's prose order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lod {
     pub draw_text: bool,
     pub draw_pads: bool,
     pub draw_tracks: bool,
     pub draw_vias: bool,
-    /// When true, individual entities are too small; draw only component bboxes.
+    /// When true, the copper classes (pads/tracks/vias) are too small; draw only
+    /// component bboxes. NOT "individual entities" as a whole: `draw_text` is
+    /// decided independently and is still true just under this threshold (see the
+    /// ordering note on [`Lod`]).
     pub bbox_only: bool,
 }
 
@@ -1223,61 +1238,80 @@ impl GpuRenderer {
     }
 
     /// Compute which classes draw this frame under `lod` and the resulting draw
-    /// count + culled percentage — pure, so it is unit-tested without a device.
+    /// count + culled percentage. Reads the per-class buffer counts off `self`
+    /// and hands them to [`plan_draws`], which owns all of the logic.
     fn draw_plan(&self, lod: &Lod) -> DrawPlan {
-        let pads = self.pad_buf.as_ref().map(|b| b.count).unwrap_or(0);
-        let tracks = self.track_buf.as_ref().map(|b| b.count).unwrap_or(0);
-        let vias = self.via_buf.as_ref().map(|b| b.count).unwrap_or(0);
-        let lines = self.line_buf.as_ref().map(|b| b.vertices).unwrap_or(0);
-
-        let draw_tracks = lod.draw_tracks && tracks > 0;
-        let draw_vias = lod.draw_vias && vias > 0;
-        let draw_pads = lod.draw_pads && pads > 0;
-        // Courtyards always available; they are the bbox-only fallback too.
-        let draw_courtyards = lines > 0;
-
-        let mut draws = 0;
-        if draw_tracks {
-            draws += 1;
-        }
-        if draw_vias {
-            draws += 1;
-        }
-        if draw_pads {
-            draws += 1;
-        }
-        if draw_courtyards {
-            draws += 1;
-        }
-
-        // culled_pct: of the SDF instance candidates, how many are NOT drawn this
-        // frame because LOD turned their class off. (Viewport-rect culling is a
-        // future per-tile refinement; class-level LOD is what this frame reports.)
-        let total = (pads + tracks + vias) as f64;
-        let drawn_pads = if draw_pads { pads } else { 0 };
-        let drawn_tracks = if draw_tracks { tracks } else { 0 };
-        let drawn_vias = if draw_vias { vias } else { 0 };
-        let drawn = (drawn_pads + drawn_tracks + drawn_vias) as f64;
-        let culled_pct = if total > 0.0 {
-            (1.0 - drawn / total) * 100.0
-        } else {
-            0.0
-        };
-
-        DrawPlan {
-            draw_tracks,
-            draw_vias,
-            draw_pads,
-            draw_courtyards,
-            draws,
-            culled_pct,
-        }
+        plan_draws(
+            lod,
+            self.pad_buf.as_ref().map(|b| b.count).unwrap_or(0),
+            self.track_buf.as_ref().map(|b| b.count).unwrap_or(0),
+            self.via_buf.as_ref().map(|b| b.count).unwrap_or(0),
+            self.line_buf.as_ref().map(|b| b.vertices).unwrap_or(0),
+        )
     }
 
     /// Expose the frame timer's current snapshot (without advancing the window) —
     /// useful for a forced telemetry drop on demand.
     pub fn frame_stats(&self) -> RenderMs {
         self.timer.snapshot()
+    }
+}
+
+/// Turn one frame's [`Lod`] plus the per-class instance counts into the frame's
+/// draw set, draw count, and culled percentage (SPEC §2 `canvas.render_ms`).
+///
+/// A FREE function on purpose. This logic used to live in the body of
+/// [`GpuRenderer::draw_plan`], whose doc claimed it was "pure, so it is
+/// unit-tested without a device" — it was neither: it took `&self` on a type that
+/// cannot exist without a real Metal adapter, so no headless test could call it,
+/// and the two tests that claimed to cover it RE-IMPLEMENTED the arithmetic on
+/// local `f64`s instead (`culled_pct_logic_matches_drawn_fraction` asserted
+/// 62.5 == 62.5 on four locals and referenced nothing from this module — it
+/// could not fail). Inverting a LOD gate, dropping a `draws += 1`, or swapping
+/// the culled_pct numerator all stayed green. Now the whole decision is callable
+/// with no device and the tests below drive THIS function.
+fn plan_draws(lod: &Lod, pads: u32, tracks: u32, vias: u32, lines: u32) -> DrawPlan {
+    let draw_tracks = lod.draw_tracks && tracks > 0;
+    let draw_vias = lod.draw_vias && vias > 0;
+    let draw_pads = lod.draw_pads && pads > 0;
+    // Courtyards always available; they are the bbox-only fallback too.
+    let draw_courtyards = lines > 0;
+
+    let mut draws = 0;
+    if draw_tracks {
+        draws += 1;
+    }
+    if draw_vias {
+        draws += 1;
+    }
+    if draw_pads {
+        draws += 1;
+    }
+    if draw_courtyards {
+        draws += 1;
+    }
+
+    // culled_pct: of the SDF instance candidates, how many are NOT drawn this
+    // frame because LOD turned their class off. (Viewport-rect culling is a
+    // future per-tile refinement; class-level LOD is what this frame reports.)
+    let total = (pads + tracks + vias) as f64;
+    let drawn_pads = if draw_pads { pads } else { 0 };
+    let drawn_tracks = if draw_tracks { tracks } else { 0 };
+    let drawn_vias = if draw_vias { vias } else { 0 };
+    let drawn = (drawn_pads + drawn_tracks + drawn_vias) as f64;
+    let culled_pct = if total > 0.0 {
+        (1.0 - drawn / total) * 100.0
+    } else {
+        0.0
+    };
+
+    DrawPlan {
+        draw_tracks,
+        draw_vias,
+        draw_pads,
+        draw_courtyards,
+        draws,
+        culled_pct,
     }
 }
 
@@ -1724,6 +1758,7 @@ mod tests {
             shape: PadShape::RoundRect,
             pin_type: PinType::Passive,
             layer: LayerId::new(0),
+            layer_to: LayerId::new(0),
             net_id: NetId::new(3),
         });
         s.pads.push(Pad {
@@ -1734,6 +1769,7 @@ mod tests {
             shape: PadShape::Circle,
             pin_type: PinType::Passive,
             layer: LayerId::new(0),
+            layer_to: LayerId::new(0),
             net_id: NetId::NONE,
         });
         s.tracks.push(Track {
@@ -1870,28 +1906,35 @@ mod tests {
 
     #[test]
     fn draw_plan_counts_and_budget() {
-        // Build a DrawPlan via the same logic GpuRenderer::draw_plan uses, by
-        // replicating it against synthetic counts (no device).
-        // Far-out LOD -> only courtyards.
-        let lod_far = Lod::for_scale(0.05);
-        assert!(lod_far.bbox_only);
-        // Near LOD with all classes present: 4 draws (tracks, vias, pads,
-        // courtyards) — well under the 30 budget.
-        let lod_near = Lod::for_scale(100.0);
-        let mut draws = 0;
-        if lod_near.draw_tracks {
-            draws += 1;
-        }
-        if lod_near.draw_vias {
-            draws += 1;
-        }
-        if lod_near.draw_pads {
-            draws += 1;
-        }
-        // courtyards always:
-        draws += 1;
-        assert_eq!(draws, 4);
-        assert!(draws <= MAX_DRAWS_PER_FRAME);
+        // Drives the REAL decision function (`plan_draws`), not a copy of it. The
+        // version of this test that "replicated" draw_plan's logic against local
+        // counters could not observe a change in draw_plan at all.
+        //
+        // Near LOD with every class present: tracks, vias, pads, courtyards.
+        let near = plan_draws(&Lod::for_scale(100.0), 100, 50, 10, 8);
+        assert!(near.draw_tracks && near.draw_vias && near.draw_pads && near.draw_courtyards);
+        assert_eq!(near.draws, 4);
+        assert!(near.draws <= MAX_DRAWS_PER_FRAME);
+        assert!(near.culled_pct.abs() < 1e-9, "nothing culled: {near:?}");
+
+        // Far out (bbox_only): the copper classes are gone and ONLY the courtyard
+        // pass survives — one draw, and every SDF candidate counted as culled.
+        let far_lod = Lod::for_scale(0.05);
+        assert!(far_lod.bbox_only);
+        let far = plan_draws(&far_lod, 100, 50, 10, 8);
+        assert!(!far.draw_tracks && !far.draw_vias && !far.draw_pads);
+        assert!(far.draw_courtyards);
+        assert_eq!(far.draws, 1);
+        assert!(
+            (far.culled_pct - 100.0).abs() < 1e-9,
+            "bbox-only culls every instance: {far:?}"
+        );
+
+        // An empty class contributes no draw even when its LOD gate is on, and an
+        // empty scene reports 0% culled (not NaN from a 0/0 denominator).
+        let empty = plan_draws(&Lod::for_scale(100.0), 0, 0, 0, 0);
+        assert_eq!(empty.draws, 0);
+        assert!(empty.culled_pct.abs() < 1e-9, "{empty:?}");
     }
 
     #[test]
@@ -1908,14 +1951,66 @@ mod tests {
 
     #[test]
     fn culled_pct_logic_matches_drawn_fraction() {
-        // Replicate draw_plan's culled_pct math: when pads (say 100) are culled
-        // but tracks (50) + vias (10) draw, culled = 100/160.
-        let pads: f64 = 100.0;
-        let tracks: f64 = 50.0;
-        let vias: f64 = 10.0;
-        let total = pads + tracks + vias;
-        let drawn = tracks + vias; // pads culled
-        let culled = (1.0 - drawn / total) * 100.0;
-        assert!((culled - 62.5).abs() < 1e-9, "{culled}");
+        // Ask `plan_draws` for the number instead of recomputing it here. The old
+        // body built `pads/tracks/vias` as bare f64 locals, did the arithmetic
+        // itself and asserted 62.5 == 62.5 — it referenced nothing from this
+        // module and passed no matter what the renderer did.
+        //
+        // Pads culled, tracks + vias drawn: 100 of 160 instances culled = 62.5%.
+        // `Lod::for_scale` cannot produce this mix (a pad is smaller than a glyph,
+        // so pads cull with tracks and vias — see the ordering note on `Lod`), so
+        // build the LOD explicitly.
+        let lod = Lod {
+            draw_text: true,
+            draw_pads: false,
+            draw_tracks: true,
+            draw_vias: true,
+            bbox_only: false,
+        };
+        let plan = plan_draws(&lod, 100, 50, 10, 8);
+        assert!(!plan.draw_pads && plan.draw_tracks && plan.draw_vias);
+        assert!(
+            (plan.culled_pct - 62.5).abs() < 1e-9,
+            "culled_pct is the NOT-drawn instance fraction: {plan:?}"
+        );
+        // tracks + vias + courtyards, no pad pass.
+        assert_eq!(plan.draws, 3);
+    }
+
+    #[test]
+    fn lod_thresholds_are_the_ones_the_doc_prints() {
+        // The `Lod` doc printed the pad cull threshold as "~0.33 px/mm" — a 10x
+        // decimal slip; the code culls at 2.0 px / 0.6 mm = 3.33 px/mm. Pin both
+        // thresholds AND their (counter-intuitive) order so neither the numbers
+        // nor the doc can drift back.
+        let pad_threshold = Lod::CULL_PX / Lod::PAD_FEATURE_MM;
+        let text_threshold = Lod::CULL_PX / Lod::TEXT_FEATURE_MM;
+        assert!((pad_threshold - 3.3333333).abs() < 1e-3, "{pad_threshold}");
+        assert!((text_threshold - 1.5748031).abs() < 1e-3, "{text_threshold}");
+        assert!(
+            pad_threshold > text_threshold,
+            "pads cull BEFORE text as you zoom out; the SPEC's text-first ladder \
+             is not what these feature sizes produce"
+        );
+        // Just above / just below the pad threshold.
+        assert!(Lod::for_scale(pad_threshold + 1e-6).draw_pads);
+        assert!(!Lod::for_scale(pad_threshold - 1e-6).draw_pads);
+        // Between the two thresholds: text still draws while the copper is gone —
+        // the state the SPEC's ladder says cannot happen.
+        let between = Lod::for_scale(2.0);
+        assert!(between.draw_text && !between.draw_pads && between.bbox_only);
+
+        // ...and the doc says so. Source-anchored, scoped to the module body so
+        // these needles cannot match this test's own text.
+        let src = include_str!("render.rs");
+        let body = &src[..src.find("\nmod tests {").expect("tests module marker")];
+        assert!(
+            body.contains("drop below ~3.3 px/mm"),
+            "the Lod doc must print the real pad threshold"
+        );
+        assert!(
+            !body.contains("~0.33 px/mm"),
+            "the 10x-off pad threshold is back in the Lod doc"
+        );
     }
 }

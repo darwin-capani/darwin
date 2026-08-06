@@ -116,10 +116,10 @@ impl AppEnv {
 }
 
 /// The in-memory app state the op dispatcher mutates. Owns the open [`Scene`],
-/// the connectivity [`Graph`] built from it at import, the current [`Selection`]
-/// (net/component/erc), the camera [`Viewport`], and the [`Tracer`] selection /
-/// trace-mode state machine. Built fresh on launch; `project.open` replaces the
-/// scene + graph.
+/// the connectivity [`Graph`] and the [`crate::rtree::Index`] built from it at
+/// import, the current [`Selection`] (net/component/erc), the camera
+/// [`Viewport`], and the [`Tracer`] selection / trace-mode state machine. Built
+/// fresh on launch; `project.open` replaces the scene + graph + index.
 ///
 /// The dispatcher is PURE over this state (no socket), so the unit tests exercise
 /// the full parser → graph → erc → trace pipeline headlessly with a real KiCad
@@ -133,6 +133,24 @@ pub struct AppState {
     /// `TraceGraph` impl; net lookups (`net_by_name`/`nodes_on_net`/`pin_count`)
     /// resolve against the graph's net ids.
     pub graph: Option<Graph>,
+    /// The per-layer R-tree spatial index built from `scene` at import (SPEC §1:
+    /// "built once at import, immutable afterward"), or `None` before the first
+    /// `project.open`.
+    ///
+    /// This was the half of `project.open` that never ran. `rtree::Index::build`
+    /// had NO caller outside its own `#[cfg(test)]` module, so `rtree.rs`'s
+    /// "Built once at import", `Op::ProjectOpen`'s "build the graph + spatial
+    /// index" and SPEC §1 were all false: 600+ lines of tested code and the
+    /// `rstar` dependency shipped with zero production callers, and any hit-test
+    /// or viewport-cull consumer had nothing to query.
+    ///
+    /// HONEST CAVEAT, so this doc does not become the next lie: the index is
+    /// BUILT here but nothing in the app QUERIES it yet. SPEC §6's op table has
+    /// no hit-test op (pointer input is a HUD-side surface concern), and the
+    /// renderer still culls by LOD feature size only, never by an envelope
+    /// query. Building it at import is what §1 requires and is what a consumer
+    /// needs to exist before it can be wired; the query side is still open.
+    pub index: Option<crate::rtree::Index>,
     /// Absolute path of the open document (for diagnostics / `view.set fit`).
     pub open_path: Option<PathBuf>,
     /// The raw source of the open document, parked here so a re-parse needs no
@@ -163,7 +181,14 @@ pub struct ViewportState {
     pub x: f64,
     pub y: f64,
     pub scale: f64,
-    /// Layer name → visible, in declared order (PCB). Empty for a schematic.
+    /// Layer name → visible, in declared order. Seeded from `scene.layer_names`
+    /// at import, all on. A PCB publishes its copper/technical stackup; a
+    /// SCHEMATIC publishes exactly one entry, `"schematic"` — the single logical
+    /// layer the parser names (parser.rs `scene.layer_names = ["schematic"]`),
+    /// which is also the only layer name `layer.set` will accept on a schematic.
+    /// This doc used to claim the list was "Empty for a schematic"; it never is,
+    /// and the HUD's minimap layer-chip row (gated on a non-empty list) has
+    /// always rendered that one chip.
     pub layers: Vec<LayerVisibility>,
 }
 
@@ -387,18 +412,6 @@ fn confine_real_path(app_dir: &Path, path: &Path) -> Result<()> {
     }
 }
 
-/// Infer the [`SceneKind`] from a confined document path's extension.
-///
-/// BOARD-SIDE: `.kicad_pcb` and `.kicad_mod`. A footprint IS board geometry — pads on
-/// copper layers — which is exactly why `parse_footprint_library` builds a
-/// `Scene::new(SceneKind::Pcb)`. This map omitted it and fell through to Schematic, so
-/// the equality check at the open site (`scene.kind != scene_kind_for(&path)`) rejected
-/// EVERY `.kicad_mod` with "imported scene kind does not match the file extension".
-///
-/// `.kicad_mod` is one of the four types the app declares it supports: the extension
-/// gate accepts it, `parse_document` dispatches it to a fully-implemented ~90-line
-/// parser, and the module docs advertise it. All of it was unreachable — a whole
-/// supported file type that could never be opened, and the error blamed the file.
 /// Viewport zoom bounds (SPEC §3: 0.01x-500x). Shared, because they were enforced only
 /// on the explicit `view.set {scale}` branch — `fit_viewport`, which computes the scale
 /// for `project.open` AND for `view.set {fit:...}`, published whatever the framing
@@ -416,6 +429,27 @@ fn clamp_viewport_scale(scale: f64) -> f64 {
     scale.clamp(MIN_VIEWPORT_SCALE, MAX_VIEWPORT_SCALE)
 }
 
+/// Infer the [`SceneKind`] from a confined document path's extension.
+///
+/// BOARD-SIDE: `.kicad_pcb` and `.kicad_mod`. A footprint IS board geometry — pads on
+/// copper layers — which is exactly why `parse_footprint_library` builds a
+/// `Scene::new(SceneKind::Pcb)`. This map omitted it and fell through to Schematic, so
+/// the equality check at the open site (`scene.kind != scene_kind_for(&path)`) rejected
+/// EVERY `.kicad_mod` with "imported scene kind does not match the file extension".
+///
+/// `.kicad_mod` is one of the four types the app declares it supports: the extension
+/// gate accepts it, `parse_document` dispatches it to a fully-implemented ~90-line
+/// parser, and the module docs advertise it. All of it was unreachable — a whole
+/// supported file type that could never be opened, and the error blamed the file.
+//
+// DOC PLACEMENT — this block belongs HERE, immediately above `scene_kind_for`. It
+// used to sit ~30 lines up, run together with the `MIN_VIEWPORT_SCALE` paragraph
+// with no blank line between them: a doc comment attaches to the next ITEM, so
+// rustdoc rendered the whole `.kicad_mod` post-mortem as the description of an
+// unrelated `f64` constant while `scene_kind_for` — the function it is actually
+// about — shipped with no doc at all. Declare any item between these `///` lines
+// and the `fn` and the doc silently moves to that item instead (guarded by
+// `the_scene_kind_doc_stays_attached_to_scene_kind_for`).
 fn scene_kind_for(path: &Path) -> SceneKind {
     match path.extension().and_then(|e| e.to_str()) {
         Some("kicad_pcb") | Some("kicad_mod") => SceneKind::Pcb,
@@ -499,6 +533,14 @@ fn dispatch_project_open(state: &mut AppState, env: &AppEnv, raw: &str) -> Resul
     }
     let graph = Graph::build(&scene);
     graph.apply_nets(&mut scene); // populates per-entity net_id from the graph
+    // The OTHER half of this op's contract (SPEC §1, ops::Op::ProjectOpen: "build
+    // the graph + spatial index"). It never ran: `rtree::Index::build` had no
+    // caller anywhere outside its own test module, so the R-tree that rtree.rs
+    // says is "built once at import" was never built at all and every hit-test /
+    // viewport-cull consumer had an empty hand. Built AFTER apply_nets so the
+    // scene the index describes is the final one, and before `scene` is moved
+    // into the state (geometry is immutable from here — SPEC §1).
+    let index = crate::rtree::Index::build(&scene);
     let markers = crate::erc::run(&scene); // ONE arg (SPEC §5; erc.rs::run)
 
     // Seed the per-layer visibility list from the scene's layer names (all on).
@@ -516,11 +558,22 @@ fn dispatch_project_open(state: &mut AppState, env: &AppEnv, raw: &str) -> Resul
 
     state.scene = Some(scene);
     state.graph = Some(graph);
+    state.index = Some(index);
     state.open_path = Some(path);
     state.open_source = Some(src);
     state.viewport = viewport;
     // A fresh import resets the selection/trace state machine.
     state.tracer = Tracer::new();
+    // ...and the trace front mirrored off it. This line was MISSING while
+    // `trace_step`'s own field doc promised it was "cleared ... on
+    // select.net/select.component/trace.stop and at import": every one of those
+    // three ops cleared it, import did not. Open document B while tracing on
+    // document A and the front survived the swap, pointing at entity indices of a
+    // scene that no longer exists — and any later selection republish
+    // (`self_selection`, which the host's `start`/`refresh` control verbs drive)
+    // re-emitted it, so the HUD painted "TRACE step k of n / PAD #0" for a board
+    // that was not open and a trace that was not running.
+    state.trace_step = None;
     // ERC runs at import (SPEC §5) — publish the REAL markers on the selection
     // channel. Parked on the state so a later select.net does not clobber the erc
     // list contract, and a later erc.run re-publishes.
@@ -1847,7 +1900,20 @@ mod tests {
         assert_eq!(scene.labels.len(), 2, "NETA + NETB labels");
 
         // project.open emits a fitted viewport then the import-time ERC selection.
-        assert!(matches!(out[0], Telemetry::Viewport(_)));
+        let Telemetry::Viewport(vp) = &out[0] else {
+            panic!("expected the fitted Viewport first");
+        };
+        // The viewport carries the scene's layer list, seeded all-on. A SCHEMATIC
+        // publishes its one logical layer — three doc comments used to claim the
+        // list was "empty for a schematic", and it never has been.
+        assert_eq!(
+            vp.layer_visibility,
+            vec![LayerVisibility {
+                layer: "schematic".into(),
+                visible: true
+            }],
+            "a schematic publishes its single logical layer, not an empty list"
+        );
         let Telemetry::Selection(sel) = &out[1] else {
             panic!("expected the import-time ERC Selection drop");
         };
@@ -1856,6 +1922,42 @@ mod tests {
             erc.is_empty(),
             "a clean board yields no ERC findings, got {:?}",
             erc.iter().map(|m| m.code.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn project_open_builds_the_spatial_index() {
+        // SPEC §1 and `Op::ProjectOpen`'s own doc both say this op builds "the
+        // graph + spatial index". Only the graph half ran: `rtree::Index::build`
+        // had no caller outside rtree.rs's `#[cfg(test)]` module, so the R-tree
+        // was never constructed on any code path a running app could reach.
+        let (env, _root) = write_project_file("indexed.kicad_sch", CLEAN_SCH);
+        let mut st = AppState::new();
+        dispatch(
+            &mut st,
+            &Op::ProjectOpen {
+                path: "indexed.kicad_sch".into(),
+            },
+            &env,
+        )
+        .unwrap();
+
+        let index = st.index.as_ref().expect("the spatial index is built at import");
+        let scene = st.scene.as_ref().expect("scene imported");
+        assert!(!index.is_empty(), "the index holds the imported entities");
+        assert!(
+            index.len() >= scene.pads.len() + scene.wires.len(),
+            "every pad and wire is indexed: len={} pads={} wires={}",
+            index.len(),
+            scene.pads.len(),
+            scene.wires.len()
+        );
+        // ...and it answers a query about the document that is actually open: a
+        // point query on pad 0's own coordinate must hit something.
+        let at = scene.pads[0].position;
+        assert!(
+            index.hit_test_any(at).is_some(),
+            "a point query on pad 0 at {at:?} must hit an indexed entity"
         );
     }
 
@@ -2371,6 +2473,78 @@ mod tests {
             panic!("expected Selection");
         };
         assert!(sel.trace.is_none(), "a plain net selection carries no trace");
+    }
+
+    #[test]
+    fn project_open_while_tracing_clears_the_stale_trace_front() {
+        // `AppState::trace_step`'s doc promised the front is cleared "on
+        // select.net/select.component/trace.stop AND at import". The three ops
+        // did; import did NOT — dispatch_project_open reset scene/graph/viewport/
+        // tracer/selection and left `trace_step` alone. Swapping documents
+        // mid-trace therefore kept the OLD document's front, and the next
+        // selection republish re-emitted it: a trace readout for a board that is
+        // no longer open, with `tracer.is_tracing()` false and no net selected.
+        let mut st = pcb_via_state();
+        let env = test_env();
+        dispatch(&mut st, &Op::SelectNet { name: "NET1".into() }, &env).unwrap();
+        dispatch(&mut st, &Op::TraceStart, &env).unwrap();
+        assert!(
+            st.trace_step.is_some(),
+            "precondition: a trace is running and carries a front"
+        );
+
+        // Import a DIFFERENT document while that trace is live.
+        let (open_env, _root) = write_project_file("swap.kicad_sch", CLEAN_SCH);
+        dispatch(
+            &mut st,
+            &Op::ProjectOpen {
+                path: "swap.kicad_sch".into(),
+            },
+            &open_env,
+        )
+        .unwrap();
+
+        assert!(!st.tracer.is_tracing(), "a fresh import resets the tracer");
+        assert!(
+            st.trace_step.is_none(),
+            "a fresh import clears the trace front the previous document owned"
+        );
+        assert!(
+            self_selection(&st).trace.is_none(),
+            "a republish after import must not re-emit the previous document's front"
+        );
+    }
+
+    #[test]
+    fn the_scene_kind_doc_stays_attached_to_scene_kind_for() {
+        // Doc-placement guard. The `/// Infer the [`SceneKind`] ...` block once
+        // sat above `const MIN_VIEWPORT_SCALE` with no blank line separating it
+        // from that constant's own paragraph, so rustdoc attached the whole
+        // `.kicad_mod` post-mortem to an f64 constant and `scene_kind_for`
+        // shipped undocumented. Nothing but comments may sit between the block
+        // and the function — declare an item there and the doc silently moves to
+        // it. Source-anchored, scoped to the module body so the needles below
+        // cannot match this test's own text.
+        let src = include_str!("ipc.rs");
+        let body_end = src
+            .find("\nmod tests {")
+            .expect("the tests module marker");
+        let body = &src[..body_end];
+        let doc = body
+            .find("/// Infer the [`SceneKind`]")
+            .expect("the scene_kind_for doc block");
+        let item = body
+            .find("fn scene_kind_for(")
+            .expect("the scene_kind_for definition");
+        assert!(doc < item, "the doc block must precede the function");
+        for line in body[doc..item].lines() {
+            let t = line.trim();
+            assert!(
+                t.is_empty() || t.starts_with("//"),
+                "an item sits between the scene_kind_for doc and the fn, which \
+                 re-attaches the doc to that item: {t:?}"
+            );
+        }
     }
 
     // =======================================================================

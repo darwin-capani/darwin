@@ -431,8 +431,14 @@ fn entity_ref_order(a: &EntityRef, b: &EntityRef) -> std::cmp::Ordering {
 }
 
 /// Set every connectable entity to [`HighlightFlag::Dimmed`] (SPEC §4: off-net
-/// entities dim to 25%). Components/sheets carry no net but are dimmed too so the
+/// entities dim to 25%). Components carry no net but are dimmed too so the
 /// selected net visually pops; the renderer maps `Dimmed` uniformly.
+///
+/// SHEETS ARE NOT DIMMED, and this doc used to say they were. [`Scene`] has no
+/// `sheet_flags` array (scene.rs's parallel arrays are component/pad/wire/
+/// junction/label/track/via/zone), so there is nothing to write — see
+/// [`set_flag`], which returns `false` for every sheet. Contained today only
+/// because `render.rs` draws no sheets either.
 fn dim_all(scene: &mut Scene) {
     for f in &mut scene.component_flags {
         *f = HighlightFlag::Dimmed;
@@ -495,8 +501,18 @@ fn demote_trace_front(scene: &mut Scene) {
 /// Write `flag` into the flag array for `e`'s class at `e`'s index. Returns
 /// `true` if the index was in range (the entity exists), `false` otherwise
 /// (out-of-range refs are ignored, never panic — the graph and scene agree on
-/// indices, but trace stays total against adversarial input). Components and
-/// sheets have flag arrays too, so every [`EntityKind`] is handled.
+/// indices, but trace stays total against adversarial input).
+///
+/// Every [`EntityKind`] is MATCHED, but not every one can be written: `Sheet`
+/// has no flag array in the [`Scene`] (there is no `sheet_flags` field, and
+/// `init_flags`/`clear_highlights` have no sheet arm either), so a sheet write
+/// is a no-op returning `false`. This doc used to claim "Components and sheets
+/// have flag arrays too, so every EntityKind is handled" nine lines above the
+/// arm that says `no sheet flag array in the scene` — a sheet is a full
+/// `EntityKind` that the R-tree indexes and `Scene::entity_net` handles, so a
+/// caller extending trace/render against that sentence would have believed
+/// sheets were highlightable. They are not; giving them a highlight means adding
+/// `sheet_flags` to the scene first.
 fn set_flag(scene: &mut Scene, e: EntityRef, flag: HighlightFlag) -> bool {
     let i = e.idx();
     let arr: &mut Vec<HighlightFlag> = match e.kind {
@@ -733,6 +749,76 @@ mod tests {
         }
         assert_eq!(t.current_net(), NetId::new(1));
         assert!(!t.is_tracing());
+    }
+
+    #[test]
+    fn a_sheet_has_no_flag_array_so_set_flag_is_a_no_op() {
+        // `set_flag`'s doc used to promise "Components and sheets have flag
+        // arrays too, so every EntityKind is handled" — nine lines above the arm
+        // that says `no sheet flag array in the scene`, and `dim_all`'s doc
+        // claimed sheets were dimmed with the rest. The Scene has no
+        // `sheet_flags` field at all. Pin the real contract: a sheet write is a
+        // no-op that reports failure, and it must not scribble on some OTHER
+        // class's array to fake success.
+        let (mut scene, g) = fixture();
+        // Give the scene a real sheet AND a real component, so "sheet 0" is a
+        // live index and `component_flags[0]` is in range: without both, a
+        // mutant that aliased sheets onto some other class's array would still
+        // return false (out of range) and this test would not see the change.
+        scene.sheets.push(crate::scene::Sheet {
+            name: "sub".into(),
+            file: "sub.kicad_sch".into(),
+            bbox: crate::scene::Aabb::new(Point::new(0.0, 0.0), Point::new(10.0, 10.0)),
+        });
+        scene.components.push(crate::scene::Component {
+            reference: "U1".into(),
+            value: "MCU".into(),
+            lib_id: "MCU:X".into(),
+            position: Point::new(0.0, 0.0),
+            rotation: 0.0,
+            mirror: false,
+            bbox: crate::scene::Aabb::new(Point::new(-5.0, -5.0), Point::new(5.0, 5.0)),
+            layer: LayerId::SCHEMATIC,
+        });
+        scene.init_flags();
+        let mut t = Tracer::new();
+        t.select_net(&mut scene, &g, NetId::new(1));
+        assert_eq!(
+            scene.component_flags.len(),
+            1,
+            "precondition: component_flags[0] is a writable slot"
+        );
+        let before = (
+            scene.component_flags.clone(),
+            scene.pad_flags.clone(),
+            scene.wire_flags.clone(),
+            scene.junction_flags.clone(),
+            scene.label_flags.clone(),
+            scene.track_flags.clone(),
+            scene.via_flags.clone(),
+            scene.zone_flags.clone(),
+        );
+
+        let sheet = EntityRef::sheet(0u32.into());
+        assert!(
+            !set_flag(&mut scene, sheet, HighlightFlag::Highlighted),
+            "a sheet write must report false — there is no array to write"
+        );
+
+        assert_eq!(
+            before,
+            (
+                scene.component_flags.clone(),
+                scene.pad_flags.clone(),
+                scene.wire_flags.clone(),
+                scene.junction_flags.clone(),
+                scene.label_flags.clone(),
+                scene.track_flags.clone(),
+                scene.via_flags.clone(),
+                scene.zone_flags.clone(),
+            ),
+            "a sheet write must not land in another class's flag array"
+        );
     }
 
     #[test]
