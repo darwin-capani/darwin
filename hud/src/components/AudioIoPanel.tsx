@@ -232,7 +232,7 @@ function SfxCueTrigger() {
     void (async () => {
       try {
         const settings = await configGet();
-        const sfx = settings.find((s) => s.key === "voice.cloud_sfx");
+        const sfx = settings.find((s) => s.id === "voice.cloud_sfx");
         if (live) setCloudSfxOn(sfx?.value === true);
       } catch {
         if (live) setCloudSfxOn(false);
@@ -369,7 +369,7 @@ function VoiceLab() {
     void (async () => {
       try {
         const settings = await configGet();
-        const tier = settings.find((s) => s.key === "voice.cloud_tier");
+        const tier = settings.find((s) => s.id === "voice.cloud_tier");
         if (live) setCloudTierOn(tier?.value === true);
       } catch {
         if (live) setCloudTierOn(false);
@@ -548,7 +548,7 @@ function ComposeMusic() {
     void (async () => {
       try {
         const settings = await configGet();
-        const music = settings.find((s) => s.key === "voice.cloud_music");
+        const music = settings.find((s) => s.id === "voice.cloud_music");
         if (live) setCloudMusicOn(music?.value === true);
       } catch {
         if (live) setCloudMusicOn(false);

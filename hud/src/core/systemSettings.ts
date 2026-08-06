@@ -859,3 +859,28 @@ export function valueMapFromStates(
   }
   return map;
 }
+
+/**
+ * Read a boolean setting by its DOTTED ID ("voice.cloud_sfx").
+ *
+ * WHAT WENT WRONG: three AudioIoPanel gates looked the setting up on the wrong
+ * field —
+ *
+ *   settings.find((s) => s.key === "voice.cloud_sfx")
+ *
+ * The backend fills `id` with the dotted form ("voice.cloud_sfx") and `key` with
+ * the BARE key ("cloud_sfx"), so that predicate is never true. The SFX cue Play
+ * buttons, the Voice Lab, and Compose Music were therefore permanently disabled
+ * no matter how the config and Keychain were set — and the panels blamed the
+ * user, telling them to "turn on [voice].cloud_sfx and add a key" when both
+ * already were.
+ *
+ * That is NOT this project's honest "ON but inert without its dependency"
+ * pattern. It was dead WITH the dependency present.
+ *
+ * Going through one helper means the id/key drift cannot recur silently in a
+ * component, which vitest cannot mount (node env, no DOM).
+ */
+export function readBoolSetting(states: SettingState[], id: string): boolean {
+  return states.find((s) => s.id === id)?.value === true;
+}
