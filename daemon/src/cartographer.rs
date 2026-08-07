@@ -96,6 +96,15 @@ pub async fn map_trace(trace: &str, root: Option<&str>) -> Result<String> {
     let mut windows_used = 0usize;
     for frame in frames {
         let resolved = resolve_in_root(&frame.file, &root_canon);
+        // WHAT WENT WRONG: `in_project` was derived from `window.is_some()` — i.e. from
+        // whether we EXCERPTED the file, not from whether the frame RESOLVED inside the
+        // project root. MAX_WINDOWS is 15 and MAX_FRAMES is 40, so frames 16..40 that
+        // are real files inside the root were tagged "[library]", counted in the
+        // "library/unresolved" census, and printed with "(source unavailable — outside
+        // project root or not on disk)" — a false statement about the user's own code.
+        // The same wrong label fired for any in-root frame whose line number is past
+        // EOF. Resolution and excerpting are separate facts; keep them separate.
+        let in_project = resolved.is_some();
         let window = match resolved {
             Some(path) if windows_used < MAX_WINDOWS => match read_window(&path, frame.line, &root_canon) {
                 Some(w) => {
@@ -107,7 +116,7 @@ pub async fn map_trace(trace: &str, root: Option<&str>) -> Result<String> {
             _ => None,
         };
         mapped.push(Mapped {
-            in_project: window.is_some(),
+            in_project,
             window,
             frame,
         });
@@ -398,6 +407,12 @@ fn render_map(headline: &str, mapped: &[Mapped], root: &Path) -> String {
         match &m.window {
             Some(w) => {
                 out.push_str(w);
+            }
+            // An IN-PROJECT frame with no excerpt is the window cap (or a line past
+            // EOF), not a missing file — saying "source unavailable" about the user's
+            // own code is a false statement, which is what this used to print.
+            None if m.in_project => {
+                out.push_str("    (excerpt omitted — in project, past the excerpt window cap)\n");
             }
             None => {
                 out.push_str("    (source unavailable — outside project root or not on disk)\n");

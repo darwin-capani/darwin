@@ -26,10 +26,11 @@
 //!     this module prove the MATH on SYNTHETIC durations/usage/traces; they do
 //!     NOT measure a live turn (which would need the mic + the cloud and is
 //!     out-of-scope for a hermetic test).
-//!   * COST has a second runtime gate: the live token `usage` counters are only
-//!     available once the cloud reply path surfaces them per turn. Until that
-//!     wiring lands the cost window simply stays empty (`awaiting turns`) — the
-//!     machinery is proven here, the live feed is gated on real cloud calls.
+//!   * COST has a second runtime gate: the live token `usage` counters only exist
+//!     once a real cloud round-trip happens. The WIRING HAS LANDED —
+//!     `record_cloud_usage` feeds this window from anthropic.rs's cloud reply sites —
+//!     so the window is empty only until the first cloud call of the run, not because
+//!     the feed is unbuilt. (This bullet used to say the wiring had not landed.)
 //!   * NO PII ever leaves this module: the emitted `eval.*` telemetry and the
 //!     report snapshot are AGGREGATE-ONLY (percentiles, sums, rates, counts).
 //!     No utterance, no per-turn row, no identifier.
@@ -81,9 +82,14 @@ pub struct CostRates {
 
 impl Default for CostRates {
     fn default() -> Self {
-        // Published list pricing for the primary cloud model, in USD per 1M
-        // tokens. A transparent multiplier ONLY — the emitted dollar figure is
-        // always marked an estimate, never a billed number.
+        // The SONNET-tier list price, in USD per 1M tokens — the middle branch of
+        // `rates_for_model`. HONESTY: this project ships NO Sonnet model
+        // (fast_model = claude-haiku-4-5, heavy_model = claude-opus-4-8), so this is a
+        // deliberately mid-range fallback for an unrecognized/absent model string, NOT
+        // "the primary cloud model's price" as this comment used to claim. A caller
+        // that knows the model should use `rates_for_model` instead.
+        // A transparent multiplier ONLY — the emitted dollar figure is always marked an
+        // estimate, never a billed number.
         Self {
             input_per_m: 3.00,
             output_per_m: 15.00,
@@ -110,8 +116,14 @@ impl CostRates {
 /// family the cheapest, the Sonnet family in between; anything unrecognized (an
 /// empty/absent model string, a future model) falls back to [`CostRates::default`]
 /// so the estimate is honest-but-conservative rather than free. PURE — the single
-/// place the daemon maps a model string to its rate, so the eval scorecard and the
-/// OBOL ledger agree on what a given model costs.
+/// place the daemon maps a model string to its rate.
+///
+/// HONESTY: the OBOL ledger uses this (obol.rs). The EVAL SCORECARD did not — the
+/// report task passed a flat `CostRates::default()` (the Sonnet branch) for every
+/// sample, so the two surfaces disagreed 3x high on a Haiku turn and 5x low on an
+/// Opus one. The scorecard now passes `rates_for_model(&cfg.cloud.fast_model)`; a
+/// fully model-aware window (one rate per recorded sample) is still the correct end
+/// state and needs `EvalState::record_usage` to keep the response's model id.
 pub fn rates_for_model(model: &str) -> CostRates {
     let m = model.to_ascii_lowercase();
     if m.contains("opus") {

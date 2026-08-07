@@ -46,7 +46,11 @@
 //     on-device store by [`load`] (`state/runbooks/<name>.runbook.toml`).
 //   * config.rs — `[runbook]` (RunbookConfig, SHIPS OFF) gates the whole subsystem.
 //   * telemetry.rs — [`emit_plan`] / [`emit_run`] / [`status_frame`] are the SECRET-FREE
-//     frames the HUD renders (`status_frame` is already wired at daemon startup).
+//     frames this module emits (`status_frame` is already wired at daemon startup).
+//     HONESTY: the HUD does NOT render them — there is no `runbook` handling anywhere
+//     in hud/src, so `runbook.plan` / `runbook.run` / `runbook.status` /
+//     `runbook.blocked` reach the telemetry/journal consumers and are dropped by the
+//     HUD reducer's fallback. This line used to claim the HUD renders them.
 //
 // A handful of pure inspection helpers (e.g. [`Registry::empty`]) remain part of the
 // auditable contract surface without an external caller yet, so the module keeps a
@@ -778,14 +782,28 @@ pub fn topological_order(rb: &Runbook) -> Result<Vec<String>, Vec<String>> {
             }
         }
     }
-    // Seed the queue with indegree-0 steps in FILE order (stable ties).
+    // Seed the queue with indegree-0 steps in FILE order (stable ties), each DISTINCT
+    // id at most ONCE.
+    //
+    // WHAT WENT WRONG: the seed walked `rb.steps`, which CAN hold the same id twice —
+    // `parse` does not dedup ids, and `check` calls this function UNCONDITIONALLY (it
+    // pushes the DuplicateStepId diagnostic and then runs the cycle check anyway). But
+    // `indegree`/`ids` are keyed by id and COLLAPSE duplicates, so a duplicated
+    // indegree-0 id was pushed twice and each of its children was decremented once per
+    // POP while only ever incremented once per DISTINCT parent. In a debug/test build
+    // that underflowed — "attempt to subtract with overflow", a panic INSIDE THE
+    // CHECKER, on a runbook whose only fault was a repeated id. In release it silently
+    // emitted the duplicate id twice in the run order, or returned `Err(vec![])`, which
+    // `check` renders as "the runbook has a dependency cycle among: " with an EMPTY
+    // member list for a runbook that has no cycle at all.
+    let mut queued: HashSet<&str> = HashSet::new();
     let mut queue: VecDeque<&str> = rb
         .steps
         .iter()
         .map(|s| s.id.as_str())
-        .filter(|id| indegree[id] == 0)
+        .filter(|id| indegree[id] == 0 && queued.insert(*id))
         .collect();
-    let mut order: Vec<String> = Vec::with_capacity(rb.steps.len());
+    let mut order: Vec<String> = Vec::with_capacity(ids.len());
     while let Some(id) = queue.pop_front() {
         order.push(id.to_string());
         if let Some(children) = deps.get(id) {
@@ -798,7 +816,10 @@ pub fn topological_order(rb: &Runbook) -> Result<Vec<String>, Vec<String>> {
             }
         }
     }
-    if order.len() == rb.steps.len() {
+    // Compare against the DISTINCT id count, not `rb.steps.len()` — with a duplicated
+    // id the raw step count can never be reached, which is what turned a duplicate into
+    // a phantom "cycle".
+    if order.len() == ids.len() {
         Ok(order)
     } else {
         // The unresolved steps are exactly those still carrying indegree > 0.
@@ -810,6 +831,7 @@ pub fn topological_order(rb: &Runbook) -> Result<Vec<String>, Vec<String>> {
             .map(str::to_string)
             .collect();
         cycle.sort();
+        cycle.dedup();
         Err(cycle)
     }
 }
@@ -1661,6 +1683,108 @@ mod tests {
         let pos = |id: &str| order.iter().position(|x| x == id).unwrap();
         assert!(pos("a") < pos("b"), "a before b: {order:?}");
         assert!(pos("b") < pos("c"), "b before c: {order:?}");
+    }
+
+    /// REGRESSION: a DUPLICATE step id must not blow up the checker.
+    ///
+    /// The Kahn seed walked `rb.steps` (duplicates and all) while `indegree` collapsed
+    /// them, so a duplicated indegree-0 id was popped twice and its children were
+    /// decremented once too often. `check` runs `topological_order` unconditionally —
+    /// AFTER pushing DuplicateStepId, before returning it — so the checker itself
+    /// panicked with "attempt to subtract with overflow" in a debug/test build. In
+    /// release the same input silently ordered the id twice, and the mirrored shape
+    /// (a duplicated DEPENDENT) returned `Err(vec![])`, which `check` renders as
+    /// "the runbook has a dependency cycle among: " — an empty member list, for a
+    /// runbook with no cycle at all.
+    #[test]
+    fn a_duplicate_step_id_does_not_underflow_or_fake_a_cycle() {
+        // A duplicated indegree-0 id, with a dependent: the debug-build panic case.
+        let dup_producer = r#"
+            [runbook]
+            name = "x"
+            [[step]]
+            id = "a"
+            uses = "summarize"
+            with = { text = "t" }
+            out = "o"
+            [[step]]
+            id = "a"
+            uses = "summarize"
+            with = { text = "t" }
+            out = "o"
+            [[step]]
+            id = "b"
+            uses = "summarize"
+            needs = ["a"]
+            with = { text = "t" }
+            out = "o"
+        "#;
+        let rb = parse(dup_producer).unwrap();
+        let order = topological_order(&rb).expect("a duplicate id is not a cycle");
+        assert_eq!(order, vec!["a".to_string(), "b".to_string()], "each DISTINCT id is ordered once");
+        let d = check(&rb, &reg());
+        assert!(kinds(&d).contains(&DiagKind::DuplicateStepId), "got {:?}", kinds(&d));
+        assert!(
+            !kinds(&d).contains(&DiagKind::Cycle),
+            "a repeated id is not a dependency cycle; got {:?}",
+            kinds(&d)
+        );
+
+        // A duplicated DEPENDENT: the release-build phantom `Err(vec![])` case.
+        let dup_dependent = r#"
+            [runbook]
+            name = "x"
+            [[step]]
+            id = "p"
+            uses = "summarize"
+            with = { text = "t" }
+            out = "o"
+            [[step]]
+            id = "a"
+            uses = "summarize"
+            needs = ["p"]
+            with = { text = "t" }
+            out = "o"
+            [[step]]
+            id = "a"
+            uses = "summarize"
+            needs = ["p"]
+            with = { text = "t" }
+            out = "o"
+        "#;
+        let rb = parse(dup_dependent).unwrap();
+        assert!(
+            topological_order(&rb).is_ok(),
+            "a duplicated dependent is not a cycle: {:?}",
+            topological_order(&rb)
+        );
+
+        // And a REAL cycle still reports NON-EMPTY members, even with a duplicate id.
+        let real_cycle = r#"
+            [runbook]
+            name = "x"
+            [[step]]
+            id = "x"
+            uses = "summarize"
+            needs = ["y"]
+            with = { text = "t" }
+            out = "o"
+            [[step]]
+            id = "y"
+            uses = "summarize"
+            needs = ["x"]
+            with = { text = "t" }
+            out = "o"
+            [[step]]
+            id = "x"
+            uses = "summarize"
+            needs = ["y"]
+            with = { text = "t" }
+            out = "o"
+        "#;
+        let rb = parse(real_cycle).unwrap();
+        let members = topological_order(&rb).expect_err("x<->y is a cycle");
+        assert_eq!(members, vec!["x".to_string(), "y".to_string()], "cycle members are named, once each");
     }
 
     // ---- plan render: which steps PARK --------------------------------------

@@ -575,10 +575,38 @@ pub fn classify_pasteboard_intent(utterance: &str) -> Option<PasteboardIntent> {
     let mentions_clipboard = lower.contains("clipboard");
     let mentions_copied = lower.contains("copied") || lower.contains("i copy");
 
-    // FORGET: an explicit wipe of the clipboard history. Requires "clipboard" so a
-    // generic "forget that" never wipes the ring.
+    // FORGET: an explicit wipe of the clipboard history.
+    //
+    // WHAT WENT WRONG: this branch ran FIRST and asked only whether the sentence
+    // mentioned "clipboard" AND carried the WORD "forget"/"clear"/"wipe" ANYWHERE. The
+    // wipe verb is ordinary English, so a READ request that happened to contain one was
+    // heard as a WIPE and router.rs called `global_clear()` — "what did I copy to my
+    // clipboard? I forget", "i forget what i copied to my clipboard", "search my
+    // clipboard history for the address, i forget it", "find the thing i copied about
+    // the clear coat on my clipboard", "recall my clipboard history about the wipe test
+    // results". The ring was destroyed and the user was told "Done, sir — I've wiped
+    // your clipboard history." The existing regression test pinned only the SUBSTRING
+    // half of the trap ("nuclear"/"clearance"), never the ordering.
+    //
+    // The wipe verb must now be AIMED AT the clipboard ("clear my clipboard", "forget
+    // the clipboard history", "wipe clipboard"), and an explicit read QUESTION vetoes
+    // the branch outright. `mentions_any_word` still runs so "unclear clipboard status"
+    // cannot sneak "clear clipboard" through as a substring.
+    const WIPE_VERBS: &[&str] = &["forget", "clear", "wipe", "erase", "empty"];
+    let wipe_aimed_at_the_clipboard = WIPE_VERBS.iter().any(|v| {
+        ["my ", "the ", "", "my whole ", "the whole ", "all my "]
+            .iter()
+            .any(|det| lower.contains(&format!("{v} {det}clipboard")))
+    });
+    let read_question = lower.contains("what did i copy")
+        || lower.contains("what have i copied")
+        || lower.contains("what i copied")
+        || lower.contains("thing i copied")
+        || lower.contains("things i copied");
     if mentions_clipboard
-        && crate::utterance::mentions_any_word(&lower, &["forget", "clear", "wipe"])
+        && !read_question
+        && crate::utterance::mentions_any_word(&lower, WIPE_VERBS)
+        && wipe_aimed_at_the_clipboard
     {
         return Some(PasteboardIntent::Forget);
     }
@@ -586,10 +614,7 @@ pub fn classify_pasteboard_intent(utterance: &str) -> Option<PasteboardIntent> {
     // RECALL: an explicit retrieval cue over the clipboard / past copies. An
     // imperative "copy X to my clipboard" (a PUT) has neither "copied"/"i copy"
     // nor a recall verb, so it is excluded here.
-    let recall_cue = lower.contains("what did i copy")
-        || lower.contains("what have i copied")
-        || lower.contains("thing i copied")
-        || lower.contains("things i copied")
+    let recall_cue = read_question
         || lower.contains("clipboard history")
         || lower.contains("recall")
         || lower.contains("find")
@@ -649,11 +674,40 @@ mod tests {
                  what the user was reaching for (got {got:?})"
             );
         }
+        // REGRESSION (ordering, not just substrings): a READ request whose sentence
+        // happens to carry a wipe WORD must never wipe. The FORGET branch ran first and
+        // asked only "does the sentence mention clipboard AND contain forget/clear/wipe
+        // anywhere", so every one of these erased the ring and answered "Done, sir —
+        // I've wiped your clipboard history."
+        for u in [
+            "what did i copy to my clipboard? i forget",
+            "i forget what i copied to my clipboard",
+            "search my clipboard history for the address, i forget it",
+            "find the thing i copied about the clear coat on my clipboard",
+            "recall my clipboard history about the wipe test results",
+        ] {
+            let got = classify_pasteboard_intent(u);
+            assert!(
+                !matches!(got, Some(PasteboardIntent::Forget)),
+                "{u:?} is a READ; wiping here destroys exactly what the user asked for \
+                 (got {got:?})"
+            );
+        }
         // A real wipe still wipes.
         assert!(matches!(
             classify_pasteboard_intent("clear my clipboard"),
             Some(PasteboardIntent::Forget)
         ));
+        assert!(matches!(
+            classify_pasteboard_intent("forget my clipboard history"),
+            Some(PasteboardIntent::Forget)
+        ));
+        assert!(matches!(
+            classify_pasteboard_intent("wipe the clipboard"),
+            Some(PasteboardIntent::Forget)
+        ));
+        // ...but a wipe-shaped word that is not aimed at the clipboard does not.
+        assert_eq!(classify_pasteboard_intent("unclear clipboard status"), None);
     }
 
     use super::*;

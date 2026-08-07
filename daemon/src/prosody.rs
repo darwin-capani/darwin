@@ -365,19 +365,93 @@ pub fn is_sustained_quiet(energies: &[f32]) -> bool {
     energies.len() >= WHISPER_SUSTAINED_SAMPLES && energies.iter().all(|&e| e < WHISPER_QUIET_RMS)
 }
 
+/// Normalize for phrase matching: lowercase, drop trailing sentence punctuation, and
+/// collapse runs of whitespace. Mirrors `vault::normalize`, the sibling ANCHORED
+/// command classifier this one is supposed to match.
+fn normalize(text: &str) -> String {
+    let lowered = text.trim().trim_end_matches(['.', '!', '?', ',']).to_lowercase();
+    lowered.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Trailing politeness/filler stripped before anchoring, so "can you speak quietly
+/// please" and "you can speak normally now" still read as the commands they are.
+const TRAILING_FILLER: &[&str] = &[
+    "please", "now", "sir", "ok", "okay", "thanks", "thank you", "for me", "again",
+];
+
+/// Strip any run of [`TRAILING_FILLER`] words off the end of `norm`.
+fn strip_trailing_filler(norm: &str) -> &str {
+    let mut s = norm;
+    loop {
+        let before = s;
+        for f in TRAILING_FILLER {
+            if let Some(head) = s.strip_suffix(f) {
+                if head.is_empty() || head.ends_with(' ') {
+                    s = head.trim_end();
+                    break;
+                }
+            }
+        }
+        if s == before {
+            return s;
+        }
+    }
+}
+
+/// Whether the normalized utterance's TRAILING imperative is one of `phrases` — the
+/// utterance IS the phrase, or ends with it on a word boundary. This is the anchor:
+/// a phrase buried mid-sentence is a MENTION, not a command.
+fn ends_with_phrase(norm: &str, phrases: &[&str]) -> bool {
+    phrases
+        .iter()
+        .any(|p| norm == *p || norm.strip_suffix(p).is_some_and(|head| head.ends_with(' ')))
+}
+
 /// PURE command parser: map an operator utterance to a [`WhisperCommand`], or None
-/// when it is not a whisper toggle. Case-insensitive substring match on a small,
-/// conservative phrase set. "back to normal" / "speak normally" / "out loud" win over
-/// the on-phrases so a "normal" utterance is never misread as "engage".
+/// when it is not a whisper toggle. ANCHORED: the phrase must be the utterance's
+/// TRAILING imperative (after trailing politeness is stripped), and OFF phrases are
+/// checked first so a "normal" utterance is never misread as "engage".
+///
+/// WHAT WENT WRONG: this was an unanchored `lower.contains()` over a phrase set whose
+/// ON list held the BARE TOKEN "whisper" — and whisper is THIS PROJECT'S OWN STT
+/// ENGINE (`stt = "mlx-community/whisper-small-mlx"`). So "which whisper model are you
+/// using for transcription?", "is whisper running on device or in the cloud?" and
+/// "switch transcription back to whisper" all parsed as `On`. router.rs handles this
+/// classifier BEFORE any intent classifier and RETURNS, so the question was never
+/// answered: the turn was consumed, the user got "Speaking discreetly, sir.", and every
+/// later reply was silently made terse and 0.45x volume until they said "back to
+/// normal". `guest_denied_fast_path` refuses the same text as an owner-control attempt.
+/// "keep it down to three bullet points" (-> On) and "please speak up about the deploy
+/// status" (-> Off) were the same bug through the two short ambiguous phrases.
+/// The doc claimed "conservative phrase set" and router.rs:376 claimed "CONSERVATIVELY
+/// anchored"; neither was true — nothing was anchored at all. Anchoring on the TRAILING
+/// imperative (rather than vault's LEADING one) is what the real command shapes need:
+/// "please switch to whisper mode" and "can you speak quietly please" are both real.
 pub fn parse_whisper_command(utterance: &str) -> Option<WhisperCommand> {
-    let u = utterance.to_lowercase();
+    let norm = normalize(utterance);
+    let u = strip_trailing_filler(&norm);
+    if u.is_empty() {
+        return None;
+    }
     // OFF phrases first (precedence): a "back to normal" must never read as "on".
     const OFF: &[&str] = &["back to normal", "speak normally", "speak up", "out loud", "normal voice"];
-    if OFF.iter().any(|p| u.contains(p)) {
+    if ends_with_phrase(u, OFF) {
         return Some(WhisperCommand::Off);
     }
-    const ON: &[&str] = &["whisper mode", "whisper", "speak quietly", "be discreet", "discreet mode", "keep it down"];
-    if ON.iter().any(|p| u.contains(p)) {
+    // NOTE: the BARE token "whisper" is deliberately NOT here — even tail-anchored it
+    // would swallow "switch transcription back to whisper". An explicit toggle uses
+    // one of the multi-word forms below (or the whole-utterance form in ON_EXACT).
+    const ON: &[&str] = &[
+        "whisper mode", "whisper to me", "whisper it", "start whispering",
+        "speak quietly", "speak softly", "be discreet", "discreet mode",
+        "keep it down", "keep your voice down", "lower your voice",
+    ];
+    if ends_with_phrase(u, ON) {
+        return Some(WhisperCommand::On);
+    }
+    // A one-word utterance is unambiguous: it can only be the command.
+    const ON_EXACT: &[&str] = &["whisper", "discreet"];
+    if ON_EXACT.contains(&u) {
         return Some(WhisperCommand::On);
     }
     None
@@ -719,6 +793,44 @@ mod tests {
         assert_eq!(parse_whisper_command("ok back to normal voice"), Some(WhisperCommand::Off));
         // Not a whisper command at all.
         assert_eq!(parse_whisper_command("what's the weather"), None);
+        // Whole-utterance forms and the added anchored imperatives still parse.
+        assert_eq!(parse_whisper_command("whisper"), Some(WhisperCommand::On));
+        assert_eq!(parse_whisper_command("keep it down"), Some(WhisperCommand::On));
+        assert_eq!(parse_whisper_command("lower your voice sir"), Some(WhisperCommand::On));
+        assert_eq!(parse_whisper_command("start whispering"), Some(WhisperCommand::On));
+        assert_eq!(parse_whisper_command("can you speak up"), Some(WhisperCommand::Off));
+        assert_eq!(parse_whisper_command("say that out loud please"), Some(WhisperCommand::Off));
+    }
+
+    /// REGRESSION: an utterance that MENTIONS whisper is not a whisper command.
+    ///
+    /// The ON list held the bare token "whisper" under an unanchored `contains`, and
+    /// this project's OWN speech-to-text engine is named whisper. Asking DARWIN about
+    /// its own transcription stack therefore never reached the classifier at all —
+    /// router.rs handles the whisper toggle BEFORE any intent classifier and returns,
+    /// so the question was consumed, answered with "Speaking discreetly, sir.", and
+    /// every later reply was made terse + quiet until the user said "back to normal".
+    /// A guest asking the same thing was refused as an owner-control attempt.
+    #[test]
+    fn an_utterance_that_merely_mentions_whisper_is_not_a_whisper_command() {
+        for u in [
+            "which whisper model are you using for transcription?",
+            "is whisper running on device or in the cloud?",
+            "switch transcription back to whisper",
+            "what did she whisper to you",
+            "read me the whisper-small-mlx benchmark",
+            "summarize the whisper release notes",
+            // The two short ambiguous phrases, used as ordinary English.
+            "keep it down to three bullet points",
+            "please speak up about the deploy status",
+        ] {
+            assert_eq!(
+                parse_whisper_command(u),
+                None,
+                "{u:?} is an ordinary request; parsing it as a whisper toggle consumes \
+                 the turn and silently changes how every later reply is delivered"
+            );
+        }
     }
 
     // === #34 whisper: terse + soft when on ================================

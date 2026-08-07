@@ -136,7 +136,7 @@ pub enum Verbosity {
 }
 
 impl Verbosity {
-    /// A rank where SMALLER == terser, so "no broader than" is `self >= base` in
+    /// A rank where LARGER == terser, so "no broader than" is `self >= base` in
     /// terseness (i.e. `self.rank() >= base.rank()` means self is at least as
     /// quiet). Full=0 (loudest), Brief=1, Silent=2 (quietest).
     fn rank(&self) -> u8 {
@@ -347,8 +347,12 @@ impl FocusProfile {
             "work" => FocusProfile::Work,
             "sleep" => FocusProfile::Sleep,
             "deep_focus" | "deepfocus" | "deep-focus" => FocusProfile::DeepFocus,
-            // A custom profile name. Preserve the original (trimmed) string for
-            // telemetry copy, but the BEHAVIOR is the restrict-only Custom table.
+            // A custom profile name. Keep the NORMALIZED (trimmed + lowercased) name
+            // on the variant — the original casing is already gone by this point, and
+            // nothing reads the inner String today (telemetry emits the stable
+            // "custom" token, not the name). The BEHAVIOR is the restrict-only Custom
+            // table. This comment used to claim both the original casing and a
+            // telemetry consumer.
             other => FocusProfile::Custom(other.to_string()),
         }
     }

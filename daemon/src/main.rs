@@ -142,7 +142,7 @@ mod interception;
 // CONTINUOUS LIVE INTERPRETATION (#30): the PURE per-segment interpret pipeline
 // (interpret_segment: transcript -> on-device-LLM translate -> rendered translation +
 // optional speak request) using an injectable translator; offline/unavailable degrades
-// HONESTLY (never a fabricated translation). ON by default ([interpret].live) but INERT WITHOUT MIC/TCC. The
+// HONESTLY (never a fabricated translation). SHIPS OFF ([interpret].live = false); INERT WITHOUT MIC/TCC even when on. The
 // continuous live-interpret mode that feeds each VAD segment through it is DEVICE-GATED:
 // wired behind the flag at the audio.rs segment site; only the pure core is proven
 // headlessly (hermetic tests in interpret.rs).
@@ -605,8 +605,10 @@ fn resolve_root() -> PathBuf {
 // AT-REST ENCRYPTION key resolution + migration ([security].encrypt_memory, #11)
 // ---------------------------------------------------------------------------
 
-/// The four sensitive SQLite stores that whole-file SQLCipher encryption covers,
-/// as paths under `state/`. The migration on enable re-keys each existing one.
+/// The sensitive SQLite stores that whole-file SQLCipher encryption covers, as paths
+/// under `state/` — SEVEN of them, matching the array length below (the doc said
+/// "four" while the signature already returned 7). The migration on enable re-keys
+/// each existing one.
 fn sensitive_db_paths(state_dir: &Path) -> [PathBuf; 7] {
     [
         state_dir.join("darwin.db"),            // memory.rs main Db
@@ -737,8 +739,7 @@ fn open_persistence_baseline(
 }
 
 /// daemon.log rotation bound (audit fix: the log was opened append-only and
-/// grew without bound on the always-on appliance, at DEBUG for the daemon's
-/// own crate). At the bound the live file is renamed to daemon.log.1
+/// grew without bound on the always-on appliance). At the bound the live file is renamed to daemon.log.1
 /// (replacing the previous rotation — total footprint stays bounded) and a
 /// fresh daemon.log is opened. The heal watchdog tails only the live file;
 /// a rotation just shortens its tail for one tick.
@@ -799,7 +800,11 @@ fn init_tracing(root: &Path) -> Result<()> {
     // Without a filter the registry defaults to TRACE and instrumented deps
     // (hyper-util connection pools etc.) spam daemon.log; RUST_LOG overrides.
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,darwin_core=debug"));
+        // The BINARY target is `darwind` (daemon/Cargo.toml `[[bin]] name = "darwind"`),
+        // so every tracing target is `darwind::<module>`. The old directive named the
+        // PACKAGE (`darwin_core`), which matches no target at all — so every debug! in
+        // the daemon was unreachable and daemon.log contained zero DEBUG lines.
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,darwind=debug"));
     tracing_subscriber::registry()
         .with(filter)
         .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
@@ -922,6 +927,67 @@ fn resolve_explicit_guest(
 /// Pure over the args + the per-turn guest scope, so the boundary is unit-tested.
 fn should_learn_turn(response: &str, transient: bool) -> bool {
     !response.is_empty() && !transient && !threshold::is_guest_turn()
+}
+
+/// Is THIS turn a TRANSIENT PERCEPTION READ?
+///
+/// PRIVACY — TRANSIENT PERCEPTION READS: a screen-read turn ("read my screen" /
+/// "what's on my screen" / "where's the <X> button"), a VLM DESCRIBE (task #2), an
+/// IMAGE-GENERATION turn (task #18), an IDENTIFY-SOUND turn (task #15) and a
+/// SCREEN-CONTEXT RECALL (task #42) all surface content that can be arbitrarily
+/// sensitive — on-screen passwords/messages, a private photo, the bounded on-screen
+/// context ring. Such a turn's utterance AND its acknowledgment must stay out of
+/// LIFELONG memory (the durable transcript, the fact learner, the episodic store,
+/// the CAUSA trace and the optimizer corpus). PURE over the utterance text, so the
+/// decision is available at every gate in `run_pipeline` — including the FIRST one.
+fn transient_turn(text: &str) -> bool {
+    router::is_screen_read(text)
+        || router::is_describe_request(text)
+        || router::is_generate_image_request(text)
+        || router::is_identify_sound_request(text)
+        || screen_context::is_screen_context_recall(text)
+}
+
+/// Record the completed turn in the DURABLE transcript store — unless the turn was a
+/// TRANSIENT perception read, in which case NOTHING is written.
+///
+/// WHAT WENT WRONG: `run_pipeline` called `memory.record_transcript(...)`
+/// UNCONDITIONALLY, roughly 110 lines BEFORE `transient` was even computed. The
+/// transience gate was applied only to the fact-learner, the episodic store, the
+/// CAUSA trace and the optimizer trace — never to the transcript. So the most
+/// privacy-sensitive text the product handles (recent on-screen context; an
+/// unredacted VLM description of the screen or a private photo) was INSERTed into the
+/// durable `transcripts` table, and from there
+///   * replayed into every later turn's chat history (`recent_exchanges` ->
+///     `router::fetch_history` -> `complete_persona`), INCLUDING cloud completions —
+///     the exact egress the on-device screen-read path exists to avoid, and
+///   * fed to the reflection consolidation (`reflect.rs` reads `recent_exchanges(40)`
+///     and writes the returned pairs through `upsert_user_fact`), so a "transient"
+///     turn could seed a DURABLE fact.
+///
+/// Meanwhile the turn emitted `privacy.transient_screen_read {"persisted": false}`.
+/// The gate now lives on the WRITE, on the same side of the seam as the write, and
+/// takes the utterance directly so no caller can pass the wrong flag.
+///
+/// The GUEST chokepoint inside `Memory::record_transcript` is unchanged and still
+/// applies to every non-transient turn.
+async fn record_turn_transcript(
+    memory: &Memory,
+    wav_path: Option<&str>,
+    text: &str,
+    intent: &str,
+    routed_to: &str,
+    response: &str,
+) {
+    if transient_turn(text) {
+        return;
+    }
+    if let Err(e) = memory
+        .record_transcript(wav_path, text, intent, routed_to, Some(response))
+        .await
+    {
+        warn!(error = %e, "failed to record transcript");
+    }
 }
 
 fn spawn_learning_task(sock: PathBuf, memory: Arc<Memory>, utterance: String, response: String) {
@@ -1122,7 +1188,12 @@ async fn eval_report_task(
         // "awaiting turns" in the snapshot).
         let (latency, cost) = {
             let st = eval_state.lock().await;
-            (st.latency(), st.cost(eval::CostRates::default()))
+            // Rate the window at the model this deployment actually calls, not the
+            // Sonnet-tier `CostRates::default()` — this project ships Haiku/Opus, so
+            // the flat default made the scorecard disagree with the OBOL ledger by 3x
+            // on a Haiku turn. (Fully per-sample rating needs EvalState to record each
+            // response's model id; this is the honest single-model estimate.)
+            (st.latency(), st.cost(eval::rates_for_model(&cfg.cloud.fast_model)))
         };
         // Accuracy + correction-rate from the durable trace corpus. A read
         // failure degrades to an empty (awaiting) accuracy — never wedges.
@@ -1785,8 +1856,11 @@ async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, soc
         // TRIPWIRE (condition) triggers: fire on a threshold crossing of the verified
         // signal snapshot rather than the clock. Only evaluated when the subsystem is
         // enabled, at least one enabled condition mission exists, and the configured
-        // eval cadence has elapsed — so NO snapshot is built (no network read) when
-        // there are no tripwires. A firing tripwire launches the SAME bounded run as
+        // eval cadence has elapsed. NOTE: the SNAPSHOT itself is NOT conditional — it
+        // is collected UNCONDITIONALLY above for the on-signal token set, and the
+        // tripwires reuse it, so a tick DOES perform the throttled calendar/mail reads
+        // even with no tripwires configured. This comment used to promise the
+        // opposite. A firing tripwire launches the SAME bounded run as
         // a time mission (RE-REASONED each fire), and its consequential steps still
         // park. The pure scheduler `standing::due_condition_missions` applies the
         // hysteresis/debounce via the ledger and honors the same master-switch guard.
@@ -2199,22 +2273,15 @@ async fn main() -> Result<()> {
     // bounded in-RAM ring never grows on its own) and no WATCHING indicator fires.
     // The flag cannot grant the consent. With consent the live capture
     // is TCC-device-gated in the Vision app; the ring stays bounded/redacted/
-    // transient + forgettable. Only the bool + cap are installed (no secrets).
+    // transient + forgettable. Only the bool + cap are installed (no secrets). SHIPS
+    // ON — see the deferred `screen_context.configured` frame below for the payload.
     screen_context::install_settings(
         cfg.screen_context.enabled,
         cfg.screen_context.effective_cap(),
     );
-    telemetry::emit(
-        "system",
-        "screen_context.configured",
-        // Secret-free: only the gate + bounds. With enabled=false (the default)
-        // the continuous loop never runs and the ring never grows.
-        serde_json::json!({
-            "enabled": cfg.screen_context.enabled,
-            "cap": cfg.screen_context.effective_cap(),
-            "interval_secs": cfg.screen_context.effective_interval_secs(),
-        }),
-    );
+    // TELEMETRY ORDER: the `screen_context.configured` frame is emitted AFTER
+    // telemetry::init() — see the DEFERRED STARTUP FRAMES block below. emit() is a
+    // silent no-op until init installs the hub, and init runs ~300 lines further down.
     // LUMEN (lumen.rs): install the continuous-narration gate ONCE from
     // [lumen].narrate (mirrors screen_context::install_settings). SHIPS OFF —
     // continuous focus-change narration reads on-screen text aloud, so it is
@@ -2223,13 +2290,7 @@ async fn main() -> Result<()> {
     // path (which selects ONE target and hands it to the UNCHANGED ui_actuate
     // capstone) are unaffected by this gate. Only the bool is installed/logged.
     lumen::install_settings(cfg.lumen.narrate, cfg.lumen.effective_max_controls());
-    telemetry::emit(
-        "system",
-        "lumen.configured",
-        // Secret-free: only the opt-in gate + the control bound (never any
-        // on-screen content).
-        lumen::status_frame(cfg.lumen.narrate),
-    );
+    // TELEMETRY ORDER: emitted AFTER telemetry::init() — see DEFERRED STARTUP FRAMES.
     // SEMANTIC PASTEBOARD (pasteboard.rs): install the [pasteboard] settings ONCE
     // so the recall op + the poll loop read one process-global gate. SHIPS OFF
     // (enabled=false) — with it off nothing is polled or stored and the poll loop
@@ -2239,15 +2300,7 @@ async fn main() -> Result<()> {
         cfg.pasteboard.effective_retention(),
         cfg.pasteboard.effective_poll_interval_secs(),
     );
-    telemetry::emit(
-        "system",
-        "pasteboard.configured",
-        serde_json::json!({
-            "enabled": cfg.pasteboard.enabled,
-            "retention": cfg.pasteboard.effective_retention(),
-            "poll_interval_secs": cfg.pasteboard.effective_poll_interval_secs(),
-        }),
-    );
+    // TELEMETRY ORDER: emitted AFTER telemetry::init() — see DEFERRED STARTUP FRAMES.
     // APERTURE (aperture.rs): install the [aperture] settings ONCE so the recall op
     // + the poll loop read one process-global gate. SHIPS OFF (enabled=false) — an
     // activity timeline is privacy-sensitive, so with it off nothing is polled or
@@ -2258,15 +2311,7 @@ async fn main() -> Result<()> {
         cfg.aperture.effective_retention(),
         cfg.aperture.effective_poll_interval_secs(),
     );
-    telemetry::emit(
-        "system",
-        "aperture.configured",
-        serde_json::json!({
-            "enabled": cfg.aperture.enabled,
-            "retention": cfg.aperture.effective_retention(),
-            "poll_interval_secs": cfg.aperture.effective_poll_interval_secs(),
-        }),
-    );
+    // TELEMETRY ORDER: emitted AFTER telemetry::init() — see DEFERRED STARTUP FRAMES.
     // FURY's mission engine plans + dispatches with the heavy cloud model; wire
     // it from config ONCE so the fury_mission tool arm reads one process-global
     // (mirrors init_persona — no model threading through execute_tool).
@@ -2320,7 +2365,9 @@ async fn main() -> Result<()> {
     // byte-for-byte today's. Emit the startup vault.status so a HUD that connects
     // after boot sees the honest current mode (the frame is retained by telemetry).
     vault::init(cfg.vault.enabled);
-    telemetry::emit("system", "vault.status", vault::status_frame(vault::active()));
+    // TELEMETRY ORDER: emitted AFTER telemetry::init() — see DEFERRED STARTUP FRAMES.
+    // vault.status is a STICKY-RETAINED key, so losing the boot emit meant a HUD that
+    // connected later got no vault.status in its replay at all.
     // MCP CLIENT (docs/SANDBOX.md): connect every configured external tool server
     // ONCE at startup, then install the connected manager as the process-global so
     // the cloud tool loop can offer + route its tools WITHOUT threading a manager
@@ -2601,6 +2648,61 @@ async fn main() -> Result<()> {
     // panel can render the external-tool surface read-only. Shipped-OFF default
     // (enabled=false, no servers) yields an empty, honest "MCP off" snapshot.
     telemetry::emit("system", "mcp.status", mcp_status);
+
+    // DEFERRED STARTUP FRAMES.
+    //
+    // WHAT WENT WRONG: these five frames were emitted at their install sites, ~300
+    // lines ABOVE `telemetry::init()`. `telemetry::emit` returns immediately when
+    // `HUB.get()` is None — BEFORE `retain_sticky` — so every one of them was silently
+    // discarded and no HUD ever saw them, at boot or on a later connect. The comment on
+    // init() states exactly the rule that was being broken, and mcp.status right above
+    // is the one case whose author noticed. The user-visible half: `[screen_context]`
+    // SHIPS ON, but the HUD's Vision panel starts at `enabled: false` and only leaves
+    // it via this frame — so it rendered "OFF by default - the continuous screen-read
+    // loop never auto-starts" for the most privacy-sensitive read feature in the
+    // product while that loop was enabled and armed. `vault.status` is sticky-retained,
+    // so losing its boot emit meant it was absent from every connect replay too.
+    //
+    // The payloads are config-derived (and `vault::active()` is already installed), so
+    // they are computed here and are byte-identical to what the install sites emitted.
+    telemetry::emit(
+        "system",
+        "screen_context.configured",
+        // Secret-free: only the gate + bounds. The shipped default is enabled=true,
+        // INERT WITHOUT Screen-Recording TCC consent; with enabled=false the continuous
+        // loop never runs and the ring never grows.
+        json!({
+            "enabled": cfg.screen_context.enabled,
+            "cap": cfg.screen_context.effective_cap(),
+            "interval_secs": cfg.screen_context.effective_interval_secs(),
+        }),
+    );
+    telemetry::emit(
+        "system",
+        "lumen.configured",
+        // Secret-free: only the opt-in gate + the control bound (never any on-screen
+        // content).
+        lumen::status_frame(cfg.lumen.narrate),
+    );
+    telemetry::emit(
+        "system",
+        "pasteboard.configured",
+        json!({
+            "enabled": cfg.pasteboard.enabled,
+            "retention": cfg.pasteboard.effective_retention(),
+            "poll_interval_secs": cfg.pasteboard.effective_poll_interval_secs(),
+        }),
+    );
+    telemetry::emit(
+        "system",
+        "aperture.configured",
+        json!({
+            "enabled": cfg.aperture.enabled,
+            "retention": cfg.aperture.effective_retention(),
+            "poll_interval_secs": cfg.aperture.effective_poll_interval_secs(),
+        }),
+    );
+    telemetry::emit("system", "vault.status", vault::status_frame(vault::active()));
     // RUNBOOK subsystem status (runbook.rs; secret-free): whether the benign-only,
     // typed automation-DAG subsystem is enabled and its step bound. SHIPS OFF; a
     // runbook carries no authority (every consequential step PARKS fresh, one at a
@@ -2630,6 +2732,12 @@ async fn main() -> Result<()> {
                 "docsearch index (chunk text + vectors)",
                 "audit log",
                 "optimizer trace store",
+                // These three are opened WITH the master key and migrated by
+                // sensitive_db_paths, but were missing from this HUD payload — so the
+                // panel understated the encrypted scope it claims to state EXACTLY.
+                "OBOL spend ledger",
+                "TCC sentinel baseline",
+                "persistence sentinel baseline",
                 "voiceid owner profile (encrypted blob wrapper)"
             ],
             // EXACTLY what is NOT covered — honest scope.
@@ -3667,8 +3775,9 @@ async fn run_pipeline(
     // translation omitted). This is READ-ONLY DISPLAY: it reuses the SAME transcript (no new
     // recording, no extra audio leaves the device), emits telemetry, and does NOT
     // classify/route/early-return — the utterance flows on to the normal pipeline below.
-    // NOTE: placed BEFORE the interpret gate on purpose — interpret.live ships ON and
-    // early-returns, so captions must tap the transcript first; and like interpret, captions
+    // NOTE: placed BEFORE the interpret gate on purpose — when an operator turns
+    // [interpret].live ON it early-returns, so captions must tap the transcript first
+    // ([interpret].live itself SHIPS OFF); and like interpret, captions
     // renders EVERY utterance (it is not "addressed to DARWIN" speech), so it sits before
     // the wake gate too. The mic loop that produced `text` is DEVICE-GATED; only the pure
     // assembly/label/translate-decision logic is proven headlessly (captions.rs).
@@ -3677,7 +3786,7 @@ async fn run_pipeline(
     }
 
     // #30 CONTINUOUS LIVE INTERPRETATION (interpret.rs), the DEVICE-GATED live feed of
-    // each VAD segment. ON by default ([interpret].live) but INERT WITHOUT MIC/TCC — with it off this whole branch
+    // each VAD segment. SHIPS OFF ([interpret].live = false), and INERT WITHOUT MIC/TCC even when on — with it off this whole branch
     // is skipped and the segment is classified/routed exactly as today. When ON, the
     // freshly-transcribed segment is run through the PURE `interpret::interpret_segment`
     // pipeline (transcript -> on-device-LLM translate -> rendered translation), which
@@ -3799,9 +3908,11 @@ async fn run_pipeline(
     // only ever NARROW (fewer tools, shared-only recall, a quieter profile).
     {
         // Resolve THIS turn's speaker signal FIRST, then the EXPLICIT guest flag
-        // under the SPEAKER GUARD (see `resolve_explicit_guest`): any speaker may turn
-        // guest mode ON (it can only NARROW), but ONLY the verified OWNER or an
-        // unenforced voice-id may turn it OFF — a bystander can never un-scope anyone,
+        // under the SPEAKER GUARD (see `resolve_explicit_guest`): ONLY the verified
+        // OWNER or an unenforced voice-id may latch the PERSISTENT flag, either ON or
+        // OFF. A non-owner needs no latch — `decide` already voice-scopes them to guest
+        // for this turn — and letting their ON latch would silently degrade the OWNER's
+        // next turn. A bystander can never un-scope anyone,
         // and auto-guest (an Unrecognized voice) is folded in by `decide`.
         let speaker = threshold::SpeakerState::from_owner_gate(&voiceid::current_turn_gate());
         let explicit_guest =
@@ -3998,9 +4109,11 @@ async fn run_pipeline(
             // confidence (parsed off the answer + carried on the structured HUD
             // field). Reads the per-turn source accumulator the cloud tool loop
             // populated (cleared each turn by the TurnSourcesGuard above). With
-            // BOTH gates off (the default) annotate_answer returns the response
-            // byte-for-byte unchanged and an empty payload, so EVERY downstream use
-            // (telemetry, transcript, speak, episodic, learning) is unchanged. The
+            // BOTH gates off (an operator who disabled them — cite + confidence both
+            // SHIP ON) annotate_answer returns the response byte-for-byte unchanged and
+            // an empty payload. On the SHIPPED default the annotated text really is what
+            // every downstream use (telemetry, transcript, speak, episodic, learning)
+            // sees. The
             // SECRET-FREE annotation payload rides answer.annotated for the HUD: the
             // real source locators + bounded snippets (never an embedding/audio),
             // the from-my-knowledge flag, and the parsed confidence level + reason.
@@ -4069,18 +4182,22 @@ async fn run_pipeline(
             // unguarded and the write simply does nothing on a guest turn. (The passive
             // fact-learner is the ONE exception — it is tokio::spawn'd, so it escapes the
             // task-local scope and keeps its own should_learn_turn spawn-gate below.)
-            if let Err(e) = memory
-                .record_transcript(
-                    Some(&wav.display().to_string()),
-                    &text,
-                    &class.intent,
-                    outcome.routed_to,
-                    Some(&outcome.response),
-                )
-                .await
-            {
-                warn!(error = %e, "failed to record transcript");
-            }
+            // PRIVACY — TRANSIENT PERCEPTION READS: `record_turn_transcript` NO-OPs on
+            // a transient turn (see its WHAT WENT WRONG note). This used to be a bare
+            // `memory.record_transcript(...)` that ran UNCONDITIONALLY here, ~110 lines
+            // BEFORE `transient` was computed below — so a screen read / VLM describe
+            // was written to the durable transcript, replayed into the cloud history,
+            // and fed to the reflection fact-consolidation, all while this same turn
+            // emitted `privacy.transient_screen_read {"persisted": false}`.
+            record_turn_transcript(
+                memory,
+                Some(&wav.display().to_string()),
+                &text,
+                &class.intent,
+                outcome.routed_to,
+                &outcome.response,
+            )
+            .await;
             // MACRO CAPTURE (#27): while a recording is in progress, append THIS
             // command (the utterance + its classified intent) to the buffer — but
             // never a macro CONTROL command itself (start/stop/list/forget/replay),
@@ -4142,6 +4259,9 @@ async fn run_pipeline(
             let total_ms = report.total_ms;
             // Learning loop: fire-and-forget fact extraction so
             // the next utterance is never blocked behind it.
+            // NOTE: `transient` is computed by `transient_turn` (above), which the
+            // DURABLE TRANSCRIPT write already consults at its own call site — the
+            // transcript used to be written before this point was ever reached.
             // PRIVACY — TRANSIENT SCREEN READS: a screen-read turn
             // ("read my screen" / "what's on my screen" / "where's
             // the <X> button") is NEVER fed to fact extraction. The
@@ -4180,11 +4300,7 @@ async fn run_pipeline(
             // lifelong memory / optimizer traces, mirroring the screen-read transience.
             // (The ring itself is in-RAM + transient by construction; this keeps the
             // RECALL TURN from seeding a durable fact too.)
-            let transient = router::is_screen_read(&text)
-                || router::is_describe_request(&text)
-                || router::is_generate_image_request(&text)
-                || router::is_identify_sound_request(&text)
-                || screen_context::is_screen_context_recall(&text);
+            let transient = transient_turn(&text);
             // THRESHOLD — GUEST MODE: `should_learn_turn` skips the passive
             // fact-learner on a guest turn, so a bystander's first-person claims never
             // poison the OWNER's fact store (mirrors the episodic VoiceGate below).
@@ -4306,7 +4422,8 @@ async fn run_pipeline(
             // turn's routing (same intent re-aimed to a different agent with an
             // explicit redirect cue — optimize::is_correction), re-label the prior
             // trace Corrected (the learnable signal). The recorder + labeler are
-            // pure no-ops when disabled, so the shipped-OFF default does nothing.
+            // pure no-ops when disabled, so turning [optimize].enabled off (it SHIPS
+            // ON — see five lines above) makes this whole block do nothing.
             // GUEST GATE: enforced at the chokepoint — record_trace returns Ok(None)
             // and label_outcome/calibrate NO-OP on a guest turn — so this site runs
             // unguarded and seeds neither the optimizer corpus nor the calibration
@@ -4456,7 +4573,7 @@ async fn run_pipeline(
 /// re-routed by the SAME `router::route` a live utterance uses, so a consequential
 /// recorded step PARKS for a spoken confirmation (master ON) or only previews
 /// (master OFF) FRESH — replay carries no pre-approval and never batches past the
-/// gate. A recorded step is the WORDS only; the gate decides afresh each time. OFF
+/// gate. A recorded step is the WORDS only; the gate decides afresh each time. ON
 /// by default ([macros].enabled): with it off this runs nothing and says so.
 #[allow(clippy::too_many_arguments)]
 async fn replay_macro_live(
@@ -4508,6 +4625,16 @@ async fn replay_macro_live(
     // so the gate-honoring property is exercised both live and in test.
     struct LiveMacroRouter<'a> {
         ctx: tokio::sync::Mutex<LiveCtx<'a>>,
+        /// DOUBLE-SPEAK GUARD: the outcomes `route()` ALREADY played aloud.
+        ///
+        /// WHAT WENT WRONG: `route_once` threw away `RouteOutcome::spoken`, and the
+        /// combined summary below then spoke EVERY step's text again — so a converse
+        /// step in a replayed macro was read out twice, back to back. The live turn
+        /// path gets this right (it captures `outcome.spoken` into `prespoken` and
+        /// skips `speak_in_lang` when it is Some); replay was the one path that did
+        /// not. The `ReplySession` is reused across steps, so the second playback
+        /// genuinely happens.
+        already_spoken: std::sync::Mutex<Vec<String>>,
         cfg: &'a Config,
         memory: &'a Memory,
         brief: Option<&'a str>,
@@ -4557,7 +4684,17 @@ async fn replay_macro_live(
                 )
                 .await
                 {
-                    Ok(o) => o.response,
+                    Ok(o) => {
+                        // A converse step already PLAYED its reply inside route()
+                        // (o.spoken carries the timings). Record the text so the
+                        // combined summary below does not speak the same words again.
+                        if o.spoken.is_some() {
+                            if let Ok(mut already) = self.already_spoken.lock() {
+                                already.push(o.response.trim().to_string());
+                            }
+                        }
+                        o.response
+                    }
                     Err(e) => format!("step failed: {e}"),
                 }
             })
@@ -4566,6 +4703,7 @@ async fn replay_macro_live(
 
     let live = LiveMacroRouter {
         ctx: tokio::sync::Mutex::new(LiveCtx { infer, reply }),
+        already_spoken: std::sync::Mutex::new(Vec::new()),
         cfg,
         memory,
         brief,
@@ -4579,15 +4717,28 @@ async fn replay_macro_live(
     // time through the gate-honoring seam.
     let steps = macros::replay(memory, name, &live).await.unwrap_or_default();
 
-    let mut summary = format!("Replayed macro \"{}\" ({step_count} steps), sir.\n", m.name);
+    // The RETURNED/HUD text carries every step. The SPOKEN text omits the steps
+    // route() already played aloud, so a converse step is never read out twice.
+    let already_spoken = live
+        .already_spoken
+        .into_inner()
+        .unwrap_or_else(|p| p.into_inner());
+    let header = format!("Replayed macro \"{}\" ({step_count} steps), sir.\n", m.name);
+    let mut summary = header.clone();
+    let mut spoken = header;
     for s in &steps {
-        summary.push_str(&format!("- {}\n", s.outcome.trim()));
+        let line = s.outcome.trim();
+        summary.push_str(&format!("- {line}\n"));
+        if !already_spoken.iter().any(|a| a == line) {
+            spoken.push_str(&format!("- {line}\n"));
+        }
     }
     telemetry::emit("system", "macro.replay_done", json!({"name": m.name}));
     let summary = summary.trim_end().to_string();
-    // Reclaim the borrows from the seam, then speak the combined summary once.
+    let spoken = spoken.trim_end().to_string();
+    // Reclaim the borrows from the seam, then speak the not-already-spoken summary once.
     let LiveCtx { infer, reply } = live.ctx.into_inner();
-    let _ = speech::speak(&summary, infer, cfg, started, reply).await;
+    let _ = speech::speak(&spoken, infer, cfg, started, reply).await;
     summary
 }
 
@@ -5564,6 +5715,38 @@ mod tests {
         let r = handle_voice_id("enroll my voice", Some(&stranger_vec), root, &cfg, &mut none_prof, &mut enrollment);
         assert!(r.unwrap().to_lowercase().contains("enroll your voice"), "the first enroll bootstraps the owner");
         assert!(enrollment.is_some(), "bootstrap enroll starts a capture session");
+    }
+
+    /// STARTUP-ORDER pin: NO startup telemetry frame may be emitted before the hub
+    /// exists.
+    ///
+    /// `telemetry::emit` returns immediately when `HUB.get()` is None — before
+    /// `retain_sticky` — so an emit above `telemetry::init()` is silently discarded and
+    /// unreachable by any HUD, forever. Five startup frames sat there
+    /// (`screen_context.configured`, `lumen.configured`, `pasteboard.configured`,
+    /// `aperture.configured`, `vault.status`); the visible consequence was the HUD
+    /// Vision panel reporting the shipped-ON continuous screen-read loop as OFF.
+    ///
+    /// The window is BOUNDED to main's prologue (`async fn main` .. `telemetry::init()`)
+    /// so this assertion can never self-match its own string literal, which lives in
+    /// the test module far below init.
+    #[test]
+    fn no_startup_telemetry_frame_is_emitted_before_the_hub_exists() {
+        let src = include_str!("main.rs");
+        let main_at = src
+            .find("\nasync fn main(")
+            .expect("main.rs defines `async fn main`");
+        let init_at = main_at
+            + src[main_at..]
+                .find("telemetry::init();")
+                .expect("main calls telemetry::init()");
+        let prologue = &src[main_at..init_at];
+        assert!(
+            !prologue.contains("telemetry::emit("),
+            "a startup telemetry::emit( sits above telemetry::init() in main; emit() is \
+             a silent no-op until the hub exists, so that frame is discarded and no HUD \
+             can ever see it (move it to the DEFERRED STARTUP FRAMES block after init)"
+        );
     }
 
     /// STARTUP-ORDER pin (source-level, like forge.rs's no_auto_deploy proof):

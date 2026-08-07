@@ -282,12 +282,6 @@ fn sigmoid(v: f32) -> f32 {
     1.0 / (1.0 + (-v).exp())
 }
 
-/// TEST-ONLY: build a structurally-valid weights blob with every tensor zeroed
-/// except `dec_b` (the decoder bias). With zero weights the whole net collapses
-/// to prob = sigmoid(dec_bias) for ANY input — a deterministic synthetic model
-/// the headless tests (here and in `vad.rs`) drive the full pipeline with, no
-/// real 1.2 MB weights needed.
-#[cfg(test)]
 /// DETERMINISTIC NON-ZERO weights, for tests that need the network to actually
 /// compute something.
 ///
@@ -319,6 +313,11 @@ pub(crate) fn synthetic_weights_varied(seed: u32) -> Vec<u8> {
     out
 }
 
+/// TEST-ONLY: build a structurally-valid weights blob with every tensor zeroed
+/// except `dec_b` (the decoder bias). With zero weights the whole net collapses
+/// to prob = sigmoid(dec_bias) for ANY input — a deterministic synthetic model
+/// the headless tests (here and in `vad.rs`) drive the full pipeline with, no
+/// real 1.2 MB weights needed.
 #[cfg(test)]
 pub(crate) fn synthetic_weights(dec_bias: f32) -> Vec<u8> {
     let mut out = Vec::new();

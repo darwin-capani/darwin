@@ -839,28 +839,58 @@ pub enum VoiceIntent {
     Forget,
 }
 
-/// Detect an explicit enroll/forget intent. CONSERVATIVE and phrase-anchored:
-/// the utterance must mention the user's VOICE together with an enroll/learn or
-/// a forget/delete verb, so an ordinary sentence that merely contains "voice"
-/// never trips it. Pure — unit-tested without audio.
+/// The VOICE NOUNS a management verb has to be aimed at.
+const VOICE_NOUNS: &[&str] = &[
+    "my voice", "my voiceprint", "voice profile", "voice id", "voice-id",
+];
+
+/// Is one of `verbs` ADJACENT to a voice noun? The verb must immediately precede the
+/// noun (optionally through "the"/"about"), which is what makes this a COMMAND rather
+/// than a sentence that happens to contain both words.
+fn verb_is_aimed_at_the_voice(lower: &str, verbs: &[&str]) -> bool {
+    verbs.iter().any(|v| {
+        VOICE_NOUNS.iter().any(|n| {
+            lower.contains(&format!("{v} {n}"))
+                || lower.contains(&format!("{v} the {n}"))
+                || lower.contains(&format!("{v} about {n}"))
+        })
+    })
+}
+
+/// Detect an explicit enroll/forget intent. CONSERVATIVE and phrase-anchored: the
+/// management verb must sit ADJACENT to the voice noun ("forget my voice", "enroll my
+/// voice", "clear my voiceprint"), so an ordinary sentence that merely contains both
+/// words never trips it. Pure — unit-tested without audio.
+///
+/// WHAT WENT WRONG: the doc already claimed "phrase-anchored", but the code anchored
+/// nothing: it asked whether the utterance mentioned a voice noun ANYWHERE and a verb
+/// ANYWHERE, independently. The Forget branch is DESTRUCTIVE — main.rs calls
+/// `delete_vault` / `delete_profile` and answers "Done — I've forgotten your voice" —
+/// and it returns, so the user's real request is never routed. That fired on
+/// "remove the background noise from my voice", "my voice is unclear on that
+/// recording", "delete the voicemail I left, it's my voice on it", "is my voice id
+/// clear enough for the call" and "remind me to clear the driveway; also how does my
+/// voice id work". NOTE this is NOT only the substring class — "remove", "clear" and
+/// "delete" are WHOLE WORDS in those sentences, so `mentions_word` would not have
+/// helped; the verb simply was not tied to the noun.
 pub fn classify_intent(utterance: &str) -> Option<VoiceIntent> {
     let lower = utterance.to_lowercase();
     // Must be about the speaker's own voice/voiceprint.
-    let about_voice = lower.contains("my voice")
-        || lower.contains("my voiceprint")
-        || lower.contains("voice profile")
-        || lower.contains("voice id")
-        || lower.contains("voice-id");
-    if !about_voice {
+    if !VOICE_NOUNS.iter().any(|n| lower.contains(n)) {
         return None;
     }
-    // FORGET takes priority (a "forget" verb is an unambiguous clear).
-    const FORGET: &[&str] = &["forget", "delete", "remove", "clear", "unenroll", "un-enroll", "erase"];
-    if FORGET.iter().any(|v| lower.contains(v)) {
+    // FORGET takes priority (a "forget" verb aimed at the voice is an unambiguous clear).
+    const FORGET: &[&str] = &[
+        "forget", "delete", "remove", "clear", "unenroll", "un-enroll", "erase",
+        "stop recognizing", "stop recognising",
+    ];
+    if verb_is_aimed_at_the_voice(&lower, FORGET) {
         return Some(VoiceIntent::Forget);
     }
-    const ENROLL: &[&str] = &["enroll", "learn", "remember", "register", "set up", "memorize"];
-    if ENROLL.iter().any(|v| lower.contains(v)) {
+    const ENROLL: &[&str] = &[
+        "enroll", "enrol", "learn", "remember", "register", "set up", "memorize", "memorise",
+    ];
+    if verb_is_aimed_at_the_voice(&lower, ENROLL) {
         return Some(VoiceIntent::Enroll);
     }
     None
@@ -1256,6 +1286,27 @@ mod tests {
         ] {
             assert_eq!(classify_intent(u), None, "{u:?} must not be a voice-id intent");
         }
+        // REGRESSION: the verb has to be AIMED AT the voice. Every one of these
+        // returned Forget — which DELETES the enrolled owner profile and returns, so
+        // the user's actual request was never routed. Note these are whole-word verbs,
+        // so this is not the substring class: the verb simply belonged to another
+        // clause.
+        for u in [
+            "remove the background noise from my voice",
+            "my voice is unclear on that recording",
+            "delete the voicemail I left, it's my voice on it",
+            "is my voice id clear enough for the call",
+            "remind me to clear the driveway; also how does my voice id work",
+            "how do I set up a new mic so my voice sounds better",
+            "remember to buy milk and tell me about my voice profile",
+        ] {
+            assert_eq!(
+                classify_intent(u),
+                None,
+                "{u:?} is an ordinary sentence; classifying it as Forget DELETES the \
+                 owner's enrolled voice profile and swallows the turn"
+            );
+        }
     }
 
     #[test]
@@ -1346,4 +1397,42 @@ mod tests {
         assert!(payload.get("samples").is_none());
         assert!(payload.get("audio").is_none());
     }
+    /// A BARE "voiceprint" MUST NOT REACH THE DESTRUCTIVE ARM.
+    ///
+    /// The noun gate requires a POSSESSED voice noun — "my voice", "my
+    /// voiceprint", "voice profile", "voice id". A fix in this batch added the
+    /// bare token "voiceprint" alongside them, which re-opened the exact class it
+    /// was written to close, through a different door:
+    ///
+    ///   "delete the voiceprint I made in Audacity"      -> Forget
+    ///   "clear the voiceprint cache"                    -> Forget
+    ///   "forget the voiceprint you saw in the tutorial" -> Forget
+    ///
+    /// Forget is DESTRUCTIVE — main.rs calls delete_vault + delete_profile,
+    /// answers "Done — I've forgotten your voice", and RETURNS, so the user's
+    /// actual request is swallowed too. Caught by the batch's adversary, not by
+    /// the agent that wrote it.
+    #[test]
+    fn a_voiceprint_that_is_not_yours_is_not_a_command_to_forget_your_voice() {
+        for u in [
+            "delete the voiceprint i made in audacity",
+            "remove the voiceprint from that recording app",
+            "clear the voiceprint cache",
+            "forget the voiceprint you saw in the tutorial",
+        ] {
+            assert!(
+                classify_intent(u).is_none(),
+                "{u:?} is about somebody else's file, not the owner's enrolled voice"
+            );
+        }
+        // ...and the real commands still work, or this guard would just break the
+        // feature it protects.
+        for u in ["forget my voiceprint", "delete my voice profile", "clear my voice id"] {
+            assert!(
+                classify_intent(u).is_some(),
+                "{u:?} IS a voice-management command"
+            );
+        }
+    }
+
 }

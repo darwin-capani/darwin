@@ -27,10 +27,16 @@
 //! THROTTLE: the calendar/mail reads are NETWORK calls; the tick runs every 60s,
 //! far faster than those signals move. So each EXTERNAL signal is cached behind a
 //! refresh interval (a [`SignalCache`] keyed off an injected clock): a tick reuses
-//! the last value until the interval elapses, then refreshes. A read that fails
-//! or isn't connected does NOT poison the cache with a wrong value — it degrades
-//! to the absent default (empty events / 0 unread) for that cycle and is retried
-//! next interval.
+//! the last value until the interval elapses, then refreshes. A read that fails or
+//! isn't connected does NOT poison the cache with a wrong value — it KEEPS SERVING
+//! THE LAST GOOD VALUE (the absent default — empty events / 0 unread — is reached
+//! only when nothing was EVER cached), and because a failure never calls `store`,
+//! the read is retried on EVERY tick rather than on the refresh interval. That has
+//! two consequences worth knowing: a persistently failing calendar read repeats the
+//! last snapshot indefinitely, and because [`UpcomingEvent::minutes_until`] is
+//! computed AT FETCH TIME, a cached event's "starts in N minutes" does not re-base
+//! against the current tick. (This block used to claim the opposite — degrade to
+//! absent, retry next interval.)
 //!
 //! HERMETIC TESTABILITY: the pure helpers ([`disk_free_pct`],
 //! [`lead_minutes_from_rfc3339`]) and the cache logic are unit-tested directly;
@@ -399,8 +405,10 @@ impl CollectorState {
 /// Inputs the caller already has cheaply: the cached telemetry `snapshot`
 /// (memory + disk), `present` (from the recent-interaction stamp), the injected
 /// `now`/`now_rfc3339` clock, and the `refresh_secs` throttle interval. Both
-/// external reads degrade SILENTLY: not connected / failed -> absent (empty
-/// events, 0 unread), never fabricated. Market stays `None` (no live source).
+/// external reads degrade SILENTLY and never fabricate: not connected / failed ->
+/// the LAST GOOD cached value, or absent (empty events, 0 unread) when nothing was
+/// ever cached. See the module header for the staleness this implies. Market stays
+/// `None` (no live source).
 pub async fn collect_signals(
     state: &mut CollectorState,
     snapshot: Option<crate::telemetry::SystemSnapshot>,

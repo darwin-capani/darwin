@@ -6,12 +6,19 @@
 //!   1. HMAC AUTH over the RAW body. Every request carries an
 //!      `X-Darwin-Signature: sha256=<hex>` header; the receiver recomputes
 //!      `HMAC-SHA256(secret, raw_body)` and compares CONSTANT-TIME. A missing,
-//!      malformed, forged, or stale signature is REJECTED (401-equivalent) and
-//!      NEVER routes — an unauthenticated request reaches no intent at all.
+//!      malformed or forged signature is REJECTED (401-equivalent) and reaches no
+//!      intent at all. NOT REPLAY-PROTECTED: the signed material is the BODY ONLY —
+//!      there is no timestamp header, no nonce, no expiry window and no seen-signature
+//!      set anywhere in this module — so a captured, byte-identical delivery
+//!      re-presented later verifies exactly like the original, forever. Only body
+//!      TAMPERING is detected. (Adding replay protection means signing a
+//!      `X-Darwin-Timestamp` alongside the body, bounding the skew, and remembering
+//!      recent signatures; none of that exists today, so do not read "stale" into
+//!      this fence.)
 //!   2. EXPLICIT event->intent ALLOWLIST. The authenticated event name is looked
 //!      up in the config-defined `[[webhooks.mappings]]`. An event with no
 //!      mapping is REJECTED (404-equivalent) — never guessed into some intent.
-//!   3. ROUTE through the NORMAL path, and if the mapped intent is CONSEQUENTIAL
+//!   3. A mapped intent is CLASSIFIED, and if the mapped intent is CONSEQUENTIAL
 //!      ([`crate::confirm::is_consequential_tool`]) the action PARKS for the
 //!      user's spoken confirm (or is rejected) — a webhook can NEVER satisfy the
 //!      cross-turn spoken confirmation, so it can never auto-execute a
@@ -75,15 +82,18 @@ pub const EVENT_HEADER: &str = "x-darwin-event";
 /// never an execute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WebhookDecision {
-    /// HMAC verified, event mapped, and the intent is NON-consequential: route it
-    /// through the normal path. Carries the resolved intent to dispatch.
+    /// HMAC verified, event mapped, and the intent is NON-consequential. HONESTY:
+    /// the intent is RESOLVED but NOT DISPATCHED — no wire exists from this module to
+    /// the router/pipeline (see [`apply_decision`]), so NOTHING RUNS on this arm.
     Route { event: String, intent: String },
     /// HMAC verified, event mapped, but the intent is CONSEQUENTIAL: PARK for the
     /// user's spoken confirm. A webhook can never satisfy the cross-turn confirm,
     /// so this NEVER becomes an execute — it surfaces a parked action the user
     /// must confirm out-of-band (voice / the authenticated command channel).
     ParkForConfirm { event: String, intent: String },
-    /// The signature was missing, malformed, forged, or stale. 401-equivalent:
+    /// The signature was missing, malformed, or forged. NOT "stale": the signature
+    /// covers the BODY ONLY, with no timestamp/nonce/expiry, so a captured delivery
+    /// replayed later verifies exactly like the original. 401-equivalent:
     /// the request reaches NO intent. (Also covers a secret that is unavailable —
     /// fail-closed: with no secret, nothing authenticates.)
     Unauthorized,
@@ -253,17 +263,41 @@ fn emit_decision(decision: &WebhookDecision) {
     telemetry::emit(
         "system",
         "webhook.received",
-        json!({"outcome": outcome, "event": event, "intent": intent}),
+        json!({
+            "outcome": outcome,
+            "event": event,
+            "intent": intent,
+            // HONESTY: a `Route` resolves an intent but NOTHING DISPATCHES IT — there
+            // is no wire from this module to the router/pipeline. Only a park has a
+            // real effect. Carried as its own field so the existing `outcome` token
+            // (which the HUD switches on) is unchanged.
+            "dispatched": matches!(decision, WebhookDecision::ParkForConfirm { .. }),
+        }),
     );
 }
 
 /// Apply a webhook decision: emit the secret-free telemetry, and for a
 /// CONSEQUENTIAL mapping PARK the action into the EXISTING cross-turn
 /// confirmation gate (so the user confirms it out-of-band by voice / the
-/// authenticated command channel) — a webhook NEVER auto-executes it. A
-/// non-consequential `Route` is surfaced for the normal pipeline to pick up; a
-/// reject path does nothing but record the secret-free outcome. Returns the
-/// resolved intent for a Route, so the live accept-loop can hand it to the router.
+/// authenticated command channel) — a webhook NEVER auto-executes it. A reject
+/// path does nothing but record the secret-free outcome. Returns the resolved
+/// intent for a `Route`.
+///
+/// NOT WIRED — READ THIS BEFORE TRUSTING THE `Route` ARM. There is NO dispatch
+/// path for a returned intent. This module references no router, dispatcher or
+/// pipeline anywhere, and the sole caller ([`serve_conn`]) has nothing to hand the
+/// intent to. So a correctly-signed, correctly-mapped, NON-consequential delivery
+/// authenticates, resolves its intent, answers 200 OK and emits
+/// `webhook.received {outcome: "routed"}` — while nothing runs. That is a green
+/// success signal for an action that never happened, and the documented use of #35
+/// (`event="ci.failed" intent="system.query"`) is exactly that shape. The
+/// `ParkForConfirm` arm below is the ONLY leg with a real effect.
+///
+/// Wiring it is a DELIBERATE SECURITY DECISION, not a mechanical fix: it would make
+/// an inbound, internet-adjacent surface drive the model tool loop, which is the
+/// confused-deputy shape the egress guard and the app-broker refusal exist to keep
+/// closed. Until an owner decides that, the honest posture is that a `Route` is
+/// RESOLVED, not dispatched — which is what the telemetry and the log now say.
 ///
 /// This is the LIVE seam that ties the pure [`handle_webhook`] to the gate. It is
 /// reached only from [`serve`]; the decision logic it applies is
@@ -325,7 +359,10 @@ fn apply_decision(decision: &WebhookDecision) -> Option<String> {
 /// IS framed, it flows through exactly the pure handler + [`apply_decision`] seam
 /// below — so the live path can never auth/map/execute differently from the
 /// proven core.
-#[allow(dead_code)] // wired behind the OFF-default flag; the bind is runtime-gated, not tested.
+// The forever accept-loop + the Keychain secret resolution are the untested leg (no
+// port is opened in tests); `serve_conn` and the full request framing ARE exercised
+// over a real loopback socket. `[webhooks].enabled` SHIPS ON (config.rs asserts it) —
+// the receiver is inert without mappings + a Keychain secret, not off by default.
 pub async fn serve(cfg: Arc<Config>) {
     if !cfg.webhooks.enabled {
         info!("webhook receiver disabled ([webhooks].enabled = false); not binding");
@@ -460,7 +497,17 @@ async fn serve_conn(
     let evt = headers.get(EVENT_HEADER).map(String::as_str);
     let decision = handle_webhook(&body, sig, evt, Some(secret.as_bytes()), cfg);
     let (code, reason) = status_for(&decision);
-    apply_decision(&decision);
+    // The resolved intent has NOWHERE TO GO: no router/pipeline wire exists from this
+    // module (see apply_decision's NOT WIRED note). Say so in the log rather than
+    // dropping the value silently — a signed, mapped, non-consequential delivery
+    // otherwise gets a 200 + a "routed" frame for work that never happens.
+    if let Some(intent) = apply_decision(&decision) {
+        warn!(
+            %intent,
+            "webhook: authenticated + mapped a non-consequential intent, but NOTHING \
+             DISPATCHES IT — there is no wire from the webhook receiver to the router"
+        );
+    }
     respond(&mut sock, code, reason).await
 }
 

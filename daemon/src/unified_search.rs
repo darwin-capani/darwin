@@ -135,8 +135,10 @@ impl Source {
 
     /// Whether this source is ON-DEVICE (content never leaves the device). The
     /// cloud sources are the only ones gated by a connected-check.
-    // Exercised by the unit tests + a structured-status surface; the live merge
-    // partitions sources by the fixed iteration order rather than this predicate.
+    // Exercised by the unit tests ONLY — there is no other caller in the tree (the
+    // live merge partitions sources by the fixed iteration order rather than this
+    // predicate, which is why the allow(dead_code) below is needed). The claim of a
+    // "structured-status surface" was not true of anything.
     #[allow(dead_code)]
     pub fn is_on_device(&self) -> bool {
         matches!(

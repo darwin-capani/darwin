@@ -164,7 +164,7 @@ fn prompted_lock() -> std::sync::MutexGuard<'static, Option<String>> {
 /// The complete set of CONSEQUENTIAL (side-effecting) tools — every tool whose
 /// `execute_tool` arm routes through `integrations::gate(confirm)`. This is the
 /// single source of truth for "does this invocation need a spoken yes"; the
-/// `consequential_registry_is_complete_and_exact` test pins this set (exactly 18
+/// `consequential_registry_is_complete_and_exact` test pins this set (exactly 22
 /// entries, no dupes) so it stays in lockstep with the gate call sites and a
 /// newly-gated tool can't silently skip the confirmation layer.
 ///
@@ -303,7 +303,9 @@ fn park_inner(mut pending: PendingConfirmation, reaches_user: bool) -> String {
 
 /// TEST-ONLY: park an action WITHOUT recording it as the prompted one — models a
 /// background turn whose prompt never reached the user. Production reaches the same
-/// state via `park_ctx(true, pending, false)`.
+/// state via `park_ctx(false, pending)` — two arguments, the reaches-user flag FIRST
+/// (this used to name a nonexistent three-argument form with the flag INVERTED, i.e.
+/// the PROMPTED-arming call that is the exact opposite of this state).
 #[cfg(test)]
 pub fn park_background_for_test(pending: PendingConfirmation) -> String {
     park_inner(pending, false)
@@ -1515,31 +1517,67 @@ mod hijack_tests {
         }
     }
 
-    /// No production caller may arm PROMPTED unconditionally again.
+    /// No park call site may leave "did this prompt reach the user?" unclassified.
+    ///
+    /// WHAT WENT WRONG: this guard scanned for the literal `confirm::park(` — a
+    /// spelling that has not existed since `park_ctx` replaced it. `"confirm::park_ctx("`
+    /// does NOT contain `"confirm::park("` (the `k` is followed by `_`, not `(`), so the
+    /// needle matched exactly ONE line in the entire tree: this assertion's own string
+    /// literal, in a file the loop does not read. The assertion evaluated to
+    /// `!false || _` on every input — it could not fail. Injecting the exact regression
+    /// its own docstring names (`park_ctx(true, ..)` on the webhook path) left it green.
+    ///
+    /// It now reads the ARGUMENT, not the spelling: every `park_ctx(` call site must
+    /// pass one of a small allowlist of context expressions, so a new call site cannot
+    /// arm PROMPTED by accident — it has to be classified here first. The floor on the
+    /// site count is the anti-rot guard: if the needle stops matching again, the test
+    /// fails instead of passing vacuously.
     #[test]
     fn every_park_call_site_states_whether_it_reaches_the_user() {
-        for file in ["anthropic.rs", "command.rs", "lockdown.rs", "main.rs", "webhooks.rs"] {
-            let src = match file {
-                "anthropic.rs" => include_str!("anthropic.rs"),
-                "command.rs" => include_str!("command.rs"),
-                "lockdown.rs" => include_str!("lockdown.rs"),
-                "main.rs" => include_str!("main.rs"),
-                _ => include_str!("webhooks.rs"),
-            };
-            for (i, line) in src.lines().enumerate() {
+        const FILES: &[(&str, &str)] = &[
+            ("anthropic.rs", include_str!("anthropic.rs")),
+            ("command.rs", include_str!("command.rs")),
+            ("lockdown.rs", include_str!("lockdown.rs")),
+            ("main.rs", include_str!("main.rs")),
+            ("standing.rs", include_str!("standing.rs")),
+            ("webhooks.rs", include_str!("webhooks.rs")),
+        ];
+        // The ONLY accepted first arguments. `true` = the prompt is spoken to the
+        // operator on THIS turn; `false` = a background parker (nobody was prompted);
+        // `context_trusted` = the tool loop's per-turn flag. Anything else has to be
+        // added here deliberately — that IS the guard.
+        const ACCEPTED: &[&str] = &["true,", "false,", "context_trusted,"];
+        let mut sites = 0usize;
+        for (file, src) in FILES {
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
                 let t = line.trim_start();
                 if t.starts_with("//") {
                     continue;
                 }
+                let Some(at) = t.find("park_ctx(") else { continue };
+                let mut rest = t[at + "park_ctx(".len()..].to_string();
+                if rest.trim().is_empty() {
+                    // A multi-line call: the context argument is on the next line.
+                    rest = lines.get(i + 1).map(|l| l.trim_start()).unwrap_or("").to_string();
+                }
+                sites += 1;
                 assert!(
-                    !t.contains("confirm::park(") || t.contains("park_ctx"),
-                    "{file}:{} calls park() without saying whether the prompt reaches \
-                     the user; an unattended park that arms PROMPTED steals the \
-                     operator's spoken confirm",
-                    i + 1
+                    ACCEPTED.iter().any(|a| rest.starts_with(a)),
+                    "{file}:{} parks with an unclassified context argument `{}` — the \
+                     call site must say whether its prompt reached the user, because an \
+                     unattended park that arms PROMPTED steals the operator's spoken \
+                     confirm",
+                    i + 1,
+                    rest.chars().take(40).collect::<String>()
                 );
             }
         }
+        assert!(
+            sites >= 10,
+            "the guard found only {sites} park_ctx call sites; the needle has rotted \
+             again and this test is passing vacuously"
+        );
     }
 
 

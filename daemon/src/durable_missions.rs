@@ -225,6 +225,52 @@ pub async fn cancel(memory: &Memory, id: &str) -> Result<bool> {
     memory.delete_fact(&key).await
 }
 
+/// A [`Dispatcher`] decorator that COUNTS the sub-tasks the engine actually handed to
+/// the real dispatcher during one run. Delegates everything else untouched.
+///
+/// WHAT WENT WRONG: [`resume`] stamped [`MissionStatus::Done`] UNCONDITIONALLY after
+/// `run_mission` returned, on the assumption that a returned answer meant the engine
+/// had run. It does not. `run_mission` short-circuits to `mission::offline_degrade`
+/// when the cloud is unreachable ("Missions need the cloud, sir ... Reconnect and I'll
+/// run \"{goal}\" for you.") and returns "I couldn't plan that mission, sir — ..." when
+/// the planning call fails (a 429/529/network timeout). In BOTH cases it plans nothing
+/// and dispatches nothing. `Done` is terminal, `paused_on_load` preserves it, and the
+/// next `resume` early-returns "already completed; nothing to resume." So ONE failed
+/// resume — one offline moment, one transient Anthropic 5xx — permanently BRICKED the
+/// mission, moments after promising to run it on reconnect. `mission_cancel` + re-save
+/// was the only recovery and nothing said so.
+///
+/// The dispatch count is the signal available on THIS side of the engine seam that
+/// distinguishes "the run happened" from "the run never started", so `run_mission`
+/// keeps its shape.
+struct CountingDispatcher<'d> {
+    inner: &'d dyn Dispatcher,
+    dispatched: std::sync::atomic::AtomicUsize,
+}
+
+impl<'d> CountingDispatcher<'d> {
+    fn new(inner: &'d dyn Dispatcher) -> Self {
+        Self { inner, dispatched: std::sync::atomic::AtomicUsize::new(0) }
+    }
+    /// How many sub-tasks reached the real dispatcher.
+    fn count(&self) -> usize {
+        self.dispatched.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Dispatcher for CountingDispatcher<'_> {
+    fn dispatch<'a>(
+        &'a self,
+        agent: &'a str,
+        tools: &'a [String],
+        instruction: &'a str,
+        depth: usize,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>> {
+        self.dispatched.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.inner.dispatch(agent, tools, instruction, depth)
+    }
+}
+
 /// RESUME a durable mission by id. SAFETY (b)+(c): this runs the mission's GOAL
 /// through the SAME [`run_mission`] engine a live `fury_mission` uses — so every
 /// sub-task re-routes to its owner under that owner's allowlist and every
@@ -234,10 +280,18 @@ pub async fn cancel(memory: &Memory, id: &str) -> Result<bool> {
 /// the daemon wires the cloud-backed pair.
 ///
 /// On resume the mission is stamped Active (so a concurrent reader still loads it
-/// Paused — `paused_on_load` normalizes Active back to Paused), the engine runs,
-/// the record is marked Done with the attempted steps recorded, and the synthesized
-/// answer is returned. A mission already Cancelled/Done is not re-run (an honest
-/// note is returned instead).
+/// Paused — `paused_on_load` normalizes Active back to Paused), the engine runs, and
+/// the synthesized answer is returned. The record is marked Done ONLY when the engine
+/// actually dispatched at least one sub-task; a run that never started (cloud
+/// unreachable, or a transient planner failure) is restored to Paused so the mission
+/// stays resumable. A mission already Cancelled/Done is not re-run (an honest note is
+/// returned instead).
+///
+/// HONESTY: NO PER-STEP RECORD IS WRITTEN. `DurableMission.steps` is never populated
+/// by any code path in this build — the engine re-plans from the goal each resume and
+/// returns a synthesized answer, not a step list — so mission listings report
+/// "(0 steps)" and the HUD progress readout is 0/0. This doc used to claim the
+/// attempted steps were recorded; they are not.
 pub async fn resume(
     memory: &Memory,
     id: &str,
@@ -267,11 +321,23 @@ pub async fn resume(
     // its owner under that owner's allowlist; each consequential step re-runs the
     // gate FRESH (the dispatcher carries no pre-approval). This is the proof of
     // SAFETY (b): a resumed mission re-gates exactly like a live one.
-    let answer = run_mission(&mission.goal, registry, planner, dispatcher, cloud_reachable).await;
+    let counting = CountingDispatcher::new(dispatcher);
+    let answer = run_mission(&mission.goal, registry, planner, &counting, cloud_reachable).await;
 
-    // Mark Done (the run finished) — we do NOT fabricate step outcomes; the synthesis
-    // answer already carries the honest per-sub-task results from the engine.
-    mission.status = MissionStatus::Done;
+    // Mark Done ONLY IF THE ENGINE ACTUALLY RAN — we do NOT fabricate step outcomes;
+    // the synthesis answer already carries the honest per-sub-task results.
+    //
+    // A run that dispatched NOTHING (cloud unreachable -> offline_degrade; a transient
+    // planner 429/529/timeout -> "I couldn't plan that mission") is restored to Paused
+    // so it stays RESUMABLE. This used to be an unconditional `Done`, which is terminal
+    // and survives `paused_on_load`, so one failed attempt permanently bricked the
+    // mission: the user was told "Reconnect and I'll run it for you" and, on
+    // reconnecting, got "already completed; nothing to resume."
+    mission.status = if counting.count() > 0 {
+        MissionStatus::Done
+    } else {
+        MissionStatus::Paused
+    };
     save(memory, &mission).await?;
     Ok(answer)
 }
@@ -456,6 +522,90 @@ mod tests {
         // terminal Done (never auto-running again).
         let after = load(&m, &mission.id).await.unwrap().unwrap();
         assert_eq!(after.status, MissionStatus::Done);
+    }
+
+    /// REGRESSION: a resume that never RAN must leave the mission RESUMABLE.
+    ///
+    /// `resume` stamped Done unconditionally, but `run_mission` returns without
+    /// planning or dispatching when the cloud is unreachable, and returns the
+    /// "I couldn't plan that mission" line on a transient planner failure. Done is
+    /// terminal and survives `paused_on_load`, so ONE offline resume (or one Anthropic
+    /// 5xx) destroyed a durable mission — the whole point of #26 — while telling the
+    /// user "Reconnect and I'll run it for you".
+    #[tokio::test]
+    async fn a_resume_that_never_ran_leaves_the_mission_resumable() {
+        let (m, _db) = mem("neverran");
+        let registry = AgentRegistry::canonical();
+        let mission = create(&m, DEFAULT_RETENTION, "ship the v2 launch").await.unwrap();
+
+        /// A planner/dispatcher that PANICS if the offline path ever touches it.
+        struct Boom;
+        impl Planner for Boom {
+            fn plan<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<PlannedTask>>> + Send + 'a>>
+            {
+                Box::pin(async { panic!("an offline resume must NOT plan") })
+            }
+        }
+        impl Dispatcher for Boom {
+            fn dispatch<'a>(
+                &'a self,
+                _: &'a str,
+                _: &'a [String],
+                _: &'a str,
+                _: usize,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String>> + Send + 'a>>
+            {
+                Box::pin(async { panic!("an offline resume must NOT dispatch") })
+            }
+        }
+
+        // (1) OFFLINE: run_mission short-circuits to offline_degrade — nothing ran.
+        let answer = resume(&m, &mission.id, &registry, &Boom, &Boom, false).await.unwrap();
+        assert!(
+            answer.to_lowercase().contains("reconnect"),
+            "the offline degrade line is what the user hears: {answer}"
+        );
+        assert_eq!(
+            load(&m, &mission.id).await.unwrap().unwrap().status,
+            MissionStatus::Paused,
+            "an offline resume must leave the mission RESUMABLE — Done is terminal and \
+             the next resume would answer \"already completed; nothing to resume\""
+        );
+
+        // (2) A TRANSIENT PLANNER FAILURE (a 429/529/timeout) is the same shape.
+        struct FailingPlanner;
+        impl Planner for FailingPlanner {
+            fn plan<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<PlannedTask>>> + Send + 'a>>
+            {
+                Box::pin(async { Err(anyhow::anyhow!("cloud returned 529 overloaded")) })
+            }
+        }
+        let answer = resume(&m, &mission.id, &registry, &FailingPlanner, &Boom, true).await.unwrap();
+        assert!(
+            answer.to_lowercase().contains("couldn't plan"),
+            "the planner failure is reported honestly: {answer}"
+        );
+        assert_eq!(
+            load(&m, &mission.id).await.unwrap().unwrap().status,
+            MissionStatus::Paused,
+            "a transient planner failure must leave the mission RESUMABLE"
+        );
+
+        // (3) A resume that DID dispatch still completes.
+        let planner = MockPlanner { plan: vec![PlannedTask::say("draft the announcement copy")] };
+        let dispatcher = GateModelingDispatcher { calls: Mutex::new(Vec::new()) };
+        let _ = resume(&m, &mission.id, &registry, &planner, &dispatcher, true).await.unwrap();
+        assert_eq!(
+            load(&m, &mission.id).await.unwrap().unwrap().status,
+            MissionStatus::Done,
+            "a resume that actually dispatched still finishes the mission"
+        );
     }
 
     #[tokio::test]

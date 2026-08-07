@@ -1075,14 +1075,6 @@ fn abs(root: &Path, p: &Path) -> PathBuf {
     }
 }
 
-/// The install prefix an interpreter's standard library lives under, derived
-/// tightly from the RESOLVED interpreter path so the read grant covers the
-/// stdlib without opening the whole Homebrew/usr-local tree. A CPython install
-/// is laid out as `<prefix>/bin/python3.11` with the stdlib under
-/// `<prefix>/lib/pythonX.Y`, so the prefix is the interpreter's grandparent
-/// (`bin/`'s parent). Returns None when the path has no such structure (e.g. a
-/// bare `/usr/bin/python3`), in which case the per-file interpreter read grant
-/// and the system dyld roots already cover the boot.
 /// The framework CPython stub `<prefix>/bin/pythonX.Y` re-execs, or `None`.
 ///
 /// A framework build ships `bin/pythonX.Y` as a small stub that posix_spawns
@@ -1098,6 +1090,14 @@ fn framework_python_stub(interp_real: &Path) -> Option<PathBuf> {
     stub.is_file().then_some(stub)
 }
 
+/// The install prefix an interpreter's standard library lives under, derived
+/// tightly from the RESOLVED interpreter path so the read grant covers the
+/// stdlib without opening the whole Homebrew/usr-local tree. A CPython install
+/// is laid out as `<prefix>/bin/python3.11` with the stdlib under
+/// `<prefix>/lib/pythonX.Y`, so the prefix is the interpreter's grandparent
+/// (`bin/`'s parent). Returns None when the path has no such structure (e.g. a
+/// bare `/usr/bin/python3`), in which case the per-file interpreter read grant
+/// and the system dyld roots already cover the boot.
 fn interpreter_install_prefix(interp_real: &Path) -> Option<PathBuf> {
     let bin_dir = interp_real.parent()?; // <prefix>/bin
     // Only treat it as an install prefix when the interpreter sits in a `bin`
@@ -3275,9 +3275,10 @@ mod tests {
     fn shipped_vision_manifest_parses_with_tcc_keys() {
         // The shipped Vision manifest must parse under the extended schema: it
         // is offline (net_hosts empty), GPU-on (ANE/Core ML), and declares the
-        // camera/screen TCC needs. (It currently keeps camera/screen as TOML
-        // comments pending this schema land; we assert the parse + the offline /
-        // gpu invariants regardless of whether the keys are uncommented yet.)
+        // camera/screen TCC needs. Those two keys are LIVE in the shipped manifest
+        // (`camera = true` / `screen = true`), so they are pinned here alongside the
+        // offline/gpu invariants — this used to say they were still commented out and
+        // skipped asserting them for that (now false) reason.
         let path = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("apps")
@@ -3292,6 +3293,9 @@ mod tests {
         );
         assert!(m.permissions.gpu, "Vision uses the ANE/GPU for built-in Vision requests");
         assert!(!m.permissions.audio, "Vision never touches the microphone");
+        // The TCC declarations the shipped manifest really makes.
+        assert!(m.permissions.camera, "the shipped Vision manifest declares camera = true");
+        assert!(m.permissions.screen, "the shipped Vision manifest declares screen = true");
         // Declared topics include the detection + status streams.
         assert!(m.ui.telemetry_topics.iter().any(|t| t == "vision.detections"));
     }
@@ -4443,7 +4447,9 @@ mod tests {
             let pending = apps.get("echo-app").unwrap().pending.clone();
             assert!(pending.lock().await.is_empty(), "timed-out waiter evicted");
         }
-        // Drain the two op lines the timed-out request + this check produced.
+        // Drain the ONE op line the timed-out request produced. (The pending-map
+        // assertion above issues no op, and read_line returns after a single newline,
+        // so "two" was never right and never mattered.)
         let mut drain = String::new();
         let _ = tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut drain)).await;
 
@@ -4830,20 +4836,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// read_line_bounded must be CANCELLATION-SAFE: dropped mid-read (a select!
-    /// arm losing the race) it must not lose bytes it already pulled off the
-    /// reader. We prove it by driving a partial line, cancelling the read via a
-    /// timer that wins a select!, then resuming — the reassembled line must be
-    /// WHOLE. (With the accumulator local to the future, as it was before, the
-    /// prefix would be consumed-then-dropped and the resumed read would return
-    /// only the tail — the exact desync this guards.)
+    /// Regression (full-OS sweep): a manifest whose entry doesn't exist (a spec-only
+    /// app, or an unbuilt compiled one) used to register as fully runnable, then flip
+    /// `running` + spawn + die with a confusing exec error. It must register (visible
+    /// in the deck), report entry_present false, and refuse to start with a clear
+    /// reason.
     #[tokio::test]
     async fn a_spec_only_app_registers_but_is_labeled_not_runnable_and_refuses_to_start() {
-        // Regression (full-OS sweep): a manifest whose entry doesn't exist (a
-        // spec-only app, or an unbuilt compiled one) used to register as fully
-        // runnable, then flip `running` + spawn + die with a confusing exec
-        // error. It must register (visible in the deck), report entry_present
-        // false, and refuse to start with a clear reason.
         let root = PathBuf::from(format!(
             "/private/tmp/jrv-specapp-{}-{}",
             std::process::id(),
@@ -4880,6 +4879,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// read_line_bounded must be CANCELLATION-SAFE: dropped mid-read (a select!
+    /// arm losing the race) it must not lose bytes it already pulled off the
+    /// reader. We prove it by driving a partial line, cancelling the read via a
+    /// timer that wins a select!, then resuming — the reassembled line must be
+    /// WHOLE. (With the accumulator local to the future, as it was before, the
+    /// prefix would be consumed-then-dropped and the resumed read would return
+    /// only the tail — the exact desync this guards.)
     #[tokio::test]
     async fn read_line_bounded_is_cancellation_safe_across_a_dropped_read() {
         let (mut client, server) = UnixStream::pair().expect("unix socketpair");

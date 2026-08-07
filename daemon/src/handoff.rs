@@ -1,11 +1,19 @@
 //! CONTINUITY HANDOFF (handoff.rs) — resume a LIVE cognitive session on ANOTHER
 //! of the owner's Macs. A running session's CONTEXT — its transcript window, the
 //! active agent, the mission it's on, the pending world-model deltas, the draft
-//! ids in flight, and the focus profile — is sealed into a [`SessionCapsule`] and
-//! moved to the owner's OTHER device over the EXISTING sync.rs sealed path
-//! (AES-256-GCM under a Keychain-paired `handoff_shared_key`). The receiving
-//! daemon RESTORES that context and PARKS: it repopulates what the assistant
-//! knows and does NOTHING with it.
+//! ids in flight, and the focus profile — is sealed into a [`SessionCapsule`]
+//! (AES-256-GCM under a Keychain-paired `handoff_shared_key`) and STAGED to
+//! `state/handoff/outbox/`. A receiving daemon that finds a capsule in
+//! `state/handoff/inbox/` RESTORES that context and PARKS: it repopulates what the
+//! assistant knows and does NOTHING with it.
+//!
+//! NO AUTOMATIC TRANSPORT EXISTS. Nothing in this build moves a capsule from one
+//! device's outbox to another's inbox — sync.rs's `transport_push` has exactly one
+//! caller (`sync_now`, which pushes SyncBundles from `state/sync/outbox`), and no
+//! code path reads or writes the handoff directories outside this module. The
+//! delivery step is MANUAL (copy the sealed file). This header used to say the
+//! capsule is "moved to the owner's OTHER device over the EXISTING sync.rs sealed
+//! path"; it is not.
 //!
 //! THE HARD RULES (each pinned by a test):
 //!   1. SHIPS OFF. `[handoff].enabled` defaults false, and it rides sync (also
@@ -26,8 +34,10 @@
 //!
 //! The capsule build + seal/open + the redaction are a PURE, hermetically tested
 //! seam (an injected key; no live peer, no Keychain, no session loop in the
-//! tests). The network leg between devices is the SAME armed-but-inert transport
-//! sync.rs rides — a sealed capsule never leaves the box in the clear.
+//! tests) — note the delivery tests simulate the hop by hand-copying the outbox
+//! file into the inbox, which is exactly the step no shipped code performs. A
+//! sealed capsule never leaves the box in the clear, because it never leaves at all
+//! without a manual copy.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -267,8 +277,13 @@ pub fn resume_from_inbox(root: &Path, key: &[u8; 32]) -> Vec<RestoredSession> {
 /// Hand the current session off to the paired Mac: seal its `capsule` to the
 /// outbox. OFF (the shipped default) is a no-op; without the shared key it
 /// refuses, NEVER staging an unsealed capsule. `key` is injected so this is
-/// hermetically tested. The delivery leg rides the sync.rs armed-but-inert
-/// transport (a configured `[sync].peer_endpoint`), never a background cadence.
+/// hermetically tested.
+///
+/// THERE IS NO DELIVERY LEG. Nothing reads `state/handoff/outbox` and nothing writes
+/// `state/handoff/inbox`; sync.rs's `transport_push` is only ever called by `sync_now`
+/// for SyncBundles. The capsule is STAGED and the operator copies it. This doc used to
+/// say the delivery leg "rides the sync.rs armed-but-inert transport", which asserts a
+/// hop that becomes real once a peer is configured — it never does.
 pub fn hand_off(
     cfg: &crate::config::Config,
     root: &Path,
@@ -284,15 +299,14 @@ pub fn hand_off(
     match stage_capsule(root, key.raw_bytes(), capsule) {
         Ok(()) => {
             let n = capsule.transcript_window.len();
-            let peer = !cfg.sync.peer_endpoint.trim().is_empty();
+            // HONEST: there is NO automatic transport for a handoff capsule — nothing
+            // reads state/handoff/outbox and nothing delivers it (see the module
+            // header). The peer-conditional branch that used to sit here said the
+            // capsule was "armed for delivery ... inert without a live peer", which
+            // asserts that delivery happens once the peer is up. It never can.
             format!(
-                "Sealed your session ({n} transcript line{}) to hand off{}. Authority did not transfer — every consequential step re-asks on the other Mac, sir.",
-                if n == 1 { "" } else { "s" },
-                if peer {
-                    " and armed for delivery (transport rides sync, inert without a live peer)"
-                } else {
-                    " to the outbox (transport to your paired Mac is armed but inert)"
-                }
+                "Sealed your session ({n} transcript line{}) to the handoff outbox. There's no automatic transport, sir — copy it to the other Mac's handoff inbox and I'll restore it there. Authority did not transfer — every consequential step re-asks on the other Mac.",
+                if n == 1 { "" } else { "s" }
             )
         }
         Err(e) => format!("Couldn't seal the handoff capsule: {e}"),
@@ -606,9 +620,15 @@ mod tests {
         let key = test_key();
         let capsule = build_capsule("dev-a", "2026-07-15T10:00:00Z", refs_with_a_secret());
 
-        // Hand off: sealed to the outbox, transport reported inert.
+        // Hand off: sealed to the outbox, and the reply says plainly that there is NO
+        // automatic transport. This used to assert "armed but inert", which is the
+        // dishonest half — it implies a transport that merely lacks a live peer, when
+        // in fact nothing in the tree ever moves an outbox capsule anywhere.
         let r = hand_off(&cfg, &dir.0, &capsule, Some(test_key()));
-        assert!(r.contains("armed but inert"), "transport honesty: {r}");
+        assert!(
+            r.contains("no automatic transport"),
+            "the reply must not imply a delivery that cannot happen: {r}"
+        );
         let out = std::fs::read(handoff_root(&dir.0).join("outbox").join("dev-a.capsule")).unwrap();
         assert!(!out.windows(6).any(|w| w == b"SECRET"), "the staged capsule is sealed, no plaintext on disk");
 

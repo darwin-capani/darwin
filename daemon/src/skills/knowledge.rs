@@ -385,8 +385,34 @@ fn morse_encode(text: &str) -> Result<String> {
 /// spaces) or a run of 3+ spaces; letters within a word separate on single spaces.
 /// An unknown code is a friendly error.
 fn morse_decode(text: &str) -> Result<String> {
+    // WHAT WENT WRONG: only the "/" separator was implemented. The letter loop below
+    // uses `split_whitespace()`, which collapses ANY run of whitespace, so the standard
+    // 3-space (or 7-space) WORD gap this function's own doc promises was
+    // indistinguishable from the 1-space LETTER gap and no word break was emitted:
+    // ".... ..   -... --- -..." decoded to "HIBOB" instead of "HI BOB". Normalize the
+    // 3+-space word gap into the "/" separator FIRST, so both documented forms decode
+    // identically. A run of spaces at the very start separates nothing and is dropped.
+    let mut normalized = String::with_capacity(text.len() + 8);
+    let mut spaces = 0usize;
+    for ch in text.chars() {
+        if ch.is_whitespace() {
+            spaces += 1;
+            continue;
+        }
+        if !normalized.is_empty() {
+            if spaces >= 3 {
+                normalized.push_str(" / ");
+            } else {
+                for _ in 0..spaces {
+                    normalized.push(' ');
+                }
+            }
+        }
+        spaces = 0;
+        normalized.push(ch);
+    }
     let mut out = String::new();
-    let words: Vec<&str> = text.split('/').collect();
+    let words: Vec<&str> = normalized.split('/').collect();
     for (wi, word) in words.iter().enumerate() {
         if wi > 0 {
             out.push(' ');
@@ -934,6 +960,23 @@ mod tests {
         let encoded = morse_code(&json!({"direction": "encode", "text": original})).unwrap();
         let decoded = morse_code(&json!({"direction": "decode", "text": encoded})).unwrap();
         assert_eq!(decoded, original);
+        // REGRESSION: the STANDARD 3-space word gap. Both doc comments promise words
+        // separate on "/" OR a run of 3+ spaces, but only "/" was implemented — the
+        // letter loop's `split_whitespace()` collapses any run of whitespace, so a
+        // 3-space (or 7-space) word gap decoded with no break at all ("HIBOB").
+        assert_eq!(
+            morse_code(&json!({"direction": "decode", "text": ".... ..   -... --- -..."})).unwrap(),
+            "HI BOB"
+        );
+        assert_eq!(
+            morse_code(&json!({"direction": "decode", "text": "... --- ...       ... --- ..."})).unwrap(),
+            "SOS SOS"
+        );
+        // Leading whitespace separates nothing.
+        assert_eq!(
+            morse_code(&json!({"direction": "decode", "text": "   ... --- ..."})).unwrap(),
+            "SOS"
+        );
         // Bad direction, unknown char/code, missing args.
         assert!(morse_code(&json!({"direction": "encode", "text": "café"})).is_err());
         assert!(morse_code(&json!({"direction": "decode", "text": "...---...-."})).is_err());

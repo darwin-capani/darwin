@@ -45,8 +45,10 @@
 //!   one.
 //! - DETERMINISTIC: the same (query, facts, k) always yields the same order
 //!   (ties broken by original index, so it never depends on hashmap iteration).
-//! - DEDUP: near-duplicate facts (same normalized text, or one a token-subset
-//!   of another with the same top relevance) collapse to one hit.
+//! - DEDUP: facts whose VALUE normalizes to the SAME token set collapse to one hit.
+//!   (Exact token-set equality only — `dedup_signature` returns the sorted-unique
+//!   token vector and the rank loop compares it with `Vec::contains`. This line used
+//!   to promise a token-SUBSET rule; no subset logic exists in the module.)
 //! - EMPTY-STORE and NO-MATCH are honest: an empty store, or a query nothing
 //!   stored is about, yields ZERO hits — the caller then says "nothing on that
 //!   yet" and NEVER fabricates a memory. Under the LEXICAL backend that means

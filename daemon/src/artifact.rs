@@ -695,12 +695,28 @@ pub fn classify_peek_intent(utterance: &str) -> bool {
         || lower.contains("what'd you")
         || lower.contains("what you just");
     if stem {
-        const VERBS: &[&str] = &[
+        // Multi-word cues are unambiguous as substrings.
+        const PHRASES: &[&str] = &[
             "just do", "just make", "just produce", "just create", "just build",
-            "just draft", "just generate", "do", "make", "produce", "create",
-            "build", "draft", "generate",
+            "just draft", "just generate",
         ];
-        if VERBS.iter().any(|v| lower.contains(v)) {
+        if PHRASES.iter().any(|v| lower.contains(v)) {
+            return true;
+        }
+        // WHAT WENT WRONG: the bare verbs used to sit in the SAME `contains` list.
+        // "do" hides inside document, domain, download, doing, doctor, Dominic — so
+        // "what did you find in the document", "what have you got on that domain",
+        // "what did you download" and "what did you say to Dominic" all classified as
+        // an artifact peek. router.rs handles the peek arm with an early `return`, so
+        // those turns were answered with the last artifact instead of being routed.
+        // utterance.rs already owns this exact rule ("the cheap way to ask —
+        // lower.contains(\"clear\") — is wrong in a way that is invisible until it
+        // destroys something"); this classifier just was not using it.
+        const VERBS: &[&str] = &[
+            "do", "done", "make", "made", "produce", "produced", "create", "created",
+            "build", "built", "draft", "drafted", "generate", "generated",
+        ];
+        if crate::utterance::mentions_any_word(lower, VERBS) {
             return true;
         }
     }
@@ -1182,10 +1198,33 @@ mod tests {
         assert!(classify_peek_intent("what did you just make?"));
         assert!(classify_peek_intent("what have you produced"));
         assert!(classify_peek_intent("let me peek at that"));
+        // Past-tense production verbs are peeks too.
+        assert!(classify_peek_intent("what have you done"));
+        assert!(classify_peek_intent("what did you create"));
         // NOT a peek: ordinary questions.
         assert!(!classify_peek_intent("what's the weather"));
         assert!(!classify_peek_intent("what did you say"));
         assert!(!classify_peek_intent("what do you think about jazz"));
         assert!(!classify_peek_intent("how are you"));
+        // REGRESSION: a bare verb hiding INSIDE a longer word is not a production
+        // verb. Every one of these classified as a peek under the old
+        // `lower.contains("do")`, and the peek arm returns early in route(), so the
+        // question was never answered — the last artifact was read back instead.
+        for u in [
+            "what did you find in the document",
+            "what did you find in my documents?",
+            "what have you got on that domain",
+            "what did you download",
+            "what did you say to Dominic",
+            "what did you learn about the domain name",
+            "what did you tell the doctor",
+            "what did you find",
+        ] {
+            assert!(
+                !classify_peek_intent(u),
+                "{u:?} is an ordinary question; the artifact-peek arm returns early in \
+                 route(), so classifying it as a peek swallows the turn"
+            );
+        }
     }
 }

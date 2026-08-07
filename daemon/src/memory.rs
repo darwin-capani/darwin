@@ -1001,10 +1001,10 @@ impl Memory {
     /// shape as the episodes/transcripts caps; revisit/browse stay agent-scoped at
     /// read time, so a global cap never lets one agent read another's rows.
     /// Returns the number of entries deleted.
-    // Bounded-retention surface; exercised by the notebook tests. Its periodic
-    // retention-task caller is the next wiring step (alongside the darwin.db
-    // retention pass), so allow dead_code until then.
-    #[allow(dead_code)]
+    // Bounded-retention surface. WIRED LIVE: main.rs's `retention_task` (spawned
+    // unconditionally at startup) calls this on its cadence with `[notebooks].retention`
+    // as the cap, alongside the darwin.db retention pass. This used to be commented as
+    // having no runtime caller yet.
     pub async fn notebook_retention_pass(&self, entries_keep: usize) -> Result<u64> {
         // One guard, held for the whole pass — never re-locked across an await
         // (a second `self.conn.lock().await` would self-deadlock the tokio Mutex

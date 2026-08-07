@@ -420,6 +420,12 @@ fn is_name_token(w: &str) -> bool {
     const STOP: &[&str] = &[
         "you", "it", "that", "this", "we", "they", "he", "she", "the", "there",
         "not", "so", "though", "now", "then", "me", "us", "do", "did", "does",
+        // The generic role words are NOT agent names. "why did the agent do that"
+        // used to bind cand = "agent" and look up an agent literally called "agent",
+        // which returns an honest-empty instead of the last decision trace the user
+        // was asking for. Branch 1 ("why the <name> agent") is unaffected — it reads
+        // the token BEFORE "agent".
+        "agent", "assistant", "model", "system",
     ];
     let len = w.chars().count();
     (2..=20).contains(&len) && w.chars().all(|c| c.is_ascii_alphabetic()) && !STOP.contains(&w)
