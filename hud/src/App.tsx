@@ -119,6 +119,7 @@ export default function App() {
   // The Settings modal: null = closed, else the tab to open on. The onboarding
   // wizard routes by opening it on a specific tab (it never adds a new surface).
   const [settingsTab, setSettingsTab] = useState<"credentials" | "system" | null>(null);
+  const [contestHint, setContestHint] = useState<string | null>(null);
   const settingsOpen = settingsTab !== null;
   const [deckOpen, setDeckOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
@@ -291,10 +292,28 @@ export default function App() {
   // user.model tier, DROPS it, and writes a suppression tombstone the consolidation
   // pass never re-derives past — reduce-only, and structurally unable to touch a
   // private agent.* note. The refreshed mirror.belief frame updates this panel.
+  // CONTEST IS SPOKEN-ONLY, and this button no longer pretends otherwise.
+  //
+  // WHAT WENT WRONG: it sent {cmd:"ask", text:`that's wrong about ${subject}`}.
+  // "that's wrong about X" is mapped to `user_model::contest_belief` by the
+  // ROUTER (router.rs:1263) — and `LivePipeline::ask` bypasses the router
+  // entirely, going straight to `complete_with_tools`. There is no contest tool
+  // for the model to reach either: the user_model family is query / correct /
+  // forget. `user_model_correct` OVERRIDES an observation; contest DROPS the
+  // belief and writes a suppression tombstone. Different operations.
+  //
+  // So the click did nothing reliable. At best the model chose `user_model_correct`
+  // — the wrong operation, silently — and at worst it just talked about it. Either
+  // way the belief the user pointed at was not contested.
+  //
+  // Not routed here deliberately: contest is DESTRUCTIVE (drop + permanent
+  // suppression), and the spoken path is where the router's gates live. Making it
+  // clickable would move a destructive op off the gated path, which is a decision
+  // for the owner, not a wiring fix.
   const contestBelief = useCallback((belief: MirrorBelief) => {
     const subject = belief.subject.replace(/_/g, " ").trim();
     if (subject === "") return;
-    void sendCommand({ cmd: "ask", text: `that's wrong about ${subject}` });
+    setContestHint(`Say "that's wrong about ${subject}" out loud — contesting a belief drops it permanently, so it runs on the spoken path where the confirmation gates are.`);
   }, []);
 
   // Dev-only: lets `vite dev` sessions inject actions/envelopes without a
@@ -766,6 +785,11 @@ export default function App() {
           <SessionRewindPanel rewind={state.sessionRewind} />
           <CausaTracePanel trace={state.causaTrace} />
           <MirrorPanel mirror={state.mirror} onContest={contestBelief} />
+          {contestHint !== null && (
+            <p className="mirror-contest-hint" role="status">
+              {contestHint}
+            </p>
+          )}
           {/* The live profile size rides the MIRROR snapshot (sticky-retained,
               so a reconnecting HUD gets it immediately) — MemoryPanel needs it
               or its FORGET control is dead until the next ~20-hourly

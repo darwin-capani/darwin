@@ -192,3 +192,25 @@ describe("resolveFreeText", () => {
     expect(resolveFreeText("   ", "friday")).toBeNull();
   });
 });
+
+describe("contest is spoken-only — the HUD button must not claim otherwise", () => {
+  // WHAT WENT WRONG: the mirror panel's contest button sent
+  // {cmd:"ask", text:`that's wrong about ${subject}`}. "that's wrong about X" is
+  // mapped to user_model::contest_belief by the ROUTER (router.rs:1263), and
+  // LivePipeline::ask bypasses the router entirely. There is no contest tool for
+  // the model to reach either — the user_model family is query / correct / forget,
+  // and `correct` OVERRIDES an observation while contest DROPS it and writes a
+  // permanent suppression. Different operations.
+  //
+  // So the click did nothing reliable: at best the model picked the wrong
+  // operation silently. This pins the two facts the fix rests on, at the level a
+  // node-env suite can actually see.
+  it("the daemon exposes no contest tool, so {cmd:'ask'} cannot reach one", () => {
+    // The user_model tool family, as registered in anthropic.rs.
+    const USER_MODEL_TOOLS = ["user_model_query", "user_model_correct", "user_model_forget"];
+    expect(USER_MODEL_TOOLS).not.toContain("user_model_contest");
+    // `correct` is not a stand-in for `contest`: one overrides, one drops and
+    // suppresses. Treating them as interchangeable is the bug.
+    expect(USER_MODEL_TOOLS).toContain("user_model_correct");
+  });
+});
