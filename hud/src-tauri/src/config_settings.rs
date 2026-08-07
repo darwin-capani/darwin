@@ -42,12 +42,19 @@ use tokio::process::Command;
 /// THIS USED TO BE ONE LABEL, com.darwin.daemon — and then the panel reported "the new
 /// config is now live". DARWIN runs THREE independent agents, and a large share of the
 /// whitelisted settings are read by the INFERENCE server's own load_config, not the
-/// daemon's: vision.model, vision.ocr_model, image.model, speech.engine, speech.model,
-/// speech.voice, speech.speed, inference.preload, inference.reranker,
-/// inference.speculative, inference.draft_model, inference.quant, models.classifier,
-/// models.local_warm and models.local_budget_gib. Every one of them was written to
-/// disk, acknowledged as applied, and then ignored until something else happened to
-/// restart that process.
+/// daemon's. The ten that are BOTH inference-owned AND in `SETTINGS` (i.e. actually
+/// writable from this panel) are: vision.model, image.model, speech.engine,
+/// speech.model, inference.speculative, inference.draft_model, inference.quant,
+/// models.classifier, models.local_warm and models.local_budget_gib. Every one of them
+/// was written to disk, acknowledged as applied, and then ignored until something else
+/// happened to restart that process.
+///
+/// (This list used to name five more — vision.ocr_model, speech.voice, speech.speed,
+/// inference.preload, inference.reranker. Those ARE read by the inference server but
+/// are NOT in `SETTINGS`, so this module has no GET/SET path for them at all and they
+/// were never "written to disk and acknowledged as applied". Naming them here
+/// overstated the blast radius by a third and told a maintainer they were
+/// user-editable in Settings. They are not.)
 ///
 /// Inference goes FIRST so it is already coming up when the daemon reconnects to its
 /// socket. com.darwin.hud is deliberately NOT kicked: it is the window the operator is
@@ -246,9 +253,15 @@ pub enum SettingValue {
     Int(i64),
     Float(f64),
     Str(String),
-    /// A string array (model-id list / absolute-path allowlist). serde(untagged)
-    /// places this BEFORE Str so a JSON `[]` / `["a"]` lands here, never coerced
-    /// to a string. The JS side sends a plain `["/Users/x"]`.
+    /// A string array (model-id list / absolute-path allowlist). A JSON array
+    /// cannot deserialize into `String`, so under serde(untagged) it can only
+    /// land here — it is never coerced to a string. The JS side sends a plain
+    /// `["/Users/x"]`.
+    ///
+    /// (This used to claim untagged "places this BEFORE Str", crediting a
+    /// DECLARATION-ORDER invariant that does not exist: StrList is declared
+    /// AFTER Str, and the outcome holds for the type reason above regardless of
+    /// order. Do not treat variant order here as a safety mechanism.)
     StrList(Vec<String>),
 }
 
@@ -759,8 +772,17 @@ fn apply_writes_in_place(
     text: &str,
     writes: &BTreeMap<SectionKey, String>,
 ) -> Result<String, String> {
-    // Preserve the file's original line endings: we rebuild from the original
-    // line slices and re-insert '\n', then restore a missing trailing newline.
+    // LINE ENDINGS ARE NORMALIZED TO '\n'. We rebuild from `str::lines()` slices,
+    // which STRIP the '\r' of a "\r\n" pair, and re-insert a bare '\n' — so a
+    // CRLF config is rewritten to LF on every line, not just the targeted ones.
+    // (This comment used to claim the opposite, "preserve the file's original
+    // line endings", and the module header's "every other line byte-for-byte"
+    // promise does not hold for a CRLF file either. `count_changed_lines` also
+    // compares via lines() on both sides, so it cannot see the difference and the
+    // panel reports only the targeted lines as changed.) Content and comments ARE
+    // preserved byte-for-byte; only the terminator changes. To genuinely preserve
+    // them, split with `split_inclusive('\n')` and rewrite only the value token
+    // inside each retained slice.
     let mut applied: BTreeMap<(String, String), bool> =
         writes.keys().map(|k| (k.clone(), false)).collect();
 
@@ -2028,25 +2050,74 @@ roots = []                     # EXPLICIT codebase-root allowlist, SHIPS EMPTY.
 mod restart_target_tests {
     use super::*;
 
-    /// Settings whose values the INFERENCE server reads, not the daemon. Kicking only
+    /// Settings whose values the INFERENCE server reads, not the daemon, AND that
+    /// this module can actually write (i.e. every id here is in `SETTINGS` — pinned
+    /// by `inference_owned_ids_are_all_actually_whitelisted` below). Kicking only
     /// com.darwin.daemon wrote them to disk, reported "the new config is now live",
     /// and left every one of them stale.
+    ///
+    /// It used to also list vision.ocr_model, speech.voice, speech.speed,
+    /// inference.preload and inference.reranker. Those are read by the inference
+    /// server but are NOT whitelisted here, so they have no GET/SET path and could
+    /// never have been "written and acknowledged" — the failure message overstated
+    /// the blast radius by a third.
     const INFERENCE_OWNED: &[&str] = &[
         "vision.model",
-        "vision.ocr_model",
         "image.model",
         "speech.engine",
         "speech.model",
-        "speech.voice",
-        "speech.speed",
-        "inference.preload",
-        "inference.reranker",
         "inference.speculative",
         "inference.draft_model",
         "inference.quant",
         "models.classifier",
         "models.local_warm",
         "models.local_budget_gib",
+    ];
+
+    /// Which process(es) READ each `SETTINGS` section. A section can be read by
+    /// BOTH (e.g. `[vision].enabled` is the daemon's master gate while
+    /// `[vision].model` is loaded by the inference server), so the value is a
+    /// LIST, not a single owner.
+    ///
+    /// EXHAUSTIVE by construction:
+    /// `every_whitelisted_setting_belongs_to_a_process_we_restart` iterates the
+    /// real `SETTINGS` and fails on any section missing from this table, so a NEW
+    /// section must be classified here — and its readers must all be in
+    /// `RESTART_LABELS` — before it can ship.
+    const SECTION_READERS: &[(&str, &[&str])] = &[
+        ("integrations", &["com.darwin.daemon"]),
+        ("voice_id", &["com.darwin.daemon"]),
+        ("security", &["com.darwin.daemon"]),
+        ("policy", &["com.darwin.daemon"]),
+        ("standing", &["com.darwin.daemon"]),
+        ("drafts", &["com.darwin.daemon"]),
+        ("missions", &["com.darwin.daemon"]),
+        ("macros", &["com.darwin.daemon"]),
+        ("proactive", &["com.darwin.daemon"]),
+        ("focus", &["com.darwin.daemon"]),
+        ("screen_context", &["com.darwin.daemon"]),
+        ("vision", &["com.darwin.daemon", "com.darwin.inference"]),
+        ("image", &["com.darwin.daemon", "com.darwin.inference"]),
+        ("audio", &["com.darwin.daemon"]),
+        ("interpret", &["com.darwin.daemon"]),
+        ("episodic", &["com.darwin.daemon"]),
+        ("voice", &["com.darwin.daemon"]),
+        ("speech", &["com.darwin.daemon", "com.darwin.inference"]),
+        ("shell", &["com.darwin.daemon"]),
+        ("ui_automation", &["com.darwin.daemon"]),
+        ("mcp", &["com.darwin.daemon"]),
+        ("webhooks", &["com.darwin.daemon"]),
+        ("plugin_sdk", &["com.darwin.daemon"]),
+        ("docsearch", &["com.darwin.daemon"]),
+        ("code", &["com.darwin.daemon"]),
+        ("local_tools", &["com.darwin.daemon"]),
+        ("report", &["com.darwin.daemon"]),
+        ("chart", &["com.darwin.daemon"]),
+        ("answers", &["com.darwin.daemon"]),
+        ("power", &["com.darwin.daemon"]),
+        ("inference", &["com.darwin.inference"]),
+        ("models", &["com.darwin.inference"]),
+        ("router", &["com.darwin.daemon"]),
     ];
 
     #[test]
@@ -2082,20 +2153,86 @@ mod restart_target_tests {
         );
     }
 
+    /// WHAT WENT WRONG: this test asserted a TAUTOLOGY. It looped over the
+    /// hand-written, test-only `INFERENCE_OWNED` and asserted
+    /// `id.split('.').next().unwrap()` is non-empty — true for every hardcoded
+    /// entry, unfalsifiable. It never read `SETTINGS` at all, so the bug it is
+    /// NAMED for ("a setting owned by NEITHER restarted process would silently
+    /// never apply") had no coverage whatsoever: a new Setting in an unclassified
+    /// section would be written, reported live by `daemon_restart`, and stay
+    /// stale, with this test green. Now it iterates the REAL whitelist against an
+    /// explicit section -> owning-label table.
     #[test]
     fn every_whitelisted_setting_belongs_to_a_process_we_restart() {
-        // A setting owned by NEITHER restarted process would silently never apply —
-        // the same class of bug, one layer up.
-        for id in INFERENCE_OWNED {
-            let section = id.split('.').next().unwrap();
+        let readers: std::collections::BTreeMap<&str, &[&str]> =
+            SECTION_READERS.iter().copied().collect();
+        let mut unclassified: Vec<&str> = Vec::new();
+        for s in SETTINGS {
+            match readers.get(s.section) {
+                None => unclassified.push(s.section),
+                Some(labels) => {
+                    assert!(!labels.is_empty(), "section [{}] lists no reader", s.section);
+                    for label in *labels {
+                        assert!(
+                            RESTART_LABELS.contains(label),
+                            "section [{}] is read by {label}, which Apply never restarts: {}.{} \
+                             would be written, reported live, and stay stale",
+                            s.section,
+                            s.section,
+                            s.key
+                        );
+                    }
+                }
+            }
+        }
+        unclassified.sort_unstable();
+        unclassified.dedup();
+        assert!(
+            unclassified.is_empty(),
+            "these whitelisted sections are not classified in SECTION_OWNER, so nobody has \
+             decided which process reads them — a setting there would be saved, acknowledged \
+             as applied, and silently never take effect: {unclassified:?}"
+        );
+        // The AUTONOMY 3-way ids are bare section names with no dot; they are
+        // daemon-read and covered by the daemon restart.
+        for section in AUTONOMY_SECTIONS {
             assert!(
-                !section.is_empty(),
-                "malformed setting id in the inference-owned list: {id}"
+                RESTART_LABELS.contains(&"com.darwin.daemon"),
+                "autonomy section [{section}] is daemon-read; the daemon must be restarted"
             );
         }
+    }
+
+    /// The companion the old test only pretended to be: every id in the
+    /// inference-owned list must ACTUALLY be writable from this module, or the
+    /// module doc (and the failure message above it) describes a blast radius
+    /// that does not exist.
+    #[test]
+    fn inference_owned_ids_are_all_actually_whitelisted() {
+        let whitelisted: std::collections::BTreeSet<String> =
+            SETTINGS.iter().map(|s| format!("{}.{}", s.section, s.key)).collect();
+        let missing: Vec<&&str> =
+            INFERENCE_OWNED.iter().filter(|id| !whitelisted.contains(**id)).collect();
         assert!(
-            RESTART_LABELS.len() >= 2,
-            "settings span the daemon AND the inference server"
+            missing.is_empty(),
+            "INFERENCE_OWNED names ids this module cannot write, so they were never \
+             'written to disk and acknowledged as applied': {missing:?}"
         );
+        // Every id in the list must live in a section the inference server reads
+        // (a section can be read by BOTH processes — `[vision].enabled` is the
+        // daemon's master gate, `[vision].model` is the inference server's load).
+        let readers: std::collections::BTreeMap<&str, &[&str]> =
+            SECTION_READERS.iter().copied().collect();
+        for id in INFERENCE_OWNED {
+            let section = id.split('.').next().unwrap();
+            let labels = readers
+                .get(section)
+                .unwrap_or_else(|| panic!("[{section}] is not classified in SECTION_READERS"));
+            assert!(
+                labels.contains(&"com.darwin.inference"),
+                "{id} is listed as inference-owned but [{section}] is not read by the \
+                 inference server"
+            );
+        }
     }
 }

@@ -392,4 +392,32 @@ describe("EvalPanel render", () => {
     expect(out).not.toContain("apply_optimization.sh");
     expect(out.toLowerCase()).toContain("propose-only");
   });
+
+  /* REGRESSION: the footer used to read "The optimizer is propose-only and ships
+     OFF" unconditionally — printed three lines under a live "ON · PROPOSE" pill
+     on every stock install, because [optimize].enabled ships TRUE
+     (config/darwin.toml; daemon/src/config.rs asserts it). The panel may never
+     tell the user a feature is off while it is rendering that feature's ON pill. */
+  it("never tells the user the optimizer ships OFF (it ships ON, propose-only)", () => {
+    const shipped = html(
+      parseEvalReport({
+        ...measuredReport,
+        optimizer: { enabled: true, mode: "propose", posture: "propose-only" },
+      }),
+    );
+    expect(shipped).toContain("eval-opt-pill on");
+    const lower = shipped.toLowerCase();
+    expect(lower).not.toContain("ships off");
+    expect(lower).not.toContain("off by default");
+    expect(lower).toContain("propose-only");
+  });
+
+  /* And the OFF branch must attribute the OFF to the OPERATOR, not to a
+     "shipped default" that does not exist. */
+  it("the OFF note says the operator disabled it, not that OFF is the shipped default", () => {
+    const off = html(parseEvalReport(measuredReport), null).toLowerCase();
+    expect(off).toContain("eval-opt-pill off");
+    expect(off).not.toContain("the shipped default");
+    expect(off).toContain("you turned it off");
+  });
 });

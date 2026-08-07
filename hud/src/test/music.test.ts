@@ -182,6 +182,23 @@ describe("classifyMusicReply (PROSE-based, fail-safe — never the bare ok flag)
       ),
     ).toBe("failed");
   });
+
+  /* REGRESSION — the ONE daemon line that carried no marker at all. It is the
+     switch-off no-op from daemon/src/main.rs::trigger_compose_music, relayed as
+     ok:TRUE with the prose in `reply` (daemon/src/command.rs). It classified as
+     "created" and composeMusicOutcomeCopy then rendered a fabricated
+     "Composed a track from …" for a track that was never composed. */
+  it("the [voice].cloud_music switch-off no-op reads unavailable, never created", () => {
+    const line = "The music-generation tier is off. Turn on [voice].cloud_music to use it.";
+    expect(classifyMusicReply(true, line)).toBe("unavailable");
+    expect(classifyMusicReply(false, line)).toBe("unavailable");
+    // The copy the panel would fall back to must not claim a creation.
+    expect(composeMusicOutcomeCopy(classifyMusicReply(true, line), "a lullaby")).not.toContain(
+      "Composed",
+    );
+    // ...and the genuine daemon success prose is still "created".
+    expect(classifyMusicReply(true, "Composed your track — it's ready.")).toBe("created");
+  });
 });
 
 describe("compose-music outcome copy is honest + secret-free", () => {

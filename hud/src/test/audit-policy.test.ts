@@ -48,10 +48,13 @@ const noop = () => {};
 /** A realistic audit.snapshot payload: an OK chain, a mix of decisions/outcomes,
  *  a redacted target — and a hostile token-shaped field the daemon would never
  *  send, to pin the secret-free contract. */
+/*  NOTE: there is deliberately NO `truncated` key here. audit.rs::snapshot_json
+ *  emits ONLY {enabled,total,chain,entries}; the fixture used to carry
+ *  `truncated: false`, a key the daemon never sends, which made the wire shape
+ *  look authoritative for a field it does not carry. */
 const mockAudit: Record<string, unknown> = {
   enabled: true,
   total: 3,
-  truncated: false,
   chain: { ok: true, count: 3 },
   entries: [
     {
@@ -356,6 +359,24 @@ describe("audit.snapshot / policy.snapshot reducer", () => {
     expect(s.audit!.truncated).toBe(true);
   });
 
+  /* REGRESSION: the periodic audit_snapshot_task re-emits audit.snapshot every
+     15s and the daemon's snapshot payload has NO `truncated` key, so a blind
+     replace silently erased the re-root disclosure one tick after the prune.
+     The rendered "chain was RE-ROOTED by a prune" notice must survive. */
+  it("a later audit.snapshot does NOT erase a prune's re-root disclosure", () => {
+    let s = tel(connected(), env("audit.snapshot", mockAudit));
+    s = tel(s, env("audit.truncated", { removed: 100, kept: 9900 }));
+    expect(s.audit!.truncated).toBe(true);
+    // The daemon's REAL next snapshot: no `truncated` key on the wire.
+    s = tel(s, env("audit.snapshot", { ...mockAudit, total: 9900 }));
+    expect(s.audit!.truncated).toBe(true);
+    expect(s.audit!.total).toBe(9900); // the rest of the snapshot IS authoritative
+    const html = renderToStaticMarkup(
+      createElement(AuditPanel, { audit: s.audit, liveGate: [] }),
+    );
+    expect(html).toContain("RE-ROOTED");
+  });
+
   it("audit.truncated is a no-op (same ref) when no snapshot is loaded", () => {
     const before = connected();
     const after = tel(before, env("audit.truncated", { removed: 1, kept: 1 }));
@@ -509,6 +530,49 @@ describe("SettingsModal policy editor (user-set only, honest)", () => {
     // both ALWAYS and NEVER decisions render
     expect(html).toContain(">ALWAYS<");
     expect(html).toContain(">NEVER<");
+  });
+
+  /* REGRESSION — a control that could not do its job. The ✕ rides
+     POLICY_PHRASES.ask, which names only the TOOL, so the daemon rebuilds
+     PolicyScope::tool(tool) with agent=None/recipient=None; PolicyStore::clear
+     keys on the full (tool, agent, recipient) triple and never matches a
+     scope-narrowed rule. Nothing was removed — and because clear() returned
+     false, apply_global returned false, whose ack is "the policy layer is off, so
+     nothing changed. Enable [policy]...". A user revoking a standing AUTO-APPROVE
+     was told the layer was disabled while the rule stayed in force. */
+  it("the ✕ is DISABLED on a scope-narrowed rule and says why (it cannot clear it)", () => {
+    const html = renderSettings(
+      parsePolicySnapshot({
+        enabled: true,
+        rules: [
+          { scope: { tool: "gmail_send", agent: "agent.pepper" }, decision: "always" },
+        ],
+      }),
+    );
+    expect(html).toContain("agent.pepper");
+    expect(html).toContain('aria-label="clear policy rule for gmail_send"');
+    // The control is inert rather than silently doing nothing. (This suite does
+    // not mock inTauri(), so `shell` is false and every button carries
+    // `disabled` — the DISCRIMINATING signal is therefore the title, asserted
+    // next, which flips on `scopeNarrowed` alone.)
+    expect(html).toMatch(/cred-remove"[^>]*disabled=""/);
+    // It must name the real remedy, not blame the policy layer.
+    expect(html).toContain("SCOPE-NARROWED");
+    expect(html).toContain("state/policy.json");
+    expect(html).not.toContain("Clear this rule back to ASK");
+    expect(html.toLowerCase()).not.toContain("policy layer is off");
+  });
+
+  it("the ✕ keeps its normal CLEAR affordance on a tool-only rule (the phrase matches it)", () => {
+    const html = renderSettings(
+      parsePolicySnapshot({
+        enabled: true,
+        rules: [{ scope: { tool: "gmail_send" }, decision: "always" }],
+      }),
+    );
+    expect(html).toContain('aria-label="clear policy rule for gmail_send"');
+    expect(html).toContain("Clear this rule back to ASK");
+    expect(html).not.toContain("SCOPE-NARROWED");
   });
 
   it("surfaces the HONEST invariants: master ceiling, NEVER wins, user-set only, inert ALWAYS", () => {

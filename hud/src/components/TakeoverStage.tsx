@@ -67,9 +67,20 @@ export default function TakeoverStage({
             feed={state.appFeeds[GLOBAL_SCAN_APP]}
             running={state.runningApps.has(GLOBAL_SCAN_APP)}
           />
+          {/* All FIVE props, exactly as the windowed layout mounts it. The
+              takeover stage is `position:fixed; inset:0` over a near-opaque
+              backdrop, so it fully OCCLUDES the windowed HUD — a prop dropped
+              here is a signal the user cannot see anywhere. Dropping the last
+              three removed the PROMINENT "WATCHING SCREEN" privacy indicator
+              (VisionPanel gates the whole screen-context block on the prop) plus
+              the ambient sound-monitor row and the on-device VLM readout, in the
+              one mode where the HUD is the only thing on screen. */}
           <VisionPanel
             feed={state.appFeeds[VISION_APP]}
             running={state.runningApps.has(VISION_APP)}
+            describe={state.visionDescribe}
+            soundMonitor={state.audioSoundMonitor}
+            screenContext={state.screenContext}
           />
         </div>
 

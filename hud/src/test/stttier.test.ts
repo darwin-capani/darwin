@@ -271,4 +271,24 @@ describe("SettingsModal voice-clone section (consent-gated)", () => {
     expect(VOICE_CLONE_PHRASES.forget.toLowerCase()).toContain("forget");
     expect(VOICE_CLONE_PHRASES.forget.toLowerCase()).toContain("voice clone");
   });
+
+  /* REGRESSION — the panel used to FABRICATE the daemon's side of this flow. The
+     buttons ride {cmd:"ask"}, which the daemon routes to LivePipeline::ask ->
+     complete_with_tools; `voiceclone::classify_intent` / `is_confirmation` are
+     reached ONLY from `handle_voice_clone` on the per-utterance SPOKEN path, and
+     the model has no voice-clone tool. So no consent is parked and FORGET does
+     not drop the stored clone — yet the panel flipped its own pill to "AWAITING
+     CONFIRM" on any successful send and printed the cloud model's reply as the
+     daemon's ack. A user could be told their clone was forgotten when it was
+     not. The copy must now point at the SPOKEN flow and claim nothing. */
+  it("never claims a parked consent — the pill states the flow is SPOKEN", () => {
+    const html = renderSettings(sttTierInitial());
+    expect(html).toContain("CONSENT-GATED · SPOKEN");
+    expect(html).not.toContain("AWAITING CONFIRM");
+    // The default hint names the spoken route and the exact phrase to say.
+    expect(html).toContain("SPOKEN path only");
+    expect(html).toContain(VOICE_CLONE_PHRASES.propose);
+    // And it must not assert the panel itself parks anything.
+    expect(html).not.toContain("the daemon parks a consent prompt");
+  });
 });

@@ -514,7 +514,19 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
                     telemetry::emit(
                         "audio",
                         "interpret.segment_fed",
-                        json!({"target": cfg.interpret.target_lang, "speak": cfg.interpret.speak}),
+                        // `source` is the CONFIGURED source language
+                        // ([interpret].source_lang, consumed by interpret.rs to
+                        // build the translation prompt). It ships EMPTY, which
+                        // honestly means auto-detect. It was omitted, so the HUD's
+                        // InterpretLive.source was write-never and the panel read
+                        // "auto-detect → X" even when the daemon was pinning the
+                        // source — a claim about the loop's posture that was false
+                        // and never self-corrected.
+                        json!({
+                            "source": cfg.interpret.source_lang,
+                            "target": cfg.interpret.target_lang,
+                            "speak": cfg.interpret.speak,
+                        }),
                     );
                 }
                 match write_wav(&path, sample_rate, &segment) {

@@ -118,13 +118,32 @@ describe("onboarding step model", () => {
     expect(ONBOARDING_STEPS[ONBOARDING_STEP_COUNT - 1].route).toBeNull();
   });
 
-  it("the copy is HONEST about the gated posture (armed-but-gated, autonomy OFF)", () => {
+  /* WHAT WENT WRONG: this was named "...autonomy OFF" and asserted a bare
+     `toContain("off")` with the comment "autonomy ships off". Both are the
+     INVERSE of what DARWIN ships — [self_heal].enabled, [forge].enabled and
+     [optimize].enabled are all TRUE — and the inverse of the copy under test,
+     which says "Autonomy is ARMED but propose-only". The assertion passed off an
+     unrelated sentence (the file-search line is the only "off" in the whole
+     deck), so it gave no coverage of the autonomy claim it was named for: delete
+     the autonomy paragraph, or turn it into an overclaim, and it stayed green. */
+  it("the copy is HONEST about the shipped posture (armed by default, propose-only)", () => {
     const blob = ONBOARDING_STEPS.flatMap((s) => [s.title, ...s.body]).join(" ").toLowerCase();
     expect(blob).toContain("gated");
-    expect(blob).toContain("off"); // autonomy ships off
     expect(blob).toContain("keychain"); // the key is never logged/shown
     // never overclaims that DARWIN will act for the user without the gate
     expect(blob).toContain("never");
+    // The AUTONOMY claim, asserted on its own substantive tokens rather than a
+    // bare "off" any sentence could satisfy.
+    const autonomy = ONBOARDING_STEPS.flatMap((s) => s.body).filter((b) =>
+      b.toLowerCase().includes("autonomy"),
+    );
+    expect(autonomy.length).toBeGreaterThan(0);
+    const auto = autonomy.join(" ").toLowerCase();
+    expect(auto).toContain("armed");
+    expect(auto).toContain("propose");
+    // It must NOT tell the user autonomy is off — it ships armed.
+    expect(auto).not.toContain("autonomy is off");
+    expect(auto).not.toContain("autonomy ships off");
   });
 });
 

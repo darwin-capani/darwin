@@ -72,7 +72,19 @@ describe("PerfGovernor", () => {
     // At 100ms frames (10fps) the cooldown still spans COOLDOWN_MS of wall
     // clock — i.e. at least COOLDOWN_MS/100 samples with no drop.
     const g = new PerfGovernor();
-    while (g.tier === 0) g.sample(100);
+    // BOUNDED, like every other loop in this file. Unbounded, a regression in the
+    // drop path (FRAME_BUDGET_MS raised, SUSTAIN_FRAMES unreachable, the drop
+    // branch broken) turned `npx vitest run` into an INDEFINITE HANG with no
+    // failing test name instead of a clean red: the loop is synchronous, so it
+    // blocks the worker thread and vitest's own timeout timer never fires. This
+    // repo's merge gate is the local run (CI only runs on v* tags), so that
+    // failure mode hides exactly what these tests exist to catch.
+    let warmup = 0;
+    while (g.tier === 0 && warmup < 10_000) {
+      g.sample(100);
+      warmup += 1;
+    }
+    expect(g.tier).toBe(1); // the governor MUST have dropped; assert, never spin
     let samples = 0;
     while (g.tier === 1 && samples < 10_000) {
       g.sample(100);

@@ -54,10 +54,19 @@ export default function DiagnosticsPanel({
   gauges,
   facts,
   actions,
+  configIssues = [],
 }: {
   gauges: SystemGauges;
   facts: LearnedFact[];
   actions: ActionEntry[];
+  /** Unknown/malformed keys the daemon found in darwin.toml / agents.toml
+   *  (config.invalid / agents.invalid, RETAINED for replay precisely so a
+   *  late-connecting HUD still learns about them). The reducer already parsed,
+   *  bounded and deduped these — and then NOTHING rendered them, so a mistyped
+   *  SAFETY key (a confirm gate, a lockdown flag, an egress switch) that the TOML
+   *  parser silently ignores still read as "set" to the operator. This is the
+   *  render. Defaulted so existing callers/tests keep compiling. */
+  configIssues?: string[];
 }) {
   const memPct =
     gauges.memUsedBytes !== null && gauges.memTotalBytes
@@ -86,6 +95,25 @@ export default function DiagnosticsPanel({
         <Gauge label="DISK FREE" value={fmtBytes(gauges.diskFreeBytes)} pct={null} />
         <Gauge label="UPTIME" value={fmtUptime(gauges.uptimeSecs)} pct={null} />
       </div>
+      {configIssues.length > 0 && (
+        <>
+          <div className="sub-title">
+            CONFIG ERRORS <span className="tag warn">{configIssues.length}</span>
+          </div>
+          <div className="config-issues sub" role="note">
+            <div className="config-issues-lead dim-note">
+              The daemon did not understand these entries in your config, so they
+              are NOT in effect — a mistyped safety key reads as set but does
+              nothing. Fix the spelling in darwin.toml / agents.toml and restart.
+            </div>
+            {configIssues.map((line) => (
+              <div key={line} className="config-issue">
+                ⚠ {line}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
       <div className="sub-title">
         MEMORY // ACTIONS <span className="tag">{facts.length + actions.length}</span>
       </div>

@@ -40,9 +40,21 @@ function connected(at = 0): HudState {
 /* ------------------------------------------------------------------------ *
  * GATED UI AUTOMATION (#44, the CAPSTONE) — the HUD's read-only view of the
  * SINGLE MOST DANGEROUS feature (physically actuating the UI). It is fed ONLY
- * by ui_actuate.* events, ships OFF, parks PER-ACTION (one confirm = one
- * actuation), and never fabricates a result. These tests pin the parsers + the
- * reducer to that honest contract.
+ * by ui_actuate.* events.
+ *
+ * IT SHIPS ON. config/darwin.toml `[ui_automation] enabled = true` ("master
+ * gate. SHIPS ON (full-power default)"), and daemon/src/config.rs
+ * UiAutomationConfig::default sets `enabled: true` with the same comment. The
+ * real safety story is ARMED BY DEFAULT, GATED PER ACTION: ui_actuate is in
+ * CONSEQUENTIAL_TOOLS + NEVER_AUTO_APPROVE_TOOLS, so it NEVER auto-runs — it
+ * parks PER-ACTION behind allow_consequential + a spoken confirm + voice-id +
+ * !lockdown, and is inert without Accessibility (TCC) consent. One confirm =
+ * one actuation, and it never fabricates a result.
+ *
+ * (This header used to say "ships OFF" — mis-stating the shipped posture of the
+ * most dangerous capability in the product, in the very file a reviewer reads to
+ * check that posture.) These tests pin the parsers + the reducer to that honest
+ * contract.
  * ------------------------------------------------------------------------ */
 
 describe("parseUiActuateBlocked (OFF/locked vs device-gated)", () => {
@@ -135,11 +147,11 @@ describe("parseUiActuateActionEvent (parked / actuating / actuated)", () => {
  * per-action, never-auto-run, never-fabricate contract holds end-to-end.
  * ------------------------------------------------------------------------ */
 describe("reduce(ui_actuate.*) — the honest per-action surface", () => {
-  it("ships OFF: the surface is null until the first event", () => {
+  it("the surface is null until the first event (the gate ships ON; no event yet)", () => {
     expect(connected().uiActuate).toBeNull();
   });
 
-  it("the OFF/locked gate lands as blocked-off (the inert default, not an error)", () => {
+  it("the OFF/locked gate lands as blocked-off (the OPTED-OUT state, not an error)", () => {
     const s = tel(connected(), env("ui_actuate.blocked", { reason: "disabled" }));
     expect((s.uiActuate as UiActuateSurface).last?.kind).toBe("blocked-off");
   });

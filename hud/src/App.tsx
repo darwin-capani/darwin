@@ -770,12 +770,21 @@ export default function App() {
               so a reconnecting HUD gets it immediately) — MemoryPanel needs it
               or its FORGET control is dead until the next ~20-hourly
               consolidation pass. */}
-          <MemoryPanel memory={state.memory} beliefCount={state.mirror?.beliefs.length ?? 0} />
+          <MemoryPanel
+            memory={state.memory}
+            beliefCount={state.mirror?.beliefs.length ?? 0}
+            consolidationStale={state.consolidationStale}
+          />
           <EvalPanel report={state.evalReport} proposal={state.optimizerProposal} />
           <SpendMeter spend={state.obolSpend} />
           <SkillsPanel skills={state.skills} />
           <InferencePerfPanel perf={state.inferencePerf} />
-          <DiagnosticsPanel gauges={state.gauges} facts={state.facts} actions={state.actions} />
+          <DiagnosticsPanel
+            gauges={state.gauges}
+            facts={state.facts}
+            actions={state.actions}
+            configIssues={state.configIssues}
+          />
           <VitalsPanel vitals={state.vitals} />
           <ProcPanel proc={state.processes} />
         </div></ErrorBoundary>

@@ -28,10 +28,13 @@ import Frame from "./Frame";
  *     MODEL'S OWN statement (a gated prompt asks for it). The plumbing is real;
  *     the calibration is runtime/model-behavior and is NOT a measured score. The
  *     copy says so — never a "% accuracy" or a guarantee.
- *   - SHIPPED OFF. The [answers].cite / [answers].confidence gates ship false, so
- *     until they are deliberately enabled the daemon emits an EMPTY annotation
- *     (no sources, no from-my-knowledge label, no confidence) and this panel
- *     renders NOTHING — behavior is byte-for-byte today's.
+ *   - SHIPS ON. [answers].cite and [answers].confidence are BOTH true in the
+ *     shipped config (config/darwin.toml; daemon/src/config.rs asserts both), so
+ *     a default install annotates every turn and this panel renders on every
+ *     answer. The EMPTY-annotation shape (no sources, no from-my-knowledge label,
+ *     no confidence) — which holds this panel at null — is what you get when the
+ *     OPERATOR turns a gate off, not a shipped default. (This block used to claim
+ *     the opposite while the panel only mounts when the gates ARE producing.)
  *   - SECRET-FREE. The wire carries only the real locators/snippets the persona
  *     already shows + the parsed self-report — never an embedding/audio/secret.
  *   - REVIEW-ONLY. There is NO button here. Citing/confidence are gated daemon
@@ -48,9 +51,10 @@ export default function AnswerSourcesPanel({
   annotation: AnswerAnnotation | null;
 }) {
   // Nothing to show until an answer.annotated carries real provenance. The
-  // [answers] gates ship OFF, so the reducer holds `answerAnnotation` at null
-  // until cite/confidence is enabled AND a real annotation arrives — render
-  // nothing rather than a placeholder, mirroring the other event-fed panels
+  // [answers] gates ship ON, so on a stock install the reducer fills
+  // `answerAnnotation` on the first annotated turn; it stays null before any turn
+  // and whenever the operator has turned cite/confidence off — render nothing
+  // rather than a placeholder, mirroring the other event-fed panels
   // (DocSearchPanel, UnifiedSearchPanel, McpPanel).
   if (annotation === null) return null;
 
@@ -78,7 +82,7 @@ export default function AnswerSourcesPanel({
             turn, never invented. <b>From my own knowledge</b> means the turn used
             no retrieval (no source was consulted). Confidence is the model&rsquo;s
             own self-report (grounded / inferred / uncertain), not a measured
-            accuracy score. Both ship OFF and are enabled only via{" "}
+            accuracy score. Both ship <b>ON</b> — turn them off with{" "}
             <code>[answers].cite</code> / <code>[answers].confidence</code>.
           </div>
         </div>

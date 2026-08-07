@@ -757,7 +757,21 @@ function VoiceIdSection({ voiceId }: { voiceId: VoiceIdStatus }) {
  *  uploads nothing and you keep your on-device Kokoro/existing voice. FORGET drops
  *  the stored clone. The HUD adds NO new authority — it sends the SAME spoken
  *  phrases the voice path uses; the consent machine lives in the daemon. Live clone
- *  quality is device/credential-gated and is NEVER claimed measured here. */
+ *  quality is device/credential-gated and is NEVER claimed measured here.
+ *
+ *  WHAT WENT WRONG — THE CONTROLS ARE NOT WIRED TO THE CONSENT MACHINE. These
+ *  buttons ride {cmd:"ask"}, which the daemon routes to LivePipeline::ask ->
+ *  anthropic::complete_with_tools. `voiceclone::classify_intent` /
+ *  `is_confirmation` are reached ONLY from `handle_voice_clone`, which the
+ *  per-utterance SPOKEN handler calls after STT and before route() — the command
+ *  channel never calls it, and the model has no voice-clone tool. So no
+ *  CloneState::Pending is parked, no confirmation is consumed, and FORGET does
+ *  NOT drop state/voice/cloned.json. Fail-safe in the upload direction (nothing
+ *  is uploaded), but the panel used to flip its own pill to "AWAITING CONFIRM"
+ *  unconditionally on any successful send and print the cloud model's reply as
+ *  the daemon's ack — so a user could be told their clone was forgotten, or a
+ *  consent parked, when neither happened. The HUD no longer fabricates either:
+ *  it states that this is the spoken flow and shows the exact phrase to say. */
 function VoiceCloneSection({ shell }: { shell: boolean }) {
   // `proposed` is a HUD-local two-step latch: the first click proposes (parks the
   // daemon's pending consent + reveals the explicit CONFIRM affordance); only the
@@ -780,11 +794,13 @@ function VoiceCloneSection({ shell }: { shell: boolean }) {
     setBusy(true);
     setNote("");
     try {
-      const reply = await send(VOICE_CLONE_PHRASES.propose);
-      setProposed(true);
+      await send(VOICE_CLONE_PHRASES.propose);
+      // NO `setProposed(true)` here. The consent machine is on the SPOKEN path
+      // only (see the module doc), so nothing was parked and there is no verdict
+      // to latch on. Latching unconditionally showed "AWAITING CONFIRM" for a
+      // consent that does not exist.
       setNote(
-        reply ||
-          "DARWIN is asking you to confirm. Nothing has left the device yet — press CONFIRM CLONE to upload the sample, or CANCEL.",
+        `Voice cloning is confirmed by VOICE, not from this panel. Say "${VOICE_CLONE_PHRASES.propose}" aloud — DARWIN will park the consent and ask you to confirm out loud. Nothing has left the device.`,
       );
     } catch {
       setNote("shell error");
@@ -799,9 +815,11 @@ function VoiceCloneSection({ shell }: { shell: boolean }) {
     if (busy) return;
     setBusy(true);
     try {
-      const reply = await send(VOICE_CLONE_PHRASES.confirm);
+      await send(VOICE_CLONE_PHRASES.confirm);
       setProposed(false);
-      setNote(reply || "Clone requested.");
+      setNote(
+        `A spoken consent cannot be confirmed from this panel. Say "${VOICE_CLONE_PHRASES.confirm}" aloud to the parked prompt. Nothing has left the device from here.`,
+      );
     } catch {
       setNote("shell error");
     } finally {
@@ -822,8 +840,12 @@ function VoiceCloneSection({ shell }: { shell: boolean }) {
     setBusy(true);
     setProposed(false);
     try {
-      const reply = await send(VOICE_CLONE_PHRASES.forget);
-      setNote(reply || "Forgot the voice clone.");
+      await send(VOICE_CLONE_PHRASES.forget);
+      // NEVER "Forgot the voice clone." — the stored clone is dropped only by the
+      // spoken path; this send does not reach it.
+      setNote(
+        `Say "${VOICE_CLONE_PHRASES.forget}" aloud to drop the stored clone — the panel cannot do it, and would otherwise tell you it had.`,
+      );
     } catch {
       setNote("shell error");
     } finally {
@@ -842,9 +864,7 @@ function VoiceCloneSection({ shell }: { shell: boolean }) {
           explicit steps and nothing is uploaded until you confirm. With no
           ElevenLabs key nothing is uploaded and you keep your on-device voice.
         </div>
-        <div className={`cred-pill ${proposed ? "warn" : "idle"}`}>
-          {proposed ? "AWAITING CONFIRM" : "CONSENT-GATED"}
-        </div>
+        <div className="cred-pill idle">CONSENT-GATED · SPOKEN</div>
       </div>
 
       <div className="cred-row">
@@ -855,7 +875,7 @@ function VoiceCloneSection({ shell }: { shell: boolean }) {
               className="icon-btn"
               onClick={() => void propose()}
               disabled={!shell || busy}
-              title="Step 1: propose a clone — the daemon parks a consent prompt; NOTHING leaves the device yet"
+              title="Sends the clone phrase over the command channel. The consent machine runs on the SPOKEN path, so say the phrase ALOUD to actually park a consent. NOTHING leaves the device either way."
             >
               CLONE MY VOICE
             </button>
@@ -865,7 +885,7 @@ function VoiceCloneSection({ shell }: { shell: boolean }) {
                 className="icon-btn"
                 onClick={() => void confirm()}
                 disabled={!shell || busy}
-                title="Step 2: confirm — this UPLOADS the audio sample to ElevenLabs (it leaves the device)"
+                title="A parked consent is confirmed by VOICE. Say the confirmation aloud; only that uploads the audio sample to ElevenLabs."
               >
                 CONFIRM CLONE (UPLOADS SAMPLE)
               </button>
@@ -883,14 +903,14 @@ function VoiceCloneSection({ shell }: { shell: boolean }) {
             className="icon-btn cred-remove"
             onClick={() => void forget()}
             disabled={!shell || busy}
-            title="Forget the stored voice clone — back to Kokoro / your existing voice"
+            title="Say the forget phrase ALOUD to drop the stored voice clone (back to Kokoro / your existing voice) — the panel cannot drop it from here."
           >
             FORGET CLONE
           </button>
         </div>
         <div className="cred-hint">
           {note ||
-            "Step 1 proposes (the daemon asks you to confirm; nothing leaves the device). Step 2 is a SEPARATE confirm that uploads the sample. Sends the same spoken phrases the voice path uses."}
+            `The consent machine runs on the SPOKEN path only, so this is the reliable route: say "${VOICE_CLONE_PHRASES.propose}" aloud, then confirm aloud. Step 1 parks the consent (nothing leaves the device); the SEPARATE spoken confirm is what uploads the sample.`}
         </div>
       </div>
 
@@ -1784,6 +1804,9 @@ function PolicyRuleRow({
       : rule.decision === "never"
         ? "NEVER"
         : "ASK";
+  // A rule narrowed to an agent and/or a recipient. The spoken clear phrase
+  // addresses a TOOL only, so the daemon's keyed lookup can never match it.
+  const scopeNarrowed = rule.agent !== null || rule.recipient !== null;
   return (
     <div className="policy-rule-row">
       <span className={`policy-decision ${rule.decision}`}>{decisionLabel}</span>
@@ -1798,11 +1821,27 @@ function PolicyRuleRow({
           to: {rule.recipient}
         </span>
       ) : null}
+      {/* SCOPE-NARROWED RULES CANNOT BE CLEARED FROM HERE, and we say so instead
+          of offering a control that does nothing. The clear rides
+          POLICY_PHRASES.ask, which names only the TOOL; the daemon rebuilds
+          `PolicyScope::tool(tool)` (agent=None, recipient=None) and
+          `PolicyStore::clear` keys on the full (tool, agent, recipient) triple —
+          so ("gmail_send",None,None) never matches ("gmail_send",Some(agent),
+          None) and NOTHING is removed. Worse, `clear` returning false made
+          apply_global return false, and the daemon's ack for that is "the policy
+          layer is off, so nothing changed. Enable [policy]..." — so a user trying
+          to revoke a standing AUTO-APPROVE was told the layer was disabled while
+          the rule stayed in force. (Reachable only for rules hand-written into
+          state/policy.json; the editor itself can only create tool-only scopes.) */}
       <button
         className="icon-btn cred-remove"
         onClick={onAsk}
-        disabled={!shell || busy || rule.decision === "ask"}
-        title="Clear this rule back to ASK (the default park/confirm)"
+        disabled={!shell || busy || rule.decision === "ask" || scopeNarrowed}
+        title={
+          scopeNarrowed
+            ? "This rule is SCOPE-NARROWED (it names an agent and/or a recipient). The spoken clear phrase can only address a tool-wide rule, so clearing it from here would silently do nothing and leave the auto-approve in force. Remove it from state/policy.json instead."
+            : "Clear this rule back to ASK (the default park/confirm)"
+        }
         aria-label={`clear policy rule for ${rule.tool}`}
       >
         ✕

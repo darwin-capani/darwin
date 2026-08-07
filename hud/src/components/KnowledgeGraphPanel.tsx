@@ -32,9 +32,12 @@ import Frame from "./Frame";
  *     caps — `skipped_at_cap` is surfaced as the honest "refused past the bound"
  *     proof, never a silent unbounded grow. This rides the local 127.0.0.1
  *     broadcast only.
- *   - SHIPS OFF + REVIEW-ONLY. Double-gated ([docsearch].enabled AND
- *     [docsearch].build_graph, both ship false); the event never arrives until
- *     deliberately enabled. There is NO button here that builds or writes —
+ *   - SHIPS ON + REVIEW-ONLY. Both gates ([docsearch].enabled AND
+ *     [docsearch].build_graph) ship TRUE (daemon/src/config.rs asserts both), so
+ *     the feature is ARMED — but it is INERT WITHOUT ROOTS: [docsearch].roots
+ *     ships empty, nothing is indexed, and the build is a SPOKEN intent, so no
+ *     event arrives on a stock install. There is NO button here that builds or
+ *     writes —
  *     building is a SPOKEN intent ("map my documents"); this panel only SHOWS the
  *     last build's stats + the resulting grouped graph.
  *
@@ -49,8 +52,9 @@ export default function KnowledgeGraphPanel({
 }) {
   // Nothing to show until the user has built a graph — render nothing rather than
   // a placeholder, mirroring the other event-fed gated panels (DocSearchPanel,
-  // UnifiedSearchPanel). The feature ships OFF, so the event never arrives until
-  // it is deliberately enabled + build_graph turned on + "map my documents" said.
+  // UnifiedSearchPanel). Both gates ship ON, but the feature is inert without an
+  // allowlisted root, so the event never arrives until a folder is indexed and
+  // "map my documents" is said.
   if (graph === null) return null;
 
   return (
@@ -71,8 +75,9 @@ export default function KnowledgeGraphPanel({
             node back to where it came from — nothing is fabricated. It writes only
             the shared, BOUNDED world-model tier (it never grows past its cap, and
             never an agent&rsquo;s private namespace), and rides the local
-            broadcast only. Ships OFF: enable <code>[docsearch].enabled</code> and{" "}
-            <code>[docsearch].build_graph</code>, index a folder, then say{" "}
+            broadcast only. <code>[docsearch].enabled</code> and{" "}
+            <code>[docsearch].build_graph</code> both ship <b>ON</b>; allowlist a
+            folder under <code>[docsearch].roots</code>, index it, then say{" "}
             <b>&ldquo;map my documents&rdquo;</b> to (re)build the graph.
           </div>
         </div>

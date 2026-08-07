@@ -7,9 +7,14 @@ import type {
 import Frame from "./Frame";
 
 /**
- * EXTENSIBILITY — the review/visibility surface for the two opt-in INBOUND /
- * MODULE extension points: #35 WEBHOOK TRIGGERS and #36 the PLUGIN SDK. Both
- * ship OFF; this panel only SHOWS what is wired + gated, read-only.
+ * EXTENSIBILITY — the review/visibility surface for the two INBOUND / MODULE
+ * extension points: #35 WEBHOOK TRIGGERS and #36 the PLUGIN SDK. Both master
+ * gates SHIP ON ([webhooks].enabled and [plugin_sdk].enabled are TRUE in the
+ * shipped config; daemon/src/config.rs asserts both). What keeps them quiet is
+ * NOT the flag: the webhook receiver is INERT WITHOUT MAPPINGS AND A KEYCHAIN
+ * HMAC SECRET — it fails closed and does not even bind without the secret — and
+ * the plugin handshake is live but no capability module is installed. This panel
+ * only SHOWS what is wired + gated, read-only.
  *
  * WEBHOOKS (#35; daemon/src/webhooks.rs): the loopback receiver maps an
  * AUTHENTICATED (HMAC) inbound event to an intent via an explicit allowlist and
@@ -34,9 +39,12 @@ import Frame from "./Frame";
  *     headline risk; this panel only mirrors the secret-free decisions.
  *   - NEVER renders a payload / secret / signature / capability token. The wire
  *     carries none of those; the parser surfaces only labels + counts + outcomes.
- *   - SHIPPED-OFF honest. Both subsystems opt-in; with the flags off NO event
- *     arrives, so the panel shows explicit OFF / nothing-installed states, not a
- *     blank or a fake.
+ *   - ARMED-BUT-INERT honest. Both master gates ship ON; what is missing on a
+ *     stock install is the webhook HMAC secret + mappings (fail-closed: no
+ *     secret, no bind) and an installed plugin module. Until something actually
+ *     flows the panel shows explicit not-bound / nothing-installed states, not a
+ *     blank or a fake — and it never claims the listener is up until a decision
+ *     has passed through it.
  *
  * The reducer only ever folds defensively-parsed webhook.received /
  * plugin.handshake frames (malformed fields dropped, no secret), so this
@@ -50,8 +58,9 @@ export default function ExtensibilityPanel({
   plugins: PluginSurface | null;
 }) {
   // An event having arrived at all means the loopback listener is bound this
-  // session (the bind is OFF by default + runtime-gated; we never claim it is up
-  // until a decision actually flows through it).
+  // session. The gate ships ON, but the bind is held back by the missing
+  // Keychain HMAC secret + empty mappings (fail-closed), so we never claim the
+  // listener is up until a decision actually flows through it.
   const listenerLive = webhooks.received > 0;
 
   return (
@@ -117,10 +126,10 @@ export default function ExtensibilityPanel({
 
             {plugins === null || plugins.modules.length === 0 ? (
               <div className="ext-empty dim-note">
-                No capability module installed. A plugin registers on launch by
-                presenting its validated manifest + capability token; enable{" "}
-                <code>[plugin_sdk].enabled</code> and install a module to turn it
-                on.
+                No capability module installed. The launch handshake ships{" "}
+                <b>ON</b> (<code>[plugin_sdk].enabled</code>) — a plugin registers
+                by presenting its validated manifest + capability token. Install a
+                capability module and it will appear here.
               </div>
             ) : (
               <div className="ext-plugins">

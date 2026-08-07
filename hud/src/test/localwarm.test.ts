@@ -313,7 +313,9 @@ describe("StatusBar resident-models chip", () => {
       activeSub: null,
     });
     expect(html).toContain("LOCAL SINGLE");
-    expect(html).toContain("good");
+    // Anchor the tone to the CHIP: a bare toContain("good") is satisfied by the
+    // bar's own "CLOUD KEY PRESENT" dot and the voice-id title copy.
+    expect(html).toContain("residentmodels-chip good");
     // honest hover: single-resident is the safe low-RAM default; not measured
     expect(html.toLowerCase()).toContain("safe default");
     expect(html.toLowerCase()).toContain("low-ram");

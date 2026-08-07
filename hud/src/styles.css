@@ -499,6 +499,25 @@ body,
   font-size: 9.5px;
   color: var(--cyan-dim);
 }
+.sub-title .tag.warn { color: var(--warn-amber); }
+
+/* CONFIG ERRORS (DiagnosticsPanel) — the daemon's config.invalid / agents.invalid
+   lines. Amber, not red: nothing is broken, but a key the operator believes is
+   set is NOT in effect. The list is already bounded + deduped by the reducer. */
+.config-issues {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 2px 12px 4px;
+}
+.config-issues-lead { line-height: 1.35; }
+.config-issue {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--warn-amber);
+  word-break: break-word;
+}
 
 /* triangular warning icon (StatusBar + AlertPanel) */
 svg.tri {
@@ -6041,6 +6060,10 @@ svg.tri circle {
 }
 .codeintel-pill.neural { color: var(--learn-green); }
 .codeintel-pill.bm25 { color: var(--warn-amber); }
+/* The daemon reported no retrieval method (its not-indexed reply carries none).
+   Deliberately the DIM/neutral tone: this is an absence of information, not a
+   backend verdict — it must not read as either a neural or a keyword result. */
+.codeintel-pill.unknown { color: var(--cyan-dim); }
 .codeintel-pill.propose { color: var(--warn-amber); }
 .codeintel-pill.note { color: var(--warn-amber); }
 .codeintel-q { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
@@ -8070,6 +8093,24 @@ svg.tri circle {
   font-size: 8.5px;
   letter-spacing: 0.06em;
   color: var(--alert-red);
+}
+
+/* PERSISTENT "consolidation is stuck" banner. The failure can last for days
+   (reflect.rs writes no stamp on failure); the 4.5s toast that used to be its
+   only artifact could not carry that. */
+.mem-stale-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px 8px;
+  margin: 0 12px;
+  border: 1px solid var(--alert-red);
+  border-radius: 3px;
+}
+.mem-stale-text {
+  font-size: 10.5px;
+  line-height: 1.35;
+  color: var(--ice-dim);
 }
 
 /* FORGET control — two-step arm -> confirm (a stray click can't wipe). */

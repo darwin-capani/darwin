@@ -98,9 +98,16 @@ function ExplainSection({ explained }: { explained: CodeExplained }) {
   // Neural iff a "neural-*" method (embedding OR neural-then-reranked); a
   // "lexical-*" method retrieved by BM25. The tooltip names any rerank stage.
   // Hybrid is neural-inclusive (uses the embeddings) -> neural pill.
-  const neural = explained.method.startsWith("neural-") || explained.method.startsWith("hybrid");
+  // NO method on the wire (the daemon's not-indexed reply is `{"hits": 0}`) =>
+  // we know nothing about which backend ran. Say exactly that; never badge a
+  // retrieval path, and never assert the embedder's health.
+  const method = explained.method;
+  const neural =
+    method !== null && (method.startsWith("neural-") || method.startsWith("hybrid"));
   const explainTitle =
-    explained.method === "neural-embedding"
+    method === null
+      ? "the daemon reported no retrieval method for this reply — nothing is claimed about which backend ran or whether the on-device embedder was available"
+      : explained.method === "neural-embedding"
       ? "grounded chunks were retrieved by cosine over on-device embedding vectors"
       : explained.method === "neural-reranked"
         ? "grounded chunks were retrieved by cosine over on-device embedding vectors, then re-ranked by an on-device cross-encoder"
@@ -112,16 +119,16 @@ function ExplainSection({ explained }: { explained: CodeExplained }) {
               ? "grounded chunks were retrieved by FUSING on-device embedding cosine with BM25 keyword relevance (reciprocal rank fusion)"
               : explained.method === "hybrid-reranked"
                 ? "grounded chunks were retrieved by fusing embedding cosine with BM25 (reciprocal rank fusion), then re-ranked by an on-device cross-encoder"
-                : `retrieval method: ${codeMethodLabel(explained.method)}`;
+                : `retrieval method: ${codeMethodLabel(method ?? "")}`;
   return (
     <div className="codeintel-explain">
       <div className="codeintel-head">
         <span className="codeintel-title">LAST EXPLAIN</span>
         <span
-          className={`codeintel-pill ${neural ? "neural" : "bm25"}`}
+          className={`codeintel-pill ${method === null ? "unknown" : neural ? "neural" : "bm25"}`}
           title={explainTitle}
         >
-          {codeMethodLabel(explained.method)}
+          {method === null ? "METHOD NOT REPORTED" : codeMethodLabel(method)}
         </span>
       </div>
 

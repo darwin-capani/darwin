@@ -1,4 +1,8 @@
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
+import DiagnosticsPanel from "../components/DiagnosticsPanel";
+import MemoryPanel from "../components/MemoryPanel";
 import {
   configIssueLines,
   CONFIG_ISSUE_CAP,
@@ -74,6 +78,44 @@ describe("config.invalid / agents.invalid reach the HUD", () => {
     const [line] = configIssueLines({ issues: ["x".repeat(500)] });
     expect(line.length).toBeLessThanOrEqual(201);
   });
+
+  /* REGRESSION — THE RENDER, not just the reducer. Every assertion above passed
+     while `configIssues` had ZERO consumers: no component, no App.tsx prop, no
+     toast. From the operator's seat that was byte-for-byte identical to the
+     pre-fix drop the file header describes — the daemon detected the typo, said
+     so, the reducer bounded and deduped it, and it died in state. Assert the
+     PIXELS. */
+  it("RENDERS the issues on DiagnosticsPanel (a typo'd safety key is visible)", () => {
+    const s = apply(initialState(), "config.invalid", {
+      issues: ["unknown key [security].encrypt_memry", "unknown section [egres]"],
+    });
+    const html = renderToStaticMarkup(
+      createElement(DiagnosticsPanel, {
+        gauges: s.gauges,
+        facts: s.facts,
+        actions: s.actions,
+        configIssues: s.configIssues,
+      }),
+    );
+    expect(html).toContain("CONFIG ERRORS");
+    expect(html).toContain("unknown key [security].encrypt_memry");
+    expect(html).toContain("unknown section [egres]");
+    // ...and it must say the setting is NOT in effect, which is the whole point.
+    expect(html).toContain("NOT in effect");
+  });
+
+  it("renders NO config-errors block when the config is clean", () => {
+    const s = initialState();
+    const html = renderToStaticMarkup(
+      createElement(DiagnosticsPanel, {
+        gauges: s.gauges,
+        facts: s.facts,
+        actions: s.actions,
+        configIssues: s.configIssues,
+      }),
+    );
+    expect(html).not.toContain("CONFIG ERRORS");
+  });
 });
 
 describe("a failed memory consolidation is visible", () => {
@@ -93,6 +135,41 @@ describe("a failed memory consolidation is visible", () => {
   it("says something honest even with no reason in the payload", () => {
     const s = apply(initialState(), "memory.consolidation_failed", {});
     expect(s.toasts.some((t) => t.text.includes("may be stale"))).toBe(true);
+  });
+
+  /* REGRESSION — a PERSISTENT surface, not a 4.5s toast. reflect.rs writes NO
+     stamp on failure, so the reflection clock can stay stuck for days while the
+     6h check keeps retrying; its own comment says the event exists to surface
+     that on the HUD "instead of silent 6h retries". `consolidationStale` was set
+     by the reducer and read by NOTHING, so the only artifact was a toast that
+     expires after TOAST_TTL_MS = 4500ms. A user not watching in that window never
+     learned the long-term memory profile had stopped being updated. */
+  it("RENDERS a persistent stale marker on MemoryPanel (not just a toast)", () => {
+    const s = apply(initialState(), "memory.consolidation_failed", { error: "llm timeout" });
+    const html = renderToStaticMarkup(
+      createElement(MemoryPanel, {
+        memory: s.memory,
+        beliefCount: 0,
+        consolidationStale: s.consolidationStale,
+      }),
+    );
+    expect(html).toContain("CONSOLIDATION FAILING");
+    expect(html).toContain("may be out of date");
+    // ...and it must not over-claim: nothing was lost, only the pass is stuck.
+    expect(html).toContain("Nothing was lost");
+  });
+
+  it("renders NO stale marker once a consolidation succeeds", () => {
+    const failed = apply(initialState(), "memory.consolidation_failed", {});
+    const ok = apply(failed, "memory.consolidated", { upserts: 3, deletes: 1 });
+    const html = renderToStaticMarkup(
+      createElement(MemoryPanel, {
+        memory: ok.memory,
+        beliefCount: 0,
+        consolidationStale: ok.consolidationStale,
+      }),
+    );
+    expect(html).not.toContain("CONSOLIDATION FAILING");
   });
 });
 

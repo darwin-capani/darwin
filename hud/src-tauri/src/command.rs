@@ -491,10 +491,16 @@ fn round_trip(sock: &Path, line: &str) -> Result<String, String> {
 /// socket round-trip off the async runtime (blocking I/O on a worker), and
 /// returns the defensively-parsed reply — token stripped, no secret echoed.
 ///
-/// Errors are surfaced as a `CommandReply` with `ok:false` + a secret-free
+/// EVERY error is surfaced as a `CommandReply` with `ok:false` + a secret-free
 /// `error` (so the UI renders a clean failure state) rather than a thrown Tauri
-/// error, EXCEPT for the not-well-formed-request case which is a programmer/UI
-/// bug worth a hard error.
+/// error — INCLUDING a not-well-formed request: `build_request`'s required-field
+/// rejections all return `Ok(CommandReply::err(..))`. The ONE hard `Err` this fn
+/// can return is a JoinError from the blocking task ("command task failed: ..").
+///
+/// (This used to document an "EXCEPT for the not-well-formed-request case which
+/// is a programmer/UI bug worth a hard error" carve-out that the code has never
+/// implemented. It read backwards: a reader adding a new verb would assume
+/// validation failures throw and skip the ok:false handling.)
 #[tauri::command]
 pub async fn send_command(request: CommandRequest) -> Result<CommandReply, String> {
     // Validate + resolve cheaply (no token, no I/O) before touching the socket.
@@ -542,26 +548,37 @@ pub struct PlayCueReply {
 /// Map a daemon `CommandReply` (the `play_cue` relay's reply) into the bounded
 /// [`PlayCueReply`] vocabulary. PURE — unit-tested without any socket.
 ///
-/// HONESTY: an `ok:false` reply NEVER becomes "played". The daemon's
-/// `trigger_cue` returns prose, so we classify on the secret-free reply/error
-/// text: a "cache"/"cached" success → `cached` (no cloud call), any other success
-/// → `played`; a switch-off/no-key/offline rejection → `disabled` (honest silent
-/// no-op); an unknown-cue rejection → `unknown`; anything else → `failed`. No path
-/// or secret is ever forwarded — only the contracted `{outcome, detail}`.
+/// HONESTY (FAIL-SAFE, the same shape [`voice_lab_outcome`] and [`music_outcome`]
+/// already use): the command channel returns `ok:true` for any DISPATCHED verb
+/// and carries `trigger_cue`'s honest outcome PROSE in `reply` — a closed gate or
+/// a failed generation is reported in that TEXT, NOT via `ok:false`
+/// (daemon/src/command.rs: `json!({"ok": true, "reply": pipeline.play_cue(..)})`).
+/// So we classify on the secret-free line from EITHER field: a
+/// switch-off/no-key/offline rejection → `disabled`, an unknown-cue rejection →
+/// `unknown`, an honest failure → `failed`, otherwise → `played`. No path or
+/// secret is ever forwarded — only the contracted `{outcome, detail}`.
+///
+/// WHAT WENT WRONG: the gate/failure classification used to live ONLY in the
+/// `!reply.ok` branch — a shape a dispatched `play_cue` never produces. So
+/// "Cue tier is off. Turn on [voice].cloud_sfx …" and "I couldn't play that cue
+/// just now …" both returned `played`, and the struct's own doc ("It NEVER claims
+/// a cue played when the daemon reported a silent no-op") was false.
+///
+/// `cached` is NOT currently reachable: the daemon collapses `PlayOutcome::Played`
+/// and `PlayOutcome::Cached` into the single line "Playing the {cue} cue."
+/// (daemon/src/command.rs). The arm is kept so a future daemon that distinguishes
+/// them classifies correctly; the marker is deliberately the narrow word "cache",
+/// which no cue name or success line contains.
 pub fn cue_outcome(reply: &CommandReply) -> PlayCueReply {
-    if reply.ok {
-        let line = reply.reply.as_deref().unwrap_or("");
-        let lower = line.to_ascii_lowercase();
-        let outcome = if lower.contains("cache") { "cached" } else { "played" };
-        return PlayCueReply {
-            outcome: outcome.to_string(),
-            detail: if line.is_empty() { "Cue played.".to_string() } else { line.to_string() },
-        };
-    }
-    let err = reply.error.as_deref().unwrap_or("command_failed");
-    let lower = err.to_ascii_lowercase();
+    let line = if reply.ok {
+        reply.reply.as_deref().unwrap_or("")
+    } else {
+        reply.error.as_deref().unwrap_or("command_failed")
+    };
+    let lower = line.to_ascii_lowercase();
     // A closed-gate no-op: switch off / no key / offline. The daemon's copy
-    // mentions these explicitly; "disabled"/"off"/"cloud_sfx" are its markers.
+    // mentions these explicitly; "disabled"/"cue tier is off"/"cloud_sfx" are its
+    // markers. Checked FIRST so a gated reply can never fall through to "played".
     let outcome = if lower.contains("cloud_sfx")
         || lower.contains("cue tier is off")
         || lower.contains("turn on")
@@ -572,10 +589,24 @@ pub fn cue_outcome(reply: &CommandReply) -> PlayCueReply {
         // The daemon's honest cue-not-found phrasing — distinct from the
         // protocol-level `unknown_command` (which is a relay failure, not a cue).
         "unknown"
-    } else {
+    } else if !reply.ok
+        || lower.contains("couldn't")
+        || lower.contains("could not")
+        || lower.contains("can't")
+        || lower.contains("didn't go through")
+        || lower.contains("nothing was produced")
+    {
+        // Any honest failure marker -> failed, even on an ok:true dispatch.
         "failed"
+    } else if lower.contains("cache") {
+        "cached"
+    } else {
+        "played"
     };
-    PlayCueReply { outcome: outcome.to_string(), detail: err.to_string() }
+    PlayCueReply {
+        outcome: outcome.to_string(),
+        detail: if line.is_empty() { "Cue played.".to_string() } else { line.to_string() },
+    }
 }
 
 /// Play a BUILT-IN SFX cue by NAME. Relays a bounded `play_cue {cue}` request
@@ -742,6 +773,15 @@ pub fn music_outcome(reply: &CommandReply) -> MusicReply {
         || lower.contains("working offline")
         || lower.contains("without an elevenlabs key")
         || lower.contains("add one in settings")
+        // The SWITCH-OFF no-op, the one honest `Err` line that carried NONE of
+        // the markers above: daemon/src/main.rs::trigger_compose_music returns
+        // "The music-generation tier is off. Turn on [voice].cloud_music to use
+        // it.", relayed as ok:TRUE with the prose in `reply` — so a closed gate
+        // used to classify as "created", the one thing this function's contract
+        // says can never happen. Both tokens appear only in that line (the real
+        // success prose is "Composed your track — it's ready.").
+        || lower.contains("tier is off")
+        || lower.contains("cloud_music")
         || lower.contains("unavailable")
     {
         "unavailable"
@@ -1116,6 +1156,65 @@ mod tests {
             assert!(!mapped.detail.contains(".wav"));
             assert!(!mapped.detail.contains("sk-"));
         }
+    }
+
+    /// REGRESSION — THE SHAPE THE DAEMON ACTUALLY SENDS. A dispatched `play_cue`
+    /// is relayed as `{"ok": true, "reply": <trigger_cue's prose>}`
+    /// (daemon/src/command.rs), so the `ok:false` cases above are a shape the
+    /// wire never carries for this verb. The gate/failure classification used to
+    /// live ONLY in the `!ok` branch, which made a closed gate and a failed cloud
+    /// generation both report "played" — the one thing `PlayCueReply`'s doc says
+    /// can never happen.
+    #[test]
+    fn cue_outcome_classifies_an_ok_true_reply_that_carries_gate_prose() {
+        // daemon/src/main.rs::trigger_cue, PlayOutcome::Disabled — verbatim.
+        let gated = parse_reply(
+            r#"{"ok":true,"reply":"Cue tier is off. Turn on [voice].cloud_sfx and add an ElevenLabs key (and be online) to play cues."}"#,
+        );
+        assert_eq!(cue_outcome(&gated).outcome, "disabled", "a silent no-op is not a play");
+
+        // trigger_cue, PlayOutcome::Failed — the generation failed, nothing played.
+        let failed = parse_reply(
+            r#"{"ok":true,"reply":"I couldn't play that cue just now — nothing was produced."}"#,
+        );
+        assert_eq!(cue_outcome(&failed).outcome, "failed");
+
+        // trigger_cue, unknown name (screened by `decide`, kept exhaustive there).
+        let unknown = parse_reply(
+            r#"{"ok":true,"reply":"There's no built-in cue called 'kaboom'."}"#,
+        );
+        assert_eq!(cue_outcome(&unknown).outcome, "unknown");
+
+        // ...and a GENUINE play still reads as played. Every cue in the catalog:
+        // the classifier must not trip on a cue NAME (e.g. the "error" cue).
+        for cue in ["confirm", "alert", "error", "success", "notify", "wake"] {
+            let ok = parse_reply(&format!(r#"{{"ok":true,"reply":"Playing the {cue} cue."}}"#));
+            assert_eq!(
+                cue_outcome(&ok).outcome,
+                "played",
+                "the honest ack for the {cue} cue must still read as played",
+            );
+        }
+    }
+
+    /// REGRESSION — the same FAIL-SAFE hole in [`music_outcome`]. The daemon's
+    /// switch-off line for compose_music carried NONE of the unavailable markers,
+    /// so a closed gate classified as "created".
+    #[test]
+    fn music_outcome_never_reads_a_closed_gate_as_created() {
+        // daemon/src/main.rs::trigger_compose_music — verbatim, relayed ok:true.
+        let gated = parse_reply(
+            r#"{"ok":true,"reply":"The music-generation tier is off. Turn on [voice].cloud_music to use it."}"#,
+        );
+        assert_eq!(music_outcome(&gated).outcome, "unavailable");
+        // The ok:false form of the same line classifies identically.
+        let gated_err = parse_reply(
+            r#"{"ok":false,"error":"The music-generation tier is off. Turn on [voice].cloud_music to use it."}"#,
+        );
+        assert_eq!(music_outcome(&gated_err).outcome, "unavailable");
+        // ...and a genuine composition is still "created".
+        let ok = parse_reply(r#"{"ok":true,"reply":"Composed your track — it's ready."}"#);
+        assert_eq!(music_outcome(&ok).outcome, "created");
     }
 
     #[test]

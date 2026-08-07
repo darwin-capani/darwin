@@ -24,6 +24,7 @@ import SystemSettingsPanel, {
   UpdatesSection,
   UninstallSection,
   VOICE_ID_PHRASES,
+  voiceIdIntentRequest,
 } from "../components/SystemSettingsPanel";
 import { sendCommand } from "../tauri/command";
 import {
@@ -689,12 +690,30 @@ describe("voice-id enroll / forget controls", () => {
     expect(VOICE_ID_PHRASES.forget).toBe("forget my voice");
   });
 
-  it("Enroll sends the spoken intent over the EXISTING bridge as {cmd:'ask'} — no new daemon command", async () => {
+  /* WHAT WENT WRONG: these two tests never rendered VoiceIdEnrollControls and
+     never fired its onClick — they called `sendCommand` from the test body and
+     asserted on their OWN call, exercising nothing in the component. A sandboxed
+     mutation that rewired the buttons to `{cmd:"totally_bogus_verb"}` and to a
+     non-anchor phrase left the whole HUD suite green (101 files / all tests).
+     This suite runs in a node env with NO DOM, so a click cannot be dispatched;
+     what CAN be pinned is the two halves the component actually reads:
+       (a) `voiceIdIntentRequest` — the one named home of the wire shape the
+           buttons send, now used by the component's `send`;
+       (b) the buttons' RENDERED titles, now built from VOICE_ID_PHRASES, so a
+           phrase rewire is visible in the markup.
+     Mutation-checked: changing either the verb or the phrase turns this red. */
+  it("the button wire shape is the SAME {cmd:'ask'} spoken intent — no new daemon verb", async () => {
+    expect(voiceIdIntentRequest(VOICE_ID_PHRASES.enroll)).toEqual({
+      cmd: "ask",
+      text: "enroll my voice",
+    });
+    expect(voiceIdIntentRequest(VOICE_ID_PHRASES.forget)).toEqual({
+      cmd: "ask",
+      text: "forget my voice",
+    });
+    // ...and that shape reaches the backend invoke unchanged.
     invokeMock.mockResolvedValue({ ok: true, reply: "Let's enroll your voice." });
-    // The button's onClick calls sendCommand({cmd:"ask", text: VOICE_ID_PHRASES.enroll}).
-    // We assert that exact wire shape (the same path the model-tier/voice-clone
-    // buttons use) reaches the backend invoke — never a bespoke enroll verb.
-    const r = await sendCommand({ cmd: "ask", text: VOICE_ID_PHRASES.enroll });
+    const r = await sendCommand(voiceIdIntentRequest(VOICE_ID_PHRASES.enroll));
     expect(r.ok).toBe(true);
     expect(invokeMock).toHaveBeenCalledTimes(1);
     const [name, args] = invokeMock.mock.calls[0];
@@ -702,13 +721,21 @@ describe("voice-id enroll / forget controls", () => {
     expect(args).toEqual({ request: { cmd: "ask", text: "enroll my voice" } });
   });
 
-  it("Forget sends the spoken forget intent over the same {cmd:'ask'} bridge", async () => {
-    invokeMock.mockResolvedValue({ ok: true, reply: "Done — I've forgotten your voice." });
-    const r = await sendCommand({ cmd: "ask", text: VOICE_ID_PHRASES.forget });
-    expect(r.ok).toBe(true);
-    expect(invokeMock.mock.calls[0][1]).toEqual({
-      request: { cmd: "ask", text: "forget my voice" },
-    });
+  it("the RENDERED Enroll/Forget buttons quote the exact daemon-classified phrases", () => {
+    const html = renderToStaticMarkup(
+      createElement(VoiceIdEnrollControls, {
+        voiceId: voiceIdInitial(),
+        enabledDraft: true,
+        enabledLive: true,
+        onEdit: () => {},
+      }),
+    );
+    expect(html).toContain("syscfg-vid-enroll-btn");
+    expect(html).toContain("syscfg-vid-forget-btn");
+    // The titles are interpolated from VOICE_ID_PHRASES, so a rewire to a
+    // non-anchor phrase changes the markup and fails here.
+    expect(html).toContain(`Sends the spoken &quot;${VOICE_ID_PHRASES.enroll}&quot; intent`);
+    expect(html).toContain(`Sends the spoken &quot;${VOICE_ID_PHRASES.forget}&quot; intent`);
   });
 
   it("reflects live capture progress from telemetry (captured / need) — never invented", () => {

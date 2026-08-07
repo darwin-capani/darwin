@@ -363,7 +363,13 @@ export interface CodeCite {
  *  IS the honest "nothing indexed matched", surfaced rather than hidden. */
 export interface CodeExplained {
   question: string;
-  method: CodeMethod;
+  /** The retrieval backend that ACTUALLY ran, or `null` when the wire carried
+   *  none. The daemon's NOT-INDEXED reply is literally `json!({"hits": 0})` — no
+   *  `method`, no `question` — so `null` is a REAL, reachable state and must stay
+   *  representable. It used to default to "lexical-bm25", which made the panel
+   *  badge a retrieval path that never ran and assert, in a tooltip, that "the
+   *  on-device embedder was unavailable" when nothing was known about it. */
+  method: CodeMethod | null;
   hits: CodeCite[];
 }
 
@@ -395,9 +401,14 @@ function coerceCodeCite(o: Record<string, unknown>): CodeCite | null {
 /** Parse a `code.explained` payload into a CodeExplained. `hits` are coerced
  *  item-by-item (a hit with no file_path is dropped — not a citation); a missing
  *  or non-array `hits` (the {hits:0} not-indexed reply) yields the empty array.
- *  `method` defaults to "lexical-bm25" (the conservative fallback) so the panel
- *  never OVER-states a result as neural. NEVER returns null and NEVER fabricates
- *  a hit — an empty `hits` is the honest not-indexed state, shown not hidden. */
+ *  `method` is NULL when the wire carries none — it is NOT defaulted. It used to
+ *  fall back to "lexical-bm25", justified as "the conservative fallback" so the
+ *  panel never over-states a result as neural; but the daemon's not-indexed reply
+ *  (`json!({"hits": 0})`) carries no method at all, so the fallback made the panel
+ *  claim BM25 keyword retrieval ran and that the on-device embedder was
+ *  unavailable — two fabricated statements about a search that returned nothing.
+ *  Absent is now absent. NEVER returns null and NEVER fabricates a hit — an empty
+ *  `hits` is the honest not-indexed state, shown not hidden. */
 export function parseCodeExplained(data: Record<string, unknown>): CodeExplained {
   const rawHits = data["hits"];
   const hits = Array.isArray(rawHits)
@@ -408,7 +419,7 @@ export function parseCodeExplained(data: Record<string, unknown>): CodeExplained
     : [];
   return {
     question: str(data, "question") ?? "",
-    method: str(data, "method") ?? "lexical-bm25",
+    method: str(data, "method"),
     hits,
   };
 }
@@ -489,13 +500,20 @@ export type ShellOutcomeKind =
   | "ran";
 
 /** A parsed shell.* event — the last command's honest outcome. `command` is the
- *  exact command text the daemon already spoke (empty for the OFF gate, which
- *  carries none); `reason` is the short denylist class / exec-failure reason;
- *  the run fields are present ONLY for a "ran" outcome. NEVER an output. */
+ *  exact command text the daemon already spoke, and is empty for EVERY event the
+ *  daemon does not put a command on (see the field doc below); `reason` is the
+ *  short denylist class / exec-failure reason; the run fields are present ONLY
+ *  for a "ran" outcome. NEVER an output. */
 export interface ShellOutcome {
   kind: ShellOutcomeKind;
-  /** The exact command (faithful, the daemon's own text). Empty when the event
-   *  carries none (the OFF/locked gate). */
+  /** The exact command (faithful, the daemon's own text). Empty for every
+   *  outcome whose event carries no `command` key, which is BOTH shell.blocked
+   *  shapes ("blocked-off" / "blocked-exec-failed") AND "denied": the only
+   *  shell.denied emit (daemon/src/anthropic.rs) is
+   *  `json!({"reason": reason})` — a refused command is deliberately never
+   *  echoed back on the wire. Only "parked"/"executing"/"ran" carry one. The
+   *  panel therefore picks its empty-state copy per `kind` (ShellPanel's
+   *  `emptyCommandNote`) and must NEVER hard-code the OFF-gate explanation. */
   command: string;
   /** A short reason — the matched denylist class (denied) or the exec-failure
    *  tag. Empty for outcomes that carry none. NEVER a secret. */
@@ -4605,8 +4623,14 @@ export function sttTierDetail(backend: SttBackend | null): string {
 /* ------------------------------------------------ audio I/O (#30 / #31 / #32) */
 
 /* ------------------------------------------------------------------------ *
- * AUDIO-INPUT surface for the three audio-input features, all SHIPPING OFF / *
- * neutral behind their own config flags and surfaced READ-ONLY here:         *
+ * AUDIO-INPUT surface for the three audio-input features, surfaced READ-ONLY *
+ * here. THEIR SHIPPED POSTURES DIFFER and this block used to flatten them    *
+ * all to "OFF": [interpret].live ships FALSE, but [voice].diarize and        *
+ * [wake].enabled BOTH ship TRUE (daemon/src/config.rs asserts each).         *
+ * Diarization is ARMED but INERT without the ElevenLabs-Scribe backend, and  *
+ * wake-word gating is ARMED and really does DROP an utterance that lacks the *
+ * phrase — it is the difference between an always-listening assistant and a  *
+ * wake-word one.                                                             *
  *                                                                            *
  *  #30 CONTINUOUS LIVE INTERPRETATION (daemon/src/interpret.rs + audio.rs).  *
  *      `audio` / `interpret.segment_fed` {target, speak} — emitted at the    *
@@ -4636,8 +4660,9 @@ export function sttTierDetail(backend: SttBackend | null): string {
  * SECRET-FREE: only languages / booleans / counts / the wake phrase ride this *
  * surface. The reducer NEVER renders the diarized transcript text, a          *
  * fabricated speaker, a fabricated translation, or the wav path. All three    *
- * are OFF/neutral by default, so before any telemetry the surface rests in    *
- * the honest "interpret OFF / diarization not seen / wake default" state.     *
+ * rest in a NEUTRAL state before any telemetry (which is not the same as the  *
+ * features being off — see the posture note above), so the surface shows the   *
+ * honest "interpret OFF / diarization not seen / wake default" resting state.  *
  * Parsed/folded DEFENSIVELY — a malformed field is dropped and the prior      *
  * honest value kept; nothing here ever throws.                                *
  * ------------------------------------------------------------------------ */
@@ -4694,8 +4719,9 @@ export interface AudioIoStatus {
 /** The resting AUDIO-I/O status before any telemetry: interpret idle (no segment
  *  fed), diarization not seen (and honestly NOT able to diarize until an
  *  EL-Scribe frame says otherwise), wake on the default "darwin" phrase with
- *  nothing dropped yet. All three features ship OFF, so this IS the shipped
- *  default the panel renders. */
+ *  nothing dropped yet. This is the RESTING state (before any frame), not a
+ *  shipped-off state: only [interpret].live ships false — [voice].diarize and
+ *  [wake].enabled both ship TRUE. */
 export function audioIoInitial(): AudioIoStatus {
   return {
     interpret: {
@@ -4727,11 +4753,19 @@ export function applyInterpretSegmentFed(
 ): AudioIoStatus {
   const target = str(data, "target");
   const speak = bool(data, "speak");
+  // `source` is [interpret].source_lang. It ships EMPTY, which honestly means
+  // auto-detect — so an empty string is a REAL value here and must overwrite a
+  // prior pin, unlike `target` (whose empty form is "not reported"). A missing
+  // key (an older daemon) keeps the prior value rather than inventing one. This
+  // field had NO writer at all, so interpretDirection always read "auto-detect"
+  // even when the daemon was pinning the source language.
+  const source = str(data, "source");
   return {
     ...prev,
     interpret: {
       ...prev.interpret,
       active: true,
+      source: source !== null ? source : prev.interpret.source,
       target: target !== null && target.length > 0 ? target : prev.interpret.target,
       spoke: speak ?? prev.interpret.spoke,
     },
@@ -4862,7 +4896,7 @@ export function diarizationTone(d: DiarizationState): string {
  *  PURE. */
 export function diarizationDetail(d: DiarizationState): string {
   if (!d.seen) {
-    return "No diarized transcript yet. Diarization is ElevenLabs-Scribe-only ([voice].diarize ships OFF); on-device whisper has no diarization model and reads as a single honest stream — never a fabricated speaker.";
+    return "No diarized transcript yet. Diarization is ElevenLabs-Scribe-only ([voice].diarize ships ON, but it is INERT without the Scribe backend); on-device whisper has no diarization model and reads as a single honest stream — never a fabricated speaker.";
   }
   if (!d.backendCanDiarize) {
     return "On-device whisper has NO diarization model — this is a single honest stream (speaker: unknown), never a fabricated speaker. Speaker labels need the ElevenLabs-Scribe backend, which carries them.";
@@ -4896,9 +4930,14 @@ export function diarizationDetail(d: DiarizationState): string {
  *     The chip's copy states this; it is a read-only indicator and toggles   *
  *     no gate.                                                               *
  *                                                                            *
- * Both features ship OFF/neutral by default — the resting indicator (before  *
- * any telemetry, or a malformed frame) reads the HONEST default: profile     *
- * NEUTRAL, no rich prosody, whisper OFF. Parsed DEFENSIVELY: unknown profile *
+ * Both features SHIP ON — [voice].adaptive_prosody and [voice].whisper are   *
+ * both TRUE in the shipped config (daemon/src/config.rs asserts "#33 adaptive *
+ * prosody SHIPS ON" / "#34 whisper mode SHIPS ON"). They are ARMED but        *
+ * RUNTIME-GATED: rich prosody needs the EL-v3 backend (the local path is a    *
+ * rate-only mapping) and whisper mode engages per-turn. The resting indicator *
+ * (before any telemetry, or a malformed frame) reads the honest NEUTRAL       *
+ * state — which is "nothing has happened yet", NOT "the features are off".    *
+ * Parsed DEFENSIVELY: unknown profile *
  * falls back to neutral, non-finite rate/volume default to 1.0, junk yields  *
  * the resting state — never a throw, never a fabricated "rich" claim.        *
  * ------------------------------------------------------------------------ */
@@ -5309,10 +5348,18 @@ export function localWarmHonest(s: LocalWarmStatus): string {
 
 /* ------------------------------------------------------------------------ *
  * INFERENCE PERF — speculative decoding (#37), battery/thermal throttle (#38), *
- * selectable quantization (#39). The daemon folds three PER-TURN, secret-free   *
- * inference facts into the existing `model.tier` payload (router.rs:747 / :1341 *
- * + the server's generate-op response, whose extra fields the daemon's Response *
- * struct ignores — no deny_unknown_fields, so they are backward-compatible):    *
+ * selectable quantization (#39). Three PER-TURN, secret-free inference facts,   *
+ * on TWO DIFFERENT EVENTS — this block used to claim all three ride the         *
+ * `model.tier` payload, which is wrong for two of them:                         *
+ *   - `throttle` DOES ride `model.tier` (router.rs builds the tier payload as    *
+ *     {tier, reason, manual, intent} and conditionally adds `local_sub` +        *
+ *     `throttle`), folded by `applyInferencePerf`;                              *
+ *   - `speculative` and `quant` ride `inference.decode` (daemon/src/speech.rs —  *
+ *     the ONLY emit site for either key), folded by `applyInferenceDecode`.      *
+ * The `speculative`/`quant` reads inside `applyInferencePerf` are therefore a    *
+ * FORWARD-COMPAT no-op today: they keep the prior value because the key is never *
+ * present. Dropping the inference.decode wiring silently kills both badges while *
+ * model.tier keeps flowing — which the old wording would have hidden.            *
  *                                                                               *
  *   - `speculative` (bool) — the path that ACTUALLY ran this turn. The server   *
  *     returns `speculative=true` ONLY when a draft model was configured AND      *
@@ -5336,9 +5383,12 @@ export function localWarmHonest(s: LocalWarmStatus): string {
  *     battery effect (throttle) are DEVICE/MODEL-GATED — they are never measured *
  *     or claimed headlessly. The panel reports only the PATH THAT ACTUALLY RAN,  *
  *     never a fabricated perf number.                                            *
- *   - All three ship OFF/neutral: speculative=false (normal generation), quant=  *
- *     auto (load as configured), [power].adaptive off (no power read, no         *
- *     throttle). OFF => today's exact runtime behavior.                          *
+ *   - The RESTING readout is speculative=false (normal generation) + quant=auto  *
+ *     (load as configured) + no throttle. That is the honest "nothing reported    *
+ *     yet / the plan is neutral" state, NOT a shipped-off posture: [power]        *
+ *     .adaptive SHIPS ON (daemon/src/config.rs test                              *
+ *     `power_adaptive_defaults_on_and_keys_known` asserts it), so the live power  *
+ *     read DOES happen and the plan is simply neutral on AC + nominal thermal.    *
  *   - The live power read (pmset / thermal pressure / IOKit) happens ONLY when   *
  *     [power].adaptive is on (device-gated). The panel says so plainly.          *
  * ------------------------------------------------------------------------ */
@@ -5445,7 +5495,12 @@ function parseThrottle(data: Record<string, unknown>): ThrottlePlan | null {
 }
 
 /** Fold a per-turn `model.tier` payload's optional inference-perf fields into the
- *  surface. Reads ONLY {speculative, quant, throttle}:
+ *  surface. Reads ONLY {speculative, quant, throttle}. NOTE the real wire split:
+ *  `model.tier` carries ONLY `throttle`; `speculative`/`quant` arrive on
+ *  `inference.decode` and are folded by `applyInferenceDecode`. The two reads
+ *  below are kept as a FORWARD-COMPAT no-op (they preserve the prior value
+ *  because the key is never present on this event) — do not read them as evidence
+ *  the tier payload carries those fields:
  *    - `speculative` keeps the prior value when absent (an old server / a turn
  *      that didn't report it never blanks a known value) — but a present bool is
  *      taken verbatim (the path that actually ran);
@@ -5736,8 +5791,18 @@ export function localToolsInitial(): LocalToolsStatus {
  *  tool actually ran offline — the ACTING OFFLINE signal). Reads ONLY
  *  {tools_used, tools, gated, intent}. `tools` non-string entries are dropped;
  *  `gated` defaults to false (an unknown gate posture reads as NOT gated — never a
- *  fake "a gate fired"). Resets `refusedOutOfSubset` for the fresh turn. Never
- *  throws. */
+ *  fake "a gate fired"). Never throws.
+ *
+ *  WHAT WENT WRONG: this used to set `refusedOutOfSubset: false`, on the belief
+ *  that `engaged` OPENS a turn. It CLOSES one. The daemon emits
+ *  `local_tools.out_of_subset` INSIDE the loop (anthropic.rs — it then `break`s)
+ *  and `local_tools.engaged` only AFTER `complete_with_local_tools` has returned
+ *  (router.rs). So the reset landed on the refusal it was meant to preserve and
+ *  the "the 4B reached outside its safe set and we STOPPED it" signal could never
+ *  render. The flag is now CARRIED (this turn's refusal already raised it) and is
+ *  cleared at the START of the next turn by [`localToolsTurnStart`], which the
+ *  reducer hangs off `model.tier` — the per-turn verdict the router emits BEFORE
+ *  it enters the offline tool loop. */
 export function applyLocalToolsEngaged(
   prev: LocalToolsStatus,
   data: Record<string, unknown>,
@@ -5751,10 +5816,21 @@ export function applyLocalToolsEngaged(
     tools,
     gated: bool(data, "gated") ?? false,
     intent: str(data, "intent") ?? prev.intent,
-    // A fresh engaged turn supersedes any prior out-of-subset refusal flag; the
-    // per-tool out_of_subset event for THIS turn re-raises it if it recurs.
-    refusedOutOfSubset: false,
+    // CARRIED, not reset: an out_of_subset for THIS turn already arrived (the
+    // daemon emits it before it returns), so clearing here would erase it.
+    refusedOutOfSubset: prev.refusedOutOfSubset,
   };
+}
+
+/** Clear the PER-TURN offline-tool-loop flags at the START of a turn. The router
+ *  emits `model.tier` on every answered conversation turn BEFORE it may enter the
+ *  offline tool loop, so this is the only boundary at which a refusal from a
+ *  PRIOR turn can be dropped without erasing the current one. Returns `prev`
+ *  unchanged when there is nothing to clear (referential stability — the reducer
+ *  relies on it to avoid churn). PURE. */
+export function localToolsTurnStart(prev: LocalToolsStatus): LocalToolsStatus {
+  if (!prev.refusedOutOfSubset) return prev;
+  return { ...prev, refusedOutOfSubset: false };
 }
 
 /** Apply a `local_tools.executed` payload (per executed tool). Reads ONLY
@@ -5981,8 +6057,12 @@ export function parseSkillsCatalog(data: Record<string, unknown>): SkillsCatalog
  * either as a 0..1 number OR the literal string "awaiting turns" when the       *
  * window/corpus is empty; we map that string to `null` so the panel renders an  *
  * honest placeholder rather than inventing a value. The optimizer is            *
- * PROPOSE-ONLY + OFF by default — `enabled`/`mode` describe the real config and *
- * the eval framework NEVER tunes anything.                                      *
+ * PROPOSE-ONLY, AND IT SHIPS ON — [optimize].enabled is TRUE in the shipped     *
+ * config (daemon/src/config.rs asserts "the optimizer SHIPS ON (full-power       *
+ * default)") with mode "propose". It is ARMED by default: it records PII-        *
+ * redacted traces and scores them. What it NEVER does is tune anything —         *
+ * `enabled`/`mode` describe the real config, and the eval framework only ever    *
+ * writes a reviewable proposal.                                                  *
  * ------------------------------------------------------------------------ */
 
 /** The measured latency aggregate (eval.rs LatencyAggregate). `measured` is
@@ -6037,10 +6117,11 @@ export interface EvalAccuracy {
 }
 
 /** The optimizer posture echoed in the eval.report (eval.rs `optimizer`). This
- *  describes the PROPOSE-ONLY + OFF-by-default optimizer so the panel's copy is
- *  grounded in the real config — `enabled` is the `[optimize].enabled` master
- *  switch (ships false), `mode` the configured mode, and `posture` is always
- *  "propose-only" (the eval framework NEVER tunes anything). */
+ *  describes the PROPOSE-ONLY optimizer so the panel's copy is grounded in the
+ *  real config — `enabled` is the `[optimize].enabled` master switch, which SHIPS
+ *  TRUE (this doc used to say "ships false", so the default-ON rendering path
+ *  read as unreachable); `mode` is the configured mode ("propose" by default);
+ *  and `posture` is always "propose-only" (the framework NEVER tunes anything). */
 export interface EvalOptimizer {
   enabled: boolean;
   mode: string;
@@ -6337,9 +6418,13 @@ export function parseOptimizerProposal(
  *     until a reindex rebuilds + re-stamps the store).                          *
  *                                                                                *
  * 100% ON-DEVICE: telemetry is the local 127.0.0.1 broadcast only — file         *
- * contents + embeddings never leave the device. SHIPPED-OFF: the feature is      *
- * disabled by default and indexes nothing until the operator flips [docsearch].  *
- * enabled AND allowlists a root, so these events simply never arrive until then. *
+ * contents + embeddings never leave the device. SHIPS ON, INERT WITHOUT ROOTS:   *
+ * [docsearch].enabled is TRUE in the shipped config (daemon/src/config.rs asserts *
+ * "file RAG SHIPS ON (full-power default; inert without roots)"). What keeps it   *
+ * from reading a byte is that [docsearch].roots ships EMPTY — it indexes nothing  *
+ * until the operator allowlists a folder, so these events never arrive until      *
+ * then. (This used to name `enabled` as the gate, which is the wrong switch:      *
+ * turning it "on" is a no-op; adding a root is the real step.)                    *
  * ------------------------------------------------------------------------ */
 
 /** Which ranking backend the daemon's recall layer ACTUALLY ran (recall.rs
@@ -7518,9 +7603,14 @@ export function unifiedCoverageSummary(coverage: UnifiedCoverage): string {
  *     caps — `skipped_at_cap` is surfaced as the honest "refused past the bound"*
  *     proof, never a silent unbounded grow. This event rides the local         *
  *     127.0.0.1 broadcast only.                                                 *
- *   - SHIPS OFF + REVIEW-ONLY. Double-gated ([docsearch].enabled AND           *
- *     [docsearch].build_graph, both ship false); the event never arrives until  *
- *     deliberately enabled. There is NO button here that builds or writes —     *
+ *   - SHIPS ON + REVIEW-ONLY. Both gates ([docsearch].enabled AND              *
+ *     [docsearch].build_graph) ship TRUE (daemon/src/config.rs asserts each),   *
+ *     so the feature is ARMED — but it is INERT WITHOUT ROOTS: the              *
+ *     [docsearch].roots allowlist ships EMPTY, nothing is indexed, and the      *
+ *     build is a SPOKEN intent, so no event arrives on a stock install. Naming  *
+ *     `enabled` as the gate (as this used to) points at the wrong switch: the   *
+ *     empty allowlist is what stands between the daemon and your files.         *
+ *     There is NO button here that builds or writes —                           *
  *     building is a SPOKEN intent ("map my documents"); this panel only SHOWS   *
  *     the last build's stats + the resulting grouped graph.                     *
  * ------------------------------------------------------------------------ */
@@ -7750,10 +7840,15 @@ export function strArr(data: Record<string, unknown>, key: string): string[] | n
  *   - `confidence` is the model's SELF-REPORT (a gated prompt asks for it):     *
  *     {level: grounded|inferred|uncertain, reason}. PLUMBING only — the         *
  *     calibration is runtime/model-behavior-gated and is NOT a measured score.  *
- *   - `cite_on` / `confidence_on` echo the [answers] gates (both SHIP OFF).     *
+ *   - `cite_on` / `confidence_on` echo the [answers] gates (both SHIP ON —      *
+ *     config/darwin.toml `cite = true` / `confidence = true`, pinned by          *
+ *     daemon/src/config.rs asserts).                                             *
  *                                                                              *
- * Both gates OFF (the shipped default) => `sources` empty + `confidence` null  *
- * + from_my_knowledge false, so the HUD renders NOTHING. The wire carries ONLY *
+ * On a DEFAULT install both gates are ON, so a turn yields real sources + a     *
+ * confidence self-report and the HUD RENDERS. The empty shape (`sources` empty  *
+ * + `confidence` null + from_my_knowledge false => the HUD renders NOTHING) is   *
+ * what you get when the OPERATOR turns a gate off — not a shipped default, as    *
+ * this block used to claim. The wire carries ONLY *
  * the real locators/snippets the persona already shows + the parsed            *
  * self-report — never an embedding/audio/secret.                                *
  * ------------------------------------------------------------------------ */
@@ -7786,8 +7881,9 @@ export interface AnswerConfidence {
  *  view of one answer's provenance. `citeOn`/`confidenceOn` echo the gates;
  *  `fromMyKnowledge` is the honest "no retrieval" label; `sources` are the real
  *  recorded citations; `confidence` is the model's self-report (null when off or
- *  unparsed). With both gates off this is empty sources + null confidence + the
- *  flags false, so the panel renders nothing. SECRET-FREE by construction. */
+ *  unparsed). Both gates SHIP ON; with a gate turned OFF by the operator this is
+ *  empty sources + null confidence + the flags false, so the panel renders
+ *  nothing. SECRET-FREE by construction. */
 export interface AnswerAnnotation {
   citeOn: boolean;
   confidenceOn: boolean;
@@ -7882,8 +7978,10 @@ export function answerAnnotationIsEmpty(a: AnswerAnnotation): boolean {
  *                                                                            *
  * The daemon's run_pipeline emits `answer.verified` per turn, built by         *
  * anthropic::verify_telemetry(verify_on, current_outcome()). It is the          *
- * SECRET-FREE outcome of the OPTIONAL second self-check pass ([answers].verify, *
- * which SHIPS OFF). The pass — when on AND the turn is important enough to gate  *
+ * SECRET-FREE outcome of the second self-check pass ([answers].verify, which     *
+ * SHIPS ON — daemon/src/config.rs asserts "answer self-verification SHIPS ON      *
+ * (full-power default)"). The pass — being on, AND the turn being important       *
+ * enough to gate                                                                 *
  * in — asks the model ONCE to critique its own DRAFT answer against the REAL     *
  * sources that turn used, and (at most ONCE) revises it. The wire carries ONLY: *
  *   - `verify_on`  — whether the [answers].verify gate is on (echoes config).    *
@@ -7895,14 +7993,17 @@ export function answerAnnotationIsEmpty(a: AnswerAnnotation): boolean {
  *     VERIFIED / REVISED / FLAGGED).                                             *
  *   - `note`       — HONEST copy: a second self-check against the sources used;  *
  *     it REDUCES — does NOT eliminate — errors; runs only on important turns; at *
- *     most one critique + one revise; ships OFF by default.                      *
+ *     most one critique + one revise; ships ON but engages only on important     *
+ *     turns (an ordinary turn is never re-checked).                              *
  *                                                                              *
  * HONESTY: a second self-check REDUCES hallucination on important turns — it is  *
  * NOT a correctness guarantee. VERIFIED means "the self-check found nothing to   *
  * flag", NOT "guaranteed correct". NO flagged-claim text (that rides the answer  *
  * itself when flagged), NO content beyond the answer, NO embedding/audio/secret. *
- * With the gate OFF (the shipped default) outcome === "off" + badge === null, so *
- * the HUD renders NOTHING and today's behavior is byte-for-byte unchanged.       *
+ * outcome === "off" + badge === null (=> the HUD renders NOTHING) is the         *
+ * PER-TURN "the pass did not run" case — the turn was not important enough — and  *
+ * the operator-disabled case. It is NOT the shipped posture, which this block     *
+ * used to assert.                                                                *
  * ------------------------------------------------------------------------ */
 
 /** The per-turn self-verification outcome token (anthropic.rs
@@ -8000,12 +8101,18 @@ export function verifyStatusIsEmpty(v: VerifyStatus): boolean {
  *   - `badge`          — the HUD label (null for "off" => render NOTHING; else  *
  *     CHECKED / UNVERIFIED).                                                    *
  *   - `note`           — HONEST copy: it only DOWNGRADES + flags, NEVER removes *
- *     a confirmation gate, is NOT a correctness guarantee, ships OFF.           *
+ *     a confirmation gate, is NOT a correctness guarantee, ships ON but runs    *
+ *     only over a tool result.                                                  *
  *                                                                            *
  * HONESTY: CHECKED means "the plausibility checks found nothing to flag", NOT  *
  * "guaranteed correct"; UNVERIFIED means a check tripped and confidence was    *
- * downgraded — never that the gate was removed. With the gate OFF (the shipped *
- * default) outcome === "off" + badge === null, so the HUD renders NOTHING.     *
+ * downgraded — never that the gate was removed. THE GATE SHIPS ON              *
+ * (config/darwin.toml `cross_check = true`; daemon/src/config.rs               *
+ * AnswersConfig::default, commented "SHIPS ON (full-power default)"), so on a  *
+ * stock install a TOOL-USING turn really does render a CHECKED badge. outcome  *
+ * === "off" + badge === null (=> the HUD renders NOTHING) is the per-turn "no  *
+ * tool result to check" case and the operator-disabled case — NOT the shipped  *
+ * posture, which this block used to assert.                                    *
  * ------------------------------------------------------------------------ */
 
 /** The per-turn cross-check outcome token (anthropic.rs CrossCheckOutcome::as_str,
@@ -8021,7 +8128,8 @@ export type CrossCheckBadge = "CHECKED" | "UNVERIFIED";
  *  honest view of the tool-result plausibility cross-check for the most recent
  *  answer. `crossCheckOn` echoes the [answers].cross_check gate; `outcome` is the
  *  per-turn token; `badge` is the label (null => render nothing); `note` is the
- *  honest copy. With the gate OFF (shipped default) this is outcome "off" + null
+ *  honest copy. The gate SHIPS ON; on a turn with no tool result to check (or
+ *  with the gate turned off by the operator) this is outcome "off" + null
  *  badge, so the panel renders nothing. SECRET-FREE by construction — never the
  *  raw tool result, never the flag-reason text (that rides the answer when
  *  flagged), never an embedding/audio/secret. */
@@ -8073,9 +8181,10 @@ export function parseCrossCheckStatus(
 }
 
 /** True when a cross-check status has NOTHING to render — the gate is off OR the
- *  cross-check did not run this turn (outcome "off" => null badge). This is the
- *  shipped default ([answers].cross_check off) and the panel uses it to render
- *  nothing rather than an empty shell. */
+ *  cross-check did not run this turn (outcome "off" => null badge). The gate
+ *  SHIPS ON, so on a stock install this is the PER-TURN "no tool result to
+ *  check" case, not a shipped-off gate; the panel uses it to render nothing
+ *  rather than an empty shell. */
 export function crossCheckStatusIsEmpty(v: CrossCheckStatus): boolean {
   return v.badge === null;
 }
@@ -8085,7 +8194,7 @@ export function crossCheckStatusIsEmpty(v: CrossCheckStatus): boolean {
  * answer.debated). SIBLING of the verify + cross-check surfaces above.       *
  *                                                                            *
  * For GATED high-stakes asks ONLY (a conservative `should_debate` predicate + *
- * the [answers].debate flag, OFF-default), the daemon runs TWO brains on the   *
+ * the [answers].debate flag, which SHIPS ON), the daemon runs TWO brains on the *
  * same question (local + cloud, or fast + heavy), then RECONCILES — bounded to *
  * at most TWO model calls. The daemon's run_pipeline emits `answer.debated`     *
  * per turn, built by anthropic::debate_badge_telemetry(debate_on,              *
@@ -8102,13 +8211,17 @@ export function crossCheckStatusIsEmpty(v: CrossCheckStatus): boolean {
  *   - `badge`     — the HUD label (null for "off" => render NOTHING; else        *
  *     CORROBORATED / DISPUTED / ONE-MODEL).                                      *
  *   - `note`      — HONEST copy: agreement raises, disagreement surfaces both    *
- *     (never picked/averaged), fallback says so; at most two calls, ships OFF.   *
+ *     (never picked/averaged), fallback says so; at most two calls; ships ON     *
+ *     but engages only on high-stakes asks (ordinary turns never debate).        *
  *                                                                            *
  * HONESTY: the second-brain quality gain is RUNTIME-gated (only when the brain  *
  * is actually available — else "fallback", stated, never a fabricated           *
- * consensus). Disagreement is SURFACED (DISPUTED), never hidden. With the gate   *
- * OFF (the shipped default), and on every ordinary turn, outcome === "off" +     *
- * badge === null, so the HUD renders NOTHING.                                    *
+ * consensus). Disagreement is SURFACED (DISPUTED), never hidden. THE GATE SHIPS  *
+ * ON (config/darwin.toml `debate = true`); what keeps this quiet on almost every  *
+ * turn is the conservative should_debate PREDICATE, not the flag. On an ordinary  *
+ * turn (and when the operator turns the gate off) outcome === "off" + badge ===   *
+ * null, so the HUD renders NOTHING — but a high-stakes ask on a stock install     *
+ * really does make a second model call.                                          *
  * ------------------------------------------------------------------------ */
 
 /** The per-turn debate outcome token (anthropic.rs DebateOutcome::as_str, on the
@@ -8173,9 +8286,10 @@ export function parseDebateStatus(data: Record<string, unknown>): DebateStatus {
 }
 
 /** True when a debate status has NOTHING to render — the gate is off OR the debate
- *  did not run this turn (an ordinary turn; outcome "off" => null badge). This is
- *  the shipped default ([answers].debate off) and the panel uses it to render
- *  nothing rather than an empty shell. */
+ *  did not run this turn (an ordinary turn; outcome "off" => null badge). The
+ *  gate SHIPS ON, so on a stock install this is the PER-TURN should_debate-
+ *  declined case, not a shipped-off gate; the panel uses it to render nothing
+ *  rather than an empty shell. */
 export function debateStatusIsEmpty(v: DebateStatus): boolean {
   return v.badge === null;
 }
@@ -8489,8 +8603,16 @@ export interface ChainStatus {
 
 /** The whole AUDIT surface (audit.snapshot). `enabled` is the [audit] on/off
  *  posture; `total` is the full bounded length (entries may exceed the shown
- *  recent window); `truncated` notes that a prune has re-rooted the chain (the
- *  surviving suffix still verifies). `entries` is newest-first. */
+ *  recent window); `entries` is newest-first.
+ *
+ *  `truncated` notes that a prune has re-rooted the chain (the surviving suffix
+ *  still verifies from its new root). It is NOT on the snapshot wire: the daemon
+ *  (daemon/src/audit.rs `snapshot_json`) emits only {enabled,total,chain,entries}
+ *  and says so — the re-root is announced ONCE by the separate `audit.truncated`
+ *  event the prune path emits. So the parse below defaults it to false and the
+ *  REDUCER is responsible for carrying a raised flag across the next snapshot;
+ *  see state.ts's `audit.snapshot` arm. Treating the snapshot as authoritative
+ *  for this field erased the disclosure within one 15s snapshot tick. */
 export interface AuditSnapshot {
   enabled: boolean;
   total: number;
@@ -8776,8 +8898,13 @@ export function parseNotebookActivity(data: Record<string, unknown>): NotebookAc
   const rawCard = data["card"];
   if (!isPlainObject(rawCard)) return { verb, card: null };
 
-  // The card's own verb must also be a known one; otherwise drop the card.
-  const cardVerb = asNotebookVerb(str(rawCard, "verb")) ?? verb;
+  // The card's own verb must also be a known one; otherwise DROP the card. This
+  // used to be `?? verb` — a silent relabel with the envelope verb, which is the
+  // opposite of the drop this comment (and the function doc) promised, and which
+  // fed ResearchNotebooksPanel a badge/isList branch keyed off a verb the card
+  // never carried.
+  const cardVerb = asNotebookVerb(str(rawCard, "verb"));
+  if (cardVerb === null) return { verb, card: null };
   const rawCites = rawCard["citations"];
   const citations = Array.isArray(rawCites)
     ? rawCites
@@ -9178,7 +9305,8 @@ export function parseMirrorFrame(data: Record<string, unknown>): MirrorFrame | n
 
 /* ------------------------------------------------------------------------ *
  * ACTION SURFACE (#25 auto-draft / #26 durable missions / #27 macros) —      *
- * the read-only HUD view of the three OFF-default, gated, wired-live action  *
+ * the read-only HUD view of the three gated, wired-live action features. All *
+ * three SHIP ON — see the posture note at the end of this block.             *
  * features. The daemon emits all of these via telemetry::emit("system", …)   *
  * and EVERY payload is SECRET-FREE by construction (ids / names / intents /  *
  * subjects / counts only — never a full draft body, never a token, never a   *
@@ -9200,11 +9328,17 @@ export function parseMirrorFrame(data: Record<string, unknown>): MirrorFrame | n
  *       pre-approval, no batching past the gate). The panel shows the named    *
  *       list + the last replay outcome only.                                   *
  *                                                                            *
- * All three SHIP OFF behind their own flags ([drafts].enabled,                 *
- * [missions].durable, [macros].enabled), so nothing arrives on this surface    *
- * until the operator explicitly turns a feature on. A `*.blocked {reason}`     *
- * with reason "disabled" is the inert shipped-OFF default — NOT an error — so   *
- * the parsers/reducer drop it (mirrors forge.blocked reason=disabled).         *
+ * ALL THREE SHIP ON: [drafts].enabled, [missions].durable and [macros].enabled *
+ * are TRUE in the shipped config (daemon/src/config.rs DraftsConfig /           *
+ * MissionsConfig / MacrosConfig defaults, each commented "SHIPS ON (full-power  *
+ * default)"). Out of the box DARWIN composes drafts, persists missions and      *
+ * records macros, and these frames DO arrive. The safety is NOT a master        *
+ * switch — it is the per-step gate spelled out above (a draft has no send path; *
+ * a mission loads PAUSED and re-gates every consequential step; a replay        *
+ * re-gates each command). A `*.blocked {reason}` with reason "disabled" is the  *
+ * OPERATOR-disabled state, NOT an error and NOT the shipped default as this     *
+ * block used to claim — so the parsers/reducer drop it (mirrors forge.blocked   *
+ * reason=disabled).                                                            *
  * ------------------------------------------------------------------------ */
 
 /** Defensive caps so a misbehaving/compromised daemon frame cannot overflow
@@ -9417,8 +9551,10 @@ export function parseMacroReplayStep(
  * plotted, line segments only connect the GIVEN points (NO interpolation, NO   *
  * resampling, NO invented/extrapolated point), the axis ranges are DERIVED     *
  * from the data, and an empty spec renders the honest-empty state. The op      *
- * ships OFF ([chart].enabled) so nothing arrives until it is deliberately      *
- * enabled — the chart is a NEUTRAL presentation surface (no gate, no action,   *
+ * SHIPS ON ([chart].enabled = true in the shipped config), so "chart this"     *
+ * works out of the box; nothing arrives until a chart is actually REQUESTED,   *
+ * which is the absence of a request, not a disabled feature. The chart is a    *
+ * NEUTRAL presentation surface (no gate, no action,                            *
  * no network). SECRET-FREE: only the labels, axis strings, title, and the      *
  * numeric points ride the wire.                                                *
  * ------------------------------------------------------------------------ */
@@ -9544,8 +9680,10 @@ export function parseChartSpec(data: Record<string, unknown>): ChartSpec | null 
  * a REAL source ref an input claim carried — the daemon never synthesizes one, *
  * and the parser drops any citation with no usable locator. An honest-empty    *
  * report (no citable source) surfaces the plain "no sources to report on", and *
- * the off/error verbs carry NO report so the panel shows nothing. The op ships *
- * OFF ([report].enabled). REVIEW-ONLY: there is no button — it SHOWS the report *
+ * the off/error verbs carry NO report so the panel shows nothing. The op SHIPS *
+ * ON ([report].enabled = true in the shipped config); the `off` verb is the     *
+ * OPERATOR-disabled state, not the shipped one. REVIEW-ONLY: there is no        *
+ * button — it SHOWS the report                                                  *
  * the daemon already built. SECRET-FREE: only the title, headings, counts, and *
  * the real citation locators ride the wire — never raw body content.           *
  * ------------------------------------------------------------------------ */

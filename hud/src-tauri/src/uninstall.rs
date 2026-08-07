@@ -48,6 +48,58 @@ fn uninstall_script_path() -> Result<PathBuf, String> {
     Ok(root.join("uninstall.sh"))
 }
 
+/// Wrap a path in SHELL single quotes so it stays exactly ONE argument: a space,
+/// a `;`, a `$`, a `&&` — nothing inside `'...'` is interpreted, and an embedded
+/// `'` is closed / backslash-escaped / reopened. NO argument is ever appended, so
+/// the script always runs its interactive two-step typed-confirmation flow; the
+/// user does the confirming.
+///
+/// EXTRACTED so the tests can call it. They used to RE-TYPE this expression
+/// inline against a local literal and never reference a single production symbol,
+/// so deleting the escaping (or appending an auto-confirm flag) in
+/// `uninstall_open` left them green — the module's stated safety invariant had no
+/// coverage at all despite two tests named for it.
+pub(crate) fn shell_single_quote(path: &str) -> String {
+    format!("'{}'", path.replace('\'', "'\\''"))
+}
+
+/// The HONEST not-an-install outcome: `opened:false` plus a line naming the path
+/// we looked at. EXTRACTED so a test can assert the real branch instead of the
+/// tautology `open_result_shape` used to run (construct an `UninstallOpen` and
+/// assert the field it set one line earlier).
+pub(crate) fn script_not_found(script: &std::path::Path) -> UninstallOpen {
+    UninstallOpen {
+        opened: false,
+        detail: format!(
+            "uninstall.sh not found at {} — this looks like a dev/source tree, not an install. Run it from the installed DARWIN home.",
+            script.display()
+        ),
+    }
+}
+
+/// The exact AppleScript `uninstall_open` runs: bring Terminal forward and run
+/// the ALREADY shell-quoted command, escaped for the AppleScript string literal
+/// it is embedded in. EXTRACTED for the same reason as `shell_single_quote`.
+pub(crate) fn terminal_do_script(shell_quoted: &str) -> String {
+    format!(
+        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
+        escape_applescript(shell_quoted)
+    )
+}
+
+/// THE WHOLE COMPOSITION `uninstall_open` hands to osascript: quote the script
+/// path, then wrap it in the Terminal `do script` AppleScript. This is the single
+/// place the command is BUILT, so a test that asserts "the quoted path and NO
+/// argument" over this function really does guard the no-auto-confirm invariant.
+///
+/// (Testing `terminal_do_script(shell_single_quote(p))` from the test body was
+/// NOT enough: it re-composed the two helpers itself, so appending `--yes` inside
+/// `uninstall_open` still slipped through — the very defect the old tests had,
+/// one layer up. Mutation-checked.)
+pub(crate) fn uninstall_applescript(script: &std::path::Path) -> String {
+    terminal_do_script(&shell_single_quote(&script.to_string_lossy()))
+}
+
 /// Escape a string for safe embedding inside an AppleScript DOUBLE-quoted string
 /// literal: a backslash and a double quote are the only metacharacters inside an
 /// AppleScript "..." string, so escaping both makes any path inert. The path is
@@ -71,13 +123,7 @@ fn escape_applescript(s: &str) -> String {
 pub async fn uninstall_open() -> Result<UninstallOpen, String> {
     let script = uninstall_script_path()?;
     if !script.is_file() {
-        return Ok(UninstallOpen {
-            opened: false,
-            detail: format!(
-                "uninstall.sh not found at {} — this looks like a dev/source tree, not an install. Run it from the installed DARWIN home.",
-                script.display()
-            ),
-        });
+        return Ok(script_not_found(&script));
     }
 
     // Build the shell command Terminal will run. The script path is wrapped in
@@ -85,15 +131,12 @@ pub async fn uninstall_open() -> Result<UninstallOpen, String> {
     // spaces stays ONE argument and no shell metacharacter is interpreted. We pass
     // NO arguments to the script -> it runs its normal interactive two-step
     // typed-confirmation flow; the user does the confirming.
-    let script_str = script.to_string_lossy();
-    let shell_quoted = format!("'{}'", script_str.replace('\'', "'\\''"));
     // The full AppleScript: bring Terminal forward and run the (single-quoted)
     // script path. The whole `do script` argument is an AppleScript string literal,
-    // so we escape it for that context too.
-    let applescript = format!(
-        "tell application \"Terminal\"\nactivate\ndo script \"{}\"\nend tell",
-        escape_applescript(&shell_quoted)
-    );
+    // so it is escaped for that context too. Built by `uninstall_applescript` —
+    // the ONE place the command is composed, so the no-auto-confirm test really
+    // guards this call site.
+    let applescript = uninstall_applescript(&script);
 
     let output = Command::new("/usr/bin/osascript")
         .arg("-e")
@@ -151,28 +194,82 @@ mod tests {
         assert!(esc.contains("\\\""), "quotes are escaped: {esc}");
     }
 
+    /* These two used to RE-TYPE `format!("'{}'", path.replace('\'', "'\\''"))`
+       inline against a local literal and assert the result equals what they had
+       just written. Neither body referenced a single symbol from `super::*`, so
+       corrupting or deleting the quoting in `uninstall_open` left both green —
+       and `!quoted.contains("yes")` was checking a hard-coded path constant, not
+       the no-auto-confirm invariant it is named for. They now call the PRODUCTION
+       `shell_single_quote`. */
+
     #[test]
     fn shell_single_quoting_keeps_a_spaced_path_as_one_arg() {
-        // The installed home has a space; single-quoting must preserve it whole and
-        // there is no auto-confirm flag appended (the script stays interactive).
+        // The installed home has a space; single-quoting must preserve it whole.
         let path = "/Users/x/Library/Application Support/DARWIN/uninstall.sh";
-        let quoted = format!("'{}'", path.replace('\'', "'\\''"));
-        assert_eq!(quoted, "'/Users/x/Library/Application Support/DARWIN/uninstall.sh'");
-        assert!(!quoted.contains("--yes"));
-        assert!(!quoted.contains("yes"));
+        assert_eq!(
+            shell_single_quote(path),
+            "'/Users/x/Library/Application Support/DARWIN/uninstall.sh'"
+        );
     }
 
     #[test]
     fn shell_single_quoting_escapes_an_embedded_single_quote() {
         let path = "/Users/o'brien/DARWIN/uninstall.sh";
-        let quoted = format!("'{}'", path.replace('\'', "'\\''"));
         // The embedded ' is closed, escaped, and reopened — a valid shell literal.
-        assert_eq!(quoted, "'/Users/o'\\''brien/DARWIN/uninstall.sh'");
+        assert_eq!(shell_single_quote(path), "'/Users/o'\\''brien/DARWIN/uninstall.sh'");
     }
 
+    /// A shell metacharacter in the path cannot break out of the single quotes,
+    /// so it can never become a second command.
     #[test]
-    fn open_result_shape() {
-        let r = UninstallOpen { opened: true, detail: "ok".into() };
-        assert!(r.opened);
+    fn shell_single_quoting_neutralizes_metacharacters() {
+        let hostile = "/Users/x/D; rm -rf ~/ && echo $HOME/uninstall.sh";
+        let q = shell_single_quote(hostile);
+        assert!(q.starts_with('\'') && q.ends_with('\''));
+        // The ONLY quotes in the output are the wrapping pair (no `'` in the input
+        // to escape), so nothing inside is interpreted by the shell.
+        assert_eq!(q.matches('\'').count(), 2, "{q}");
+    }
+
+    /// THE SAFETY INVARIANT THIS MODULE EXISTS FOR: the built AppleScript carries
+    /// the quoted script path and NOTHING else — no auto-confirm flag is ever
+    /// appended, so the uninstaller always runs its interactive two-step typed
+    /// confirmation. Built from the PRODUCTION helpers, so appending an argument
+    /// in `uninstall_open` turns this red.
+    #[test]
+    fn the_built_applescript_passes_the_script_path_and_no_arguments() {
+        let path = "/Users/x/Library/Application Support/DARWIN/uninstall.sh";
+        // Build it the way `uninstall_open` does — through the ONE composition
+        // function — so appending an argument at that call site turns this red.
+        let script = uninstall_applescript(std::path::Path::new(path));
+        assert!(script.contains("tell application \\\"Terminal\\\"") || script.contains("tell application \"Terminal\""));
+        assert!(script.contains("do script"));
+        // The command Terminal runs is exactly the quoted path.
+        let start = script.find("do script \"").expect("do script present") + "do script \"".len();
+        let end = script[start..].find("\"\n").expect("closing quote") + start;
+        let command = &script[start..end];
+        assert_eq!(
+            command,
+            "'/Users/x/Library/Application Support/DARWIN/uninstall.sh'",
+            "the command must be the quoted path and NOTHING else"
+        );
+        // No auto-confirm flag, in any spelling.
+        for flag in ["--yes", "-y", "--force", "--no-confirm", "--assume-yes"] {
+            assert!(!script.contains(flag), "auto-confirm flag {flag} leaked into: {script}");
+        }
+    }
+
+    /// `open_result_shape` used to construct an `UninstallOpen` and assert the
+    /// field it had just set one line earlier — a pure tautology. Assert the
+    /// PRODUCTION not-found branch instead: a dev/source tree must report
+    /// `opened:false` and say so, never silently "succeed".
+    #[test]
+    fn a_missing_uninstall_script_is_an_honest_not_opened() {
+        let r = script_not_found(std::path::Path::new("/nope/DARWIN/uninstall.sh"));
+        assert!(!r.opened, "a missing script must never report opened");
+        assert!(r.detail.contains("uninstall.sh not found"), "{}", r.detail);
+        assert!(r.detail.contains("/nope/DARWIN/uninstall.sh"), "{}", r.detail);
+        // It must not claim anything ran.
+        assert!(!r.detail.to_ascii_lowercase().contains("uninstalled"), "{}", r.detail);
     }
 }

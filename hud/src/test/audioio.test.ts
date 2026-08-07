@@ -127,6 +127,47 @@ describe("audio-i/o folding helpers (events.ts)", () => {
     expect(interpretDirection(on)).toBe("auto-detect → Spanish");
   });
 
+  /* REGRESSION — InterpretLive.source had NO writer anywhere in the HUD (the
+     daemon did not send it either), so the direction read "auto-detect" even
+     when [interpret].source_lang was configured and interpret.rs was pinning the
+     source in its translation prompt. Unlike the wake phrase, it never
+     self-corrected: the field was write-never. The daemon now carries
+     `source` on interpret.segment_fed. */
+  it("#30 a CONFIGURED source language is shown, not reported as auto-detect", () => {
+    const pinned = applyInterpretSegmentFed(audioIoInitial(), {
+      source: "Spanish",
+      target: "English",
+      speak: true,
+    }).interpret;
+    expect(pinned.source).toBe("Spanish");
+    expect(interpretDirection(pinned)).toBe("Spanish → English");
+  });
+
+  it("#30 the EMPTY shipped source_lang still reads honestly as auto-detect", () => {
+    const auto = applyInterpretSegmentFed(audioIoInitial(), {
+      source: "",
+      target: "English",
+    }).interpret;
+    expect(interpretDirection(auto)).toBe("auto-detect → English");
+    // ...and an empty source must CLEAR a previously pinned one (it is a real
+    // value, not "not reported"), or the panel would keep claiming a source the
+    // operator has since removed.
+    const cleared = applyInterpretSegmentFed(
+      applyInterpretSegmentFed(audioIoInitial(), { source: "Spanish", target: "English" }),
+      { source: "", target: "English" },
+    ).interpret;
+    expect(interpretDirection(cleared)).toBe("auto-detect → English");
+  });
+
+  it("#30 an older daemon that omits `source` keeps the prior value (no invention)", () => {
+    const prior = applyInterpretSegmentFed(audioIoInitial(), {
+      source: "Spanish",
+      target: "English",
+    });
+    const next = applyInterpretSegmentFed(prior, { target: "English" }).interpret;
+    expect(next.source).toBe("Spanish");
+  });
+
   /* ---- #31 diarization (EL-Scribe-only honesty) ---- */
 
   it("#31 on-device whisper reads as a single honest stream (NO fabricated speaker)", () => {

@@ -11,8 +11,13 @@ import Frame from "./Frame";
 
 /**
  * ACTION // DRAFTS · MISSIONS · MACROS — the read-only HUD surface for the three
- * OFF-default, gated, wired-live action features (daemon #25 auto-draft, #26
- * durable missions, #27 macro record/replay).
+ * gated, wired-live action features (daemon #25 auto-draft, #26 durable
+ * missions, #27 macro record/replay). All three SHIP ON ([drafts].enabled,
+ * [missions].durable, [macros].enabled are TRUE in the shipped config); the
+ * safety is not a master switch but the per-step gate: a draft has NO send path,
+ * a mission loads PAUSED and re-gates every consequential step, and a macro
+ * replay re-gates each command. A `*.blocked {reason:"disabled"}` frame is the
+ * OPERATOR-disabled state, not the shipped one.
  *
  * SAFETY + HONESTY CONTRACT (do not regress — the panel must SAY these, not just
  * imply them):

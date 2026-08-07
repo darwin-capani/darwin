@@ -246,6 +246,15 @@ export function classifyMusicReply(ok: boolean, line: string): MusicOutcome {
     lower.includes("working offline") ||
     lower.includes("without an elevenlabs key") ||
     lower.includes("add one in settings") ||
+    // The SWITCH-OFF no-op. daemon/src/main.rs::trigger_compose_music returns
+    // "The music-generation tier is off. Turn on [voice].cloud_music to use it."
+    // and command.rs relays it as ok:TRUE with the prose in `reply` — the exact
+    // ok:true-with-gate-prose case this function's contract says can never read
+    // as "created". It carried none of the markers above, so a closed gate
+    // classified as a composed track. Both tokens below appear only in that
+    // line; the genuine success prose is "Composed your track — it's ready."
+    lower.includes("tier is off") ||
+    lower.includes("cloud_music") ||
     lower.includes("unavailable")
   ) {
     return "unavailable";

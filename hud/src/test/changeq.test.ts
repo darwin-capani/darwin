@@ -185,7 +185,7 @@ describe("pure helpers", () => {
     );
     expect(hasPending(s)).toBe(true);
     expect(mirroredCount(s)).toBe(1);
-    expect(hasPending({ branch: "b", pending: [] } as ChangeqState)).toBe(false);
+    expect(hasPending({ branch: "b", pending: [], total: 0 } as ChangeqState)).toBe(false);
   });
 });
 
@@ -199,7 +199,46 @@ describe("ChangeQueuePanel", () => {
 
   it("renders nothing when null or empty", () => {
     expect(render(null)).toBe("");
-    expect(render({ branch: "darwin/changeq", pending: [] })).toBe("");
+    expect(render({ branch: "darwin/changeq", pending: [], total: 0 })).toBe("");
+  });
+
+  /* REGRESSION — HONEST COUNT. MAX_DISPLAY caps the rendered list at 50, but the
+     daemon's queue bound is DEFAULT_QUEUE_BOUND = 64 (and [changeq] max_pending
+     raises it to 512). The header used to print `pending.length`, so at 64 queued
+     proposals it read "50 pending proposals" and dropped the 14 oldest with no
+     marker at all — in the one lane whose stated purpose is complete, honest
+     surfacing of every propose-only change. The frame's `count` is now read. */
+  it("reports the DAEMON'S total and marks the list truncated past MAX_DISPLAY", () => {
+    const many = Array.from({ length: 64 }, (_, i) =>
+      item({ ts: 1000 + i, seq: i, committed: i % 2 === 0 }),
+    );
+    const state = changeqReduce(null, parseChangeqList(frame(many)));
+    expect(state!.pending).toHaveLength(MAX_DISPLAY);
+    expect(state!.total).toBe(64);
+    const html = render(state);
+    expect(html).toContain("64 pending proposals");
+    expect(html).toContain("Showing the 50 newest of 64");
+    expect(html).toContain("14 older proposals are pending review");
+    // The under-count must be gone.
+    expect(html).not.toContain("50 pending proposals");
+  });
+
+  it("shows NO truncation notice when the whole queue fits", () => {
+    const state = changeqReduce(null, parseChangeqList(frame([item({ ts: 1 }), item({ ts: 2, seq: 2 })])));
+    const html = render(state);
+    expect(html).toContain("2 pending proposals");
+    expect(html).not.toContain("Showing the");
+  });
+
+  it("never reports a total BELOW what it is rendering (a junk/absent count floors to the list)", () => {
+    const raw = { branch: "darwin/changeq", count: 1, pending: [item({ ts: 1 }), item({ ts: 2, seq: 2 })] };
+    const state = changeqReduce(null, parseChangeqList(raw));
+    expect(state!.total).toBe(2);
+    const noCount = changeqReduce(
+      null,
+      parseChangeqList({ branch: "darwin/changeq", pending: [item({ ts: 1 })] }),
+    );
+    expect(noCount!.total).toBe(1);
   });
 
   it("lists each pending proposal with its kind, artifact, provenance, and EXISTING apply command", () => {

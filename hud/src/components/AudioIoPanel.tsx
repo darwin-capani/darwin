@@ -78,10 +78,14 @@ import Frame from "./Frame";
  *     fabricated wake trigger reaches this surface — diarization honesty is the
  *     backend's own `backend_can_diarize`, a translation count is only the real
  *     translated:true frames, and the wake phrase is the configured one.
- *   - SHIPS OFF / NEUTRAL. All three flags ship OFF; before any telemetry the
- *     surface rests in the honest INTERPRET OFF / NOT SEEN / default-"darwin"
- *     state and the panel still renders that resting posture (it is informative —
- *     it names the configured wake word and the diarization posture).
+ *   - MIXED POSTURE, STATED HONESTLY. Only [interpret].live ships OFF. [voice].
+ *     diarize and [wake].enabled both ship ON (daemon/src/config.rs asserts
+ *     both): diarization is ARMED but INERT without the ElevenLabs-Scribe
+ *     backend, and wake-word gating is ARMED and really does drop an utterance
+ *     that lacks the phrase. Before any telemetry the surface rests in the honest
+ *     INTERPRET OFF / NOT SEEN / default-"darwin" state and the panel still
+ *     renders that resting posture (it is informative — it names the configured
+ *     wake word and the diarization posture).
  *   - SECRET-FREE. Only languages / booleans / counts / the wake phrase — never
  *     the transcript text, the translation, or the wav path.
  */
@@ -142,7 +146,7 @@ export default function AudioIoPanel({
             </span>
             <span className="verify-meaning">
               {!d.seen
-                ? "ElevenLabs-Scribe-only ([voice].diarize ships OFF)"
+                ? "ElevenLabs-Scribe-only ([voice].diarize ships ON, inert without Scribe)"
                 : d.backendCanDiarize
                   ? `${d.turns} turn${d.turns === 1 ? "" : "s"}`
                   : "single honest stream — no on-device diarization model"}
@@ -158,7 +162,8 @@ export default function AudioIoPanel({
                 'The configured wake phrase that gates "is this for DARWIN" (#32). ' +
                 'Defaults to "darwin", preserving today\'s behavior. The matcher is ' +
                 "conservative + pure; the always-listening loop that consults it is " +
-                "DEVICE-GATED (mic). Ships OFF ([wake].enabled)."
+                "DEVICE-GATED (mic). Ships ON ([wake].enabled) — it GATES ACTIVATION: " +
+                "an utterance that does not carry the phrase is dropped as not for DARWIN."
               }
             >
               <span className="dot good" />“{w.phrase}”

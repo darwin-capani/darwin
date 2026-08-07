@@ -226,9 +226,10 @@ describe("StatusBar lockdown indicator + PANIC button", () => {
 
   it("renders NORMAL in the ok tone for the shipped-OFF default", () => {
     const html = renderStatusBar(parseLockdownStatus({ locked: false }));
-    expect(html).toContain("lockdown-chip");
     expect(html).toContain("NORMAL");
-    expect(html).toContain("ok");
+    // Anchor the tone to the CHIP: a bare toContain("ok") is satisfied by the
+    // bar's own `<span class="dot ok">LINK ONLINE</span>` in every render.
+    expect(html).toContain("lockdown-chip ok");
   });
 
   it("renders LOCKED DOWN in the alarm (bad) tone when engaged, with honest hover copy", () => {
@@ -316,6 +317,10 @@ describe("SettingsModal PANIC / LOCKDOWN section (honest)", () => {
     expect(html).toContain("NORMAL");
     expect(html).toContain("panic-engage");
     expect(html).toContain("panic-unlock");
+    // NOT LOCKED: PANIC is live, UNLOCK is inert. `disabled` follows the class in
+    // the rendered attribute order, so the anchored substring observes BOTH.
+    expect(html).not.toContain('panic-engage" disabled=""');
+    expect(html).toContain('panic-unlock" disabled=""');
   });
 
   it("renders the AWAITING state before the snapshot arrives", () => {
@@ -347,9 +352,13 @@ describe("SettingsModal PANIC / LOCKDOWN section (honest)", () => {
   it("when LOCKED DOWN, the PANIC control is disabled and UNLOCK is enabled", () => {
     const html = renderSettings(parseLockdownStatus({ locked: true }));
     expect(html).toContain("LOCKED DOWN");
-    // both buttons present; the disabled attribute appears (on PANIC when locked)
-    expect(html).toContain("panic-engage");
-    expect(html).toContain("panic-unlock");
+    // WHAT WENT WRONG: this asserted only that the two CLASSES are present —
+    // verbatim duplicates of the locked:false test above — and never observed
+    // `disabled` at all, despite being named for it. The enable/disable logic is
+    // the only thing stopping an UNLOCK press being offered while nothing is
+    // locked, and the only inert-PANIC guard. Observe the ATTRIBUTE.
+    expect(html).toContain('panic-engage" disabled=""');
+    expect(html).not.toContain('panic-unlock" disabled=""');
   });
 
   it("notes the restart re-entry when restored from the marker", () => {

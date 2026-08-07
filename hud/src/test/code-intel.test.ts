@@ -84,8 +84,21 @@ describe("parseCodeExplained (grounded + cited)", () => {
     expect(out.hits[0].filePath).toBe("a.rs");
   });
 
-  it("defaults method to lexical-bm25 (never OVER-states a result as neural)", () => {
-    expect(parseCodeExplained({ hits: [] }).method).toBe("lexical-bm25");
+  /* REGRESSION — this used to assert `method` DEFAULTED to "lexical-bm25" for
+     "conservatism". The daemon's NOT-INDEXED reply is literally
+     `json!({"hits": 0})` (daemon/src/anthropic.rs) — code.rs discards the method
+     the search used when there are no hits — so the default was not conservative,
+     it was a fabrication: the panel badged LEXICAL (BM25 keyword) and its tooltip
+     asserted "the on-device embedder was unavailable" for a search whose backend
+     the HUD knew nothing about (the neural embedder may have been perfectly
+     healthy and simply matched nothing). Absent must read as absent. */
+  it("leaves method NULL when the wire carries none — it never invents a backend", () => {
+    expect(parseCodeExplained({ hits: 0 }).method).toBeNull();
+    expect(parseCodeExplained({ hits: [] }).method).toBeNull();
+    // A real method is still carried through verbatim.
+    expect(parseCodeExplained({ hits: [], method: "neural-embedding" }).method).toBe(
+      "neural-embedding",
+    );
   });
 
   it("never throws on junk", () => {
@@ -292,6 +305,27 @@ describe("CodeIntelPanel (grounded + propose-only, no auto-apply)", () => {
     });
     expect(html).toMatch(/nothing in the code index matched/i);
     expect(html).toMatch(/no code is invented/i);
+  });
+
+  /* REGRESSION — the daemon's REAL not-indexed frame. anthropic.rs emits
+     `json!({"hits": 0})`: no method, no question. The parser used to default
+     `method` to "lexical-bm25", so this panel — tagged "GROUNDED · PROPOSE-ONLY",
+     whose whole contract is honest provenance — badged LEXICAL (BM25 keyword)
+     and asserted in its tooltip that "the on-device embedder was unavailable"
+     for a retrieval that never happened. */
+  it("claims NO retrieval method on the daemon's real not-indexed frame", () => {
+    const html = render({
+      explained: parseCodeExplained({ hits: 0 }),
+      proposal: null,
+      note: null,
+    });
+    expect(html).toMatch(/nothing in the code index matched/i);
+    expect(html).toContain("METHOD NOT REPORTED");
+    // No fabricated backend claim, and no claim about the embedder's health.
+    expect(html).not.toContain("LEXICAL (BM25 keyword)");
+    expect(html).not.toContain("codeintel-pill bm25");
+    expect(html).not.toContain("codeintel-pill neural");
+    expect(html.toLowerCase()).not.toContain("embedder was unavailable");
   });
 
   it("shows the PROPOSE-ONLY diff with the EXACT MANUAL apply command", () => {

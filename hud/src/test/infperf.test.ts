@@ -365,8 +365,12 @@ describe("InferencePerfPanel", () => {
     expect(html).toContain("SPECULATIVE DECODING");
     expect(html).toContain("THROTTLE");
     expect(html).toContain("QUANTIZATION");
-    // The path that actually ran.
-    expect(html).toContain("ON"); // speculative ran
+    // The path that actually ran. ANCHORED TO THE PILL: a bare toContain("ON")
+    // could not fail — "ACTUAL PATH · READ ONLY", "NONE", "happens ONLY when…"
+    // and "QUANTIZATION" all contain "ON", so this assertion passed verbatim on a
+    // render with speculative:false. Mutation-checked by flipping the fixture.
+    expect(html).toContain('spec-on"');
+    expect(html).not.toContain('spec-off"');
     expect(html).toContain("INT4"); // quant that loaded
     expect(html).toContain("LOW BATTERY"); // throttle reason
     expect(html).toContain("DEFER HEAVY");
@@ -378,7 +382,8 @@ describe("InferencePerfPanel", () => {
       quant: "auto",
     });
     const html = renderPanel(perf);
-    expect(html).toContain("OFF"); // normal generation
+    expect(html).toContain('spec-off"'); // normal generation
+    expect(html).not.toContain('spec-on"');
     expect(html).toContain("AUTO"); // loaded as configured
     expect(html).toContain("NONE"); // no throttle
     // No phantom throttle reason.

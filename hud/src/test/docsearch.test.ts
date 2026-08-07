@@ -512,13 +512,20 @@ describe("DocSearchPanel (cited, honest, review-only)", () => {
     expect(render(null, null)).toBe("");
   });
 
-  it("shows the honest NOT-INDEXED state with the enable + allowlist steps", () => {
+  it("shows the honest NOT-INDEXED state and names the REAL gate (roots, not enabled)", () => {
     // An index event with zero chunks reads as "not indexed yet", never a fake.
     const html = render(parseDocIndexStatus({ files: 0, chunks: 0, embedded_chunks: 0 }), null);
     expect(html).toMatch(/NOT INDEXED/i);
-    expect(html).toContain("[docsearch].enabled");
     expect(html).toContain("[docsearch].roots");
     expect(html).toContain("REVIEW ONLY");
+    // REGRESSION GUARD. [docsearch].enabled SHIPS TRUE (daemon/src/config.rs:
+    // "file RAG SHIPS ON (full-power default; inert without roots)"). This copy
+    // used to say the feature "ships OFF" and told the operator to enable that
+    // flag — a no-op instruction that also mis-stated the security posture. The
+    // only thing standing between the daemon and the user's files is the EMPTY
+    // roots allowlist, and the copy must name that gate and no other.
+    expect(html).not.toContain("[docsearch].enabled");
+    expect(html.toLowerCase()).not.toContain("ships off");
   });
 
   it("shows counts and the NEURAL pill for a fully-embedded index", () => {

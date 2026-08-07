@@ -52,17 +52,22 @@ function render(
 /* The daemon's lean badge-telemetry shapes (anthropic.rs
  * cross_check_badge_telemetry / debate_badge_telemetry). The honest notes are
  * taken verbatim from CROSS_CHECK_NOTE / DEBATE_NOTE in the daemon. */
+/* DRIFTED (now re-synced): both constants used to end "ships OFF by default",
+ * a claim the daemon abandoned when the gates flipped ON. They are copied from
+ * daemon/src/anthropic.rs CROSS_CHECK_NOTE / DEBATE_NOTE and must stay verbatim
+ * — a fixture that models a payload the daemon does not send proves nothing. */
 const CROSS_NOTE =
   "A bounded plausibility cross-check of a tool result before it is surfaced as " +
   "fact. It only DOWNGRADES confidence and FLAGS a questionable result — it NEVER " +
-  "removes a confirmation gate and is NOT a correctness guarantee. Ships OFF by " +
-  "default.";
+  "removes a confirmation gate and is NOT a correctness guarantee. Ships ON but " +
+  "runs only over a tool result (an ordinary turn is never cross-checked).";
 
 const DEBATE_NOTE =
   "For high-stakes asks only, a second independent model answers the same " +
   "question. Agreement RAISES confidence; disagreement SURFACES BOTH answers " +
   "(never silently picked or averaged); if the second model is unavailable it " +
-  "falls back to one and says so. At most two model calls; ships OFF by default.";
+  "falls back to one and says so. At most two model calls; ships ON but engages " +
+  "only on high-stakes asks (ordinary turns never debate).";
 
 /* #21 cross-check, gate ON, each possible outcome. */
 const crossPlausible: Record<string, unknown> = {
@@ -77,7 +82,9 @@ const crossFlagged: Record<string, unknown> = {
   badge: "UNVERIFIED",
   note: CROSS_NOTE,
 };
-/* The SHIPPED DEFAULT: [answers].cross_check OFF — outcome "off" + null badge. */
+/* NOT the shipped default — [answers].cross_check ships TRUE. This is the
+ * "the pass did not run this turn" shape (no tool result to check), and the
+ * operator-disabled shape: outcome "off" + null badge. */
 const crossOff: Record<string, unknown> = {
   cross_check_on: false,
   outcome: "off",
@@ -104,7 +111,8 @@ const debateFallback: Record<string, unknown> = {
   badge: "ONE-MODEL",
   note: DEBATE_NOTE,
 };
-/* The SHIPPED DEFAULT / every ordinary turn: outcome "off" + null badge. */
+/* Every ORDINARY turn (the gate ships TRUE; the high-stakes predicate is what
+ * declines), and the operator-disabled shape: outcome "off" + null badge. */
 const debateOff: Record<string, unknown> = {
   debate_on: false,
   outcome: "off",
@@ -357,7 +365,7 @@ describe("answer.debated reducer", () => {
 /* === PANEL =============================================================== */
 
 describe("AnswerCrossCheckPanel", () => {
-  it("renders nothing when both statuses are null (shipped OFF default)", () => {
+  it("renders nothing when both statuses are null (neither pass ran this turn)", () => {
     expect(render(null, null)).toBe("");
   });
 

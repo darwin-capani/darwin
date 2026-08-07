@@ -57,9 +57,27 @@ describe("buildPaletteItems", () => {
     expect(agent.action).toEqual({ kind: "target-agent", agent: "friday" });
   });
 
+  /* WHAT WENT WRONG: this guard could not fail. `PaletteSources` has no skills
+     field and the SOURCES fixture supplied none, so buildPaletteItems had no
+     skill data to enumerate under ANY implementation — and `PaletteGroup` is the
+     closed union of exactly the three groups asserted. Adding a `skills` input
+     plus a skill loop would have left it green. FEED IT THE REGRESSION: pass a
+     skills-shaped source (the first thing such a change would add) and require
+     the output to be IDENTICAL to the skills-free build. */
   it("does NOT enumerate skills (they have no HUD-side invocation — no dead-ends)", () => {
-    expect(items.some((i) => i.id.startsWith("skill:"))).toBe(false);
-    expect(items.every((i) => i.group === "Command" || i.group === "App" || i.group === "Agent")).toBe(true);
+    const withSkills = {
+      ...SOURCES,
+      skills: [
+        { name: "consolidate-memory", description: "reflective pass over memory" },
+        { name: "security-review", description: "review the pending changes" },
+      ],
+    } as PaletteSources;
+    const built = buildPaletteItems(withSkills);
+    expect(built.some((i) => i.id.startsWith("skill:"))).toBe(false);
+    expect(built.some((i) => i.label.toLowerCase().includes("consolidate-memory"))).toBe(false);
+    expect(built.every((i) => i.group === "Command" || i.group === "App" || i.group === "Agent")).toBe(true);
+    // The load-bearing assertion: a skills input changes NOTHING.
+    expect(built).toEqual(items);
   });
 
   it("dedups by id and produces stable order (Command, App, Agent)", () => {

@@ -113,10 +113,20 @@ fn pane_url(anchor: &str) -> String {
     format!("x-apple.systempreferences:com.apple.preference.security?{anchor}")
 }
 
-/// The outcome surfaced to the HUD. `opened` is true only when `/usr/bin/open`
-/// dispatched the URL (System Settings launched); `label` is the pane name;
+/// The outcome surfaced to the HUD. `opened` means "this call actually did
+/// something the user can see": either `/usr/bin/open` dispatched the URL and
+/// System Settings launched (the `open_url` / fallback path), OR a NATIVE TCC
+/// PROMPT fired (`request_access`'s non-fallback path returns `prompt.fired`, and
+/// that path never shells `/usr/bin/open`). It is FALSE when the permission was
+/// already granted and nothing needed to happen. `label` is the pane name;
 /// `detail` is a short human line (no secret — the only material is a public URL
 /// / pane name + honest guidance).
+///
+/// (This used to say `opened` is true ONLY when `/usr/bin/open` dispatched the
+/// URL — false for the whole `request_access` command, which is where a native
+/// prompt is the normal outcome. Nothing renders `opened` today, but any future
+/// consumer that trusted it — "we opened Settings for you, go flip the switch" —
+/// would have reported the wrong thing.)
 #[derive(Debug, Serialize, PartialEq, Eq)]
 pub struct PaneOpen {
     pub opened: bool,

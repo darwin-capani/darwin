@@ -11,6 +11,7 @@ import {
   localToolsInitial,
   localToolsLabel,
   localToolsTone,
+  localToolsTurnStart,
   modelTierInitial,
   sttTierInitial,
   voiceIdInitial,
@@ -156,11 +157,29 @@ describe("offline tool-loop folding helpers (events.ts)", () => {
     expect(last.isError).toBe(true);
   });
 
-  it("a fresh engaged turn clears a prior out-of-subset refusal flag", () => {
-    let lt = applyLocalToolsOutOfSubset(localToolsInitial(), { tool: "send_email" });
+  /* REGRESSION — this test used to assert the OPPOSITE ("a fresh engaged turn
+     clears a prior out-of-subset refusal flag") and so pinned a real defect: the
+     daemon emits local_tools.out_of_subset INSIDE the loop and local_tools.engaged
+     only AFTER the loop returns, so the "clear" landed on the refusal it was
+     supposed to preserve and the REFUSED signal could never render. Replay the
+     daemon's REAL order. */
+  it("the turn-closing engaged event PRESERVES this turn's out-of-subset refusal", () => {
+    let lt = applyLocalToolsExecuted(localToolsInitial(), { tool: "recall_facts" });
+    lt = applyLocalToolsOutOfSubset(lt, { tool: "send_email" });
     expect(lt.refusedOutOfSubset).toBe(true);
     lt = applyLocalToolsEngaged(lt, { tools_used: 1, tools: ["recall_facts"] });
-    expect(lt.refusedOutOfSubset).toBe(false);
+    expect(lt.refusedOutOfSubset).toBe(true);
+    expect(localToolsTone(lt)).toBe("warn");
+    expect(localToolsHonest(lt)).toContain("OUTSIDE the safe subset");
+  });
+
+  it("localToolsTurnStart clears a PRIOR turn's refusal (and is a no-op otherwise)", () => {
+    let lt = applyLocalToolsOutOfSubset(localToolsInitial(), { tool: "send_email" });
+    lt = applyLocalToolsEngaged(lt, { tools_used: 1, tools: ["recall_facts"] });
+    const fresh = localToolsTurnStart(lt);
+    expect(fresh.refusedOutOfSubset).toBe(false);
+    // Referentially stable when there is nothing to clear.
+    expect(localToolsTurnStart(fresh)).toBe(fresh);
   });
 
   it("never throws on a malformed payload and never surfaces a stray field", () => {
@@ -334,6 +353,35 @@ describe("reducer local_tools.* events", () => {
     expect(s.localTools.recent[0].outOfSubset).toBe(true);
   });
 
+  /* REGRESSION (the whole point of the flag): replay the DAEMON'S REAL emission
+     order for one offline turn — model.tier (router, before the loop) ->
+     executed -> out_of_subset (loop, then break) -> engaged (after the loop).
+     The refusal must survive to the render. */
+  it("survives the turn-closing engaged event on the daemon's real order", () => {
+    let s = tel(connected(), env("model.tier", { tier: "local", reason: "auto" }, "system"));
+    s = tel(s, env("local_tools.executed", { tool: "recall_facts" }));
+    s = tel(s, env("local_tools.out_of_subset", { tool: "send_email" }));
+    s = tel(s, env("local_tools.engaged", { tools_used: 1, tools: ["recall_facts"] }));
+    expect(s.localTools.engaged).toBe(true);
+    expect(s.localTools.refusedOutOfSubset).toBe(true);
+    const html = renderStatusBar(s.localTools);
+    expect(html).toContain("REFUSED");
+    expect(html).toContain('localtools-chip warn"');
+  });
+
+  /* ...and the NEXT turn must not inherit it. model.tier is the router's
+     start-of-turn verdict, emitted before it may enter the offline tool loop. */
+  it("the next turn's model.tier clears a prior turn's refusal", () => {
+    let s = tel(connected(), env("local_tools.out_of_subset", { tool: "send_email" }));
+    s = tel(s, env("local_tools.engaged", { tools_used: 1, tools: ["recall_facts"] }));
+    expect(s.localTools.refusedOutOfSubset).toBe(true);
+    s = tel(s, env("model.tier", { tier: "local", reason: "auto" }, "system"));
+    expect(s.localTools.refusedOutOfSubset).toBe(false);
+    s = tel(s, env("local_tools.engaged", { tools_used: 1, tools: ["recall_facts"] }));
+    expect(s.localTools.refusedOutOfSubset).toBe(false);
+    expect(renderStatusBar(s.localTools)).not.toContain("REFUSED");
+  });
+
   it("a malformed local_tools.engaged never throws and never blanks the indicator", () => {
     let s = tel(
       connected(),
@@ -394,8 +442,10 @@ describe("StatusBar offline-agency chip", () => {
     });
     const html = renderStatusBar(lt);
     expect(html).toContain("ACTING OFFLINE");
-    expect(html).toContain("localtools-chip");
-    expect(html).toContain("ok"); // clean tone
+    // Anchor the tone to the CHIP'S OWN class attribute. A bare toContain("ok")
+    // cannot fail: "LINK ONLINE"/"INFERENCE" render `<span class="dot ok">` in
+    // every StatusBar, so the assertion was satisfied by unrelated markup.
+    expect(html).toContain('localtools-chip ok"');
     expect(html).toContain("2");
   });
 
@@ -423,17 +473,23 @@ describe("StatusBar offline-agency chip", () => {
     const html = renderStatusBar(lt);
     expect(html).toContain("ACTING OFFLINE");
     expect(html).toContain("GATED");
-    expect(html).toContain("warn");
+    expect(html).toContain('localtools-chip warn"');
   });
 
+  /* The DAEMON'S REAL ORDER: out_of_subset is emitted inside the loop, engaged
+     only after it returns. This used to build the state the other way round
+     (engaged first) — the one order the daemon never produces. */
   it("flags REFUSED inline when the 4B reached outside the safe subset", () => {
-    const lt = applyLocalToolsOutOfSubset(
-      applyLocalToolsEngaged(localToolsInitial(), { tools_used: 1, tools: ["recall_facts"] }),
-      { tool: "send_email" },
+    const lt = applyLocalToolsEngaged(
+      applyLocalToolsOutOfSubset(
+        applyLocalToolsExecuted(localToolsInitial(), { tool: "recall_facts" }),
+        { tool: "send_email" },
+      ),
+      { tools_used: 1, tools: ["recall_facts"] },
     );
     const html = renderStatusBar(lt);
     expect(html).toContain("REFUSED");
-    expect(html).toContain("warn");
+    expect(html).toContain('localtools-chip warn"');
   });
 
   it("never claims the on-device path equals the cloud model's quality", () => {

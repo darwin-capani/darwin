@@ -245,4 +245,22 @@ describe("TakeoverStage layout (device-gated render aside; the DOM stage is real
     expect(html).not.toMatch(/sk-/);
     expect(html).not.toMatch(/secret/i);
   });
+
+  /* REGRESSION — PRIVACY. The stage is `position:fixed; inset:0` over a
+     near-opaque backdrop, so it fully occludes the windowed HUD: whatever it
+     does not mount, the user cannot see ANYWHERE. It used to pass VisionPanel
+     only {feed, running}, dropping `screenContext` — and VisionPanel gates the
+     whole screen-context block (and the header's WATCHING SCREEN indicator) on
+     that prop. The most privacy-sensitive read feature ran with no indicator at
+     all in the one mode where the HUD is the only thing on screen. */
+  it("carries the WATCHING SCREEN privacy indicator into takeover", () => {
+    const watching: HudState = {
+      ...hud,
+      screenContext: { ...hud.screenContext, enabled: true, watching: true, held: 2, cap: 8 },
+    };
+    const html = render({ state: watching, onExit: () => {} });
+    expect(html).toContain("WATCHING SCREEN");
+    // ...and the resting posture must NOT claim it.
+    expect(render({ state: hud, onExit: () => {} })).not.toContain("WATCHING SCREEN");
+  });
 });

@@ -226,9 +226,18 @@ const FLAG_COMMAND: u64 = 0x0010_0000;
 ///
 /// HONESTY OVER COMPLETENESS: if the base key cannot be mapped, returns `None` and
 /// the caller posts NO event — it NEVER guesses a wrong key. Modifiers
-/// (`cmd`/`command`/`ctrl`/`control`/`opt`/`option`/`alt`/`shift`) in any order are
-/// folded into the flag mask; the LAST non-modifier token is the base key.
+/// (`cmd`/`command`/`super`/`win`/`meta`, `ctrl`/`control`, `opt`/`option`/`alt`,
+/// `shift`) in any order are folded into the flag mask. EXACTLY ONE non-modifier
+/// token is allowed and it is the base key; a SECOND one is a malformed combo and
+/// returns `None` (`map_combo("a+b") == None`, pinned by the test below).
 /// Case-insensitive. PURE — unit-tested.
+///
+/// (This used to say "the LAST non-modifier token is the base key", i.e. that
+/// `a+b` presses `b`. The code refuses, the test asserts the refusal, and the
+/// doc list also omitted the `super`/`win`/`meta` aliases. On the UI-actuation
+/// path — where the contract is "never guess a wrong key" — a maintainer who
+/// trusted the doc could have "fixed" the refusal branch to match it, turning a
+/// malformed combo into a real synthetic keystroke on the user's machine.)
 pub fn map_combo(combo: &str) -> Option<(u16, u64)> {
     let mut flags: u64 = 0;
     let mut base: Option<u16> = None;
@@ -345,10 +354,25 @@ fn bind_actuate_socket(path: &Path) -> std::io::Result<UnixListener> {
 /// START the actuator listener on a dedicated background thread. NON-BLOCKING:
 /// returns immediately; the thread binds the socket and accepts connections for
 /// the life of the process. It NEVER actuates on its own — it only posts a CGEvent
-/// when a token-authenticated daemon request arrives. A bind failure (e.g. the
-/// daemon hasn't created `state/ipc/` yet, or another HUD instance holds it) is a
-/// clean no-op: the thread logs nothing sensitive and exits, leaving the app
-/// otherwise healthy.
+/// when a token-authenticated daemon request arrives.
+///
+/// BIND FAILURE is a clean no-op: the thread logs nothing sensitive and exits,
+/// leaving the app otherwise healthy. What can actually cause one is root
+/// resolution failing or `state/` being unwritable — NOT the two conditions this
+/// doc used to name. `bind_actuate_socket` creates the directory itself
+/// (`create_dir_all`), so a missing `state/ipc/` never fails; and it UNLINKS any
+/// existing socket before binding, so a second HUD instance does not fail either.
+///
+/// CONTENTION IS LAST-WINS, NOT A NO-OP. A newer HUD unlinks the live socket and
+/// binds its own; the first instance keeps accepting on an orphaned inode nothing
+/// can reach. The daemon connects BY PATH, so actuation requests land in whichever
+/// process bound last — e.g. a `npm run tauri dev` build started alongside the
+/// launchd-managed DARWIN.app (docs/BRINGUP.md documents both side by side). The
+/// dev build is a different bundle with its own Accessibility TCC entry, so
+/// actuations then start returning "accessibility not granted" even though the
+/// GRANTED app is running. If last-wins is ever not what we want, gate the unlink
+/// on a liveness probe (try to `connect()` the existing path first and exit
+/// cleanly if a peer answers) rather than unconditionally removing it.
 pub fn start_actuator_listener() {
     let _ = std::thread::Builder::new()
         .name("hud-actuator".to_string())

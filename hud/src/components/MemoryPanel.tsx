@@ -63,6 +63,7 @@ function clock(ts: string): string {
 export default function MemoryPanel({
   memory,
   beliefCount = 0,
+  consolidationStale = false,
 }: {
   memory: MemoryState;
   /** How many beliefs the LIVE user-model profile holds, from the MIRROR
@@ -80,6 +81,19 @@ export default function MemoryPanel({
    *  tooltip "nothing observed to forget yet" — for up to ~20 hours, precisely
    *  when a user who had just read their profile would reach for it. */
   beliefCount?: number;
+  /** The SEMANTIC-MEMORY consolidation pass (reflect.rs) failed and no newer pass
+   *  has succeeded — HudState.consolidationStale. DISTINCT from
+   *  `memory.userModelStale`, which is the user-model pass.
+   *
+   *  WHAT WENT WRONG: reflect.rs deliberately writes NO stamp on failure, so the
+   *  clock can stay stuck indefinitely and the 6h check keeps retrying; its own
+   *  comment says the event exists to "surface a stuck reflection clock on the
+   *  HUD ... instead of silent 6h retries". The reducer set the flag, and NOTHING
+   *  read it — the only artifact was a toast that expires after TOAST_TTL_MS
+   *  (4.5s). A user not watching the HUD in that window never learned that
+   *  long-term memory had stopped being updated. Defaulted so existing
+   *  callers/tests keep compiling. */
+  consolidationStale?: boolean;
 }) {
   const shell = inTauri();
   const { timeline } = memory;
@@ -103,6 +117,21 @@ export default function MemoryPanel({
             built from real turns · redacted · recalled by voice · not clairvoyant
           </span>
         </div>
+
+        {/* PERSISTENT stale marker. The toast that used to be the ONLY artifact
+            of a failed consolidation expires in 4.5s; the failure itself can
+            persist for days (reflect.rs writes no stamp on failure). */}
+        {consolidationStale && (
+          <div className="mem-stale-banner" role="note">
+            <span className="mem-um-stale">CONSOLIDATION FAILING</span>
+            <span className="mem-stale-text">
+              The last semantic-memory consolidation pass FAILED and no newer one
+              has succeeded, so what DARWIN has consolidated may be out of date.
+              Nothing was lost — new turns are still recorded; only the periodic
+              consolidation is stuck, and it keeps retrying.
+            </span>
+          </div>
+        )}
 
         {/* ---- EPISODIC TIMELINE — newest-first episode-store outcomes. ---- */}
         <div className="mem-section">

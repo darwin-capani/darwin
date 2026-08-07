@@ -116,6 +116,7 @@ import {
   applyVoiceIdVerify,
   bool,
   localToolsInitial,
+  localToolsTurnStart,
   localWarmInitial,
   inferencePerfInitial,
   MODEL_LOCAL_WARM_EVENT,
@@ -368,7 +369,19 @@ export interface AppFeed {
   /** Latest status line, when the app emits one (feeds_ok/feeds_failed). */
   feedsOk: number | null;
   feedsFailed: number | null;
-  /** envelope `at` of the last app.data — drives "stale feed" affordances. */
+  /** Envelope `at` of the last app.data. AN UNRENDERED FRESHNESS STAMP — NO
+   *  component reads it (nor the sibling `fetchedAt`); AppDeckPanel's only
+   *  liveness predicate is `runningApps.has(id) || appFeeds[id]?.running`, with
+   *  no time-based staleness anywhere.
+   *
+   *  This used to claim it "drives 'stale feed' affordances". It does not, and
+   *  it is the WRONG value to hang one off: `sameAppFeedContent` deliberately
+   *  excludes `updatedAt`, and the no-churn bailout below returns the SAME state
+   *  when only this field would change — so a high-rate app republishing an
+   *  identical payload (the 30 Hz nexus case the bailout cites) stops advancing
+   *  it while the feed is perfectly live. An affordance built on it would report
+   *  an actively-updating feed as stale. To add one, stamp freshness OUTSIDE the
+   *  content-equality bailout first. */
   updatedAt: number;
   /** Latest raw payload PER relay topic, keyed by the manifest topic string
    *  (apps.rs::resolve_topic). The feed-shaped fields above stay populated for
@@ -956,7 +969,8 @@ export interface HudState {
    *  citation) grouped by type, and relationships (from/relation/to + the
    *  `source file:offset` detail on the co-occurrence edge). Null until the user
    *  builds a graph (double-gated: [docsearch].enabled AND [docsearch].build_graph,
-   *  both ship false). Every node/edge is EXTRACTED from real document text and
+   *  both ship TRUE — what keeps this quiet is the EMPTY [docsearch].roots
+ *  allowlist, not the flags). Every node/edge is EXTRACTED from real document text and
    *  provenance-tagged — never fabricated; the shipped extractor is a conservative
    *  heuristic (errs toward missing, not a sophisticated NER). Counts/ids/names/
    *  source strings only — no chunk text; rides the local broadcast only. */
@@ -974,7 +988,8 @@ export interface HudState {
    *  Never carries an embedding/audio/secret. */
   answerAnnotation: AnswerAnnotation | null;
   /** The last SELF-VERIFICATION outcome (answer.verified) — the per-turn result
-   *  of the OPTIONAL second self-check pass ([answers].verify, which SHIPS OFF).
+   *  of the second self-check pass ([answers].verify, which SHIPS ON; it engages
+ *  only on important turns).
    *  When the gate is on AND the turn was important enough to gate in, the model
    *  critiques its own DRAFT answer ONCE against the real sources that turn used,
    *  and (at most ONCE) revises it. Carries only: the gate flag, the per-turn
@@ -988,7 +1003,8 @@ export interface HudState {
   verifyStatus: VerifyStatus | null;
   /** The last TOOL-RESULT CROSS-CHECK outcome (#21, answer.cross_checked) — the
    *  per-turn result of the BOUNDED plausibility cross-check of a tool result
-   *  before it is surfaced as fact ([answers].cross_check, which SHIPS OFF). When
+   *  before it is surfaced as fact ([answers].cross_check, which SHIPS ON; it runs
+ *  only over a tool result). When
    *  the gate is on, deterministic sanity checks run (shape/range/contradiction/
    *  empty-vs-claimed/citation), plus an OPTIONAL single bounded model pass for
    *  important results. A failed check DOWNGRADES confidence + FLAGS the result —
@@ -1004,7 +1020,7 @@ export interface HudState {
   crossCheckStatus: CrossCheckStatus | null;
   /** The last MULTI-MODEL DEBATE outcome (#22, answer.debated) — the per-turn
    *  result of consulting TWO brains on a GATED high-stakes ask ([answers].debate,
-   *  which SHIPS OFF; a conservative should_debate predicate means ordinary turns
+   *  which SHIPS ON; a conservative should_debate predicate means ordinary turns
    *  never debate). Bounded to at most two model calls. Carries only: the gate
    *  flag, the per-turn outcome token (off | agree | disagree | fallback), the
    *  derived badge (null => render nothing), and honest copy. Null until the first
@@ -1153,7 +1169,8 @@ export interface HudState {
    *  ACTUALLY RAN this turn — whether speculative decoding ran, the quant that
    *  actually loaded, and the active throttle plan (or none). HONEST: the real
    *  speedup / RAM-quality tradeoff / thermal-battery effect are device/model-gated
-   *  and are NEVER measured or claimed here; all three ship OFF/neutral (off =>
+   *  and are NEVER measured or claimed here; the RESTING readout is neutral, which
+ *  is not the same as off ([power].adaptive SHIPS ON) (neutral =>
    *  today's runtime); the live power read is device-gated ([power].adaptive). */
   inferencePerf: InferencePerfStatus;
 
@@ -1371,7 +1388,7 @@ export interface HudState {
    *  chart.rs emitted for the Chart component to render verbatim (every emitted
    *  point plotted, line segments only between GIVEN points, NO interpolation/
    *  invented/extrapolated point, axis ranges derived from the data). Null until
-   *  the first chart.data; the op ships OFF ([chart].enabled) so nothing arrives
+   *  the first chart.data; the op SHIPS ON ([chart].enabled) so nothing arrives
    *  until it is enabled AND a "chart this" command runs. An honest-empty spec
    *  (no plottable point) rides `empty: true` so the panel shows the honest-empty
    *  state rather than a fabricated point. SECRET-FREE — labels/axes/title/points
@@ -3220,7 +3237,7 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
     case "answer.verified": {
       // The per-turn SELF-VERIFICATION outcome (anthropic.rs verify_telemetry,
       // emitted from main.rs run_pipeline next to answer.annotated). The OPTIONAL
-      // second self-check ([answers].verify, ships OFF) critiques the DRAFT answer
+      // second self-check ([answers].verify, ships ON) critiques the DRAFT answer
       // ONCE against the real sources that turn used, then at most ONCE revises it;
       // this carries only the gate flag, the per-turn outcome token, the DERIVED
       // badge, and honest copy. SECRET-FREE: never the flagged-claim text (that
@@ -3247,7 +3264,7 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // The per-turn TOOL-RESULT CROSS-CHECK outcome (#21,
       // anthropic.rs cross_check_badge_telemetry, emitted from main.rs
       // run_pipeline next to answer.verified). The BOUNDED plausibility
-      // cross-check ([answers].cross_check, ships OFF) runs deterministic sanity
+      // cross-check ([answers].cross_check, ships ON) runs deterministic sanity
       // checks (and an OPTIONAL single bounded model pass) over a tool result
       // before it is surfaced as fact; a failed check DOWNGRADES confidence +
       // FLAGS the result, and NEVER removes a confirmation gate. This carries only
@@ -3278,7 +3295,7 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // The per-turn MULTI-MODEL DEBATE outcome (#22,
       // anthropic.rs debate_badge_telemetry, emitted from main.rs run_pipeline
       // next to answer.cross_checked). For GATED high-stakes asks only
-      // ([answers].debate, ships OFF; a conservative should_debate predicate means
+      // ([answers].debate, ships ON; a conservative should_debate predicate means
       // ordinary turns never debate), two brains answer the same question and the
       // daemon RECONCILES — at most two model calls. This carries only the gate
       // flag, the per-turn outcome token, the DERIVED badge, and honest copy.
@@ -3404,7 +3421,7 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // flag), so an honest-empty spec rides empty:true and the panel shows the
       // honest-empty state rather than a fabricated point. A malformed/unrecognized
       // payload is dropped (same reference) so junk never churns the tree. The op
-      // ships OFF ([chart].enabled), so nothing arrives until it is enabled.
+      // ships ON ([chart].enabled); nothing arrives until a chart is REQUESTED.
       const spec = parseChartSpec(env.data);
       if (spec === null) return s;
       return { ...s, chart: spec };
@@ -3440,8 +3457,8 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       //
       // A fresh report REPLACES the prior one (the latest build). A payload with no
       // report object is dropped (same reference) so an off/error round never
-      // churns the tree or blanks a real report already shown. The op ships OFF
-      // ([report].enabled), so nothing arrives until it is enabled. REVIEW-ONLY +
+      // churns the tree or blanks a real report already shown. The op ships ON
+      // ([report].enabled); nothing arrives until a report is REQUESTED. REVIEW-ONLY +
       // SECRET-FREE — counts/headings/real locators only.
       const readout = parseReportReadout(env.data);
       if (readout === null) return s;
@@ -3476,7 +3493,20 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // A fresh snapshot REPLACES the prior one (it is the durable source of
       // truth); the live ring keeps reacting between snapshots. REVIEW-ONLY:
       // there is no action here that records, prunes, or rewrites the log.
-      return { ...s, audit: parseAuditSnapshot(env.data) };
+      //
+      // EXCEPT `truncated`. audit.rs::snapshot_json emits only
+      // {enabled,total,chain,entries} — its own comment says the re-root is
+      // surfaced LIVE by the separate `audit.truncated` event instead. A blind
+      // replace therefore reset the flag to false on the very next
+      // AUDIT_SNAPSHOT_INTERVAL (15s) tick, so "the log was pruned and the chain
+      // RE-ROOTED — the gap is explicit, not silent" went silent within 15
+      // seconds of the prune and never came back. Carry it forward: a re-root is
+      // a durable fact about this log, not a per-frame one.
+      const next = parseAuditSnapshot(env.data);
+      return {
+        ...s,
+        audit: { ...next, truncated: next.truncated || (s.audit?.truncated ?? false) },
+      };
     }
 
     case "policy.snapshot": {
@@ -3558,9 +3588,12 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
     case "audit.truncated": {
       // A prune re-rooted the chain (audit.rs bounded retention). Reflect the
       // truncation flag on the current snapshot so the panel's chain copy stays
-      // honest ("the surviving suffix still verifies from the new root") until
-      // the next full audit.snapshot arrives. No-op if no snapshot is loaded yet
-      // (the next snapshot will carry the authoritative truncated flag anyway).
+      // honest ("the surviving suffix still verifies from the new root"). This is
+      // the ONLY frame that carries the fact — snapshot_json does not emit a
+      // `truncated` key at all — so the snapshot arm above CARRIES it forward
+      // rather than replacing it. No-op if no snapshot is loaded yet; the flag is
+      // then re-derivable only from a later prune, which is the honest limit of
+      // what the daemon tells us.
       if (s.audit === null || s.audit.truncated) return s;
       return { ...s, audit: { ...s.audit, truncated: true } };
     }
@@ -3594,11 +3627,17 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
       // inference-perf facts (speculative #37 / quant #39 — the path that actually
       // ran; throttle #38 — present only when the plan actually throttled, absent
       // under the OFF default), folded into the inference-perf surface.
+      // It is ALSO the honest START-OF-TURN boundary for the offline tool loop:
+      // the router emits model.tier BEFORE it may enter complete_with_local_tools,
+      // so this is where a PRIOR turn's out-of-subset refusal is dropped. (It used
+      // to be dropped by local_tools.engaged, which the daemon emits AFTER the loop
+      // — i.e. after the refusal — so the signal could never render.)
       return {
         ...s,
         modelTier: applyModelTier(s.modelTier, env.data),
         localWarm: applyLocalSub(s.localWarm, env.data),
         inferencePerf: applyInferencePerf(s.inferencePerf, env.data),
+        localTools: localToolsTurnStart(s.localTools),
       };
     case "inference.decode":
       // Post-turn mlx_lm-measured decode telemetry (tok/s + peak GPU mem + the
@@ -3896,7 +3935,7 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
     }
 
     case "mission.blocked": {
-      // The durable-missions feature did not run. "disabled" is the shipped-OFF
+      // The durable-missions feature did not run. "disabled" is the OPERATOR-disabled
       // gate ([missions].durable=false) — NOT an error, so it is a no-op for the
       // surface (mirrors forge.blocked reason=disabled). Any other reason is also
       // not surfaced as a card here (there is nothing to persist); the spoken
@@ -3937,7 +3976,7 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
     }
 
     case "macro.blocked": {
-      // The macro feature did not run. "disabled" is the shipped-OFF gate
+      // The macro feature did not run. "disabled" is the OPERATOR-disabled gate
       // ([macros].enabled=false) — NOT an error, so it is a no-op for the surface
       // (mirrors forge.blocked reason=disabled). No-op (same reference).
       return s;

@@ -37,16 +37,31 @@ export default function ChangeQueuePanel({ changeq }: { changeq: ChangeqState | 
   if (!hasPending(changeq)) return null;
 
   const mirrored = mirroredCount(changeq);
-  const total = changeq.pending.length;
+  const shown = changeq.pending.length;
+  // The DAEMON's count, not the displayed window. The header used to read
+  // `pending.length`, so once the queue passed MAX_DISPLAY (the daemon's default
+  // bound is 64) the operator was told a number SMALLER than the truth and the
+  // oldest proposals vanished with no marker — in a lane whose whole purpose is
+  // complete surfacing.
+  const total = changeq.total;
+  const truncated = total > shown;
 
   return (
     <div className="changeq-panel">
       <Frame title="CHANGE QUEUE // REVIEW LANE" tag="PROPOSE-ONLY · GIT-NATIVE">
         <div className="changeq-body">
           <div className="changeq-head dim-note">
-            {total} pending proposal{total === 1 ? "" : "s"} · {mirrored}/{total} mirrored onto{" "}
-            <code>{changeq.branch}</code>
+            {total} pending proposal{total === 1 ? "" : "s"} · {mirrored}/{shown} shown mirrored
+            onto <code>{changeq.branch}</code>
           </div>
+
+          {truncated && (
+            <div className="changeq-truncated dim-note" role="note">
+              Showing the {shown} newest of {total} — {total - shown} older proposal
+              {total - shown === 1 ? " is" : "s are"} pending review and not listed
+              here. Nothing was applied or discarded.
+            </div>
+          )}
 
           <div className="changeq-list">
             {changeq.pending.map((c) => (

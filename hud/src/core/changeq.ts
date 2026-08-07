@@ -68,8 +68,17 @@ export interface PendingChange {
 export interface ChangeqState {
   /** The dedicated LOCAL review branch (e.g. "darwin/changeq"). */
   branch: string;
-  /** The pending proposals, deduped + newest-first + capped. */
+  /** The pending proposals, deduped + newest-first + capped to MAX_DISPLAY. This
+   *  is the DISPLAYED window, not the queue: see `total`. */
   pending: PendingChange[];
+  /** The daemon's OWN pending count for the whole queue (the frame's `count`),
+   *  which can exceed `pending.length` once the queue passes MAX_DISPLAY. The
+   *  daemon's default bound is 64 and `[changeq] max_pending` raises it to 512,
+   *  so this is reachable on a long-lived box. It used to be dropped on the
+   *  floor, and the panel reported `pending.length` as "N pending proposals" —
+   *  a number smaller than the truth, with no truncation marker, in the one lane
+   *  whose stated purpose is complete surfacing of every propose-only change. */
+  total: number;
 }
 
 /* ----------------------------------------------------------------------- *
@@ -150,9 +159,18 @@ export function parseChangeqList(data: unknown): ChangeqState | null {
     const parsed = parsePendingChange(item);
     if (parsed !== null) pending.push(parsed);
   }
+  // The daemon's own queue length (changeq.rs emits `"count": items.len()`).
+  // Falls back to the parsed item count when absent/junk — never BELOW it, so
+  // the panel can never report fewer proposals than it is showing.
+  const count = readNum(o, "count");
+  const total =
+    count !== null && Number.isFinite(count) && count >= pending.length
+      ? Math.floor(count)
+      : pending.length;
   return {
     branch: readStr(o, "branch") ?? "darwin/changeq",
     pending,
+    total,
   };
 }
 
@@ -175,11 +193,14 @@ export function changeqReduce(
   for (const c of next.pending) {
     byKey.set(`${c.kind}:${c.ts}`, c); // last write wins (dedup)
   }
-  const pending = [...byKey.values()]
-    .sort((a, b) => b.ts - a.ts || b.seq - a.seq)
-    .slice(0, MAX_DISPLAY);
+  const deduped = [...byKey.values()].sort((a, b) => b.ts - a.ts || b.seq - a.seq);
+  const pending = deduped.slice(0, MAX_DISPLAY);
   if (pending.length === 0) return null;
-  return { branch: next.branch, pending };
+  // `total` is the daemon's queue length, never the displayed window. Dedup can
+  // only shrink what we received, so clamp up to the deduped length too — the
+  // honest total is always >= what we render.
+  const total = Math.max(next.total, deduped.length, pending.length);
+  return { branch: next.branch, pending, total };
 }
 
 /* ----------------------------------------------------------------------- *

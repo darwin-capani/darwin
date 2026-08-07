@@ -277,7 +277,8 @@ describe("StatusBar model-tier chip", () => {
     });
     expect(html).toContain("MODEL HEAVY");
     expect(html).toContain("AUTO");
-    expect(html).toContain("good");
+    // Anchor the tone to the CHIP (a bare "good" is present in every render).
+    expect(html).toContain("modeltier-chip good");
   });
 
   it("renders LOCAL as MANUAL with the honest on-device/not-Opus hover copy", () => {

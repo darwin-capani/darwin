@@ -240,8 +240,18 @@ export async function healApply(ts: string): Promise<HealApplyResult> {
  *  short human line (never a secret); `version` is present only when an update is
  *  available/installed. */
 export interface UpdateCheck {
-  /** "not_configured" (the shipped state — no owner key/release yet), "up_to_date",
-   *  "available", "installed", "error", or "unavailable" (no desktop shell). */
+  /** "not_configured" (the UNARMED dev state: tauri.conf.json still carries the
+   *  `REPLACE_WITH_TAURI_UPDATER_PUBLIC_KEY` placeholder, or no pubkey at all, so
+   *  `updater_unarmed()` short-circuits before any network call), "up_to_date",
+   *  "available", "installed", "error", or "unavailable" (no desktop shell).
+   *
+   *  NOT the shipped state, which this used to claim: the committed
+   *  tauri.conf.json carries a REAL minisign pubkey and the shipped updater is
+   *  live — see src-tauri/src/updates.rs `updater_unarmed()` and the
+   *  `committed_config_carries_a_real_updater_pubkey` tripwire that stops it
+   *  regressing to the placeholder. A reader who trusted the old wording would
+   *  conclude About > Check for Updates can only ever return not_configured and
+   *  does no network call. It does. */
   status:
     | "not_configured"
     | "up_to_date"
@@ -595,9 +605,16 @@ export function bindFullscreenKey(): () => void {
 
 /* ---------------------------------------------------- SYSTEM ACCESS (macOS TCC) */
 
-/** Outcome of opening a macOS System Settings privacy pane. `opened` is true
- *  only when System Settings was actually launched; `detail` is a short, honest
- *  human line (never a faked "granted"). */
+/** Outcome of opening a macOS System Settings privacy pane. `opened` means this
+ *  call actually did something visible — System Settings was launched OR a
+ *  NATIVE TCC prompt fired (see src-tauri/src/permissions.rs `PaneOpen`); it is
+ *  false when the permission was already granted and nothing had to happen.
+ *  `detail` is a short, honest human line (never a faked "granted").
+ *
+ *  (This mirror used to say `opened` is true "only when System Settings was
+ *  actually launched", which is false for the whole `request_access` command:
+ *  its non-fallback path returns the native-prompt flag and never shells
+ *  `/usr/bin/open`.) */
 export interface PaneOpenResult {
   opened: boolean;
   label: string;

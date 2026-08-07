@@ -139,6 +139,27 @@ describe("parseNotebookActivity", () => {
     expect(a.card).toBeNull();
   });
 
+  /* The CARD's own verb, which only the OUTER verb used to be checked. The
+     card verb fell back to the envelope verb (`?? verb`), so an unrecognized
+     card was silently RELABELLED and still built — the exact opposite of the
+     "otherwise drop the card" guard the code comment claimed. */
+  it("drops the CARD when the card's own verb is unknown (not a silent relabel)", () => {
+    const a = parseNotebookActivity({
+      verb: "revisit",
+      card: { verb: "obliterate", topic: "x", snippet: "s", run_count: 3 },
+    });
+    expect(a.verb).toBe("revisit"); // the envelope verb is still honest
+    expect(a.card).toBeNull(); // ...but it is NOT borrowed for the card
+  });
+
+  it("still builds the card when the card's own verb is known", () => {
+    const a = parseNotebookActivity({
+      verb: "revisit",
+      card: { verb: "saved", topic: "x", snippet: "s", run_count: 3 },
+    });
+    expect(a.card?.verb).toBe("saved");
+  });
+
   it("never throws on junk and yields an honest no-card record", () => {
     const a = parseNotebookActivity({ verb: "revisit", card: "not-an-object" });
     expect(a.verb).toBe("revisit");

@@ -19,10 +19,14 @@ import Frame from "./Frame";
  *     panel says so plainly (the runtime-gated foot note).
  *   - COST $ IS AN ESTIMATE — the dollar figure is a published $/1M multiplier
  *     over the measured token sums, NOT a billed number. Always labelled EST.
- *   - OPTIMIZER IS PROPOSE-ONLY + OFF BY DEFAULT — it NEVER auto-tunes routing.
- *     A pending proposal is shown READ-ONLY with the MANUAL apply command
- *     (scripts/apply_optimization.sh <ts>); there is deliberately no one-click
- *     apply. The panel never mutates anything.
+ *   - OPTIMIZER IS PROPOSE-ONLY AND SHIPS ON — [optimize].enabled = true
+ *     (config/darwin.toml; daemon/src/config.rs asserts it), mode "propose". It
+ *     is ARMED by default: it records PII-redacted traces and scores them. What
+ *     it NEVER does is auto-tune routing. A pending proposal is shown READ-ONLY
+ *     with the MANUAL apply command (scripts/apply_optimization.sh <ts>); there
+ *     is deliberately no one-click apply. The panel never mutates anything.
+ *     (This block used to say "OFF BY DEFAULT" while the live pill next to it
+ *     read "ON · PROPOSE" on every stock install.)
  *
  * The reducer only ever sets `evalReport` from a defensively-parsed `eval.report`
  * (parseEvalReport never returns null and never carries PII) and
@@ -139,7 +143,7 @@ export default function EvalPanel({
             ) : (
               <div className="eval-opt-note dim-note">
                 {optimizerOff
-                  ? "Optimizer is OFF (the shipped default). No traces are scored and no proposal is written. It NEVER auto-tunes routing — when enabled it only writes a reviewable proposal you apply by hand."
+                  ? "Optimizer is OFF — you turned it off in [optimize] (it ships ON). No traces are scored and no proposal is written. It NEVER auto-tunes routing — while on it only writes a reviewable proposal you apply by hand."
                   : "No pending proposal. The optimizer is PROPOSE-ONLY: when a candidate beats the held-out baseline it writes a reviewable artifact you apply by hand (scripts/apply_optimization.sh). It never changes live routing on its own."}
               </div>
             )}
@@ -148,8 +152,10 @@ export default function EvalPanel({
           <div className="eval-foot dim-note">
             All numbers are MEASURED from real turns; an empty window reads
             "awaiting turns", never a fabricated value. Latency + cost are
-            runtime-gated (a live mic + cloud feed them). The optimizer is
-            propose-only and ships OFF — it never tunes routing itself.
+            runtime-gated (a live mic + cloud feed them). The optimizer ships{" "}
+            <b>ON</b> (<code>[optimize].enabled</code>) but is{" "}
+            <b>propose-only</b> — it records and scores traces, and never tunes
+            routing itself.
           </div>
         </div>
       </Frame>

@@ -12,10 +12,14 @@ import Frame from "./Frame";
  *   - 100% ON-DEVICE / PRIVATE. File contents + embeddings NEVER leave the
  *     device — the embed op is the on-device MLX model and these events ride the
  *     local 127.0.0.1 telemetry broadcast only. The footer says so plainly.
- *   - SHIPPED OFF + ALLOWLIST-ONLY. The feature is disabled by default and
- *     indexes NOTHING until the operator flips [docsearch].enabled AND allowlists
- *     a folder — never a whole-disk scan. Until an index is built this panel
- *     shows the honest "not indexed yet" state, not a fake.
+ *   - SHIPS ON + INERT WITHOUT ROOTS (allowlist-only). [docsearch].enabled is
+ *     TRUE in the shipped config (daemon/src/config.rs asserts "file RAG SHIPS ON
+ *     (full-power default; inert without roots)"). What keeps it from reading a
+ *     single byte is that [docsearch].roots ships EMPTY: it indexes NOTHING until
+ *     the operator allowlists a folder — never a whole-disk scan. Until an index
+ *     is built this panel shows the honest "not indexed yet" state, not a fake.
+ *     (This block used to say the master switch was off, which named the wrong
+ *     gate: turning it "on" is a no-op — adding a root is the real step.)
  *   - CITES REAL FILES, NEVER FABRICATES. Every hit is a real indexed chunk the
  *     daemon returned (the parser drops any hit with no file to point at). An
  *     empty result is the honest "nothing found", shown — never hidden.
@@ -61,8 +65,9 @@ export default function DocSearchPanel({
 }) {
   // Nothing to show until the user has either built an index or run a search —
   // render nothing rather than a placeholder, mirroring the other event-fed
-  // panels (McpPanel, EvalPanel). The feature ships OFF, so neither event arrives
-  // until it is deliberately enabled + a folder allowlisted + indexed/searched.
+  // panels (McpPanel, EvalPanel). The feature ships ON but is INERT WITHOUT
+  // ROOTS, so neither event arrives until a folder is allowlisted and something
+  // is indexed/searched.
   if (index === null && search === null) return null;
 
   return (
@@ -79,8 +84,9 @@ export default function DocSearchPanel({
           <SearchResults search={search} />
 
           <div className="docsearch-foot dim-note">
-            100% on-device. The index reads ONLY the folders you allowlist (it
-            ships off and never scans your whole disk), and your file contents +
+            100% on-device. The index reads ONLY the folders you allowlist (the
+            allowlist ships EMPTY, so it never scans your whole disk), and your
+            file contents +
             embeddings NEVER leave this machine — the embedder is the on-device
             model and search runs locally. Results cite real indexed files; when
             the on-device embedder is down, search falls back to keyword (BM25)
@@ -121,11 +127,11 @@ function IndexStatusRow({
           <span className="docsearch-pill off">NOT INDEXED</span>
         </div>
         <div className="docsearch-empty dim-note">
-          No files are indexed yet. On-device file search ships OFF — enable{" "}
-          <code>[docsearch].enabled</code> and add a folder under{" "}
-          <code>[docsearch].roots</code> in darwin.toml (it indexes only the
-          folders you allowlist, never your whole disk), then say{" "}
-          <b>&ldquo;index my documents&rdquo;</b>.
+          No files are indexed yet. On-device file search ships <b>ON</b> but is
+          inert until you allowlist a folder — add one under{" "}
+          <code>[docsearch].roots</code> in darwin.toml (the allowlist ships
+          empty; it indexes only the folders you name, never your whole disk),
+          then say <b>&ldquo;index my documents&rdquo;</b>.
         </div>
       </div>
     );

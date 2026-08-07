@@ -54,6 +54,21 @@ export const VOICE_ID_PHRASES = {
   forget: "forget my voice",
 } as const;
 
+/** The EXACT wire shape the voice-id Enroll/Forget buttons send: the SAME
+ *  `{cmd:"ask"}` spoken intent, never a bespoke enroll/forget verb. Factored out
+ *  and exported so the invariant has ONE named home a test can pin.
+ *
+ *  WHAT WENT WRONG: the two "button wiring" tests never rendered the component or
+ *  fired its onClick — they called `sendCommand` from the test body and asserted
+ *  on their own call, so the whole HUD suite stayed green with Enroll rewired to
+ *  a non-existent daemon verb. This suite runs in a node env with NO DOM, so a
+ *  click cannot be dispatched; what CAN be pinned is (a) this shape, (b) that the
+ *  buttons' rendered titles are built from VOICE_ID_PHRASES, so a phrase rewire
+ *  is visible in the markup. Both are asserted in system-settings.test.ts. */
+export function voiceIdIntentRequest(phrase: string): { cmd: "ask"; text: string } {
+  return { cmd: "ask", text: phrase };
+}
+
 /**
  * SYSTEM SETTINGS — the dedicated config surface for config/darwin.toml. On open
  * it reads every whitelisted setting (config_get) and renders the catalog
@@ -719,7 +734,7 @@ export function VoiceIdEnrollControls({
   const need = voiceId?.need ?? null;
 
   const send = useCallback(async (phrase: string): Promise<string> => {
-    const r = await sendCommand({ cmd: "ask", text: phrase });
+    const r = await sendCommand(voiceIdIntentRequest(phrase));
     return r.ok ? r.reply || "" : r.error || "command failed";
   }, []);
 
@@ -799,7 +814,7 @@ export function VoiceIdEnrollControls({
           className="icon-btn syscfg-vid-enroll-btn"
           onClick={() => void enroll()}
           disabled={!shell || busy || enrolling}
-          title="Sends the spoken &quot;enroll my voice&quot; intent the daemon classifies — needs Microphone access + the daemon running; speak the prompts when asked. The badge flips to ENROLLED only when real telemetry reports it."
+          title={`Sends the spoken "${VOICE_ID_PHRASES.enroll}" intent the daemon classifies — needs Microphone access + the daemon running; speak the prompts when asked. The badge flips to ENROLLED only when real telemetry reports it.`}
         >
           {enrollLabel}
         </button>
@@ -808,7 +823,7 @@ export function VoiceIdEnrollControls({
           className={`icon-btn syscfg-vid-forget-btn${confirmForget ? " armed" : ""}`}
           onClick={() => void forget()}
           disabled={!shell || busy || enrolling || (!enrolled && !confirmForget)}
-          title="Sends the spoken &quot;forget my voice&quot; intent — clears your enrolled profile. Two-step confirm."
+          title={`Sends the spoken "${VOICE_ID_PHRASES.forget}" intent — clears your enrolled profile. Two-step confirm.`}
         >
           {confirmForget ? "Forget — confirm" : "Forget my voice"}
         </button>

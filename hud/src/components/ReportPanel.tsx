@@ -26,8 +26,11 @@ import Frame from "./Frame";
  *     list is bounded shorter.
  *   - REVIEW-ONLY. There is NO button — the daemon already built the report; this
  *     panel only SHOWS it.
- *   - SHIPPED OFF. The [report].enabled gate ships false; until it is enabled the
- *     off verb carries no report and this panel renders NOTHING.
+ *   - SHIPS ON. The [report].enabled gate ships TRUE (config/darwin.toml;
+ *     daemon/src/config.rs ReportConfig::default). The panel renders NOTHING
+ *     until a "generate a report on X" turn actually produces one — that is the
+ *     absence of a REQUEST, not a disabled feature. The `off` verb (which carries
+ *     no report) is what you get when the OPERATOR turns the gate off.
  *   - SECRET-FREE. The wire carries only the title, counts, headings, and the
  *     real citation locators — never raw body content, never an embedding/secret.
  *
@@ -37,8 +40,8 @@ import Frame from "./Frame";
  */
 export default function ReportPanel({ report }: { report: ReportReadout | null }) {
   // Nothing to show until a report.built carries a report. The [report].enabled
-  // gate ships OFF, so the reducer holds `report` at null until it is enabled AND
-  // a "generate a report on X" command runs — render nothing rather than a
+  // gate ships ON, so the reducer holds `report` at null only until a "generate a
+  // report on X" command actually runs — render nothing rather than a
   // placeholder.
   if (report === null) return null;
 
