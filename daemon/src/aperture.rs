@@ -23,8 +23,20 @@
 //!     (bounded in length), never a place PII lives.
 //!   * BOUNDED retention: the timeline ring is capped (`[aperture].retention`);
 //!     recording a new activity evicts the OLDEST past the cap, so the timeline
-//!     cannot grow without bound on an always-on appliance. The ring is TRANSIENT
-//!     (in-RAM only — NEVER written to memory / the optimizer corpus / disk).
+//!     cannot grow without bound on an always-on appliance. The RING is TRANSIENT
+//!     (in-RAM only — NEVER serialized to memory / the optimizer corpus / disk).
+//!     SCOPE, stated exactly: that covers the ring and everything in it. It does
+//!     NOT cover a recall TURN. `render_recall`'s reply (app names + already-redacted
+//!     window titles) leaves this module as an ordinary `RouteOutcome.response`, and
+//!     main.rs's transience gate names only the screen-read / describe / generate-image
+//!     / identify-sound / screen-context-recall predicates — there is no aperture
+//!     predicate — so with `[episodic].enabled` (ships on) an aperture recall turn is
+//!     recorded like any other turn and fed to the passive fact learner. The sibling
+//!     `pasteboard.rs` carries the identical idiom and the identical gap, so this is a
+//!     PROJECT-WIDE position, not an aperture oversight; flagged here rather than
+//!     silently widened, because narrowing the gate is a product call (see the
+//!     10-line justification at main.rs's `transient` binding for the one sibling
+//!     that WAS special-cased).
 //!   * ON-DEVICE only: nothing here reaches the network. Recall READS the ring and
 //!     renders a summary; it never actuates, and it NEVER fabricates (an empty /
 //!     un-fed ring, or a window with no recorded activity, is an honest "I have no
@@ -355,12 +367,70 @@ fn extract_subject(lower: &str) -> Option<String> {
             // the timeline on `title/app contains "last hour"`, which no window
             // title ever does, so a fully populated timeline answered the most
             // natural phrasing with "I have no record of what you were working on".
-            if !phrase.is_empty() && phrase.len() <= 64 && !looks_like_time_cue(phrase) {
-                return Some(phrase.to_string());
+            // A TRAILING time cue ("…the budget this morning") is a WINDOW, not
+            // part of the subject. Strip it BEFORE judging the phrase so both word
+            // orders resolve to the same subject; a phrase that is nothing but a
+            // cue collapses to empty here and is rejected below, exactly as
+            // `looks_like_time_cue` already rejected it.
+            let phrase = strip_trailing_time_cue(phrase);
+            if !phrase.is_empty() && phrase.len() <= 64 && !looks_like_time_cue(&phrase) {
+                return Some(phrase);
             }
         }
     }
     None
+}
+
+/// The TIME vocabulary. Module-scoped so [`looks_like_time_cue`] and
+/// [`strip_trailing_time_cue`] share ONE table — a second private copy is exactly
+/// how the two halves of this rule would drift apart.
+const TIME_WORDS: &[&str] = &[
+    "the", "this", "that", "last", "past", "next", "few", "couple", "recent",
+    "hour", "hours", "minute", "minutes", "day", "days", "week", "weeks",
+    "morning", "afternoon", "evening", "night", "tonight", "today",
+    "yesterday", "noon", "midnight", "earlier", "recently", "just", "now",
+];
+
+/// True when a SINGLE token belongs to a time cue: a time word, a bare number
+/// ("2" in "past 2 hours"), or a clock hour ("3pm").
+fn is_time_token(tok: &str) -> bool {
+    !tok.is_empty()
+        && (TIME_WORDS.contains(&tok)
+            || tok.chars().all(|c| c.is_ascii_digit())
+            || parse_clock_hour(tok).is_some())
+}
+
+/// Strip a TRAILING time cue off a candidate recall SUBJECT.
+///
+/// WHAT WENT WRONG: [`extract_subject`] took the ENTIRE tail after a subject lead
+/// and rejected it only when the WHOLE phrase was a time cue, so the mirror-image
+/// word order survived. "what was I working on about the budget this morning"
+/// yielded the subject "budget this morning"; `render_recall` then filtered the
+/// timeline on `title/app contains "budget this morning"`, which no window title
+/// ever satisfies, and a fully populated timeline answered "I have no record of
+/// what you were working on this morning, sir." That is the EXACT failure this
+/// file already carries a regression test for — on the other word order only.
+///
+/// Pops trailing time tokens, then the preposition that introduced them, so
+/// "budget this morning" -> "budget" while "the last hour" -> "" (rejected as a
+/// subject entirely, leaving it a WINDOW, which is today's behavior).
+fn strip_trailing_time_cue(phrase: &str) -> String {
+    const TRAILING_CONNECTORS: &[&str] =
+        &["for", "at", "around", "in", "on", "during", "since", "from"];
+    let toks: Vec<&str> = phrase.split_whitespace().collect();
+    let clean = |t: &str| t.trim_matches(|c: char| !c.is_alphanumeric()).to_string();
+    let mut end = toks.len();
+    while end > 0 && is_time_token(&clean(toks[end - 1])) {
+        end -= 1;
+    }
+    if end < toks.len() {
+        // Only a cue we ACTUALLY removed can leave a dangling preposition behind,
+        // so this never eats a trailing word of a real subject.
+        while end > 0 && TRAILING_CONNECTORS.contains(&clean(toks[end - 1]).as_str()) {
+            end -= 1;
+        }
+    }
+    toks[..end].join(" ")
 }
 
 /// True when `phrase` is ITSELF only a time cue ("3pm", "last hour", "past 2
@@ -383,12 +453,6 @@ fn looks_like_time_cue(phrase: &str) -> bool {
     if parse_clock_hour(p).is_some() || parse_past_n_hours(p).is_some() {
         return true;
     }
-    const TIME_WORDS: &[&str] = &[
-        "the", "this", "that", "last", "past", "next", "few", "couple", "recent",
-        "hour", "hours", "minute", "minutes", "day", "days", "week", "weeks",
-        "morning", "afternoon", "evening", "night", "tonight", "today",
-        "yesterday", "noon", "midnight", "earlier", "recently", "just", "now",
-    ];
     let mut saw_token = false;
     for tok in p.split_whitespace() {
         let t = tok.trim_matches(|c: char| !c.is_alphanumeric());
@@ -616,7 +680,16 @@ pub fn render_recall(entries: &[Activity], query: &ApertureQuery, k: usize) -> S
 /// so the citation layer treats it as an empty retrieval.
 fn empty_recall_line(query: &ApertureQuery) -> String {
     match (&query.window, &query.subject) {
-        (Some(w), _) => format!(
+        // WINDOW **and** SUBJECT: name the SUBJECT. The old arm ignored the subject
+        // and answered "I have no record of what you were working on this morning,
+        // sir." over a timeline that held four recorded morning spans — a false
+        // statement from a module whose stated contract is honest-empty, and one
+        // that also masks a wrong subject as a window-level denial.
+        (Some(w), Some(s)) => format!(
+            "I have no record of anything about \"{s}\" {}, sir.",
+            w.label
+        ),
+        (Some(w), None) => format!(
             "I have no record of what you were working on {}, sir.",
             w.label
         ),
@@ -1307,6 +1380,26 @@ mod tests {
         // …and a real subject that merely MENTIONS a time word is still a subject.
         let q = build_query("what was I working on the morning briefing", &fixed_now());
         assert_eq!(q.subject.as_deref(), Some("morning briefing"));
+
+        // THE MIRROR-IMAGE WORD ORDER — uncovered until now, and broken. When the
+        // cue TRAILS the subject the whole tail was taken as the subject
+        // ("budget this morning"), `render_recall` filtered on a string no window
+        // title ever contains, and a populated timeline answered "I have no record
+        // of what you were working on this morning, sir."
+        for (utterance, want) in [
+            ("what was I working on about the budget this morning", "budget"),
+            ("what was I working on about the budget today", "budget"),
+            ("what did I do about the lease this afternoon", "lease"),
+            ("what was I working on the report this morning", "report"),
+        ] {
+            let q = build_query(utterance, &fixed_now());
+            assert_eq!(
+                q.subject.as_deref(),
+                Some(want),
+                "{utterance:?} must carry the SUBJECT only, not the trailing time cue"
+            );
+            assert!(q.window.is_some(), "{utterance:?} must still resolve a window");
+        }
     }
 
     // -- SUMMARIZE + RENDER (group by app, honest-empty) ---------------------
@@ -1372,6 +1465,31 @@ mod tests {
         let miss = ApertureQuery { window: None, subject: Some("quarterly taxes".into()) };
         let out = render_recall(&timeline_for_summary(), &miss, 5);
         assert!(out.to_lowercase().starts_with("i have no activity recorded about"), "{out}");
+    }
+
+    /// REGRESSION: a WINDOW + SUBJECT miss must name the SUBJECT. The windowed arm
+    /// ignored the subject entirely, so over this very timeline (four recorded
+    /// morning spans) a miss on "quarterly taxes" answered "I have no record of
+    /// what you were working on this morning, sir." — telling the user the
+    /// timeline holds nothing for a period in which it holds plenty.
+    #[test]
+    fn a_window_plus_subject_miss_names_the_subject_not_just_the_window() {
+        let q = build_query("what was I working on this morning about quarterly taxes", &fixed_now());
+        assert!(q.window.is_some(), "the window is still parsed: {q:?}");
+        assert_eq!(q.subject.as_deref(), Some("quarterly taxes"));
+        let out = render_recall(&timeline_for_summary(), &q, 5);
+        assert!(
+            out.to_lowercase().contains("quarterly taxes"),
+            "the honest-empty line must name the SUBJECT that missed: {out}"
+        );
+        assert!(out.to_lowercase().starts_with("i have no"), "still an honest-empty line: {out}");
+        // …and the window-only miss keeps its own wording.
+        let window_only = ApertureQuery { window: q.window.clone(), subject: None };
+        let out = render_recall(&[], &window_only, 5);
+        assert!(
+            out.to_lowercase().contains("what you were working on"),
+            "a window-only miss is unchanged: {out}"
+        );
     }
 
     #[test]

@@ -331,11 +331,30 @@ impl TrimSpec {
     /// Reduce-only: this only names tools to REFUSE, never one to add. Enforced at
     /// the single robust chokepoint (`execute_tool`), so it holds even for a
     /// wildcard-allowlist agent whose offered set can't be filtered by name.
+    /// `unified_search` IS ON THIS LIST. It is not a "search files" tool: its
+    /// on-device fan-out reads the SAME two withheld categories directly —
+    /// `episodic_recall(..)` for history and `load_recall_candidates(..)` ->
+    /// `facts_candidates(..)` for facts — and returns the ranked fact keys/values
+    /// and episode text as the tool result, which is appended to the cloud
+    /// conversation and POSTed on the next loop iteration. It is a registered cloud
+    /// tool and the orchestrator holds the `["*"]` tools wildcard, so it is offered
+    /// on an ordinary cloud turn. Leaving it off this table meant an operator on
+    /// `no_facts` / `no_memory` saw a `boundary.manifest` frame reporting
+    /// facts/history as WITHHELD while the model pulled the very same rows back
+    /// into egress with one `unified_search` call — the manifest and the actual
+    /// egress disagreeing, which is precisely what this module says cannot happen.
+    /// It is named under BOTH trims because it reads facts under `NoFacts` and
+    /// facts + episodes under `NoMemory`.
     pub fn withheld_recall_tools(&self) -> &'static [&'static str] {
         match self {
             TrimSpec::None => &[],
-            TrimSpec::NoFacts => &["recall_facts", "mnemosyne_recall"],
-            TrimSpec::NoMemory => &["recall_facts", "mnemosyne_recall", "episodic_recall"],
+            TrimSpec::NoFacts => &["recall_facts", "mnemosyne_recall", "unified_search"],
+            TrimSpec::NoMemory => &[
+                "recall_facts",
+                "mnemosyne_recall",
+                "episodic_recall",
+                "unified_search",
+            ],
         }
     }
 
@@ -508,6 +527,13 @@ pub fn apply_trim(manifest: &EgressManifest, spec: TrimSpec) -> EgressManifest {
 /// shipped config, turning the neutral PREVIEW on.
 static BOUNDARY_GATE: OnceLock<(bool, TrimSpec)> = OnceLock::new();
 
+/// What [`gate_and_trim`] falls back to when [`init`] was never called: the gate
+/// OFF and the IDENTITY trim. Named (rather than an inline literal at the
+/// `unwrap_or`) so "an uninitialized gate is inert" is a value a test can assert
+/// on — the test that carried that name used to assert an irrefutable `matches!`
+/// over all three `TrimSpec` variants and could not fail for any implementation.
+const BOUNDARY_GATE_FALLBACK: (bool, TrimSpec) = (false, TrimSpec::None);
+
 /// Wire the `[boundary]` gate from the loaded config. Called once from `main()`
 /// alongside `init_answers`. Idempotent (a lost `set` means the same value was
 /// already installed). Logs nothing sensitive (just the bool + trim word).
@@ -520,7 +546,7 @@ pub fn init(enabled: bool, default_trim: &str) {
 /// [`init`] was never called, so the manifest path is inert and today's behavior
 /// holds.
 pub fn gate_and_trim() -> (bool, TrimSpec) {
-    let (enabled, default_trim) = BOUNDARY_GATE.get().copied().unwrap_or((false, TrimSpec::None));
+    let (enabled, default_trim) = BOUNDARY_GATE.get().copied().unwrap_or(BOUNDARY_GATE_FALLBACK);
     let trim = current_turn_trim().unwrap_or(default_trim);
     // VAULT MODE ("go dark", vault.rs): an active vault forces CUSTOMS to the
     // MAXIMAL reduce-only trim. RESTRICT-ONLY — `TrimSpec::maximal()` withholds a
@@ -904,11 +930,26 @@ mod tests {
         assert!(nf.contains(&"recall_facts"));
         assert!(nf.contains(&"mnemosyne_recall"));
         assert!(!nf.contains(&"episodic_recall"), "history is still allowed under no_facts");
-        // No-memory withholds facts + history => all three recall tools refused.
+        // REGRESSION: `unified_search` is a MEMORY-READING tool. Its on-device
+        // fan-out calls `episodic_recall` and `load_recall_candidates` ->
+        // `facts_candidates` directly and returns the ranked fact keys/values and
+        // episode text as its tool result — which is appended to the cloud
+        // conversation and POSTed on the next loop iteration. Omitting it let a
+        // `no_facts` / `no_memory` turn report facts/history as WITHHELD in the
+        // boundary manifest while the model pulled the very same rows back into
+        // egress with ONE call. It reads facts under no_facts, so it is refused
+        // under BOTH trims.
+        assert!(
+            nf.contains(&"unified_search"),
+            "unified_search reads facts; it must be refused under no_facts"
+        );
+        // No-memory withholds facts + history => every memory-reading tool refused.
         let nm = TrimSpec::NoMemory.withheld_recall_tools();
-        for t in ["recall_facts", "mnemosyne_recall", "episodic_recall"] {
+        for t in ["recall_facts", "mnemosyne_recall", "episodic_recall", "unified_search"] {
             assert!(nm.contains(&t), "{t} must be refused under no_memory");
         }
+        // …and the identity still refuses NOTHING (the trim is reduce-only).
+        assert!(!TrimSpec::None.withheld_recall_tools().contains(&"unified_search"));
         // The stripped set aligns with the categories the trim drops (no tool leaks a
         // category the trim claims to keep).
         assert!(TrimSpec::NoFacts.drops(ContextCategory::Facts));
@@ -917,16 +958,46 @@ mod tests {
 
     #[test]
     fn uninitialized_gate_is_inert() {
-        // Without init the gate is OFF and the trim is the identity — the manifest
-        // path never runs and today's behavior holds. (This test may run before or
-        // after init in the suite; it asserts the FALLBACK semantics via a fresh
-        // read only when uninitialized. The turn override is cleared to isolate.)
-        clear_turn_trim();
-        // gate_and_trim never panics and returns a valid pair regardless of init.
-        let (_enabled, trim) = gate_and_trim();
-        // With no per-turn override, the effective trim equals the gate default
-        // (None when uninit; whatever init set otherwise) — never an invalid value.
-        assert!(matches!(trim, TrimSpec::None | TrimSpec::NoFacts | TrimSpec::NoMemory));
+        // WHAT WENT WRONG: this test used to end at
+        //   assert!(matches!(trim, TrimSpec::None | TrimSpec::NoFacts | TrimSpec::NoMemory));
+        // `TrimSpec` has exactly those three variants and is not #[non_exhaustive],
+        // so the pattern is IRREFUTABLE — true for every possible value of `trim`.
+        // `_enabled` was discarded, so nothing about the OFF-by-default gate was
+        // checked either. Rewriting `gate_and_trim` to return
+        // `(true, TrimSpec::NoMemory)` — a gate that is ON and force-trims every
+        // turn, the exact opposite of "inert" — still passed it. The only failure
+        // mode left was a panic inside `gate_and_trim`.
+        //
+        // It also no longer calls `clear_turn_trim()`: that is a WRITE to the same
+        // process-global `per_turn_override_takes_precedence_and_clears` owns, and
+        // the two tests raced (an intermittent failure reproducible on the
+        // pre-change file). Everything below is a pure read or a constant.
+        assert_eq!(
+            BOUNDARY_GATE_FALLBACK,
+            (false, TrimSpec::None),
+            "an uninitialized gate must be INERT: OFF, with the identity trim"
+        );
+        // "identity trim" is a PROPERTY, not just a name: it withholds no context
+        // category and refuses no recall tool, so an uninitialized-gate turn is
+        // byte-for-byte today's cloud turn.
+        assert!(
+            BOUNDARY_GATE_FALLBACK.1.dropped().is_empty(),
+            "the fallback trim must withhold NO category"
+        );
+        assert!(
+            BOUNDARY_GATE_FALLBACK.1.withheld_recall_tools().is_empty(),
+            "the fallback trim must refuse NO recall tool"
+        );
+        // …and the fallback is what `gate_and_trim` actually reaches for. Only
+        // checkable when this test observes an uninitialized gate and no per-turn
+        // override; the second read of the override rejects a snapshot another test
+        // changed underneath us, so this never flakes and never writes.
+        if BOUNDARY_GATE.get().is_none() && current_turn_trim().is_none() {
+            let got = gate_and_trim();
+            if current_turn_trim().is_none() && !crate::vault::active() {
+                assert_eq!(got, BOUNDARY_GATE_FALLBACK, "gate_and_trim must use the inert fallback");
+            }
+        }
     }
 
     #[test]

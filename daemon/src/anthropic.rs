@@ -2359,38 +2359,19 @@ pub async fn complete_with_tools(
     // dropped from `facts`/`history` here, never added to (reduce-only by
     // construction). INERT under the shipped default (enabled preview, trim "none")
     // => `facts`/`history` are untouched and the prompt is byte-for-byte today's.
-    // HONESTY: this gates ONLY the cloud path — the LOCAL inference path routes
-    // through `complete_with_local_tools`, never this function, so it never reaches
-    // CUSTOMS (it egresses nothing off the box, and the manifest says so on the wire).
-    let (customs_on, trim) = boundary::gate_and_trim();
-    if customs_on {
-        // Inventory the FULL egress, then apply the trim to get the honest, subset
-        // manifest of what actually leaves. Both the manifest and the data reduction
-        // below derive from the SAME `trim`, so the frame can never disagree with
-        // what egressed.
-        let full = boundary::build_egress_manifest(
-            persona(),
-            agent_persona,
-            facts,
-            history,
-            world_context,
-            personalization,
-            utterance,
-        );
-        let manifest = boundary::apply_trim(&full, trim);
-        debug_assert!(
-            manifest.is_subset_of(&full),
-            "CUSTOMS trim must never broaden the egress manifest"
-        );
-        telemetry::emit("cloud", "boundary.manifest", manifest.telemetry());
-    }
-    // REDUCE-ONLY: withhold a trimmed category's data from the actual request. With
-    // the shipped "none" trim (or CUSTOMS off) both drop-checks are false, so
-    // `facts`/`history` are untouched and the prompt is byte-for-byte today's.
-    let facts: &[(String, String)] =
-        if customs_on && trim.drops(boundary::ContextCategory::Facts) { &[] } else { facts };
-    let history: &[(String, String)] =
-        if customs_on && trim.drops(boundary::ContextCategory::History) { &[] } else { history };
+    // HONESTY: this gates the CLOUD paths — BOTH of them (this tool loop and the
+    // conversation-routed `complete_persona` chat turn, which calls the SAME helper).
+    // The LOCAL inference path routes through `complete_with_local_tools`, never
+    // either of these, so it never reaches CUSTOMS (it egresses nothing off the box,
+    // and the manifest says so on the wire).
+    let (facts, history) = customs_pre_flight(
+        agent_persona,
+        facts,
+        history,
+        world_context,
+        personalization,
+        utterance,
+    );
 
     let system = build_system_blocks(agent_persona, facts, &world_tail);
     let mut messages = build_messages(history, utterance);
@@ -2507,8 +2488,17 @@ pub async fn complete_with_tools(
             // confirmation gate (the confirm gate lives in confirm.rs, untouched).
             // The aggregated tool results stand in for the result being surfaced; no
             // numeric domain bound applies to the generic tool-loop path.
+            //
+            // ...AND IT ONLY RUNS WHEN A TOOL ACTUALLY FIRED. `joined` is
+            // `actions.join("\n")`, and `actions` is only appended to on a real
+            // execution, so on a no-tool turn it is the EMPTY STRING — which the
+            // deterministic layer reads as "the tool returned nothing" and flags as
+            // `EmptyButClaimed`. Without this `used_tool` term the check flagged
+            // nearly every ordinary conversational answer, lighting the HUD's
+            // UNVERIFIED pill permanently and appending a caveat about a tool that was
+            // never called. See `crosscheck::cross_check_runs`.
             let (cross_on, cross_model_pass) = cross_check_gate();
-            if cross_on {
+            if crosscheck::cross_check_runs(cross_on, used_tool) {
                 let joined = actions.join("\n");
                 let cc = crosscheck::run_cross_check(
                     cross_on,
@@ -3413,8 +3403,12 @@ async fn local_tool_loop(
             // model answering the owner directly), so it is context_trusted=true —
             // an `Always` here is attended and unchanged. (The offline subset holds
             // no consequential outward tools anyway.)
+            // `cloud_bound = false`: this loop's tool results feed the ON-DEVICE 4B
+            // and nothing else, so the CUSTOMS egress refusal must not fire here —
+            // there is no egress to refuse. Every OTHER gate in execute_tool still
+            // applies unchanged; this flag scopes that one refusal and nothing more.
             let mut effect = ToolEffect::DryRun;
-            let (out, is_error) = execute_tool(
+            let (out, is_error) = execute_tool_bound(
                 &call.name,
                 &call.input,
                 memory,
@@ -3422,6 +3416,7 @@ async fn local_tool_loop(
                 namespace,
                 true,
                 true,
+                DEVICE_LOCAL,
                 &mut effect,
             )
             .await;
@@ -3537,6 +3532,11 @@ pub async fn complete_plain(
 /// forces identical user input (e.g. a repeated bare "Hi DARWIN") to vary
 /// instead of collapsing onto one peaked sequence. Empty `avoid` leaves the
 /// prompt untouched (first turn, or no recent replies to dodge).
+///
+/// CUSTOMS: this path runs the SAME `customs_pre_flight` the tool loop runs, so a
+/// `no_facts` / `no_memory` trim reduces a CHAT turn's egress too and the operator's
+/// `boundary.manifest` frame is emitted for it. It did not, once, and that was a real
+/// privacy hole — see `customs_pre_flight`.
 #[allow(clippy::too_many_arguments)] // mirrors the cloud chat turn's working set
 pub async fn complete_persona(
     model: &str,
@@ -3558,6 +3558,20 @@ pub async fn complete_persona(
              HUD settings panel, then restart DARWIN"
         )
     })?;
+    // CUSTOMS // EGRESS pre-flight for the CHAT path. This is the DEFAULT route for
+    // an ordinary conversation turn ([router].conversation_route = "cloud_heavy"),
+    // and it carries the same personal payload the tool loop does — the RAG-ranked
+    // facts, the recent conversation history, the shared world-model rows and the
+    // observed user profile (router.rs assembles all four before calling us). Run it
+    // AFTER the key resolves, so a turn that can never go out never claims an egress.
+    let (facts, history) = customs_pre_flight(
+        agent_persona,
+        facts,
+        history,
+        world_context,
+        personalization,
+        utterance,
+    );
     let body = persona_body(
         model,
         spoken_cap(max_tokens),
@@ -3662,6 +3676,84 @@ fn persona_body(
         body["system"] = system;
     }
     body
+}
+
+/// The (facts, history) pair a cloud request actually sends, borrowed from the
+/// caller's own slices — so the reduce-only trim can only ever hand back a shorter
+/// view of what the caller assembled, never a rebuilt or extended one.
+type EgressContext<'a> = (&'a [(String, String)], &'a [(String, String)]);
+
+/// CUSTOMS // EGRESS (boundary.rs) — the PRE-FLIGHT egress boundary gate, shared by
+/// EVERY cloud path. Before a cloud request goes out, build a READ-ONLY manifest of
+/// EXACTLY the personal context the caller assembled (the SAME facts / history /
+/// world rows / persona / system prompt that turn sends), apply the active
+/// REDUCE-ONLY trim (config default or a per-turn voice override), and emit it as a
+/// `boundary.manifest` frame so the operator sees what egresses BEFORE it leaves.
+/// Returns the (possibly reduced) `facts` / `history` the caller must actually send —
+/// the trim ALSO reduces what is SENT, never only what is reported. INERT under the
+/// shipped default (enabled preview, trim "none") => both slices come back untouched
+/// and the prompt is byte-for-byte today's.
+///
+/// THIS LIVED INLINE IN `complete_with_tools`, AND THAT WAS THE BUG. CUSTOMS was
+/// invoked in exactly one function, so the CHAT path — `complete_persona`, which is
+/// where the shipped `[router].conversation_route = "cloud_heavy"` sends every
+/// greeting/opinion/chat turn, i.e. the most common turn class there is — was never
+/// inventoried and never trimmed. An operator who set `[boundary].default_trim =
+/// "no_memory"` specifically to keep remembered facts and conversation history off
+/// the Anthropic wire still shipped all of it on every chat turn, and no
+/// `boundary.manifest` frame was emitted for those turns either, so a turn that DID
+/// egress facts + history read, in the operator's readout, as a turn with no egress.
+/// Both cloud entry points call this now; keep it that way.
+fn customs_pre_flight<'a>(
+    agent_persona: Option<&str>,
+    facts: &'a [(String, String)],
+    history: &'a [(String, String)],
+    world_context: &str,
+    personalization: &str,
+    utterance: &str,
+) -> EgressContext<'a> {
+    let (customs_on, trim) = boundary::gate_and_trim();
+    if customs_on {
+        // Inventory the FULL egress, then apply the trim to get the honest, subset
+        // manifest of what actually leaves. Both the manifest and the data reduction
+        // below derive from the SAME `trim`, so the frame can never disagree with
+        // what egressed.
+        let full = boundary::build_egress_manifest(
+            persona(),
+            agent_persona,
+            facts,
+            history,
+            world_context,
+            personalization,
+            utterance,
+        );
+        let manifest = boundary::apply_trim(&full, trim);
+        debug_assert!(
+            manifest.is_subset_of(&full),
+            "CUSTOMS trim must never broaden the egress manifest"
+        );
+        telemetry::emit("cloud", "boundary.manifest", manifest.telemetry());
+    }
+    customs_reduce(customs_on, trim, facts, history)
+}
+
+/// REDUCE-ONLY: withhold a trimmed category's data from the actual request. With the
+/// shipped "none" trim (or CUSTOMS off) both drop-checks are false, so `facts` /
+/// `history` come back untouched and the prompt is byte-for-byte today's. Reduce-only
+/// by construction — it can only ever return an EMPTY slice in place of the caller's,
+/// never a different or larger one. Pure, so the reduction is unit-testable without
+/// the boundary gate globals.
+fn customs_reduce<'a>(
+    customs_on: bool,
+    trim: boundary::TrimSpec,
+    facts: &'a [(String, String)],
+    history: &'a [(String, String)],
+) -> EgressContext<'a> {
+    let facts: &[(String, String)] =
+        if customs_on && trim.drops(boundary::ContextCategory::Facts) { &[] } else { facts };
+    let history: &[(String, String)] =
+        if customs_on && trim.drops(boundary::ContextCategory::History) { &[] } else { history };
+    (facts, history)
 }
 
 /// The anti-repeat instruction for a non-empty avoid list, or None when there
@@ -5707,6 +5799,30 @@ mod crosscheck {
         pub level: ConfidenceLevel,
     }
 
+    /// Does the #21 cross-check RUN at all this turn? It needs BOTH the gate AND a
+    /// tool that actually executed — because this check is a check of a TOOL RESULT,
+    /// and with no tool there is no result to check.
+    ///
+    /// THIS GUARD IS LOAD-BEARING, AND ITS ABSENCE WAS A REAL BUG. The production
+    /// caller passes `actions.join("\n")` as the `result`, and `actions` is only
+    /// appended to when a tool genuinely fired — so on a no-tool turn (a greeting, an
+    /// opinion, "what's the capital of France?": the MAJORITY of turns) the result was
+    /// the EMPTY STRING. `result_is_empty("")` is unconditionally true and
+    /// `asserts_concrete_fact` is true for any hedge-free answer of >= 12 non-blank
+    /// chars, so `EmptyButClaimed` tripped on essentially every ordinary answer. Two
+    /// dishonest consequences shipped: the HUD's red UNVERIFIED pill was permanently
+    /// lit (and therefore meaningless), and the answer had a caveat appended saying
+    /// "the tool returned nothing, but the answer states a concrete fact" — a
+    /// statement about a tool that was never called, in exactly the direction this
+    /// subsystem exists to prevent.
+    ///
+    /// Note the fix belongs HERE, at the caller, not in `deterministic_checks`: an
+    /// empty result from a tool that DID run is a genuine `EmptyButClaimed`, and that
+    /// remains flagged. What was wrong was feeding a non-result in as a result.
+    pub fn cross_check_runs(cross_check_on: bool, used_tool: bool) -> bool {
+        cross_check_on && used_tool
+    }
+
     /// Run the GATED, BOUNDED cross-check over one tool RESULT before it is surfaced
     /// as fact or built into a consequential action.
     ///
@@ -5825,8 +5941,8 @@ mod crosscheck {
     const CROSS_CHECK_NOTE: &str =
         "A bounded plausibility cross-check of a tool result before it is surfaced as \
          fact. It only DOWNGRADES confidence and FLAGS a questionable result — it NEVER \
-         removes a confirmation gate and is NOT a correctness guarantee. Ships OFF by \
-         default.";
+         removes a confirmation gate and is NOT a correctness guarantee. Ships ON \
+         (engaging only when a tool result is being surfaced).";
 
     /// The LEAN per-turn HUD badge payload (the analogue of `verify_telemetry`): just
     /// the gate flag + the recorded outcome token + badge + honest copy. Used on the
@@ -6244,12 +6360,21 @@ fn tool_carries_citation(name: &str) -> bool {
 /// tool result, or `None` when the result is an honest MISS / not a real source
 /// (so nothing is appended — never a fabricated citation). The locator is derived
 /// from the tool NAME + its real OUTCOME text the tool already produced:
-///   * doc_search / unified_search → "<tool> results" (the outcome itself names
-///     the real cited file paths/offsets; we keep the bounded snippet),
+///   * doc_search → "indexed files" / code_explain → "indexed code" /
+///     unified_search → "personal search" (the outcome itself names the real cited
+///     file paths/offsets; we keep the bounded snippet),
 ///   * mnemosyne_recall / recall_facts → "stored memory" (real fact keys/values),
 ///   * episodic_recall → "past episodes" (real episode ids/summaries),
-///   * web_search / open_url → the real URL from the input when present,
+///   * pasteboard_recall → "clipboard history", aperture_recall → "activity
+///     timeline", screen_recall → "recent screen context",
 ///   * karen_triage → "comms triage" (the read-only provider lists).
+///
+/// There is deliberately NO web_search / open_url arm, and `_input` is unused
+/// BECAUSE of that — nothing is ever extracted from the input. This doc used to
+/// promise "web_search / open_url → the real URL from the input when present", which
+/// is precisely the fabricated-citation behavior a prior fix removed (a locator
+/// naming a page nobody read); the removal rationale is 15 lines below. Do not
+/// restore it on the strength of a doc bullet.
 ///     An outcome that is an honest empty/miss (the tool's own "nothing found" /
 ///     "nothing recorded" / "not connected" copy) yields `None` — there is no real
 ///     source to cite, so the accumulator stays untouched. Pure + unit-testable.
@@ -6385,8 +6510,18 @@ pub fn parse_confidence(text: &str) -> Option<(Confidence, String)> {
         .map(|(i, _)| i + 1)
         .chain(std::iter::once(0))
         .find(|&start| text[start..].trim_start().to_lowercase().starts_with("confidence:"))?;
-    // Everything after the "confidence:" prefix on that line.
-    let line = text[idx..].trim();
+    // WHERE THAT LINE ENDS. This bound is the whole fix for a real bug: the reason
+    // and the stripped body were BOTH taken as "everything from `idx` onward", so
+    // parse_confidence silently DELETED every honesty caveat the pipeline appends
+    // AFTER the model's trailing confidence line — the #7 verify flag caveat, the #21
+    // cross-check caveat, and the debate fallback note. In the shipped configuration
+    // (confidence + verify + cross_check all ON) the user heard the unqualified claim
+    // while the HUD showed FLAGGED/UNVERIFIED, and the caveat text was swallowed into
+    // the one-line `reason` field, where it renders as the model's justification for
+    // its OWN confidence — the exact opposite of what it says.
+    let line_end = text[idx..].find('\n').map(|n| idx + n + 1).unwrap_or(text.len());
+    // Everything after the "confidence:" prefix ON THAT LINE (never past it).
+    let line = text[idx..line_end].trim();
     let after = line
         .get(line.to_lowercase().find("confidence:")? + "confidence:".len()..)?
         .trim_start();
@@ -6406,8 +6541,16 @@ pub fn parse_confidence(text: &str) -> Option<(Confidence, String)> {
         .trim_start_matches(|c: char| c.is_whitespace() || c == '-' || c == '—' || c == ':')
         .trim()
         .to_string();
-    // Strip the whole confidence line (and a trailing blank line) from the body.
-    let body = text[..idx].trim_end().to_string();
+    // Strip ONLY the confidence LINE (and the blank line around it) from the body —
+    // everything AFTER it must survive. Rejoined with a blank line so the paragraph
+    // spacing matches how the pipeline composed it ("\n\n" before each caveat).
+    let head = text[..idx].trim_end();
+    let tail = text[line_end..].trim();
+    let body = match (head.is_empty(), tail.is_empty()) {
+        (_, true) => head.to_string(),
+        (true, false) => tail.to_string(),
+        (false, false) => format!("{head}\n\n{tail}"),
+    };
     Some((Confidence { level, reason }, body))
 }
 
@@ -7377,13 +7520,68 @@ fn downgrade_always_if_unattended(
     decision
 }
 
+/// Path discriminators for `execute_tool_bound`'s `cloud_bound` parameter. Named
+/// rather than bare booleans so each call site says which path it is on, and so
+/// `local_tool_loop_is_not_cloud_bound` can pin the offline loop's choice at the
+/// source level (a bare `false` in an eight-argument list is unpinnable).
+const CLOUD_BOUND: bool = true;
+const DEVICE_LOCAL: bool = false;
+
+/// Does the active CUSTOMS trim withhold this recall tool ON THIS PATH? All four
+/// terms are load-bearing: the gate, the trim's own withheld list, the tool name, and
+/// — the one that was missing — whether the call's result is CLOUD-BOUND at all. A
+/// recall on the on-device loop egresses nothing, so refusing it withholds data from
+/// the user, not from Anthropic. Pure, so the scoping is unit-testable without the
+/// boundary gate globals.
+fn customs_withholds_recall(
+    customs_on: bool,
+    trim: boundary::TrimSpec,
+    name: &str,
+    cloud_bound: bool,
+) -> bool {
+    cloud_bound && customs_on && trim.withheld_recall_tools().contains(&name)
+}
+
 // `pub` (crate-wide) because the router's UNDO arm (journal.rs / router.rs)
 // hands a derived inverse to THIS same entry point, so the inverse receives the
 // identical treatment a live utterance's tool call gets: voice-id refusal,
 // faithful dry-run preview, the policy layer, the master ceiling, and the
 // spoken-confirm park. Undo deliberately has no other execution path.
-#[allow(clippy::too_many_arguments)] // the chokepoint's full working set + the effect it reports back
+#[allow(clippy::too_many_arguments)] // the chokepoint's public working set
 pub async fn execute_tool(
+    name: &str,
+    input: &Value,
+    memory: &Memory,
+    allowed: &[String],
+    namespace: &str,
+    user_originated: bool,
+    context_trusted: bool,
+    effect: &mut ToolEffect,
+) -> (String, bool) {
+    // CLOUD-BOUND by default. Every caller outside this module (the router's UNDO
+    // arm, the standing/mission dispatch, the Lumen actuation) is on a path whose
+    // results can end up in a cloud request, so they keep today's behavior exactly:
+    // the CUSTOMS recall refusal applies. Only `local_tool_loop` — the on-device 4B,
+    // which sends nothing off the box — opts out, via `execute_tool_bound`.
+    execute_tool_bound(
+        name,
+        input,
+        memory,
+        allowed,
+        namespace,
+        user_originated,
+        context_trusted,
+        CLOUD_BOUND,
+        effect,
+    )
+    .await
+}
+
+/// `execute_tool` with the CLOUD-BOUND discriminator made explicit. See the
+/// `cloud_bound` parameter — it exists solely so the CUSTOMS egress refusal does not
+/// fire on a path that cannot egress.
+#[allow(clippy::too_many_arguments)] // the chokepoint's full working set + the effect it reports back
+async fn execute_tool_bound(
     name: &str,
     input: &Value,
     memory: &Memory,
@@ -7403,6 +7601,12 @@ pub async fn execute_tool(
     // unattended `Always`->park downgrade so a standing mission can never auto-fire
     // a consequential action with nobody present. See `downgrade_always_if_unattended`.
     context_trusted: bool,
+    // Whether this call's RESULT can end up in a CLOUD request (`true`: the cloud
+    // tool loop and every out-of-module caller) or is confined to the device
+    // (`false`: `local_tool_loop`, the on-device 4B). It scopes the CUSTOMS egress
+    // refusal below and NOTHING else — every other gate here is path-independent and
+    // must stay that way.
+    cloud_bound: bool,
     // WHAT THIS CALL ACTUALLY DID, reported rather than re-derived.
     //
     // `is_parked_consequential` used to guess this from the master switch and the
@@ -7457,9 +7661,22 @@ pub async fn execute_tool(
     // found: without it, a `no_memory` turn empties the seeded facts yet the model
     // calls `recall_facts` and re-egresses them. HONEST: the model is told the recall
     // was WITHHELD BY POLICY, never handed empty data as if the store were empty.
+    //
+    // SCOPED TO THE CLOUD-BOUND PATH, AND THAT SCOPING IS THE POINT. This refusal had
+    // no path discriminator, so it fired on the OFFLINE loop identically — and vault
+    // mode ("go dark") forces the MAXIMAL trim, which withholds recall_facts,
+    // mnemosyne_recall AND episodic_recall. Vault ALSO cuts the cloud off entirely
+    // (router.rs's `vault::deny_cloud`), so engaging the one feature whose whole point
+    // is "keep this on my machine" silently disabled the 4B's memory recall and told
+    // the user it was "excluded from what may leave the device this turn" at the exact
+    // moment nothing could leave. In `local_tool_loop` the refusal is is_error, which
+    // sets `gated` and BREAKS the loop, so that false reason became the spoken answer.
+    // boundary.rs's own contract says CUSTOMS "gates ONLY the CLOUD egress path...
+    // CUSTOMS never claims to 'block' [the local path] — there is nothing to block";
+    // this makes that true.
     {
         let (customs_on, trim) = boundary::gate_and_trim();
-        if customs_on && trim.withheld_recall_tools().contains(&name) {
+        if customs_withholds_recall(customs_on, trim, name, cloud_bound) {
             warn!(tool = name, trim = trim.as_str(), "CUSTOMS: refusing a recall that a trim withholds");
             crate::telemetry::emit(
                 "system",
@@ -7986,10 +8203,23 @@ fn force_confirm(input: &mut Value, value: bool) {
 /// the static registry, so the park decision is unit-testable without a network
 /// call. This is the skill-aware analogue of `confirm::is_consequential_tool`.
 fn skill_invoke_is_consequential(input: &Value) -> bool {
+    skill_invoke_is_consequential_in(crate::skills::global(), input)
+}
+
+/// `skill_invoke_is_consequential` over an EXPLICIT registry — the testable core,
+/// mirroring `skill_invoke_dispatch_in` / `skill_list_catalog_in`.
+///
+/// It exists because the POSITIVE case is otherwise unobservable: every skill in
+/// `global()` ships pure this round (`shipped_skills_are_all_pure_this_round` proves
+/// it), so the process-global-only version provably returns `false` for EVERY input
+/// in this build, and a mutant body of `false` passed the test that names this
+/// behavior — while silently disabling the park-widening for the first consequential
+/// skill anyone adds.
+fn skill_invoke_is_consequential_in(reg: &crate::skills::Registry, input: &Value) -> bool {
     input
         .get("name")
         .and_then(Value::as_str)
-        .and_then(|n| crate::skills::global().get(n))
+        .and_then(|n| reg.get(n))
         .is_some_and(|s| s.consequential)
 }
 
@@ -8656,9 +8886,14 @@ async fn dispatch_tool(
         // generated code live — forge::forge_app only writes a reviewable
         // proposal + stamps meta.forge_pending; the human runs
         // scripts/apply_forge.sh to install. Gated on [forge].enabled (read from
-        // the FORGE_GATE process-global, shipped OFF): when OFF it returns the
-        // friendly "Self-Forge is off" line WITHOUT any cloud call (exactly like
-        // self-heal off). It maps the typed ForgeOutcome to a spoken-friendly
+        // the FORGE_GATE process-global). [forge] SHIPS ON (armed by default) and is
+        // INERT WITHOUT A CLOUD KEY; FORGE_GATE falls back to OFF only when
+        // `init_forge` was never called (tests / a startup-bypassing path). When the
+        // effective gate is OFF it returns the friendly "Self-Forge is off" line
+        // WITHOUT any cloud call (exactly like self-heal off); when ON — the stock
+        // install — this arm runs the full draft -> stage -> validate -> propose
+        // pipeline, a heavy-model cloud call plus a proposal written under
+        // state/forge/. It maps the typed ForgeOutcome to a spoken-friendly
         // summary AND emits the HUD-facing forge.* telemetry (proposed/rejected/
         // blocked) so the Forge review panel can surface it.
         "forge_app" => match serde_json::from_value::<ForgeAppArgs>(input.clone()) {
@@ -9547,7 +9782,10 @@ pub(crate) async fn run_fury_mission(goal: &str, memory: &Memory, trusted: bool)
 /// and this NEVER deploys, NEVER installs into apps/, and NEVER runs the
 /// generated code live.
 ///
-/// Gate (read from the FORGE_GATE process-global, shipped OFF): when [forge] is
+/// Gate (read from the FORGE_GATE process-global). [forge] SHIPS ON (armed by
+/// default, INERT WITHOUT A CLOUD KEY); FORGE_GATE falls back to OFF only when
+/// `init_forge` was never called (tests / a startup-bypassing path) — so on a stock
+/// install this runs the pipeline, it does not sit inert. When [forge] is
 /// disabled, return the friendly "Self-Forge is off" line WITHOUT any cloud call
 /// (exactly like self-heal off) AND emit forge.blocked{reason:"disabled"} so the
 /// HUD can note the off-state, then STOP. When ON, load the live Config + Memory
@@ -9555,6 +9793,25 @@ pub(crate) async fn run_fury_mission(goal: &str, memory: &Memory, trusted: bool)
 /// CLI path uses — one source of truth) and map the typed outcome to a summary,
 /// emitting the HUD-facing forge.* telemetry (proposed/rejected/blocked).
 async fn run_forge_app(goal: &str, memory: &Memory) -> Result<String> {
+    let (enabled, mode) = forge_gate();
+    run_forge_app_with_gate(enabled, mode, goal, memory).await
+}
+
+/// `run_forge_app` with the [forge] gate INJECTED instead of read from the
+/// `FORGE_GATE` process-global. The lockdown AND lives HERE, over the injected
+/// config gate, which is the only way the "LOCKDOWN forces forge OFF even with
+/// [forge] ENABLED" invariant can be exercised at runtime: FORGE_GATE is a `OnceLock`
+/// that only `init_forge` (production) ever sets, so in the test binary
+/// `forge_gate()` is unconditionally `(false, "propose")` and a lockdown test driving
+/// `run_forge_app` could not tell "lockdown forced it off" from "the gate was off
+/// anyway". It could not, and for a while did not — see
+/// `forge_app_is_forced_off_when_locked_even_if_enabled`.
+async fn run_forge_app_with_gate(
+    enabled: bool,
+    _mode: &'static str,
+    goal: &str,
+    memory: &Memory,
+) -> Result<String> {
     // LOCKDOWN (task #12) is an OVERLAY that forces this autonomy surface OFF. The
     // autonomous watchdog path already ANDs `!is_locked_down()` into the forge gate
     // (forge.rs); this parallel MODEL-REACHABLE entry (forge_app is allowlisted to
@@ -9564,7 +9821,6 @@ async fn run_forge_app(goal: &str, memory: &Memory) -> Result<String> {
     // stop. We fold the lockdown read into the gate exactly like the watchdog: when
     // locked, `enabled` is false and this routes to the existing friendly off-branch
     // — no cloud call, no draft, no stage, no proposal written.
-    let (enabled, _mode) = forge_gate();
     let enabled = enabled && !crate::lockdown::is_locked_down();
     if !enabled {
         // OFF (config-off OR locked down): no draft, no stage, no cloud — the
@@ -11415,8 +11671,16 @@ fn changeq_apply_tool(kind: &str, ts: u64) -> String {
 // -- SANDBOXED SHELL / TERMINAL (crate::shell, #43) ------------------------------
 
 /// Load the live [shell] config from the on-disk darwin.toml (one source of
-/// truth, like load_code_config). When no root is resolved, returns the OFF
-/// default — so the tool reports off honestly rather than ever running.
+/// truth, like load_code_config). When no root is resolved, returns the SHIPPED
+/// default — and `ShellConfig::default().enabled` is TRUE, so this is NOT a
+/// fail-closed fallback: `shell_permitted(true)` holds and `shell_run_tool` proceeds
+/// to the denylist, the gate, and (with the master switch + confirm) a real
+/// sandboxed exec. This comment used to claim the opposite ("returns the OFF default
+/// — so the tool reports off honestly rather than ever running") about the
+/// highest-risk capability in the daemon, which is exactly the kind of thing a
+/// maintainer reads as the safety story for the no-root path. The real containment
+/// on this path is downstream and unchanged: master switch + spoken confirm +
+/// voice-id + !lockdown + the deny-default sandbox profile.
 fn load_shell_config() -> crate::config::ShellConfig {
     let Some(root) = ROOT.get() else {
         return crate::config::ShellConfig::default();
@@ -11523,8 +11787,12 @@ async fn verify_proposal_in_realm(
 // -- GATED UI AUTOMATION / ACTUATION (crate::ui_automation, #44) -----------------
 
 /// Load the live [ui_automation] config from the on-disk darwin.toml (one source
-/// of truth, like load_shell_config). When no root is resolved, returns the OFF
-/// default — so the tool reports off honestly rather than ever actuating.
+/// of truth, like load_shell_config). When no root is resolved, returns the SHIPPED
+/// default — and `UiAutomationConfig::default().enabled` is TRUE, so (exactly as in
+/// `load_shell_config`, and for the same stale-comment reason) this is NOT a
+/// fail-closed fallback: `ui_automation_permitted(true)` holds and `ui_actuate`
+/// proceeds to the planner and the gate. The containment is downstream: master switch
+/// + spoken confirm PER ACTION + voice-id + !lockdown, and INERT WITHOUT TCC consent.
 fn load_ui_automation_config() -> crate::config::UiAutomationConfig {
     let Some(root) = ROOT.get() else {
         return crate::config::UiAutomationConfig::default();
@@ -11680,9 +11948,29 @@ fn daemon_state_dir() -> std::path::PathBuf {
 }
 
 /// The throwaway scratch dir a sandboxed command may write to (the ONLY writable
-/// location under the deny-default profile). Rooted under state/shell/scratch/<ts>
-/// — distinct from the denied state/darwin db + secrets, so the write-allow never
-/// overlaps a secret deny.
+/// location under the deny-default profile). Rooted under state/shell/scratch/<ts>.
+///
+/// THIS IS A STRICT DESCENDANT OF `daemon_state_dir()`, WHICH THE PROFILE DENIES.
+/// The previous comment here claimed the opposite — "distinct from the denied
+/// state/darwin db + secrets, so the write-allow never overlaps a secret deny" — and
+/// it overlaps completely. What saves it is ORDERING, not separation:
+/// `generate_shell_sbpl` emits, in this order,
+/// `(deny file-read* file-write* (subpath "<root>/state"))`, then
+/// `(allow file-write* (subpath "<scratch>"))`, then
+/// `(allow file-read*  (subpath "<scratch>"))`. SBPL is last-match-wins, so BOTH the
+/// write AND the read are re-opened for exactly this subtree, while the rest of
+/// state/ (the db + the secret stores) stays denied for both. The read re-allow is
+/// the load-bearing half — without it a command could write the ONLY writable
+/// directory it has and then not read it back, and a Scratch Realm verify build
+/// could not read a single source file — and it is pinned by shell.rs's
+/// `sbpl_write_confinement_excludes_the_daemon_state`, which asserts the re-allow
+/// comes AFTER the state deny. MEASURED against the real kernel with the generated
+/// profile and the shipped layout: inside the scratch dir `echo hi > f`, `cat f` and
+/// `ls .` all return rc 0, while a read of `<root>/state` from inside it is still
+/// "Operation not permitted". Any FURTHER re-opening belongs in the profile
+/// generator (crate::shell), NOT here — and do NOT "fix" anything on this path by
+/// widening what is passed as `daemon_state`, which would unseal the db and the
+/// secret stores.
 fn shell_scratch_dir(ts: u64) -> std::path::PathBuf {
     daemon_state_dir().join("shell").join("scratch").join(ts.to_string())
 }
@@ -13993,8 +14281,9 @@ mod tests {
         record_source,
         render_mcp_outcome,
         replay_confirmed_action,
-        run_forge_app,
+        run_forge_app_with_gate,
         resolve_key_order, skill_invoke_dispatch_in, skill_invoke_is_consequential,
+        skill_invoke_is_consequential_in,
         skill_list_catalog_in, spoken_cap,
         standing_cancel_tool, standing_create_tool, standing_list_tool,
         system_blocks_with_preamble,
@@ -14005,6 +14294,236 @@ mod tests {
         KEYCHAIN_TIMEOUT, SECURITY_BIN, SPOKEN_MAX_TOKENS, TOOL_LOOP_BUDGET, TOOL_LOOP_MAX_CALLS,
     };
     use super::tool_signature;
+
+    /// REGRESSION (#21 cross-check flagged EVERY no-tool answer). The check is a
+    /// check of a TOOL RESULT; with no tool there is no result, so it must not run.
+    ///
+    /// The production caller passes `actions.join("\n")` as the result, and `actions`
+    /// is only appended to when a tool genuinely fired — so on the majority of turns
+    /// (a greeting, an opinion, an answer from the persona/facts preamble) it was the
+    /// EMPTY STRING, which the deterministic layer reads as "the tool returned
+    /// nothing". The second half of this test is what makes the first half
+    /// load-bearing: it shows the deterministic layer really does flag those inputs,
+    /// so the guard is the only thing standing between an ordinary answer and a
+    /// permanently-lit UNVERIFIED badge plus a caveat about a tool nobody called.
+    #[test]
+    fn a_no_tool_turn_is_never_cross_checked() {
+        // Both terms are required.
+        assert!(
+            !crosscheck::cross_check_runs(true, false),
+            "gate ON but NO tool ran => the cross-check must not run at all"
+        );
+        assert!(crosscheck::cross_check_runs(true, true), "gate ON + a tool ran => it runs");
+        assert!(!crosscheck::cross_check_runs(false, true), "gate OFF => inert, as always");
+
+        // WHY the `used_tool` term is load-bearing: with the EXACT production shape of
+        // a no-tool turn (result == actions.join("\n") == ""), the deterministic layer
+        // flags a perfectly ordinary answer.
+        for answer in [
+            "The capital of France is Paris.",
+            "Certainly, sir. Photosynthesis converts light into chemical energy.",
+            "Good evening, sir. Everything is running normally on your machine.",
+        ] {
+            let flags = deterministic_checks(answer, "", &[], None);
+            assert!(
+                flags.contains(&CheckFlag::EmptyButClaimed),
+                "an empty result + a concrete answer trips EmptyButClaimed ({answer:?}) — \
+                 which is CORRECT for a tool that ran and returned nothing, and wrong \
+                 only because a no-tool turn used to be fed in with the same shape"
+            );
+        }
+        // And the check stays honest for a tool that DID run and returned nothing —
+        // the fix must not have disarmed that.
+        assert!(
+            crosscheck::cross_check_runs(true, true),
+            "a real empty tool result is still cross-checked"
+        );
+    }
+
+    /// REGRESSION (`parse_confidence` deleted the honesty caveats). The pipeline
+    /// appends the #7 verify caveat and the #21 cross-check caveat AFTER the model's
+    /// trailing `Confidence:` line; `parse_confidence` then stripped from the START of
+    /// that line to the END of the text, so both caveats vanished from the spoken /
+    /// stored answer while the HUD still showed FLAGGED — the badge and the words
+    /// disagreed — and the caveat text leaked into the one-line `reason` field, where
+    /// it renders as the model's justification for its own confidence.
+    #[test]
+    fn confidence_parsing_keeps_caveats_appended_after_the_line() {
+        let verify_caveat =
+            "(A second self-check flagged this for review — the date is not supported by \
+             the sources — so please treat it as unverified.)";
+        let cross_caveat =
+            "(A cross-check flagged this tool result for review — the tool returned \
+             nothing — so please treat it as unverified rather than confirmed.)";
+        let text = format!(
+            "The launch is on the 14th of March.\n\n\
+             Confidence: grounded — the calendar entry says so.\n\n\
+             {verify_caveat}\n\n{cross_caveat}"
+        );
+
+        let (conf, body) = parse_confidence(&text).expect("the confidence line parses");
+        assert_eq!(conf.level, ConfidenceLevel::Grounded);
+        // The reason is ONE LINE — bounded to the confidence line, never the rest.
+        assert_eq!(conf.reason, "the calendar entry says so.");
+        assert!(
+            !conf.reason.contains("cross-check"),
+            "the caveats must not be swallowed into the confidence reason: {:?}",
+            conf.reason
+        );
+        // The body keeps the answer AND both caveats, and drops only the marker line.
+        assert!(body.starts_with("The launch is on the 14th of March."), "body: {body}");
+        assert!(body.contains(verify_caveat), "the verify caveat must survive: {body}");
+        assert!(body.contains(cross_caveat), "the cross-check caveat must survive: {body}");
+        assert!(
+            !body.to_lowercase().contains("confidence:"),
+            "the confidence marker line itself is still stripped: {body}"
+        );
+
+        // The ordinary shape — nothing after the line — is unchanged.
+        let (c2, b2) = parse_confidence("It is 12 degrees.\n\nConfidence: inferred — from the last reading.")
+            .expect("parses");
+        assert_eq!(c2.level, ConfidenceLevel::Inferred);
+        assert_eq!(c2.reason, "from the last reading.");
+        assert_eq!(b2, "It is 12 degrees.");
+    }
+
+    /// REGRESSION (CUSTOMS never ran on the cloud CHAT path). `complete_persona` is
+    /// where the shipped `[router].conversation_route = "cloud_heavy"` sends every
+    /// greeting/chat/opinion turn — the most common turn class — and it carried the
+    /// RAG facts, the conversation history, the shared world rows and the observed
+    /// user profile straight into `persona_body` with no manifest and no trim. An
+    /// operator who set `default_trim = "no_memory"` to keep exactly that off the
+    /// wire still shipped all of it.
+    ///
+    /// `complete_persona` itself needs a key + the network, so the wiring is pinned at
+    /// the source level (code lines only — a comment naming the helper must not
+    /// satisfy it) and the REDUCTION is pinned behaviorally on the pure core.
+    #[test]
+    fn the_chat_path_runs_the_same_customs_pre_flight_as_the_tool_loop() {
+        use crate::boundary::TrimSpec;
+
+        // The pure reduce-only core: each trim withholds exactly its categories.
+        let facts = vec![("user.car".to_string(), "a blue Subaru".to_string())];
+        let history = vec![("user".to_string(), "what did I say earlier".to_string())];
+        let (f, h) = super::customs_reduce(true, TrimSpec::None, &facts, &history);
+        assert_eq!(f.len(), 1, "trim none withholds nothing");
+        assert_eq!(h.len(), 1, "trim none withholds nothing");
+        let (f, h) = super::customs_reduce(true, TrimSpec::NoFacts, &facts, &history);
+        assert!(f.is_empty(), "no_facts withholds the facts");
+        assert_eq!(h.len(), 1, "...and only the facts");
+        let (f, h) = super::customs_reduce(true, TrimSpec::NoMemory, &facts, &history);
+        assert!(f.is_empty() && h.is_empty(), "no_memory withholds facts AND history");
+        // CUSTOMS off is the identity, whatever the trim says.
+        let (f, h) = super::customs_reduce(false, TrimSpec::NoMemory, &facts, &history);
+        assert_eq!((f.len(), h.len()), (1, 1), "gate off => byte-for-byte today's prompt");
+
+        // SOURCE WIRING: both cloud entry points must call the pre-flight, on a CODE
+        // line. `find` locates each function's own body; we bound the window at the
+        // next item so a later function's call cannot satisfy an earlier one.
+        let src = include_str!("anthropic.rs");
+        let body_of = |start_marker: &str, end_marker: &str| -> String {
+            let start = src.find(start_marker).unwrap_or_else(|| panic!("{start_marker} must exist"));
+            let rest = &src[start..];
+            let end = rest.find(end_marker).unwrap_or_else(|| panic!("end of {start_marker}"));
+            rest[..end].to_string()
+        };
+        for (label, body) in [
+            (
+                "complete_with_tools",
+                body_of("pub async fn complete_with_tools(", "\nfn budget_exhausted_reply("),
+            ),
+            ("complete_persona", body_of("pub async fn complete_persona(", "\nfn persona_body(")),
+        ] {
+            let calls = body.lines().any(|l| {
+                let l = l.trim_start();
+                !l.starts_with("//") && !l.starts_with("///") && l.contains("customs_pre_flight(")
+            });
+            assert!(
+                calls,
+                "{label} must run the CUSTOMS egress pre-flight on a code line (a comment \
+                 mentioning it does not count)"
+            );
+        }
+    }
+
+    /// REGRESSION (CUSTOMS refused on-device recall). The recall refusal had no path
+    /// discriminator, so it fired on `local_tool_loop` too — and vault mode ("go
+    /// dark") forces the MAXIMAL trim, which withholds all three recall tools while
+    /// simultaneously cutting the cloud off. Engaging the keep-it-on-my-machine
+    /// feature therefore disabled on-device memory recall and told the user it was
+    /// "excluded from what may leave the device this turn" when nothing could leave.
+    #[test]
+    fn customs_recall_refusal_is_scoped_to_the_cloud_bound_path() {
+        use crate::boundary::TrimSpec;
+
+        // CLOUD-BOUND: the refusal stands, exactly as before, for every withheld tool.
+        for tool in ["recall_facts", "mnemosyne_recall", "episodic_recall"] {
+            assert!(
+                super::customs_withholds_recall(true, TrimSpec::NoMemory, tool, super::CLOUD_BOUND),
+                "{tool} must still be withheld on the cloud path under no_memory"
+            );
+        }
+        assert!(
+            super::customs_withholds_recall(true, TrimSpec::NoFacts, "recall_facts", super::CLOUD_BOUND),
+            "no_facts still withholds the fact recall on the cloud path"
+        );
+        // DEVICE-LOCAL: nothing is withheld, because nothing can egress.
+        for tool in ["recall_facts", "mnemosyne_recall", "episodic_recall"] {
+            assert!(
+                !super::customs_withholds_recall(true, TrimSpec::NoMemory, tool, super::DEVICE_LOCAL),
+                "{tool} must NOT be refused on the on-device loop — there is no egress \
+                 to refuse, and vault mode forces exactly this trim"
+            );
+        }
+        // The other terms still bind on the cloud path.
+        assert!(
+            !super::customs_withholds_recall(false, TrimSpec::NoMemory, "recall_facts", super::CLOUD_BOUND),
+            "CUSTOMS off refuses nothing"
+        );
+        assert!(
+            !super::customs_withholds_recall(true, TrimSpec::None, "recall_facts", super::CLOUD_BOUND),
+            "the neutral trim withholds no tool"
+        );
+        assert!(
+            !super::customs_withholds_recall(true, TrimSpec::NoMemory, "doc_search", super::CLOUD_BOUND),
+            "only the recall tools the trim names are withheld"
+        );
+    }
+
+    /// SOURCE WIRING for the test above: the offline loop must reach the chokepoint
+    /// through `execute_tool_bound` with the DEVICE_LOCAL discriminator. The named
+    /// constants exist so this is pinnable at all — a bare `false` in an eight-argument
+    /// call is not.
+    #[test]
+    fn local_tool_loop_is_not_cloud_bound() {
+        let src = include_str!("anthropic.rs");
+        let start = src.find("async fn local_tool_loop(").expect("local_tool_loop must exist");
+        let rest = &src[start..];
+        // BOUND THE WINDOW. `unwrap_or(rest.len())` would silently widen the slice to
+        // the rest of the file on a renamed marker, and the negative assertion below
+        // would then match some other function's CLOUD_BOUND. Fail loudly instead.
+        let end = rest
+            .find("\npub async fn complete_plain(")
+            .expect("the item after local_tool_loop must exist so the slice stays bounded");
+        let body = &rest[..end];
+        let code: Vec<&str> = body
+            .lines()
+            .map(|l| l.trim_start())
+            .filter(|l| !l.starts_with("//"))
+            .collect();
+        assert!(
+            code.iter().any(|l| l.contains("execute_tool_bound(")),
+            "the offline loop must go through execute_tool_bound"
+        );
+        assert!(
+            code.iter().any(|l| l.contains("DEVICE_LOCAL")),
+            "the offline loop must pass DEVICE_LOCAL — its tool results never reach the cloud"
+        );
+        assert!(
+            !code.iter().any(|l| l.contains("CLOUD_BOUND")),
+            "the offline loop must never claim to be cloud-bound"
+        );
+    }
 
     // ATTRIBUTION CAPTURE (task: light up traces.tool_or_skill) — the pure
     // capability-label resolver + the per-turn last-wins accumulator.
@@ -14423,7 +14942,16 @@ mod tests {
         let brain = ScriptedBrain::new(script);
         let executed = std::sync::Mutex::new(Vec::new());
 
-        let out = run_loop(&brain, &memory, &tools, &allowed, &executed).await;
+        // Drive `tool_loop` directly (not the `run_loop` helper) so we can read the
+        // TRANSCRIPT back — the thing this test's headline claim is actually about.
+        let system = Value::Null;
+        let mut messages = build_messages(&[], "do the multi-step thing");
+        let out = tool_loop(
+            "claude-test", 256, &system, &mut messages, &brain, &memory, &executed, &tools,
+            &allowed, "agent.darwin", true,
+        )
+        .await
+        .expect("loop terminates and produces a spoken answer");
 
         // The gate never permitted Execute: with the switch OFF, gate(true) is a
         // DryRun for every confirm value, so the consequential tool CANNOT
@@ -14433,14 +14961,93 @@ mod tests {
         assert!(!crate::integrations::consequential_allowed(), "gate stayed OFF");
         assert_eq!(crate::integrations::gate(true), crate::integrations::ActionMode::DryRun);
         // The loop TERMINATED (no infinite loop on repeated consequential asks)
-        // and stayed inside the cap.
-        assert!(out.is_ok() || out.is_err(), "loop returned (terminated)");
+        // and stayed inside the cap. `out` above is the loop's real spoken answer —
+        // the old assertion here was `out.is_ok() || out.is_err()`, which is true of
+        // every possible value and so could never fail.
+        assert!(!out.trim().is_empty(), "the loop produced a spoken answer: {out:?}");
         assert!(brain.calls() <= TOOL_LOOP_MAX_CALLS, "bounded even with consequential asks");
+
+        // THE ACTUAL CLAIM, asserted at last: NOTHING FIRED. `executed` is the real
+        // actuator ledger — `tool_loop` only pushes into it when `effect` came back
+        // `Executed` — and it must hold no gcal actuation. Every other assertion in
+        // this test used to be about process-globals the loop does not touch
+        // (`consequential_allowed`, `gate`) or a pure predicate (`tool_needs_park`),
+        // so a regression in which `execute_tool` stopped consulting the gate inside
+        // the loop would have left it green.
+        let fired = executed.lock().unwrap().clone();
+        assert!(
+            !fired.iter().any(|e| e.starts_with("gcal_create_event")),
+            "no consequential calendar action may be recorded as executed: {fired:?}"
+        );
+        // ...and the transcript must not report one as done either: the tool_result
+        // that re-entered the model is the gate's own preview/refusal, never a
+        // completion string the model could relay to the user as "created".
+        let transcript = serde_json::to_string(&messages).expect("serialize transcript");
+        for claimed in ["Created event", "Event created", "I created"] {
+            assert!(
+                !transcript.contains(claimed),
+                "the loop must never report a consequential action as completed \
+                 ({claimed:?}): {transcript}"
+            );
+        }
         // And these tools are park-needing, never reads — so the deeper loop
         // cannot smuggle a consequential action into the "completed"
         // acknowledgment as if it had fired.
         assert!(tool_needs_park("gcal_create_event", &json!({})));
         cleanup_temp_memory(&memory_path("conseq"));
+    }
+
+    /// The sibling of the test above, driven with a LOCAL consequential tool so the
+    /// no-fire assertion cannot be satisfied by a missing credential.
+    ///
+    /// `gcal_create_event` builds a Google client before the gate, so with no creds
+    /// in the sandbox it errors out early and the gate decision is never observed —
+    /// the same short-circuit that made `master_off_never_parks_still_previews`
+    /// unfalsifiable. `standing_create` is local: its dispatch really runs, so the
+    /// DRY-RUN PREVIEW in the transcript is genuine evidence that the master-switch
+    /// gate — not a credential failure — is what kept the action from firing.
+    #[tokio::test]
+    async fn deeper_loop_previews_a_local_consequential_action_instead_of_firing_it() {
+        assert!(
+            !crate::integrations::consequential_allowed(),
+            "consequential gate must ship OFF"
+        );
+        let (memory, tools, allowed) = loop_fixture("conseq-local");
+        let script = vec![
+            tool_use_resp(
+                "s1",
+                "standing_create",
+                json!({"goal": "review my deadlines", "schedule": "daily at 8", "confirm": true}),
+            ),
+            text_resp("That would set up a standing mission; say the word to confirm, sir."),
+        ];
+        let brain = ScriptedBrain::new(script);
+        let executed = std::sync::Mutex::new(Vec::new());
+        let system = Value::Null;
+        let mut messages = build_messages(&[], "set up a standing review");
+        let out = tool_loop(
+            "claude-test", 256, &system, &mut messages, &brain, &memory, &executed, &tools,
+            &allowed, "agent.darwin", true,
+        )
+        .await
+        .expect("loop terminates");
+        assert!(!out.trim().is_empty(), "the loop produced a spoken answer");
+
+        let transcript = serde_json::to_string(&messages).expect("serialize transcript");
+        // The dispatch RAN (this is the precondition that makes the rest meaningful):
+        // the tool_result is the gate's faithful dry-run preview.
+        assert!(
+            transcript.contains("[dry run]"),
+            "the local consequential dispatch must have produced its dry-run preview \
+             — without it this test proves nothing: {transcript}"
+        );
+        // Nothing fired, and nothing was recorded as fired.
+        let fired = executed.lock().unwrap().clone();
+        assert!(
+            !fired.iter().any(|e| e.starts_with("standing_create")),
+            "master OFF: no standing mission may be recorded as executed: {fired:?}"
+        );
+        cleanup_temp_memory(&memory_path("conseq-local"));
     }
 
     /// THE park predicate covers the whole consequential registry and nothing
@@ -16211,6 +16818,21 @@ mod tests {
         let steve = steve_tools();
         let veronica = veronica_tools();
 
+        // Snapshot the proposal store BEFORE any code_propose_diff call in this test
+        // — step (1a) below already makes one, so a snapshot taken after it would see
+        // an artifact that call had already written and compare it against itself.
+        // (That is exactly how the first version of this assertion survived a mutation
+        // that made the OFF branch write into the store.)
+        let proposals = super::code_root_dir().join("proposals");
+        let snapshot = |dir: &std::path::Path| -> Vec<String> {
+            let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+            let mut names: Vec<String> =
+                entries.flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+            names.sort();
+            names
+        };
+        let proposals_before = snapshot(&proposals);
+
         // (1a) steve OWNS both code tools — they pass the allowlist; OFF by default
         //      (no [code] enabled / no root in this sandbox) so each returns the
         //      honest "off" reply, NOT a refusal, and reaches NO model/network.
@@ -16242,10 +16864,32 @@ mod tests {
 
         // (2) OFF means NO proposal artifact was written by code_propose_diff (the
         //     gate short-circuits before the store). The proposal store lives under
-        //     <root>/state/code/proposals/; in this test ROOT is unset so it would
-        //     be ./state/code — assert nothing was created there for this run.
+        //     <root>/state/code/proposals/; in this test ROOT is unset so it resolves
+        //     against the cwd. This used to be a COMMENT AND NOTHING ELSE — there was
+        //     no assert! between it and the closing brace, so the doc's "writes NO
+        //     proposal while off" clause was unverified and a regression in which the
+        //     OFF gate stopped short-circuiting before the store would have shipped
+        //     green. Snapshot the directory around the call and compare.
         // (The crate::code core's hermetic tests cover the store-write + no-tree-
         //  mutation path with a mock brain; here we only prove the OFF short-circuit.)
+        let (off, _is_error) = exec_t(
+            "code_propose_diff",
+            &json!({"request": "rename the parser"}),
+            &mem,
+            &steve,
+        )
+        .await;
+        assert!(
+            off.to_lowercase().contains("code intelligence is off"),
+            "the OFF short-circuit is the precondition for the store assertion: {off}"
+        );
+        assert_eq!(
+            snapshot(&proposals),
+            proposals_before,
+            "code_propose_diff must write NO proposal artifact under {} while off",
+            proposals.display()
+        );
+
         cleanup_temp_memory(&mem_path("code-own"));
     }
 
@@ -16337,10 +16981,16 @@ mod tests {
         );
 
         // (4) VOICE-ID unverified REFUSES shell_run before it can even park, even
-        //     with the master switch ON. (We force [shell] off in this sandbox, so
-        //     the off-gate would short-circuit first; the voice-id refusal in
-        //     execute_tool fires BEFORE the off-config dispatch is reached, so this
-        //     proves the voice-id chokepoint covers shell_run.)
+        //     with the master switch ON. ([shell] is ON in this sandbox — the shipped
+        //     default; ROOT is unset so load_shell_config() returns Default, whose
+        //     `enabled` is true, exactly as step (1) above asserts. An earlier comment
+        //     here claimed we force it OFF; nothing in this function touches the
+        //     config, and forcing it off would MOVE the assertion off the chokepoint
+        //     it pins — with the feature off, shell_run_tool returns the inert "the
+        //     sandboxed shell is off" reply and the test could no longer tell the
+        //     voice-id refusal from the config gate. What makes step (4)
+        //     load-bearing is that the voice-id refusal in execute_tool fires BEFORE
+        //     the preview dispatch is ever built.)
         let (vout, verr) = {
             let _on = crate::integrations::ConsequentialOverride::force(true);
             let _gate = crate::voiceid::GateOverride::force(crate::voiceid::OwnerGate {
@@ -16469,9 +17119,13 @@ mod tests {
         }
 
         // (4) VOICE-ID unverified REFUSES ui_actuate before it can even park, even
-        //     with the master switch ON. (The off-config in this sandbox would short-
-        //     circuit later; the voice-id refusal in execute_tool fires BEFORE the
-        //     off-config dispatch, so this proves the voice-id chokepoint covers it.)
+        //     with the master switch ON. ([ui_automation] is ON in this sandbox — the
+        //     shipped default; ROOT is unset so load_ui_automation_config() returns
+        //     Default, whose `enabled` is true, exactly as step (1) above asserts. An
+        //     earlier comment here claimed an off-config; there is none, and adding
+        //     one would move this assertion off the chokepoint it pins. What makes
+        //     step (4) load-bearing is that the voice-id refusal in execute_tool
+        //     fires BEFORE the preview dispatch is ever built.)
         let (vout, verr) = {
             let _on = crate::integrations::ConsequentialOverride::force(true);
             let _gate = crate::voiceid::GateOverride::force(crate::voiceid::OwnerGate {
@@ -16744,13 +17398,33 @@ mod tests {
     /// test that never calls `integrations::init`): a consequential invocation
     /// does NOT park. It falls straight through to the dispatch, where
     /// gate(confirm) is always DryRun — so it previews only, parks nothing, and
-    /// fires nothing. We assert the slot stays empty after the call (no pending
-    /// was armed) regardless of the model's confirm flag. With no creds in the
-    /// sandbox the dispatch returns the friendly "not connected" is_error, which
-    /// is the correct preview-attempt outcome; the LOAD-BEARING assertion is that
-    /// nothing parked.
+    /// fires nothing. We assert BOTH the outcome (no confirmation prompt) and the
+    /// shared slot (no pending was armed) regardless of the model's confirm flag.
+    ///
+    /// IT MUST USE A *LOCAL* CONSEQUENTIAL TOOL. This test used to drive `gmail_send`,
+    /// which made it unfalsifiable: `execute_tool`'s park branch builds a DryRun
+    /// PREVIEW first, and with no Google creds in the sandbox that preview is_error,
+    /// so the function returns BEFORE `integrations::consequential_allowed()` is ever
+    /// read (its sibling `replay_of_an_allowed_tool_reaches_dispatch` proves the same
+    /// dispatch is_error in this binary). The master-switch branch this test names was
+    /// unreachable, and it is the ONLY test pinning the built-in "master OFF never
+    /// parks" invariant — so a regression that parked consequential built-ins under
+    /// the OFF switch would have shipped green. `standing_create` is LOCAL: its DryRun
+    /// preview needs no provider creds, so the park decision is genuinely reached.
+    // The slot lock is deliberately held across the await, exactly like every other
+    // slot-touching test here: the whole point is that no parallel test may park
+    // between our clear and our read.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn master_off_never_parks_still_previews() {
+        use std::time::Instant;
+        // The confirm slot is a process-global; take the shared lock and clear it so
+        // a parallel test that parks cannot be mistaken for this call parking.
+        let _lock = crate::confirm::PENDING_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let _ = crate::confirm::take_live(Instant::now());
+
         // Sanity: the master switch is OFF in this test binary.
         assert!(
             !crate::integrations::consequential_allowed(),
@@ -16758,22 +17432,32 @@ mod tests {
         );
         let mem = open_temp_memory("confirm_off");
 
-        // Even with confirm=true, OFF means the park branch is never entered:
-        // the outcome is the dispatch's own DryRun result, NOT a confirmation
-        // prompt. (Asserting on the OUTCOME — not the shared slot — keeps this
-        // immune to any parallel test that parks; with no Google creds the
-        // dispatch returns the friendly "not connected" line, which is the
-        // correct OFF-mode preview attempt.)
-        let (outcome, _is_error) = exec_t(
-            "gmail_send",
-            &json!({"to": "a@b.com", "subject": "Hi", "body": "x", "confirm": true}),
+        // Even with confirm=true, OFF means the park branch is never entered: the
+        // outcome is the dispatch's own DryRun preview, NOT a confirmation prompt.
+        let (outcome, is_error) = exec_t(
+            "standing_create",
+            &json!({"goal": "review my deadlines", "schedule": "daily at 8", "confirm": true}),
             &mem,
-            &pepper_tools(),
+            &["standing_create".to_string()],
         )
         .await;
+        // Precondition for the assertions below: the dispatch really ran (a local
+        // consequential tool needs no creds), so we are observing the master-switch
+        // decision and not an early credential error.
+        assert!(!is_error, "the local consequential dispatch must succeed here: {outcome}");
+        assert!(
+            outcome.to_lowercase().starts_with("[dry run]"),
+            "master OFF must PREVIEW the action: {outcome}"
+        );
         assert!(
             !outcome.contains("say 'confirm' to proceed"),
             "master OFF must NOT park (no confirmation prompt): {outcome}"
+        );
+        // THE LOAD-BEARING ASSERTION the doc always claimed: nothing was armed.
+        let parked = crate::confirm::take_live(Instant::now());
+        assert!(
+            parked.is_none(),
+            "master OFF must arm NO pending confirmation: {parked:?}"
         );
         cleanup_temp_memory(&mem_path("confirm_off"));
     }
@@ -20272,8 +20956,10 @@ mod tests {
         cleanup_temp_memory(&mem_path("forge-allow"));
     }
 
-    /// OFF-STATE: with [forge] disabled (the shipped default — FORGE_GATE is
-    /// unset in tests, which fails safe to OFF), the forge_app tool returns the
+    /// OFF-STATE: with the EFFECTIVE forge gate off — which in this binary means
+    /// FORGE_GATE is unset (tests never call `init_forge`) and so fails safe to OFF;
+    /// note [forge].enabled itself SHIPS ON, so this is the test-binary posture, not
+    /// the stock-install one — the forge_app tool returns the
     /// friendly "Self-Forge is off" line WITHOUT any cloud call, draft, staging,
     /// or proposal — exactly like self-heal off. It is NOT an error (a friendly
     /// guidance message), and it never deploys or runs anything.
@@ -20315,44 +21001,81 @@ mod tests {
 
     /// LOCKDOWN forces the model-reachable forge_app tool OFF even with [forge]
     /// ENABLED (the blocking finding: the cloud Self-Forge tool must not author /
-    /// stage / propose while the emergency stop is engaged). We turn the gate ON
-    /// (init_forge(true,...)) so this is NOT merely the shipped-off posture, then
-    /// force lockdown via the thread-local LockdownOverride and assert run_forge_app
-    /// returns the friendly off-posture string and writes NOTHING (no draft, no
-    /// proposal, no meta.forge_pending stamp). This mirrors the watchdog gate test
-    /// in forge.rs and the consequential/standing/mic gate tests in lockdown.rs.
+    /// stage / propose while the emergency stop is engaged). This mirrors the
+    /// watchdog gate test in forge.rs and the consequential/standing/mic gate tests
+    /// in lockdown.rs.
+    ///
+    /// THE GATE IS INJECTED ON, and that is the whole point. This test used to call
+    /// `run_forge_app` and claim in its doc that it turned the gate on with
+    /// `init_forge(true,..)` — it never called `init_forge`, and `init_forge` is
+    /// called from exactly one place in the tree (main.rs). FORGE_GATE is a `OnceLock`
+    /// no test sets, so `forge_gate()` returned `(false, "propose")`, the lockdown
+    /// override was irrelevant to the outcome, and every assertion was already
+    /// produced by the config-OFF branch that
+    /// `forge_app_off_state_returns_friendly_message_and_does_nothing` asserts
+    /// verbatim. Deleting the lockdown term from the gate left it green.
+    ///
+    /// The CONTROL leg is what makes it bite: with the gate ON and lockdown OFF, the
+    /// call must get PAST the gate — in this binary it then stops at the unset ROOT
+    /// with a DIFFERENT honest message ("could not locate the project root"), so no
+    /// cloud call, no draft and no proposal happen here either, but the two outcomes
+    /// are distinguishable.
     #[tokio::test]
     async fn forge_app_is_forced_off_when_locked_even_if_enabled() {
-        // Serialize on the lockdown test lock surrogate: the override is
-        // thread-local, so we only need the FORGE_GATE OnceLock set ON. init_forge
-        // is idempotent; once any test sets it, it stays — so we read the effective
-        // gate and only assert the lockdown override drives the EFFECTIVE result.
-        let _lock = crate::lockdown::LockdownOverride::force(true);
         let mem = open_temp_memory("forge-locked");
 
-        // Drive run_forge_app directly (the tool helper). Even if FORGE_GATE were
-        // ON, is_locked_down() forces the effective gate false, so we hit the
-        // friendly off branch with no cloud call and no disk write.
-        let outcome = run_forge_app("an app that reverses a string", &mem)
-            .await
-            .expect("locked forge returns Ok(off-posture), never errors");
+        // LOCKED + gate ON => the friendly off-posture, no cloud call, no disk write.
+        let locked = {
+            let _lock = crate::lockdown::LockdownOverride::force(true);
+            run_forge_app_with_gate(true, "propose", "an app that reverses a string", &mem)
+                .await
+                .expect("locked forge returns Ok(off-posture), never errors")
+        };
         assert!(
-            outcome.to_lowercase().contains("self-forge is off"),
-            "locked: forge_app returns the off-posture string: {outcome}"
+            locked.to_lowercase().contains("self-forge is off"),
+            "locked: forge_app returns the off-posture string: {locked}"
         );
-        let low = outcome.to_lowercase();
-        assert!(!low.contains("installed"), "locked: no install claim: {outcome}");
-        assert!(!low.contains("drafted"), "locked: no draft claim: {outcome}");
+        let low = locked.to_lowercase();
+        assert!(!low.contains("installed"), "locked: no install claim: {locked}");
+        assert!(!low.contains("drafted"), "locked: no draft claim: {locked}");
 
-        // NOTHING was staged: meta.forge_pending must be absent (the off branch
-        // returns before any forge_draft / stamp).
+        // CONTROL: the SAME gate-ON call with lockdown OFF must NOT produce the
+        // off-posture — it gets past the gate. Without this leg the assertion above
+        // is satisfied by any always-off implementation.
+        let unlocked = {
+            let _lock = crate::lockdown::LockdownOverride::force(false);
+            run_forge_app_with_gate(true, "propose", "an app that reverses a string", &mem)
+                .await
+                .expect("unlocked forge returns Ok, never errors")
+        };
+        assert!(
+            !unlocked.to_lowercase().contains("self-forge is off"),
+            "gate ON + NOT locked must get past the gate (lockdown is what forces it \
+             off, not the gate being off anyway): {unlocked}"
+        );
+
+        // ...and the config-OFF gate still yields the off-posture with lockdown OFF,
+        // so the two independent reasons for OFF are both pinned.
+        let config_off = {
+            let _lock = crate::lockdown::LockdownOverride::force(false);
+            run_forge_app_with_gate(false, "propose", "an app that reverses a string", &mem)
+                .await
+                .expect("config-off forge returns Ok(off-posture)")
+        };
+        assert!(
+            config_off.to_lowercase().contains("self-forge is off"),
+            "config-off: forge_app returns the off-posture string: {config_off}"
+        );
+
+        // NOTHING was staged on ANY leg: meta.forge_pending must be absent (the off
+        // branch returns before any forge_draft / stamp, and the control leg stops at
+        // the unresolved root before it).
         let pending = mem.get_fact("meta.forge_pending").await.unwrap();
         assert!(
             pending.is_none(),
-            "locked: forge_app wrote no proposal marker: {pending:?}"
+            "forge_app wrote no proposal marker: {pending:?}"
         );
 
-        drop(_lock);
         cleanup_temp_memory(&mem_path("forge-locked"));
     }
 
@@ -20360,6 +21083,13 @@ mod tests {
     /// run_forge_app body must AND the lockdown read into the gate, exactly like the
     /// autonomous watchdog (forge.rs). This pins the wiring so a future refactor
     /// cannot silently drop the lockdown check from this parallel entry point.
+    ///
+    /// IT MUST SKIP COMMENT LINES, or it SELF-MATCHES and proves nothing. run_forge_app
+    /// opens with a prose comment reading "already ANDs `!is_locked_down()` into the
+    /// forge gate"; a bare `body.contains("is_locked_down()")` was satisfied by that
+    /// sentence alone, so deleting the one executable lockdown read left this test
+    /// green. (Its sibling `forge_app_tool_path_never_deploys` already skips `//`
+    /// lines — this one did not.)
     #[test]
     fn forge_app_tool_path_consults_lockdown() {
         let src = include_str!("anthropic.rs");
@@ -20369,9 +21099,14 @@ mod tests {
         let body = &src[start..];
         let end = body.find("\nfn proposal_ts(").expect("run_forge_app body end");
         let body = &body[..end];
+        let executable_read = body.lines().any(|l| {
+            let l = l.trim_start();
+            !l.starts_with("//") && l.contains("lockdown::is_locked_down()")
+        });
         assert!(
-            body.contains("is_locked_down()"),
-            "the model-reachable forge tool must AND lockdown into its gate"
+            executable_read,
+            "the model-reachable forge tool must AND lockdown into its gate on a CODE \
+             line (a comment mentioning is_locked_down() does not count)"
         );
     }
 
@@ -20721,26 +21456,36 @@ mod tests {
             "expected not-connected message: {outcome}"
         );
 
-        // stark MAY pause a Google Ads campaign (a CONSEQUENTIAL money action) —
-        // passes the allowlist, reaches the client builder, then fails friendly (no
-        // Google Ads connected). NOT a refusal, NOT a panic, no network — and with
-        // the gate OFF it would only ever have PREVIEWED anyway.
-        let (outcome, is_error) = exec_t(
-            "gads_pause_campaign",
-            &json!({"campaign_id": "111", "confirm": true}),
-            &mem,
-            &gecko,
-        )
-        .await;
-        assert!(is_error, "no Google Ads connected -> is_error: {outcome}");
-        assert!(
-            !outcome.contains("not permitted"),
-            "gads_pause_campaign is allowed for gecko, not refused: {outcome}"
-        );
-        assert!(
-            outcome.contains("Google Ads isn't connected"),
-            "expected not-connected message: {outcome}"
-        );
+        // BOTH ads agents MAY pause a Google Ads campaign (a CONSEQUENTIAL money
+        // action) — each passes the allowlist, reaches the client builder, then fails
+        // friendly (no Google Ads connected). NOT a refusal, NOT a panic, no network
+        // — and with the gate OFF it would only ever have PREVIEWED anyway.
+        //
+        // stark is exercised EXPLICITLY here. The comment used to say "stark MAY
+        // pause..." over a call that passed `&gecko`, so stark's allowlist was never
+        // exercised for ANY consequential spend tool. `stark_tools()` resolves through
+        // `AgentRegistry::canonical()`, i.e. CANONICAL_ROSTER in agents.rs (NOT
+        // config/agents.toml, which this binary never reads) — and dropping
+        // "gads_pause_campaign" from stark's entry there left this test green, despite
+        // this function's own header claiming BOTH agents' spend tools are pinned.
+        for (label, agent) in [("stark", &stark), ("gecko", &gecko)] {
+            let (outcome, is_error) = exec_t(
+                "gads_pause_campaign",
+                &json!({"campaign_id": "111", "confirm": true}),
+                &mem,
+                agent,
+            )
+            .await;
+            assert!(is_error, "no Google Ads connected -> is_error ({label}): {outcome}");
+            assert!(
+                !outcome.contains("not permitted"),
+                "gads_pause_campaign is allowed for {label}, not refused: {outcome}"
+            );
+            assert!(
+                outcome.contains("Google Ads isn't connected"),
+                "expected not-connected message ({label}): {outcome}"
+            );
+        }
 
         // THE MONEY GATE. Every consequential ads arg deserializes confirm=false when
         // absent, and with the global gate OFF (the default in tests) even confirm=true
@@ -21113,9 +21858,45 @@ mod tests {
         let reg = crate::skills::global();
         let utils = skill_list_catalog_in(reg, Some("utilities")).unwrap();
         assert!(utils.contains("base64_encode"));
-        // An empty-but-real category gives an honest "none yet" line, not an error.
+        // A POPULATED category lists its real members under its real count.
+        //
+        // This used to read `assert!(text.contains("none so far") || text.contains("text"))`
+        // over the "text" category, with a comment calling it "an empty-but-real
+        // category". "text" is not empty — skills/text.rs registers 13 Category::Text
+        // skills — so the empty branch was never reached; and BOTH branches embed the
+        // slug (`scope = format!(" in '{slug}'")`), so with slug == "text" the second
+        // disjunct is true of every possible Ok return and the assertion could not
+        // fail for any implementation.
         let text = skill_list_catalog_in(reg, Some("text")).unwrap();
-        assert!(text.contains("none so far") || text.contains("text"));
+        let text_count = reg.by_category(crate::skills::Category::Text).len();
+        assert!(text_count > 0, "the 'text' category ships populated");
+        assert!(
+            text.contains(&format!("{text_count} skill(s) in 'text'")),
+            "a populated category states its real count: {text}"
+        );
+        assert!(text.contains("word_frequency"), "and lists its real members: {text}");
+        assert!(!text.contains("none so far"), "a populated category is not 'none so far': {text}");
+
+        // The GENUINELY empty branch — its honest "none so far" copy is asserted
+        // nowhere else in the tree — over an injected registry with no Text skills.
+        fn never(_: &serde_json::Value) -> anyhow::Result<String> {
+            panic!("skill_list must never RUN a skill");
+        }
+        let empty_text = crate::skills::Registry::from_skills_for_test(vec![
+            crate::skills::SkillDef::new(
+                "only_util",
+                crate::skills::Category::Utilities,
+                "a lone utility",
+                &[],
+                never,
+            ),
+        ])
+        .unwrap();
+        let none = skill_list_catalog_in(&empty_text, Some("text")).unwrap();
+        assert!(
+            none.contains("none so far"),
+            "an EMPTY-but-real category gives the honest 'none yet' line, not an error: {none}"
+        );
         // Unknown category -> friendly error.
         let err = skill_list_catalog_in(reg, Some("wizardry")).unwrap_err();
         assert!(err.to_string().contains("unknown skill category"));
@@ -21187,14 +21968,48 @@ mod tests {
     /// `skill_invoke_is_consequential` keys on the SKILL named in the input, not
     /// the meta-tool name — so execute_tool's park condition widens correctly. A
     /// pure skill, an unknown skill, and a missing name are all non-consequential.
+    ///
+    /// THE POSITIVE CASE IS THE ONLY ONE THAT BITES, so it is asserted against an
+    /// INJECTED registry. Every shipped skill is pure this round (the sibling test
+    /// below proves it), so `skill_invoke_is_consequential` provably returns `false`
+    /// for every input in this build — meaning a mutant body of `false` passed the
+    /// three negative assertions that used to be the whole test, while disabling the
+    /// park-widening entirely for the first consequential skill anyone adds.
     #[test]
     fn consequential_detection_keys_on_the_named_skill() {
+        use crate::skills::{Category, Registry, SkillDef};
         // A real, pure proof skill is NOT consequential.
         assert!(!skill_invoke_is_consequential(&json!({"name": "base64_encode"})));
         // An unknown skill is not inferred consequential (it errors at dispatch).
         assert!(!skill_invoke_is_consequential(&json!({"name": "nope"})));
         // A missing name is non-consequential.
         assert!(!skill_invoke_is_consequential(&json!({})));
+
+        // POSITIVE: a registry holding one CONSEQUENTIAL skill. The detection keys on
+        // the skill NAMED IN THE INPUT (not on the `skill_invoke` meta-tool name), so
+        // execute_tool's park condition widens for it — and stays narrow for the pure
+        // sibling in the very same registry.
+        fn must_not_run(_: &Value) -> anyhow::Result<String> {
+            panic!("the detector must never RUN a skill");
+        }
+        let reg = Registry::from_skills_for_test(vec![
+            SkillDef::new("test_act", Category::Utilities, "a test consequential skill", &[], must_not_run)
+                .consequential(),
+            SkillDef::new("test_pure", Category::Utilities, "a test pure skill", &[], must_not_run),
+        ])
+        .unwrap();
+        assert!(
+            skill_invoke_is_consequential_in(&reg, &json!({"name": "test_act"})),
+            "a CONSEQUENTIAL skill named in the input must widen the park condition"
+        );
+        assert!(
+            !skill_invoke_is_consequential_in(&reg, &json!({"name": "test_pure"})),
+            "a pure skill in the same registry must NOT"
+        );
+        assert!(
+            !skill_invoke_is_consequential_in(&reg, &json!({"name": "not_in_this_registry"})),
+            "an unknown name is never inferred consequential"
+        );
     }
 
     /// No skill ships consequential OR source-gated THIS round (honest scope: the
@@ -21482,8 +22297,12 @@ mod tests {
 
     /// The per-turn accumulator is CLEARED each turn: turn N's sources never
     /// annotate turn N+1 — the no-cross-turn-leak contract, enforced by the guard
-    /// in run_pipeline. Here we exercise the underlying clear directly (the
-    /// override seam stands in for the process-global the guard clears).
+    /// in run_pipeline. This drives the REAL process-global (it does NOT use the
+    /// `answers::SourcesOverride` seam — the body comment below is the accurate one;
+    /// this doc used to claim the opposite), which means it SHARES that slot with
+    /// `tool_loop_records_real_recall_source_and_not_an_empty_one`. Both clear at
+    /// entry, which is what keeps them from racing the way the verify-outcome pair
+    /// once did.
     #[tokio::test]
     async fn the_guard_clears_the_accumulator_each_turn() {
         // Drive the REAL process-global accumulator (not the override) so we are
@@ -21903,11 +22722,28 @@ mod tests {
         assert_eq!(brain.calls(), 1, "the one (failed) critique was attempted, nothing more");
     }
 
+    /// Serializes the two tests that drive `verify::TURN_OUTCOME`, the process-global
+    /// `Mutex<Option<VerifyOutcome>>`. Mirrors `crate::confirm::PENDING_TEST_LOCK`.
+    ///
+    /// WITHOUT IT THESE TWO RACE AND FAIL FOR NO REASON. libtest runs them on parallel
+    /// threads: `verify_outcome_is_per_turn_and_cleared` clears the GLOBAL and then
+    /// asserts it reads back `Off`, while `the_verify_guard_clears_the_outcome_each_turn`
+    /// writes `Flagged` into that same slot — so either can observe the other's write.
+    /// Measured at ~1.25% of runs for the two-test filter (5/400) and ~1/200 for a
+    /// plain `cargo test ... verify`. That matters here specifically because CI runs
+    /// only on `v*` tags, so a local filtered run IS the merge gate — and a red that
+    /// means nothing trains a reviewer to re-run and ignore, which is how a real
+    /// regression gets waved through.
+    static VERIFY_OUTCOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// PER-TURN STATE: the outcome accumulator is set within a turn and CLEARED by
     /// the guard so turn N's outcome never labels turn N+1 — the no-cross-turn-leak
     /// contract (the override seam stands in for the process-global the guard clears).
     #[test]
     fn verify_outcome_is_per_turn_and_cleared() {
+        let _lock = VERIFY_OUTCOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let _g = verify::OutcomeOverride::fresh();
         assert_eq!(current_outcome(), VerifyOutcome::Off, "fresh turn starts Off");
         verify::set_outcome(VerifyOutcome::Revised);
@@ -21922,9 +22758,14 @@ mod tests {
     }
 
     /// THE GUARD CLEARS THE PROCESS-GLOBAL: drive the real `TURN_OUTCOME` slot the
-    /// `TurnVerifyGuard` clears, mirroring the sources-guard test.
+    /// `TurnVerifyGuard` clears, mirroring the sources-guard test. Takes
+    /// `VERIFY_OUTCOME_TEST_LOCK` — this and `verify_outcome_is_per_turn_and_cleared`
+    /// write the SAME process-global and raced without it.
     #[test]
     fn the_verify_guard_clears_the_outcome_each_turn() {
+        let _lock = VERIFY_OUTCOME_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         super::clear_outcome();
         assert_eq!(current_outcome(), VerifyOutcome::Off, "start clean");
         {
@@ -22267,6 +23108,62 @@ mod tests {
             level: ConfidenceLevel::Grounded,
         };
         assert!(cross_check_telemetry(false, &off)["badge"].is_null(), "Off => no badge");
+    }
+
+    /// COPY TRUTH: the HUD-facing notes and the safety-posture comments in this file
+    /// must match the SHIPPED config defaults.
+    ///
+    /// Three of them did not. `CROSS_CHECK_NOTE` — the one piece of copy the HUD shows
+    /// to explain what the cross-check badge MEANS — ended "Ships OFF by default"
+    /// while `[answers].cross_check` ships `true`, contradicting its own module header
+    /// ("ON-by-default") twenty lines above it; an operator reading the panel would
+    /// conclude the badge could not be firing and that the caveats on their answers
+    /// came from somewhere else. `load_shell_config` / `load_ui_automation_config`
+    /// documented their no-root fallback as "the OFF default ... rather than ever
+    /// running / actuating" for the two highest-risk capabilities in the daemon, both
+    /// of which ship ON. And the `forge_app` dispatch arm called [forge] "shipped OFF"
+    /// for a model-reachable, token-spending, disk-writing autonomy surface that is
+    /// armed by default. This test fails if a default moves without the copy.
+    #[test]
+    fn shipped_defaults_match_the_copy_that_describes_them() {
+        let note = super::crosscheck::cross_check_badge_telemetry(true, CrossCheckOutcome::Flagged)
+            ["note"]
+            .as_str()
+            .unwrap()
+            .to_lowercase();
+        assert!(
+            !note.contains("ships off"),
+            "the cross-check note must not claim it ships OFF: {note}"
+        );
+        assert!(note.contains("ships on"), "...it must say ON, as it does: {note}");
+        assert!(
+            crate::config::AnswersConfig::default().cross_check,
+            "[answers].cross_check ships ON — if this flips, fix CROSS_CHECK_NOTE"
+        );
+
+        // The two highest-risk capabilities: the no-root fallback IS the shipped
+        // default, and the shipped default is ON (fail-open, gated downstream).
+        assert!(
+            crate::config::ShellConfig::default().enabled,
+            "[shell] ships ON — load_shell_config's no-root fallback is NOT fail-closed"
+        );
+        assert!(super::load_shell_config().enabled, "and that is what the loader returns here");
+        assert!(
+            crate::config::UiAutomationConfig::default().enabled,
+            "[ui_automation] ships ON — same for load_ui_automation_config"
+        );
+        assert!(super::load_ui_automation_config().enabled, "and that is what the loader returns");
+
+        // Self-Forge is ARMED by default; only the uninitialized FORGE_GATE is OFF.
+        assert!(
+            crate::config::ForgeConfig::default().enabled,
+            "[forge] ships ON (armed, inert without a cloud key) — not 'shipped OFF'"
+        );
+        assert!(
+            !forge_gate().0,
+            "FORGE_GATE is the thing that defaults OFF, and only because init_forge \
+             is never called outside main()"
+        );
     }
 
     /// #21 PER-TURN OUTCOME: set within a turn, read back, cleared by the guard so

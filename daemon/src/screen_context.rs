@@ -468,8 +468,16 @@ static RING: Mutex<Option<ScreenContextRing>> = Mutex::new(None);
 /// `[screen_context]`. A poison-tolerant `Mutex` (mirrors the prosody/lockdown
 /// process-global precedent). DEFAULTS to OFF (enabled=false) so that — until the
 /// daemon explicitly installs the configured settings — the continuous push path
-/// is INERT (no ring growth), exactly like the config default. This is the single
-/// gate the relay-side `ingest_continuous_snapshot` reads.
+/// is INERT (no ring growth). This is the single gate the relay-side
+/// `ingest_continuous_snapshot` reads.
+///
+/// NOT "exactly like the config default", which is what this doc used to say: the
+/// shipped `[screen_context].enabled` default is TRUE (config/darwin.toml and
+/// `impl Default for ScreenContextConfig`). The global is OFF only until
+/// `install_settings` runs at startup. On the most privacy-sensitive read feature
+/// in the system, that clause told a reader continuous capture ships off; it ships
+/// ON and is inert only until Screen-Recording TCC consent is granted — which is
+/// what the accurate comment 64 lines below already says.
 static SETTINGS: Mutex<LoopSettings> = Mutex::new(LoopSettings::off());
 
 /// The continuous-loop settings the daemon honours: whether the loop is enabled
@@ -839,7 +847,24 @@ pub fn classify_screen_context_intent(utterance: &str) -> Option<ScreenContextIn
         && (lower.contains("working on")
             || lower.contains("doing")
             || lower.contains("looking at"));
-    if working_recall {
+    // "what was on my screen earlier" — the phrasing the Recall variant's own doc
+    // lists as supported, and which classified as None. It reaches neither gate
+    // above ("what was on" is not "what was i", and there is no "screen context"
+    // phrase), and the Vision one-shot OCR router does not take it either: that path
+    // requires the screen noun to END the phrase, and the trailing "earlier" makes it
+    // fall through. So the most natural phrasing of a screen-context recall was
+    // silently unrouted and the ring was never consulted. A PAST-TIME qualifier is
+    // required so the PRESENT-tense one-shot read ("what's on my screen") is
+    // untouched.
+    let past_screen_recall = (lower.contains("what was on") || lower.contains("what were on"))
+        && (lower.contains("my screen") || lower.contains("the screen"))
+        && (lower.contains("earlier")
+            || lower.contains("before")
+            || lower.contains("a minute ago")
+            || lower.contains("a moment ago")
+            || lower.contains("just now")
+            || lower.contains("recently"));
+    if working_recall || past_screen_recall {
         return Some(ScreenContextIntent::Recall {
             subject: extract_recall_subject(&lower),
         });
@@ -1311,6 +1336,39 @@ mod tests {
             classify_screen_context_intent("forget my screen context"),
             Some(ScreenContextIntent::Forget)
         );
+    }
+
+    /// REGRESSION: "what was on my screen earlier" is listed in the `Recall`
+    /// variant's own doc as a supported phrasing and returned `None`. It satisfies
+    /// neither of the two original gates ("what was on" is not "what was i", and it
+    /// carries no "screen context" phrase), and the Vision one-shot OCR router does
+    /// not take it either (that path needs the screen noun to END the phrase, and
+    /// the trailing "earlier" makes it fall through) — so the most natural phrasing
+    /// of a screen-context recall was silently unrouted and the ring never consulted.
+    #[test]
+    fn a_past_tense_screen_question_is_a_recall() {
+        for u in [
+            "what was on my screen earlier",
+            "what was on the screen before the crash",
+            "what was on my screen a minute ago",
+        ] {
+            assert!(
+                matches!(
+                    classify_screen_context_intent(u),
+                    Some(ScreenContextIntent::Recall { .. })
+                ),
+                "{u:?} must classify as a screen-context Recall, got {:?}",
+                classify_screen_context_intent(u)
+            );
+            // …and it is treated as a transient perception turn like the other
+            // recall phrasings, so it never seeds durable memory.
+            assert!(is_screen_context_recall(u), "{u:?} must be flagged transient");
+        }
+        // CONTROL: the PRESENT-tense one-shot read is untouched — it still belongs to
+        // the Vision OCR router, not here.
+        assert_eq!(classify_screen_context_intent("what's on my screen"), None);
+        assert_eq!(classify_screen_context_intent("what is on my screen"), None);
+        assert_eq!(classify_screen_context_intent("read my screen"), None);
     }
 
     #[test]

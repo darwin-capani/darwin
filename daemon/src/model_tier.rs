@@ -21,9 +21,13 @@
 //!      A `Local` override forces local: NO cloud call is made (the privacy path).
 //!   2. **Auto** — no override: the configured [router].conversation_route is the
 //!      durable default tier, refined by THIS turn's difficulty (a trivial turn
-//!      can step DOWN to Fast/Local to save cost+latency; a heavy turn steps UP to
-//!      Heavy). This is a HEURISTIC — it can be wrong, which is exactly why it is
-//!      overridable and surfaced (the `model.tier` telemetry carries the reason).
+//!      can step DOWN to Fast to save cost+latency; a heavy turn steps UP to
+//!      Heavy). AUTO NEVER steps a cloud default down to `Local` — going on-device
+//!      is a deliberate choice, not a cost optimization, so `Local` is reached ONLY
+//!      via an Override, `Pressure::Floor`, a local [router].conversation_route, or
+//!      the Fallback below (see `auto_tier`'s own doc). This is a HEURISTIC — it
+//!      can be wrong, which is exactly why it is overridable and surfaced (the
+//!      `model.tier` telemetry carries the reason).
 //!   3. **Fallback** — if the resolved tier is a cloud tier but the cloud is NOT
 //!      reachable (no key / offline), OR the cloud call later errors, fall back to
 //!      `Local` (Reason::Fallback) — the existing degrade path, now named. A
@@ -753,7 +757,11 @@ pub struct ThrottlePlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThrottleReason {
     /// Adaptive throttling is OFF ([power].adaptive=false): neutral plan, the
-    /// live reader is never consulted. This is the shipped default.
+    /// live reader is never consulted. NOT the shipped default — `[power].adaptive`
+    /// SHIPS ON (config.rs `impl Default for PowerConfig`, pinned by
+    /// `power_adaptive_ships_on` below), so `Disabled` is emitted ONLY when an
+    /// operator explicitly turns the flag off. On a shipped install the live
+    /// `pmset -g batt` + thermalState read DOES run on local turns.
     Disabled,
     /// On AC + nominal/fair thermal: no throttle (the machine has power + headroom).
     Nominal,
@@ -981,27 +989,144 @@ impl ModelSwapIntent {
     }
 }
 
+/// True when `text` OPENS with `phrase` AND the phrase ends on a WORD BOUNDARY.
+///
+/// The boundary half is load-bearing: a bare `starts_with` would let "go faster"
+/// satisfy "go fast" and "go privately" satisfy "go private" — the very substring
+/// hole the head-anchoring below exists to close.
+fn opens_with_phrase(text: &str, phrase: &str) -> bool {
+    match text.strip_prefix(phrase) {
+        Some(rest) => !rest.starts_with(|c: char| c.is_alphanumeric()),
+        None => false,
+    }
+}
+
+/// Peel ONE leading ADDRESS / POLITENESS / REQUEST wrapper off `text`, or `None`
+/// when the head is not a wrapper. "darwin, use the fast model", "please go
+/// offline" and "can you switch to opus" are all commands whose control phrase
+/// does not literally start the sentence; peeling the wrapper lets the phrase be
+/// anchored at the HEAD without losing them.
+///
+/// Deliberately SHORT, and every entry is a REQUEST wrapper — never a word that
+/// can open an ordinary declarative sentence. "now" / "then" / "and" / "the" are
+/// left out ON PURPOSE: with "now" in this table, "now offline mode is the
+/// default" would peel to a command.
+fn strip_one_command_lead(text: &str) -> Option<&str> {
+    const LEADS: &[&str] = &[
+        // Address forms.
+        "hey darwin", "ok darwin", "okay darwin", "hi darwin", "darwin",
+        "hey", "ok", "okay",
+        // Politeness / request framing.
+        "please", "pls",
+        "can you", "could you", "would you", "will you", "can we",
+        "let's", "lets", "let us",
+        "i want you to", "i'd like you to", "i would like you to", "i need you to",
+        "you should", "you can", "just",
+        // Imperative lead-ins that the phrase tables do not already spell out, so
+        // "use the lightweight model" still reaches the bare "lightweight model"
+        // entry. Tried only AFTER a whole-phrase match fails, so "switch to opus"
+        // is matched WHOLE before "switch to" is ever peeled.
+        "use the", "use a", "use", "switch to the", "switch to",
+        // The PLAIN IMPERATIVE forms of those same commands. Head-anchoring WITHOUT
+        // these dropped a whole family of commands the pre-anchor code classified
+        // correctly — measured by running both versions of `classify_model_swap`
+        // side by side on the same inputs:
+        //
+        //     "turn on offline mode"     Local -> None
+        //     "turn on private mode"     Local -> None
+        //     "enable offline mode"      Local -> None
+        //     "put it in offline mode"   Local -> None
+        //     "set it to offline mode"   Local -> None
+        //     "turn on fast mode"        Fast  -> None
+        //
+        // "a miss is safe" is true for Heavy/Fast/Auto — but NOT for LOCAL, which is
+        // a PRIVACY control: a "turn on private mode" that silently does not take
+        // effect sends the turn to the CLOUD after the user asked it not to.
+        //
+        // "turn off" / "disable" are deliberately ABSENT: they are the INVERSE of the
+        // command, and peeling them would read "turn off offline mode" as an order to
+        // GO offline — the same sign error the negation cases are about. Every entry
+        // here was probed against the measured false-trigger set and adds none of it
+        // back: "turn on low power mode" still returns None, because the peel exposes
+        // "low power mode" and "power mode" does not open THAT either.
+        "turn on", "enable", "put it in", "put yourself in", "set it to", "switch it to",
+    ];
+    for lead in LEADS {
+        let Some(rest) = text.strip_prefix(lead) else {
+            continue;
+        };
+        // Word boundary: "darwinism" is not the address "darwin".
+        if rest.starts_with(|c: char| c.is_alphanumeric()) {
+            continue;
+        }
+        return Some(rest.trim_start_matches(|c: char| !c.is_alphanumeric()));
+    }
+    None
+}
+
 /// CONSERVATIVELY detect a model-control command in `utterance`. Returns
 /// `Some(intent)` ONLY for imperative, model-control phrasing — a normal sentence
 /// that merely MENTIONS "fast" / "offline" / "powerful" must NOT trigger.
 ///
-/// How false-triggers are avoided:
-///   * Detection anchors on full MODEL-CONTROL PHRASES ("use the powerful model",
-///     "go offline", "switch to opus", "speed mode"), not bare adjectives. A
-///     sentence like "the offline backup ran fast" contains "offline" and "fast"
-///     but none of the anchored control phrases, so it returns `None`.
-///   * The model-naming family ("use the ... model", "switch to opus/haiku") is a
-///     two-part match: a control lead-in AND a model word. "I read a fast book"
-///     has neither lead-in nor model word.
-///   * Each family's phrases are deliberately specific imperatives, so a passing
-///     mention can't satisfy them.
+/// WHAT WENT WRONG (and why the match is anchored the way it is): the four family
+/// checks used to be UNANCHORED substring searches over the whole lowercased
+/// utterance (`text.contains(p)`), while this very doc block claimed the opposite.
+/// Several table entries are short enough to live inside ordinary English, so
+/// plain sentences — and even NEGATED ones — classified as model commands.
+/// Measured before the fix:
+///
+///     "don't go offline"                            -> Local
+///     "please don't use the powerful model"         -> Heavy
+///     "i don't want fast mode"                      -> Fast
+///     "never go offline without telling me"         -> Local
+///     "turn on low power mode"                      -> Heavy  ("power mode")
+///     "how do i make my mac go faster"              -> Fast   ("go fast")
+///     "what's the best model for this task"         -> Heavy
+///     "did you go offline last night"               -> Local
+///     "the server went into offline mode yesterday" -> Local
+///     "things are back to normal now"               -> Auto
+///
+/// Both halves of that are damage: `router.rs` returns the ack IMMEDIATELY on a
+/// hit, so the user's real request is swallowed AND a process-global tier
+/// override is installed that outlives the turn (`resolve_tier` gives Override
+/// top precedence over auto AND over the OBOL budget). "don't go offline" took
+/// DARWIN OFFLINE for the rest of the process — the exact opposite of what was
+/// said.
+///
+/// How false-triggers are avoided NOW: the control phrase must OPEN the utterance
+/// once a leading request wrapper is peeled ([`strip_one_command_lead`]), and must
+/// END on a word boundary ([`opens_with_phrase`]). That is what makes these
+/// deliberately-specific phrases actually IMPERATIVE: "go offline" commands, while
+/// "did you go offline last night" reports and "don't go offline" refuses — and
+/// only the first opens with the phrase.
+///
+/// A MISS IS SAFE AND A FALSE HIT IS NOT: an unrecognized utterance falls through
+/// to normal routing and still gets answered, whereas a false hit both swallows
+/// the request and re-aims the model process-wide. When in doubt, return `None`.
 ///
 /// Pure + deterministic — a function of the utterance only.
 pub fn classify_model_swap(utterance: &str) -> Option<ModelSwapIntent> {
-    let text = utterance.trim().to_lowercase();
-    if text.is_empty() {
+    let lowered = utterance.trim().to_lowercase();
+    if lowered.is_empty() {
         return None;
     }
+    // Test the WHOLE head first, then peel one wrapper and re-test. Each peel
+    // strictly shrinks the slice, so this terminates.
+    let mut head = lowered.trim_start_matches(|c: char| !c.is_alphanumeric());
+    loop {
+        if let Some(intent) = match_control_phrase(head) {
+            return Some(intent);
+        }
+        match strip_one_command_lead(head) {
+            Some(rest) => head = rest,
+            None => return None,
+        }
+    }
+}
+
+/// The phrase tables, matched HEAD-ANCHORED against an already-lowercased,
+/// already-unwrapped `text`. Family order is the precedence order.
+fn match_control_phrase(text: &str) -> Option<ModelSwapIntent> {
 
     // AUTO checked first: "back to normal / auto / let you decide / default mode".
     // (An auto request is unambiguous and should clear an override even if a stray
@@ -1028,7 +1153,7 @@ pub fn classify_model_swap(utterance: &str) -> Option<ModelSwapIntent> {
         "automatically pick",
         "automatically choose",
     ];
-    if AUTO_PHRASES.iter().any(|p| text.contains(p)) {
+    if AUTO_PHRASES.iter().any(|p| opens_with_phrase(text, p)) {
         return Some(ModelSwapIntent::Auto);
     }
 
@@ -1055,7 +1180,7 @@ pub fn classify_model_swap(utterance: &str) -> Option<ModelSwapIntent> {
         "local model only",
         "local only",
     ];
-    if LOCAL_PHRASES.iter().any(|p| text.contains(p)) {
+    if LOCAL_PHRASES.iter().any(|p| opens_with_phrase(text, p)) {
         return Some(ModelSwapIntent::Local);
     }
 
@@ -1084,7 +1209,7 @@ pub fn classify_model_swap(utterance: &str) -> Option<ModelSwapIntent> {
         "heavy mode",
         "go heavy",
     ];
-    if HEAVY_PHRASES.iter().any(|p| text.contains(p)) {
+    if HEAVY_PHRASES.iter().any(|p| opens_with_phrase(text, p)) {
         return Some(ModelSwapIntent::Heavy);
     }
 
@@ -1108,7 +1233,7 @@ pub fn classify_model_swap(utterance: &str) -> Option<ModelSwapIntent> {
         "lightweight model",
         "light mode model",
     ];
-    if FAST_PHRASES.iter().any(|p| text.contains(p)) {
+    if FAST_PHRASES.iter().any(|p| opens_with_phrase(text, p)) {
         return Some(ModelSwapIntent::Fast);
     }
 
@@ -1494,6 +1619,121 @@ mod tests {
                 classify_model_swap(u),
                 None,
                 "must NOT trigger on normal sentence {u:?}"
+            );
+        }
+    }
+
+    /// REGRESSION (the unanchored-`contains` family). Every one of these was
+    /// MEASURED classifying as a model swap: the four family checks searched for
+    /// their phrase ANYWHERE in the utterance, so a substring of ordinary English
+    /// ("go fast" inside "go faster", "power mode" inside "low power mode"), a
+    /// QUESTION about models, a PAST-TENSE report, and — worst — a NEGATED command
+    /// all installed a process-global tier override and swallowed the request.
+    /// "don't go offline" took DARWIN OFFLINE for the rest of the process.
+    #[test]
+    fn a_negated_or_incidental_mention_never_installs_a_tier_override() {
+        for u in [
+            // NEGATED: the user is refusing the very thing that used to fire.
+            "don't go offline",
+            "please don't use the powerful model",
+            "i don't want fast mode",
+            "never go offline without telling me",
+            // SUBSTRING of a longer word / of an unrelated setting.
+            "turn on low power mode",
+            "turn off low power mode",
+            "how do i make my mac go faster",
+            "why is my mac slow, can you make it go faster",
+            // A QUESTION about models is not a command to switch.
+            "what's the best model for this task",
+            // PAST-TENSE report / narration, not an imperative.
+            "did you go offline last night",
+            "the server went into offline mode yesterday",
+            "things are back to normal now",
+        ] {
+            assert_eq!(
+                classify_model_swap(u),
+                None,
+                "{u:?} must NOT be read as a model-swap command (it would swallow the \
+                 request AND pin the tier process-wide)"
+            );
+        }
+    }
+
+    /// The anchoring must not cost the REAL commands: an address/politeness/request
+    /// wrapper in front of a control phrase is peeled, and a phrase that CONTAINS a
+    /// wrapper word ("switch to opus") is matched whole before anything is peeled.
+    #[test]
+    fn a_wrapped_command_still_classifies() {
+        for (u, want) in [
+            ("darwin, go offline", ModelSwapIntent::Local),
+            ("hey darwin use the fast model", ModelSwapIntent::Fast),
+            ("please go offline", ModelSwapIntent::Local),
+            ("can you switch to opus", ModelSwapIntent::Heavy),
+            ("just go heavy", ModelSwapIntent::Heavy),
+            // "switch to" is also a peelable lead — the WHOLE phrase must win first.
+            ("switch to opus", ModelSwapIntent::Heavy),
+            ("switch to haiku", ModelSwapIntent::Fast),
+            // Peeling "use the" is what reaches the bare model-name entries.
+            ("use the lightweight model", ModelSwapIntent::Fast),
+        ] {
+            assert_eq!(classify_model_swap(u), Some(want), "{u:?} must still classify");
+        }
+    }
+
+    /// REGRESSION (the head anchor's blind side). Anchoring the control phrase at
+    /// the head dropped the PLAIN IMPERATIVE forms, which the pre-anchor code
+    /// classified correctly — measured by running both versions side by side:
+    /// "turn on offline mode", "turn on private mode", "enable offline mode",
+    /// "put it in offline mode", "set it to offline mode" and "turn on fast mode"
+    /// all went `Some` -> `None`. For Heavy/Fast/Auto a miss only costs a
+    /// convenience, but LOCAL is a PRIVACY control: a "turn on private mode" that
+    /// silently does not take effect sends the turn to the CLOUD after the user
+    /// asked it not to, so for that family a miss is NOT the safe direction.
+    ///
+    /// The second half of this test is the other side of the trade: the lead-ins
+    /// must not re-open anything the anchoring closed. The peel only exposes the
+    /// REST of the utterance to the same head-anchored match, and "turn off" /
+    /// "disable" are deliberately not leads.
+    #[test]
+    fn a_plain_imperative_lead_in_still_reaches_the_control_phrase() {
+        for (u, want) in [
+            ("turn on offline mode", ModelSwapIntent::Local),
+            ("turn on private mode", ModelSwapIntent::Local),
+            ("enable offline mode", ModelSwapIntent::Local),
+            ("put it in offline mode", ModelSwapIntent::Local),
+            ("put yourself in private mode", ModelSwapIntent::Local),
+            ("set it to offline mode", ModelSwapIntent::Local),
+            ("turn on fast mode", ModelSwapIntent::Fast),
+            ("turn on auto mode", ModelSwapIntent::Auto),
+            ("can you turn on offline mode", ModelSwapIntent::Local),
+        ] {
+            assert_eq!(
+                classify_model_swap(u),
+                Some(want),
+                "{u:?} is a plain imperative model command and must classify"
+            );
+        }
+        for u in [
+            // The measured false triggers stay closed: the peel exposes
+            // "low power mode", which "power mode" does not open either.
+            "turn on low power mode",
+            "turn off low power mode",
+            // The INVERSE command must never be read as the command.
+            "turn off offline mode",
+            "don't turn on offline mode",
+            // A question about a phone setting is not an order to re-aim the model.
+            "how do i turn on offline mode on my phone",
+            // Ordinary imperatives that merely start the same way.
+            "turn on the lights",
+            "turn on the clock",
+            "enable the plugin",
+            "enable two factor authentication",
+            "put it in the drawer",
+        ] {
+            assert_eq!(
+                classify_model_swap(u),
+                None,
+                "{u:?} must NOT be read as a model-swap command"
             );
         }
     }

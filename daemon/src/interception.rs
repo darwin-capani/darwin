@@ -452,6 +452,12 @@ struct Summary {
     loopback_resolvers: usize,
     system_certs_non_apple: usize,
     profiles: usize,
+    /// Whether the /etc/hosts read SUCCEEDED. `host_blocks` is deliberately excluded
+    /// from [`Summary::notable`] (block entries have too many benign causes to
+    /// alarm on), but the "all clear" posture line still asserted "hosts file clean"
+    /// from `notable() == 0` alone — so it claimed a clean hosts file both when the
+    /// same tick had just counted entries on it AND when the file was never read.
+    hosts_read: bool,
     /// Surfaces that could not be read, each with an honest reason.
     skips: Vec<String>,
 }
@@ -527,6 +533,7 @@ fn summarize(f: &Findings) -> Summary {
         loopback_resolvers,
         system_certs_non_apple,
         profiles,
+        hosts_read: f.hosts.is_ok(),
         skips,
     }
 }
@@ -684,9 +691,28 @@ pub fn posture_line() -> Option<String> {
         )
     };
     if s.notable() == 0 {
+        // The hosts clause states only what this tick actually KNOWS. Saying "hosts
+        // file clean" from `notable() == 0` was wrong twice over: `notable()`
+        // deliberately excludes `host_blocks`, so the same tick could be emitting
+        // `counts.host_blocks: 3` and three "Your hosts file maps …" findings while
+        // this line called the surface clean; and when the hosts read FAILED the
+        // counts fall to 0 and it called a file it never opened clean — a fabricated
+        // clean, in a module whose whole contract is that an unreadable surface never
+        // fabricates one.
+        let hosts_clause = if !s.hosts_read {
+            "hosts file not read".to_string()
+        } else if s.host_blocks > 0 {
+            format!(
+                "{} hosts entry(ies) mapping names to a local/blocked address (benign-looking — \
+                 listed in the report)",
+                s.host_blocks
+            )
+        } else {
+            "hosts file clean".to_string()
+        };
         return Some(format!(
             "Interception check: no proxy, no non-Apple admin-trusted root CA, {} DNS resolver(s), \
-             hosts file clean — nothing appears to be intercepting your traffic. Read-only.{skip_note}",
+             {hosts_clause} — nothing appears to be intercepting your traffic. Read-only.{skip_note}",
             s.resolvers_total
         ));
     }
@@ -1184,11 +1210,65 @@ _computerlevel[1] attribute: name: Acme Device Management";
             loopback_resolvers: 0,
             system_certs_non_apple: 0,
             profiles: 0,
+            hosts_read: true,
             skips: Vec::new(),
         });
         let line = posture_line().expect("a cached summary");
         assert!(line.to_lowercase().contains("nothing appears to be intercepting"), "{line}");
         assert!(line.contains("2 DNS resolver(s)"), "{line}");
+    }
+
+    /// REGRESSION: the "nothing appears to be intercepting your traffic" line must
+    /// not claim "hosts file clean" when the same tick counted hosts entries — or
+    /// when the hosts file was never read at all. `notable()` deliberately excludes
+    /// `host_blocks`, so a machine with an ad-blocker hosts file (or a dev pinning
+    /// `api.staging.internal` to 127.0.0.1) and no proxy / no rogue root / no
+    /// loopback resolver got `notable() == 0` and the clean branch — while the very
+    /// same tick emitted `counts.host_blocks: 3` and three "Your hosts file maps …"
+    /// findings. In a module whose contract is "an unreadable surface never
+    /// fabricates 'clean'", that is a fabricated clean for the hosts surface.
+    #[test]
+    fn the_clean_posture_line_never_claims_a_hosts_file_it_did_not_read_or_did_not_like() {
+        let base = Summary {
+            proxies: 0,
+            host_redirects: 0,
+            host_blocks: 0,
+            trusted_roots_total: 0,
+            trusted_roots_non_apple: 0,
+            resolvers_total: 2,
+            loopback_resolvers: 0,
+            system_certs_non_apple: 0,
+            profiles: 0,
+            hosts_read: true,
+            skips: Vec::new(),
+        };
+
+        // (1) Read, and genuinely empty -> "clean" is TRUE and stays.
+        set_last_summary(base.clone());
+        let line = posture_line().expect("a cached summary");
+        assert!(line.contains("hosts file clean"), "{line}");
+        assert_eq!(base.notable(), 0, "precondition: this is the clean branch");
+
+        // (2) Read, with block entries -> `notable()` is STILL 0, but the line must
+        //     report the entries instead of calling the surface clean.
+        let with_blocks = Summary { host_blocks: 3, ..base.clone() };
+        assert_eq!(with_blocks.notable(), 0, "precondition: blocks are excluded from notable()");
+        set_last_summary(with_blocks);
+        let line = posture_line().expect("a cached summary");
+        assert!(!line.contains("hosts file clean"), "must not fabricate a clean hosts file: {line}");
+        assert!(line.contains("3 hosts entry(ies)"), "the entries it DID find are reported: {line}");
+
+        // (3) NOT read (the read timed out / was denied) -> never "clean".
+        let unread = Summary {
+            hosts_read: false,
+            skips: vec!["hosts file: the check timed out".to_string()],
+            ..base.clone()
+        };
+        set_last_summary(unread);
+        let line = posture_line().expect("a cached summary");
+        assert!(!line.contains("hosts file clean"), "a file it never opened is not clean: {line}");
+        assert!(line.contains("hosts file not read"), "{line}");
+        assert!(line.contains("privilege I don't have"), "the skip is still surfaced: {line}");
     }
 
     // -- the read commands are exactly the read-only local reads -------------

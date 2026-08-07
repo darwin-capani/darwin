@@ -393,7 +393,13 @@ pub async fn set_relationship(
 /// True if any attribute row already exists for this entity (so a write to it is
 /// an UPDATE, exempt from the new-entity cap). One attribute row is enough to
 /// prove existence, so a tiny limit suffices.
-async fn entity_exists(memory: &Memory, etype: EntityType, id: &str) -> Result<bool> {
+///
+/// `pub(crate)` so the knowledge-graph BUILD shares this ONE exact-key existence
+/// check instead of re-deriving the `user.world.entity.<type>.<slug>.` key shape
+/// (it used the LEXICAL `query()` and got the wrong answer — see
+/// `knowledge_graph::build_from_chunks`). A second private copy of the key
+/// composition is how that would drift apart again.
+pub(crate) async fn entity_exists(memory: &Memory, etype: EntityType, id: &str) -> Result<bool> {
     let prefix = format!("{ENTITY_PREFIX}{}.{id}.", etype.as_str());
     let rows = memory.recall_facts_limited(&prefix, 1).await?;
     Ok(!rows.is_empty())

@@ -488,10 +488,12 @@ pub async fn episodic_recall(
     }
 
     // 3. Topical ranking over the candidates. Map each episode to a recall::Fact
-    //    (key = the row id so we can map a hit back to its episode; value = the
-    //    searchable text), rank runtime-selected, then re-materialize the ranked
-    //    episodes in hit order. Zero-score episodes are dropped by rank() — no
-    //    fabrication on a no-match query.
+    //    (key EMPTY — `Fact::searchable()` concatenates key + value, so ANYTHING
+    //    in the key becomes a searchable TERM; a hit is mapped back to its episode
+    //    by its `index`, never by the key. See the note at the mapping below),
+    //    value = the searchable text; rank runtime-selected, then re-materialize
+    //    the ranked episodes in hit order. Zero-score episodes are dropped by
+    //    rank() — no fabrication on a no-match query.
     if candidates.is_empty() {
         return EpisodicRecall {
             episodes: Vec::new(),
@@ -501,7 +503,16 @@ pub async fn episodic_recall(
     let facts: Vec<Fact> = candidates
         .iter()
         .map(|ep| Fact {
-            key: ep.id.to_string(),
+            // KEY MUST STAY EMPTY. `Fact::searchable()` is `format!("{} {}", key,
+            // value)` and BOTH ranker backends score that whole string, so putting
+            // the SQLite row id here made the row id a searchable TERM: the query
+            // "what did I say about route 66" returned the episode whose rowid is
+            // 66 — an unrelated "memory" — and a rare numeric term carries high
+            // BM25 IDF, so it outranked genuine partial matches. The id was never
+            // needed: a hit is resolved back to its episode by `h.index` below, so
+            // the key was pure contamination of a module whose stated contract is
+            // "a no-match query returns NOTHING — never a fabricated episode".
+            key: String::new(),
             value: episode_searchable(ep),
         })
         .collect();
@@ -905,6 +916,48 @@ mod tests {
     // =====================================================================
     // AGENT SCOPING — agent A never sees agent B's episodes
     // =====================================================================
+
+    /// REGRESSION: a bare NUMBER in the query must never match an episode's SQLite
+    /// row id. The ranker input used `key: ep.id.to_string()`, and `Fact::searchable()`
+    /// concatenates key + value, so the row id was a searchable term — "what did I
+    /// say about route 66" returned the episode stored at rowid 66.
+    #[tokio::test]
+    async fn a_bare_number_never_matches_an_episodes_row_id() {
+        let db = TempDb::new("rowid");
+        let mem = Memory::open(&db.0).unwrap();
+        for u in [
+            "remind me to water the plants",
+            "my corgi is named Watson",
+            "I prefer neovim over vscode",
+        ] {
+            seed(&mem, "agent.darwin", u, "conversation").await;
+        }
+        // Learn the REAL row ids (they are SQLite rowids, not fixed by this test).
+        let all = episodic_recall(&mem, "agent.darwin", "", None, 10, &LexicalOnlyEmbedder).await;
+        assert_eq!(all.episodes.len(), 3, "precondition: three episodes are stored");
+        for ep in &all.episodes {
+            let q = format!("what did I say about route {}", ep.id);
+            let out =
+                episodic_recall(&mem, "agent.darwin", &q, None, 5, &LexicalOnlyEmbedder).await;
+            assert!(
+                out.episodes.is_empty(),
+                "row id {} must not be a searchable term; {q:?} returned {:?}",
+                ep.id,
+                out.episodes.iter().map(|e| e.utterance_redacted.clone()).collect::<Vec<_>>()
+            );
+        }
+        // CONTROL: a genuinely topical query still recalls, so the fix did not
+        // simply blind the ranker.
+        let hit = episodic_recall(
+            &mem, "agent.darwin", "corgi Watson", None, 5, &LexicalOnlyEmbedder,
+        )
+        .await;
+        assert!(
+            hit.episodes.iter().any(|e| e.utterance_redacted.contains("corgi")),
+            "a real topical match must still be found: {:?}",
+            hit.episodes
+        );
+    }
 
     #[tokio::test]
     async fn recall_is_agent_scoped_own_plus_shared_never_cross_agent() {

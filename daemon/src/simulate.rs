@@ -462,20 +462,48 @@ fn plan_tool(utterance: &str, mode: Option<Mode>) -> Option<PlannedTool> {
 /// device-context scoping in `agents.rs::is_home_query`: the broad verbs
 /// ("turn on/off", "lock/unlock", "set") only count alongside a home-device noun,
 /// so "turn on do-not-disturb" is NOT read as a device action.
+///
+/// WHAT WENT WRONG: that "mirrors agents.rs" claim was false. `is_home_query` uses
+/// `contains_word`; this used raw `t.contains(n)`, so a device noun matched INSIDE
+/// an unrelated word — "ac" in account/backup/replacement/track, "lock" in
+/// clock/block, "fan" in fanfare, "plug" in plugin, "door" in doorway. Measured:
+///   "unlock my account"              -> Some("unlock")
+///   "turn off the backup"            -> Some("turn_off")
+///   "turn on the clock"              -> Some("lock")     <- not even the right verb
+///   "turn on the replacement server" -> Some("turn_on")
+/// PRECOG then answered the user's "what would you do if I said X" with a
+/// FABRICATED plan — "I'd prepare 'dume_control' … it would PARK for your spoken
+/// yes", and for the "lock" case "there'd be no mechanical undo, so I'd be extra
+/// clear before firing" — for utterances with no home device in them at all. And
+/// because `home_action` is the FIRST cue `plan_tool` checks, a false positive also
+/// pre-empted the correct projection for a mixed utterance.
+///
+/// The verbs are whole-word too now: without that, "turn on the bedroom clock"
+/// passed the (correct) device gate and then matched "lock" inside "clock".
 fn home_action(t: &str) -> Option<&'static str> {
     const DEVICE_NOUNS: &[&str] = &[
         "light", "lights", "lamp", "thermostat", "heater", "heating", "ac", "fan",
         "door", "lock", "blinds", "shades", "outlet", "plug", "bedroom", "living room",
         "kitchen", "garage", "scene", "hvac",
     ];
-    let has_device = DEVICE_NOUNS.iter().any(|n| t.contains(n));
+    // Single tokens use the WHOLE-WORD check (the substring trap above); the
+    // multi-word phrases are already specific, so they stay plain `contains` —
+    // the same split `agents.rs::is_triage_query` documents. (`contains_word`
+    // splits on non-alphanumerics, so a needle with a space can never match.)
+    let has_device = DEVICE_NOUNS.iter().any(|n| {
+        if n.contains(' ') {
+            t.contains(n)
+        } else {
+            crate::agents::contains_word(t, n)
+        }
+    });
     if !has_device {
         return None;
     }
-    if t.contains("unlock") {
+    if crate::agents::contains_word(t, "unlock") {
         return Some("unlock");
     }
-    if t.contains("lock") {
+    if crate::agents::contains_word(t, "lock") {
         return Some("lock");
     }
     if t.contains("turn on") {
@@ -706,6 +734,59 @@ mod tests {
         assert_eq!(out.tool.as_deref(), Some("dume_control"));
         assert!(out.would_park);
         assert!(!out.reversible, "arming an unlock is not offered as an undo");
+    }
+
+    /// REGRESSION: PRECOG must not project a SMART-HOME action for an utterance
+    /// that merely contains a device noun as a SUBSTRING. `home_action` matched
+    /// DEVICE_NOUNS with raw `contains`, so "ac" hit account/backup/replacement,
+    /// "lock" hit clock/block — and it is the FIRST cue `plan_tool` checks, so the
+    /// false positive also pre-empted the correct projection. Measured before the
+    /// fix: "unlock my account" -> unlock, "turn off the backup" -> turn_off,
+    /// "turn on the clock" -> lock (not even the right verb). PRECOG then told the
+    /// user "I'd prepare 'dume_control' … it would PARK for your spoken yes" for a
+    /// request with no home device in it.
+    #[test]
+    fn a_device_noun_hiding_inside_another_word_is_not_a_home_action() {
+        let (agents, _) = AgentRegistry::load(std::path::Path::new("/nonexistent/agents.toml"));
+        let cfg = Config::default();
+        let scorer = LexicalAgentScorer;
+        let c = ctx(&agents, &cfg, &scorer, true);
+        for u in [
+            "unlock my account",                // "ac" inside "account"
+            "turn off the backup",              // "ac" inside "backup"
+            "turn on the clock",                // "lock" inside "clock"
+            "turn on the replacement server",   // "ac" inside "replacement"
+            "turn off the plugin",              // "plug" inside "plugin"
+        ] {
+            let out = simulate(u, &predicted("conversation", 0.7, "light"), &c);
+            assert_ne!(
+                out.tool.as_deref(),
+                Some("dume_control"),
+                "{u:?} names no home device — PRECOG must not project a gated \
+                 smart-home action for it"
+            );
+        }
+        // CONTROL: a REAL home action still projects (and still parks).
+        let out = simulate(
+            "turn on the living room lights",
+            &predicted("conversation", 0.7, "light"),
+            &c,
+        );
+        assert_eq!(out.tool.as_deref(), Some("dume_control"), "a real device action still projects");
+        assert!(out.would_park);
+        // …and a device noun with a verb hiding inside an unrelated word still reads
+        // the RIGHT verb: "turn on the bedroom clock" is a turn_on, never a "lock".
+        let out = simulate(
+            "turn on the bedroom clock",
+            &predicted("conversation", 0.7, "light"),
+            &c,
+        );
+        assert_eq!(out.tool.as_deref(), Some("dume_control"), "bedroom IS a device context");
+        assert!(
+            out.reversible,
+            "the verb must read as turn_on (which HAS a mechanical inverse), not the \
+             'lock' that used to hide inside \"clock\" and reported irreversible"
+        );
     }
 
     #[test]

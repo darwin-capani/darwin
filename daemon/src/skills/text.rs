@@ -84,7 +84,7 @@ pub fn skills() -> Vec<SkillDef> {
         SkillDef::new(
             "normalize_whitespace",
             Category::Text,
-            "Collapse runs of whitespace to single spaces and trim each line, dropping blank lines. Use to clean up messy spacing/tabs/trailing whitespace in text.",
+            "Collapse runs of whitespace to single spaces. BY DEFAULT the whole text becomes ONE line; pass keep_lines=true to instead clean each line separately and drop blank lines. Use to clean up messy spacing/tabs/trailing whitespace in text.",
             &["normalize whitespace", "collapse spaces", "trim whitespace", "clean up spacing"],
             normalize_whitespace,
         ),
@@ -556,12 +556,12 @@ fn first_match(
     text: &[char],
     budget: &std::cell::Cell<u64>,
 ) -> Result<Option<(usize, usize)>, RegexBudgetExceeded> {
-    let starts: Vec<usize> = if pattern.anchor_start {
-        vec![0]
-    } else {
-        (0..=text.len()).collect()
-    };
-    for s in starts {
+    // SCAN the candidate start positions; do NOT MATERIALIZE them. `(0..=len)`
+    // collected into a Vec allocates 8 bytes per character of input — 8 MB for the
+    // skill's own 1 MiB `MAX_INPUT` — before a single comparison runs. A Range is
+    // already an iterator.
+    let last = if pattern.anchor_start { 0 } else { text.len() };
+    for s in 0..=last {
         if let Some(end) = match_here(&pattern.tokens, 0, text, s, pattern.anchor_end, budget)? {
             return Ok(Some((s, end)));
         }
@@ -612,19 +612,34 @@ fn regex_extract(args: &Value) -> Result<String> {
     let mut matches = Vec::new();
     let mut pos = 0;
     while pos <= chars.len() {
-        // Re-anchor the search to start at or after `pos`.
-        let sub_starts: Vec<usize> = if pattern.anchor_start {
-            if pos == 0 { vec![0] } else { vec![] }
-        } else {
-            (pos..=chars.len()).collect()
-        };
+        // Re-anchor the search to start at or after `pos` — SCANNING the candidate
+        // start positions, not MATERIALIZING them.
+        //
+        // WHAT WENT WRONG: this used to `collect()` `(pos..=chars.len())` into a Vec
+        // on EVERY iteration of the outer match loop, even though the inner loop
+        // breaks at the FIRST hit. With m matches over n chars that is
+        // sum(n - pos) ~= n^2/2 usizes allocated and filled — work the step budget
+        // NEVER charges, because `charge` only counts atom comparisons inside
+        // `match_here`. Measured at the skill's own MAX_INPUT (1 MiB) with the
+        // pattern ".": 74.6 seconds of CPU, RETURNING Ok — the budget was never
+        // exhausted because "." charges ~1.05M of its 2M allowance. That directly
+        // contradicts this file's own guarantee ("a crafted pattern cannot wedge the
+        // daemon's single event loop"), and `regex_extract` is called synchronously
+        // from the async tool dispatch, so the burn pins a tokio worker throughout.
+        // A Range is already an iterator; nothing needs materializing, and the
+        // scan-for-next-start now costs the distance advanced, not the whole
+        // remaining text.
         let mut found = None;
-        for s in sub_starts {
-            if let Some(end) = match_here(&pattern.tokens, 0, &chars, s, pattern.anchor_end, &budget)
-                .map_err(|_| too_complex_err())?
-            {
-                found = Some((s, end));
-                break;
+        if !pattern.anchor_start || pos == 0 {
+            let last = if pattern.anchor_start { 0 } else { chars.len() };
+            for s in pos..=last {
+                if let Some(end) =
+                    match_here(&pattern.tokens, 0, &chars, s, pattern.anchor_end, &budget)
+                        .map_err(|_| too_complex_err())?
+                {
+                    found = Some((s, end));
+                    break;
+                }
             }
         }
         match found {
@@ -1234,6 +1249,37 @@ mod tests {
         assert!(regex_test(&json!({"text": "a", "pattern": "[a-"})).is_err());
         // Missing args.
         assert!(regex_test(&json!({"text": "a"})).is_err());
+    }
+
+    /// REGRESSION: `regex_extract`'s cost must be LINEAR-ish in the input, not
+    /// quadratic. It used to rebuild the whole remaining start-index Vec on every
+    /// iteration of the outer match loop — sum(n - pos) ~= n^2/2 usizes — work
+    /// `charge` never counts, so the step budget could not stop it. Measured at the
+    /// skill's own MAX_INPUT (1 MiB) with pattern ".": 74.6 s of CPU, returning Ok,
+    /// with a tokio worker pinned throughout.
+    ///
+    /// This test DOES need a wall-clock assert (unlike its sibling below, where
+    /// merely completing proves the hang is gone): the quadratic version COMPLETES,
+    /// it is just ~40x slower. The margin is deliberately huge — the fixed path runs
+    /// this in well under a second, while the quadratic one measured ~10 s at this
+    /// size — so a loaded machine cannot flip it.
+    #[test]
+    fn regex_extract_is_not_quadratic_in_the_input_length() {
+        let n = 400_000usize;
+        let text = "a".repeat(n);
+        let t0 = std::time::Instant::now();
+        let out = regex_extract(&json!({"text": text, "pattern": "."})).expect("matches");
+        let elapsed = t0.elapsed();
+        assert!(
+            out.starts_with(&format!("{n} matches")),
+            "precondition: every character matched, got: {}",
+            &out[..out.len().min(40)]
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "regex_extract over {n} chars took {elapsed:?} — the start positions are \
+             being materialized again (quadratic, and uncharged by the step budget)"
+        );
     }
 
     #[test]

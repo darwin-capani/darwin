@@ -10,10 +10,12 @@
 //! the [`FiredState`] of what was last surfaced, and returns a [`Decision`]:
 //!   - `Nothing`            — no trigger crossed its threshold, or a guard
 //!     suppressed it (debounce / cooldown / quiet hours);
-//!   - `Surface(Brief)`     — emit a HUD proactive card only (the SHIPPED
-//!     default: `[proactive].speak = false`);
+//!   - `Surface(Brief)`     — emit a HUD proactive card only. This is what you
+//!     get when the OPERATOR sets `[proactive].speak = false`;
 //!   - `Speak(Brief)`       — additionally voice it via the EXISTING speech
-//!     path, ONLY when the operator has opted in.
+//!     path. **THIS IS THE SHIPPED OUTCOME**: `[proactive].speak` ships `true`
+//!     (config.rs `impl Default for ProactiveConfig`, config/darwin.toml), so out
+//!     of the box a trigger that survives every guard IS voiced.
 //!
 //! The [`Brief`] it composes is GROUNDED: every line traces to a field of the
 //! `Signals` snapshot. The evaluator never invents a fact, a number, a time, or
@@ -33,8 +35,12 @@
 //!     hour band, EDITH stays silent entirely (it surfaces NOTHING, not even a
 //!     card — the user asked not to be interrupted).
 //!
-//! SAFETY: the evaluator decides `Speak` ONLY when `cfg.speak` is true; with it
-//! false (the shipped default) the strongest outcome is `Surface`. EDITH never
+//! SAFETY: the evaluator decides `Speak` ONLY when `cfg.speak` is true — and
+//! `[proactive].speak` SHIPS TRUE, so on a shipped install DARWIN DOES speak
+//! unprompted (a brief that survives every guard is voiced). Setting it false is an
+//! OPERATOR choice, and then the strongest outcome is `Surface`. This section used
+//! to say the opposite, which is the wrong answer to the one question a reader
+//! brings to the only module in the daemon that can speak unprompted. EDITH never
 //! *acts* — a consequential follow-up the user approves still routes through
 //! `integrations::gate()` at the call site, never from here. And when the live
 //! loop does speak, it goes through speech.rs `speak()` like every other
@@ -52,10 +58,12 @@ use serde_json::{json, Value};
 /// alone — no globals, fully unit-testable.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Policy {
-    /// Master switch for SPOKEN proactivity. `false` (the shipped default):
-    /// EDITH only ever returns `Surface` (a HUD card) — it NEVER speaks
-    /// unprompted. `true`: a relevant, un-suppressed trigger may return
-    /// `Speak`, voiced through the existing speech path.
+    /// Master switch for SPOKEN proactivity. `true` — THE SHIPPED VALUE
+    /// (`[proactive].speak` defaults true; `Policy::from_config` always overwrites
+    /// `Policy::default()`'s `false` with it, and main.rs builds the live policy
+    /// through `from_config`): a relevant, un-suppressed trigger may return `Speak`,
+    /// voiced through the existing speech path. `false` — an OPERATOR choice: EDITH
+    /// only ever returns `Surface` (a HUD card) and NEVER speaks unprompted.
     pub speak: bool,
     /// A calendar event this many minutes away (or nearer) is worth surfacing.
     pub lead_minutes: i64,
@@ -90,6 +98,9 @@ impl Default for Policy {
     /// nighttime band (22:00-07:00 local) so EDITH never wakes the user.
     fn default() -> Self {
         Self {
+            // The STRUCT default only — NOT the shipped posture. The live policy is
+            // always built by `Policy::from_config`, which overwrites this with
+            // `[proactive].speak`, and that ships TRUE.
             speak: false,
             lead_minutes: 15,
             unread_floor: 3,
@@ -290,7 +301,8 @@ impl Brief {
 pub enum Decision {
     /// Nothing to surface (no trigger, or a guard suppressed it).
     Nothing,
-    /// Surface a HUD card only — the shipped default (`speak = false`).
+    /// Surface a HUD card only — what the operator gets with `speak = false`.
+    /// (NOT the shipped default; `[proactive].speak` ships true.)
     Surface(Brief),
     /// Surface AND speak — only when the operator enabled `[proactive].speak`.
     Speak(Brief),
@@ -465,8 +477,9 @@ pub fn evaluate(
         return Decision::Nothing;
     }
 
-    // Survived every guard. Speak only when the operator opted in; otherwise a
-    // HUD card is the strongest outcome (the shipped default).
+    // Survived every guard. Speak when `speak` is on — which is the SHIPPED value,
+    // so this is the ordinary outcome; a HUD card alone is what an operator who set
+    // `[proactive].speak = false` gets.
     if policy.speak {
         Decision::Speak(brief)
     } else {

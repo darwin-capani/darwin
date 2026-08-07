@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
@@ -756,9 +756,19 @@ pub struct ConverseDone {
     /// server measured it — else all-None. Forwarded to the HUD's inference-perf
     /// surface so the measurement is no longer dropped at the converse parser.
     pub metrics: DecodeMetrics,
-    /// Whether speculative decoding actually drove this turn (server-reported).
+    /// Whether speculative decoding actually drove this turn.
+    ///
+    /// ALWAYS `None` ON CONVERSE — not "server-reported". The converse done event
+    /// (`inference/server.py`) carries exactly id/event/ok/text/sentences/
+    /// first_sentence_ms/metrics/latency_ms; `speculative`/`quant` exist ONLY on
+    /// the `op=generate` response, and the daemon's `Response` struct has no field
+    /// for them there either, so they are dropped on that path too. Kept as the
+    /// parse seam for a future server that does report them — but nothing reads a
+    /// real value today, and `speech.rs`'s `|| d.speculative.is_some()` emit
+    /// disjunct is consequently dead.
     pub speculative: Option<bool>,
-    /// The quant that actually loaded for this turn (server-reported).
+    /// The quant that actually loaded for this turn. ALWAYS `None` on converse —
+    /// see [`ConverseDone::speculative`].
     pub quant: Option<String>,
 }
 
@@ -864,12 +874,18 @@ fn jittered_delay(base: Duration, seed: u64) -> Duration {
 
 // ---------------------------------------------------------------------------
 // SHARED INFERENCE HEALTH — a process-global snapshot of inference-server
-// reachability, published by the background liveness task (liveness_task) and
-// read by the daemon's degraded-mode logic + the HUD. Today a down server is
-// only discovered when a user turn is LOST; this lets the system know it is
-// degraded BEFORE a turn fails. Multiple InferenceClients exist (mic loop +
-// reflect + anticipation + standing); ONE liveness probe feeds this one shared
-// state so they don't each have to discover the outage independently.
+// reachability, published by the background liveness task (liveness_task).
+//
+// NO CONSUMER TODAY. This comment used to say the state was "read by the daemon's
+// degraded-mode logic + the HUD"; it is not, and neither exists. `health_snapshot()`
+// is the only read API and its ONLY callers repo-wide are liveness_task's own
+// telemetry payload and this module's unit test — `InferenceHealth` appears nowhere
+// else in daemon/src, and the HUD could not read a daemon process-global anyway. No
+// code path anywhere changes behaviour on this state. It is kept because the probe
+// + the emitted frames are cheap and useful to any telemetry client, NOT because
+// anything acts on them: a down server is still discovered only when a user turn is
+// LOST. Multiple InferenceClients exist (mic loop + reflect + anticipation +
+// standing); ONE liveness probe feeds this one shared state.
 // ---------------------------------------------------------------------------
 
 /// Default cadence of the background liveness probe. Frequent enough that the
@@ -948,13 +964,19 @@ fn record_probe(ok: bool, now_unix: i64) -> bool {
 /// Background liveness loop: every [`LIVENESS_INTERVAL`] it connect-probes the
 /// inference socket (NO model call — `probe_reachable` connects + closes) and
 /// folds the result into the shared [`InferenceHealth`]. On every probe it
-/// publishes an `inference.health` telemetry frame (so the HUD can render a
-/// degraded badge); on an UP<->DOWN transition it logs + emits a coherent
-/// `inference.degraded` / `inference.recovered` frame ONCE, instead of the
-/// per-turn `inference.unavailable` spam the daemon emits today. Never blocks
-/// the pipeline and never panics it (a poisoned lock just skips the tick).
-/// This is the proactive half of degraded-mode honesty; the per-turn abort
-/// path is unchanged.
+/// publishes an `inference.health` telemetry frame; on an UP<->DOWN transition it
+/// logs + emits a coherent `inference.degraded` / `inference.recovered` frame
+/// ONCE. Never blocks the pipeline and never panics it (a poisoned lock just
+/// skips the tick).
+///
+/// FOR THE TELEMETRY JOURNAL ONLY — no consumer today. This doc used to say the
+/// frames let "the HUD render a degraded badge" and that they replace "the
+/// per-turn `inference.unavailable` spam the daemon emits today". Neither is
+/// true: the HUD reducer (`hud/src/core/state.ts`) has cases for
+/// `inference.unavailable` and `inference.decode` and for NOTHING else on this
+/// topic, so all three frames fall through its default and change no HUD state;
+/// and the per-turn `inference.unavailable` events are still emitted from five
+/// live sites and remain the ONE inference-health signal the HUD renders.
 pub async fn liveness_task(socket_path: PathBuf, interval: Duration) {
     let probe = InferenceClient::new(socket_path);
     let mut ticker = tokio::time::interval(interval);
@@ -995,12 +1017,76 @@ pub async fn liveness_task(socket_path: PathBuf, interval: Duration) {
     }
 }
 
+/// Read ONE inference response line, buffering AT MOST [`MAX_INFERENCE_LINE_BYTES`].
+///
+/// WHAT WENT WRONG: both readers on this socket used tokio's `read_line`, which
+/// grows the target String WITHOUT LIMIT until it sees a `\n`, and then checked
+/// `buf.len() > MAX_INFERENCE_LINE_BYTES` AFTERWARDS. The cap therefore bounded
+/// NOTHING — the `bail!` was unreachable in the exact case it was written for (to
+/// reach it the server must send an over-cap line that DOES end in a newline, by
+/// which point the memory is already committed). A hijacked or spoofed inference
+/// server that streams bytes with NO newline drove the daemon's RSS as high as it
+/// liked for the whole op window (REQUEST_TIMEOUT 30s / CONSOLIDATE_TIMEOUT 120s;
+/// the converse loop's timeout is per-read and also outside the read). Measured
+/// with the daemon's own tokio against a fake server streaming 512 MiB with no
+/// `\n`: 224 MiB resident at 500 ms, 391 MiB at 1.5 s — from a constant whose own
+/// comment claims it "bounds a hijacked inference server from OOMing the daemon".
+///
+/// This delegates to the repo's already-audited bounded reader — the SAME one
+/// `apps.rs` / `genproxy.rs` / `fetchproxy.rs` use on the untrusted micro-app
+/// socket. It caps the buffer AS IT FILLS, and it is cancellation-safe (the
+/// accumulator lives in the CALLER's `pending`), which is load-bearing here
+/// because `converse_roundtrip` wraps this read in a `tokio::time::timeout` that
+/// can drop the future mid-line. Its oversize error is re-worded for this socket.
+async fn read_inference_line(
+    reader: &mut BufReader<OwnedReadHalf>,
+    pending: &mut Vec<u8>,
+    buf: &mut String,
+) -> Result<usize> {
+    match crate::apps::read_line_bounded(reader, pending, buf, MAX_INFERENCE_LINE_BYTES).await {
+        Ok(n) => Ok(n),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => Err(anyhow!(
+            "inference line exceeds {} bytes",
+            MAX_INFERENCE_LINE_BYTES
+        )),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Clamp a caller's `describe_image` decode budget to [`DESCRIBE_IMAGE_MAX_TOKENS_CAP`]
+/// (absent => the daemon default). PURE, and extracted on purpose: the test that
+/// claimed to cover this clamp asserted `99_999u32.min(1024) == 1024` — a property
+/// of `u32::min`, not of this crate — so deleting the `.min(..)` from the request
+/// builder left the whole suite green.
+fn clamp_describe_tokens(asked: Option<u32>) -> u32 {
+    asked
+        .unwrap_or(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS)
+        .min(DESCRIBE_IMAGE_MAX_TOKENS_CAP)
+}
+
+/// Clamp a requested canvas size into [MIN, MAX]. `None` passes through so the
+/// server applies its own default. PURE — see [`clamp_describe_tokens`] for why
+/// these are functions and not inline expressions.
+fn clamp_image_size(asked: Option<u32>) -> Option<u32> {
+    asked.map(|s| s.clamp(GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_MAX_SIZE))
+}
+
+/// Clamp a requested sampler step count into [1, CAP]. `None` passes through.
+fn clamp_image_steps(asked: Option<u32>) -> Option<u32> {
+    asked.map(|s| s.clamp(1, GENERATE_IMAGE_MAX_STEPS_CAP))
+}
+
 /// Lazy JSONL client for the Python inference server. The daemon must keep
 /// running when the server is down, so every failure surfaces as Err and the
 /// connection is dropped for a fresh attempt next time.
 pub struct InferenceClient {
     socket_path: PathBuf,
     conn: Option<(BufReader<OwnedReadHalf>, OwnedWriteHalf)>,
+    /// Partial bytes carried across reads by [`read_inference_line`]. It lives on
+    /// the CLIENT, not in the read function, so a `tokio::time::timeout` that drops
+    /// the converse read future mid-line does not lose the bytes already pulled off
+    /// the socket. Cleared whenever a fresh connection is established.
+    pending: Vec<u8>,
     next_id: u64,
 }
 
@@ -1009,6 +1095,7 @@ impl InferenceClient {
         Self {
             socket_path,
             conn: None,
+            pending: Vec::new(),
             next_id: 0,
         }
     }
@@ -1510,6 +1597,19 @@ impl InferenceClient {
         })
     }
 
+    /// SELF-DISTILLATION (distill.rs): tell the inference server to DROP its
+    /// resident LLM so the NEXT generate reloads with the current
+    /// state/lora/promoted/ pointer — fusing a freshly-promoted personal adapter,
+    /// or serving base after a rollback. BEST-EFFORT: the on-disk pointer is the
+    /// source of truth, so a server that's down or on an old build simply picks
+    /// up the change on its next (re)start; the caller treats an error as
+    /// "applies on restart", never a failure of the promotion itself.
+    pub async fn reload_lora(&mut self) -> Result<()> {
+        let req = Request::new(self.fresh_id(), "reload_lora");
+        let _ = self.request_raw(&req, "reload_lora", REQUEST_TIMEOUT).await?;
+        Ok(())
+    }
+
     /// ON-DEVICE VISUAL DESCRIPTION (VLM). Hand the server a LOCAL image `path`
     /// (the DAEMON path-confines it via canonicalize + allowed-root BEFORE this
     /// call) and an OPTIONAL `question` (absent => a general scene description
@@ -1532,19 +1632,6 @@ impl InferenceClient {
     /// description). NOT exercised against a real model by any test — the op
     /// dispatch + the unavailable path are proven with a stub; the description
     /// QUALITY is device-gated and never claimed measured.
-    /// SELF-DISTILLATION (distill.rs): tell the inference server to DROP its
-    /// resident LLM so the NEXT generate reloads with the current
-    /// state/lora/promoted/ pointer — fusing a freshly-promoted personal adapter,
-    /// or serving base after a rollback. BEST-EFFORT: the on-disk pointer is the
-    /// source of truth, so a server that's down or on an old build simply picks
-    /// up the change on its next (re)start; the caller treats an error as
-    /// "applies on restart", never a failure of the promotion itself.
-    pub async fn reload_lora(&mut self) -> Result<()> {
-        let req = Request::new(self.fresh_id(), "reload_lora");
-        let _ = self.request_raw(&req, "reload_lora", REQUEST_TIMEOUT).await?;
-        Ok(())
-    }
-
     pub async fn describe_image(
         &mut self,
         path: &Path,
@@ -1557,11 +1644,7 @@ impl InferenceClient {
         // Clamp the decode budget to the shared cap so the daemon can never ask
         // the on-device VLM for an unbounded decode; absent => the server's
         // default (we still send the daemon default for an explicit contract).
-        req.max_tokens = Some(
-            max_tokens
-                .unwrap_or(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS)
-                .min(DESCRIBE_IMAGE_MAX_TOKENS_CAP),
-        );
+        req.max_tokens = Some(clamp_describe_tokens(max_tokens));
         // describe_image needs the raw Response (ok true AND false) so the
         // structured unavailable reason survives — request_generic collapses
         // ok:false into an opaque Err, which would lose the fall-back signal.
@@ -1639,8 +1722,8 @@ impl InferenceClient {
         // Clamp size/steps into the shared bounds so the daemon can never push an
         // out-of-range canvas / unbounded sampler at the on-device model; absent
         // => the server applies its own default + clamp.
-        req.size = size.map(|s| s.clamp(GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_MAX_SIZE));
-        req.steps = steps.map(|s| s.clamp(1, GENERATE_IMAGE_MAX_STEPS_CAP));
+        req.size = clamp_image_size(size);
+        req.steps = clamp_image_steps(steps);
         req.seed = seed;
         // generate_image needs the raw Response (ok true AND false) so the
         // structured unavailable reason survives — request_generic collapses
@@ -1766,7 +1849,10 @@ impl InferenceClient {
         events: &mpsc::UnboundedSender<SentenceEvent>,
         emitted: &mut u64,
     ) -> Result<ConverseOutcome> {
-        let (reader, writer) = self.conn.as_mut().expect("connection established by caller");
+        // Split-borrow: the bounded reader needs the caller-owned `pending`
+        // accumulator alongside the reader, and both live on `self`.
+        let Self { conn, pending, .. } = self;
+        let (reader, writer) = conn.as_mut().expect("connection established by caller");
         let mut line = serde_json::to_string(req)?;
         line.push('\n');
         writer.write_all(line.as_bytes()).await?;
@@ -1788,7 +1874,15 @@ impl InferenceClient {
                 .min(deadline.saturating_duration_since(tokio::time::Instant::now()))
                 .max(Duration::from_millis(50));
             buf.clear();
-            let read = tokio::time::timeout(per_read, reader.read_line(&mut buf)).await;
+            // BOUNDED read (see `read_inference_line`): the old `reader.read_line`
+            // here grew `buf` without limit for the whole per-read window, so the
+            // `buf.len() > MAX_INFERENCE_LINE_BYTES` check that used to sit below
+            // could only ever run AFTER the memory was already committed.
+            let read = tokio::time::timeout(
+                per_read,
+                read_inference_line(reader, pending, &mut buf),
+            )
+            .await;
             let now = tokio::time::Instant::now();
             let n = match read {
                 Ok(result) => result?,
@@ -1803,9 +1897,6 @@ impl InferenceClient {
             };
             if n == 0 {
                 bail!("inference server closed the connection mid-converse");
-            }
-            if buf.len() > MAX_INFERENCE_LINE_BYTES {
-                bail!("inference line exceeds {} bytes", MAX_INFERENCE_LINE_BYTES);
             }
             // Any well-formed line is progress: reset the done budget.
             deadline = now + CONVERSE_DONE_TIMEOUT;
@@ -1882,6 +1973,9 @@ impl InferenceClient {
             };
             let (r, w) = stream.into_split();
             self.conn = Some((BufReader::new(r), w));
+            // A fresh connection starts a fresh line: any bytes left over from the
+            // previous (failed//dropped) one must never be prefixed onto it.
+            self.pending.clear();
         }
         Ok(())
     }
@@ -2034,19 +2128,22 @@ impl InferenceClient {
     }
 
     async fn roundtrip<T: Serialize>(&mut self, req: &T) -> Result<Response> {
-        let (reader, writer) = self.conn.as_mut().expect("connection established above");
+        // Split-borrow: the bounded reader needs the caller-owned `pending`
+        // accumulator alongside the reader, and both live on `self`.
+        let Self { conn, pending, .. } = self;
+        let (reader, writer) = conn.as_mut().expect("connection established above");
         let mut line = serde_json::to_string(req)?;
         line.push('\n');
         writer.write_all(line.as_bytes()).await?;
         writer.flush().await?;
 
         let mut buf = String::new();
-        let n = reader.read_line(&mut buf).await?;
+        // BOUNDED read (see `read_inference_line`): the old `reader.read_line` grew
+        // `buf` without limit until a newline arrived, so the cap check that used to
+        // follow it never bounded anything.
+        let n = read_inference_line(reader, pending, &mut buf).await?;
         if n == 0 {
             bail!("inference server closed the connection");
-        }
-        if buf.len() > MAX_INFERENCE_LINE_BYTES {
-            bail!("inference line exceeds {} bytes", MAX_INFERENCE_LINE_BYTES);
         }
         let resp: Response =
             serde_json::from_str(buf.trim()).context("malformed inference response")?;
@@ -2057,8 +2154,9 @@ impl InferenceClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_extras_to_request, apply_shape_to_request, backoff_delay, jittered_delay,
-        record_probe, reset_health_for_test, Classification,
+        apply_extras_to_request, apply_shape_to_request, backoff_delay,
+        clamp_describe_tokens, clamp_image_size, clamp_image_steps, jittered_delay,
+        record_probe, reset_health_for_test, Classification, MAX_INFERENCE_LINE_BYTES,
         ConsolidateRequest, FactPair, InferenceClient, PronunciationRule, Request, Response,
         SpeakExtras, TranscriptPair,
         CONNECT_TIMEOUT, CONSOLIDATE_TIMEOUT, DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS,
@@ -2951,9 +3049,15 @@ mod tests {
         const { assert!(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS > 0) };
         const { assert!(DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS <= DESCRIBE_IMAGE_MAX_TOKENS_CAP) };
         assert_eq!(DESCRIBE_IMAGE_MAX_TOKENS_CAP, 1024, "cap pinned to the server's contract");
-        // The clamp the client applies: an over-budget ask collapses to the cap.
-        let asked = 99_999u32;
-        assert_eq!(asked.min(DESCRIBE_IMAGE_MAX_TOKENS_CAP), DESCRIBE_IMAGE_MAX_TOKENS_CAP);
+        // THE CLAMP THE CLIENT ACTUALLY APPLIES. This used to read
+        // `assert_eq!(99_999u32.min(CAP), CAP)` — a property of `u32::min`, not of
+        // this crate: it never called describe_image, never built a Request, and
+        // stayed green with the `.min(..)` deleted from the request builder.
+        assert_eq!(clamp_describe_tokens(Some(99_999)), DESCRIBE_IMAGE_MAX_TOKENS_CAP,
+            "an over-budget ask must collapse to the cap");
+        assert_eq!(clamp_describe_tokens(Some(16)), 16, "an in-range ask is passed through");
+        assert_eq!(clamp_describe_tokens(None), DESCRIBE_IMAGE_DEFAULT_MAX_TOKENS,
+            "absent => the daemon default, which is itself under the cap");
     }
 
     // ----- generate_image (task #18) — on-device text->image wire contract ----
@@ -3047,10 +3151,17 @@ mod tests {
         assert_eq!(GENERATE_IMAGE_DEFAULT_STEPS, 4, "default steps pinned to the fast schnell budget");
         assert_eq!(GENERATE_IMAGE_MAX_STEPS_CAP, 50, "steps cap pinned to the server's contract");
         const { assert!(GENERATE_IMAGE_DEFAULT_STEPS <= GENERATE_IMAGE_MAX_STEPS_CAP) };
-        // The clamps the client applies: an over/under-range ask collapses inward.
-        assert_eq!(8.clamp(GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_MAX_SIZE), GENERATE_IMAGE_MIN_SIZE);
-        assert_eq!(99_999u32.clamp(GENERATE_IMAGE_MIN_SIZE, GENERATE_IMAGE_MAX_SIZE), GENERATE_IMAGE_MAX_SIZE);
-        assert_eq!(9_999u32.clamp(1, GENERATE_IMAGE_MAX_STEPS_CAP), GENERATE_IMAGE_MAX_STEPS_CAP);
+        // THE CLAMPS THE CLIENT ACTUALLY APPLIES. These used to read
+        // `assert_eq!(8.clamp(64,1536), 64)` etc. — properties of `u32::clamp`, not
+        // of this crate: neither test body called generate_image or built a Request,
+        // so removing both `.clamp(..)` calls from the request builder was invisible.
+        assert_eq!(clamp_image_size(Some(8)), Some(GENERATE_IMAGE_MIN_SIZE), "under-range size clamps up");
+        assert_eq!(clamp_image_size(Some(99_999)), Some(GENERATE_IMAGE_MAX_SIZE), "over-range size clamps down");
+        assert_eq!(clamp_image_size(Some(512)), Some(512), "an in-range size is passed through");
+        assert_eq!(clamp_image_size(None), None, "absent => the server's own default, not a daemon guess");
+        assert_eq!(clamp_image_steps(Some(9_999)), Some(GENERATE_IMAGE_MAX_STEPS_CAP), "over-range steps clamp down");
+        assert_eq!(clamp_image_steps(Some(0)), Some(1), "0 steps clamps up to 1 (never an empty sampler run)");
+        assert_eq!(clamp_image_steps(None), None, "absent => the server's own default");
     }
 
     // -----------------------------------------------------------------------
@@ -3190,6 +3301,65 @@ mod tests {
         assert!(res.is_ok(), "a server that comes up during the backoff window must be recovered");
         assert!(client.conn.is_some(), "a live connection is established after recovery");
         let _ = binder.await;
+        let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// REGRESSION: a hijacked / spoofed inference server cannot grow the daemon's
+    /// read buffer past [`MAX_INFERENCE_LINE_BYTES`].
+    ///
+    /// The cap used to be a POST-HOC check on an UNBOUNDED `read_line`, so it
+    /// bounded nothing: measured against a fake server streaming with no newline,
+    /// the daemon reached 391 MiB resident inside 1.5 s of the 30 s op window. The
+    /// fake server below is exactly that shape — it writes far past the cap and
+    /// then goes QUIET WITHOUT CLOSING, so an unbounded reader sits holding
+    /// everything it read until the op timeout (which the outer `timeout` here
+    /// catches as a failure), while the bounded reader errors the moment the cap
+    /// is crossed.
+    #[tokio::test]
+    async fn a_newline_less_flood_is_bounded_by_the_line_cap() {
+        use tokio::io::AsyncWriteExt as _;
+        // /tmp keeps the sockaddr_un path under macOS's ~104-byte SUN_LEN cap.
+        let dir = std::path::PathBuf::from("/tmp").join(format!("jv-flood-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("inference.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = tokio::net::UnixListener::bind(&sock).expect("bind the fake server");
+
+        let server = tokio::spawn(async move {
+            let Ok((stream, _)) = listener.accept().await else {
+                return;
+            };
+            let (_r, mut w) = stream.into_split();
+            let chunk = vec![b'A'; 64 * 1024];
+            let mut sent = 0usize;
+            while sent < 4 * MAX_INFERENCE_LINE_BYTES {
+                if w.write_all(&chunk).await.is_err() {
+                    return;
+                }
+                sent += chunk.len();
+            }
+            // Go quiet, but hold the connection OPEN: no newline will ever arrive.
+            std::future::pending::<()>().await;
+        });
+
+        let mut client = InferenceClient::new(sock.clone());
+        client.connect_with_backoff().await.expect("connect to the fake server");
+        let req = Request::new("1".to_string(), "classify");
+        let outcome = tokio::time::timeout(Duration::from_secs(10), client.roundtrip(&req))
+            .await
+            .expect("the bounded reader must ERROR promptly, never block until the op timeout");
+        // (`Response` is not Debug, so unwrap the Result by hand.)
+        let err = match outcome {
+            Ok(_) => panic!("a newline-less flood must fail, never succeed"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("exceeds"),
+            "the failure must be the LINE CAP, not something else: {err}"
+        );
+
+        server.abort();
         let _ = std::fs::remove_file(&sock);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -189,8 +189,12 @@ impl Trace {
 ///
 /// Ordinary words, short numbers, and punctuation pass through unchanged.
 pub fn redact(s: &str) -> String {
-    // Split on whitespace but preserve the original spacing so the redacted
-    // utterance still reads naturally. We rebuild token-by-token.
+    // Rebuild token-by-token. NOTE the spacing contract, which this comment used
+    // to state backwards: `split_whitespace()` DISCARDS the separators and the loop
+    // re-emits exactly one ' ' between tokens, so every whitespace run — including
+    // newlines and indentation — is NORMALIZED TO A SINGLE SPACE. Line structure is
+    // NOT preserved. That matters for the consumers where line structure IS the
+    // content (pasteboard clips, screen-context OCR text): "a\nb" stores as "a b".
     let mut out = String::with_capacity(s.len());
     let mut first = true;
     for token in s.split_whitespace() {
@@ -407,13 +411,94 @@ fn is_secret_shaped(token: &str) -> bool {
     false
 }
 
+/// True when `token` is a DATE, a DECIMAL, or a YEAR RANGE rather than a phone
+/// number — the shapes [`is_phone`]'s digit-count band cannot tell apart from a
+/// formatted phone number on its own.
+///
+/// Deliberately NARROW — but NOT free, and the residual is stated here rather
+/// than claimed away. A miss leaks a phone number; a false positive destroys a
+/// date. Two of the three arms exclude only shapes a phone number never takes
+/// (an ISO date / a year range under DASH-only; a 3-3-3 dotted grouping like
+/// "100.000.000" is left redactable — genuinely ambiguous, and privacy wins that
+/// tie). The DOT-ONLY TWO-GROUP arm is different: it is a real tie broken the
+/// OTHER way, because the shapes are literally identical.
+///
+/// MEASURED, running the pre-change and post-change redactor side by side:
+///     "-122.4194"  [redacted] -> -122.4194   (a coordinate, correctly recovered)
+///     "555.0123"   [redacted] -> 555.0123    (a phone number, now KEPT VERBATIM)
+/// "555.0123" and "122.4194" are both `ddd.dddd`; no shape rule can separate
+/// them, and nothing downstream catches the leak — the digit runs are 3 and 4,
+/// both under DIGIT_RUN_MIN, so `redact_digit_runs` never sees it. The exposure
+/// is bounded to a dot-grouped number whose BOTH groups are under DIGIT_RUN_MIN
+/// ("415.555.0123", "555-0123", "415 555 0123", "+1 (415) 555-0123" and
+/// "415.5550123" are all still collapsed). Widening it back to catch
+/// "555.0123" would destroy every decimal coordinate in memory, which is the
+/// defect this function exists to fix — so the tie is the OWNER's to re-break,
+/// not something to silently paper over in a comment.
+fn looks_like_date_or_decimal(token: &str) -> bool {
+    // '+' and parentheses are unambiguous PHONE markers (E.164 / an area code); no
+    // date or decimal carries them.
+    if token.chars().any(|c| matches!(c, '+' | '(' | ')')) {
+        return false;
+    }
+    // A leading '-' on a number is a SIGN ("-122.4194"), not a group separator.
+    let body = token.strip_prefix('-').unwrap_or(token);
+    if body.contains(' ') {
+        // Spaced grouping is phone formatting ("415 555 0123"), never a date.
+        return false;
+    }
+    let dot = body.contains('.');
+    let dash = body.contains('-');
+    let groups: Vec<&str> = body.split(['.', '-']).collect();
+    if groups
+        .iter()
+        .any(|g| g.is_empty() || !g.chars().all(|c| c.is_ascii_digit()))
+    {
+        return false;
+    }
+    let lens: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+    let is_year = |g: &str| g.len() == 4 && (1900..=2199).contains(&g.parse::<u32>().unwrap_or(0));
+    let in_range = |g: &str, hi: u32| (1..=hi).contains(&g.parse::<u32>().unwrap_or(0));
+    match (dot, dash) {
+        // DOT-ONLY. Two groups is a DECIMAL ("37.7749", "-122.4194"); three groups
+        // with a plausible YEAR at one end is a written date ("4.11.2025",
+        // "2025.11.04"). No phone number DARWIN reads is written with dots alone.
+        (true, false) => match lens.as_slice() {
+            [_, _] => true,
+            [_, _, _] => {
+                (is_year(groups[2]) && in_range(groups[0], 31) && in_range(groups[1], 31))
+                    || (is_year(groups[0]) && in_range(groups[1], 12) && in_range(groups[2], 31))
+            }
+            _ => false,
+        },
+        // DASH-ONLY. Only the two unambiguous calendar shapes: an ISO date
+        // YYYY-MM-DD and a year range YYYY-YYYY. "555-0123" and "415-555-0123" are
+        // neither, so a real phone number is still collapsed.
+        (false, true) => match lens.as_slice() {
+            [4, 2, 2] => is_year(groups[0]) && in_range(groups[1], 12) && in_range(groups[2], 31),
+            [4, 4] => is_year(groups[0]) && is_year(groups[1]),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 /// A phone number: once '+', '(', ')', '-', '.', and spaces-within-token are
-/// removed, the token is ALL digits and has a plausible phone length (>= 7).
-/// "555-0123" (7), "+1 (415) 555-0123" tokens, etc. A short "3-2" or a date
-/// "2026-06-15" (digits 8 but contains separators -> still 8 digits >=7) —
-/// guard the date case by requiring the token to be DOMINATED by digits and
-/// phone-punctuation only (no letters), which a date satisfies, so we ALSO
-/// exclude pure ISO dates by length heuristic: phone digit count is 7..=15.
+/// removed, the token is ALL digits and has a plausible phone length (7..=15).
+/// "555-0123" (7), "+1 (415) 555-0123" tokens, etc.
+///
+/// WHAT WENT WRONG: this doc used to claim the ISO-date case was "ALSO excluded by
+/// length heuristic". It was not — 8 IS inside 7..=15, and there was no shape test
+/// at all, so `is_phone("2026-06-15")` returned TRUE. Because
+/// [`redact`] is the shared, project-wide sanitizer (episodic memory, pasteboard
+/// clips, screen-context OCR, journal previews, CAUSA traces, distill transcripts,
+/// research summaries, handoff fields, audit targets), that silently destroyed
+/// extremely common content on the way to storage: "remember the review is on
+/// 2026-06-15" was persisted as "remember the review is on [redacted]", and a
+/// copied coordinate became a clip of pure "[redacted]". Nothing else would have
+/// touched them — "2026-06-15" has digit runs of 4/2/2, all below DIGIT_RUN_MIN,
+/// so `redact_digit_runs` never sees them. The shape test now lives in
+/// [`looks_like_date_or_decimal`], and the comment describes what is enforced.
 fn is_phone(token: &str) -> bool {
     let digits: String = token.chars().filter(|c| c.is_ascii_digit()).collect();
     let non_phone = token
@@ -426,7 +511,11 @@ fn is_phone(token: &str) -> bool {
     // by the digit-run pass anyway; this rule additionally collapses formatted
     // numbers like 555-0123 whose individual digit runs are each < 6.)
     let n = digits.len();
-    (7..=15).contains(&n)
+    if !(7..=15).contains(&n) {
+        return false;
+    }
+    // …but the band alone also swallows dates, decimals and year ranges.
+    !looks_like_date_or_decimal(token)
 }
 
 /// Replace every maximal run of >= DIGIT_RUN_MIN ASCII digits with `[redacted]`.
@@ -629,8 +718,10 @@ impl TraceStore {
 /// This is the function the daemon calls per turn (the LIVE recording is
 /// runtime-gated: it only ever fires while the real daemon runs with
 /// [optimize].enabled = true). When `cfg.optimize.enabled` is false this is a
-/// pure NO-OP — it returns `Ok(None)` immediately and writes NOTHING, so the
-/// shipped-OFF default never accrues a corpus. The raw utterance is REDACTED
+/// pure NO-OP — it returns `Ok(None)` immediately and writes NOTHING. NOTE that
+/// this is the OPERATOR-SELECTED off state, NOT the shipped one: `[optimize].enabled`
+/// SHIPS TRUE (config.rs `impl Default for OptimizeConfig`, pinned by a contract
+/// test), so out of the box the corpus DOES accrue. The raw utterance is REDACTED
 /// here before it reaches the store. The returned id lets the live recorder hold
 /// the PRIOR turn's row so a next-turn correction can re-label it (see
 /// [`is_correction`] + [`TraceStore::label_outcome`]). Tests insert mock traces
@@ -649,7 +740,7 @@ pub async fn record_trace(
     ts: u64,
 ) -> Result<Option<i64>> {
     if !cfg.optimize.enabled {
-        return Ok(None); // shipped-OFF default: record NOTHING.
+        return Ok(None); // operator turned it OFF: record NOTHING. (Ships ON.)
     }
     // THRESHOLD write-integrity chokepoint: a GUEST turn seeds NO optimizer trace.
     // Returning Ok(None) (rather than relying only on the store-level guard) keeps
@@ -1365,7 +1456,10 @@ pub fn optimize(traces: &[Trace]) -> Option<Proposal> {
 /// heal_action in heal.rs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OptimizeAction {
-    /// enabled=false: the optimizer does NOTHING (ships here).
+    /// enabled=false: the optimizer does NOTHING. OPERATOR-SELECTED — the SHIPPED
+    /// state is [`OptimizeAction::Propose`] (`[optimize].enabled` defaults true and
+    /// `mode` defaults "propose"), so a shipped install records a PII-redacted trace
+    /// every turn and runs the propose-only pass periodically over them.
     Disabled,
     /// enabled=true, mode="propose": write a reviewable proposal, mutate nothing.
     Propose,
@@ -1488,7 +1582,8 @@ pub fn run_optimizer(
 ) -> OptimizeAction {
     let action = optimize_action(enabled, mode);
     if action == OptimizeAction::Disabled {
-        // Shipped-OFF default: do NOTHING (no scoring, no proposal, no write).
+        // Operator-selected OFF (NOT the shipped default, which is Propose): do
+        // NOTHING — no scoring, no proposal, no write.
         telemetry::emit(
             "system",
             "optimize.suppressed",
@@ -1750,6 +1845,35 @@ mod tests {
         // identifies a line); a bare 3-digit area code on its own is not PII and
         // survives, exactly as a standalone "415" would.
         assert_eq!(redact("call 415 5550123 now"), "call 415 [redacted] now");
+    }
+
+    /// REGRESSION: the phone rule must not eat DATES, YEAR RANGES or DECIMALS.
+    ///
+    /// `is_phone` accepted any token of 7..=15 digits made only of digits and
+    /// phone punctuation, and '-' and '.' are phone punctuation — so "2026-06-15"
+    /// (8 digits) classified as a phone number and was collapsed. Nothing else in
+    /// the chain would have touched it: its digit runs are 4/2/2, all below
+    /// DIGIT_RUN_MIN, so `redact_digit_runs` never sees it. Because `redact` is the
+    /// SHARED sanitizer (episodic memory, pasteboard clips, screen-context OCR,
+    /// journal previews, CAUSA traces, distill, research, handoff, audit), this was
+    /// silent, irreversible data loss on extremely common content: "remember the
+    /// review is on 2026-06-15" was stored as "…on [redacted]".
+    #[test]
+    fn a_date_a_year_range_and_a_coordinate_survive_redaction() {
+        // ISO date — the exact shape the old doc claimed was excluded.
+        assert_eq!(redact("meeting on 2026-06-15 at noon"), "meeting on 2026-06-15 at noon");
+        // Year range.
+        assert_eq!(redact("range 2020-2026"), "range 2020-2026");
+        // Decimal coordinates, including a signed one.
+        assert_eq!(redact("coords 37.7749 -122.4194"), "coords 37.7749 -122.4194");
+        // A written (dotted) date.
+        assert_eq!(redact("chapter 4.11.2025"), "chapter 4.11.2025");
+
+        // CONTROL — the privacy rule these must not weaken. A real phone number in
+        // any of its ordinary written forms is still collapsed.
+        assert_eq!(redact("ring 555-0123"), "ring [redacted]");
+        assert_eq!(redact("call 415-555-0123"), "call [redacted]");
+        assert_eq!(redact("call +1(415)555-0123 now"), "call [redacted] now");
     }
 
     #[test]
@@ -2330,8 +2454,9 @@ mod tests {
 
     #[tokio::test]
     async fn periodic_run_optimizer_is_disabled_when_off() {
-        // The shipped-OFF default: even with a corpus on disk, an OFF master
-        // switch makes the pass a complete no-op (Disabled, no artifact).
+        // The OPERATOR-SELECTED off state (the shipped default is ON/propose): even
+        // with a corpus on disk, an OFF master switch makes the pass a complete
+        // no-op (Disabled, no artifact).
         let db = TempDb::new("periodic-off");
         let store = TraceStore::open(&db.0).unwrap();
         // (We hand-insert with record so the store has rows regardless of gate.)
@@ -2606,6 +2731,10 @@ mod optimizer_tests {
         let dir = TempDir::new("propose");
         let corpus = favoring_gecko_corpus();
         let ts = 1_700_000_123;
+        // Snapshot BEFORE the pass: the propose-only guarantee is a before/after
+        // comparison, and without this the assertion at the bottom compared the
+        // post-state to itself.
+        let baseline_before = RoutingConfig::baseline();
         let action = run_optimizer(true, "propose", &dir.0, &corpus, ts);
         assert_eq!(action, OptimizeAction::Propose);
 
@@ -2631,10 +2760,34 @@ mod optimizer_tests {
 
         // CRITICAL: the SHIPPED baseline config is byte-for-byte unchanged — the
         // optimizer only PROPOSED; it mutated no live routing config.
+        //
+        // This assertion used to compare `RoutingConfig::baseline()` to
+        // `RoutingConfig::baseline()` — the SAME argument-free call, both evaluated
+        // AFTER run_optimizer had already run. With no pre-call snapshot both
+        // operands observed identical post-state, so the one assertion labelled
+        // CRITICAL in the propose-only contract test could not fail for ANY
+        // implementation of run_optimizer. `baseline_before` is captured before the
+        // call (matching the sibling test at `run_optimizer_writes_a_proposal…`).
         assert_eq!(
             RoutingConfig::baseline(),
-            RoutingConfig::baseline(),
-            "baseline is a pure function of the shipped vocabulary; the proposal does not touch it"
+            baseline_before,
+            "the proposal must not touch the live routing config"
+        );
+        // …and the propose-only guarantee has a SIDE that a mutation can reach:
+        // the pass must write NOTHING outside its own proposals/<ts>/ directory.
+        // (`RoutingConfig::baseline()` is a pure function of the shipped vocabulary,
+        // so the comparison above is structurally right but can only ever catch a
+        // change to `baseline()` itself — this is the half that catches a
+        // run_optimizer that started writing somewhere live.)
+        let stray: Vec<String> = std::fs::read_dir(&dir.0)
+            .expect("the optimize root exists")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n != "proposals")
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "run_optimizer must write ONLY under proposals/<ts>/; found {stray:?}"
         );
     }
 

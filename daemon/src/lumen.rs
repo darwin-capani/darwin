@@ -1,10 +1,23 @@
 //! lumen.rs — LUMEN: an LLM-grounded SCREEN NARRATOR + hands-free VOICE
 //! NAVIGATION (assistive tech). Two capabilities, one PURE + testable core:
 //!
-//!   (a) NARRATE — on a focus-change (or an explicit "read me the screen") speak
-//!       the focused element / the on-screen controls through the existing speech
-//!       path. This half is READ-ONLY: it describes what is on the screen and
+//!   (a) NARRATE — compose the spoken line for a focused element / the on-screen
+//!       controls. This half is READ-ONLY: it describes what is on the screen and
 //!       actuates NOTHING.
+//!
+//!       **NOT WIRED TO ANY CALLER TODAY — read this before trusting the knob.**
+//!       `narrate_element` / `narrate_focus` / `narrate_controls` /
+//!       `narrate_on_focus_change` / `narration_event_frame` have ZERO call sites
+//!       outside this file's own tests (a repo-wide grep over daemon, hud, apps and
+//!       scripts returns one DOC COMMENT in router.rs and nothing else). The
+//!       vision.screen relay in apps.rs only calls `remember_readout` — it caches
+//!       the controls for `select_target` and never speaks them. `is_narrating()`
+//!       has exactly one caller and it is a telemetry field, not behaviour. So
+//!       `[lumen].narrate = true` installs a setting, emits a `lumen.configured`
+//!       frame, and changes NOTHING: the gate's only consumer,
+//!       `narrate_on_focus_change`, is never called, and there is no focus-change
+//!       source in the daemon to call it from. Wiring it needs (1) a focus-change
+//!       event source and (2) a speech call at the relay — neither exists yet.
 //!   (b) VOICE-NAVIGATE — pair the READ-ONLY OCR/AX locate (the Vision app's
 //!       `read.screen` control readout) with the EXISTING, per-action-gated
 //!       `ui_actuate` CAPSTONE (#44) to execute ONE voice-named UI action at a
@@ -34,7 +47,8 @@
 //! ever happen under `cargo test`.
 //!
 //! PRIVACY / HONESTY: continuous narration is EXPLICIT opt-in (`[lumen].narrate`
-//! ships **false** — off is a no-op). Narration NEVER fabricates an element (an
+//! ships **false** — off is a no-op; and see (a) above: ON is currently a no-op
+//! too, because nothing calls the narration path). Narration NEVER fabricates an element (an
 //! empty focus / empty screen is spoken honestly). Selection NEVER fabricates a
 //! target (a miss / an ambiguity REFUSES). The telemetry frame is SECRET-FREE by
 //! construction: it carries the element ROLE + counts + lengths, NEVER the raw
@@ -698,9 +712,14 @@ pub fn max_controls() -> usize {
 /// focus-change ONLY when continuous narration is opted in. When it is OFF (the
 /// default) this is a strict NO-OP — it returns `None` and speaks nothing. When
 /// ON it returns the honest narration line (`Some`), including the honest
-/// "nothing is focused" for an empty focus. The explicit on-request read path
-/// calls [`narrate_focus`] / [`narrate_controls`] directly and is NOT gated by
-/// this (a user who asks to be read the screen always gets an answer).
+/// "nothing is focused" for an empty focus.
+///
+/// NO CALLER TODAY (see the module header): the daemon has no focus-change event
+/// source, so this function — the ONLY consumer of the `[lumen].narrate` gate — is
+/// never invoked outside this file's tests. The second sentence of the version of
+/// this doc that shipped before also described an on-request path that "calls
+/// `narrate_focus` / `narrate_controls` directly"; no such call site exists either.
+/// The composition below is correct and tested; it is the WIRING that is missing.
 pub fn narrate_on_focus_change(focused: Option<&NarratableElement>) -> Option<String> {
     if !is_narrating() {
         return None;

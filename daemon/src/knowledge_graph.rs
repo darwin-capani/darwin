@@ -41,6 +41,7 @@
 //! seam would make a runtime/MLX-gated call, and it is never called in tests.
 
 use anyhow::Result;
+use std::collections::HashSet;
 
 use crate::memory::Memory;
 use crate::world_model::{self, EntityType};
@@ -901,9 +902,13 @@ fn spans_overlap(a: (usize, usize), b: (usize, usize)) -> bool {
 pub struct BuildStats {
     /// Chunks the extractor ran over.
     pub chunks_scanned: u64,
-    /// Distinct entities upserted (new + merged) into the shared world tier.
+    /// DISTINCT entities this pass actually wrote to in the shared world tier
+    /// (a new grounding, or a new attribute on an existing node) — counted ONCE per
+    /// (type, slug), no matter how many chunks mention it.
     pub entities_written: u64,
-    /// Distinct relationships upserted into the shared world tier.
+    /// DISTINCT relationships this pass upserted into the shared world tier —
+    /// counted ONCE per (from, relation, to), no matter how many chunks repeat the
+    /// co-occurrence.
     pub relationships_written: u64,
     /// Entities/relationships REFUSED because the world model is at its cap
     /// (honest skip — the model is never grown past its bound).
@@ -933,6 +938,19 @@ pub async fn build_from_chunks(
     chunks: &[(String, i64, String)],
 ) -> Result<BuildStats> {
     let mut stats = BuildStats::default();
+    // DISTINCT nodes/edges this pass actually wrote. WHAT WENT WRONG without these:
+    // both counters were incremented per WRITE, and the relationship arm had no
+    // dedup at all — `set_relationship` composes a stable `rel_key(from, rel, to)`
+    // and `upsert_user_fact` UPDATEs in place, so N chunks repeating one
+    // co-occurrence produced ONE row and N increments. The deterministic extractor
+    // always labels the edge "mentions" and orders endpoints by span, so repeated
+    // text yields a byte-identical key. The user-facing "Mapped your documents …
+    // N relationship(s)" line and the `knowledge_graph.built` telemetry could
+    // therefore report one or two orders of magnitude more edges than the graph
+    // holds — and the world model caps at MAX_RELATIONS = 1024, so a reported
+    // 40,000 was flatly impossible yet printable.
+    let mut entities_seen: HashSet<(EntityType, String)> = HashSet::new();
+    let mut edges_seen: HashSet<(String, String, String)> = HashSet::new();
     for (file_path, byte_offset, text) in chunks.iter().take(MAX_BUILD_CHUNKS) {
         stats.chunks_scanned += 1;
         let extraction = extractor.extract(text).await;
@@ -948,15 +966,46 @@ pub async fn build_from_chunks(
             // Set the PROVENANCE source attribute. This ALSO seeds the entity's
             // display name (world_model seeds `name` for a new entity), so a brand
             // new entity is created here; an existing one is merged (dedup).
-            let already = world_model::query(memory, &ent.name).await?;
-            let exists = entity_already_present(&already, ent);
+            // EXACT existence on (type, slug) — NOT a lexical search.
+            //
+            // WHAT WENT WRONG: this used `world_model::query(memory, &ent.name)` and
+            // then looked for the entity in the returned slice. `query` -> `filter_state`
+            // tokenizes the name through `query_terms`, which DROPS stopwords and
+            // 1-char tokens, and a non-blank query with NO terms matches NOTHING (the
+            // world model's own test pins that). So for any name that tokenizes away —
+            // "IT" ("The IT department shipped the release."), "X" ("Reviewed by X and
+            // approved.") — `exists` was ALWAYS false: the entity was "created" again
+            // on every chunk, `set_attribute` found it already there and UPDATEd
+            // `…entity.project.it.source` IN PLACE, overwriting the FIRST grounding
+            // with the latest chunk's, and `entities_written` counted it again. That
+            // contradicts two explicit promises in this file: "the source attribute
+            // keeps the FIRST grounding (re-running is idempotent, never a churned
+            // provenance)" (module doc) and the same claim in this function's own doc.
+            // The lexical path had a second, broader miss too: `filter_state`
+            // truncates at MAX_QUERY_ENTITIES = 24, so any name whose tokens are
+            // shared by >= 24 earlier-sorting entities also missed.
+            //
+            // It was also the expensive way to ask: a full `user.world.*` snapshot
+            // read plus an O(rows x entities) restructure PER EXTRACTED ENTITY PER
+            // CHUNK (up to 50_000 chunks x 32 entities), which is what made a
+            // full-index build pathologically slow.
+            let slug = world_model::slugify(&ent.name);
+            let exists = match &slug {
+                Some(id) => world_model::entity_exists(memory, ent.entity_type, id).await?,
+                // No usable characters at all: `set_attribute` will reject it below.
+                None => false,
+            };
             if exists {
                 // Already grounded: this is a DEDUP/merge. Do not overwrite the
                 // original `source` (first grounding wins — idempotent re-run),
                 // and write any NEW confident attributes the extractor returned.
                 for (a, v) in &ent.attributes {
                     if write_attr(memory, ent, a, v, &mut stats).await? {
-                        stats.entities_written += 1;
+                        if let Some(id) = &slug {
+                            if entities_seen.insert((ent.entity_type, id.clone())) {
+                                stats.entities_written += 1;
+                            }
+                        }
                     }
                 }
                 continue;
@@ -966,7 +1015,11 @@ pub async fn build_from_chunks(
                 .await
             {
                 Ok(_) => {
-                    stats.entities_written += 1;
+                    if let Some(id) = &slug {
+                        if entities_seen.insert((ent.entity_type, id.clone())) {
+                            stats.entities_written += 1;
+                        }
+                    }
                     // Any extra confident attributes (LLM seam may add some).
                     for (a, v) in &ent.attributes {
                         let _ = write_attr(memory, ent, a, v, &mut stats).await?;
@@ -995,7 +1048,14 @@ pub async fn build_from_chunks(
             )
             .await
             {
-                Ok(_) => stats.relationships_written += 1,
+                // `set_relationship` returns the CANONICAL (from_id, relation, to_id)
+                // it wrote — the same triple that composes the row key — so this
+                // counts genuinely distinct edges, not repeat upserts of one edge.
+                Ok(triple) => {
+                    if edges_seen.insert(triple) {
+                        stats.relationships_written += 1;
+                    }
+                }
                 Err(e) => {
                     if is_cap_error(&e) {
                         stats.skipped_at_cap += 1;
@@ -1030,16 +1090,6 @@ async fn write_attr(
             }
         }
     }
-}
-
-/// Whether the entity is ALREADY present in a queried slice of the world model
-/// (same type + same slug). Drives dedup: an already-present entity is merged, not
-/// re-sourced. The query is lexical by name, so this is a bounded, cheap check.
-fn entity_already_present(state: &world_model::WorldState, ent: &ExtractedEntity) -> bool {
-    let want = world_model::slugify(&ent.name);
-    state.entities.iter().any(|e| {
-        e.entity_type == ent.entity_type && Some(e.id.as_str()) == want.as_deref()
-    })
 }
 
 /// Recognize the world-model's honest "at cap" refusal so the build counts it as a
@@ -1362,6 +1412,106 @@ mod tests {
         );
     }
 
+    /// REGRESSION: dedup must be an EXACT (type, slug) lookup, not the lexical
+    /// `world_model::query`. `query` -> `filter_state` drops stopwords and 1-char
+    /// tokens, and a non-blank query with NO terms matches NOTHING — so for a name
+    /// like "IT" (a stopword) or "X" (1 char) the build believed the entity was new
+    /// on EVERY chunk: `set_attribute` then UPDATEd the existing `source` row in
+    /// place, replacing the FIRST grounding with the latest chunk's, while
+    /// `entities_written` counted the same node again and again. Both of this
+    /// module's idempotence promises were broken by exactly this.
+    #[tokio::test]
+    async fn a_stopword_named_entity_dedups_and_keeps_its_first_provenance() {
+        let db = TempDb::new("build-stopword-name");
+        let mem = Memory::open(&db.0).unwrap();
+        // "IT" is a stopword, so `query_terms("IT")` is EMPTY and the lexical
+        // dedup lookup matched nothing. The SAME sentence in three files, so every
+        // entity is first grounded in first.md and no later chunk introduces one.
+        let line = "The IT department shipped the release.".to_string();
+        let chunks = vec![
+            ("first.md".to_string(), 10i64, line.clone()),
+            ("second.md".to_string(), 20i64, line.clone()),
+            ("third.md".to_string(), 30i64, line.clone()),
+        ];
+        let stats = build_from_chunks(&mem, &DeterministicExtractor, &chunks)
+            .await
+            .unwrap();
+
+        // Read the shared tier DIRECTLY — the lexical query cannot find this name,
+        // which is the whole bug.
+        let sources = |rows: &Vec<(String, String)>| -> Vec<(String, String)> {
+            rows.iter()
+                .filter(|(k, _)| k.starts_with("user.world.entity.") && k.ends_with(".source"))
+                .cloned()
+                .collect()
+        };
+        let rows = mem.all_facts(10_000).await.unwrap();
+        let first_pass = sources(&rows);
+        assert!(!first_pass.is_empty(), "the build must have grounded the entity: {rows:?}");
+        for (k, v) in &first_pass {
+            assert!(
+                v.contains("first.md"),
+                "FIRST grounding wins: re-seeing the entity must not re-source it; {k} = {v:?}"
+            );
+        }
+        // …and each node is counted ONCE, not once per chunk that mentions it.
+        assert_eq!(
+            stats.entities_written as usize,
+            first_pass.len(),
+            "entities_written must equal the DISTINCT nodes grounded, got {stats:?} for {} node(s)",
+            first_pass.len()
+        );
+
+        // IDEMPOTENT RE-RUN — the module's other explicit promise. A second pass
+        // over LATER files must ground nothing new and churn no provenance.
+        let rerun: Vec<(String, i64, String)> =
+            vec![("fourth.md".to_string(), 40i64, line.clone())];
+        let stats2 = build_from_chunks(&mem, &DeterministicExtractor, &rerun)
+            .await
+            .unwrap();
+        assert_eq!(stats2.entities_written, 0, "a re-run grounds NOTHING new: {stats2:?}");
+        let second_pass = sources(&mem.all_facts(10_000).await.unwrap());
+        assert_eq!(
+            second_pass, first_pass,
+            "a re-run must leave provenance byte-for-byte unchanged"
+        );
+    }
+
+    /// REGRESSION: a co-occurrence repeated across chunks is ONE edge, so it must be
+    /// counted ONCE. `set_relationship` composes a stable `rel_key(from, rel, to)`
+    /// and `upsert_user_fact` UPDATEs in place, so N chunks repeating one pair
+    /// produced ONE row and N increments — and the reply "Mapped your documents …
+    /// N relationship(s)" printed that inflated N, which could exceed
+    /// MAX_RELATIONS = 1024 and so be flatly impossible.
+    #[tokio::test]
+    async fn a_repeated_co_occurrence_is_one_relationship_not_one_per_chunk() {
+        let db = TempDb::new("build-rel-dedup");
+        let mem = Memory::open(&db.0).unwrap();
+        let line = "Met with Darwin Capani about Project DARWIN.".to_string();
+        let chunks: Vec<(String, i64, String)> = (0..6)
+            .map(|i| (format!("f{i}.md"), i as i64 * 100, line.clone()))
+            .collect();
+        let stats = build_from_chunks(&mem, &DeterministicExtractor, &chunks)
+            .await
+            .unwrap();
+        assert_eq!(stats.chunks_scanned, 6, "precondition: every chunk was scanned");
+
+        // The REAL number of relationship rows in the shared tier.
+        let rows = mem.all_facts(10_000).await.unwrap();
+        let rel_rows = rows
+            .iter()
+            .filter(|(k, _)| k.starts_with("user.world.rel."))
+            .count();
+        assert!(rel_rows > 0, "precondition: the extractor produced an edge");
+        assert_eq!(
+            stats.relationships_written as usize, rel_rows,
+            "the SPOKEN count must equal the edges actually in the graph, not the \
+             number of chunks that repeated them (6 chunks, {rel_rows} row(s), \
+             reported {})",
+            stats.relationships_written
+        );
+    }
+
     #[tokio::test]
     async fn build_respects_entity_cap_skips_past_max_honestly() {
         let db = TempDb::new("build-cap");
@@ -1436,7 +1586,10 @@ mod tests {
     fn build_is_not_permitted_when_off() {
         // docsearch off -> never, even with build_graph on.
         assert!(!build_permitted(false, true));
-        // docsearch on but build_graph off (the shipped default) -> never.
+        // docsearch on but build_graph off -> never. (NOT the shipped default: both
+        // `[docsearch].enabled` and `[docsearch].build_graph` default TRUE — see
+        // config.rs and this module's own doc — so a shipped install with docsearch
+        // roots DOES mine them on the "map my documents" intent.)
         assert!(!build_permitted(true, false));
         // both off -> never.
         assert!(!build_permitted(false, false));
@@ -1445,7 +1598,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn map_documents_is_gated_off_by_default() {
+    async fn map_documents_mines_nothing_when_the_gate_is_off() {
         let db = TempDb::new("map-gated");
         let mem = Memory::open(&db.0).unwrap();
         let chunks = vec![(
@@ -1453,7 +1606,8 @@ mod tests {
             0i64,
             "Project DARWIN is here.".to_string(),
         )];
-        // OFF (shipped default) -> mines NOTHING even with real chunks.
+        // Gate OFF (operator-selected; the SHIPPED default is ON for both flags) ->
+        // mines NOTHING even with real chunks.
         let off = map_documents(false, false, &mem, &DeterministicExtractor, &chunks)
             .await
             .unwrap();

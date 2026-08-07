@@ -581,6 +581,25 @@ fn capture_death(reason: &str) -> anyhow::Error {
 /// (token + two integers); anything larger is a probe or mistake and is rejected
 /// BEFORE parse so a hostile client can't feed the JSON parser an unbounded line.
 const MAX_HANDSHAKE_BYTES: usize = 8 * 1024;
+
+/// The sane band a client-declared capture rate must fall in.
+///
+/// WHAT WENT WRONG: `accept_app_audio`'s caller clamped `channels` with `.max(1)`
+/// but took `sample_rate` VERBATIM, and `AppAudioHandshake.sample_rate` is
+/// `#[serde(default)]` — so a handshake that OMITS the field (or sends 0) yields
+/// rate 0. `Vad::new` then degenerates completely: per_ms = 0/1000 = 0, so
+/// frame_len, min_speech_samples, silence_limit_samples AND max_segment_samples
+/// all collapse to their `.max(1)` floor of ONE SAMPLE — the 30-second segment cap
+/// becomes 1 sample. The capture loop then starts a segment on the first voiced
+/// sample and force-emits on the next, so it writes a WAV into `state/tmp` and
+/// sends an `Event::Utterance` into an UNBOUNDED tokio channel roughly every TWO
+/// input samples — ~24,000 files and ~24,000 sends per second for a 48 kHz stream.
+/// `BargeDetector::new` collapses identically. The intended client is safe (the HUD
+/// takes the rate from a real cpal device), so this is a validation gap on a
+/// trusted-ish channel — but a malformed-but-authenticated handshake must be
+/// REFUSED, not turned into a disk/memory-exhaustion loop.
+const MIN_APP_SAMPLE_RATE: u32 = 8_000;
+const MAX_APP_SAMPLE_RATE: u32 = 192_000;
 /// Hard cap on a single frame's sample count (the u32 length prefix). At 48 kHz
 /// stereo this is ~10 s of audio per frame — far above any real capture buffer —
 /// so a corrupt/hostile prefix can never make the daemon attempt a multi-gigabyte
@@ -658,6 +677,20 @@ fn read_app_handshake<R: std::io::BufRead>(reader: &mut R) -> Result<AppAudioHea
     if !crate::apps::verify_command_token(&hs.token) {
         // No token value is logged — only that verification failed.
         return Err(anyhow!("app-audio handshake token failed verification"));
+    }
+    // The declared FORMAT is validated too, not just the token. Rejecting here (the
+    // same path as a bad token: the caller warns, closes and re-accepts) is better
+    // than clamping at the call site, because it keeps the format-change guard in
+    // `serve_app_audio` comparing REAL rates. `channels` keeps its existing
+    // call-site `.max(1)`; a 0 there is merely wrong, while a 0 rate is the
+    // degenerate-VAD hazard described at MIN_APP_SAMPLE_RATE.
+    if !(MIN_APP_SAMPLE_RATE..=MAX_APP_SAMPLE_RATE).contains(&hs.sample_rate) {
+        return Err(anyhow!(
+            "app-audio handshake declared an out-of-range sample_rate ({}); expected {}..={}",
+            hs.sample_rate,
+            MIN_APP_SAMPLE_RATE,
+            MAX_APP_SAMPLE_RATE
+        ));
     }
     Ok(AppAudioHeader {
         sample_rate: hs.sample_rate,
@@ -1333,7 +1366,8 @@ fn round4(v: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{round4, LevelMeter, Vad, LEVEL_INTERVAL};
+    use super::{read_app_handshake, round4, AppAudioHeader, LevelMeter, Vad, LEVEL_INTERVAL};
+    use anyhow::Result;
     use crate::config::Config;
     use std::time::{Duration, Instant};
 
@@ -1524,6 +1558,56 @@ mod tests {
             rms_segs >= 2,
             "the RMS gate false-accepts the loud noise (that is the measured failure mode it has)"
         );
+    }
+
+    /// REGRESSION: the app-audio handshake must REFUSE a malformed declared format,
+    /// not pass it to the VAD. `sample_rate` is `#[serde(default)]`, so a handshake
+    /// that omits it yields 0 — and `Vad::new(0, ..)` collapses every derived bound
+    /// to its `.max(1)` floor of ONE SAMPLE (the 30 s segment cap included), turning
+    /// the capture loop into one WAV file + one unbounded-channel `Event::Utterance`
+    /// per ~2 input samples (~24,000/s at 48 kHz). The token is valid in every case
+    /// below, so this test isolates the FORMAT check.
+    #[test]
+    fn an_app_audio_handshake_with_a_bad_sample_rate_is_refused() {
+        let token = crate::apps::mint_command_token();
+        let line = |body: String| -> Result<AppAudioHeader> {
+            let mut r = std::io::BufReader::new(std::io::Cursor::new(body.into_bytes()));
+            read_app_handshake(&mut r)
+        };
+        // PRECONDITION: a well-formed handshake with the SAME token is accepted, so
+        // a failure below is the rate and not the token.
+        let ok = line(format!(
+            "{{\"token\":\"{token}\",\"sample_rate\":48000,\"channels\":1}}\n"
+        ))
+        .expect("a valid handshake must be accepted");
+        assert_eq!(ok.sample_rate, 48_000);
+        assert_eq!(ok.channels, 1);
+
+        // sample_rate OMITTED -> serde default 0 -> the degenerate-VAD hazard.
+        let err = line(format!("{{\"token\":\"{token}\",\"channels\":1}}\n"))
+            .expect_err("an omitted sample_rate must be refused, not defaulted to 0");
+        assert!(err.to_string().contains("sample_rate"), "{err}");
+        // Explicit 0, and both ends of the band.
+        for rate in [0u32, 1, 7_999, 192_001, 4_000_000] {
+            assert!(
+                line(format!(
+                    "{{\"token\":\"{token}\",\"sample_rate\":{rate},\"channels\":1}}\n"
+                ))
+                .is_err(),
+                "sample_rate {rate} is out of band and must be refused"
+            );
+        }
+        // …and the band's own edges are accepted.
+        for rate in [8_000u32, 44_100, 192_000] {
+            assert_eq!(
+                line(format!(
+                    "{{\"token\":\"{token}\",\"sample_rate\":{rate},\"channels\":1}}\n"
+                ))
+                .expect("an in-band rate must be accepted")
+                .sample_rate,
+                rate
+            );
+        }
     }
 
     fn meter_at(origin: Instant) -> LevelMeter {

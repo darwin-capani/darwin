@@ -305,10 +305,16 @@ pub fn build_report(title: &str, sources: &[SourcedClaim], _cfg: &ReportConfig) 
 /// listing every REAL citation (`[n] title — url`). An honest-empty report renders
 /// a plain "no sources to report on" line under the title — NEVER a fabricated
 /// body or citation. Pure — unit-testable without I/O. When a point's text ALREADY
-/// ends with its own `[n]` citation marker (e.g. a notebook entry's pre-rendered
-/// cited synthesis), the marker is NOT appended again — the existing one already
-/// points at the same real source, so re-stamping it would only double the marker,
-/// never add a citation.
+/// ends with its own `[n]` citation marker, the marker is NOT appended again — the
+/// existing one already points at the same real source, so re-stamping it would
+/// only double the marker, never add a citation.
+///
+/// SCOPE of that dedup branch, stated honestly: it is a BELT for DIRECT
+/// [`build_report`] callers. The parenthetical example this doc used to give ("a
+/// notebook entry's pre-rendered cited synthesis") CANNOT occur, because the only
+/// live producer of points — [`sourced_claims_from_entries`] — runs
+/// `strip_run_local_citations` first, which deletes every bare `[digits]` marker
+/// before the text ever reaches here.
 pub fn render_markdown(report: &Report) -> String {
     let mut out = String::new();
     let title = if report.title.is_empty() { "Report" } else { report.title.as_str() };
@@ -391,13 +397,21 @@ pub struct ReportIntent {
 pub fn classify_report_intent(utterance: &str) -> Option<ReportIntent> {
     let lower = utterance.to_lowercase();
     let lower = lower.trim();
-    if !lower.contains("report") {
+    // WHOLE WORDS, not substrings. `contains("report")` also matched reporter /
+    // reported / reporting, and `contains("write")` matched writer, `contains("make")`
+    // matched makes, `contains("draft")` matched drafted — so "draft an email about
+    // the reported outage" and "what did the reporter write about the merger" both
+    // classified as report-generation intents, were answered by the report op, and
+    // `route()` returned immediately, so the email was never drafted and the question
+    // was never answered. This is the exact substring class notebook.rs already had
+    // to fix.
+    if !crate::utterance::mentions_word(lower, "report") {
         return None;
     }
     // Must carry an explicit build verb so a mere mention of "report" (a question
     // about an existing report) does not trip it.
     const VERBS: &[&str] = &["generate", "write", "build", "make", "create", "produce", "draft", "compile"];
-    if !VERBS.iter().any(|v| lower.contains(v)) {
+    if !crate::utterance::mentions_any_word(lower, VERBS) {
         return None;
     }
     // Pull the topic after the LAST " on " / " about " that follows "report".
@@ -422,17 +436,15 @@ fn extract_report_topic(lower: &str) -> Option<String> {
             }
         }
     }
-    // Fallback: a trailing " on X" / " about X" anywhere (e.g. "write me a report,
-    // on X"). Take the last occurrence so "report on the budget" still works.
-    for anchor in [" on ", " about "] {
-        if let Some(pos) = lower.rfind(anchor) {
-            let rest = &lower[pos + anchor.len()..];
-            let topic = rest.trim().trim_end_matches('?').trim();
-            if !topic.is_empty() {
-                return Some(topic.to_string());
-            }
-        }
-    }
+    // NO BARE " on " / " about " FALLBACK. There used to be one — an `rfind` over
+    // the WHOLE utterance — so the topic could follow ANY " on "/" about " in the
+    // sentence rather than one that follows "report". Combined with the substring
+    // matches above that produced "make a note about the report I read" ->
+    // ReportIntent{topic: "the report i read"} and "write a haiku about the weather
+    // report" -> ReportIntent{topic: "the weather report"}. The doc on this module
+    // promises "only an explicit 'report on / write a report about X' phrasing trips
+    // it"; requiring the anchor above is what makes that true. Every existing
+    // positive case uses the anchor, so nothing real is lost.
     None
 }
 
@@ -789,6 +801,39 @@ mod tests {
         assert_eq!(classify_report_intent("generate the report"), None);
     }
 
+    /// REGRESSION: the classifier ran on raw SUBSTRINGS ("report" inside reporter /
+    /// reported / reporting; "write" inside writer; "make" inside makes; "draft"
+    /// inside drafted) and then took its topic from ANY later " on "/" about " via
+    /// an `rfind` over the whole utterance. Every line below was MEASURED producing
+    /// a ReportIntent — and because `route()` returns immediately on one, the real
+    /// request was silently replaced by "# <topic> / _No sources to report on…_":
+    /// the email was never drafted, the question never answered.
+    #[test]
+    fn an_ordinary_utterance_mentioning_a_report_word_is_not_a_report_intent() {
+        for u in [
+            "draft an email about the reported outage",
+            "what did the reporter write about the merger",
+            "make a note about the report I read",
+            "write a haiku about the weather report",
+            "create a playlist about reporting season",
+        ] {
+            assert_eq!(
+                classify_report_intent(u),
+                None,
+                "{u:?} must NOT be hijacked by the report op"
+            );
+        }
+        // CONTROL: the real phrasing the doc promises still classifies, topic and all.
+        assert_eq!(
+            classify_report_intent("generate a report on the JWST"),
+            Some(ReportIntent { topic: "the jwst".to_string() })
+        );
+        assert_eq!(
+            classify_report_intent("write me a report about black holes"),
+            Some(ReportIntent { topic: "black holes".to_string() })
+        );
+    }
+
     // ---- from notebook entries: cite-only-real carries through -------------
 
     fn entry(topic: &str, synth: &str, cites: Vec<(i64, &str, &str)>) -> crate::memory::NotebookEntry {
@@ -936,15 +981,45 @@ mod tests {
 
     #[test]
     fn render_does_not_double_a_pre_existing_citation_marker() {
-        // A notebook entry's synthesized text already ends with its own [1] marker;
-        // the render must NOT append a second one (it would only duplicate, never
-        // add a real citation).
-        let entries = vec![entry("X", "Key finding [1]", vec![(1, "Src", "https://x.test")])];
-        let claims = sourced_claims_from_entries(&entries);
-        let r = build_report("X", &claims, &cfg());
+        // WHAT WENT WRONG: this test used to feed a notebook entry through
+        // `sourced_claims_from_entries`, which runs `strip_run_local_citations`
+        // FIRST — so the "[1]" was already gone by the time render_markdown saw the
+        // text, the dedup branch was never taken, and BOTH assertions held with the
+        // branch deleted entirely (mutation-proven). Build the Report DIRECTLY so
+        // the point text really does arrive carrying its own marker.
+        let r = Report {
+            title: "X".to_string(),
+            sections: vec![ReportSection {
+                heading: "Findings".to_string(),
+                points: vec![("Key finding [1]".to_string(), 1)],
+            }],
+            all_citations: vec![ReportCitation {
+                id: 1,
+                title: "Src".to_string(),
+                url: "https://x.test".to_string(),
+            }],
+            empty: false,
+        };
         let md = render_markdown(&r);
         assert!(md.contains("- Key finding [1]\n"), "single marker kept: {md}");
         assert!(!md.contains("[1] [1]"), "no doubled marker: {md}");
+        assert_eq!(md.matches("[1]").count(), 2, "exactly one body marker + one bibliography entry: {md}");
+
+        // …and a point WITHOUT its own marker still gets one appended.
+        let r2 = Report {
+            title: "X".to_string(),
+            sections: vec![ReportSection {
+                heading: "Findings".to_string(),
+                points: vec![("Key finding".to_string(), 1)],
+            }],
+            all_citations: vec![ReportCitation {
+                id: 1,
+                title: "Src".to_string(),
+                url: "https://x.test".to_string(),
+            }],
+            empty: false,
+        };
+        assert!(render_markdown(&r2).contains("- Key finding [1]\n"), "{}", render_markdown(&r2));
     }
 
     #[test]

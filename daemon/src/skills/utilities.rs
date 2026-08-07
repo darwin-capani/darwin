@@ -80,7 +80,7 @@ pub fn skills() -> Vec<SkillDef> {
         SkillDef::new(
             "slugify",
             Category::Utilities,
-            "Turn arbitrary text into a clean URL/file slug: lowercase ASCII words joined by single hyphens. Use for a permalink or filename stem.",
+            "Turn arbitrary text into a clean URL/file slug: lowercase words joined by single hyphens. Accents and non-Latin scripts are KEPT as-is (not folded to ASCII), so a slug can contain non-ASCII characters. Use for a permalink or filename stem.",
             &["slugify", "make a slug", "url slug", "permalink", "filename from title"],
             slugify,
         ),
@@ -510,8 +510,16 @@ fn tokenize_words(s: &str) -> Vec<String> {
 }
 
 /// `slugify {text}` -> a clean URL/file slug: tokenized words joined by single
-/// hyphens, all lowercase ASCII-folded. Empty/symbol-only input is an error
-/// (there is no honest slug for it). Pure.
+/// hyphens, all lowercase. Empty/symbol-only input is an error (there is no honest
+/// slug for it). Pure.
+///
+/// NOT ASCII-FOLDED — this doc used to claim it was. `tokenize_words` keeps any
+/// `char::is_alphanumeric()` (Unicode) and lowercases with Unicode
+/// `char::to_lowercase()`, so `slugify("Café Münster")` returns `"café-münster"`
+/// and `slugify("日本語 テスト")` returns `"日本語-テスト"`. A caller using the result
+/// directly as a permalink or filename stem gets multi-byte non-ASCII characters
+/// that still need percent-encoding. The existing test only feeds pure-ASCII input,
+/// so the claim was never exercised.
 fn slugify(args: &Value) -> Result<String> {
     let text = require_str(args, "text", "slugify")?;
     let slug = tokenize_words(text).join("-");

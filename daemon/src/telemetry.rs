@@ -334,8 +334,13 @@ mod tests {
             sticky_key("app.manifest_invalid", &serde_json::json!({"name": "fab-link"})).as_deref(),
             Some("app.manifest_invalid:fab-link"),
         );
-        // SAFETY SNAPSHOT: the anchored restore point is event-driven state a fresh
-        // HUD must still learn (to render "you can roll back to …"), so it retains.
+        // SAFETY SNAPSHOT: the anchored restore point is rare, event-driven state a
+        // later-connecting client must still learn, so it retains. NOTE — matching
+        // the retraction in the production comment above `sticky_key`: the HUD has NO
+        // consumer for this frame today (grep `snapshot.anchor` / "roll back" over
+        // hud/src returns nothing; the frame falls through applyEnvelope's default).
+        // The retention is correct on its own terms; do NOT restate the old "renders
+        // 'you can roll back to 14:32'" claim here.
         assert_eq!(
             sticky_key("snapshot.anchor", &serde_json::json!({"status": "created"})).as_deref(),
             Some("snapshot.anchor"),

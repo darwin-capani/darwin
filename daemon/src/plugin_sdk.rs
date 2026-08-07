@@ -12,13 +12,27 @@
 //!       requested scope claims a privilege the plugin's own `[permissions]`
 //!       block (and hence the SBPL profile) does not actually grant. A malformed
 //!       or OVER-PRIVILEGED manifest is rejected with a precise error.
-//!   (b) the register-on-launch HANDSHAKE — [`register_plugin`] — the plugin
-//!       presents its manifest + its capability token; the daemon RE-VALIDATES
-//!       the manifest and VERIFIES the token (the SAME HMAC/nonce machinery as
-//!       the per-app relay and the generate proxy — no new crypto) before
-//!       scoping the plugin's declared intents/tools onto the router. A
-//!       forged/cross-app/stale token, or an invalid manifest, fails the
-//!       handshake — the plugin is not admitted.
+//!   (b) the register-on-launch HANDSHAKE — [`register_plugin`] — the plugin's
+//!       manifest is RE-VALIDATED and its capability token VERIFIED (the SAME
+//!       HMAC/nonce machinery as the per-app relay and the generate proxy — no new
+//!       crypto).
+//!
+//!       **OBSERVATIONAL, NOT ADMISSION CONTROL — this doc used to claim the
+//!       opposite.** `HandshakeOutcome` has exactly one non-test consumer,
+//!       `main.rs`'s `[apps].autostart` loop, and it only LOGS the outcome and
+//!       emits it as a `plugin.handshake` telemetry frame. Nothing stops the app,
+//!       unregisters it, or scopes anything: the app is LAUNCHED FIRST and keeps
+//!       running after an `InvalidManifest` / `Unauthorized` outcome, and its tools
+//!       are still offered to the agent loop (`agent_tools()` is built from the
+//!       manifest alone and never consults the handshake). `intents.provides` is
+//!       read for routing NOWHERE. Discovery uses `AppManifest::load`/`parse`, not
+//!       [`validate_manifest`], so "the on-disk manifest is checked at discovery"
+//!       below is about the base manifest contract, not this validator. Every
+//!       non-autostart start path (router.rs, anthropic.rs) skips the handshake
+//!       entirely. Practical privilege impact is limited — declared scopes grant
+//!       nothing; the SBPL profile and the token derive from `[permissions]` — so
+//!       what is actually wrong is that a security control's documentation asserted
+//!       a fail-closed gate the code does not implement.
 //!   (c) capability-token SCOPING per SANDBOX.md: the token already binds
 //!       `name || canonical(permissions) || nonce`, so a plugin that widens its
 //!       permissions after launch fails verification. The validator additionally
@@ -212,8 +226,11 @@ pub fn validate_manifest(raw: &str, dir_name: &str) -> ValidateResult {
 /// Outcome of the register-on-launch handshake.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HandshakeOutcome {
-    /// Manifest valid AND token verified: the plugin is ADMITTED with these
-    /// scoped intents (the names the daemon will route to it).
+    /// Manifest valid AND token verified, carrying the intents the manifest
+    /// declares. NOTE: "Admitted" names the CHECK's verdict, not an enforcement
+    /// action — see the module header. Nothing consumes this variant except the
+    /// `plugin.handshake` telemetry emit, the intents are not scoped onto any
+    /// router, and the other two variants do not stop or unregister the app.
     Admitted { name: String, intents: Vec<String> },
     /// The presented manifest failed validation (precise reason).
     InvalidManifest(String),

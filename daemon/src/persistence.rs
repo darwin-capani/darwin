@@ -645,8 +645,23 @@ where
 }
 
 /// Collect loaded jobs from the user domain (`launchctl list`), keeping the
-/// THIRD-PARTY ones (Apple's own `com.apple.*` are filtered as noise, mirroring
-/// the kext filter) and labeling DARWIN's own as self.
+/// THIRD-PARTY AUTOSTART ones (Apple's own `com.apple.*` are filtered as noise,
+/// mirroring the kext filter) and labeling DARWIN's own as self.
+///
+/// WHAT WENT WRONG: the user-domain `launchctl list` is dominated by PER-LAUNCH
+/// GUI-APP SERVICE INSTANCES — `application.<bundle-id>.<asn-pair>` — which are
+/// not persistence items at all: the ASN pair is minted fresh on every launch, so
+/// the label CHANGES every time the user opens or quits an app. Keeping them made
+/// the baseline diff report a brand-new "NEW autostart" (and a matching "REMOVED
+/// autostart" for the superseded row) every time Chrome restarted. This machine's
+/// baseline held 15 such rows out of 38 launchctl rows, six of them minted after
+/// the cold-start seed — six false security anomalies in two weeks, on the loudest
+/// signal this module has. They also skew `summarize()` / `posture_line()`, which
+/// posture.rs and triage.rs read back to the user.
+///
+/// Note the `com.apple.` prefix test does NOT catch them: Apple's own instances
+/// are labeled `application.com.apple.systemevents.<asn-pair>`, so the prefix is
+/// `application.`, not `com.apple.`. Filtering `application.` covers both.
 async fn collect_launchctl<F, Fut>(run: &F) -> (Vec<AutostartItem>, Option<(&'static str, String)>)
 where
     F: Fn(&'static str, Vec<String>, Duration) -> Fut,
@@ -659,6 +674,14 @@ where
     };
     let mut out = Vec::new();
     for (pid, status, label) in parse_launchctl_list(&text) {
+        // A per-launch GUI-app service instance, NOT an autostart job (see the doc
+        // above). Its label carries the app's ASN pair, so it is different on every
+        // relaunch — recording it manufactures a NEW/REMOVED anomaly pair per app
+        // restart. This also catches Apple's own `application.com.apple.*` rows,
+        // which the `com.apple.` prefix test below misses.
+        if label.starts_with("application.") {
+            continue;
+        }
         if label.starts_with("com.apple.") {
             continue;
         }
@@ -886,7 +909,24 @@ type BaselineRow = (String, String, String);
 /// its binary isn't validly signed), a REMOVED item, and a signed→unsigned
 /// regression on an existing one. DARWIN's own items are excluded on BOTH sides,
 /// so `com.darwin.*` never appears as an anomaly.
-fn baseline_diff(baseline: &[BaselineRow], live: &[AutostartItem]) -> Vec<String> {
+///
+/// `skipped` names the surfaces this tick could NOT read. WHAT WENT WRONG without
+/// it: each collector honestly returns `(Vec::new(), Some(skip))` on an unreadable
+/// read, but only the items half reached this diff — so a surface that timed out
+/// (a 5s `osascript`/System Events launch, a busy `kmutil`, a revoked Automation
+/// consent) was INDISTINGUISHABLE from "every item on that surface was removed".
+/// One slow tick produced a burst of false `REMOVED autostart` alarms, the store
+/// then DELETED those rows, and the next tick produced the matching burst of false
+/// `NEW autostart` alarms — the loudest possible false positive, from a module
+/// whose stated contract (lines 19-21) is "a surface that needs a privilege the
+/// no-sudo daemon lacks degrades to an explicit SKIP — never a fabricated empty
+/// list". The SKIP was honest in the `skips` field and dishonest in `anomalies`,
+/// which is the field that alarms. A skipped surface now contributes NO removals.
+fn baseline_diff(
+    baseline: &[BaselineRow],
+    live: &[AutostartItem],
+    skipped: &[&str],
+) -> Vec<String> {
     let live_non_self: Vec<&AutostartItem> = live.iter().filter(|i| !i.is_self).collect();
     let live_keys: HashSet<(&str, &str)> = live_non_self
         .iter()
@@ -918,6 +958,11 @@ fn baseline_diff(baseline: &[BaselineRow], live: &[AutostartItem]) -> Vec<String
     }
 
     for (s, k, _) in baseline {
+        // A surface we could not READ this tick tells us NOTHING about whether its
+        // items are still there — it is never evidence of a removal.
+        if skipped.contains(&s.as_str()) {
+            continue;
+        }
         if !live_keys.contains(&(s.as_str(), k.as_str())) {
             anomalies.push(format!("REMOVED autostart: {s} → {k}"));
         }
@@ -1028,7 +1073,18 @@ impl PersistenceBaseline {
     /// Set-replacement (not accumulation) is what lets a later diff report a
     /// genuine REMOVED delta tick-over-tick without re-alarming forever. Call
     /// AFTER diffing against the prior baseline.
-    async fn replace_with(&self, items: &[AutostartItem], now: i64) -> Result<()> {
+    ///
+    /// `skipped` names the surfaces that could NOT be read this tick; their rows
+    /// are LEFT ALONE. Deleting them would wipe the baseline for a surface we
+    /// never observed, which is what turned one 5s timeout into a burst of false
+    /// REMOVED alarms followed by a matching burst of false NEW alarms on the very
+    /// next tick (see [`baseline_diff`]).
+    async fn replace_with(
+        &self,
+        items: &[AutostartItem],
+        now: i64,
+        skipped: &[&str],
+    ) -> Result<()> {
         let live: Vec<&AutostartItem> = items.iter().filter(|i| !i.is_self).collect();
         let conn = self.conn.lock().await;
         // ONE TRANSACTION for the whole replacement.
@@ -1061,6 +1117,10 @@ impl PersistenceBaseline {
         let live_keys: HashSet<(&str, &str)> =
             live.iter().map(|i| (i.surface, i.key.as_str())).collect();
         for (s, k) in &recorded {
+            // Never delete a row for a surface we could not read this tick.
+            if skipped.contains(&s.as_str()) {
+                continue;
+            }
             if !live_keys.contains(&(s.as_str(), k.as_str())) {
                 tx.execute(
                     "DELETE FROM persistence_baseline WHERE surface = ?1 AND key = ?2",
@@ -1133,16 +1193,19 @@ async fn sentinel_tick(store: &PersistenceBaseline, assess_signing: bool, max_as
     set_last_snapshot(LastSnapshot { total, self_n, unsigned, gatekeeper: inv.gatekeeper });
 
     let now = now_secs();
+    // The surfaces this tick could NOT read. Both the diff and the store write need
+    // them: an unreadable surface is not an empty one (see `baseline_diff`).
+    let skipped: Vec<&str> = inv.skips.iter().map(|(surface, _)| *surface).collect();
     // Cold start: seed silently so a first run does not alert on every existing item.
     let anomalies: Vec<String> = match store.is_empty().await {
         Ok(true) => {
-            let _ = store.replace_with(&inv.items, now).await;
+            let _ = store.replace_with(&inv.items, now, &skipped).await;
             Vec::new()
         }
         Ok(false) => {
             let baseline = store.load().await.unwrap_or_default();
-            let anomalies = baseline_diff(&baseline, &inv.items);
-            let _ = store.replace_with(&inv.items, now).await;
+            let anomalies = baseline_diff(&baseline, &inv.items, &skipped);
+            let _ = store.replace_with(&inv.items, now, &skipped).await;
             anomalies
         }
         Err(_) => Vec::new(),
@@ -1395,7 +1458,7 @@ mod tests {
             // DARWIN's own — must NEVER appear as an anomaly.
             item("LaunchAgent(user)", "com.darwin.daemon", Signedness::NotAssessed, true),
         ];
-        let a = baseline_diff(&baseline, &live);
+        let a = baseline_diff(&baseline, &live, &[]);
         assert!(a.iter().any(|x| x.contains("NEW autostart") && x.contains("com.new.tool") && x.contains("[UNSIGNED]")), "{a:?}");
         assert!(a.iter().any(|x| x.contains("NEW autostart") && x.contains("com.new.signed") && !x.contains("[UNSIGNED]")), "{a:?}");
         assert!(a.iter().any(|x| x.contains("REMOVED autostart") && x.contains("com.went.away")), "{a:?}");
@@ -1410,7 +1473,7 @@ mod tests {
     fn baseline_diff_silent_when_unchanged() {
         let baseline = vec![("kext".into(), "com.thirdparty.driver".into(), "not_assessed".into())];
         let live = vec![item("kext", "com.thirdparty.driver", Signedness::NotAssessed, false)];
-        assert!(baseline_diff(&baseline, &live).is_empty());
+        assert!(baseline_diff(&baseline, &live, &[]).is_empty());
     }
 
     #[test]
@@ -1436,7 +1499,7 @@ mod tests {
             // self excluded from the store entirely.
             item("LaunchAgent(user)", "com.darwin.daemon", Signedness::NotAssessed, true),
         ];
-        store.replace_with(&first, 1000).await.unwrap();
+        store.replace_with(&first, 1000, &[]).await.unwrap();
         assert!(!store.is_empty().await.unwrap());
         let rows = store.load().await.unwrap();
         assert_eq!(rows.len(), 2, "self is excluded: {rows:?}");
@@ -1447,7 +1510,7 @@ mod tests {
             item("LaunchAgent(user)", "com.a", Signedness::Adhoc, false),
             item("kext", "com.c", Signedness::NotAssessed, false),
         ];
-        store.replace_with(&second, 2000).await.unwrap();
+        store.replace_with(&second, 2000, &[]).await.unwrap();
         let rows = store.load().await.unwrap();
         assert_eq!(rows.len(), 2, "set-replacement: com.b removed, com.c added: {rows:?}");
         assert!(rows.iter().any(|(s, k, sig)| s == "LaunchAgent(user)" && k == "com.a" && sig == "adhoc"));
@@ -1585,6 +1648,77 @@ mod tests {
         assert_eq!(items.len(), 2, "com.apple.* filtered: {items:?}");
         assert!(items.iter().any(|i| i.key == "com.example.agent" && !i.is_self));
         assert!(items.iter().any(|i| i.key == "com.darwin.daemon" && i.is_self), "self labeled");
+    }
+
+    /// REGRESSION: a per-launch GUI-app service instance is NOT an autostart item.
+    /// The user-domain `launchctl list` is full of `application.<bundle>.<asn-pair>`
+    /// rows whose label is minted fresh on every app launch. Recording them made a
+    /// Chrome restart mint a brand-new "autostart persistence item" and retire the
+    /// old one — a NEW + REMOVED security anomaly pair per app restart. This machine
+    /// had 15 such rows in its live baseline, 6 of them alarmed after the cold-start
+    /// seed. Note the third line: Apple's OWN instances start with `application.`,
+    /// not `com.apple.`, so the pre-existing Apple filter never caught them.
+    #[tokio::test]
+    async fn collect_launchctl_drops_per_launch_app_instances() {
+        let mut m = std::collections::HashMap::new();
+        stub_text(
+            &mut m,
+            LAUNCHCTL,
+            "PID\tStatus\tLabel\n\
+             1\t0\tapplication.com.google.Chrome.914882.164397706\n\
+             2\t0\tapplication.com.adobe.CCXProcess.162510742.162510748\n\
+             3\t0\tapplication.com.apple.systemevents.1152921500312102922.1152921500312102927\n\
+             -\t0\tcom.example.agent",
+        );
+        let run = canned(m);
+        let (items, skip) = collect_launchctl(&run).await;
+        assert!(skip.is_none(), "a successful read records no skip");
+        assert!(
+            !items.iter().any(|i| i.key.starts_with("application.")),
+            "a per-launch app instance is not an autostart item: {items:?}"
+        );
+        assert_eq!(items.len(), 1, "only the real third-party job survives: {items:?}");
+        assert_eq!(items[0].key, "com.example.agent");
+    }
+
+    /// REGRESSION: a surface that could NOT be read must contribute NO removals and
+    /// must leave its baseline rows alone. Before this, `sentinel_tick` handed the
+    /// diff only `inv.items` — so a 5s System Events timeout looked exactly like
+    /// "every login item was removed": a burst of false REMOVED alarms, the rows
+    /// deleted, then a matching burst of false NEW alarms on the next tick.
+    #[tokio::test]
+    async fn a_skipped_surface_never_fabricates_removals_or_wipes_its_baseline() {
+        let baseline: Vec<BaselineRow> = vec![
+            ("login item".into(), "OneDrive".into(), "notarized".into()),
+            ("login item".into(), "Rectangle Pro".into(), "notarized".into()),
+            ("LaunchDaemon".into(), "com.thirdparty.updater".into(), "signed".into()),
+        ];
+        // This tick could not read login items; the LaunchDaemon surface read fine
+        // and is unchanged.
+        let live = vec![item("LaunchDaemon", "com.thirdparty.updater", Signedness::Signed, false)];
+        let anomalies = baseline_diff(&baseline, &live, &["login item"]);
+        assert!(
+            anomalies.is_empty(),
+            "a SKIPPED surface is not a removal — nothing on the host changed: {anomalies:?}"
+        );
+        // …and the same tick must not delete the rows it never observed.
+        let store = PersistenceBaseline::in_memory().unwrap();
+        store.replace_with(&[
+            item("login item", "OneDrive", Signedness::Notarized, false),
+            item("login item", "Rectangle Pro", Signedness::Notarized, false),
+            item("LaunchDaemon", "com.thirdparty.updater", Signedness::Signed, false),
+        ], 1000, &[]).await.unwrap();
+        store.replace_with(&live, 2000, &["login item"]).await.unwrap();
+        let rows = store.load().await.unwrap();
+        assert_eq!(rows.len(), 3, "the skipped surface keeps its rows: {rows:?}");
+        assert!(rows.iter().any(|(_, k, _)| k == "OneDrive"));
+        assert!(rows.iter().any(|(_, k, _)| k == "Rectangle Pro"));
+
+        // CONTROL: with the surface actually READ and empty, a removal IS reported
+        // and the rows DO go — the honest signal must survive the fix.
+        let anomalies = baseline_diff(&baseline, &live, &[]);
+        assert_eq!(anomalies.len(), 2, "a real removal still alarms: {anomalies:?}");
+        assert!(anomalies.iter().all(|a| a.starts_with("REMOVED autostart: login item")), "{anomalies:?}");
     }
 
     #[tokio::test]

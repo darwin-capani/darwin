@@ -336,8 +336,13 @@ fn run(mut rx: mpsc::UnboundedReceiver<PlayCmd>) {
     // The composed-music player: entirely separate from the per-reply speech `sink`
     // above, so a long track plays alongside (never inside) the speaking turn. It
     // shares the one device sink (the expensive resource), but its own Player means
-    // a track is stopped/replaced without touching speech playback. It is detached
-    // (`play()` + `detach()` below) so the thread never blocks draining it.
+    // a track is stopped/replaced without touching speech playback. It is NON-BLOCKING
+    // (`play()` below, and the thread never drains it) — deliberately NOT detached:
+    // rodio's `Player::detach(mut self)` CONSUMES the player, and `Drop` only stops
+    // playback while `!detached`, so calling it would destroy the very handle
+    // `MusicStop` / lockdown / replacement rely on. This comment used to name
+    // `detach()` as something the code below did, which invited exactly that
+    // "restoration".
     let mut music: Option<Player> = None;
     // Throttle for the default-device poll below. Start it "stale" so the very
     // first device-touching command re-checks the default immediately.
@@ -455,9 +460,10 @@ fn start_music(output: &mut Option<DeviceOutput>, bytes: Vec<u8>) -> Option<Play
     match Decoder::new(Cursor::new(bytes)) {
         Ok(source) => {
             sink.append(source);
-            // Detach: the sink plays to completion on the audio thread without the
-            // playback thread blocking on it, yet we keep the handle so a panic /
-            // lockdown / replacement can stop it.
+            // NON-BLOCKING (not "detached"): the sink plays to completion on the
+            // audio thread while this thread never drains it, and we KEEP the live
+            // handle so a panic / lockdown / replacement can stop it. A real
+            // `detach()` would CONSUME the Player and take that handle away.
             sink.play();
             Some(sink)
         }
