@@ -1050,6 +1050,19 @@ fn strip_one_command_lead(text: &str) -> Option<&str> {
         // back: "turn on low power mode" still returns None, because the peel exposes
         // "low power mode" and "power mode" does not open THAT either.
         "turn on", "enable", "put it in", "put yourself in", "set it to", "switch it to",
+        // "run in <x> mode" / "do this in <x> mode" are how people phrase it when
+        // they mean THIS turn rather than a standing change. Both peel to the bare
+        // mode phrase and add no false trigger: "run in the park", "run in
+        // circles", "do this in the morning" all expose a head no table opens on.
+        "run in", "do this in", "run this in",
+        // The SUGGESTION form. "we should go offline" is a request, not a
+        // declarative about the world — and it was one of the measured losses.
+        // "we should go to the park" peels to "go to the park", which opens
+        // nothing.
+        "we should", "i think we should", "maybe we should",
+        // The WANT form, without the "you to" the entries above require:
+        // "i'd like offline mode", "i want offline mode".
+        "i'd like", "id like", "i would like", "i want", "i need",
     ];
     for lead in LEADS {
         let Some(rest) = text.strip_prefix(lead) else {
@@ -2155,4 +2168,55 @@ mod tests {
         assert_eq!(ThermalState::Serious.as_str(), "serious");
         assert_eq!(ThermalState::Critical.as_str(), "critical");
     }
+    /// A PRIVACY CONTROL MUST NOT FAIL SILENTLY.
+    ///
+    /// Head-anchoring the swap phrases was a precision win and a RECALL loss, and
+    /// the two are not symmetric. For Heavy/Fast/Auto a miss is safe — you get the
+    /// default tier. For LOCAL it is not: "turn on private mode" that resolves to
+    /// None does not keep the turn on-device, it sends it to the CLOUD. The user
+    /// asked for privacy, got silence, and got the opposite.
+    ///
+    /// These are the plain imperatives a person actually says.
+    #[test]
+    fn the_ordinary_ways_of_asking_for_private_mode_all_land() {
+        for u in [
+            "turn on private mode",
+            "turn on offline mode",
+            "enable offline mode",
+            "put it in offline mode",
+            "set it to offline mode",
+            "run in private mode",
+            "we should go offline",
+            "i'd like offline mode",
+        ] {
+            let got = classify_model_swap(u);
+            assert!(
+                got == Some(ModelSwapIntent::Local),
+                "{u:?} is a request to stay on-device; resolving to {got:?} sends it to the cloud"
+            );
+        }
+    }
+
+    /// ...and the false triggers the head-anchoring closed STAY closed. Restoring
+    /// recall must not re-open them.
+    #[test]
+    fn restoring_recall_did_not_reopen_the_false_triggers() {
+        for u in [
+            "turn on low power mode",
+            "turn off low power mode",
+            "turn off offline mode",
+            "don't turn on offline mode",
+            "how do i turn on offline mode on my phone",
+            "turn on the lights",
+            "enable the plugin",
+            "put it in the drawer",
+        ] {
+            assert!(
+                classify_model_swap(u).is_none(),
+                "{u:?} must NOT install a tier override: {:?}",
+                classify_model_swap(u)
+            );
+        }
+    }
+
 }
