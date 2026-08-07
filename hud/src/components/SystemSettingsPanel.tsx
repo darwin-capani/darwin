@@ -28,7 +28,6 @@ import {
   uninstallOpen,
   type UpdateCheck,
 } from "../tauri/bridge";
-import { sendCommand } from "../tauri/command";
 import { isAutoUpdateOn, setAutoUpdateOn } from "../core/autoUpdate";
 import useModalFocus from "./useModalFocus";
 
@@ -54,19 +53,34 @@ export const VOICE_ID_PHRASES = {
   forget: "forget my voice",
 } as const;
 
-/** The EXACT wire shape the voice-id Enroll/Forget buttons send: the SAME
- *  `{cmd:"ask"}` spoken intent, never a bespoke enroll/forget verb. Factored out
- *  and exported so the invariant has ONE named home a test can pin.
+/** VOICE-ID ENROLL/FORGET CANNOT BE DONE FROM A BUTTON, and these no longer
+ *  pretend they can.
  *
- *  WHAT WENT WRONG: the two "button wiring" tests never rendered the component or
- *  fired its onClick — they called `sendCommand` from the test body and asserted
- *  on their own call, so the whole HUD suite stayed green with Enroll rewired to
- *  a non-existent daemon verb. This suite runs in a node env with NO DOM, so a
- *  click cannot be dispatched; what CAN be pinned is (a) this shape, (b) that the
- *  buttons' rendered titles are built from VOICE_ID_PHRASES, so a phrase rewire
- *  is visible in the markup. Both are asserted in system-settings.test.ts. */
-export function voiceIdIntentRequest(phrase: string): { cmd: "ask"; text: string } {
-  return { cmd: "ask", text: phrase };
+ *  WHAT WENT WRONG: both buttons sent `{cmd:"ask", text:"enroll my voice"}`. That
+ *  reaches `LivePipeline::ask` -> `complete_with_tools` — the cloud brain. The
+ *  daemon's `handle_voice_id` is called from ONE place, `run_pipeline`
+ *  (main.rs:3879), which the command channel never enters. So the classifier was
+ *  never consulted and nothing was ever enrolled or forgotten.
+ *
+ *  The HUD then reported success anyway: whatever the cloud model happened to say
+ *  was shown as the result, and on an empty reply it printed its own optimistic
+ *  fallback — "Enrollment started ... the badge flips to ENROLLED when capture
+ *  completes." It never flips.
+ *
+ *  And this is NOT a wiring bug that a bespoke `{cmd:"enroll"}` verb would fix.
+ *  `handle_voice_id(text, embedding, ..)` takes the SPEAKER'S VOICE EMBEDDING.
+ *  Enroll needs a sample to enrol; Forget needs one to verify you are the owner
+ *  before clearing the profile (an unverified "forget my voice" is refused, on
+ *  purpose — otherwise anyone could delete your profile and inherit your scope).
+ *  A GUI click carries no voice. The operation is spoken-path by nature.
+ *
+ *  So the buttons now tell the user what to SAY, and claim nothing. */
+export const VOICE_ID_SPOKEN_ONLY_NOTE =
+  "Voice-id enrollment has to be spoken — it works from your voice, not from a click. " +
+  "Say it out loud and DARWIN will walk you through it.";
+
+export function voiceIdSpokenInstruction(phrase: string): string {
+  return `Say "${phrase}" out loud. ${VOICE_ID_SPOKEN_ONLY_NOTE}`;
 }
 
 /**
@@ -722,7 +736,7 @@ export function VoiceIdEnrollControls({
   onEdit: (id: string, value: SettingValue) => void;
 }) {
   const shell = inTauri();
-  const [busy, setBusy] = useState(false);
+  const [busy] = useState(false);
   const [confirmForget, setConfirmForget] = useState(false);
   const [note, setNote] = useState("");
 
@@ -733,10 +747,7 @@ export function VoiceIdEnrollControls({
   const captured = voiceId?.captured ?? null;
   const need = voiceId?.need ?? null;
 
-  const send = useCallback(async (phrase: string): Promise<string> => {
-    const r = await sendCommand(voiceIdIntentRequest(phrase));
-    return r.ok ? r.reply || "" : r.error || "command failed";
-  }, []);
+
 
   // ENROLL. If voice-id is not LIVE-enabled yet, enrollment can't reach the daemon
   // (its handler is gated on [voice_id].enabled), so we flip the toggle ON as a
@@ -754,21 +765,10 @@ export function VoiceIdEnrollControls({
       );
       return;
     }
-    setBusy(true);
-    setNote("");
-    try {
-      const reply = await send(VOICE_ID_PHRASES.enroll);
-      setNote(
-        reply ||
-          "Enrollment started — speak the prompted phrases when asked. Needs Microphone " +
-            "access + the daemon running; the badge flips to ENROLLED when capture completes.",
-      );
-    } catch {
-      setNote("shell error");
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, enabledLive, enabledDraft, onEdit, send]);
+    // Do NOT fire this at the daemon: the command channel cannot reach the
+    // voice-id handler, and enrollment needs a voice this click does not carry.
+    setNote(voiceIdSpokenInstruction(VOICE_ID_PHRASES.enroll));
+  }, [busy, enabledLive, enabledDraft, onEdit]);
 
   // FORGET — two-step. First click arms the confirm; the second sends the real
   // spoken forget intent that clears the enrolled profile.
@@ -782,18 +782,11 @@ export function VoiceIdEnrollControls({
       );
       return;
     }
-    setBusy(true);
-    setNote("");
-    try {
-      const reply = await send(VOICE_ID_PHRASES.forget);
-      setNote(reply || "Forgot your voice — voice recognition is off until you enroll again.");
-    } catch {
-      setNote("shell error");
-    } finally {
-      setBusy(false);
-      setConfirmForget(false);
-    }
-  }, [busy, confirmForget, send]);
+    // Same: a typed "forget my voice" carries no embedding, so the daemon could
+    // not verify the owner even if it reached the handler — and it does not.
+    setNote(voiceIdSpokenInstruction(VOICE_ID_PHRASES.forget));
+    setConfirmForget(false);
+  }, [busy, confirmForget]);
 
   // The live progress line: ONLY shown when telemetry says a capture session is
   // open, and built straight from the captured/need counters (never invented).

@@ -24,9 +24,9 @@ import SystemSettingsPanel, {
   UpdatesSection,
   UninstallSection,
   VOICE_ID_PHRASES,
-  voiceIdIntentRequest,
+  voiceIdSpokenInstruction,
+  VOICE_ID_SPOKEN_ONLY_NOTE,
 } from "../components/SystemSettingsPanel";
-import { sendCommand } from "../tauri/command";
 import {
   applyVoiceIdEnrolled,
   applyVoiceIdEnrollStarted,
@@ -702,23 +702,35 @@ describe("voice-id enroll / forget controls", () => {
        (b) the buttons' RENDERED titles, now built from VOICE_ID_PHRASES, so a
            phrase rewire is visible in the markup.
      Mutation-checked: changing either the verb or the phrase turns this red. */
-  it("the button wire shape is the SAME {cmd:'ask'} spoken intent — no new daemon verb", async () => {
-    expect(voiceIdIntentRequest(VOICE_ID_PHRASES.enroll)).toEqual({
-      cmd: "ask",
-      text: "enroll my voice",
-    });
-    expect(voiceIdIntentRequest(VOICE_ID_PHRASES.forget)).toEqual({
-      cmd: "ask",
-      text: "forget my voice",
-    });
-    // ...and that shape reaches the backend invoke unchanged.
-    invokeMock.mockResolvedValue({ ok: true, reply: "Let's enroll your voice." });
-    const r = await sendCommand(voiceIdIntentRequest(VOICE_ID_PHRASES.enroll));
-    expect(r.ok).toBe(true);
-    expect(invokeMock).toHaveBeenCalledTimes(1);
-    const [name, args] = invokeMock.mock.calls[0];
-    expect(name).toBe("send_command");
-    expect(args).toEqual({ request: { cmd: "ask", text: "enroll my voice" } });
+  it("the Enroll/Forget buttons do NOT fire a command — the operation needs a voice", () => {
+    // WHAT WENT WRONG: both buttons sent {cmd:"ask", text:"enroll my voice"}. That
+    // reaches LivePipeline::ask -> complete_with_tools (the cloud brain). The
+    // daemon's handle_voice_id is called from ONE place, run_pipeline
+    // (main.rs:3879), which the command channel never enters — so the classifier
+    // was never consulted and nothing was ever enrolled or forgotten. The HUD then
+    // showed whatever the cloud model said, or its own fallback: "Enrollment
+    // started ... the badge flips to ENROLLED when capture completes." It never
+    // flips.
+    //
+    // A bespoke {cmd:"enroll"} verb would NOT fix it. handle_voice_id takes the
+    // speaker's VOICE EMBEDDING: enroll needs a sample, and forget needs one to
+    // verify you are the owner before clearing the profile (an unverified "forget
+    // my voice" is refused on purpose — otherwise anyone could delete your profile
+    // and inherit your scope). A click carries no voice.
+    //
+    // So the buttons instruct instead of pretending, and this pins that they send
+    // NOTHING.
+    expect(voiceIdSpokenInstruction(VOICE_ID_PHRASES.enroll)).toContain('Say "enroll my voice"');
+    expect(voiceIdSpokenInstruction(VOICE_ID_PHRASES.forget)).toContain('Say "forget my voice"');
+    // The instruction must say WHY, or it reads as a UI failure rather than a fact
+    // about how voice-id works.
+    expect(VOICE_ID_SPOKEN_ONLY_NOTE).toMatch(/spoken|voice/i);
+    // And it must not claim the thing happened.
+    for (const phrase of [VOICE_ID_PHRASES.enroll, VOICE_ID_PHRASES.forget]) {
+      const t = voiceIdSpokenInstruction(phrase).toLowerCase();
+      expect(t).not.toContain("enrollment started");
+      expect(t).not.toContain("forgot your voice");
+    }
   });
 
   it("the RENDERED Enroll/Forget buttons quote the exact daemon-classified phrases", () => {
