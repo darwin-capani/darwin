@@ -265,8 +265,27 @@ impl NetBuilder {
         let mut synthetic = 0u32;
 
         // Snapshot the interned keys so we can mutate `self` (find) while iterating.
-        let keys: Vec<(QuantKey, usize)> =
+        //
+        // SORTED, AND THAT IS LOAD-BEARING. `index_of` is a `HashMap` with the
+        // default `RandomState`, whose iteration order is randomized PER MAP
+        // INSTANCE — including between two calls inside one process.
+        //
+        // WHAT WENT WRONG: this loop both assigns `NetId`s and mints the synthetic
+        // `Net-N` names in whatever order it happened to walk the map, so parsing
+        // the SAME BYTES twice produced different NetId->name mappings. Measured on
+        // a file with 5 disjoint unlabelled wires, parsed 40 times in one process:
+        // the FIRST wire came back as every one of "Net-1".."Net-5" across the runs.
+        // `parse_document` is a public API, and the module doc claims this table
+        // "gives the scene enough net metadata for highlighting and ERC" — metadata
+        // that was not reproducible, so any consumer that persists or diffs a
+        // synthetic net name (a saved selection, a golden-file test, two imports of
+        // the same board) saw spurious churn.
+        //
+        // `QuantKey` derives `Ord`, so sorting by grid cell makes the numbering a
+        // pure function of the geometry: same bytes in, same names out, forever.
+        let mut keys: Vec<(QuantKey, usize)> =
             self.index_of.iter().map(|(k, &i)| (*k, i)).collect();
+        keys.sort_unstable_by_key(|(k, _)| *k);
 
         let mut key_to_net: HashMap<QuantKey, NetId> = HashMap::with_capacity(keys.len());
         for (key, node) in keys {
@@ -1643,6 +1662,52 @@ mod tests {
         assert!(scene.wires.iter().all(|w| w.net_id == gnd));
         // Exactly one "GND" entry in net_names.
         assert_eq!(scene.net_names.iter().filter(|n| *n == "GND").count(), 1);
+    }
+
+    /// REGRESSION: `parse_document` was NOT REPRODUCIBLE. `NetBuilder::finalize`
+    /// snapshotted the interned cells straight out of a `HashMap<QuantKey, usize>`
+    /// with the default `RandomState` and assigned `NetId`s + minted `Net-N` names
+    /// in that order — and `HashMap` iteration order is randomized per map
+    /// instance, INCLUDING between two calls in one process. Measured on this exact
+    /// input, parsed 40 times in one process: the first wire came back as every one
+    /// of "Net-1".."Net-5" across the runs.
+    #[test]
+    fn synthetic_net_names_are_deterministic_across_repeated_parses() {
+        // Five disjoint unlabelled wires -> five synthetic nets, nothing to name
+        // them after, so the numbering comes purely from the iteration order.
+        let src = r#"(kicad_sch (version 1)
+            (wire (pts (xy 0 0) (xy 0 10)))
+            (wire (pts (xy 20 0) (xy 20 10)))
+            (wire (pts (xy 40 0) (xy 40 10)))
+            (wire (pts (xy 60 0) (xy 60 10)))
+            (wire (pts (xy 80 0) (xy 80 10))))"#;
+
+        let names_of = || -> Vec<String> {
+            let scene = parse_document(Path::new("x.kicad_sch"), src).unwrap();
+            scene.wires.iter().map(|w| scene.net_name(w.net_id).to_string()).collect()
+        };
+
+        let first = names_of();
+        // Precondition: the input really does produce five DISTINCT synthetic
+        // names. Without this the equality below could hold vacuously (e.g. if
+        // every wire resolved to the no-net name "").
+        assert_eq!(first.len(), 5, "{first:?}");
+        assert!(first.iter().all(|n| n.starts_with("Net-")), "{first:?}");
+        let mut uniq = first.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 5, "expected five distinct synthetic nets: {first:?}");
+
+        // The map is rebuilt from scratch on every parse, so each iteration gets a
+        // freshly seeded RandomState — 40 rounds made the old code produce all five
+        // orderings. The names must be a pure function of the bytes.
+        for round in 0..40 {
+            assert_eq!(names_of(), first, "net names changed on round {round}");
+        }
+
+        // And the numbering follows the geometry (sorted by quantized cell), so it
+        // is predictable, not merely stable within one build.
+        assert_eq!(first, ["Net-1", "Net-2", "Net-3", "Net-4", "Net-5"], "{first:?}");
     }
 
     // ---- in-tree fuzz: deterministic panic-freedom (SPEC §1/§7) -----------

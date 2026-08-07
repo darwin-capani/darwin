@@ -43,6 +43,16 @@ pub const QUANTUM_MM: f64 = 1.0e-4;
 /// A 2-D point in scene space (f64 millimetres). f64 is mandatory: SPEC §3 needs
 /// double-precision view math across the 0.01x–500x zoom range on large boards,
 /// where f32 loses sub-pixel precision.
+///
+/// AXIS CONVENTION — STATED ONCE, HERE. Scene space IS KiCad space: `parser`
+/// reads `(at x y)` / `(xy x y)` verbatim (`read_at`, `read_pts`) and negates
+/// nothing, so +X is right and **+Y grows DOWNWARD**, exactly as in the file and
+/// on the KiCad canvas. Anything that maps scene space onto a Y-UP space (clip /
+/// NDC) must invert Y itself; `render::View::scene_to_clip_f64` is the one place
+/// that does. This used to be documented only in `render.rs`, in two comments 25
+/// lines apart that contradicted each other — one claimed the scene was Y-up and
+/// the projection flipped, the other (correctly) said the projection did not —
+/// and the composition of the two rendered every board vertically mirrored.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Point {
     pub x: f64,

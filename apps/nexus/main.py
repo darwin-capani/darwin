@@ -119,6 +119,12 @@ ROUTES_MIN_HZ = 1.0
 # below the panel's -60 dBFS display floor, so it renders as an empty bar.
 SPECTRUM_FLOOR_DBFS = -140.0
 
+# The dBFS value a SILENT input channel is reported as in `audio.levels` `ch[]`.
+# Same reasoning as SPECTRUM_FLOOR_DBFS, one topic over: `ch[]` is a POSITIONAL
+# array whose index IS the channel number, so an entry must never be droppable.
+# See `_level_dbfs`.
+LEVEL_FLOOR_DBFS = -140.0
+
 # The C-ABI status codes from core/src/error.rs `codes` (FROZEN — keep in sync).
 OK = 0
 NULL_POINTER = -1
@@ -678,10 +684,29 @@ def telemetry_loop(core: NexusCore, link: HostLink, dispatcher: OpDispatcher, st
 
 
 def _emit_levels(core: NexusCore, link: HostLink) -> None:
+    """SPEC §6 audio.levels (30 Hz): the per-input meter strip + the LUFS trio.
+
+    WHAT WENT WRONG: the per-channel peak/rms went through `_finite`, which maps
+    -inf/NaN to None. A SILENT input reads -inf (`ChannelMeter::default()`, and
+    `linear_to_db(0.0)`), and every input index at or above the device's real
+    input count keeps that default FOREVER (engine.rs stores meters only for
+    `.take(active_in)`). The HUD's `coerceChannelLevel` returns null when
+    `peak_dbfs` is not a number and `parseNexusLevels` then FILTERS that entry
+    out of the array — but `ch[]` is POSITIONAL: NexusPanel labels each meter by
+    its ARRAY INDEX. Dropping a silent channel shifted every meter after it, so
+    on a 4-input matrix with input 0 idle the HUD drew input 1's level under the
+    label "0", disagreeing with the I0..I3 row headers of the matrix grid
+    rendered directly above it from the same panel, and the header tag read
+    "3 CH". A user setting gain was looking at the wrong channel's meter.
+
+    So a per-channel level FLOORS to a real number instead (`_level_dbfs`); the
+    array is always exactly `core.inputs()` long. The LUFS scalars keep `_finite`
+    on purpose: they are not positional, and the HUD deliberately distinguishes
+    "not reported yet" (null) from a real loudness rather than showing a fake."""
     ch = []
     for c in range(core.inputs()):
         peak, rms = core.channel_meter(c)
-        ch.append({"peak_dbfs": _finite(peak), "rms_dbfs": _finite(rms)})
+        ch.append({"peak_dbfs": _level_dbfs(peak), "rms_dbfs": _level_dbfs(rms)})
     m, s, i = core.loudness()
     link.telemetry(
         "audio.levels",
@@ -721,6 +746,20 @@ def _finite(x: float) -> float | None:
     """JSON has no -inf; map silence (-inf / NaN) to None so the HUD shows an
     empty meter rather than a malformed payload."""
     return None if (x is None or math.isinf(x) or math.isnan(x)) else x
+
+
+def _level_dbfs(x: float) -> float:
+    """The `audio.levels` per-channel fold: ALWAYS a finite number, never None.
+
+    Unlike the LUFS scalars next to it, a channel level cannot be None — the HUD
+    drops a whole `ch[]` entry whose `peak_dbfs` is not a number and then labels
+    the survivors by array index, so one None RENUMBERS every meter after it (see
+    `_emit_levels`). Silence, an unbacked input index, NaN — all floor to
+    LEVEL_FLOOR_DBFS, which sits below the panel's display floor and renders as an
+    empty meter, which is what a silent channel should look like anyway."""
+    if x is None or math.isinf(x) or math.isnan(x):
+        return LEVEL_FLOOR_DBFS
+    return float(x)
 
 
 def _spectrum_band(x: float) -> float:

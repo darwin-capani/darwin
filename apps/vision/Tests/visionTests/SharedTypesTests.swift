@@ -405,6 +405,73 @@ final class VisionEventWireTests: XCTestCase {
         XCTAssertFalse(DyldReport.consumeChanged(), "consumeChanged clears the flag")
     }
 
+    /// REGRESSION: the manifest granted `fs_write` on `state/tmp/vision` and NO
+    /// `fs_read` covering it.
+    ///
+    /// `apps.rs::generate_sbpl` emits `(allow file-write* (subpath ...))` per
+    /// fs_write entry and `(allow file-read* (subpath ...))` per fs_read entry,
+    /// under `(deny default)` — a write grant does NOT imply a read grant. Probed
+    /// against a profile mirroring generate_sbpl for this manifest, reading a file
+    /// the app had just been granted permission to WRITE returned "Operation not
+    /// permitted". So the dir documented as the "decoded-frame cache" was a cache
+    /// nothing could read back, and any clip handed to `classify.sound` under it
+    /// failed to open — `AVAudioFile(forReading:)` returns nil on EPERM, so
+    /// `classify(audioClipPath:)` returns [] and the user gets the honest
+    /// `no_sound_classes` non-answer forever (see
+    /// `SoundInferenceTests.testClassifyBadAudioPathIsEmpty` and
+    /// `ClassifySoundWiringTests.testClassifySoundNoClassesEmitsHonestError`,
+    /// which pin that consequence).
+    ///
+    /// Reads the real manifest off disk rather than restating it, so deleting the
+    /// grant fails this test.
+    func testEveryWritableScratchDirIsAlsoReadable() throws {
+        let manifestURL = URL(fileURLWithPath: #filePath)   // .../Tests/visionTests/<file>
+            .deletingLastPathComponent()                     // .../Tests/visionTests
+            .deletingLastPathComponent()                     // .../Tests
+            .deletingLastPathComponent()                     // .../apps/vision
+            .appendingPathComponent("manifest.toml")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: manifestURL.path),
+                      "manifest.toml not found at \(manifestURL.path) — this test must not pass vacuously")
+        let toml = try String(contentsOf: manifestURL, encoding: .utf8)
+
+        /// The quoted entries of a `key = [...]` array, ignoring `#` comments.
+        func entries(of key: String) -> [String] {
+            guard let start = toml.range(of: "\(key)   = [") ?? toml.range(of: "\(key)  = [")
+                    ?? toml.range(of: "\(key) = [") else { return [] }
+            guard let close = toml.range(of: "]", range: start.upperBound..<toml.endIndex) else { return [] }
+            let body = toml[start.upperBound..<close.lowerBound]
+            var out: [String] = []
+            for line in body.split(separator: "\n", omittingEmptySubsequences: false) {
+                let code = line.split(separator: "#", maxSplits: 1, omittingEmptySubsequences: false)[0]
+                var scanning = code[...]
+                while let a = scanning.firstIndex(of: "\""),
+                      let b = scanning[scanning.index(after: a)...].firstIndex(of: "\"") {
+                    out.append(String(scanning[scanning.index(after: a)..<b]))
+                    scanning = scanning[scanning.index(after: b)...]
+                }
+            }
+            return out
+        }
+
+        let reads = entries(of: "fs_read")
+        let writes = entries(of: "fs_write")
+
+        // Preconditions: the scrape actually found both lists. Empty lists would
+        // make the subset check below hold vacuously.
+        XCTAssertTrue(reads.contains("apps/vision/videos/input"),
+                      "fs_read scrape failed, got \(reads)")
+        XCTAssertEqual(writes, ["state/tmp/vision"], "fs_write scrape failed, got \(writes)")
+
+        for w in writes {
+            XCTAssertTrue(
+                reads.contains(where: { w == $0 || w.hasPrefix($0 + "/") }),
+                "fs_write grants \(w) but no fs_read entry covers it — under (deny default) "
+                    + "a write grant does not imply a read grant, so the app cannot open a file "
+                    + "it just wrote. fs_read = \(reads)"
+            )
+        }
+    }
+
     func testEveryTopicMatchesManifestDeclaredTopics() throws {
         // The relay drops any topic not declared in manifest.toml. These MUST
         // equal the manifest's telemetry_topics exactly (vision.screen for the OCR

@@ -20,7 +20,7 @@ use crate::metering::{
 };
 use crate::types::{
     db_to_linear, AudioFormat, BlockMut, BlockRef, ChannelDsp, ChannelMeter, ClipEvent,
-    LoudnessMeter, Sample, MAX_CHANNELS,
+    LoudnessMeter, Sample, GAIN_MAX_DB, MAX_CHANNELS,
 };
 
 /// Worst-case interleaved samples per `process_block` we preallocate audio-thread
@@ -181,6 +181,21 @@ impl Engine {
     }
 
     /// SPEC §5 `gain.set` on an input trim. Validates finiteness + range.
+    ///
+    /// WHAT WENT WRONG: this doc line said "finiteness + range" while the body
+    /// checked only finiteness — `GAIN_MAX_DB` was not so much as imported into
+    /// this file. `set_input_trim(0, 1000.0)` returned `Ok(())` even though SPEC §1
+    /// pins the range at "-inf to +12 dB" and `MatrixState::set_crosspoint` has
+    /// always enforced exactly that on the crosspoint next door. That was harmless
+    /// only while the trims were written and read by nothing; they now drive the
+    /// realtime smoothers (see the `input_trims` field comment), so an accepted
+    /// +1000 dB is a real ~10^50 multiplier on the monitored bus.
+    ///
+    /// `-inf` is NOT accepted here the way it is on a crosspoint: on a crosspoint
+    /// it is the documented "no route" sentinel, but a trim has a separate mute, so
+    /// `-inf` would only smooth toward a silence the caller already has a word for
+    /// — and `db_to_linear(-inf)` past a non-finite guard is not a value this ramp
+    /// should ever be aimed at.
     pub fn set_input_trim(&mut self, channel: usize, gain_db: f32) -> Result<()> {
         if channel >= self.state.inputs() {
             return Err(NexusError::OutOfBounds {
@@ -189,8 +204,11 @@ impl Engine {
                 limit: self.state.inputs(),
             });
         }
-        if !gain_db.is_finite() {
-            return Err(NexusError::InvalidParam { param: "gain_db", reason: "must be finite" });
+        if !gain_db.is_finite() || gain_db > GAIN_MAX_DB {
+            return Err(NexusError::InvalidParam {
+                param: "gain_db",
+                reason: "must be finite and <= +12 dB",
+            });
         }
         self.input_trim_db[channel] = gain_db;
         // Aim the realtime smoother at the new linear gain — WITHOUT this the op
@@ -199,7 +217,9 @@ impl Engine {
         Ok(())
     }
 
-    /// SPEC §5 `gain.set` on an output trim.
+    /// SPEC §5 `gain.set` on an output trim. Same finiteness + `GAIN_MAX_DB` range
+    /// gate as [`Self::set_input_trim`] — an out-of-range output trim scales the
+    /// whole mixed bus, so it is the more dangerous of the two.
     pub fn set_output_trim(&mut self, channel: usize, gain_db: f32) -> Result<()> {
         if channel >= self.state.outputs() {
             return Err(NexusError::OutOfBounds {
@@ -208,8 +228,11 @@ impl Engine {
                 limit: self.state.outputs(),
             });
         }
-        if !gain_db.is_finite() {
-            return Err(NexusError::InvalidParam { param: "gain_db", reason: "must be finite" });
+        if !gain_db.is_finite() || gain_db > GAIN_MAX_DB {
+            return Err(NexusError::InvalidParam {
+                param: "gain_db",
+                reason: "must be finite and <= +12 dB",
+            });
         }
         self.output_trim_db[channel] = gain_db;
         self.output_trims[channel].set_target(db_to_linear(gain_db));
@@ -339,10 +362,35 @@ impl Engine {
             // Run the chain in place over this input's staged region. The borrow is
             // confined to the slice so `chain_state[ch]` can be borrowed mutably
             // alongside it. Bypass flags are honored inside the chain.
+            //
+            // MONO ONLY, AND NOW ENFORCED. `dsp::process_channel_chain` documents
+            // its block as "one channel's MONO block", and `ChannelChainState`
+            // carries exactly ONE set of biquad delay lines and envelopes.
+            //
+            // WHAT WENT WRONG: this handed it the whole staged region, which is
+            // `frames * channels` INTERLEAVED samples, with no deinterleave. On a
+            // stereo input the biquad delay line and every envelope stepped across
+            // alternating L/R samples, so the lanes leaked into each other and each
+            // filter's corner moved by a factor of `channels` — an 80 Hz HPF behaved
+            // as 40 Hz on stereo, and the trim smoother's 5 ms ramp became 2.5 ms.
+            // Measured with L = a 1 kHz sine at 0.5 and R = digital silence: the
+            // silent lane came out at -20 dBFS of the other lane's content.
+            //
+            // `dsp::mix_block` explicitly supports interleaved multi-channel blocks,
+            // so `channels > 1` is a contemplated input here, not an impossible one.
+            // Until `ChannelChainState` grows per-lane filter/envelope memory, an
+            // interleaved input SKIPS the chain rather than being corrupted by it:
+            // the samples pass through bit-transparently and are still trimmed,
+            // metered and mixed. (Nothing can reach this today with `channels > 1`
+            // AND `enabled == true`: `ChannelDsp::enabled` defaults false and
+            // `chain.set` has no FFI symbol — main.py logs it as "chain plumbing
+            // pending" — so this is a latent path being closed, not a live fix.)
             let region = &mut self.chain_scratch[off..off + n];
-            if let Some(state) = self.chain_state.get_mut(ch) {
-                let params = &self.channel_dsp[ch];
-                dsp::process_channel_chain(params, state, region, inp.format.sample_rate);
+            if inp.format.channels <= 1 {
+                if let Some(state) = self.chain_state.get_mut(ch) {
+                    let params = &self.channel_dsp[ch];
+                    dsp::process_channel_chain(params, state, region, inp.format.sample_rate);
+                }
             }
 
             // SPEC §5 `gain.set` INPUT trim, applied to the staged (chain-processed)
@@ -524,6 +572,120 @@ mod tests {
         assert!(e.set_input_trim(0, f32::NAN).is_err());
         assert!(e.set_monitor_output(Some(9)).is_err());
         assert!(Engine::new(MAX_CHANNELS + 1, 2, 48_000).is_err());
+    }
+
+    /// REGRESSION: `set_input_trim`'s doc said "Validates finiteness + range" and
+    /// the body checked only finiteness — `GAIN_MAX_DB` was not even imported into
+    /// engine.rs. `set_input_trim(0, 1000.0)` returned `Ok(())` while the crosspoint
+    /// setter next door rejected +13 dB, and the trims now drive the realtime
+    /// smoothers, so the accepted value reaches the monitored bus as a ~10^50
+    /// multiplier.
+    #[test]
+    fn trim_setters_enforce_the_gain_range_their_doc_promises() {
+        let mut e = Engine::new(2, 2, 48_000).unwrap();
+
+        // Precondition: this is the bound `set_crosspoint` already enforces, so the
+        // two gain surfaces agree rather than each inventing a limit.
+        assert_eq!(GAIN_MAX_DB, 12.0);
+        assert!(e.set_crosspoint(0, 0, GAIN_MAX_DB + 1.0).is_err());
+
+        // The exact value from the finding, plus the boundary either side.
+        assert!(e.set_input_trim(0, 1000.0).is_err(), "+1000 dB input trim accepted");
+        assert!(e.set_input_trim(0, GAIN_MAX_DB + 1.0).is_err(), "+13 dB input trim accepted");
+        assert!(e.set_input_trim(0, GAIN_MAX_DB).is_ok(), "+12 dB is in range and must be kept");
+        assert!(e.set_input_trim(0, -40.0).is_ok(), "attenuation is unbounded below");
+
+        assert!(e.set_output_trim(0, 1000.0).is_err(), "+1000 dB output trim accepted");
+        assert!(e.set_output_trim(0, GAIN_MAX_DB + 1.0).is_err(), "+13 dB output trim accepted");
+        assert!(e.set_output_trim(0, GAIN_MAX_DB).is_ok(), "+12 dB is in range and must be kept");
+
+        // A rejected op must not have moved the stored value or the smoother target.
+        let _ = e.set_input_trim(1, -6.0);
+        assert!(e.set_input_trim(1, 99.0).is_err());
+        assert_eq!(e.input_trim(1), -6.0, "a rejected trim still mutated the state");
+    }
+
+    /// REGRESSION: the per-input studio chain is MONO-ONLY (`process_channel_chain`
+    /// says so, and `ChannelChainState` carries exactly one set of biquad delay
+    /// lines and envelopes) but `process_block` handed it the whole staged region,
+    /// which is `frames * channels` INTERLEAVED samples. Every filter and envelope
+    /// then stepped across alternating L/R samples, bleeding one lane into the
+    /// other and moving each filter's corner by a factor of `channels`.
+    ///
+    /// Drives the finding's probe exactly: L = a 1 kHz sine at 0.5, R = DIGITAL
+    /// SILENCE, one stereo interleaved input, HPF enabled, unity route. Before the
+    /// fix the silent lane came out at -20 dBFS of the other lane's content.
+    #[test]
+    fn interleaved_input_does_not_bleed_across_lanes_through_the_chain() {
+        const CH: usize = 2;
+        let frames = 4096;
+        let left = sine(1000.0, 0.5, frames, FS);
+
+        let hpf_on = ChannelDsp {
+            enabled: true,
+            hpf: FilterParams { enabled: true, cutoff_hz: 80.0, order: 2 },
+            gate: GateParams { enabled: false, ..Default::default() },
+            deesser: DeEsserParams { enabled: false, ..Default::default() },
+            compressor: CompressorParams { enabled: false, ..Default::default() },
+            ..Default::default()
+        };
+
+        let mut e = Engine::new(1, 1, FS).unwrap();
+        e.set_crosspoint(0, 0, 0.0).unwrap();
+        e.set_monitor_output(Some(0)).unwrap();
+        e.set_channel_dsp(0, hpf_on).unwrap();
+        // Precondition: the chain is actually configured ON. Without this the test
+        // would pass with a bit-transparent bypass and prove nothing.
+        assert!(e.channel_dsp(0).unwrap().enabled);
+        assert!(e.channel_dsp(0).unwrap().hpf.enabled);
+
+        let fmt = AudioFormat::new(CH as u16, FS);
+        let mut captured: Vec<f32> = Vec::with_capacity(frames * CH);
+        for chunk in left.chunks(BLK) {
+            // Interleave: even index = L (signal), odd index = R (digital silence).
+            let mut inbuf = vec![0.0f32; chunk.len() * CH];
+            for (f, &s) in chunk.iter().enumerate() {
+                inbuf[f * CH] = s;
+            }
+            let mut outbuf = vec![0.0f32; chunk.len() * CH];
+            {
+                let inputs = [BlockRef { data: &inbuf, format: fmt }];
+                let mut outputs = [BlockMut { data: &mut outbuf, format: fmt }];
+                e.process_block(&inputs, &mut outputs);
+            }
+            captured.extend_from_slice(&outbuf);
+        }
+
+        // Precondition: the LEFT lane really carried signal, so an all-zero output
+        // (which would satisfy the assertion below vacuously) is ruled out.
+        let l_peak = captured.iter().step_by(CH).fold(0.0f32, |a, &s| a.max(s.abs()));
+        assert!(l_peak > 0.4, "left lane lost its signal: peak {l_peak}");
+
+        // The silent lane must come out BIT-ZERO. Nothing in the mix, trim or chain
+        // may move a sample that was zero at the input.
+        let r_peak = captured.iter().skip(1).step_by(CH).fold(0.0f32, |a, &s| a.max(s.abs()));
+        assert_eq!(
+            r_peak, 0.0,
+            "a digitally silent interleaved lane came out at {} ({} dBFS) — the mono \
+             chain is being run across lanes",
+            r_peak,
+            linear_to_db(r_peak)
+        );
+
+        // CONTROL: the same chain on a MONO input is still applied — the fix must
+        // skip the chain for interleaved blocks, not disable it everywhere. A 1 kHz
+        // sine through an 80 Hz HPF is near-unity, so use a 30 Hz tone the HPF
+        // measurably attenuates.
+        let sub = sine(30.0, 0.5, frames, FS);
+        let flat = monitored_output(ChannelDsp::default(), &sub);
+        let filtered = monitored_output(hpf_on, &sub);
+        let tail = frames - 2400;
+        assert!(
+            rms(&filtered[tail..]) < rms(&flat[tail..]) * 0.5,
+            "mono chain stopped running: flat {} vs filtered {}",
+            rms(&flat[tail..]),
+            rms(&filtered[tail..])
+        );
     }
 
     #[test]
@@ -1087,8 +1249,27 @@ mod tests {
         }
         // The detector actually fired (the loop is exercised, not skipped) and the
         // accumulator saturated at its bound (drop-on-overflow held the line).
+        //
+        // WHAT WENT WRONG: the second assertion used to read
+        //     assert!(e.clip_events.len() <= cap_clip_events0, ...)
+        // where `cap_clip_events0` is `e.clip_events.capacity()`. `len() <=
+        // capacity()` is a universal invariant of `Vec` — it holds for every Vec
+        // that has ever existed, INCLUDING one that reallocated and grew past 256.
+        // So the assertion could not fail, proved nothing about "drop-on-overflow
+        // held the line", and the comment directly above it claimed otherwise.
+        //
+        // The real precondition is SATURATION: 256 blocks x 2 clipping inputs
+        // attempt 512 pushes against a `len < capacity` guard, so the accumulator
+        // must end EXACTLY full. Bounded against `cap_clip_events0` rather than
+        // `MAX_CLIP_EVENTS` because the guard reads `capacity()`, and the
+        // `cap_clip_events0 >= MAX_CLIP_EVENTS` assertion above already pins the
+        // two together.
         assert!(!e.clip_events.is_empty(), "sustained clipping produced no clip events");
-        assert!(e.clip_events.len() <= cap_clip_events0, "clip events exceeded reserved capacity");
+        assert_eq!(
+            e.clip_events.len(),
+            cap_clip_events0,
+            "drop-on-overflow should have saturated the accumulator at its reserved bound"
+        );
     }
 
     #[test]

@@ -162,6 +162,83 @@ def main():
 import main as _frame_mod  # noqa: E402 — deliberately mid-file, after the app's own imports
 
 
+def test_split_hosts_is_bounded_and_answers_immediately():
+    """REGRESSION: an unbounded `split_hosts` stalled the single-threaded app.
+
+    `_positive_int` checked only the TYPE and `>= 1`, and the VLSM search then
+    iterated on the argument's BIT LENGTH with growing bigints
+    (`while (1 << host_bits) - 2 < split_hosts`) — O(bits^2). Measured on the
+    real `compute` before the fix: ~10k digits = 0.018 s, ~50k = 0.41 s, ~200k =
+    6.28 s, and the daemon's 1 MiB line budget admits ~1M digits, i.e. minutes.
+    `harness.run` serves ops serially from one socket loop, so for the whole
+    duration NOTHING else was processed — including `stop` — the 15 s
+    APP_REQUEST_TIMEOUT fired and the user was told the app did not answer.
+
+    The budget is deliberately loose: this measures the COMPLEXITY CLASS, not
+    this machine's clock. 2**3_000_000 is ~903k digits — near the wire cap, and
+    ~20x the bit length that already took 6.3 s quadratically (so ~40 minutes
+    unfixed).
+    """
+    import time as _time
+
+    huge = (1 << 3_000_000) - 1
+    # Precondition: the argument really is enormous. If a future edit made this a
+    # small int the timing assertion would pass vacuously.
+    assert huge.bit_length() == 3_000_000
+
+    started = _time.monotonic()
+    r = _frame_mod.compute({"cidr": "10.0.0.0/8", "split_hosts": huge})
+    elapsed = _time.monotonic() - started
+
+    assert r == {"error": "network too small to hold split_hosts usable hosts per subnet"}, r
+    assert elapsed < 1.0, "split_hosts search is superlinear in bit length again (%.2fs)" % elapsed
+
+    # v6 takes the other branch and must be bounded identically.
+    started = _time.monotonic()
+    r6 = _frame_mod.compute({"cidr": "2001:db8::/32", "split_hosts": huge})
+    elapsed6 = _time.monotonic() - started
+    assert r6 == {"error": "network too small to hold split_hosts usable hosts per subnet"}, r6
+    assert elapsed6 < 1.0, "v6 split_hosts search is superlinear again (%.2fs)" % elapsed6
+
+
+def test_split_hosts_prefix_choice_is_unchanged_by_the_bound():
+    """CONTROL: the closed-form target-prefix computation must agree with the
+    loop it replaced everywhere the loop was reachable — otherwise the fix above
+    bought speed by changing answers."""
+
+    def loop_v4(sh):
+        hb = 2
+        while (1 << hb) - 2 < sh:
+            hb += 1
+        return 32 - hb
+
+    def loop_v6(sh):
+        hb = 0
+        while (1 << hb) < sh:
+            hb += 1
+        return 128 - hb
+
+    # Spot-check the real `compute` at the boundaries the -2 reservation moves.
+    # /16 base: every split below stays under MAX_SUBNETS, so `subnets` is present.
+    for hosts, want in ((2, "/31"), (3, "/29"), (6, "/29"), (7, "/28"),
+                        (126, "/25"), (254, "/24"), (255, "/23")):
+        r = _frame_mod.compute({"cidr": "10.1.0.0/16", "split_hosts": hosts})
+        assert "subnets" in r, (hosts, r)
+        assert r["subnets"][0].endswith(want), (hosts, want, r["subnets"][0])
+
+    # And the closed forms themselves, against the loops, densely and at every
+    # power-of-two boundary out to 2**64.
+    for sh in range(3, 20000):
+        assert 32 - max(2, (sh + 1).bit_length()) == loop_v4(sh), sh
+    for sh in range(2, 20000):
+        assert 128 - (sh - 1).bit_length() == loop_v6(sh), sh
+    for e in range(2, 65):
+        for d in (-2, -1, 0, 1, 2):
+            sh = (1 << e) + d
+            assert 32 - max(2, (sh + 1).bit_length()) == loop_v4(sh), sh
+            assert 128 - (sh - 1).bit_length() == loop_v6(sh), sh
+
+
 def test_max_frame_bytes_is_8_mib():
     assert _frame_mod.MAX_FRAME_BYTES == 8 * 1024 * 1024
 
@@ -225,11 +302,17 @@ def test_non_string_or_empty_id_is_treated_as_absent():
 
 
 if __name__ == "__main__":
+    # NOTE: this app has TWO runners — pytest collects every `test_*` function,
+    # the script runner below calls them explicitly. A new test added to only one
+    # of them silently does not run in the other, so every `test_*` above MUST be
+    # listed here too.
+    test_split_hosts_is_bounded_and_answers_immediately()
+    test_split_hosts_prefix_choice_is_unchanged_by_the_bound()
     test_max_frame_bytes_is_8_mib()
     test_oversized_frame_is_dropped_not_accumulated()
     test_complete_lines_drain_and_partial_is_preserved()
     test_tool_op_with_id_answers_a_correlated_result()
     test_tool_op_without_id_keeps_the_legacy_items_line()
     test_non_string_or_empty_id_is_treated_as_absent()
-    print("framing + contract: 6 checks ok")
+    print("framing + contract: 8 checks ok")
     main()

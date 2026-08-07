@@ -34,8 +34,41 @@ gpu       = true                        # ANE / Core ML / GPU for built-in Visio
 net_hosts = []                          # fully offline — frames/detections NEVER leave the device
 fs_read   = [
   "apps/vision/videos/input",           # user-provided video files for analyze.file
+  "state/tmp/vision",                   # our OWN scratch dir — see below; fs_write does NOT imply read
 ]
 fs_write  = ["state/tmp/vision"]        # scratch: decoded-frame cache, run artifacts
+
+# WHY state/tmp/vision IS IN **BOTH** LISTS.
+#
+# apps.rs::generate_sbpl emits `(allow file-write* (subpath ...))` for each
+# fs_write entry and `(allow file-read* (subpath ...))` for each fs_read entry —
+# and NOTHING ELSE. Under `(deny default)` a write grant therefore does NOT imply
+# a read grant. Measured against a profile mirroring generate_sbpl for this exact
+# manifest:
+#
+#   fs_read  apps/vision/videos/input/ok.mov      -> readable, exit 0
+#   fs_write state/tmp/vision/inside-the-grant.wav -> cat: Operation not permitted
+#   (ungranted) state/tmp/sound-clip.wav           -> cat: Operation not permitted
+#
+# So the "decoded-frame cache" this dir is documented to hold was a cache the app
+# could WRITE and could never READ BACK, and the `classify.sound` op — the whole
+# vision.sound / "what was that sound" feature, whose topic is declared below —
+# was handed a clip path its own seatbelt profile forbade it to open. Swift's
+# `AVAudioFile(forReading:)` returns nil on the EPERM, `decodeFile` returns nil,
+# `classify(audioClipPath:)` returns [], and the user always got the honest
+# `no_sound_classes` non-answer instead of a classification.
+#
+# STILL REQUIRED to make classify.sound work end to end, both OUTSIDE this file:
+#   1. daemon/src/router.rs::sound_clip_path hands the op
+#      <root>/state/tmp/sound-clip.wav, which is outside every grant above. It
+#      must write/point at <root>/state/tmp/vision/sound-clip.wav.
+#   2. Nothing produces that clip at all today: the VAD/cpal capture loop writes
+#      state/tmp/utterance-<pid>-<n>.wav (daemon/src/audio.rs), so router.rs's
+#      `candidate.exists()` is false and the daemon short-circuits with "I don't
+#      have a recent sound clip" before the app is ever asked.
+# Granting a read on `state/tmp` itself is NOT the fix: that dir also holds the
+# daemon's raw utterance WAVs (captured microphone audio) and every other app's
+# scratch, and this app is declared mic-free.
 
 # --- TCC-gated capabilities this app needs ---------------------------------
 # These DECLARE what the app will ask the OS for; they grant nothing by themselves

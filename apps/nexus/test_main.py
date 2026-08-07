@@ -267,6 +267,92 @@ class TestFakeLinkIsTheRealHostLink(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
+# Pure-Python: the audio.levels channel fold (must NEVER emit a null level).
+# --------------------------------------------------------------------------- #
+class _LevelsStubCore:
+    """The two NexusCore methods `_emit_levels` calls. Pure Python, so this test
+    runs whether or not the cdylib has been built."""
+
+    def __init__(self, meters: list[tuple[float, float]]) -> None:
+        self._meters = list(meters)
+
+    def inputs(self) -> int:
+        return len(self._meters)
+
+    def channel_meter(self, c: int) -> tuple[float, float]:
+        return self._meters[c]
+
+    def loudness(self) -> tuple[float, float, float]:
+        return (float("-inf"), float("-inf"), float("-inf"))
+
+
+class TestLevelsWireShape(unittest.TestCase):
+    """REGRESSION: a SILENT input was dropped from `ch[]`, RENUMBERING every meter
+    after it.
+
+    Silence reads -inf from the engine, and every input index at or above the
+    device's real input count keeps `ChannelMeter::default()` (= -inf) forever.
+    `_emit_levels` folded those through `_finite` -> None; the HUD's
+    `coerceChannelLevel` returns null for a non-number `peak_dbfs` and
+    `parseNexusLevels` filters that entry OUT of the array — but `ch[]` is
+    positional and NexusPanel labels each meter by its ARRAY INDEX. On a 4-input
+    matrix with input 0 idle, input 1's meter was drawn under the label "0" and
+    the header tag read "3 CH"."""
+
+    @staticmethod
+    def _hud_coerce(ch: list) -> list:
+        """The HUD's own coercion, transcribed from hud/src/core/events.ts
+        (`num` + `coerceChannelLevel` + `parseNexusLevels`): an entry whose
+        `peak_dbfs` is not a finite number is DROPPED from the array."""
+        out = []
+        for entry in ch:
+            peak = entry.get("peak_dbfs")
+            if not isinstance(peak, (int, float)) or isinstance(peak, bool):
+                continue
+            if math.isinf(peak) or math.isnan(peak):
+                continue
+            out.append(peak)
+        return out
+
+    def test_silent_channels_keep_their_slot_so_meters_stay_index_aligned(self):
+        # 4 inputs; input 0 is an idle/unconnected lane and input 3 is past the
+        # device's real input count — both read -inf forever.
+        core = _LevelsStubCore([
+            (float("-inf"), float("-inf")),   # 0: silent
+            (-6.0, -9.0),                     # 1: the mic
+            (-12.0, -15.0),                   # 2
+            (float("-inf"), float("-inf")),   # 3: unbacked index
+        ])
+        link = FakeLink()
+        nexus._emit_levels(core, link)
+        p = link.telemetry_for("audio.levels")[-1]
+
+        self.assertEqual(len(p["ch"]), core.inputs(), "a channel was dropped from the wire")
+        json.dumps(p)  # still JSON-safe: no -inf reached the wire
+
+        # THE ACTUAL DEFECT: after the HUD's coercion the array must still be
+        # index-aligned, so ch[1] is the mic and nothing shifted up into slot 0.
+        coerced = self._hud_coerce(p["ch"])
+        self.assertEqual(len(coerced), core.inputs(),
+                         "the HUD dropped a channel — every later meter is mislabelled")
+        self.assertEqual(coerced[1], -6.0, "input 1's level is no longer at index 1")
+        self.assertEqual(coerced[2], -12.0, "input 2's level is no longer at index 2")
+        self.assertEqual(coerced[0], nexus.LEVEL_FLOOR_DBFS)
+        self.assertEqual(coerced[3], nexus.LEVEL_FLOOR_DBFS)
+
+    def test_level_fold_never_returns_none(self):
+        for bad in (float("-inf"), float("inf"), float("nan"), None):
+            self.assertEqual(nexus._level_dbfs(bad), nexus.LEVEL_FLOOR_DBFS)
+        self.assertEqual(nexus._level_dbfs(-6.0), -6.0)
+        self.assertEqual(nexus._level_dbfs(0.0), 0.0)
+
+    def test_the_floor_is_below_the_panel_display_floor(self):
+        # If the floor were ever raised into the visible range, a silent channel
+        # would draw as a real level instead of an empty meter.
+        self.assertLessEqual(nexus.LEVEL_FLOOR_DBFS, -120.0)
+
+
+# --------------------------------------------------------------------------- #
 # Pure-Python: the audio.spectrum band fold (must NEVER emit a null band).
 # --------------------------------------------------------------------------- #
 class _SpectrumStubCore:

@@ -28,8 +28,14 @@
 //!   - LOD by zoom ([`Lod`]): below screen-space feature-size thresholds drop
 //!     text, then pads (tracks imply them), then everything but component bboxes.
 //!   - Target <= 30 draw calls/frame (one per layer x pipeline), 4x MSAA.
-//!   - Frame stats published on `canvas.render_ms` at 1 Hz via [`FrameTimer`] ->
-//!     [`RenderMs`]; the `ipc` agent wraps that in an `OutboundLine`.
+//!   - Frame stats FOLDED for `canvas.render_ms` at 1 Hz via [`FrameTimer`] ->
+//!     [`RenderMs`]. NOT YET PUBLISHED: this used to say "the `ipc` agent wraps
+//!     that in an `OutboundLine`", but ipc.rs constructs only `Telemetry::Viewport`
+//!     and `Telemetry::Selection` — `Telemetry::RenderMs` is built nowhere outside
+//!     this module and its tests, and nothing in the crate constructs a
+//!     [`GpuRenderer`] to produce the stats in the first place (see main.rs). Wiring
+//!     `FrameTimer`'s output into the ipc emit path is what would make the declared
+//!     `canvas.render_ms` topic real.
 //!
 //! The HUD composites our output as a shared IOSurface texture (SPEC, HUD.md §5
 //! tier 2). This module renders into an offscreen MSAA-resolved color target and
@@ -133,37 +139,57 @@ impl View {
         self.center += before - after;
     }
 
-    /// Map a surface pixel to scene space under the current view (f64). Pixel
-    /// origin is top-left, scene Y is up (KiCad Y grows downward, but the scene
-    /// is stored in its own mm space and the projection flips Y so up is up on
-    /// screen).
+    /// Map a surface pixel to scene space under the current view (f64).
+    ///
+    /// AXIS CONVENTION (see [`crate::scene::Point`], which states it once): scene
+    /// space is KiCad space verbatim — the parser stores `(at x y)` unchanged and
+    /// negates nothing — so scene +Y grows DOWNWARD, the same direction as the
+    /// surface pixel origin's +Y. This map is therefore a pure translate + scale
+    /// with NO Y inversion.
+    ///
+    /// WHAT WENT WRONG: this doc used to claim "scene Y is up … the projection
+    /// flips Y so up is up on screen" — and neither half was true. The parser
+    /// never negated Y (`read_at`/`read_pts` build `Point::new(v[0], v[1])`
+    /// straight from the file), and the comment 25 lines below on
+    /// `scene_to_clip_f64` said, correctly, that the Y axis was NOT inverted
+    /// there. Composing a Y-DOWN scene with a projection that maps scene +Y to
+    /// clip +Y drew every entity with the larger sheet Y HIGHER on screen: the
+    /// rendered board/schematic was a VERTICAL MIRROR of what KiCad shows, which
+    /// on a PCB reads as looking at the wrong side of the board. Because
+    /// `screen_to_scene` was the exact inverse, picking stayed self-consistent and
+    /// only the picture was wrong — and two comments 25 lines apart flatly
+    /// contradicted each other, so the next reader could not tell which
+    /// convention was intended.
     pub fn screen_to_scene(&self, px: DVec2) -> DVec2 {
         let (w, h) = self.viewport_px;
         let s = self.clamped_scale();
         // Pixel offset from the screen center.
         let dx = px.x - (w as f64) * 0.5;
         let dy = px.y - (h as f64) * 0.5;
-        // Invert scale; flip Y (screen down -> scene up).
-        DVec2::new(self.center.x + dx / s, self.center.y - dy / s)
+        // Invert scale only: pixel +Y down maps to scene +Y down.
+        DVec2::new(self.center.x + dx / s, self.center.y + dy / s)
     }
 
     /// The f64 scene->clip matrix: translate by -center, scale to pixels, then
-    /// normalize to clip space (-1..1). Scene +Y and clip +Y are both up, so no
-    /// Y inversion is applied (this keeps it the inverse of `screen_to_scene`).
+    /// normalize to clip space (-1..1). Scene +Y is DOWN (KiCad's axis, kept
+    /// verbatim by the parser) and clip/NDC +Y is UP, so the Y axis IS inverted
+    /// here — that is what puts the top of the KiCad sheet at the top of the
+    /// screen and keeps this matrix the exact inverse of `screen_to_scene`.
     /// Computed in f64 then downcast.
     pub fn scene_to_clip_f64(&self) -> DMat3 {
         let (w, h) = self.viewport_px;
         let s = self.clamped_scale();
         let (w, h) = (w as f64, h as f64);
         // scene -> pixels-from-center: (p - center) * s.
-        // pixels-from-center -> clip: x * 2/w, y * 2/h.
+        // pixels-from-center -> clip: x * 2/w, y * -2/h.
         let ax = 2.0 * s / w;
-        let ay = 2.0 * s / h;
+        // WHAT WENT WRONG: this was `2.0 * s / h`. Together with a scene that is
+        // KiCad's Y-DOWN space verbatim, that mapped the larger sheet Y to the
+        // HIGHER screen row and mirrored every board and schematic vertically.
+        // See the axis-convention note on `screen_to_scene`.
+        let ay = -2.0 * s / h;
         // column-major mat3 (glam is column-major): columns are the images of the
-        // basis vectors. clip.x = ax*(x-cx);  clip.y = ay*(y-cy). Scene +Y is up
-        // and clip/NDC +Y is up, so the Y axis is NOT inverted here — that keeps
-        // this matrix the exact inverse of `screen_to_scene` (which already maps
-        // pixel-down to scene-up), so picking and rendering agree.
+        // basis vectors. clip.x = ax*(x-cx);  clip.y = ay*(y-cy).
         DMat3::from_cols(
             glam::DVec3::new(ax, 0.0, 0.0),
             glam::DVec3::new(0.0, ay, 0.0),
@@ -1667,16 +1693,62 @@ mod tests {
         assert!((clip.z - 1.0).abs() < 1e-9, "{clip:?}");
     }
 
+    /// FLIPPED (this test used to assert the mirroring). It read:
+    ///
+    ///     fn view_y_axis_flips_for_screen_up() { ... assert!(up.y > 0.0) }
+    ///
+    /// "since scene Y is up" — but scene Y is NOT up. `parser::read_at`/`read_pts`
+    /// store `(at x y)` verbatim with no negation anywhere, so scene Y is KiCad's
+    /// Y and grows DOWNWARD. Mapping scene +Y to clip +Y therefore drew the entity
+    /// with the LARGER sheet Y HIGHER on screen, and every board and schematic
+    /// rendered as a vertical mirror of what KiCad shows. The old assertion was
+    /// pinning that mirror in place.
     #[test]
-    fn view_y_axis_flips_for_screen_up() {
-        // A scene point above the center (greater Y) should map to positive clip
-        // Y (up on screen), since scene Y is up.
+    fn view_y_axis_inverts_because_the_scene_is_kicad_y_down() {
         let mut v = View::new((800.0, 600.0));
         v.center = DVec2::ZERO;
         v.scale = 10.0;
         let m = v.scene_to_clip_f64();
-        let up = m * glam::DVec3::new(0.0, 5.0, 1.0);
-        assert!(up.y > 0.0, "scene +Y should be clip +Y (up): {up:?}");
+        // A point FURTHER DOWN the KiCad sheet (greater Y) must land LOWER on
+        // screen, i.e. at negative clip Y.
+        let lower_on_sheet = m * glam::DVec3::new(0.0, 5.0, 1.0);
+        assert!(
+            lower_on_sheet.y < 0.0,
+            "greater scene Y (further down the KiCad sheet) must be clip -Y (lower on \
+             screen); the board is rendering vertically mirrored: {lower_on_sheet:?}"
+        );
+        let higher_on_sheet = m * glam::DVec3::new(0.0, -5.0, 1.0);
+        assert!(higher_on_sheet.y > 0.0, "{higher_on_sheet:?}");
+    }
+
+    /// The projection and the pick map must stay EXACT inverses — that is the
+    /// property that kept the mirroring invisible to hit-testing (picking was
+    /// self-consistently wrong), so it has to be re-asserted after fixing the sign.
+    /// Round-trips scene -> clip -> pixel -> scene.
+    #[test]
+    fn scene_to_clip_and_screen_to_scene_are_inverses_including_the_y_sign() {
+        let (w, h) = (800.0f32, 600.0f32);
+        let mut v = View::new((w, h));
+        let (w, h) = (w as f64, h as f64);
+        v.center = DVec2::new(12.5, -7.25);
+        v.scale = 6.0;
+        let m = v.scene_to_clip_f64();
+
+        for &(x, y) in &[(0.0, 0.0), (30.0, 40.0), (-18.0, 55.0), (12.5, -7.25)] {
+            let clip = m * glam::DVec3::new(x, y, 1.0);
+            // clip (-1..1, +Y up) -> surface pixel (top-left origin, +Y down).
+            let px = DVec2::new((clip.x + 1.0) * 0.5 * w, (1.0 - clip.y) * 0.5 * h);
+            let back = v.screen_to_scene(px);
+            assert!((back.x - x).abs() < 1e-9, "x round-trip {x},{y} -> {back:?}");
+            assert!((back.y - y).abs() < 1e-9, "y round-trip {x},{y} -> {back:?}");
+        }
+
+        // And the direction is right, not just self-consistent: a point lower on
+        // the KiCad sheet must come out at a LARGER pixel row.
+        let top = m * glam::DVec3::new(0.0, -10.0, 1.0);
+        let bottom = m * glam::DVec3::new(0.0, 10.0, 1.0);
+        let py = |c: glam::DVec3| (1.0 - c.y) * 0.5 * h;
+        assert!(py(top) < py(bottom), "sheet top drew below sheet bottom");
     }
 
     #[test]

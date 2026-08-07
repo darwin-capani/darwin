@@ -39,12 +39,13 @@ use crate::error::{NexusError, Result};
 use crate::types::AudioFormat;
 
 /// The realtime hand-off the IOProc reads each callback. The control plane wires
-/// one of these (it owns the [`SnapshotRing`] the engine publishes into, and the
-/// [`MeterRing`] the telemetry loop drains) and hands a stable pointer to it as
-/// the IOProc client data. It is `Send`/`Sync` by the same SPSC argument as the
-/// ring: the control thread mutates the routing (via `publish` on the ring it
-/// shares here) and drains meters; the audio thread only `load`s the snapshot
-/// and `push`es meters — both wait-free.
+/// one of these (it owns the [`SnapshotRing`] the engine publishes into and passes
+/// a pointer to it here; the [`MeterRing`] is constructed and OWNED by this
+/// context, and drained through [`RtContext::meters`] / [`IoProc::drain_meters`])
+/// and hands a stable pointer to it as the IOProc client data. It is `Send`/`Sync`
+/// by the same SPSC argument as the ring: the control thread mutates the routing
+/// (via `publish` on the ring it shares here) and drains meters; the audio thread
+/// only `load`s the snapshot and `push`es meters — both wait-free.
 ///
 /// DEVICE-GATED fields are only meaningful under `--features coreaudio`; the
 /// type exists in both builds so the engine/control plane can hold one without
@@ -61,8 +62,9 @@ pub struct RtContext {
     #[cfg(feature = "coreaudio")]
     format: AudioFormat,
     /// Lock-free meter/FFT tap the audio thread pushes the monitored mix into and
-    /// the control plane drains (SPEC §2 "meter taps … pushed to the control
-    /// plane over a lock-free ring").
+    /// the control plane drains via [`RtContext::meters`] (SPEC §2 "meter taps …
+    /// pushed to the control plane over a lock-free ring"). It had no accessor at
+    /// all until that method existed — see its comment.
     #[cfg(feature = "coreaudio")]
     meters: MeterRing,
     #[cfg(not(feature = "coreaudio"))]
@@ -93,6 +95,23 @@ impl RtContext {
     #[cfg(feature = "coreaudio")]
     pub unsafe fn new(ring: *const crate::matrix::SnapshotRing, format: AudioFormat) -> Self {
         Self { ring, format, meters: MeterRing::new() }
+    }
+
+    /// CONTROL thread: the meter/FFT tap the IOProc pushes the monitored mix into.
+    ///
+    /// WHAT WENT WRONG: `meters` is a PRIVATE field of a struct whose only `impl`
+    /// exposed `new` and `placeholder`, and the only `RtContext` ever built is
+    /// boxed inside `install_ioproc` and stored in the equally private `IoProc.ctx`.
+    /// `MeterRing::load`/`published` were `pub` but there was no way to obtain a
+    /// `&MeterRing` from outside this module, so the ring was WRITE-ONLY: the audio
+    /// thread paid the mono-sum + copy on every ~1.33 ms callback for data no
+    /// caller could read, while five doc sentences in this file (including the
+    /// module header and the field's own comment) said the control plane drained
+    /// it. SPEC §2's "meter taps … pushed to the control plane over a lock-free
+    /// ring" had no reachable consumer at all.
+    #[cfg(feature = "coreaudio")]
+    pub fn meters(&self) -> &MeterRing {
+        &self.meters
     }
 
     /// Headless placeholder constructor: there is no realtime path to bind on a
@@ -884,6 +903,32 @@ pub fn install_ioproc(_device: &AggregateDevice) -> Result<IoProc> {
 }
 
 impl IoProc {
+    /// CONTROL thread: drain the most recently pushed monitored-mix block from the
+    /// installed IOProc's meter tap, or `None` when nothing has been pushed yet
+    /// (and always `None` headlessly, where no proc is ever installed).
+    ///
+    /// This is the OTHER half of the write-only-ring defect documented on
+    /// [`RtContext::meters`]: `ctx` is a private raw pointer and `impl IoProc`
+    /// exposed only `shutdown`, so even with an accessor on `RtContext` there was
+    /// no way to reach the one that exists. The telemetry loop calls this.
+    ///
+    /// SAFETY: `ctx` is the `Box::into_raw` allocation made in `install_ioproc` and
+    /// is only nulled by [`Self::shutdown`], which also stops and removes the proc
+    /// first — so while this returns, the audio thread is either not running or is
+    /// the ring's single producer, exactly the SPSC discipline `MeterRing::load` is
+    /// written for.
+    ///
+    /// DEVICE-GATED, unlike `shutdown`: the return type is [`MeterBlock`], which
+    /// only exists under `--features coreaudio`, and headlessly there is no proc to
+    /// drain in the first place.
+    #[cfg(feature = "coreaudio")]
+    pub fn drain_meters(&self) -> Option<MeterBlock> {
+        if self.ctx.is_null() {
+            return None;
+        }
+        unsafe { (*self.ctx).meters().load() }
+    }
+
     /// Stop the IOProc, remove it from the device, and free the realtime context.
     /// DEVICE-GATED — a no-op headless placeholder. Idempotent-ish: safe to call
     /// once on teardown. Returns [`NexusError::Device`] only if a HAL stop/remove
@@ -1122,7 +1167,71 @@ mod tests {
                 &ctx as *const RtContext as *mut std::os::raw::c_void,
             );
             assert_eq!(status, 0, "the IOProc must return noErr");
-            ctx.meters.load().expect("the IOProc must publish a meter block")
+            // Through the PUBLIC accessor, not the private field — see
+            // `meter_tap_is_reachable_through_the_public_accessor`.
+            ctx.meters().load().expect("the IOProc must publish a meter block")
+        }
+
+        /// REGRESSION: the meter tap was WRITE-ONLY. `RtContext.meters` is private,
+        /// `impl RtContext` exposed only `new`/`placeholder`, the only `RtContext`
+        /// ever built is boxed into the equally private `IoProc.ctx`, and
+        /// `impl IoProc` exposed only `shutdown`. `MeterRing::load` was `pub` but
+        /// no caller outside this module could obtain a `&MeterRing`, so the audio
+        /// thread paid the mono-sum + copy every ~1.33 ms callback for data nobody
+        /// could read — while five doc sentences in this file said the control
+        /// plane drained it. The tests in this module all read `ctx.meters`
+        /// DIRECTLY, which is a same-module private access and is exactly why the
+        /// gap was invisible from in here.
+        ///
+        /// This test therefore goes through `RtContext::meters()` only. Deleting
+        /// that method does not make an assertion fail — it makes this module stop
+        /// compiling, which is the same red suite.
+        #[test]
+        fn meter_tap_is_reachable_through_the_public_accessor() {
+            let mut state = MatrixState::new(1, 1).unwrap();
+            state.set_crosspoint(0, 0, 0.0).unwrap();
+            state.set_monitor_output(Some(0)).unwrap();
+            let ring = SnapshotRing::new(state.snapshot());
+            let fmt = AudioFormat::new(1, FS);
+
+            let ctx = unsafe { RtContext::new(&ring as *const SnapshotRing, fmt) };
+
+            // Precondition: nothing published yet, so a `Some` below cannot be a
+            // stale/default block that was already sitting in the ring.
+            assert_eq!(ctx.meters().published(), 0);
+            assert!(ctx.meters().load().is_none());
+
+            let mut inbuf = vec![1.0f32; FRAMES];
+            let mut outbuf = vec![7.0f32; FRAMES];
+            let status = unsafe {
+                let in_list = BufferList3 {
+                    number_buffers: 1,
+                    buffers: [buf(&mut inbuf), null_buf(), null_buf()],
+                };
+                let mut out_list = BufferList3 {
+                    number_buffers: 1,
+                    buffers: [buf(&mut outbuf), null_buf(), null_buf()],
+                };
+                nexus_io_proc(
+                    0,
+                    std::ptr::null(),
+                    &in_list as *const BufferList3 as *const sys::AudioBufferList,
+                    std::ptr::null(),
+                    &mut out_list as *mut BufferList3 as *mut sys::AudioBufferList,
+                    std::ptr::null(),
+                    &ctx as *const RtContext as *mut std::os::raw::c_void,
+                )
+            };
+            assert_eq!(status, 0);
+
+            let block = ctx.meters().load().expect("the tap must be drainable from outside");
+            assert_eq!(ctx.meters().published(), 1);
+            assert_eq!(block.frames, FRAMES);
+            assert!((block.out_peak[0] - 1.0).abs() < 1e-6);
+
+            // The other half: an IoProc with no installed context drains to None
+            // rather than dereferencing a null `ctx`.
+            assert!(IoProc::default().drain_meters().is_none());
         }
 
         /// REGRESSION: the IOProc called `mix_block` once PER OUTPUT BUFFER with a

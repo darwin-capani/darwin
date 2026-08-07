@@ -30,6 +30,30 @@ MAX_SUBNETS = 1 << 16  # cap on the SPLIT ITSELF (finer is refused outright)
 # count + a truncation flag keep the answer honest.
 MAX_SUBNETS_LISTED = 1 << 10
 
+# Cap on the MAGNITUDE of `split_hosts`. `subnet.plan` is a non-consequential
+# exposed tool, so this argument arrives straight from a model/user-supplied tool
+# input, and `_positive_int` only checked the TYPE and `>= 1` — no upper bound.
+#
+# WHAT WENT WRONG: the VLSM target-prefix search iterated on the argument's BIT
+# LENGTH with growing Python bigints (`while (1 << host_bits) - 2 < split_hosts`).
+# Both the shift and the compare are O(bits), so the loop was O(bits^2). Measured
+# against `compute` on this box: ~10k digits = 0.018 s, ~50k = 0.41 s, ~200k =
+# 6.28 s — and the daemon's 1 MiB line budget (apps.rs MAX_APP_LINE_BYTES) admits
+# a literal with ~1M digits, which projects to minutes. The app serves ops
+# serially from one socket loop (apps/_sdk/harness.py `run`), so for that whole
+# time NOTHING else was processed — including `stop` — darwind's 15 s
+# APP_REQUEST_TIMEOUT fired and told the user the app did not answer, and every
+# later op queued behind it. The answer is the "network too small" error either
+# way, so the entire computation was wasted work.
+#
+# The loop is now closed-form (see `compute`), which alone removes the blowup;
+# this bound is the explicit, cheap refusal that sits beside MAX_SUBNETS and says
+# what the ceiling IS. `bit_length()` on a Python int is O(1) — it reads the
+# stored size, it does not iterate. A subnet of an N-bit address space can hold
+# at most 2**N addresses, so anything needing more than `max_prefixlen` bits
+# cannot fit in ANY network of that family, which is exactly the error already
+# returned for an over-fine split.
+
 
 def compute(payload):
     """PURE, offline, no I/O, never raises.
@@ -145,23 +169,31 @@ def compute(payload):
             if new_prefix > max_prefix:
                 return {"error": "split_count too fine for the address space"}
         else:
+            # Refuse an absurd magnitude BEFORE doing any bigint arithmetic at all
+            # (see the note on the constants above: this argument is unbounded
+            # model/user input and the search used to be quadratic in its bit
+            # length). `bit_length()` reads the stored size; it does not iterate.
+            if split_hosts.bit_length() > max_prefix:
+                return {"error": "network too small to hold split_hosts usable hosts per subnet"}
             if net.version == 4:
                 if split_hosts <= 1:
                     new_prefix = 32
                 elif split_hosts == 2:  # RFC 3021 fits exactly 2 usable
                     new_prefix = 31
                 else:
-                    host_bits = 2
-                    while (1 << host_bits) - 2 < split_hosts:
-                        host_bits += 1
+                    # Smallest host_bits >= 2 with (2**host_bits) - 2 >= split_hosts,
+                    # i.e. 2**host_bits >= split_hosts + 2. The smallest h with
+                    # 2**h >= N is (N - 1).bit_length(). Closed form, not a loop —
+                    # the loop this replaces was the O(bits^2) stall.
+                    host_bits = max(2, (split_hosts + 1).bit_length())
                     new_prefix = 32 - host_bits
             else:
                 if split_hosts <= 1:
                     new_prefix = 128
                 else:
-                    host_bits = 0
-                    while (1 << host_bits) < split_hosts:
-                        host_bits += 1
+                    # Smallest host_bits with 2**host_bits >= split_hosts (v6 has no
+                    # network/broadcast reservation, so no -2 here). Same closed form.
+                    host_bits = (split_hosts - 1).bit_length()
                     new_prefix = 128 - host_bits
             if new_prefix < prefixlen:
                 return {"error": "network too small to hold split_hosts usable hosts per subnet"}

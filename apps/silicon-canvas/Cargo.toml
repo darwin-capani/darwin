@@ -7,9 +7,20 @@
 # DEPENDENCY POLICY (frozen): every dependency the whole app will ever need is
 # declared HERE so no downstream module agent edits this file. The GPU stack is
 # behind an OPTIONAL `gpu` feature so `cargo test` / `cargo build` work WITHOUT a
-# Metal device (CI / this M1 dev box), and `cargo check --features gpu` compiles
-# the wgpu renderer. The non-gpu core (parser, scene, graph, R-tree, ERC, IPC,
-# trace) builds and tests headlessly.
+# Metal device (CI / this M1 dev box), and `cargo test --features gpu` compiles
+# AND EXERCISES the wgpu renderer's CPU-side math. The non-gpu core (parser,
+# scene, graph, R-tree, ERC, IPC, trace) builds and tests headlessly.
+#
+# RUN BOTH. `cargo test` alone does not touch render.rs at all: the module is
+# `#[cfg(feature = "gpu")]`, so its ~21 unit tests (view/clip math, LOD, scene
+# packing byte layout, flag widening, percentile timer) simply do not exist in
+# that build. This file used to document only `cargo check --features gpu`, and
+# `cargo check` does not set `--cfg test`, so it never even compiles
+# `#[cfg(test)] mod tests`. The renderer's entire CPU-side safety net was absent
+# from the merge gate under BOTH documented commands while render.rs's header
+# claimed that math "is unit-tested" — and a regression in any of it landed
+# green. `cargo test --features gpu` needs no Metal device (only
+# `GpuRenderer::new`/`render` do) and adds well under a second.
 
 [package]
 name = "silicon-canvas"
@@ -51,7 +62,9 @@ lyon = { version = "1", optional = true }
 
 [features]
 # Default OFF so the headless core builds and tests on a GPU-less box. Turn on
-# with `cargo check --features gpu` to compile the renderer.
+# with `cargo test --features gpu` to compile the renderer AND run its CPU-side
+# unit tests — see the note at the top of this file for why `cargo check` was the
+# wrong command to document.
 default = []
 gpu = ["dep:wgpu", "dep:bytemuck", "dep:pollster", "dep:glam", "dep:lyon"]
 

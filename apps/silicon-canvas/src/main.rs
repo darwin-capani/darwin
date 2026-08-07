@@ -15,9 +15,21 @@
 //!
 //! HARD SAFETY (never violated here): this binary binds NO listener (it CONNECTS
 //! to the daemon's socket), opens NO window, touches NO GPU, and plays NO audio.
-//! The GPU renderer is behind the optional `gpu` feature and is only ever entered
-//! from inside the ipc loop on an explicit, device-present path — never at
-//! startup, and never on this headless dev box.
+//!
+//! THE GPU RENDERER IS NOT DRIVEN FROM THIS BINARY AT ALL — say so plainly. This
+//! comment used to read "[it] is only ever entered from inside the ipc loop on an
+//! explicit, device-present path", which described a wiring that does not exist:
+//! nothing in the crate constructs or calls `render::GpuRenderer` (grep for it —
+//! it appears in render.rs and its own tests and nowhere else), `ipc.rs` mentions
+//! the renderer only in prose, and install.sh builds this crate with a bare
+//! `cargo build --release` with no `--features gpu`, so the SHIPPED binary does
+//! not even contain render.rs. Consequently `canvas.render_ms` — one of the three
+//! topics manifest.toml declares, with its own P50/P95/DRAWS/CULLED strip in the
+//! HUD's SiliconCanvasPanel — has no code path that can produce a payload, with
+//! or without the feature and with or without a GPU, and those cells can only
+//! ever show "—". The safety claim above is true; the "entered from inside the
+//! ipc loop" claim was not, and reading it as a description of live wiring is the
+//! mistake it invited.
 
 use std::process::ExitCode;
 

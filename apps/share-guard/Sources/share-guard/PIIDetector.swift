@@ -110,6 +110,37 @@ public enum PIIDetector {
         return nil
     }
 
+    /// Whether `text`'s DIGIT RUNS form a real dialling grouping — the shape gate the
+    /// phone regroup below stands on. Measured over maximal runs of digits rather
+    /// than over whitespace atoms, so "555 123 4567", "(555) 123-4567" and
+    /// "555-123-4567" all read as the same 3-3-4.
+    ///
+    /// Accepted: NANP subscriber grouping 3-3-4, optionally behind a 1- or 2-digit
+    /// country code (1-3-3-4, 2-3-3-4) — exactly the "10–12 digit run (NANP ±
+    /// country code)" this file's header declares a phone to be.
+    ///
+    /// Deliberately NOT accepted: 4-4-4. That is the shape of the first three groups
+    /// of "ref 1234 5678 9012 3456 end", which the non-over-masking contract
+    /// (`testLongNumberThatFailsLuhnIsNotOverMasked`) requires be left alone.
+    static func isPhoneGrouping(_ text: String) -> Bool {
+        var runs: [Int] = []
+        var run = 0
+        for ch in text {
+            if ch.isNumber {
+                run += 1
+            } else if run > 0 {
+                runs.append(run)
+                run = 0
+            }
+        }
+        if run > 0 { runs.append(run) }
+
+        if runs == [3, 3, 4] { return true }
+        // A leading 1-2 digit country code in front of the same 3-3-4 body.
+        if runs.count == 4, runs[0] <= 2, Array(runs.dropFirst()) == [3, 3, 4] { return true }
+        return false
+    }
+
     /// Classify a number CANDIDATE (which — because the run class allows whitespace
     /// to catch a spaced phone like "555 123 4567" — may greedily span TWO
     /// bare-adjacent numbers) into 0+ spans. A real grouped phone/card has small
@@ -153,6 +184,15 @@ public enum PIIDetector {
             groups.append((sub, start..<cursor))
         }
 
+        // Per-group digit counts + their prefix sum, hoisted ONCE. The window scans
+        // below ask "how many digits are in groups[i...k]" O(N^2) times; answering
+        // that by re-slicing the source and recounting was the inner term of the
+        // cubic blowup documented on the card loop. The prefix sum answers it in O(1)
+        // and lets the source slice be materialized only for an in-band window.
+        let digitCounts = groups.map { digitsOf($0.text) }
+        var prefixDigits = [Int](repeating: 0, count: groups.count + 1)
+        for idx in groups.indices { prefixDigits[idx + 1] = prefixDigits[idx] + digitCounts[idx] }
+
         // GREEDY, LUHN-GATED REGROUP — then per-atom for whatever is left over.
         //
         // WHAT WENT WRONG: this used to classify each whitespace-separated group
@@ -174,39 +214,148 @@ public enum PIIDetector {
         // whose digits land in the card band AND pass Luhn.
         //
         // THE LUHN GATE IS LOAD-BEARING, not decoration. It is what stops the
-        // regroup from swallowing benign digit runs, and it is why there is
-        // deliberately NO symmetric phone regroup: a 10-12 digit window has no
-        // checksum, so regrouping for phone would mask the first three groups of
+        // regroup from swallowing benign digit runs. A 10-12 digit phone window
+        // has NO checksum to gate on, which is why the phone regroup is a SEPARATE
+        // pass standing on a grouping-shape gate instead — an unrestricted phone
+        // regroup HERE would mask the first three groups of
         // "ref 1234 5678 9012 3456 end" and break `testLongNumber...NotOverMasked`.
+        //
+        // (This comment used to say there is "deliberately NO symmetric phone
+        // regroup". There is one now — the fix for the adjacent-number leak added
+        // it — so the sentence described the opposite of the code beneath it.)
+        //
+        //
+        // WHAT WENT WRONG: the j-loop used to stop only when the accumulated digit
+        // count passed 19. A group made entirely of separators — `-` `.` `(` `)` —
+        // contributes ZERO digits, so `digits + 0 <= 19` stayed true forever and j
+        // ran to the END of the array. Given a long run of digit-free atoms (a
+        // `- - - -` rule, a `. . . .` dot leader, a `( ) ( )` checkbox column — all
+        // ordinary OCR output) the k-loop then walked O(N) windows, each re-slicing
+        // and recounting O(N) characters, inside an outer loop that ran O(N) times:
+        // CUBIC. Measured on "1 " + "- "*n + "1" — 0.62 s at n=400, 4.81 s at n=800,
+        // 38.4 s at n=1600, i.e. ~8x per doubling. `Pipeline` is an actor and the
+        // socket loop dispatches ops serially with NO cancellation, so for that whole
+        // time the app answered nothing at all — not even `{"type":"stop"}` — the
+        // daemon's request timeout fired and told the user the scrub did not answer,
+        // and the sandboxed process kept pegging a core until it was killed. The
+        // `scrub.image` OCR path puts no cap on its input, so the ceiling was set
+        // only by the caller.
+        //
+        // THE WINDOW IS **NOT** BOUNDED BY GROUP COUNT — that was tried and it
+        // FAILED OPEN. A first cut of this fix added `maxCardGroups = 20` and
+        // refused any wider window. It was unnecessary (the seed/endpoint skips
+        // below are what make the pass linear: a 131 KB separator wall scrubs in
+        // 0.73 s, and 4x the bytes costs 4x the time) and it LOST CARDS: a
+        // Luhn-valid card written with a separator group between every digit is
+        // 31 groups, so on
+        //     "A 4 - 1 - 1 - ... - 1 9 9 9 9 end"
+        // — whole candidate 20 digits, out of every band, so this regroup is the
+        // ONLY path — no window could reach the 13-19 digit band and the scrub
+        // came back "No PII detected" with 4111111111111111 verbatim in the
+        // "redacted" copy. That is precisely the under-mask this regroup exists
+        // to prevent. Only the DIGIT cap bounds the window.
         var consumed = [Bool](repeating: false, count: groups.count)
         var i = 0
         while i < groups.count {
+            // A card window can never START on a digit-free token, so never seed one
+            // there (this is also what stops a wall of separators from being scanned
+            // once per separator).
+            if digitCounts[i] == 0 { i += 1; continue }
             var digits = 0
             var j = i
-            while j < groups.count, digits + digitsOf(groups[j].text) <= cardDigitRange.upperBound {
-                digits += digitsOf(groups[j].text)
+            while j < groups.count,
+                  digits + digitCounts[j] <= cardDigitRange.upperBound {
+                digits += digitCounts[j]
                 j += 1
             }
             var matched = false
             var k = j - 1
             while k > i {
-                let span = groups[i].range.lowerBound..<groups[k].range.upperBound
-                let windowText = String(text[span])
-                let windowDigits = windowText.reduce(0) { $0 + ($1.isNumber ? 1 : 0) }
-                if cardDigitRange.contains(windowDigits), luhnValid(windowText) {
-                    spans.append(PIISpan(kind: .card, range: span, matched: windowText))
-                    for c in i...k { consumed[c] = true }
-                    i = k + 1
-                    matched = true
-                    break
+                // ...nor END on one.
+                if digitCounts[k] == 0 { k -= 1; continue }
+                let windowDigits = prefixDigits[k + 1] - prefixDigits[i]
+                if cardDigitRange.contains(windowDigits) {
+                    let span = groups[i].range.lowerBound..<groups[k].range.upperBound
+                    let windowText = String(text[span])
+                    if luhnValid(windowText) {
+                        spans.append(PIISpan(kind: .card, range: span, matched: windowText))
+                        for c in i...k { consumed[c] = true }
+                        i = k + 1
+                        matched = true
+                        break
+                    }
                 }
                 k -= 1
             }
             if !matched { i += 1 }
         }
 
-        // Whatever no card window claimed is classified on its own, exactly as
-        // before — this is what still turns "5551234567 5559876543" into two phones.
+        // SHAPE-GATED PHONE REGROUP, over whatever the card pass did not claim.
+        //
+        // WHAT WENT WRONG (the same failure as the card case, one band down): the
+        // regroup above was CARD-ONLY, so a spaced phone glued by whitespace to any
+        // neighbouring number still fell through to the per-atom pass — where "555",
+        // "123" and "4567" are 3-4 digits each, below the 10-digit phone floor, and
+        // NOTHING was emitted. Because the candidate run class spans a NEWLINE, and
+        // VNRecognizeTextRequest joins recognized lines with one, the shape that
+        // failed was the canonical `scrub.image` input:
+        //
+        //     Acme Corp
+        //     1 Market St Suite 1200
+        //     555 123 4567
+        //
+        // "1200\n555 123 4567" is 14 digits — out of the phone band, into the card
+        // band, Luhn-invalid, so no card window claimed it either. The "redacted"
+        // copy came back carrying the whole phone number while the preview said
+        // "No PII detected". Same under-mask direction, same induced leak: the user
+        // is the one who then shares that copy.
+        //
+        // WHY A SHAPE GATE RATHER THAN A BARE DIGIT COUNT: a 10-12 digit window has
+        // no checksum to gate on, which is why there deliberately was no phone
+        // regroup here. An UNRESTRICTED one would swallow the first three groups of
+        // "ref 1234 5678 9012 3456 end" (4+4+4 = 12 digits) and break the
+        // non-over-masking contract. `isPhoneGrouping` is the substitute for Luhn:
+        // the window's digit runs must form a real dialling grouping (3-3-4, or that
+        // behind a 1-2 digit country code). 4-4-4 is not one, so the long non-card
+        // run stays untouched.
+        //
+        // Runs AFTER the card pass and only over unconsumed groups: Luhn is stronger
+        // evidence than a shape, so a card window always wins the same digits.
+        let maxPhoneGroups = 8
+        var p = 0
+        while p < groups.count {
+            if consumed[p] || digitCounts[p] == 0 { p += 1; continue }
+            var digits = 0
+            var q = p
+            while q < groups.count, !consumed[q], q - p < maxPhoneGroups,
+                  digits + digitCounts[q] <= phoneDigitRange.upperBound {
+                digits += digitCounts[q]
+                q += 1
+            }
+            var matched = false
+            var k = q - 1
+            while k > p {
+                if digitCounts[k] == 0 { k -= 1; continue }
+                let windowDigits = prefixDigits[k + 1] - prefixDigits[p]
+                if phoneDigitRange.contains(windowDigits) {
+                    let span = groups[p].range.lowerBound..<groups[k].range.upperBound
+                    let windowText = String(text[span])
+                    if isPhoneGrouping(windowText) {
+                        spans.append(PIISpan(kind: .phone, range: span, matched: windowText))
+                        for c in p...k { consumed[c] = true }
+                        p = k + 1
+                        matched = true
+                        break
+                    }
+                }
+                k -= 1
+            }
+            if !matched { p += 1 }
+        }
+
+        // Whatever no card or phone window claimed is classified on its own, exactly
+        // as before — this is what still turns "5551234567 5559876543" into two
+        // phones (two 10-digit atoms; no window can span them, 20 > 12).
         for (idx, g) in groups.enumerated() where !consumed[idx] {
             let subToken = String(g.text)
             if let kind = numberBand(subToken, digitsOf(g.text)) {

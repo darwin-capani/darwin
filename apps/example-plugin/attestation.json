@@ -1,0 +1,12 @@
+{
+  "plugin_id": "some-other-plugin",
+  "version": "1.0",
+  "closure_hash": "cc",
+  "artifact_hash": "aa",
+  "signer_key_id": "owner-key-1",
+  "signature_hex": "c2b2b508e5ab2dc006ca9733518bb6e11bc660c372651f955b1a013b6570c85139ace9cd60b3f1461aec58bbabba558c47cf24f95d888f6348023d38e5ccb10f",
+  "rebuild": {
+    "closure_hash": "cc",
+    "artifact_hash": "aa"
+  }
+}

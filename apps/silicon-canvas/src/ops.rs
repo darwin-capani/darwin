@@ -570,9 +570,12 @@ mod tests {
     /// (`daemon/src/router.rs::silicon_canvas_command`) builds these EXACT op
     /// strings from spoken phrases and forwards them verbatim — it never imports
     /// this standalone crate, so this test is the load-bearing guarantee that
-    /// the wire form the router emits deserializes into the intended [`Op`]. If
-    /// either side renames a tag/field, this fails. Keep these literals byte-for-
-    /// byte identical to the router's `op_*` builders.
+    /// the wire form the router emits deserializes into the intended [`Op`].
+    ///
+    /// This half proves the literals below deserialize. It does NOT, on its own,
+    /// prove they are what the router emits — see
+    /// `daemon_voice_router_op_strings_match_the_routers_actual_builders`, which
+    /// reads router.rs.
     #[test]
     fn daemon_voice_router_op_strings_deserialize() {
         let cases: &[(&str, Op)] = &[
@@ -600,6 +603,120 @@ mod tests {
                 .unwrap_or_else(|e| panic!("router op string {json:?} must deserialize: {e}"));
             assert_eq!(&got, want, "router op string {json:?} -> wrong Op");
         }
+    }
+
+    /// THE OTHER HALF OF THE CONTRACT LOCK — SOURCE-ANCHORED AGAINST router.rs.
+    ///
+    /// WHAT WENT WRONG: the doc on the test above used to promise "If EITHER side
+    /// renames a tag/field, this fails", and then ended with "Keep these literals
+    /// byte-for-byte identical to the router's `op_*` builders" — which is the
+    /// admission that they are a hand-kept COPY. The test body contained only
+    /// hard-coded strings; it never read router.rs, never linked the daemon crate,
+    /// and lives in a crate `cargo test` for the daemon does not build. So a
+    /// router-side rename accompanied by an update to router.rs's OWN `assert_op`
+    /// expectations left both suites green while every spoken Silicon Canvas
+    /// command started landing in `parse_command`'s "unknown or malformed op" arm
+    /// and being dropped — voice control of the app silently stops working with no
+    /// failing test anywhere. The doc told a maintainer that class of drift was
+    /// covered when it was not.
+    ///
+    /// So: actually read the router's builders. Bounded to the Silicon Canvas
+    /// builder REGION — router.rs has four separate "The op-string builders"
+    /// sections (vision, nexus, world, ours), so the start anchor is the full
+    /// sentence naming Silicon Canvas and the region ends at the next top-level
+    /// `fn` that is not an `op_*` builder. Without that bound a `"op": "status"`
+    /// from another app's section could satisfy an assertion here.
+    ///
+    /// Matched on TOKENS, not bytes: the router writes `json!({"op": "select.net",
+    /// "name": name})` (spaces after the colons) and `serde_json` emits the compact
+    /// form, so a byte-for-byte comparison is not available — but a renamed tag or
+    /// field disappears from the region either way, which is the drift this exists
+    /// to catch.
+    #[test]
+    fn daemon_voice_router_op_strings_match_the_routers_actual_builders() {
+        // apps/silicon-canvas/src/ops.rs -> repo root.
+        let router = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("daemon")
+            .join("src")
+            .join("router.rs");
+        let src = std::fs::read_to_string(&router).unwrap_or_else(|e| {
+            panic!(
+                "daemon/src/router.rs not readable at {} ({e}) — this contract lock \
+                 must not pass vacuously",
+                router.display()
+            )
+        });
+
+        // Bound the window to OUR builder section.
+        const START: &str =
+            "// The op-string builders. Each produces the EXACT wire JSON Silicon Canvas's";
+        let from = src
+            .find(START)
+            .expect("router.rs no longer has the Silicon Canvas op-string builder section");
+        let region = &src[from..];
+        // End at the next `// ===` section banner. Bounding the WINDOW is the point:
+        // router.rs defines `op_*` builders for four different apps, and an
+        // unbounded scan would happily satisfy these assertions from the vision or
+        // nexus section instead of ours.
+        let end = region
+            .find("\n// ====")
+            .expect("no section banner after the Silicon Canvas builders — window unbounded");
+        let region = &region[..end];
+
+        // Preconditions: the window is real and tight. If either of these ever
+        // trips, every assertion below is meaningless.
+        assert!(region.len() > 200, "builder region is implausibly small: {region:?}");
+        assert!(
+            !region.contains("Vision voice control"),
+            "builder region leaked into the next app's section"
+        );
+
+        // Every builder the section defines, and the exact wire shape ops.rs above
+        // claims for it. Counted, so a NEW router op with no case above fails here
+        // rather than silently going unparsed by this app.
+        let expect: &[(&str, &str, &[&str])] = &[
+            ("op_select_net", "select.net", &["name"]),
+            ("op_select_component", "select.component", &["name"]),
+            ("op_trace_start", "trace.start", &[]),
+            ("op_trace_step", "trace.step", &[]),
+            ("op_trace_stop", "trace.stop", &[]),
+            ("op_erc_run", "erc.run", &[]),
+            ("op_view_fit_all", "view.set", &["mode", "target"]),
+        ];
+        assert_eq!(
+            region.matches("\nfn op_").count(),
+            expect.len(),
+            "the router's Silicon Canvas builder set changed; add the new op to \
+             `daemon_voice_router_op_strings_deserialize` and to this table"
+        );
+
+        for (builder, tag, fields) in expect {
+            let at = region
+                .find(&format!("fn {builder}("))
+                .unwrap_or_else(|| panic!("router.rs no longer defines `{builder}`"));
+            // One builder is one `json!(...).to_string()` line.
+            let body = region[at..].lines().nth(1).unwrap_or("");
+            assert!(
+                body.contains(&format!(r#""op": "{tag}""#)),
+                "`{builder}` no longer emits op tag {tag:?}: {body}"
+            );
+            for f in *fields {
+                assert!(
+                    body.contains(&format!(r#""{f}""#)),
+                    "`{builder}` no longer emits field {f:?}: {body}"
+                );
+            }
+        }
+
+        // And the "fit the board" builder still pins BOTH literal values, which the
+        // Op above decodes as `ViewSet::Fit { target: FitTarget::All }`.
+        let fit = region[region.find("fn op_view_fit_all(").unwrap()..]
+            .lines()
+            .nth(1)
+            .unwrap_or("");
+        assert!(fit.contains(r#""fit""#) && fit.contains(r#""all""#), "{fit}");
     }
 
     #[test]
