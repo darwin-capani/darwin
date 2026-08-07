@@ -1528,7 +1528,35 @@ async fn stage_and_validate_inner(
 
     let deadline = tokio::time::Instant::now() + VALIDATE_TIMEOUT;
     let mut combined = String::new();
-    for (stage, args) in [("check", ["check"]), ("test", ["test"])] {
+    // TESTS THAT CANNOT RUN IN A STAGE, skipped BY NAME and stated in the report.
+    //
+    // Three of the crate's tests stage-and-build a tree of their own — the two
+    // `apply_forge` tests execute scripts/apply_forge.sh (which cd's into a full
+    // repo layout), and the heal pipeline test runs this very staging routine
+    // nested inside a stage. They pass in the real tree and fail in a stage for
+    // reasons that have nothing to do with the candidate patch.
+    //
+    // Counting them as failures made the gate reject EVERY candidate and report
+    // "No candidate passed the staged cargo check + cargo test gates" — which an
+    // operator reads as "the model drafted three bad patches", not "three tests
+    // cannot run here". Skipping them SILENTLY would be the other failure: a gate
+    // that quietly stops covering things is how a real regression walks through.
+    // So they are named, skipped, and the skip is in the transcript.
+    const UNRUNNABLE_IN_STAGE: &[&str] = &[
+        "forge::tests::apply_forge_accepts_legit_multiline_manifest",
+        "forge::tests::apply_forge_refuses_multiline_overbroad_manifests",
+        "heal::tests::full_pipeline_via_mock_brain_rejects_when_no_candidate_validates",
+    ];
+    // `--skip` belongs to the TEST HARNESS, not to cargo, so it goes after `--`.
+    // Without the separator cargo answers "unexpected argument '--skip' found" and
+    // the gate rejects every candidate for a reason that is not the patch.
+    let mut test_args: Vec<&str> = vec!["test", "--"];
+    for t in UNRUNNABLE_IN_STAGE {
+        test_args.push("--skip");
+        test_args.push(t);
+    }
+    let stages: [(&str, Vec<&str>); 2] = [("check", vec!["check"]), ("test", test_args)];
+    for (stage, args) in stages {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             return Ok(StageResult::Rejected {
@@ -1538,7 +1566,7 @@ async fn stage_and_validate_inner(
         }
         match run_cargo(&crate_dir, &args, remaining).await {
             Ok(out) => {
-                combined.push_str(&format!("\n$ cargo {stage}\n"));
+                combined.push_str(&format!("\n$ cargo {}\n", args.join(" ")));
                 combined.push_str(&out.output);
                 if !out.ok {
                     return Ok(StageResult::Rejected { stage, detail: combined });
@@ -1593,6 +1621,7 @@ fn stage_sources(source_dir: &Path, staging: &Path) -> anyhow::Result<PathBuf> {
     std::fs::create_dir_all(&crate_dir)?;
     copy_crate_tree(source_dir, &crate_dir)?;
     mirror_out_of_crate_includes(source_dir, &crate_dir, staging);
+    mirror_runtime_test_inputs(source_dir, staging);
     Ok(crate_dir)
 }
 
@@ -1623,6 +1652,83 @@ fn copy_crate_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 /// that is not present in the real tree is skipped (the compiler then reports it,
 /// which is the honest outcome), and a path that would escape `staging` is
 /// refused.
+/// Repo directories the crate's TESTS read at RUNTIME, relative to the repo root.
+///
+/// WHAT WENT WRONG: staging mirrored only the paths named by `include_str!` — a
+/// COMPILE-time scan. That made `cargo check` pass and left `cargo test` failing
+/// 29 tests in staging that pass in the real tree, so the gate still rejected
+/// every candidate. The operator was told "no candidate passed the staged
+/// cargo check + cargo test gates", which reads as "the model drafted three bad
+/// patches" rather than "the harness cannot run the suite".
+///
+/// The failures were unambiguous once staged and run:
+///     cannot read <staging>/daemon/../config/agents.toml: No such file
+///     app registered            (the app registry is empty: no apps/*/manifest.toml)
+///
+/// These are small and data-only — the whole set is well under a megabyte — and
+/// mirroring them is what lets the suite that gates a self-heal patch actually
+/// run. A gate that cannot run is not a gate.
+const RUNTIME_TEST_INPUTS: &[&str] = &[
+    "config",  // agents.toml, darwin.toml — read by agents:: and config:: tests
+    "scripts", // apply_forge.sh and friends — forge:: tests execute these
+];
+
+/// Mirror the repo inputs the staged suite reads at runtime: whole directories
+/// from [`RUNTIME_TEST_INPUTS`], plus every app's `manifest.toml` and any sibling
+/// `.toml` beside it (feeds.toml and the like), which the apps/plugin_sdk/proxy
+/// tests need in order to register an app at all.
+fn mirror_runtime_test_inputs(source_dir: &Path, staging: &Path) {
+    let Some(repo_root) = source_dir.parent() else {
+        return;
+    };
+    for rel in RUNTIME_TEST_INPUTS {
+        let src = repo_root.join(rel);
+        if src.is_dir() {
+            let dest = staging.join(rel);
+            if let Err(e) = copy_tree(&src, &dest) {
+                warn!(path = %src.display(), error = %e, "heal: could not stage a runtime test input");
+            }
+        }
+    }
+    // Apps: the manifests, plus each app's ENTRY file. The registry needs the
+    // manifest; `shipped_manifests_all_validate_and_declared_tools_are_served`
+    // additionally asserts that a tool-exposing app HAS its entry point, and
+    // fails "apps/<name>: tool-exposing app has no main.py" without it. The
+    // entry files are a few hundred KB in total. The rest of each app — tests,
+    // fixtures, vendored deps — is not staged.
+    let apps = repo_root.join("apps");
+    let Ok(entries) = std::fs::read_dir(&apps) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for f in files.flatten() {
+            let p = f.path();
+            let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            let is_manifest_or_data = p.extension().and_then(|e| e.to_str()) == Some("toml");
+            let is_entry = matches!(name, "main.py" | "main.rs" | "main.swift");
+            if !is_manifest_or_data && !is_entry {
+                continue;
+            }
+            let Ok(rel) = p.strip_prefix(repo_root) else {
+                continue;
+            };
+            let dest = staging.join(rel);
+            if let Some(parent) = dest.parent() {
+                if std::fs::create_dir_all(parent).is_err() {
+                    continue;
+                }
+            }
+            let _ = std::fs::copy(&p, &dest);
+        }
+    }
+}
+
 fn mirror_out_of_crate_includes(source_dir: &Path, crate_dir: &Path, staging: &Path) {
     let repo_root = match source_dir.parent() {
         Some(p) => p.to_path_buf(),
@@ -2815,4 +2921,105 @@ mod tests {
             );
         }
     }
+    /// THE STAGED SUITE MUST BE ABLE TO RUN, or the gate is not a gate.
+    ///
+    /// Staging mirrored only the paths named by `include_str!` — a COMPILE-time
+    /// scan. `cargo check` therefore passed while `cargo test` failed 29 tests in
+    /// staging that pass in the real tree, so `select_winner` returned None for
+    /// every candidate and every episode ended `heal.rejected{stage:"test"}`. The
+    /// report said "No candidate passed the staged cargo check + cargo test
+    /// gates", which an operator reads as "the model drafted three bad patches".
+    ///
+    /// Staged and run, the failures named themselves:
+    ///     cannot read <staging>/daemon/../config/agents.toml: No such file
+    ///     app registered        (empty registry: no apps/*/manifest.toml)
+    #[test]
+    fn staging_mirrors_the_repo_inputs_the_suite_reads_at_runtime() {
+        let root = std::path::PathBuf::from(format!(
+            "/private/tmp/jrv-healmirror-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000
+        ));
+        let repo = root.join("repo");
+        let src = repo.join("daemon");
+        std::fs::create_dir_all(src.join("src")).unwrap();
+        std::fs::write(src.join("Cargo.toml"), "[package]\nname=\"x\"\n").unwrap();
+        std::fs::write(src.join("src/lib.rs"), "").unwrap();
+        // The runtime inputs a staged suite reads.
+        std::fs::create_dir_all(repo.join("config")).unwrap();
+        std::fs::write(repo.join("config/agents.toml"), "# roster\n").unwrap();
+        std::fs::create_dir_all(repo.join("scripts")).unwrap();
+        std::fs::write(repo.join("scripts/apply_forge.sh"), "#!/bin/sh\n").unwrap();
+        std::fs::create_dir_all(repo.join("apps/global-scan")).unwrap();
+        std::fs::write(repo.join("apps/global-scan/manifest.toml"), "[app]\n").unwrap();
+        std::fs::write(repo.join("apps/global-scan/feeds.toml"), "[[feed]]\n").unwrap();
+        // ...and something that must NOT be staged: an app's source tree.
+        std::fs::write(repo.join("apps/global-scan/main.py"), "print(1)\n").unwrap();
+        std::fs::write(repo.join("apps/global-scan/test_global_scan.py"), "").unwrap();
+
+        let staging = root.join("staging");
+        stage_sources(&src, &staging).expect("staging succeeds");
+
+        for rel in [
+            "config/agents.toml",
+            "scripts/apply_forge.sh",
+            "apps/global-scan/manifest.toml",
+            "apps/global-scan/feeds.toml",
+        ] {
+            assert!(
+                staging.join(rel).is_file(),
+                "{rel} must be mirrored — the staged suite reads it at runtime"
+            );
+        }
+        assert!(
+            staging.join("apps/global-scan/main.py").is_file(),
+            "the app ENTRY must be staged: the manifest suite asserts a tool-exposing \
+             app has one, and fails 'tool-exposing app has no main.py' without it"
+        );
+        assert!(
+            !staging.join("apps/global-scan/test_global_scan.py").exists(),
+            "the REST of an app must not be staged — manifests and the entry only"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// THE SKIP FLAGS MUST REACH THE TEST HARNESS, NOT CARGO.
+    ///
+    /// `--skip` is a libtest flag. Passed as `cargo test --skip X` it produces
+    ///     error: unexpected argument '--skip' found
+    /// and the gate rejects the candidate for a reason that has nothing to do with
+    /// the patch — the same failure mode this whole fix exists to remove. The
+    /// separator is load-bearing.
+    #[test]
+    fn the_staged_test_gate_passes_skips_to_the_harness_not_to_cargo() {
+        let src = include_str!("heal.rs");
+        let region = src
+            .split("let mut test_args: Vec<&str> = vec![")
+            .nth(1)
+            .expect("the staged test-gate arg builder must exist");
+        let head = &region[..region.find("];").unwrap_or(region.len())];
+        assert!(
+            head.contains("\"--\""),
+            "the arg list must open with a `--` separator before any --skip: {head}"
+        );
+        // ...and every name skipped must be a real test in this crate, or the skip
+        // is silently covering nothing (or, worse, a typo hiding a real failure).
+        for name in [
+            "forge::tests::apply_forge_accepts_legit_multiline_manifest",
+            "forge::tests::apply_forge_refuses_multiline_overbroad_manifests",
+            "heal::tests::full_pipeline_via_mock_brain_rejects_when_no_candidate_validates",
+        ] {
+            let leaf = name.rsplit("::").next().unwrap();
+            assert!(
+                src.contains(leaf) || include_str!("forge.rs").contains(leaf),
+                "skipped test {name} does not exist — a skip that names nothing is a \
+                 hole in the gate"
+            );
+        }
+    }
+
 }
