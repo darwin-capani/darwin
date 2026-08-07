@@ -19,9 +19,14 @@
 //!     USER. It takes an [`ActionMode`]: in [`ActionMode::DryRun`] it builds and
 //!     returns a clear PREVIEW of the exact tweet text and issues NO request; only
 //!     in [`ActionMode::Execute`] does it POST exactly one tweet. Call sites get
-//!     the mode from the foundation's `gate(confirm)`, so with
-//!     `[integrations].allow_consequential` false (the shipped default) it always
-//!     previews. The 280-char limit is enforced with a friendly error BEFORE any
+//!     the mode from the foundation's `gate(confirm)`. The master switch
+//!     `[integrations].allow_consequential` SHIPS ON (armed), so on a default
+//!     install a CONFIRMED post really is published under the user's handle — what
+//!     keeps it a preview is the absence of a fresh per-action `confirm`, not the
+//!     switch, and a confirmed post still clears voice-id + policy + !lockdown at
+//!     the runtime chokepoints. (This said the switch shipped false, understating
+//!     the default posture on the highest-blast-radius write in the module.)
+//!     The 280-char limit is enforced with a friendly error BEFORE any
 //!     request is built — an over-long tweet never reaches the network.
 //!
 //! Every method returns a concise human-facing `String` — what veronica would
@@ -243,8 +248,10 @@ impl<T: HttpTransport, A: HttpTransport> XClient<T, A> {
     ///   * In [`ActionMode::Execute`] it issues exactly one `POST /2/tweets`
     ///     carrying `{"text": ...}` and returns a short confirmation with the new
     ///     tweet id.
-    ///     Callers obtain `mode` from the foundation's `gate(confirm)`, so the shipped
-    ///     default (gate OFF) always previews.
+    ///     Callers obtain `mode` from the foundation's `gate(confirm)`; the master
+    ///     switch ships ARMED, so this previews when `confirm` is false (or the
+    ///     operator disarmed the switch, or lockdown is engaged) and PUBLISHES
+    ///     under the user's handle on a fresh confirm.
     pub async fn post_tweet(&self, text: &str, mode: ActionMode) -> IntegrationResult<String> {
         // Enforce the length limit up front — counted in Unicode scalar values,
         // matching how X counts a standard tweet for this purpose — so a too-long

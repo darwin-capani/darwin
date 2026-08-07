@@ -22,8 +22,13 @@
 //!     of exactly the service call it WOULD make and issues NO request; only in
 //!     [`ActionMode::Execute`] does it POST /api/services/<domain>/<service>
 //!     exactly once. Call sites get the mode from the foundation's
-//!     `gate(confirm)`, so with `[integrations].allow_consequential` false (the
-//!     shipped default) a control always previews — no device moves.
+//!     `gate(confirm)`. The master switch `[integrations].allow_consequential`
+//!     SHIPS ON (armed), so what keeps a control a preview is the absence of a
+//!     fresh per-action `confirm` — not the switch. On a default install a
+//!     CONFIRMED control really does move the lock or the light; the switch alone
+//!     never executes anything, and a confirmed action still clears voice-id +
+//!     policy + !lockdown at the runtime chokepoints. (This said the switch shipped
+//!     false, i.e. that a physical actuation was unreachable out of the box.)
 //!
 //! Every method returns a concise human-facing `String` — what dume would say —
 //! while parsing only the typed fields it needs. Non-2xx responses map to
@@ -196,8 +201,9 @@ impl<T: HttpTransport> SmartHomeClient<T> {
     /// In [`ActionMode::DryRun`] this issues NO request — it returns a preview of
     /// exactly the service call it would make. In [`ActionMode::Execute`] it POSTs
     /// `/api/services/<domain>/<service>` exactly once. Callers obtain `mode` from
-    /// the foundation's `gate(confirm)`, so the shipped default (gate OFF) always
-    /// previews — no device moves.
+    /// the foundation's `gate(confirm)`; the master switch ships ARMED, so this
+    /// previews when `confirm` is false (or the operator disarmed the switch, or
+    /// lockdown is engaged) and EXECUTES — the device moves — on a fresh confirm.
     pub async fn set_device(
         &self,
         entity_id: &str,

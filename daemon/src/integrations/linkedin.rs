@@ -25,9 +25,13 @@
 //!     does it issue exactly one create-post request, carrying the author URN +
 //!     commentary + PUBLIC visibility and the `LinkedIn-Version` /
 //!     `X-Restli-Protocol-Version` headers the Posts API requires. Call sites get
-//!     `mode` from the foundation's `gate(confirm)`, so with
-//!     `[integrations].allow_consequential` false (the shipped default) a post
-//!     always previews.
+//!     `mode` from the foundation's `gate(confirm)`. The master switch
+//!     `[integrations].allow_consequential` SHIPS ON (armed), so on a default
+//!     install a CONFIRMED post really is published under the member's own
+//!     identity — what keeps it a preview is the absence of a fresh per-action
+//!     `confirm`, not the switch, and a confirmed post still clears voice-id +
+//!     policy + !lockdown at the runtime chokepoints. (This said the switch
+//!     shipped false, i.e. that a public post could not happen out of the box.)
 //!
 //! Non-2xx responses map to friendly, secret-free errors via [`map_status`]
 //! (401 -> reconnect; 403 -> the LinkedIn "posting not permitted" app/scope hint;
@@ -184,8 +188,9 @@ impl<T: HttpTransport, A: HttpTransport> LinkedinClient<T, A> {
     /// carrying the author URN + commentary + PUBLIC visibility and the
     /// `LinkedIn-Version` / `X-Restli-Protocol-Version` headers the Posts API
     /// requires, and returns a short confirmation. Callers obtain `mode` from the
-    /// foundation's `gate(confirm)`, so the shipped default (gate OFF) always
-    /// previews.
+    /// foundation's `gate(confirm)`; the master switch ships ARMED, so this
+    /// previews when `confirm` is false (or the operator disarmed the switch, or
+    /// lockdown is engaged) and PUBLISHES on a fresh confirm.
     pub async fn create_post(&self, text: &str, mode: ActionMode) -> IntegrationResult<String> {
         if mode == ActionMode::DryRun {
             // No request is built or sent — pure preview. We surface the text via

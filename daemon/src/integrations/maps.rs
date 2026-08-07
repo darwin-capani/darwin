@@ -6,14 +6,40 @@
 //! `MockTransport` — zero network in tests), and holds the user's own Maps
 //! Platform API key, which it attaches per request at the moment of the send.
 //!
-//! KEY HANDLING — the security crux of this client. Google Maps web services
-//! classically accept the API key as a `?key=...` QUERY PARAMETER, but a key in
-//! the URL would land in every logged/recorded request line. So this client
-//! attaches the key ONLY in the `X-Goog-Api-Key` HEADER (a Google Maps Platform
-//! auth method) and NEVER puts it in the URL. The key value is never logged, never
-//! stored on the transport, never put in an error or a `Debug` field — only its
-//! presence (a bool) is ever recorded. A test (`api_key_never_appears_in_a_logged_url`)
-//! pins that no recorded URL — and no produced output — ever contains the key.
+//! KEY HANDLING — the security crux of this client. The key is attached ONLY in
+//! the `X-Goog-Api-Key` HEADER and NEVER in the URL. That is not a stylistic
+//! choice: `SECURITY.md` §8 states flatly that API keys are "never logged, never
+//! placed in a URL/argv/telemetry event", and this client holds one. The key
+//! value is never logged, never stored on the transport, never put in an error or
+//! a `Debug` field — only its presence (a bool) is ever recorded. A test
+//! (`api_key_never_appears_in_a_logged_url`) pins that no recorded URL — and no
+//! produced output — ever contains the key.
+//!
+//! KNOWN NON-FUNCTIONAL — READ THIS BEFORE "FIXING" THE AUTH. The three endpoints
+//! below are the LEGACY Maps web services on `maps.googleapis.com`, and they read
+//! the key from `?key=` ONLY. Measured live, same fake key, all three endpoints:
+//! with `X-Goog-Api-Key` (also with `Authorization` and `X-Api-Key`) Google
+//! answers `{"status":"REQUEST_DENIED","error_message":"You must use an API key
+//! to authenticate each request …"}` — i.e. it sees NO credential; with `?key=`
+//! it answers "The provided API key is invalid.", i.e. it sees the key. So every
+//! `voyager_directions` / `voyager_places` / `voyager_eta` call fails today even
+//! with a perfect key, and [`map_provider_status`] blames the user's key for it.
+//! There is no header name that fixes this — the HOST is what is wrong.
+//!
+//! Closing it is an OWNER DECISION, because the two options trade against each
+//! other and one of them changes a stated security property:
+//!   (a) append `&key=` to these legacy URLs — makes the calls work, but puts a
+//!       live credential in a request URL, which `SECURITY.md` §8 forbids. It
+//!       cannot be taken by an agent: it needs `SECURITY.md` changed first.
+//!   (b) move to the surfaces that really do read the header — Routes API
+//!       (`routes.googleapis.com/directions/v2:computeRoutes`) and Places API New
+//!       (`places.googleapis.com/v1/places:searchText`), both verified live to
+//!       reach key validation from `X-Goog-Api-Key` alone. Keeps §8 intact, but
+//!       is a real migration: two new hosts, POST + JSON bodies, `X-Goog-FieldMask`,
+//!       and all three response parsers replaced — and it cannot be written
+//!       blind, since the summaries below quote Google's own human `text` fields.
+//! Until one is chosen, this module attaches the key the safe way and is honest
+//! that the endpoints ignore it.
 //!
 //! READ-ONLY by construction. This client reads ROUTES, PLACES, and TRAVEL TIMES;
 //! it does NOT book or pay for anything. There is deliberately NO reservation or
@@ -47,15 +73,19 @@ use super::{
 
 /// The Keychain account holding the user's Maps Platform API key (from their own
 /// Google Maps Platform project). Pasted in Settings. Rides ONLY the
-/// `X-Goog-Api-Key` request header at call time — never the URL, never a log.
+/// `X-Goog-Api-Key` request header at call time — never the URL, never a log
+/// (SECURITY.md §8). See the module header for why these endpoints ignore it.
 pub const ACCOUNT_API_KEY: &str = "maps_api_key";
 
 /// Default Maps base URL — Google Maps Platform web services. No trailing slash so
 /// `{base}/maps/api/...` is clean.
 pub const DEFAULT_BASE: &str = "https://maps.googleapis.com";
 
-/// The header Google Maps Platform reads the API key from. Using the header (not a
-/// `?key=` query param) keeps the key out of every logged/recorded URL.
+/// The header an API key is attached to. The NEWER Google Maps Platform surfaces
+/// (Routes, Places API New) really do read it; the LEGACY `/maps/api/...` web
+/// services this client currently calls do NOT — see the module header. Using the
+/// header (never a `?key=` query param) is what keeps the key out of every
+/// logged/recorded URL, per SECURITY.md §8.
 const API_KEY_HEADER: &str = "X-Goog-Api-Key";
 
 /// Default travel mode when the caller does not specify one.
@@ -217,9 +247,19 @@ impl<T: HttpTransport> MapsClient<T> {
 
     /// Compose a GET to a Maps endpoint. The API key is attached HERE — at the
     /// moment of the call — ONLY in the `X-Goog-Api-Key` header, NEVER in the URL,
-    /// so it can never land in a logged/recorded request line. `query` is the
-    /// already-URL-encoded query string (key=value pairs, no leading `?`); it
-    /// carries the request params but NEVER the API key.
+    /// so it can never land in a logged/recorded request line (SECURITY.md §8).
+    /// `query` is the already-URL-encoded query string (name=value pairs, no
+    /// leading `?`); it carries the request params but NEVER the API key.
+    ///
+    /// AND THESE ENDPOINTS IGNORE THAT HEADER. `/maps/api/...` on
+    /// `maps.googleapis.com` reads `?key=` and nothing else, so Google sees no
+    /// credential and answers every call with
+    /// `{"status":"REQUEST_DENIED","error_message":"You must use an API key to
+    /// authenticate each request …"}`, which [`map_provider_status`] renders as
+    /// "check your Maps Platform API key … in Settings" — blaming a key that is
+    /// correct and was never read. DO NOT close that by appending `&key=` here:
+    /// §8 forbids a credential in a URL, and trading it away is the owner's call,
+    /// not this function's. The module header states both options.
     fn get(&self, path: &str, query: &str) -> HttpRequest {
         let url = if query.is_empty() {
             format!("{}{path}", self.base)
@@ -602,6 +642,11 @@ mod tests {
 
     // -- the API KEY rides the HEADER, never the URL -------------------------
 
+    /// THE security pin on the composed request: the key is attached as a HEADER
+    /// and the URL carries request params only. SECURITY.md §8 ("never placed in a
+    /// URL/argv/telemetry event") is what this defends, and a fix for the dead
+    /// legacy endpoints must not be bought by breaking it — see the module header
+    /// for the two options that do not.
     #[tokio::test]
     async fn request_carries_key_in_header_not_in_url() {
         let mock = MockTransport::new().on(HttpMethod::Get, "/maps/api/directions/json", 200, directions_json());
@@ -614,7 +659,29 @@ mod tests {
         // The URL carries the request params but NOT the key.
         assert!(req.url.starts_with("https://maps.googleapis.com/maps/api/directions/json?"), "got: {}", req.url);
         assert!(req.url.contains("origin=A"), "params in url: {}", req.url);
+        assert!(req.url.contains("destination=B") && req.url.contains("mode=driving"), "got: {}", req.url);
         assert!(!req.url.to_lowercase().contains("key="), "the API key must NOT be a URL query param: {}", req.url);
+    }
+
+    /// The same on ALL THREE endpoints, not just directions: none of them may be
+    /// given a credential-bearing URL.
+    #[tokio::test]
+    async fn no_endpoint_puts_the_key_in_its_url() {
+        let mock = MockTransport::new()
+            .on(HttpMethod::Get, "/maps/api/directions/json", 200, directions_json())
+            .on(HttpMethod::Get, "/maps/api/place/textsearch/json", 200, places_json())
+            .on(HttpMethod::Get, "/maps/api/distancematrix/json", 200, distance_matrix_json());
+        let c = client(mock);
+        c.directions("Cupertino", "SFO", None).await.unwrap();
+        c.places_search("coffee near me", None).await.unwrap();
+        c.eta("the office", "the venue", Some("driving")).await.unwrap();
+        let reqs = c.transport.requests();
+        assert_eq!(reqs.len(), 3, "one read per method");
+        for req in &reqs {
+            assert!(req.has_header("x-goog-api-key"), "api key header attached: {}", req.url);
+            assert!(!req.url.contains(FAKE_KEY), "key in a URL: {}", req.url);
+            assert!(!req.url.to_lowercase().contains("key="), "key= in a URL: {}", req.url);
+        }
     }
 
     /// THE security pin: the API key value must never appear in any RECORDED URL,

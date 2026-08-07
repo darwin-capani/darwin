@@ -28,11 +28,18 @@
 //!     [`GoogleAdsClient::pause_campaign`] / [`GoogleAdsClient::enable_campaign`]
 //!     flip a campaign's status, and [`GoogleAdsClient::set_campaign_budget`]
 //!     changes a campaign budget's amount. In [`ActionMode::DryRun`] each issues NO
-//!     request and returns a clear PREVIEW of the exact change (which resource,
-//!     old -> new); only in [`ActionMode::Execute`] does it issue exactly one
+//!     request and returns a clear PREVIEW naming the resource and the TARGET
+//!     status/amount — NOT a before-and-after transition: the client never reads
+//!     current state on a mutate path (that is what keeps "DryRun issues no
+//!     request" true), so it cannot show what the campaign or budget is changing
+//!     FROM. Only in [`ActionMode::Execute`] does it issue exactly one
 //!     `campaigns:mutate` / `campaignBudgets:mutate`. Call sites get `mode` from the
-//!     foundation's `gate(confirm)`, so with `[integrations].allow_consequential`
-//!     false (the shipped default) every mutation previews and changes nothing.
+//!     foundation's `gate(confirm)`. The master switch
+//!     `[integrations].allow_consequential` SHIPS ON (armed), so on a default
+//!     install a CONFIRMED mutation really does move money — what keeps it a
+//!     preview is the absence of a fresh per-action `confirm`, not the switch, and
+//!     a confirmed mutation still clears voice-id + policy + !lockdown at the
+//!     runtime chokepoints.
 //!
 //! Non-2xx responses map to friendly, secret-free errors via [`map_status`]
 //! (401 -> reconnect; 403 -> the developer-token-not-approved / no-access hint;
@@ -48,13 +55,32 @@ use super::{
     StatusOutcome,
 };
 
-/// The Google Ads REST API version this client is pinned to. Bumping it in one
-/// place moves every endpoint together. (`v17` is a current GA version of the
-/// Google Ads API at time of writing.)
-pub const GOOGLE_ADS_VERSION: &str = "v17";
+/// The API version literal, as a macro. `const` string concatenation is not
+/// available in stable Rust, so this is what lets [`API_BASE`] be BUILT from the
+/// version instead of repeating it.
+///
+/// WHAT WENT WRONG BEFORE: the version was written twice — `GOOGLE_ADS_VERSION`
+/// held "v17" and `API_BASE` had a SECOND "v17" baked into its literal. Every
+/// endpoint took its version from `API_BASE`; `GOOGLE_ADS_VERSION` was read by
+/// nothing but its own pinning test. So the documented promise ("bumping it in one
+/// place moves every endpoint together") was false: a maintainer moving the client
+/// to a new API version would edit the constant and still send every request to
+/// the old version.
+macro_rules! google_ads_version {
+    () => {
+        "v17"
+    };
+}
 
-/// The Google Ads REST API base, with the version baked in.
-pub const API_BASE: &str = "https://googleads.googleapis.com/v17";
+/// The Google Ads REST API version this client is pinned to. It is the SINGLE
+/// place the version appears — [`API_BASE`] is composed from it, so bumping it
+/// really does move every endpoint together. (`v17` is a current GA version of the
+/// Google Ads API at time of writing.)
+pub const GOOGLE_ADS_VERSION: &str = google_ads_version!();
+
+/// The Google Ads REST API base, with the version composed in from
+/// [`GOOGLE_ADS_VERSION`] — never a second literal.
+pub const API_BASE: &str = concat!("https://googleads.googleapis.com/", google_ads_version!());
 
 /// How many campaigns one report/list read may ask for. The GAQL `LIMIT` is
 /// clamped into this band so a bad `max` can never produce a pathological query.
@@ -317,9 +343,10 @@ impl<T: HttpTransport, A: HttpTransport> GoogleAdsClient<T, A> {
 
     /// PAUSE a campaign (set `campaign.status` = PAUSED). Consequential: it stops a
     /// running campaign's spend. In [`ActionMode::DryRun`] it issues NO request and
-    /// returns a PREVIEW naming the campaign and the ENABLED -> PAUSED change; in
-    /// [`ActionMode::Execute`] it issues exactly one `campaigns:mutate`. Callers get
-    /// `mode` from `gate(confirm)`.
+    /// returns a PREVIEW naming the campaign and the TARGET status (PAUSED) — the
+    /// campaign's CURRENT status is never fetched, so the preview cannot and does
+    /// not show a transition; in [`ActionMode::Execute`] it issues exactly one
+    /// `campaigns:mutate`. Callers get `mode` from `gate(confirm)`.
     pub async fn pause_campaign(
         &self,
         campaign_id: &str,
@@ -330,8 +357,9 @@ impl<T: HttpTransport, A: HttpTransport> GoogleAdsClient<T, A> {
     }
 
     /// ENABLE a campaign (set `campaign.status` = ENABLED). Consequential: it lets a
-    /// paused campaign spend again. DryRun previews the PAUSED -> ENABLED change and
-    /// issues no request; Execute issues exactly one `campaigns:mutate`.
+    /// paused campaign spend again. DryRun previews the TARGET status (ENABLED) —
+    /// not a transition, since the current status is never read — and issues no
+    /// request; Execute issues exactly one `campaigns:mutate`.
     pub async fn enable_campaign(
         &self,
         campaign_id: &str,
@@ -380,8 +408,10 @@ impl<T: HttpTransport, A: HttpTransport> GoogleAdsClient<T, A> {
     /// how much a campaign can spend. `budget` may be a full campaignBudget resource
     /// name (`customers/<cid>/campaignBudgets/<bid>`) or a bare budget id — both are
     /// normalized to the resource name. In [`ActionMode::DryRun`] it issues NO
-    /// request and previews the new amount; in [`ActionMode::Execute`] it issues
-    /// exactly one `campaignBudgets:mutate` with an `update_mask` of `amount_micros`.
+    /// request and previews the NEW amount only — the budget's current amount is
+    /// never fetched, so the operator sees what it will become, not what it is
+    /// changing from; in [`ActionMode::Execute`] it issues exactly one
+    /// `campaignBudgets:mutate` with an `update_mask` of `amount_micros`.
     pub async fn set_campaign_budget(
         &self,
         budget: &str,
@@ -1172,10 +1202,37 @@ mod tests {
         assert!(map_status(500, "x").unwrap_err().to_string().contains("transient"));
     }
 
+    /// The version pin, and — the part that used to be vacuous — the LOCKSTEP:
+    /// `API_BASE` must be composed FROM `GOOGLE_ADS_VERSION`, not from a second
+    /// literal of its own. Asserting the base against the CONSTANT (rather than
+    /// against a hardcoded "/v17") is what makes a bump of the constant provably
+    /// move every endpoint with it.
     #[test]
     fn version_and_base_are_pinned() {
-        assert_eq!(GOOGLE_ADS_VERSION, "v17");
-        assert!(API_BASE.ends_with("/v17"));
+        // LOCKSTEP FIRST, so a version bump that fails to move the endpoints is
+        // reported as what it is, rather than being masked by the literal pin.
+        assert_eq!(
+            API_BASE,
+            format!("https://googleads.googleapis.com/{GOOGLE_ADS_VERSION}"),
+            "API_BASE must be composed FROM GOOGLE_ADS_VERSION — with a second literal \
+             of its own, bumping the constant moves no endpoint at all"
+        );
+        assert!(
+            API_BASE.ends_with(&format!("/{GOOGLE_ADS_VERSION}")),
+            "API_BASE must take its version from GOOGLE_ADS_VERSION: {API_BASE}"
+        );
         assert!(API_BASE.starts_with("https://googleads.googleapis.com/"));
+        assert_eq!(GOOGLE_ADS_VERSION, "v17");
+        // Every endpoint builder rides API_BASE, so they all move together.
+        for url in [
+            format!("{API_BASE}/customers/1/googleAds:search"),
+            format!("{API_BASE}/customers/1/campaigns:mutate"),
+            format!("{API_BASE}/customers/1/campaignBudgets:mutate"),
+        ] {
+            assert!(
+                url.contains(&format!("/{GOOGLE_ADS_VERSION}/")),
+                "endpoint must carry the pinned version: {url}"
+            );
+        }
     }
 }

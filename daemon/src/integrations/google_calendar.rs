@@ -21,8 +21,12 @@
 //!     [`ActionMode::DryRun`] it builds and returns a human-readable preview and
 //!     issues NO request; only in [`ActionMode::Execute`] does it POST exactly one
 //!     `events.insert`. Call sites obtain `mode` from the foundation's
-//!     `gate(confirm)`, so with `[integrations].allow_consequential` false (the
-//!     shipped default) `create_event` always previews.
+//!     `gate(confirm)`. The master switch `[integrations].allow_consequential`
+//!     SHIPS ON (armed), so on a default install a CONFIRMED `create_event` really
+//!     does write to the user's calendar (and mail any invitees) — what keeps it a
+//!     preview is the absence of a fresh per-action `confirm`, not the switch, and
+//!     a confirmed insert still clears voice-id + policy + !lockdown at the runtime
+//!     chokepoints.
 //!
 //! Every method returns a concise human-facing `String` while parsing the typed
 //! fields it needs from the Calendar JSON (event id/summary/start/end). Non-2xx
@@ -279,8 +283,9 @@ impl<T: HttpTransport> GoogleCalendarClient<T> {
     /// In [`ActionMode::DryRun`] this issues NO request — it returns a preview of
     /// exactly what would be created. In [`ActionMode::Execute`] it POSTs one
     /// `events.insert` and returns the created event's link. Callers obtain `mode`
-    /// from the foundation's `gate(confirm)`, so the shipped default (gate OFF)
-    /// always previews.
+    /// from the foundation's `gate(confirm)`; the master switch ships ARMED, so
+    /// this previews when `confirm` is false (or the operator disarmed the switch,
+    /// or lockdown is engaged) and INSERTS the event on a fresh confirm.
     pub async fn create_event(
         &self,
         calendar_id: &str,

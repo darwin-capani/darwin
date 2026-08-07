@@ -23,9 +23,13 @@
 //!     [`ActionMode::DryRun`] it issues NO request and returns a clear PREVIEW
 //!     (to / subject / first line); only in [`ActionMode::Execute`] does it
 //!     issue exactly one `messages.send` carrying a base64url-encoded RFC 2822
-//!     message. Call sites get `mode` from the foundation's `gate(confirm)`, so
-//!     with `[integrations].allow_consequential` false (the shipped default) a
-//!     send always previews.
+//!     message. Call sites get `mode` from the foundation's `gate(confirm)`. The
+//!     master switch `[integrations].allow_consequential` SHIPS ON (armed), so on
+//!     a default install a CONFIRMED send really does put mail on the wire as the
+//!     user — what keeps it a preview is the absence of a fresh per-action
+//!     `confirm`, not the switch, and a confirmed send still clears voice-id +
+//!     policy + !lockdown at the runtime chokepoints. (This said the switch
+//!     shipped false, i.e. that mail could not go out without re-configuring.)
 //!
 //! Non-2xx responses map to friendly, secret-free errors via [`map_status`]
 //! (401 -> reconnect; 403 -> scope), never echoing the provider body (which can
@@ -300,7 +304,9 @@ impl<T: HttpTransport, A: HttpTransport> GmailClient<T, A> {
     /// line of the body). In [`ActionMode::Execute`] it issues exactly one
     /// `messages.send` carrying a base64url-encoded RFC 2822 message and returns
     /// a short confirmation. Callers obtain `mode` from the foundation's
-    /// `gate(confirm)`, so the shipped default (gate OFF) always previews.
+    /// `gate(confirm)`; the master switch ships ARMED, so this previews when
+    /// `confirm` is false (or the operator disarmed the switch, or lockdown is
+    /// engaged) and SENDS on a fresh confirm.
     pub async fn send_message(
         &self,
         to: &str,

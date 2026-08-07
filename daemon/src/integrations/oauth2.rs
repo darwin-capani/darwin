@@ -95,7 +95,35 @@ pub struct ProviderConfig {
     /// Keychain account holding the long-lived refresh token — WRITTEN by DARWIN
     /// after consent, read back on every connect. Lives ONLY in the Keychain.
     pub account_refresh_token: &'static str,
+    /// Provider-specific EXTRA consent-URL parameters, appended verbatim (both
+    /// halves percent-encoded) after the standard set. Empty for providers whose
+    /// refresh token is unlocked by a SCOPE (X's `offline.access`, WHOOP's
+    /// `offline`).
+    ///
+    /// WHAT WENT WRONG WITHOUT THIS: Google does NOT have an offline scope — its
+    /// authorization endpoint defaults to `access_type=online`, which returns NO
+    /// `refresh_token` from the code exchange. `GOOGLE_ADS` points at the same
+    /// endpoint the Workspace flow uses, but the generic `build_auth_url` emitted
+    /// no `access_type`, so a real, fully-granted Google Ads consent came back
+    /// without a refresh token and `exchange_code` hard-stopped with "did not
+    /// return a refresh token — reconnect and grant offline access". Every retry
+    /// failed identically, because the missing parameter was in the URL DARWIN
+    /// built, not in anything the user could change: the whole integration was
+    /// unconnectable, and the read path answered "say 'connect Google Ads'".
+    /// `prompt=consent` matters just as much — without it a user who already
+    /// granted this client once gets no refresh token on a re-consent, the same
+    /// dead end on the second connect.
+    pub extra_auth_params: &'static [(&'static str, &'static str)],
 }
+
+/// The extra consent-URL parameters Google requires to mint a REFRESH token for
+/// an installed app: `access_type=offline` (Google's authorization endpoint
+/// defaults to `online`, which returns no refresh token) plus `prompt=consent`
+/// (so a RE-consent by a user who already granted this client still returns one).
+/// Identical to what the round-2 Workspace flow bakes into its own auth URL
+/// (`google_oauth::build_auth_url`).
+pub const GOOGLE_OFFLINE_PARAMS: &[(&str, &str)] =
+    &[("access_type", "offline"), ("prompt", "consent")];
 
 // ---------------------------------------------------------------------------
 // X (Twitter API v2)
@@ -131,6 +159,8 @@ pub const X: ProviderConfig = ProviderConfig {
     account_client_id: X_ACCOUNT_CLIENT_ID,
     account_client_secret: X_ACCOUNT_CLIENT_SECRET,
     account_refresh_token: X_ACCOUNT_REFRESH_TOKEN,
+    // None: X unlocks the refresh token with the `offline.access` SCOPE.
+    extra_auth_params: &[],
 };
 
 // ---------------------------------------------------------------------------
@@ -162,6 +192,8 @@ pub const LINKEDIN: ProviderConfig = ProviderConfig {
     account_client_id: LINKEDIN_ACCOUNT_CLIENT_ID,
     account_client_secret: LINKEDIN_ACCOUNT_CLIENT_SECRET,
     account_refresh_token: LINKEDIN_ACCOUNT_REFRESH_TOKEN,
+    // None: LinkedIn's authorization endpoint takes no offline/prompt parameter.
+    extra_auth_params: &[],
 };
 
 // ---------------------------------------------------------------------------
@@ -204,6 +236,10 @@ pub const GOOGLE_ADS: ProviderConfig = ProviderConfig {
     account_client_id: GOOGLE_ADS_ACCOUNT_CLIENT_ID,
     account_client_secret: GOOGLE_ADS_ACCOUNT_CLIENT_SECRET,
     account_refresh_token: GOOGLE_ADS_ACCOUNT_REFRESH_TOKEN,
+    // REQUIRED: Google has no offline scope — without these two the consent
+    // returns no refresh token at all and the connect can never succeed. See
+    // [`GOOGLE_OFFLINE_PARAMS`].
+    extra_auth_params: GOOGLE_OFFLINE_PARAMS,
 };
 
 // ---------------------------------------------------------------------------
@@ -250,6 +286,8 @@ pub const WHOOP: ProviderConfig = ProviderConfig {
     account_client_id: WHOOP_ACCOUNT_CLIENT_ID,
     account_client_secret: WHOOP_ACCOUNT_CLIENT_SECRET,
     account_refresh_token: WHOOP_ACCOUNT_REFRESH_TOKEN,
+    // None: WHOOP unlocks the refresh token with the `offline` SCOPE.
+    extra_auth_params: &[],
 };
 
 /// Everything a Google Ads REST call needs that is NOT the bearer: the
@@ -483,7 +521,9 @@ pub(crate) fn percent_encode(value: &str) -> String {
 /// `state`, optional PKCE `challenge` and loopback `port`. PURE — no I/O, no
 /// secret. The client_secret is NEVER part of an auth URL (asserted in tests).
 /// When `cfg.uses_pkce` is false, `challenge` is ignored and the
-/// `code_challenge`/`code_challenge_method` params are omitted.
+/// `code_challenge`/`code_challenge_method` params are omitted. Finally
+/// `cfg.extra_auth_params` is appended — the provider-specific tail that makes
+/// Google return a refresh token at all (see [`ProviderConfig::extra_auth_params`]).
 pub fn build_auth_url(
     cfg: &ProviderConfig,
     client_id: &str,
@@ -511,6 +551,12 @@ pub fn build_auth_url(
             "&code_challenge={}&code_challenge_method=S256",
             percent_encode(challenge)
         ));
+    }
+    // Provider-specific tail. For Google (Ads) this is `access_type=offline` +
+    // `prompt=consent`; without them the consent completes and mints NO refresh
+    // token, so the connect always failed at `exchange_code`'s hard stop.
+    for (k, v) in cfg.extra_auth_params {
+        url.push_str(&format!("&{}={}", percent_encode(k), percent_encode(v)));
     }
     url
 }
@@ -654,17 +700,38 @@ fn percent_decode(s: &str) -> String {
 
 /// The close-tab page shown to the browser after the redirect. Provider name is
 /// interpolated; no secrets, no other dynamic content.
-fn close_tab_page(provider: &str) -> String {
-    format!(
-        "<!doctype html><html><body style=\"font-family:system-ui;text-align:center;padding:3rem\">\
-         <h2>DARWIN is connected to {provider}.</h2><p>You can close this tab.</p></body></html>"
-    )
+///
+/// WHAT WENT WRONG BEFORE: this page was a single unconditional string reading
+/// "DARWIN is connected to {provider}." and `receive_redirect` wrote it for EVERY
+/// outcome — including a consent the user had just DECLINED and a redirect
+/// REJECTED as a possible CSRF. The tab the user was looking at asserted the
+/// connection had succeeded while nothing was stored and no grant existed, flatly
+/// contradicting the spoken reply ("consent was declined, so nothing was
+/// connected") for the same action. So the page is now a function of the outcome.
+/// The success wording also stops short of claiming a connection: it is written
+/// BEFORE the token exchange runs, so at that instant consent is all that is
+/// certain.
+fn close_tab_page(provider: &str, granted: bool) -> String {
+    if granted {
+        format!(
+            "<!doctype html><html><body style=\"font-family:system-ui;text-align:center;padding:3rem\">\
+             <h2>{provider} consent received.</h2>\
+             <p>DARWIN is finishing the connection — you can close this tab.</p></body></html>"
+        )
+    } else {
+        format!(
+            "<!doctype html><html><body style=\"font-family:system-ui;text-align:center;padding:3rem\">\
+             <h2>{provider} was not connected.</h2>\
+             <p>Consent wasn't completed. You can close this tab and try again.</p></body></html>"
+        )
+    }
 }
 
 /// Build the full HTTP/1.1 response (status line + headers + body) for the
-/// close-tab page. Pure, so the wire shape is testable.
-fn close_tab_response(provider: &str) -> String {
-    let page = close_tab_page(provider);
+/// close-tab page. `granted` selects the success vs. not-connected wording. Pure,
+/// so the wire shape is testable.
+fn close_tab_response(provider: &str, granted: bool) -> String {
+    let page = close_tab_page(provider, granted);
     format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
@@ -714,9 +781,15 @@ pub async fn receive_redirect(
 
     let outcome = parse_redirect(request_line, expected_state);
 
-    // Always reply with the close-tab page (even on a rejected/denied parse), so
-    // the browser shows something rather than hanging, then close.
-    let _ = stream.write_all(close_tab_response(provider).as_bytes()).await;
+    // Always reply with a close-tab page (even on a rejected/denied parse), so the
+    // browser shows something rather than hanging — but the page must MATCH the
+    // outcome. Only an authorization code means consent was granted; a `Denied`
+    // (the user pressed Cancel) or an `Err` (CSRF/malformed redirect) gets the
+    // "was not connected" page, never the success one.
+    let granted = matches!(outcome, Ok(RedirectOutcome::Code(_)));
+    let _ = stream
+        .write_all(close_tab_response(provider, granted).as_bytes())
+        .await;
     let _ = stream.flush().await;
     let _ = stream.shutdown().await;
 
@@ -1159,8 +1232,13 @@ pub async fn run_consent_flow<T: HttpTransport>(
 
 /// Build the production [`RefreshTokenStore`] that writes the refresh token to the
 /// macOS Keychain under `account` via `security add-generic-password -U`
-/// (update-or-add). The token is passed as an argv value to security(1) only
-/// (never a shell string, never logged). Runs ONLY in the real connect flow
+/// (update-or-add). The token rides security(1)'s STDIN — `-w` is the LAST,
+/// VALUELESS argument, so security(1) prompts and reads the secret from the pipe
+/// (see [`super::keychain_write`]): never argv, never a shell string, never
+/// logged. (This doc used to say the opposite — that the token was passed as an
+/// argument value — long after the body was changed to the argv-free write, so it
+/// described the very leak that fix removed: a refresh token in a child's argument
+/// vector is readable by any same-UID process via ps/KERN_PROCARGS2.) Runs ONLY in the real connect flow
 /// (device-gated); tests inject a recorder. `account` is one of the provider's
 /// allowlisted refresh-token account names (a fixed identifier, safe to log).
 pub(crate) fn keychain_store(account: &'static str) -> RefreshTokenStore {
@@ -1390,6 +1468,41 @@ mod tests {
             !url.contains(FAKE_CLIENT_SECRET) && !url.contains("client_secret"),
             "Google Ads auth URL must never carry the client secret: {url}"
         );
+    }
+
+    /// THE regression pin for the dead Google Ads connect: Google has no offline
+    /// SCOPE, so a consent URL without `access_type=offline` mints NO refresh
+    /// token and `exchange_code` hard-stops — the integration was unconnectable.
+    /// `prompt=consent` is the second half: without it a RE-consent by a user who
+    /// already granted this client returns no refresh token either. Mirrors the
+    /// round-2 Workspace assertions in `google_oauth.rs`. The providers that
+    /// unlock the refresh token with a scope must NOT grow these params.
+    #[test]
+    fn google_ads_consent_url_requests_offline_access_and_forces_consent() {
+        let url = build_auth_url(&GOOGLE_ADS, FAKE_CLIENT_ID, "STATEG", "CHALLENGEG", 49152);
+        assert!(
+            url.contains("access_type=offline"),
+            "without access_type=offline Google returns no refresh token: {url}"
+        );
+        assert!(
+            url.contains("prompt=consent"),
+            "without prompt=consent a re-consent returns no refresh token: {url}"
+        );
+        // The extra params ride the QUERY, after the PKCE pair — still no secret.
+        assert!(
+            !url.contains(FAKE_CLIENT_SECRET) && !url.contains("client_secret"),
+            "the extra params must not drag a secret in: {url}"
+        );
+        // Scope-based providers stay untouched: X (`offline.access`), WHOOP
+        // (`offline`), and LinkedIn (no such parameter at all).
+        for cfg in [&X, &LINKEDIN, &WHOOP] {
+            let u = build_auth_url(cfg, FAKE_CLIENT_ID, "S", "C", 49152);
+            assert!(
+                !u.contains("access_type=") && !u.contains("prompt="),
+                "{} must not carry Google's offline params: {u}",
+                cfg.name
+            );
+        }
     }
 
     fn google_ads_refresh_ok() -> &'static str {
@@ -1741,10 +1854,32 @@ mod tests {
 
     #[test]
     fn close_tab_response_names_provider() {
-        let r = close_tab_response("X");
+        let r = close_tab_response("X", true);
         assert!(r.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(r.contains("connected to X"));
+        assert!(r.contains("X consent received"));
         assert!(r.contains("close this tab"));
+    }
+
+    /// THE regression pin: the browser page must never claim a connection the
+    /// consent did not produce. The declined page (also served for a CSRF-rejected
+    /// or malformed redirect) says NOT connected, and the success page — written
+    /// before the token exchange even runs — claims only that consent arrived.
+    #[test]
+    fn close_tab_page_does_not_claim_a_connection_that_did_not_happen() {
+        let denied = close_tab_response("X", false);
+        assert!(denied.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(denied.contains("X was not connected"), "got: {denied}");
+        assert!(denied.contains("close this tab"), "still tells the user to close it");
+        assert!(
+            !denied.contains("is connected"),
+            "a declined/CSRF-rejected consent must NOT report a connection: {denied}"
+        );
+        // The success page stops at "consent received" — the exchange has not run.
+        let ok = close_tab_response("X", true);
+        assert!(
+            !ok.contains("is connected"),
+            "the page is written before exchange_code; it must not assert a connection: {ok}"
+        );
     }
 
     // -- (3) one ephemeral loopback test -------------------------------------
@@ -1770,6 +1905,66 @@ mod tests {
         assert_eq!(outcome, RedirectOutcome::Code("LOOPCODE".to_string()));
         let page = client.await.unwrap();
         assert!(page.contains("close this tab"), "browser got: {page}");
+    }
+
+    /// The DECLINED path over the same ephemeral loopback: the user pressed Cancel,
+    /// so the page the browser is left showing must say the provider was NOT
+    /// connected — the whole point is that the tab and the spoken reply agree.
+    #[tokio::test]
+    async fn receive_redirect_declined_serves_the_not_connected_page() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            sock.write_all(
+                b"GET /?error=access_denied&state=STATEOK HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut resp = Vec::new();
+            let _ = sock.read_to_end(&mut resp).await;
+            String::from_utf8_lossy(&resp).into_owned()
+        });
+
+        let outcome = receive_redirect(listener, "STATEOK", "X").await.unwrap();
+        assert_eq!(outcome, RedirectOutcome::Denied("access_denied".to_string()));
+        let page = client.await.unwrap();
+        assert!(
+            page.contains("X was not connected"),
+            "the declined tab must not claim success; browser got: {page}"
+        );
+        assert!(!page.contains("is connected"), "browser got: {page}");
+    }
+
+    /// The CSRF path: a redirect whose `state` does not match is rejected, and the
+    /// forged tab must NOT be answered with a success page either.
+    #[tokio::test]
+    async fn receive_redirect_csrf_rejection_serves_the_not_connected_page() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            sock.write_all(b"GET /?code=FORGED&state=WRONG HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+                .await
+                .unwrap();
+            let mut resp = Vec::new();
+            let _ = sock.read_to_end(&mut resp).await;
+            String::from_utf8_lossy(&resp).into_owned()
+        });
+
+        let err = receive_redirect(listener, "STATEOK", "X").await.unwrap_err();
+        assert!(err.to_string().contains("CSRF"), "got: {err}");
+        let page = client.await.unwrap();
+        assert!(
+            page.contains("X was not connected"),
+            "a CSRF-rejected redirect must not be answered with success; got: {page}"
+        );
     }
 
     // -- (4) token exchange/refresh per provider via MockTransport -----------

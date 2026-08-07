@@ -435,22 +435,50 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// The tiny HTML page sent back to the browser after the redirect, so the user
-/// sees confirmation instead of a raw response. No secrets, no dynamic content.
-const CLOSE_TAB_PAGE: &str =
+/// The tiny HTML page sent back to the browser when consent was GRANTED (an
+/// authorization code came back). No secrets, no dynamic content.
+///
+/// It deliberately stops short of "connected": this page is written BEFORE
+/// [`GoogleAuth::exchange_code`] runs, so at that instant a granted consent is all
+/// that is certain — an `invalid_grant` or a network failure during the exchange
+/// would otherwise leave the browser asserting a connection that does not exist.
+const CONSENT_RECEIVED_PAGE: &str =
     "<!doctype html><html><body style=\"font-family:system-ui;text-align:center;padding:3rem\">\
-     <h2>DARWIN is connected to Google.</h2><p>You can close this tab.</p></body></html>";
+     <h2>Google consent received.</h2>\
+     <p>DARWIN is finishing the connection — you can close this tab.</p></body></html>";
+
+/// The page sent back when consent was NOT granted: the user pressed Cancel/Deny
+/// (`?error=access_denied`), the redirect failed the CSRF `state` check, or it was
+/// malformed.
+///
+/// WHAT WENT WRONG BEFORE: there was ONE page — "DARWIN is connected to Google." —
+/// and `receive_redirect` wrote it for every outcome, so a declined consent and a
+/// REJECTED (possibly forged) redirect were both answered with a success page. The
+/// browser tab stated as fact that the account was linked while nothing had been
+/// stored and no grant existed, directly contradicting the spoken reply for the
+/// same action ("Google consent was declined, so nothing was connected") — a user
+/// reading the tab would stop retrying a connect that never happened.
+const CONSENT_NOT_COMPLETED_PAGE: &str =
+    "<!doctype html><html><body style=\"font-family:system-ui;text-align:center;padding:3rem\">\
+     <h2>Google was not connected.</h2>\
+     <p>Consent wasn't completed. You can close this tab and try again.</p></body></html>";
 
 /// Build the full HTTP/1.1 response (status line + headers + body) for the
-/// close-tab page. Pure, so the wire shape is testable.
-fn close_tab_response() -> String {
+/// close-tab page. `granted` picks the page, so the tab can never claim an outcome
+/// the redirect did not produce. Pure, so the wire shape is testable.
+fn close_tab_response(granted: bool) -> String {
+    let page = if granted {
+        CONSENT_RECEIVED_PAGE
+    } else {
+        CONSENT_NOT_COMPLETED_PAGE
+    };
     format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: text/html; charset=utf-8\r\n\
          Content-Length: {}\r\n\
          Connection: close\r\n\r\n{}",
-        CLOSE_TAB_PAGE.len(),
-        CLOSE_TAB_PAGE
+        page.len(),
+        page
     )
 }
 
@@ -496,9 +524,12 @@ pub async fn receive_redirect(
 
     let outcome = parse_redirect(request_line, expected_state);
 
-    // Always reply with the close-tab page (even on a rejected/denied parse, so
-    // the browser shows something rather than hanging), then close.
-    let _ = stream.write_all(close_tab_response().as_bytes()).await;
+    // Always reply with a close-tab page (even on a rejected/denied parse, so the
+    // browser shows something rather than hanging) — but the page must MATCH the
+    // outcome. Only an authorization code means consent was granted; a `Denied`
+    // (Cancel) or an `Err` (CSRF/malformed) gets the "was not connected" page.
+    let granted = matches!(outcome, Ok(RedirectOutcome::Code(_)));
+    let _ = stream.write_all(close_tab_response(granted).as_bytes()).await;
     let _ = stream.flush().await;
     let _ = stream.shutdown().await;
 
@@ -558,13 +589,22 @@ struct CachedToken {
 /// `ReqwestTransport` and tests wire `MockTransport`. `Debug` is hand-written to
 /// redact every secret.
 pub struct GoogleAuth<T: HttpTransport> {
-    /// The injected HTTP seam for the token endpoint. `pub(crate)` so sibling
-    /// service-client test modules (Gmail/Calendar/Drive) can introspect the
-    /// recorded token-endpoint requests via the test `MockTransport` — e.g. to
-    /// assert a DryRun never even minted an access token. Read-only seam: no
-    /// secret is reachable through it (tokens ride in request headers/bodies the
-    /// tests check by presence, not value).
-    pub(crate) transport: T,
+    /// The injected HTTP seam for the token endpoint. PRIVATE: this module's own
+    /// `mod tests` is a child module and can still read it, which is the only
+    /// reader there has ever been.
+    ///
+    /// It was `pub(crate)`, justified as letting the sibling Gmail/Calendar/Drive
+    /// test modules introspect the token-endpoint requests — but none of them ever
+    /// touched `auth.transport` (they introspect their OWN `c.transport`), so the
+    /// widening bought nothing and handed every module in the crate a handle on the
+    /// token-endpoint transport. The rationale was also wrong on the security
+    /// point: under `MockTransport` the recorded `form` holds the token-POST pairs
+    /// UNENCODED, and this module's tests deliberately assert the client_secret and
+    /// the refresh token BY VALUE (that is safe precisely because the mock is
+    /// hermetic and the values are fakes) — so the old claim that credentials could
+    /// not be reached through this seam was contradicted a few hundred lines below,
+    /// by the tests in this same file.
+    transport: T,
     client_id: String,
     client_secret: String,
     /// The long-lived grant. Empty BEFORE the first consent (exchange writes it);
@@ -906,9 +946,15 @@ pub async fn run_consent_flow<T: HttpTransport>(
 
 /// Build the production [`RefreshTokenStore`] that writes the refresh token to
 /// the macOS Keychain under [`ACCOUNT_REFRESH_TOKEN`] via
-/// `security add-generic-password -U` (update-or-add). The token is passed as an
-/// argv value to security(1) only (never a shell string, never logged). This
-/// runs ONLY in the real connect flow (device-gated); tests inject a recorder.
+/// `security add-generic-password -U` (update-or-add). The token rides
+/// security(1)'s STDIN — `-w` is the LAST, VALUELESS argument, so security(1)
+/// prompts and reads the secret from the pipe (see [`super::keychain_write`]):
+/// never argv, never a shell string, never logged. (Like its twin in `oauth2.rs`,
+/// this doc went on describing an ARGUMENT-VECTOR write long after the body was
+/// changed — i.e. it documented the exact leak that fix removed, which is how a
+/// contributor "restoring the documented contract" puts a refresh token back
+/// where ps/KERN_PROCARGS2 can read it.) This runs ONLY in the real connect flow
+/// (device-gated); tests inject a recorder.
 fn keychain_store() -> RefreshTokenStore {
     Arc::new(|token: &str| -> IntegrationResult<()> {
         // ARGV-FREE write: the secret rides security(1)'s stdin, never argv. See
@@ -1192,10 +1238,43 @@ mod tests {
 
     #[test]
     fn close_tab_response_is_well_formed_http() {
-        let r = close_tab_response();
+        let r = close_tab_response(true);
         assert!(r.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(r.contains("Content-Type: text/html"));
         assert!(r.contains("close this tab"));
+    }
+
+    /// THE regression pin: the browser page must never claim a connection the
+    /// redirect did not produce. A declined consent or a CSRF-rejected redirect
+    /// gets the "was not connected" page, and even the granted page stops short of
+    /// asserting a connection, because it is written before the token exchange.
+    #[test]
+    fn close_tab_page_does_not_claim_a_connection_that_did_not_happen() {
+        let denied = close_tab_response(false);
+        assert!(denied.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(denied.contains("Google was not connected"), "got: {denied}");
+        assert!(denied.contains("close this tab"), "still tells the user to close it");
+        assert!(
+            !denied.contains("is connected"),
+            "a declined/CSRF-rejected consent must NOT report a connection: {denied}"
+        );
+        let ok = close_tab_response(true);
+        assert!(ok.contains("Google consent received"), "got: {ok}");
+        assert!(
+            !ok.contains("is connected"),
+            "the page precedes exchange_code; it must not assert a connection: {ok}"
+        );
+        // Content-Length must match the page actually sent, for BOTH pages.
+        for r in [close_tab_response(true), close_tab_response(false)] {
+            let (head, body) = r.split_once("\r\n\r\n").expect("headers then body");
+            let len: usize = head
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length: "))
+                .expect("Content-Length header")
+                .parse()
+                .expect("numeric Content-Length");
+            assert_eq!(len, body.len(), "Content-Length must match the chosen page");
+        }
     }
 
     // -- (4) ONE scoped loopback test: ephemeral 127.0.0.1:0, one request -----
@@ -1230,6 +1309,41 @@ mod tests {
 
         let page = client.await.unwrap();
         assert!(page.contains("close this tab"), "browser got: {page}");
+        assert!(page.contains("Google consent received"), "browser got: {page}");
+    }
+
+    /// The DECLINED path over the same ephemeral loopback (the user pressed Cancel,
+    /// so Google redirects with `?error=access_denied`). This pins the WIRING, not
+    /// just the page builder: the tab the user is left looking at must agree with
+    /// the spoken reply that nothing was connected.
+    #[tokio::test]
+    async fn receive_redirect_declined_serves_the_not_connected_page() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let client = tokio::spawn(async move {
+            let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+            sock.write_all(
+                b"GET /?error=access_denied&state=STATEOK HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+            )
+            .await
+            .unwrap();
+            let mut resp = Vec::new();
+            let _ = sock.read_to_end(&mut resp).await;
+            String::from_utf8_lossy(&resp).into_owned()
+        });
+
+        let outcome = receive_redirect(listener, "STATEOK").await.unwrap();
+        assert_eq!(outcome, RedirectOutcome::Denied("access_denied".to_string()));
+
+        let page = client.await.unwrap();
+        assert!(
+            page.contains("Google was not connected"),
+            "the declined tab must not claim success; browser got: {page}"
+        );
+        assert!(!page.contains("is connected"), "browser got: {page}");
     }
 
     // -- (5) token exchange + refresh via MockTransport ----------------------

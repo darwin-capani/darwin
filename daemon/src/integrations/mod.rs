@@ -13,9 +13,17 @@
 //!      tests are fully hermetic and never hit the network.
 //!   3. The consequential-action SAFETY GATE — `ActionMode` / `gate` /
 //!      `consequential_allowed`. Side-effecting actions (post a message, create
-//!      an event) are DRY-RUN by default; they only execute when the operator
-//!      has flipped `[integrations].allow_consequential` true AND the call site
-//!      passed an explicit confirm. Ships OFF, exactly like self-heal.
+//!      an event) execute ONLY when the master switch
+//!      `[integrations].allow_consequential` is on AND the call site passed an
+//!      explicit confirm; any other combination is a DRY-RUN preview. The master
+//!      switch SHIPS ON — armed (`IntegrationsConfig::default()` and
+//!      `config/darwin.toml` both set it `true`). That is not a hole: the switch
+//!      ALONE never executes anything, because a consequential call still needs a
+//!      fresh per-action confirm, and the runtime chokepoints add voice-id +
+//!      policy + !lockdown on top (lockdown forces `consequential_allowed()`
+//!      false outright). This header used to claim the switch shipped off, which
+//!      described the safest possible posture for a switch that ships armed and
+//!      understated the blast radius of every outward action below.
 //!
 //! The Authorization / x-api-key header is ALWAYS set per-request by the
 //! calling client at the moment of the send — never stored in the transport,
@@ -1469,10 +1477,16 @@ mod tests {
     }
 
     /// MCP per-server token accounts (`mcp_<server>_token`) are admitted ONLY for
-    /// a strictly-validated server name; the fixed allowlist is untouched (still
-    /// exactly 35). A hostile name (traversal, NUL, space, argv-shaped, empty
-    /// middle) is refused, and `mcp_token_account` mints NO account for it — so
-    /// such a name can never reach security(1).
+    /// a strictly-validated server name; the fixed allowlist is untouched — the
+    /// `assert_eq!(ALLOWED_ACCOUNTS.len(), …)` at the end of this test (and its
+    /// twin in `allowlist_is_exactly_the_known_integration_accounts`) is the single
+    /// source of truth for the count, so this prose can never drift from it again.
+    /// (It said "exactly 35" while both assertions and the list itself held 39 —
+    /// the count IS the tripwire these tests exist to defend, so a reviewer
+    /// checking a new account against the documented number was reading a figure
+    /// four entries stale.) A hostile name (traversal, NUL, space, argv-shaped,
+    /// empty middle) is refused, and `mcp_token_account` mints NO account for it —
+    /// so such a name can never reach security(1).
     #[test]
     fn mcp_token_accounts_admitted_only_for_safe_server_names() {
         // Valid names -> admitted + a derivable account.
@@ -1616,6 +1630,180 @@ mod tests {
             cfg.integrations.allow_consequential,
             "allow_consequential defaults to true (full-power default; runtime gate still enforces per-action)"
         );
+    }
+
+    /// Strip comment markers and collapse ALL whitespace, so a phrase that wraps
+    /// across `//!` / `///` lines is still one contiguous string to search. Every
+    /// source-anchored doc guard below runs on this, because a claim does not stop
+    /// being a claim when rustfmt-free hand-wrapping puts a newline in the middle
+    /// of it. Test-only, pure.
+    fn flatten_comments(src: &str) -> String {
+        src.lines()
+            .map(|l| {
+                let l = l.trim_start();
+                l.strip_prefix("//!")
+                    .or_else(|| l.strip_prefix("///"))
+                    .or_else(|| l.strip_prefix("//"))
+                    .unwrap_or(l)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// SOURCE-ANCHORED GUARD: no integration module may describe the outward-action
+    /// master switch as shipping OFF, because it ships ARMED
+    /// (`IntegrationsConfig::default()` -> `allow_consequential: true`,
+    /// `config/darwin.toml:490`, and `config_default_for_allow_consequential_is_true`
+    /// right above). Seven modules carried the opposite claim — including the ones
+    /// whose consequential action unlocks a door, publishes a public post as the
+    /// user, or sends mail as the user — so an operator auditing "can DARWIN do
+    /// this without me?" from the file header got the answer exactly backwards.
+    ///
+    /// The needles are ASSEMBLED AT RUNTIME from fragments so this test cannot
+    /// match its own source (mod.rs is one of the files it scans), and the scanned
+    /// set is exactly the files this pass corrected — a sibling module that still
+    /// carries the phrasing is a separate finding, not a failure of this guard.
+    ///
+    /// The source is FLATTENED first ([`flatten_comments`]). Doc comments wrap, and
+    /// smarthome.rs's copy of the claim straddled a line break mid-phrase — a plain
+    /// substring search read that file as clean while the sentence sat right there.
+    /// A guard a line wrap defeats is worse than no guard, because it reports
+    /// success.
+    #[test]
+    fn no_integration_module_claims_the_consequential_gate_ships_off() {
+        // Assembled, never written literally: see the doc above.
+        let stale_module_claim = format!("false (the {}", "shipped default)");
+        let stale_method_claim = format!("(gate {}) always", "OFF");
+        let stale_header_claim = format!("Ships {}, exactly like", "OFF");
+
+        // Collect EVERY violation before failing: a guard that stops at the first
+        // file hides the rest, and this drift arrived in all seven at once.
+        let mut violations: Vec<String> = Vec::new();
+        for (name, src) in [
+            ("mod.rs", include_str!("mod.rs")),
+            ("smarthome.rs", include_str!("smarthome.rs")),
+            ("x_social.rs", include_str!("x_social.rs")),
+            ("google_gmail.rs", include_str!("google_gmail.rs")),
+            ("linkedin.rs", include_str!("linkedin.rs")),
+            ("meta_ads.rs", include_str!("meta_ads.rs")),
+            ("google_ads.rs", include_str!("google_ads.rs")),
+            // These three carried the identical claim and were left out of the
+            // first pass. A guard whose scanned set is "the files we happened to
+            // correct" cannot fail on the ones that were missed — which is exactly
+            // how three of them survived — so the set is EVERY integration module
+            // with a consequential action.
+            ("github.rs", include_str!("github.rs")),
+            ("google_calendar.rs", include_str!("google_calendar.rs")),
+            ("google_drive.rs", include_str!("google_drive.rs")),
+            ("slack.rs", include_str!("slack.rs")),
+        ] {
+            let flat = flatten_comments(src);
+            for needle in [&stale_module_claim, &stale_method_claim, &stale_header_claim] {
+                if flat.contains(needle.as_str()) {
+                    violations.push(format!("{name}: {needle:?}"));
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "these modules still say the consequential master switch ships off; it ships \
+             ARMED — say so, and name the per-action confirm as what holds: {violations:#?}"
+        );
+    }
+
+    /// SOURCE-ANCHORED GUARD: the size of the fixed Keychain allowlist lives in the
+    /// two `assert_eq!(ALLOWED_ACCOUNTS.len(), …)` sites and NOWHERE else. A doc
+    /// comment restated it as "exactly 35" while both assertions — and the list —
+    /// held 39, i.e. the prose describing the tripwire had drifted four entries
+    /// behind the tripwire itself, which is how a reviewer ends up "correcting" the
+    /// assertion in the wrong direction.
+    #[test]
+    fn allowlist_size_is_not_restated_in_prose() {
+        // Assembled at runtime so this test cannot match its own source; flattened
+        // so the wrap between "still" and "exactly 35" cannot hide it.
+        let stale_allowlist_count = format!("untouched (still exactly {})", "35");
+        assert!(
+            !flatten_comments(include_str!("mod.rs")).contains(stale_allowlist_count.as_str()),
+            "the allowlist size must not be restated in prose — the assert_eq! sites are the pin"
+        );
+        assert_eq!(ALLOWED_ACCOUNTS.len(), 39, "…and this is that pin");
+    }
+
+    /// SOURCE-ANCHORED GUARD for the two secret-handling claims that had gone
+    /// stale in the OAuth core: `keychain_store` documented the ARGV write that a
+    /// security-hardening pass had already removed (a contributor "restoring the
+    /// documented contract" would have re-leaked every refresh token into a child's
+    /// argument vector), and `GoogleAuth::transport` claimed no secret was reachable
+    /// through it while this very module's tests read the client_secret and refresh
+    /// token out of the recorded form BY VALUE.
+    #[test]
+    fn oauth_core_docs_do_not_restate_removed_secret_handling() {
+        let mut violations: Vec<&str> = Vec::new();
+        let argv_claim = format!("passed as an {} value to security(1)", "argv");
+        if flatten_comments(include_str!("oauth2.rs")).contains(argv_claim.as_str()) {
+            violations.push("oauth2.rs: keychain_store writes the token on security(1)'s STDIN, not argv");
+        }
+        let unreachable_claim = format!("no {} is reachable through it", "secret");
+        let google_oauth = flatten_comments(include_str!("google_oauth.rs"));
+        // BOTH refresh-token writers carried the stale argv doc — the round-2
+        // Google one as well as the generic round-3a one.
+        if google_oauth.contains(argv_claim.as_str()) {
+            violations.push("google_oauth.rs: keychain_store writes the token on security(1)'s STDIN, not argv");
+        }
+        if google_oauth.contains(unreachable_claim.as_str()) {
+            violations.push(
+                "google_oauth.rs: the token-endpoint transport DOES expose the recorded form \
+                 (client_secret, refresh token) to this module's own hermetic tests",
+            );
+        }
+        // …and the seam is private again: nothing outside google_oauth.rs ever read it.
+        if google_oauth.contains("pub(crate) transport: T,") {
+            violations.push("google_oauth.rs: GoogleAuth::transport needs no crate-wide visibility");
+        }
+        assert!(violations.is_empty(), "stale secret-handling claims: {violations:#?}");
+    }
+
+    /// SOURCE-ANCHORED GUARD: Plaid is pinned to the SANDBOX host and there is no
+    /// mechanism to point it anywhere else, so the module must not promise that
+    /// production is a host swap away — an operator would go looking for a setting
+    /// that does not exist, and a user with production credentials would be told
+    /// their credentials are bad when the environment is the problem.
+    #[test]
+    fn plaid_does_not_promise_a_production_host_swap() {
+        let src = flatten_comments(include_str!("plaid.rs"));
+        let swap_claim = format!("swaps the host with {} change", "no code");
+        assert!(
+            !src.contains(swap_claim.as_str()),
+            "there is no plaid base-url setting: no config key, no Keychain account, no \
+             Settings row — moving off the sandbox is a code change"
+        );
+        // The pin itself, so the guard fails if the base ever silently moves.
+        assert_eq!(super::plaid::DEFAULT_BASE, "https://sandbox.plaid.com");
+    }
+
+    /// SOURCE-ANCHORED GUARD: the Google Ads dry-run previews name the TARGET
+    /// status/amount only. The client issues no read on a mutate path (that is what
+    /// makes "DryRun issues NO request" true), so it cannot know the current value —
+    /// three doc sites nevertheless promised an "old -> new" transition, which would
+    /// have an operator believe a budget preview reveals the magnitude of the change
+    /// they are approving.
+    #[test]
+    fn google_ads_docs_do_not_promise_a_before_and_after_preview() {
+        let src = flatten_comments(include_str!("google_ads.rs"));
+        for needle in [
+            format!("{} -> new", "old"),
+            format!("ENABLED {} PAUSED", "->"),
+            format!("PAUSED {} ENABLED", "->"),
+        ] {
+            assert!(
+                !src.contains(needle.as_str()),
+                "google_ads.rs promises a transition preview ({needle:?}) that no code path \
+                 can produce — the current status/amount is never fetched"
+            );
+        }
     }
 
     // -- (4) status mapping ----------------------------------------------------

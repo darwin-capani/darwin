@@ -16,8 +16,12 @@
 //!     takes an [`ActionMode`]. In [`ActionMode::DryRun`] the method builds and
 //!     returns a human-readable preview and issues NO mutating request; only in
 //!     [`ActionMode::Execute`] does it POST. Call sites get the mode from the
-//!     foundation's `gate(confirm)`, so with `[integrations].allow_consequential`
-//!     false (the shipped default) these always preview.
+//!     foundation's `gate(confirm)`. The master switch
+//!     `[integrations].allow_consequential` SHIPS ON (armed), so on a default
+//!     install a CONFIRMED call really does open the issue / post the comment
+//!     under the user's GitHub identity — what keeps it a preview is the absence
+//!     of a fresh per-action `confirm`, not the switch, and a confirmed write
+//!     still clears voice-id + policy + !lockdown at the runtime chokepoints.
 //!
 //! Every method returns a concise human-facing `String` — what steve would say
 //! — while parsing the typed fields it needs from the JSON (PR number/title/
@@ -305,7 +309,9 @@ impl<T: HttpTransport> GithubClient<T> {
     /// In [`ActionMode::DryRun`] this issues NO request — it returns a preview
     /// of exactly what would be posted. In [`ActionMode::Execute`] it POSTs the
     /// comment and returns its URL. Callers obtain `mode` from the foundation's
-    /// `gate(confirm)`, so the shipped default (gate OFF) always previews.
+    /// `gate(confirm)`; the master switch ships ARMED, so this previews when
+    /// `confirm` is false (or the operator disarmed the switch, or lockdown is
+    /// engaged) and POSTS the comment on a fresh confirm.
     pub async fn create_issue_comment(
         &self,
         owner: &str,

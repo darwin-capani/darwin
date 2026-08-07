@@ -550,9 +550,12 @@ fn map_meta_error(status: u16, err: &MetaError, what: &str) -> super::Integratio
 //     each take an [`ActionMode`]: in [`ActionMode::DryRun`] they build and return
 //     a clear PREVIEW of the EXACT change and issue NO request; only in
 //     [`ActionMode::Execute`] do they issue exactly one `POST /{campaign_id}`.
-//     Call sites get the mode from the foundation's `gate(confirm)`, so with
-//     `[integrations].allow_consequential` false (the shipped default) every
-//     mutation previews and changes nothing.
+//     Call sites get the mode from the foundation's `gate(confirm)`. The master
+//     switch `[integrations].allow_consequential` SHIPS ON (armed), so on a
+//     default install a CONFIRMED mutation really does change live ad delivery —
+//     what keeps it a preview is the absence of a fresh per-action `confirm`, not
+//     the switch, and a confirmed mutation still clears voice-id + policy +
+//     !lockdown at the runtime chokepoints.
 
 /// Meta Graph API base. The Marketing API lives on the Graph API; all paths are
 /// appended to this. Pinned to the same version as the OAuth endpoints via
@@ -721,9 +724,11 @@ impl<T: HttpTransport> MetaAdsClient<T> {
     /// A concise SPEND report for the ad account (up to `max` campaigns, clamped
     /// to 1..=100). Read-only: it reads campaign names/status via
     /// `GET /act_{id}/campaigns` and the spend/impressions/clicks via
-    /// `GET /act_{id}/insights`, then joins them into one spoken summary. If the
-    /// insights endpoint returns no rows (e.g. no spend in the window) it falls
-    /// back to just the campaign roster so the caller still gets something useful.
+    /// `GET /act_{id}/insights`, then JOINS them into one spoken summary — the
+    /// roster is the spine, so a campaign with no delivery in the window is still
+    /// named (see [`build_spend_report`], which for a long time silently dropped
+    /// it). If the insights endpoint returns no rows at all it falls back to just
+    /// the campaign roster so the caller still gets something useful.
     pub async fn report_campaigns(&self, max: u32) -> IntegrationResult<String> {
         let want = max.clamp(META_MIN_RESULTS, META_MAX_RESULTS);
 
@@ -743,11 +748,15 @@ impl<T: HttpTransport> MetaAdsClient<T> {
                 anyhow::anyhow!("reading your Meta campaigns returned an unexpected response")
             })?;
 
-        // Leg 2: the insights (spend/impressions/clicks per campaign).
+        // Leg 2: the insights (spend/impressions/clicks per campaign). `level` is
+        // explicit: the insights edge otherwise reports at the level of the node it
+        // was queried on — here the ACCOUNT — which is one aggregate row that
+        // carries no `campaign_name` to join on, even though the fields asked for
+        // are campaign-level.
         let ins_req = self.request(
             HttpMethod::Get,
             &format!(
-                "/{}/insights?fields=campaign_name,spend,impressions,clicks&limit={want}",
+                "/{}/insights?fields=campaign_name,spend,impressions,clicks&level=campaign&limit={want}",
                 self.account_node()
             ),
         );
@@ -770,8 +779,9 @@ impl<T: HttpTransport> MetaAdsClient<T> {
     /// — it stops a live campaign from spending. In [`ActionMode::DryRun`] it
     /// issues NO request and returns a PREVIEW of the exact change; in
     /// [`ActionMode::Execute`] it issues exactly one POST. Callers get `mode` from
-    /// the foundation's `gate(confirm)`, so the shipped default (gate OFF) always
-    /// previews.
+    /// the foundation's `gate(confirm)`; the master switch ships ARMED, so this
+    /// previews when `confirm` is false (or the operator disarmed the switch, or
+    /// lockdown is engaged) and PAUSES the campaign on a fresh confirm.
     pub async fn pause_campaign(
         &self,
         campaign_id: &str,
@@ -926,9 +936,35 @@ fn summarize_campaigns(campaigns: &[MetaCampaign]) -> String {
     out
 }
 
-/// Join the campaign roster with the insights rows into one concise spend report.
-/// When there are insight rows, lead with spend per campaign; otherwise fall back
-/// to the roster so a zero-spend account still gets a useful answer. Pure.
+/// One insights row rendered as a spend line. Pure.
+fn spend_line(name: &str, i: &MetaInsight) -> String {
+    format!(
+        "\"{name}\" — spend {}, {} impressions, {} clicks",
+        if i.spend.is_empty() { "0" } else { &i.spend },
+        if i.impressions.is_empty() { "0" } else { &i.impressions },
+        if i.clicks.is_empty() { "0" } else { &i.clicks }
+    )
+}
+
+/// Join the campaign ROSTER with the insights rows into one concise spend report.
+/// The roster is the SPINE: every campaign the account has is named, and the ones
+/// with an insights row for the window carry their spend/impressions/clicks. An
+/// insights row whose campaign is missing from the roster (the roster leg is
+/// `limit`-capped, so a spender can fall outside it) is appended rather than
+/// dropped. Campaigns WITH spend come first — roster order preserved within each
+/// group — so the 5-line preview always shows the ones that actually spent. Pure.
+///
+/// WHAT WENT WRONG BEFORE: this took `campaigns` and then used it ONLY on the
+/// insights-empty path. In the common case the entire roster leg — a full extra
+/// round-trip — was fetched and thrown away, and the report named only campaigns
+/// that had an insights row. A live account normally has campaigns with no
+/// delivery in the window (newly launched, paused, zero-spend); every one of them
+/// was silently absent, and the header counted INSIGHTS rows, so an account with
+/// six campaigns and one delivering answered "Meta spend across 1 campaign" — read
+/// by the model, and relayed to the user, as a complete answer. The comment on the
+/// roster fetch ("so a zero-spend campaign still shows up in the report") and the
+/// method doc ("then joins them into one spoken summary") both described behavior
+/// the code did not have.
 fn build_spend_report(campaigns: &[MetaCampaign], insights: &[MetaInsight]) -> String {
     if insights.is_empty() {
         // No spend in the window — still report what campaigns exist.
@@ -937,28 +973,52 @@ fn build_spend_report(campaigns: &[MetaCampaign], insights: &[MetaInsight]) -> S
         }
         return format!("No Meta ad spend in this window. {}", summarize_campaigns(campaigns));
     }
-    let lines: Vec<String> = insights
-        .iter()
-        .take(5)
-        .map(|i| {
+
+    // Walk the roster, matching each campaign to its insights row by name.
+    // `matched` records which rows the roster consumed, so a spending campaign the
+    // roster leg did not return is still reported instead of vanishing.
+    let mut with_spend: Vec<String> = Vec::new();
+    let mut without_spend: Vec<String> = Vec::new();
+    let mut matched = vec![false; insights.len()];
+    for c in campaigns {
+        let name = if c.name.is_empty() { "(unnamed)" } else { &c.name };
+        // Skip rows already claimed by an earlier campaign: Meta permits two
+        // campaigns with the SAME name in one account, and a plain first-match
+        // would hand BOTH of them the same insights row — double-counting that
+        // row's spend AND leaving the real second row unmatched, so it came back
+        // round again through the off-roster loop and inflated the campaign count.
+        let hit = insights
+            .iter()
+            .enumerate()
+            .position(|(idx, i)| !matched[idx] && !i.campaign_name.is_empty() && i.campaign_name == c.name);
+        match hit {
+            Some(idx) => {
+                matched[idx] = true;
+                with_spend.push(spend_line(name, &insights[idx]));
+            }
+            None => {
+                let status = if c.status.is_empty() { "—" } else { &c.status };
+                without_spend.push(format!("\"{name}\" [{status}] — no spend in this window"));
+            }
+        }
+    }
+    for (idx, i) in insights.iter().enumerate() {
+        if !matched[idx] {
             let name = if i.campaign_name.is_empty() {
                 "(unnamed)"
             } else {
                 &i.campaign_name
             };
-            let spend = if i.spend.is_empty() { "0" } else { &i.spend };
-            format!(
-                "\"{name}\" — spend {spend}, {} impressions, {} clicks",
-                if i.impressions.is_empty() { "0" } else { &i.impressions },
-                if i.clicks.is_empty() { "0" } else { &i.clicks }
-            )
-        })
-        .collect();
-    let more = insights.len().saturating_sub(lines.len());
+            with_spend.push(spend_line(name, i));
+        }
+    }
+
+    let total = with_spend.len() + without_spend.len();
+    let lines: Vec<String> = with_spend.into_iter().chain(without_spend).take(5).collect();
+    let more = total.saturating_sub(lines.len());
     let mut out = format!(
-        "Meta spend across {} campaign{}: {}",
-        insights.len(),
-        if insights.len() == 1 { "" } else { "s" },
+        "Meta spend across {total} campaign{}: {}",
+        if total == 1 { "" } else { "s" },
         lines.join("; ")
     );
     if more > 0 {
@@ -1558,6 +1618,9 @@ mod tests {
         assert!(reqs[0].url.contains("/act_9876543210/campaigns"));
         assert!(reqs[1].url.contains("/act_9876543210/insights"));
         assert!(reqs[1].url.contains("fields=campaign_name,spend,impressions,clicks"));
+        // The insights edge must be asked for CAMPAIGN-level rows: at the default
+        // (account) level there is one aggregate row and no campaign_name to join.
+        assert!(reqs[1].url.contains("level=campaign"), "got url: {}", reqs[1].url);
         for r in &reqs {
             assert!(r.has_header("authorization"), "auth header on every read");
             assert!(!r.url.contains(FAKE_ACCESS), "token never on a read URL");
@@ -1566,6 +1629,11 @@ mod tests {
 
     /// No insight rows (no spend in the window) falls back to the roster so the
     /// caller still gets a useful answer.
+    ///
+    /// THE regression pin is its sibling below
+    /// (`report_campaigns_names_campaigns_with_no_spend_in_the_window`): THIS test
+    /// only ever exercised insights=[], which is why the roster being discarded in
+    /// the non-empty case went unnoticed for so long.
     #[tokio::test]
     async fn report_campaigns_falls_back_to_roster_when_no_spend() {
         let mock = MockTransport::new()
@@ -1574,6 +1642,77 @@ mod tests {
         let out = ads_client(mock).report_campaigns(10).await.unwrap();
         assert!(out.contains("No Meta ad spend"), "got: {out}");
         assert!(out.contains("Summer Sale"), "still names the campaigns: {out}");
+    }
+
+    /// THE regression pin: a live account normally has campaigns that did NOT
+    /// deliver in the window. The roster leg is fetched precisely so those still
+    /// show up — and it used to be thrown away whenever there was any spend at all,
+    /// so the report named only the spenders and counted only insights rows.
+    #[tokio::test]
+    async fn report_campaigns_names_campaigns_with_no_spend_in_the_window() {
+        // Roster of three; only one has an insights row.
+        let roster = r#"{"data":[
+            {"id":"1","name":"Summer Sale","status":"ACTIVE"},
+            {"id":"2","name":"Holiday Teaser","status":"PAUSED"},
+            {"id":"3","name":"Black Friday","status":"ACTIVE"}
+        ]}"#;
+        let ins = r#"{"data":[
+            {"campaign_name":"Summer Sale","spend":"42.17","impressions":"10240","clicks":"318"}
+        ]}"#;
+        let mock = MockTransport::new()
+            .on(HttpMethod::Get, "/campaigns", 200, roster)
+            .on(HttpMethod::Get, "/insights", 200, ins);
+        let out = ads_client(mock).report_campaigns(10).await.unwrap();
+
+        // The header counts the ROSTER, not the insights rows.
+        assert!(out.contains("Meta spend across 3 campaigns"), "got: {out}");
+        // The spender carries its numbers…
+        assert!(out.contains("\"Summer Sale\" — spend 42.17"), "got: {out}");
+        // …and the two non-delivering campaigns are still named, not dropped.
+        assert!(out.contains("Holiday Teaser"), "zero-spend campaign must appear: {out}");
+        assert!(out.contains("Black Friday"), "zero-spend campaign must appear: {out}");
+        assert!(out.contains("no spend in this window"), "says why they have no numbers: {out}");
+    }
+
+    /// Two campaigns may legitimately share a name in one Meta account. Each must
+    /// consume its OWN insights row: a first-match join gives both of them the
+    /// first row (double-counting its spend) and leaves the second row unclaimed,
+    /// which then reappears via the off-roster path as a third "campaign".
+    #[tokio::test]
+    async fn report_campaigns_does_not_double_count_duplicate_campaign_names() {
+        let roster = r#"{"data":[
+            {"id":"1","name":"Evergreen","status":"ACTIVE"},
+            {"id":"2","name":"Evergreen","status":"ACTIVE"}
+        ]}"#;
+        let ins = r#"{"data":[
+            {"campaign_name":"Evergreen","spend":"10.00","impressions":"100","clicks":"5"},
+            {"campaign_name":"Evergreen","spend":"20.00","impressions":"200","clicks":"9"}
+        ]}"#;
+        let mock = MockTransport::new()
+            .on(HttpMethod::Get, "/campaigns", 200, roster)
+            .on(HttpMethod::Get, "/insights", 200, ins);
+        let out = ads_client(mock).report_campaigns(10).await.unwrap();
+        assert!(out.contains("Meta spend across 2 campaigns"), "two campaigns, not three: {out}");
+        assert_eq!(out.matches("spend 10.00").count(), 1, "row consumed once: {out}");
+        assert_eq!(out.matches("spend 20.00").count(), 1, "the second row is its own line: {out}");
+    }
+
+    /// A spender the roster leg did not return (the roster is `limit`-capped) must
+    /// still be reported — the join must never drop an insights row either.
+    #[tokio::test]
+    async fn report_campaigns_keeps_an_insights_row_missing_from_the_roster() {
+        let roster = r#"{"data":[{"id":"1","name":"Summer Sale","status":"ACTIVE"}]}"#;
+        let ins = r#"{"data":[
+            {"campaign_name":"Summer Sale","spend":"42.17","impressions":"10240","clicks":"318"},
+            {"campaign_name":"Off-Roster Spender","spend":"9.99","impressions":"100","clicks":"4"}
+        ]}"#;
+        let mock = MockTransport::new()
+            .on(HttpMethod::Get, "/campaigns", 200, roster)
+            .on(HttpMethod::Get, "/insights", 200, ins);
+        let out = ads_client(mock).report_campaigns(10).await.unwrap();
+        assert!(out.contains("Off-Roster Spender"), "got: {out}");
+        assert!(out.contains("spend 9.99"), "got: {out}");
+        assert!(out.contains("Meta spend across 2 campaigns"), "got: {out}");
     }
 
     // -- CONSEQUENTIAL: DryRun issues NO request, previews the EXACT change ---

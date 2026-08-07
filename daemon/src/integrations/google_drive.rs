@@ -23,8 +23,12 @@
 //!     [`ActionMode::DryRun`] it builds and returns a human-readable preview
 //!     (name + byte size) and issues NO request; only in [`ActionMode::Execute`]
 //!     does it issue EXACTLY ONE multipart upload. Call sites get the mode from
-//!     the foundation's `gate(confirm)`, so with `[integrations].allow_consequential`
-//!     false (the shipped default) the upload always previews. The content is
+//!     the foundation's `gate(confirm)`. The master switch
+//!     `[integrations].allow_consequential` SHIPS ON (armed), so on a default
+//!     install a CONFIRMED upload really does put a file in the user's Drive —
+//!     what keeps it a preview is the absence of a fresh per-action `confirm`, not
+//!     the switch, and a confirmed upload still clears voice-id + policy +
+//!     !lockdown at the runtime chokepoints. The content is
 //!     PASSED IN (small text) — this client deliberately never reads arbitrary
 //!     local files.
 //!
@@ -251,8 +255,9 @@ impl<T: HttpTransport> DriveClient<T> {
     /// exactly what would be uploaded (name + byte size). In [`ActionMode::Execute`]
     /// it issues EXACTLY ONE multipart/related upload (metadata + media in a single
     /// request) and returns the new file's id. Callers obtain `mode` from the
-    /// foundation's `gate(confirm)`, so the shipped default (gate OFF) always
-    /// previews.
+    /// foundation's `gate(confirm)`; the master switch ships ARMED, so this
+    /// previews when `confirm` is false (or the operator disarmed the switch, or
+    /// lockdown is engaged) and UPLOADS on a fresh confirm.
     ///
     /// The content is passed in (small text only — see [`MAX_UPLOAD_BYTES`]); this
     /// client never reads arbitrary local files.

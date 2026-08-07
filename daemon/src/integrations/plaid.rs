@@ -59,11 +59,27 @@ pub const ACCOUNT_SECRET: &str = "plaid_secret";
 /// Settings. Rides only the request body at call time.
 pub const ACCOUNT_ACCESS_TOKEN: &str = "plaid_access_token";
 
-/// Default Plaid base URL — the SANDBOX environment. The user's own app
-/// credentials determine which environment is real; sandbox is the safe default
-/// for a read-only insight agent and matches the honest "connect via Plaid"
-/// onboarding. Production swaps the host with no code change (the secrets are the
-/// same shape). No trailing slash so `{base}/accounts/...` is clean.
+/// The Plaid base URL — the SANDBOX environment, and the ONLY one DARWIN can
+/// reach. Sandbox is the safe default for a read-only insight agent and matches
+/// the honest "connect via Plaid" onboarding. No trailing slash so
+/// `{base}/accounts/...` is clean.
+///
+/// PINNED, NOT CONFIGURABLE. [`PlaidClient::connect`] passes this unconditionally;
+/// there is no parameter, env read, config key, Keychain account, or Settings row
+/// that can point midas at `production.plaid.com`. (`with_creds` takes a base, but
+/// its only callers are tests.) Moving to production is a CODE change plus a
+/// rebuild — the doc here used to claim the opposite, that reaching production was
+/// only a matter of pointing the client at a different host, which would send an
+/// operator hunting for a setting that does not exist. Contrast Home Assistant,
+/// which really does ship a user-settable `homeassistant_url` row.
+///
+/// The consequence to keep in mind when reading midas's answers: every balance and
+/// transaction it can return is Plaid's CANNED SANDBOX data ("Plaid Checking",
+/// "Plaid Saving"), not the user's money. And a user who pastes PRODUCTION Plaid
+/// credentials gets them rejected by the sandbox host, which [`map_status`] reports
+/// as "your Plaid credentials were rejected; check your client id, secret, and
+/// linked access token in Settings" — a wrong diagnosis for an environment
+/// mismatch, and one no Settings change can fix.
 pub const DEFAULT_BASE: &str = "https://sandbox.plaid.com";
 
 /// How many transactions to pull by default when the caller does not specify.
@@ -399,6 +415,9 @@ impl PlaidClient<ReqwestTransport> {
     /// without ever surfacing a secret. The access_token in particular is minted by
     /// Plaid LINK (a frontend step DARWIN does not perform), so its absence is the
     /// common "not linked yet" case.
+    ///
+    /// The base URL is [`DEFAULT_BASE`] — the Plaid SANDBOX — unconditionally.
+    /// There is no production path here; see that constant.
     pub async fn connect() -> IntegrationResult<Self> {
         let client_id = resolve_secret(ACCOUNT_CLIENT_ID).await.ok_or_else(not_configured)?;
         let secret = resolve_secret(ACCOUNT_SECRET).await.ok_or_else(not_configured)?;
