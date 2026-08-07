@@ -140,6 +140,46 @@ confined_patch() {
 # and a genuinely missing include is the compiler's to report, honestly), and so
 # is anything that resolves outside the repo root — staging never reaches out of
 # the tree it was asked to stage.
+# Mirror the repo inputs the crate's TESTS read at RUNTIME.
+#
+# WHAT WENT WRONG: staging mirrored only the paths named by `include_str!` — a
+# COMPILE-time scan. `cargo check` therefore passed and `cargo test` failed 29
+# tests in staging that pass in the real tree, so this script always ended
+#   RESULT: failed  cargo test failed in staging — live daemon/src NOT modified
+# and exit 1. No self-heal patch could be applied by ANY path: interactive,
+# --yes, or the HUD Accept button. The operator was told the patch failed the
+# test gate when the harness could not run the suite at all.
+#
+# Staged and run, the failures named themselves:
+#   cannot read <staging>/daemon/../config/agents.toml: No such file
+#   app registered              (empty registry: no apps/*/manifest.toml)
+#   apps/cronwise: tool-exposing app has no main.py
+#
+# The set is data-only and ~12 MB. This mirrors the same inputs as the daemon's
+# own gate (daemon/src/heal.rs RUNTIME_TEST_INPUTS) — the two MUST agree, or a
+# patch the daemon proved will fail here for a reason that is not the patch.
+mirror_runtime_test_inputs() {
+  local daemon_dir="$1" staging="$2" repo_root d
+  repo_root="$(cd "$daemon_dir/.." && pwd -P)"
+  for d in config scripts; do
+    [ -d "$repo_root/$d" ] || continue
+    mkdir -p "$staging/$d"
+    cp -R "$repo_root/$d/." "$staging/$d/"
+  done
+  # Apps: manifests, sibling .toml data, and each app's ENTRY file. The registry
+  # needs the manifest; the manifest suite asserts a tool-exposing app HAS its
+  # entry ("tool-exposing app has no main.py"). Nothing else from an app.
+  if [ -d "$repo_root/apps" ]; then
+    local f rel
+    while IFS= read -r f; do
+      rel="${f#"$repo_root"/}"
+      mkdir -p "$staging/$(dirname "$rel")"
+      cp "$f" "$staging/$rel"
+    done < <(find "$repo_root/apps" -maxdepth 2 -type f \
+               \( -name '*.toml' -o -name 'main.py' -o -name 'main.rs' -o -name 'main.swift' \) 2>/dev/null)
+  fi
+}
+
 mirror_out_of_crate_includes() {
   local daemon_dir="$1" staging="$2"
   local crate_abs repo_root src_file lit lit_dir lit_base abs_dir abs rel
@@ -209,6 +249,7 @@ stage_crate() {
     cp -R "$entry" "$crate_dir/$name"
   done
   mirror_out_of_crate_includes "$daemon_dir" "$staging"
+  mirror_runtime_test_inputs "$daemon_dir" "$staging"
   printf '%s\n' "$crate_dir"
 }
 
@@ -402,7 +443,17 @@ fi
 if ! (cd "$CRATE" && cargo check); then
   fail "cargo check failed in staging — live daemon/src NOT modified"
 fi
-if ! (cd "$CRATE" && cargo test); then
+# Three tests cannot run inside a stage and are skipped BY NAME, matching
+# daemon/src/heal.rs UNRUNNABLE_IN_STAGE. The two apply_forge tests shell out to
+# a script that cd's into a full repo layout; the heal pipeline test runs this
+# very staging routine NESTED inside a stage. They pass in the real tree and fail
+# here for reasons unrelated to the patch. `--skip` is a libtest flag, so it goes
+# after `--` — `cargo test --skip X` answers "unexpected argument" and would fail
+# the gate for the wrong reason.
+if ! (cd "$CRATE" && cargo test -- \
+        --skip forge::tests::apply_forge_accepts_legit_multiline_manifest \
+        --skip forge::tests::apply_forge_refuses_multiline_overbroad_manifests \
+        --skip heal::tests::full_pipeline_via_mock_brain_rejects_when_no_candidate_validates); then
   fail "cargo test failed in staging — live daemon/src NOT modified"
 fi
 

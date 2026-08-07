@@ -1505,6 +1505,12 @@ async fn stage_and_validate(
     out
 }
 
+const UNRUNNABLE_IN_STAGE: &[&str] = &[
+    "forge::tests::apply_forge_accepts_legit_multiline_manifest",
+    "forge::tests::apply_forge_refuses_multiline_overbroad_manifests",
+    "heal::tests::full_pipeline_via_mock_brain_rejects_when_no_candidate_validates",
+];
+
 async fn stage_and_validate_inner(
     source_dir: &Path,
     heal_root: &Path,
@@ -1542,11 +1548,6 @@ async fn stage_and_validate_inner(
     // cannot run here". Skipping them SILENTLY would be the other failure: a gate
     // that quietly stops covering things is how a real regression walks through.
     // So they are named, skipped, and the skip is in the transcript.
-    const UNRUNNABLE_IN_STAGE: &[&str] = &[
-        "forge::tests::apply_forge_accepts_legit_multiline_manifest",
-        "forge::tests::apply_forge_refuses_multiline_overbroad_manifests",
-        "heal::tests::full_pipeline_via_mock_brain_rejects_when_no_candidate_validates",
-    ];
     // `--skip` belongs to the TEST HARNESS, not to cargo, so it goes after `--`.
     // Without the separator cargo answers "unexpected argument '--skip' found" and
     // the gate rejects every candidate for a reason that is not the patch.
@@ -3020,6 +3021,53 @@ mod tests {
                  hole in the gate"
             );
         }
+    }
+
+    /// THE TWO GATES MUST SKIP THE SAME TESTS.
+    ///
+    /// The daemon proves a candidate with its own staged `cargo test`
+    /// (UNRUNNABLE_IN_STAGE, above). `scripts/apply_heal.sh` re-proves it before
+    /// touching live sources — that second gate is the point, since a patch is
+    /// drafted at one commit and applied at another.
+    ///
+    /// If the two lists drift, a patch the daemon PROVED fails on apply for a
+    /// reason that is not the patch, and the operator is told "cargo test failed
+    /// in staging" about a candidate that already passed. That is exactly the
+    /// misleading failure this whole fix removes, reintroduced at the next hop.
+    #[test]
+    fn the_apply_script_skips_the_same_unrunnable_tests_as_the_daemon_gate() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        for name in UNRUNNABLE_IN_STAGE {
+            assert!(
+                script.contains(name),
+                "apply_heal.sh must skip {name} too — otherwise a candidate the \
+                 daemon proved is rejected at apply time for the wrong reason"
+            );
+        }
+        // ...and the script must pass them to the HARNESS, not to cargo.
+        assert!(
+            script.contains("cargo test -- \\"),
+            "apply_heal.sh must use `cargo test --` before any --skip: cargo answers \
+             \"unexpected argument '--skip' found\" without the separator"
+        );
+        // The script must also mirror the runtime inputs, or its suite cannot run
+        // at all — the defect this pair of fixes exists to close.
+        // The CALL, not merely the name. Asserting the bare name self-matches on
+        // the function DEFINITION, so deleting the call left this green — the
+        // source-anchored-guard trap. Scope to the staging routine and require an
+        // invocation with its arguments.
+        let stage_fn = script
+            .split("stage_sources()")
+            .nth(1)
+            .or_else(|| script.split("mirror_out_of_crate_includes \"$daemon_dir\"").nth(1))
+            .expect("apply_heal.sh must have a staging routine");
+        let window = &stage_fn[..stage_fn.len().min(600)];
+        assert!(
+            window.contains("mirror_runtime_test_inputs \"$daemon_dir\"")
+                || script.contains("mirror_runtime_test_inputs \"$daemon_dir\" \"$staging\""),
+            "apply_heal.sh must CALL mirror_runtime_test_inputs during staging — \
+             without it the staged suite cannot run and every apply fails"
+        );
     }
 
 }
