@@ -1448,7 +1448,7 @@ impl Default for CloudConfig {
     fn default() -> Self {
         Self {
             fast_model: "claude-haiku-4-5".to_string(),
-            heavy_model: "claude-opus-4-8".to_string(),
+            heavy_model: "claude-opus-5".to_string(),
             max_tokens: 4096,
         }
     }

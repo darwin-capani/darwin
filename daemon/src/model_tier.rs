@@ -1378,7 +1378,7 @@ mod tests {
         let cfg = Config::default(); // heavy=opus, fast=haiku
         assert_eq!(
             tier_to_model(Tier::Heavy, &cfg),
-            ModelChoice::Cloud("claude-opus-4-8".to_string())
+            ModelChoice::Cloud("claude-opus-5".to_string())
         );
         assert_eq!(
             tier_to_model(Tier::Fast, &cfg),

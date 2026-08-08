@@ -2336,7 +2336,7 @@ mod tests {
             eprintln!("forge_drill_real_cloud: no API key resolved; skipping (run with the key set)");
             return;
         }
-        let model = "claude-opus-4-8";
+        let model = "claude-opus-5";
         let dir = run_forge_drill(model).await.expect("forge drill must produce a proposal");
         assert!(dir.join("report.md").exists(), "drill must write report.md");
         assert!(dir.join("manifest.toml").exists());

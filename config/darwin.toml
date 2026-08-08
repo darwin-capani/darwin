@@ -193,7 +193,7 @@ subset = []                         # OPTIONAL allow-list override; empty = the 
 
 [cloud]
 fast_model = "claude-haiku-4-5"    # default cloud model (exact id, no date suffix)
-heavy_model = "claude-opus-4-8"    # used when complexity == "heavy" (exact id, no date suffix)
+heavy_model = "claude-opus-5"    # used when complexity == "heavy" (exact id, no date suffix)
 max_tokens = 4096
 
 [proactive]

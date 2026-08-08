@@ -9465,7 +9465,7 @@ mod tests {
         let _guard = crate::model_tier::OverrideGuard::force(None);
         let mut cfg = Config::default();
         // heavy_model/fast_model are the shipped contract ids.
-        assert_eq!(cfg.cloud.heavy_model, "claude-opus-4-8");
+        assert_eq!(cfg.cloud.heavy_model, "claude-opus-5");
         assert_eq!(cfg.cloud.fast_model, "claude-haiku-4-5");
         // A heavy, confident conversation turn keeps the configured default tier.
         let heavy = classification("conversation", "heavy", 0.95);
@@ -9474,7 +9474,7 @@ mod tests {
         assert_eq!(cfg.router.conversation_route, "cloud_heavy");
         assert_eq!(
             conversation_brain(&cfg, true, &heavy).0,
-            ConversationBrain::Cloud("claude-opus-4-8".to_string())
+            ConversationBrain::Cloud("claude-opus-5".to_string())
         );
         // No key: even cloud_heavy degrades to the local 4B (Fallback).
         assert_eq!(conversation_brain(&cfg, false, &heavy).0, ConversationBrain::Local);
@@ -9565,7 +9565,7 @@ mod tests {
 
         // No override -> Auto -> Heavy/Opus (config default preserved).
         let (brain, _tier, reason) = conversation_brain(&cfg, true, &heavy);
-        assert_eq!(brain, ConversationBrain::Cloud("claude-opus-4-8".to_string()));
+        assert_eq!(brain, ConversationBrain::Cloud("claude-opus-5".to_string()));
         assert_eq!(reason, crate::model_tier::Reason::Auto);
 
         // Offline override -> Local, NO cloud model, even with cloud reachable.
@@ -9693,7 +9693,7 @@ mod tests {
         // Heavy conversation -> cloud, Opus (heavy path, unchanged).
         let heavy = classification("conversation", "heavy", 0.95);
         assert!(wants_cloud(&heavy, &cfg), "heavy must route to cloud");
-        assert_eq!(cloud_model(true, &cfg), "claude-opus-4-8", "heavy -> opus");
+        assert_eq!(cloud_model(true, &cfg), "claude-opus-5", "heavy -> opus");
 
         // Confident light action intent -> local (unchanged: not heavy, high
         // confidence). conversation_route is irrelevant for action intents.

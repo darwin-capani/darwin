@@ -15,7 +15,7 @@
 //!      files + line numbers, a window of surrounding log context, and the
 //!      implicated subsystem (audio/inference/router/...) by module path.
 //!      Emits heal.diagnosing{signature, files, subsystem}.
-//!   4. MULTI-CANDIDATE DRAFT (v2) — ask the heavy model (claude-opus-4-8) for
+//!   4. MULTI-CANDIDATE DRAFT (v2) — ask the heavy model ([cloud].heavy_model) for
 //!      N=2-3 ALTERNATIVE minimal unified-diff patches (distinct approaches,
 //!      each minimal, no new deps). Each is parsed/cleaned; non-diffs rejected.
 //!   5. STAGE + VALIDATE EACH (v2) — every candidate is staged independently
@@ -2789,7 +2789,7 @@ mod tests {
             eprintln!("heal_drill_real_cloud: no API key resolved; skipping (run with the key set)");
             return;
         }
-        let model = "claude-opus-4-8";
+        let model = "claude-opus-5";
         let dir = run_heal_drill(model).await.expect("heal drill must produce a proposal");
         assert!(dir.join("patch.diff").exists(), "drill must write patch.diff");
         assert!(dir.join("report.md").exists());
