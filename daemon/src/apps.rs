@@ -1825,7 +1825,38 @@ pub async fn stop(registry: &Arc<AppRegistry>, name: &str) -> Result<()> {
 /// authenticated by the socket itself (the daemon owns and bound it, 0600), the
 /// same trust model the start/refresh/stop control verbs already rely on; the
 /// per-app capability token authenticates the REVERSE direction (app->host).
+/// Ops that START a CAPTURE — a camera or the screen. Refused while the emergency
+/// stop is engaged.
+///
+/// WHAT WENT WRONG: `lockdown::panic()` stops outward actions, autonomy, parked
+/// confirmations, background music, and the MICROPHONE — the mic because audio.rs
+/// re-reads the flag per chunk. Capture is a different shape: the Vision app is a
+/// SEPARATE PROCESS, so nothing it is told to do is re-checked against the flag,
+/// and no gate stood between a capture-start op and the app. `screen_context.rs`
+/// and `aperture.rs` contain ZERO `is_locked_down` consults.
+///
+/// So a user could say "panic", watch the mic go silent and the HUD light turn
+/// red, and a subsequent capture-start would still open the lens.
+///
+/// The check lives HERE, at the one dispatch every op passes through, rather than
+/// at each caller — a per-caller gate is exactly the "one gate knew the rule, its
+/// twin did not" shape that produced this campaign's other lockdown defect.
+fn is_capture_start(op_line: &str) -> bool {
+    // Match on the op NAME, not a substring of the whole line: a `read.screen`
+    // QUERY carries arbitrary user text and must not be caught by it.
+    let op = serde_json::from_str::<Value>(op_line)
+        .ok()
+        .and_then(|v| v.get("op").and_then(Value::as_str).map(str::to_string))
+        .unwrap_or_default();
+    matches!(op.as_str(), "watch.start" | "screen.context.start" | "describe.capture")
+}
+
 pub async fn send_op(registry: &Arc<AppRegistry>, name: &str, op_line: &str) -> Result<()> {
+    // EMERGENCY STOP: never open a lens while locked down. Restrict-only — with
+    // lockdown off (the shipped default) this is byte-for-byte the old path.
+    if crate::lockdown::is_locked_down() && is_capture_start(op_line) {
+        bail!("lockdown is engaged; refusing to start a capture");
+    }
     let apps = registry.apps.lock().await;
     let entry = apps
         .get(name)
@@ -5222,6 +5253,133 @@ mod tests {
             stderr.contains("host must be * or localhost"),
             "the failure changed shape; re-read it before assuming it is the same defect: {stderr}"
         );
+    }
+
+    /// A PANIC MUST CLOSE THE LENS, NOT JUST THE MICROPHONE.
+    ///
+    /// `lockdown::panic()` stops outward actions, autonomy, parked confirmations,
+    /// background music, and the mic — the mic because audio.rs re-reads the flag
+    /// per chunk. Capture is a different shape: the Vision app is a SEPARATE
+    /// PROCESS, so nothing it is told is re-checked, and screen_context.rs and
+    /// aperture.rs contain ZERO `is_locked_down` consults. A capture-start after a
+    /// panic still opened the lens.
+    #[test]
+    fn a_capture_start_is_refused_while_locked_down_but_a_read_is_not() {
+        // The op NAME is what is matched — never a substring of the line.
+        for line in [
+            r#"{"op":"watch.start","source":"camera"}"#,
+            r#"{"op":"screen.context.start","interval_secs":30}"#,
+            r#"{"op":"describe.capture"}"#,
+        ] {
+            assert!(is_capture_start(line), "{line} starts a capture");
+        }
+        // Not captures: stopping one, and a read whose QUERY may contain anything.
+        for line in [
+            r#"{"op":"watch.stop"}"#,
+            r#"{"op":"screen.context.stop"}"#,
+            r#"{"op":"read.screen"}"#,
+            r#"{"op":"select.net","name":"GND"}"#,
+        ] {
+            assert!(!is_capture_start(line), "{line} is not a capture start");
+        }
+        // THE TRAP THIS GUARDS: a read whose user-supplied query quotes a capture
+        // op name. A substring match would refuse it — and worse, a substring
+        // match on "watch.start" inside a query is how a user asking about their
+        // own settings would get an unexplained refusal.
+        assert!(
+            !is_capture_start(r#"{"op":"read.screen","query":"what does watch.start do"}"#),
+            "a read whose QUERY mentions a capture op is still a read"
+        );
+        // Malformed input must not be treated as a capture start (it will fail
+        // later on its own terms) — and must not panic.
+        assert!(!is_capture_start("not json"));
+        assert!(!is_capture_start(""));
+    }
+
+    /// ...AND `send_op` ACTUALLY CONSULTS IT.
+    ///
+    /// The test above pins the predicate. Deleting the check from `send_op` still
+    /// compiles and leaves that test green — a correct predicate nobody consults
+    /// is exactly the shape of this campaign's other lockdown defect (the MCP
+    /// manager's gate was right; it was built before the flag existed). So this
+    /// drives the real dispatch with the flag forced on.
+    #[tokio::test]
+    async fn send_op_refuses_a_capture_start_under_a_live_lockdown() {
+        let root = PathBuf::from(format!(
+            "/private/tmp/jrv-lockcap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000
+        ));
+        let app_dir = root.join("apps/vision");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(root.join("state/ipc/apps")).unwrap();
+        std::fs::write(
+            app_dir.join("manifest.toml"),
+            r#"
+            [app]
+            name = "vision"
+            version = "0.1.0"
+            description = "hermetic capture stand-in"
+            entry = "apps/vision/main.py"
+            runtime = "python"
+            [permissions]
+            audio = false
+            gpu = false
+            net_hosts = []
+            fs_read = []
+            fs_write = ["state/apps/vision"]
+            [ui]
+            surface = "panel"
+            telemetry_topics = ["feed"]
+        "#,
+        )
+        .unwrap();
+        let mut registry = AppRegistry::discover(&root);
+        Arc::get_mut(&mut registry).unwrap().interpreter_override =
+            Some(PathBuf::from("/bin/sleep"));
+        start(&registry, "vision").await.unwrap();
+        let sock = root.join("state/ipc/apps/vision.sock");
+        let mut waited = 0;
+        while !sock.exists() && waited < 60 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += 1;
+        }
+
+        // PRECONDITION: unlocked, the capture start is accepted — otherwise this
+        // would pass against a build that refuses everything.
+        {
+            let _unlocked = crate::lockdown::LockdownOverride::force(false);
+            assert!(
+                send_op(&registry, "vision", r#"{"op":"watch.start","source":"camera"}"#)
+                    .await
+                    .is_ok(),
+                "unlocked, a capture start must go through unchanged"
+            );
+        }
+
+        {
+            let _locked = crate::lockdown::LockdownOverride::force(true);
+            let err = send_op(&registry, "vision", r#"{"op":"watch.start","source":"camera"}"#)
+                .await
+                .expect_err("a panic must close the lens, not just the microphone");
+            assert!(
+                err.to_string().contains("lockdown"),
+                "the refusal must name the reason: {err}"
+            );
+            // ...and STOPPING a capture is still allowed while locked — a gate that
+            // blocked the stop would strand a live capture it exists to end.
+            assert!(
+                send_op(&registry, "vision", r#"{"op":"watch.stop"}"#).await.is_ok(),
+                "watch.stop must still be deliverable under lockdown"
+            );
+        }
+
+        let _ = stop(&registry, "vision").await;
+        let _ = std::fs::remove_dir_all(&root);
     }
 
 }

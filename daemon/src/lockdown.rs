@@ -294,12 +294,12 @@ pub async fn panic() -> &'static str {
     crate::audit::record_global(
         "system",
         "lockdown.panic",
-        "all outward actions, autonomy, and the mic",
+        "all outward actions, autonomy, the mic, and any new capture",
         crate::policy::Decision::Never,
         crate::audit::Outcome::BlockedByPolicy,
     )
     .await;
-    info!("lockdown: PANIC — all future outward actions, autonomy, and the mic are now OFF and persisted");
+    info!("lockdown: PANIC — all future outward actions, autonomy, the mic, and any new camera/screen capture are now OFF and persisted");
     PANIC_CONFIRMATION
 }
 
