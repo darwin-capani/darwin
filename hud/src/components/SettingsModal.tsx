@@ -60,16 +60,21 @@ import {
 import { sendCommand } from "../tauri/command";
 
 /**
- * The EXACT spoken model-control phrases the four "Set tier" buttons send over
- * the command channel as `{cmd:"ask", text}`. These are interpreted by the
- * daemon's CONSERVATIVE `classify_model_swap` (daemon/src/model_tier.rs) — each
- * MUST match an anchor there or the click leaks to the normal answer path and
- * the override is never set/cleared. The AUTO phrase in particular must classify
- * (clearing the override), which `"auto, you pick the model"` did NOT — it is
- * `"auto mode"` here on purpose. The daemon test
+ * The EXACT spoken model-control phrases the four "Set tier" controls QUOTE to
+ * the user. These are interpreted by the daemon's CONSERVATIVE
+ * `classify_model_swap` (daemon/src/model_tier.rs) — each MUST match an anchor
+ * there or the SPOKEN utterance leaks to the normal answer path and the override
+ * is never set/cleared. The AUTO phrase in particular must classify (clearing the
+ * override), which `"auto, you pick the model"` did NOT — it is `"auto mode"`
+ * here on purpose. The daemon test
  * `settings_button_phrases_round_trip_to_their_intent` locks these literals to
- * the classifier; the HUD test locks the buttons to these literals. Both ends of
+ * the classifier; the HUD test locks the controls to these literals. Both ends of
  * the round-trip are covered, so a phrase edit on either side fails CI.
+ *
+ * These are NO LONGER SENT over the command channel — see the ModelTierSection
+ * doc: `classify_model_swap` is router-only and the `ask` verb never enters the
+ * router, so a clicked phrase set nothing and (for LOCAL) egressed the turn it
+ * was asking to keep on-device.
  */
 export const MODEL_SWAP_BUTTON_PHRASES: Record<ModelSwapIntent, string> = {
   heavy: "use the most powerful model",
@@ -77,6 +82,22 @@ export const MODEL_SWAP_BUTTON_PHRASES: Record<ModelSwapIntent, string> = {
   local: "work offline, stay on device",
   auto: "auto mode",
 };
+
+/** Why the model-tier controls state a phrase instead of acting. Mirrors the
+ *  voice-id enrolment controls' spoken-only note: the operation exists, it is
+ *  simply not reachable from the command channel this HUD holds. */
+export const MODEL_TIER_SPOKEN_ONLY_NOTE =
+  "Re-aiming the model is spoken-only — the command channel this panel uses " +
+  "never reaches the router that interprets a model-control phrase, so a click " +
+  "here cannot set or clear the override. Say the phrase out loud instead; " +
+  '"auto mode" clears the override back to the config default.';
+
+/** The exact instruction a model-tier control shows for `intent`: the phrase to
+ *  say, verbatim from MODEL_SWAP_BUTTON_PHRASES, plus why it is spoken-only.
+ *  PURE — no I/O, nothing sent. */
+export function modelTierSpokenInstruction(intent: ModelSwapIntent): string {
+  return `Say "${MODEL_SWAP_BUTTON_PHRASES[intent]}" out loud. ${MODEL_TIER_SPOKEN_ONLY_NOTE}`;
+}
 
 /**
  * The EXACT spoken phrases the voice-clone control sends over the command channel
@@ -334,13 +355,13 @@ export default function SettingsModal({
             <VoiceIdSection voiceId={voiceId} />
 
             <div className="cred-section-title">VOICE CLONE // YOUR OWN VOICE (CONSENT-GATED)</div>
-            <VoiceCloneSection shell={shell} />
+            <VoiceCloneSection />
 
             <div className="cred-section-title">CLOUD STT // TRANSCRIPTION</div>
             <SttTierSection sttTier={sttTier} />
 
             <div className="cred-section-title">MODEL TIER // WHICH MODEL ANSWERS</div>
-            <ModelTierSection modelTier={modelTier} shell={shell} />
+            <ModelTierSection modelTier={modelTier} />
 
             <div className="cred-section-title">MEMORY // EPISODES + USER MODEL</div>
             <MemorySection />
@@ -749,13 +770,15 @@ function VoiceIdSection({ voiceId }: { voiceId: VoiceIdStatus }) {
  *  not regress): cloning UPLOADS an audio SAMPLE — it LEAVES this device for
  *  ElevenLabs. It is therefore CONSENT-GATED + AUTHORIZATION-BOUND: never automatic,
  *  only on a sample confined to the DARWIN root (your own voice — no impersonating
- *  others), and it takes TWO explicit steps. Step 1 (PROPOSE) sends the spoken
- *  "clone my voice" intent; the daemon PARKS a pending consent and asks you to
- *  confirm — NOTHING leaves the device yet. Step 2 (CONFIRM) is a SEPARATE explicit
- *  click that sends a clear "yes"; only then is the sample uploaded. Anything other
- *  than confirming cancels (audio never leaves). With no ElevenLabs key the daemon
+ *  others), and it takes TWO explicit steps — BOTH SPOKEN. Step 1 (PROPOSE) is the
+ *  SAID "clone my voice" intent; the daemon PARKS a pending consent and asks you to
+ *  confirm — NOTHING leaves the device yet. Step 2 (CONFIRM) is a SEPARATE SPOKEN
+ *  "yes"; only then is the sample uploaded. (This paragraph used to call step 2 "a
+ *  SEPARATE explicit CLICK" — there is no confirm click and there never could be
+ *  one from here; see the two blocks below.) Anything other than confirming cancels
+ *  (audio never leaves). With no ElevenLabs key the daemon
  *  uploads nothing and you keep your on-device Kokoro/existing voice. FORGET drops
- *  the stored clone. The HUD adds NO new authority — it sends the SAME spoken
+ *  the stored clone. The HUD adds NO new authority — it names the SAME spoken
  *  phrases the voice path uses; the consent machine lives in the daemon. Live clone
  *  quality is device/credential-gated and is NEVER claimed measured here.
  *
@@ -771,87 +794,46 @@ function VoiceIdSection({ voiceId }: { voiceId: VoiceIdStatus }) {
  *  unconditionally on any successful send and print the cloud model's reply as
  *  the daemon's ack — so a user could be told their clone was forgotten, or a
  *  consent parked, when neither happened. The HUD no longer fabricates either:
- *  it states that this is the spoken flow and shows the exact phrase to say. */
-function VoiceCloneSection({ shell }: { shell: boolean }) {
-  // `proposed` is a HUD-local two-step latch: the first click proposes (parks the
-  // daemon's pending consent + reveals the explicit CONFIRM affordance); only the
-  // SEPARATE confirm click sends the yes that lets the sample leave the device. A
-  // single click can never upload — this mirrors the daemon's own cross-turn gate.
-  const [proposed, setProposed] = useState(false);
-  const [busy, setBusy] = useState(false);
+ *  it states that this is the spoken flow and shows the exact phrase to say.
+ *
+ *  AND THE DEAD SENDS ARE GONE. The pass that fixed the COPY left the
+ *  `{cmd:"ask"}` calls in place, so a click still pushed "yes, go ahead and clone
+ *  my voice" / "forget my voice clone" into `complete_with_tools` — a phrase that
+ *  cannot reach the consent machine, handed to a model that DOES hold
+ *  forget-shaped tools of its own. These controls now send nothing at all,
+ *  matching the voice-id enrolment controls in SystemSettingsPanel. */
+function VoiceCloneSection() {
   const [note, setNote] = useState("");
 
-  const send = useCallback(async (phrase: string): Promise<string> => {
-    const r = await sendCommand({ cmd: "ask", text: phrase });
-    return r.ok ? r.reply || "" : r.error || "command failed";
+  // NOTHING IS SENT FROM HERE. The previous pass fixed the COPY but left the
+  // `{cmd:"ask"}` sends in place, so every click still fired a phrase into
+  // `complete_with_tools`. That is not a harmless no-op: the bare confirmation
+  // ("yes, go ahead and clone my voice") and the forget phrase ("forget my voice
+  // clone") entered the cloud tool loop as ordinary user turns, next to the
+  // forget-shaped tools the loop DOES hold (user_model_forget, draft_forget,
+  // docsearch forget) — a request that cannot do what it says, aimed at a model
+  // that can do something else. The voice-id enrolment controls in
+  // SystemSettingsPanel already stopped firing for exactly this reason; these now
+  // match. Each control states the phrase to SAY and claims nothing.
+  //
+  // The two-step latch went with the sends: `proposed` could no longer become
+  // true (the propose handler stopped setting it once the fabricated
+  // "AWAITING CONFIRM" was removed), so the CONFIRM/CANCEL branch was UI no
+  // render could reach. The two-step gate is the daemon's, on the spoken path,
+  // and the copy points there.
+  const propose = useCallback(() => {
+    setNote(
+      `Voice cloning is confirmed by VOICE, not from this panel. Say "${VOICE_CLONE_PHRASES.propose}" aloud — DARWIN will park the consent and ask you to confirm out loud. Nothing has left the device.`,
+    );
   }, []);
 
-  // Step 1 — PROPOSE. Sends the spoken clone intent; the daemon parks the pending
-  // consent and speaks the honest prompt. Nothing has left the device. We then
-  // reveal the explicit CONFIRM control (the user must take a SECOND action).
-  const propose = useCallback(async () => {
-    if (busy) return;
-    setBusy(true);
-    setNote("");
-    try {
-      await send(VOICE_CLONE_PHRASES.propose);
-      // NO `setProposed(true)` here. The consent machine is on the SPOKEN path
-      // only (see the module doc), so nothing was parked and there is no verdict
-      // to latch on. Latching unconditionally showed "AWAITING CONFIRM" for a
-      // consent that does not exist.
-      setNote(
-        `Voice cloning is confirmed by VOICE, not from this panel. Say "${VOICE_CLONE_PHRASES.propose}" aloud — DARWIN will park the consent and ask you to confirm out loud. Nothing has left the device.`,
-      );
-    } catch {
-      setNote("shell error");
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, send]);
-
-  // Step 2 — CONFIRM. The SEPARATE explicit yes that authorizes the upload. Only
-  // reachable after a propose, so the sample can never leave on a single click.
-  const confirm = useCallback(async () => {
-    if (busy) return;
-    setBusy(true);
-    try {
-      await send(VOICE_CLONE_PHRASES.confirm);
-      setProposed(false);
-      setNote(
-        `A spoken consent cannot be confirmed from this panel. Say "${VOICE_CLONE_PHRASES.confirm}" aloud to the parked prompt. Nothing has left the device from here.`,
-      );
-    } catch {
-      setNote("shell error");
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, send]);
-
-  // CANCEL — clears the HUD's pending step WITHOUT sending a yes (so the daemon's
-  // pending consent lapses unconfirmed; the audio never leaves). Local-only.
-  const cancel = useCallback(() => {
-    setProposed(false);
-    setNote("Cancelled — nothing left the device.");
+  const forget = useCallback(() => {
+    // NEVER "Forgot the voice clone." — the stored clone is dropped only by the
+    // spoken path, which this panel cannot reach.
+    setNote(
+      `Say "${VOICE_CLONE_PHRASES.forget}" aloud to drop the stored clone — the panel cannot do it, and would otherwise tell you it had.`,
+    );
   }, []);
-
-  // FORGET — drops the stored clone slot (back to Kokoro / the existing voice).
-  const forget = useCallback(async () => {
-    if (busy) return;
-    setBusy(true);
-    setProposed(false);
-    try {
-      await send(VOICE_CLONE_PHRASES.forget);
-      // NEVER "Forgot the voice clone." — the stored clone is dropped only by the
-      // spoken path; this send does not reach it.
-      setNote(
-        `Say "${VOICE_CLONE_PHRASES.forget}" aloud to drop the stored clone — the panel cannot do it, and would otherwise tell you it had.`,
-      );
-    } catch {
-      setNote("shell error");
-    } finally {
-      setBusy(false);
-    }
-  }, [busy, send]);
 
   return (
     <>
@@ -868,42 +850,19 @@ function VoiceCloneSection({ shell }: { shell: boolean }) {
       </div>
 
       <div className="cred-row">
-        <div className="cred-label">{proposed ? "Confirm" : "Action"}</div>
+        <div className="cred-label">Action</div>
         <div className="modeltier-controls">
-          {!proposed ? (
-            <button
-              className="icon-btn"
-              onClick={() => void propose()}
-              disabled={!shell || busy}
-              title="Sends the clone phrase over the command channel. The consent machine runs on the SPOKEN path, so say the phrase ALOUD to actually park a consent. NOTHING leaves the device either way."
-            >
-              CLONE MY VOICE
-            </button>
-          ) : (
-            <>
-              <button
-                className="icon-btn"
-                onClick={() => void confirm()}
-                disabled={!shell || busy}
-                title="A parked consent is confirmed by VOICE. Say the confirmation aloud; only that uploads the audio sample to ElevenLabs."
-              >
-                CONFIRM CLONE (UPLOADS SAMPLE)
-              </button>
-              <button
-                className="icon-btn"
-                onClick={cancel}
-                disabled={busy}
-                title="Cancel — nothing leaves the device"
-              >
-                CANCEL
-              </button>
-            </>
-          )}
+          <button
+            className="icon-btn"
+            onClick={propose}
+            title="Shows the clone phrase to SAY. The consent machine runs on the SPOKEN path only, so say it ALOUD to park a consent. This button sends nothing and NOTHING leaves the device."
+          >
+            CLONE MY VOICE
+          </button>
           <button
             className="icon-btn cred-remove"
-            onClick={() => void forget()}
-            disabled={!shell || busy}
-            title="Say the forget phrase ALOUD to drop the stored voice clone (back to Kokoro / your existing voice) — the panel cannot drop it from here."
+            onClick={forget}
+            title="Shows the forget phrase to SAY. Saying it ALOUD drops the stored voice clone (back to Kokoro / your existing voice) — the panel cannot drop it from here and sends nothing."
           >
             FORGET CLONE
           </button>
@@ -998,51 +957,48 @@ function SttTierSection({ sttTier }: { sttTier: SttTierStatus }) {
  *  required); when the cloud is unreachable the resolver degrades to local
  *  (reason=FALLBACK), never a silent wrong answer.
  *
- *  The runtime override is what these buttons set — by sending the SAME spoken
- *  model-control command the voice path uses (an `ask` over the command channel,
- *  which the daemon's conservative classify_model_swap interprets), so the HUD adds
- *  no new authority and the override + telemetry flow are identical to voice. The
- *  DURABLE default lives in darwin.toml under [router].conversation_route (the HUD
- *  never writes daemon config); the runtime override resets to that default on
+ *  THE RUNTIME OVERRIDE CANNOT BE SET FROM A CLICK, and these controls no longer
+ *  pretend it can.
+ *
+ *  WHAT WENT WRONG: each button sent `{cmd:"ask", text:<phrase>}`. That reaches
+ *  `LivePipeline::ask` -> `anthropic::complete_with_tools` — the cloud brain.
+ *  `model_tier::classify_model_swap` is called from TWO places, both inside
+ *  `router::route` (daemon/src/router.rs:350 and :3423), and the command channel
+ *  never enters the router; there is no model-tier tool for the loop to reach
+ *  either (the tool list has no swap/tier verb at all). So no override was ever
+ *  installed or cleared, and no `model.swap` telemetry was emitted — the pill kept
+ *  showing whatever the last ANSWERED turn reported.
+ *
+ *  The panel then reported success anyway: it printed `r.reply` — whatever the
+ *  cloud model happened to say about the phrase — as if it were the daemon's ack.
+ *  Clicking LOCAL was the worst case: "work offline, stay on device" was itself
+ *  sent to api.anthropic.com, so the one control whose entire purpose is to keep
+ *  the turn on-device egressed the turn that asked for it, and then said "of
+ *  course, staying local".
+ *
+ *  Not routed here deliberately: a dedicated verb would be NEW command-channel
+ *  authority over which model answers, which is the owner's call, not a wiring
+ *  fix. So the controls now show the exact phrase to SAY (the phrases are still
+ *  anchored byte-for-byte to `classify_model_swap`, and the daemon's
+ *  `settings_button_phrases_round_trip_to_their_intent` still locks that).
+ *
+ *  The DURABLE default lives in darwin.toml under [router].conversation_route (the
+ *  HUD never writes daemon config); the runtime override resets to that default on
  *  restart. "Auto" clears the override back to that default. */
-function ModelTierSection({
-  modelTier,
-  shell,
-}: {
-  modelTier: ModelTierStatus;
-  shell: boolean;
-}) {
+function ModelTierSection({ modelTier }: { modelTier: ModelTierStatus }) {
   const tone = modelTierTone(modelTier.tier, modelTier.reason);
   const label = modelTierLabel(modelTier.tier);
   const mode = modelTierModeLabel(modelTier.manual);
   const reasonLabel = modelTierReasonLabel(modelTier.reason);
-  const [busy, setBusy] = useState(false);
   const [note, setNote] = useState("");
 
-  // Each control sends the canonical spoken model-control phrase over the command
-  // channel; the daemon's classify_model_swap installs/clears the override and
-  // emits model.swap/model.tier (which refresh the live indicator). The HUD never
-  // writes the override directly — it asks the daemon, exactly like voice.
-  const swap = useCallback(
-    async (intent: ModelSwapIntent, phrase: string) => {
-      if (busy) return;
-      setBusy(true);
-      setNote("");
-      try {
-        const r = await sendCommand({ cmd: "ask", text: phrase });
-        setNote(
-          r.ok
-            ? r.reply || `Requested: ${intent}.`
-            : r.error || "command failed",
-        );
-      } catch {
-        setNote("shell error");
-      } finally {
-        setBusy(false);
-      }
-    },
-    [busy],
-  );
+  // Each control SHOWS the canonical spoken model-control phrase. It does NOT
+  // send it: the command channel cannot reach classify_model_swap (see the
+  // section doc above), and firing it anyway both did nothing and — for LOCAL —
+  // egressed the very turn that asked to stay on-device.
+  const swap = useCallback((intent: ModelSwapIntent) => {
+    setNote(modelTierSpokenInstruction(intent));
+  }, []);
 
   // The live status line under the section title — the same honest verdict the
   // StatusBar chip shows, expanded with the reason gloss when there is one.
@@ -1075,40 +1031,35 @@ function ModelTierSection({
         <div className="modeltier-controls">
           <button
             className="icon-btn"
-            onClick={() => void swap("heavy", MODEL_SWAP_BUTTON_PHRASES.heavy)}
-            disabled={!shell || busy}
-            title="Pin the cloud HEAVY model (most capable; needs a cloud key)"
+            onClick={() => swap("heavy")}
+            title="Pin the cloud HEAVY model (most capable; needs a cloud key) — spoken only; shows the phrase to say"
           >
             HEAVY
           </button>
           <button
             className="icon-btn"
-            onClick={() => void swap("fast", MODEL_SWAP_BUTTON_PHRASES.fast)}
-            disabled={!shell || busy}
-            title="Pin the cloud FAST model (quick + cheap; needs a cloud key)"
+            onClick={() => swap("fast")}
+            title="Pin the cloud FAST model (quick + cheap; needs a cloud key) — spoken only; shows the phrase to say"
           >
             FAST
           </button>
           <button
             className="icon-btn"
-            onClick={() => void swap("local", MODEL_SWAP_BUTTON_PHRASES.local)}
-            disabled={!shell || busy}
-            title="Pin the on-device model — NO cloud call (private), capability-limited"
+            onClick={() => swap("local")}
+            title="Pin the on-device model — NO cloud call (private), capability-limited — spoken only; shows the phrase to say"
           >
             LOCAL
           </button>
           <button
             className="icon-btn"
-            onClick={() => void swap("auto", MODEL_SWAP_BUTTON_PHRASES.auto)}
-            disabled={!shell || busy}
-            title="Clear the override — AUTO picks per turn by a heuristic (the config default resumes)"
+            onClick={() => swap("auto")}
+            title="Clear the override — AUTO picks per turn by a heuristic (the config default resumes) — spoken only; shows the phrase to say"
           >
             AUTO
           </button>
         </div>
         <div className="cred-hint">
-          {note ||
-            "Sends the same spoken model-control command the voice path uses. AUTO clears the override back to the config default."}
+          {note || MODEL_TIER_SPOKEN_ONLY_NOTE}
         </div>
       </div>
 
@@ -1129,11 +1080,14 @@ function ModelTierSection({
             capable tier. This is a routing HEURISTIC, not a measured accuracy.
           </li>
         </ul>
-        The buttons above set a RUNTIME override (it resets to the{" "}
+        The controls above do NOT set the override — they show the phrase to say.
+        A SPOKEN swap sets a RUNTIME override (it resets to the{" "}
         <code>conversation_route</code> default on restart); say{" "}
-        <b>&quot;use the most powerful model&quot;</b>,{" "}
-        <b>&quot;fast mode&quot;</b>, <b>&quot;work offline&quot;</b>, or{" "}
-        <b>&quot;auto&quot;</b> for the same effect by voice. Going LOCAL/offline is
+        <b>&quot;{MODEL_SWAP_BUTTON_PHRASES.heavy}&quot;</b>,{" "}
+        <b>&quot;{MODEL_SWAP_BUTTON_PHRASES.fast}&quot;</b>,{" "}
+        <b>&quot;{MODEL_SWAP_BUTTON_PHRASES.local}&quot;</b>, or{" "}
+        <b>&quot;{MODEL_SWAP_BUTTON_PHRASES.auto}&quot;</b> out loud to change it.
+        Going LOCAL/offline is
         a REAL privacy choice — the utterance and content stay on-device with no
         cloud call — but the on-device model is capability-limited and is NOT a
         substitute for the heavy cloud model on hard tasks. Every tier is subject to
@@ -1854,5 +1808,9 @@ function PolicyRuleRow({
  *  agent/recipient), so two rules on the same tool with different scopes do not
  *  collide. */
 function ruleKey(rule: PolicyRule): string {
-  return `${rule.tool} ${rule.agent ?? ""} ${rule.recipient ?? ""}`;
+  // The separator is U+0000 written as an ESCAPE, never a raw NUL byte in this
+  // source. Identical runtime string; but a literal NUL makes grep/ugrep classify
+  // this whole ~1800-line file as BINARY and silently skip it, so every grep-based
+  // audit (and every source-anchored guard) misses SettingsModal entirely.
+  return `${rule.tool}\u0000${rule.agent ?? ""}\u0000${rule.recipient ?? ""}`;
 }

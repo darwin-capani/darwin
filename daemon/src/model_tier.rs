@@ -1751,15 +1751,26 @@ mod tests {
         }
     }
 
-    // --- INTEGRATION SEAM: the HUD Settings buttons send phrases the classifier
-    //     MUST recognize. These four literals are the exact `swap(..)` phrases in
+    // --- INTEGRATION SEAM: the HUD Settings model-tier controls QUOTE these
+    //     phrases to the user, and the classifier MUST recognize each one. They are
+    //     the exact `MODEL_SWAP_BUTTON_PHRASES` literals in
     //     hud/src/components/SettingsModal.tsx; if either side drifts (e.g. the AUTO
-    //     button regresses to "auto, you pick the model", which classifies as None
+    //     phrase regresses to "auto, you pick the model", which classifies as None
     //     and would leak to the normal answer path instead of clearing the
     //     override), this test fails. Locks the round-trip neither suite covered.
+    //
+    //     THE CONTROLS DO NOT SEND THESE OVER THE COMMAND CHANNEL, and this comment
+    //     used to say they did. `classify_model_swap` is called from `router.rs`
+    //     ONLY (the SPOKEN path); the HUD's `{cmd:"ask"}` reaches
+    //     `LivePipeline::ask` -> `complete_with_tools`, which never enters the
+    //     router and has no model-tier tool. A clicked phrase therefore reached the
+    //     cloud brain as ordinary chat and set no override — so the LOCAL control
+    //     ("work offline, stay on device") egressed the very turn it was asking to
+    //     keep on-device. The HUD now shows the phrase to SAY instead of firing it,
+    //     which is why these literals still have to classify.
     #[test]
     fn settings_button_phrases_round_trip_to_their_intent() {
-        // (button label, exact phrase the SettingsModal click handler sends, intent)
+        // (control label, exact phrase the SettingsModal tells the user to SAY, intent)
         let cases: &[(&str, &str, ModelSwapIntent)] = &[
             ("HEAVY", "use the most powerful model", ModelSwapIntent::Heavy),
             ("FAST", "use the fast model", ModelSwapIntent::Fast),

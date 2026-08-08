@@ -704,9 +704,13 @@ export function VoiceIdBadge({ voiceId }: { voiceId: VoiceIdStatus | null }) {
 
 /** VOICE-ID ENROLLMENT CONTROLS — the "Enroll my voice" / "Forget my voice"
  *  affordances that sit under the voice_id.enabled toggle. PURE FRONTEND: they add
- *  NO new Tauri/daemon command — each button sends the SAME spoken phrase the voice
- *  path uses over the EXISTING `sendCommand({cmd:"ask", text})` bridge, and the
- *  daemon's `voiceid::classify_intent` drives the REAL flow.
+ *  NO new Tauri/daemon command, AND THEY SEND NOTHING — each shows the SAME spoken
+ *  phrase the voice path uses, because only that path reaches the daemon's
+ *  `voiceid::classify_intent` (see the block above `VOICE_ID_SPOKEN_ONLY_NOTE`).
+ *  This paragraph used to say each button "sends the phrase over the EXISTING
+ *  `sendCommand({cmd:"ask", text})` bridge"; that bridge lands in
+ *  `complete_with_tools`, never in `handle_voice_id`, which is exactly the bug the
+ *  controls were changed to stop repeating. The comment now matches the code.
  *
  *  HONESTY CONTRACT (do not regress):
  *   - This does NOT simulate success. Enrollment captures live MIC audio prompt by
@@ -752,7 +756,9 @@ export function VoiceIdEnrollControls({
   // ENROLL. If voice-id is not LIVE-enabled yet, enrollment can't reach the daemon
   // (its handler is gated on [voice_id].enabled), so we flip the toggle ON as a
   // pending change and say so honestly — we do NOT fire the phrase into a dead
-  // path. Once it is live-enabled, the button sends the real spoken enroll intent.
+  // path. Once it IS live-enabled the button still sends nothing: it shows the
+  // phrase to SAY. (This line used to end "the button sends the real spoken
+  // enroll intent" — it does not, and a click carries no voice to enrol.)
   const enroll = useCallback(async () => {
     if (busy) return;
     setConfirmForget(false);
@@ -770,8 +776,10 @@ export function VoiceIdEnrollControls({
     setNote(voiceIdSpokenInstruction(VOICE_ID_PHRASES.enroll));
   }, [busy, enabledLive, enabledDraft, onEdit]);
 
-  // FORGET — two-step. First click arms the confirm; the second sends the real
-  // spoken forget intent that clears the enrolled profile.
+  // FORGET — two-step. First click arms the confirm; the second shows the spoken
+  // forget phrase. (It used to say the second click "sends the real spoken forget
+  // intent that clears the enrolled profile" — it never cleared anything: the
+  // command channel does not reach `voiceid::classify_intent`.)
   const forget = useCallback(async () => {
     if (busy) return;
     if (!confirmForget) {
