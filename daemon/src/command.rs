@@ -1889,6 +1889,67 @@ pub fn write_command_token(root: &Path, token: &str) -> bool {
 #[cfg(test)]
 mod tests {
 
+    /// EVERY DAEMON VERB THE HUD CAN SEND MUST EXIST, AND VICE VERSA.
+    ///
+    /// The reachability hunt found SEVEN daemon verbs with no client at all —
+    /// implemented, gated, tested, and unreachable from the only GUI that ships.
+    /// The mirror failure is worse: a verb in the HUD's allow-list that the daemon
+    /// does not implement is a button that returns "unknown command" forever.
+    ///
+    /// This pins BOTH directions against the Tauri allow-list, so the two lists
+    /// cannot drift apart silently the way they had.
+    #[test]
+    fn the_hud_allow_list_and_the_daemon_verbs_agree() {
+        let daemon_src = include_str!("command.rs");
+        let tauri = include_str!("../../hud/src-tauri/src/command.rs");
+
+        // The daemon's verbs: the match arms of the request classifier.
+        let mut daemon_verbs: Vec<&str> = daemon_src
+            .lines()
+            .filter_map(|l| {
+                let t = l.trim();
+                t.strip_prefix('"')
+                    .and_then(|r| r.split_once("\" =>"))
+                    .map(|(name, _)| name)
+            })
+            .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .collect();
+        daemon_verbs.sort_unstable();
+        daemon_verbs.dedup();
+        assert!(daemon_verbs.len() > 10, "the verb scrape found too few: {daemon_verbs:?}");
+
+        // The allow-list block in the Tauri backend.
+        let list = tauri
+            .split("const ALLOWED_COMMANDS: &[&str] = &[")
+            .nth(1)
+            .and_then(|r| r.split_once("];"))
+            .map(|(b, _)| b)
+            .expect("the Tauri allow-list must exist");
+        // Only real list ENTRIES: skip comment lines, or a lowercase word quoted
+        // inside the prose (the block is heavily commented) is read as a verb.
+        let allowed: Vec<&str> = list
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.split('"').skip(1).step_by(2))
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .collect();
+        assert!(allowed.len() > 8, "the allow-list scrape found too few: {allowed:?}");
+
+        // EVERY allowed verb must be implemented — else the button is dead.
+        for v in &allowed {
+            assert!(
+                daemon_verbs.contains(v),
+                "the HUD may send {v:?}, but the daemon implements no such verb — \
+                 that button answers \"unknown command\" forever"
+            );
+        }
+        // `overnight` specifically: the verb this test was written alongside.
+        assert!(
+            allowed.contains(&"overnight"),
+            "overnight is implemented and gated daemon-side; it must be reachable"
+        );
+    }
+
     /// THE TYPED PATH CAN NOW DO WHAT THE SPOKEN PATH CAN, for the tier swap.
     ///
     /// The four Settings tier buttons sent {cmd:"ask", text:"<phrase>"}.

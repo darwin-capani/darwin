@@ -35,7 +35,14 @@ export type CommandVerb =
   // `{cmd:"panic"}`, never `{cmd:"ask"}`, so a panic can never leak to the answer
   // path; the reply carries `locked` so the HUD flips its indicator immediately.
   | "panic"
-  | "unlock";
+  | "unlock"
+  // OVERNIGHT — queue a task for the unattended runner. Carries {prompt, agent?}.
+  // Adds no new authority for a structural reason: overnight::run_real_task is a
+  // `complete_plain` call with NO TOOL LOOP, so a queued task can generate TEXT
+  // and nothing else — it is never offered a tool to send, post or actuate with.
+  // [overnight].enabled ships FALSE and the runner needs a cloud key; the daemon's
+  // ack names a missing dependency rather than promising work that will not run.
+  | "overnight";
 
 /** The typed request the deck hands the backend. One shape serves all verbs;
  *  per-verb requirements are enforced backend-side (and mirrored in the deck UI
@@ -43,6 +50,8 @@ export type CommandVerb =
 export interface CommandRequest {
   cmd: CommandVerb;
   text?: string;
+  /** The task body for `overnight`. */
+  prompt?: string;
   agent?: string;
   goal?: string;
   id?: string;

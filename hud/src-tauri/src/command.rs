@@ -92,6 +92,16 @@ const ALLOWED_COMMANDS: &[&str] = &[
     // token-injecting socket as every other verb (defense-in-depth: a too-thin /
     // empty request is rejected daemon-side).
     "design_voice", "create_pronunciation",
+    // OVERNIGHT — queue a task for the unattended runner. Carries {prompt, agent?}.
+    //
+    // ADDS NO NEW AUTHORITY, and the reason is structural rather than a promise:
+    // `overnight::run_real_task` is a `complete_plain` call — a plain completion
+    // with NO TOOL LOOP. A queued task can generate TEXT and nothing else; it
+    // cannot send, post, write or actuate, because it is never offered a tool.
+    // `[overnight].enabled` also ships FALSE, and the runner needs a cloud key, so
+    // the ack names the missing dependency rather than promising work that will
+    // not run (see overnight::enqueue).
+    "overnight",
     // Phase-3 Compose music — generate a FULL music track from a text PROMPT (the
     // daemon `compose_music` verb). Carries {prompt, length_ms?}: only the text
     // prompt (+ an optional bounded track length) leaves the device; the generated
