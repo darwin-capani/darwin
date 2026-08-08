@@ -9743,12 +9743,27 @@ pub(crate) fn edith_brief_now() -> String {
 /// `complete_with_tools` so a mission born of injected content cannot reset the
 /// egress guard to open on its sub-tasks' call 0 (the exfiltration bypass).
 pub(crate) async fn run_fury_mission(goal: &str, memory: &Memory, trusted: bool) -> String {
-    // VAULT MODE restrict-only gate: a mission must honor an active vault exactly like
-    // the direct-turn cloud decision does. run_fury_mission recomputes reachability
-    // from the key, so without this a vault-active Mission-mode turn would still plan +
-    // dispatch to the Anthropic cloud (the review's HIGH leak). deny_cloud can only
-    // REMOVE cloud (returns key_present && !vault_active), never add it.
-    let cloud_reachable = crate::vault::deny_cloud(resolve_api_key().await.is_some());
+    // VAULT + GUEST restrict-only gate: a mission must honor an active vault AND a
+    // guest turn exactly like the direct-turn cloud decision does. run_fury_mission
+    // recomputes reachability from the key, so without this a vault-active Mission-mode
+    // turn would still plan + dispatch to the Anthropic cloud (the review's HIGH leak).
+    //
+    // THE GUEST HALF WAS MISSING, and this is the THIRD cloud-decision seam — the two
+    // in router.rs (`route()` entry and the actuating `to_cloud`) both fold
+    // `threshold::deny_cloud` OVER `vault::deny_cloud`, and `command.rs`'s `ask` was
+    // brought to the same expression when it was found calling the cloud with no gate
+    // at all. This one applied vault only, so the composite the other three share did
+    // not hold here. Today no guest reaches it (`GUEST_READ_ONLY_TOOLS` does not admit
+    // `fury_mission`, and `execute_tool`'s scope gate refuses it), so this closes a
+    // PARITY gap rather than a live leak — which is exactly the shape that becomes a
+    // live leak the day the guest allowlist or a mission entry point moves.
+    //
+    // Both halves are RESTRICT-ONLY and COMPOSE: `guest OR vault -> local`. On the
+    // owner path, and in every BACKGROUND task (the guest scope is a per-turn
+    // task-local, so a standing tick / anticipation loop reads no scope), this is
+    // byte-for-byte `key_present`.
+    let cloud_reachable =
+        crate::threshold::deny_cloud(crate::vault::deny_cloud(resolve_api_key().await.is_some()));
     // SAFETY SNAPSHOT (snapshot.rs): before a consequential mission dispatches its
     // steps, anchor an APFS restore point so a later "undo that" can name a
     // concrete OS-level rollback target. Additive-benign (a COW marker; touches
@@ -23541,6 +23556,71 @@ mod embed_batching_tests {
              a larger daemon-side cap means every reindex of a real corpus is refused \
              and silently stored vector-less",
             crate::inference::EMBED_MAX_BATCH
+        );
+    }
+}
+
+#[cfg(test)]
+mod cloud_seam_tests {
+    /// EVERY CLOUD-DECISION SEAM FOLDS THE SAME TWO GATES, IN THE SAME ORDER.
+    ///
+    /// There are four places the daemon decides "may this reach the Anthropic cloud":
+    /// `router::route`'s entry `cloud_reachable`, the actuating `to_cloud`,
+    /// `command.rs`'s `LivePipeline::ask`, and `run_fury_mission` — which recomputes
+    /// reachability from the API key rather than inheriting the router's. The first
+    /// three fold `threshold::deny_cloud` OVER `vault::deny_cloud`; this one applied
+    /// VAULT ONLY. Both prior defects in this family were a gate present in one entry
+    /// point and absent in its sibling, and `ask` was fixed only after it shipped
+    /// sending a "go dark" turn to the cloud.
+    ///
+    /// Checked at the source because the distinguishing case is unobservable at
+    /// runtime: `resolve_api_key()` returns None in a test binary, so reachability is
+    /// already false and a behavioral assertion would pass against a build with NO
+    /// gate at all. The window is bounded to the function body (so it cannot pass on a
+    /// neighbour's code, nor on this test's own text) and the composite must precede
+    /// the dispatch it guards.
+    #[test]
+    fn run_fury_mission_folds_guest_over_vault_like_the_router() {
+        let src = include_str!("anthropic.rs");
+        // THE WINDOW ANCHOR IS ASSEMBLED, AND MUST BE UNIQUE. Written whole, the
+        // needle occurred TWICE in this file — at the definition AND on this very
+        // line — and `find` returned whichever came first. That is only safe by
+        // accident of source order: move this module above the definition (or add a
+        // second mention anywhere earlier) and the guard silently windows onto its
+        // own text and passes vacuously. `concat!` keeps the literal out of the
+        // haystack, and the count assertion turns a future duplicate into a FAILURE
+        // rather than a wrong window. The main.rs half of this batch already did
+        // this; its sibling here did not — the same "present in one, missing in the
+        // other" shape this whole hunt is about, applied to the guard itself.
+        let fn_anchor = concat!("pub(crate) async fn ", "run_fury_mission(");
+        assert_eq!(
+            src.matches(fn_anchor).count(),
+            1,
+            "`{fn_anchor}` must name exactly ONE site — the definition. With more \
+             than one, this guard can window onto the wrong region and pass without \
+             ever reading the gate it exists to pin"
+        );
+        let start = src
+            .find(fn_anchor)
+            .expect("run_fury_mission moved; re-point this guard");
+        let rest = &src[start..];
+        // Bound at the next top-level item so the search cannot drift downward.
+        let end = rest.find("\n}\n").map(|e| e + 2).unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let gate = body
+            .find("crate::threshold::deny_cloud(crate::vault::deny_cloud(")
+            .expect(
+                "run_fury_mission must fold the guest gate OVER the vault gate, the \
+                 same composite router.rs and command.rs use — vault alone lets a \
+                 local-only turn plan and dispatch against the owner's paid cloud",
+            );
+        let dispatch = body
+            .find("crate::mission::run_mission(")
+            .expect("run_fury_mission still dispatches through mission::run_mission");
+        assert!(
+            gate < dispatch,
+            "the reachability composite must be computed BEFORE the mission dispatch"
         );
     }
 }

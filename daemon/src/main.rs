@@ -2368,6 +2368,31 @@ async fn main() -> Result<()> {
     // TELEMETRY ORDER: emitted AFTER telemetry::init() — see DEFERRED STARTUP FRAMES.
     // vault.status is a STICKY-RETAINED key, so losing the boot emit meant a HUD that
     // connected later got no vault.status in its replay at all.
+
+    let state_dir = root.join("state");
+
+    // PANIC / LOCKDOWN emergency stop (task #12, lockdown.rs). Wire the persistence
+    // marker path and RE-ENTER lockdown if a prior panic left the marker on disk —
+    // BEFORE any consequential subsystem below can act, so a restart can never
+    // silently drop the emergency stop. With no marker (the normal cold start, and
+    // the shipped default) this comes up unlocked and every gate is byte-for-byte
+    // today. Lockdown is an OVERLAY: it forces gates OFF while engaged but never
+    // mutates the operator's [integrations]/[mcp]/[standing]/... switches, so an
+    // unlock restores their CONFIGURED state exactly.
+    //
+    // THIS USED TO SIT ~30 LINES BELOW THE MCP BLOCK, and the comment above ("BEFORE
+    // any consequential subsystem below can act") was false for the one startup
+    // subsystem that actually reaches the network. `McpManager::enabled()` ANDs in
+    // `!lockdown::is_locked_down()`, but it reads a process-global that ONLY this
+    // call populates from the on-disk marker — so at `connect_all` time the flag was
+    // still `false` on a machine that came up locked. A restart after a panic
+    // therefore spawned every configured stdio server and POSTed the user's Keychain
+    // bearer token to every configured remote endpoint: the exact opposite of what
+    // `lockdown::PANIC_CONFIRMATION` promises persists across a restart. The gate in
+    // mcp.rs was correct; this ordering was the other half of it. Nothing between
+    // here and the old site reads `state_dir`, so the move is otherwise inert.
+    let came_up_locked = lockdown::init(&state_dir);
+
     // MCP CLIENT (docs/SANDBOX.md): connect every configured external tool server
     // ONCE at startup, then install the connected manager as the process-global so
     // the cloud tool loop can offer + route its tools WITHOUT threading a manager
@@ -2400,18 +2425,9 @@ async fn main() -> Result<()> {
     //     every store ENCRYPTED with that key. Honest scope: the four SQLite stores
     //     + the voiceid profile are encrypted AT REST ON DISK; the config TOML, the
     //     Keychain item, and the in-RAM working set/key are NOT (see crypto.rs).
-    let state_dir = root.join("state");
-
-    // PANIC / LOCKDOWN emergency stop (task #12, lockdown.rs). Wire the persistence
-    // marker path and RE-ENTER lockdown if a prior panic left the marker on disk —
-    // BEFORE any consequential subsystem below can act, so a restart can never
-    // silently drop the emergency stop. With no marker (the normal cold start, and
-    // the shipped default) this comes up unlocked and every gate is byte-for-byte
-    // today. Lockdown is an OVERLAY: it forces gates OFF while engaged but never
-    // mutates the operator's [integrations]/[mcp]/[standing]/... switches, so an
-    // unlock restores their CONFIGURED state exactly.
-    let came_up_locked = lockdown::init(&state_dir);
-
+    // (`state_dir` + `lockdown::init` are established ABOVE the MCP block — the
+    // emergency stop has to be live before the first subsystem that touches the
+    // network.)
     let master_key = resolve_encryption_key(cfg.security.encrypt_memory, &state_dir).await;
 
     // ENCLAVE CUSTODY (enclave.rs, ADDITIVE over the Keychain path). Purely a
@@ -5561,6 +5577,65 @@ mod tests {
     use std::io::Write;
     use std::time::Duration;
 
+    /// THE EMERGENCY STOP MUST BE RE-ENTERED BEFORE THE FIRST SUBSYSTEM THAT
+    /// TOUCHES THE NETWORK.
+    ///
+    /// `McpManager::enabled()` ANDs in `!lockdown::is_locked_down()`, and
+    /// `mcp::tests::a_locked_down_manager_connects_to_nothing` proves that gate
+    /// works — but it reads a process-global that ONLY `lockdown::init` populates
+    /// from the on-disk marker. `connect_all` used to run ~30 lines ABOVE that init,
+    /// so on a machine that came up locked the flag was still `false` at connect
+    /// time and the gate fell open: every configured stdio server was spawned and
+    /// the user's Keychain bearer token was POSTed to every configured remote
+    /// endpoint. `lockdown::PANIC_CONFIRMATION` promises the stop "persists across a
+    /// restart"; for the one startup subsystem that reaches the network, it did not.
+    ///
+    /// The gate lives in mcp.rs and is behaviorally tested there; THIS is the other
+    /// half — the startup ORDER — which no runtime test can reach (`main()` is not
+    /// callable from a test). Checked at the source, and deliberately NOT with a
+    /// bare `contains`: the needles are assembled with `concat!` so this test's own
+    /// body cannot satisfy the search (a self-matching guard is how the last
+    /// source-anchored assertion in this tree passed vacuously), comment lines are
+    /// skipped so prose about the ordering cannot stand in for it, and each needle
+    /// must match EXACTLY ONCE so a rename fails the test instead of rotting it.
+    #[test]
+    fn lockdown_is_reentered_before_the_first_networked_subsystem() {
+        let src = include_str!("main.rs");
+        // Assembled, never written whole — so the literals below are not themselves
+        // matches. Each names the CALL, not the module or the function.
+        let lockdown_call = concat!("lockdown::", "init(&state_dir)");
+        let mcp_connect = concat!("mcp_manager.", "connect_all(&root)");
+
+        let find_one = |needle: &str, what: &str| -> usize {
+            let hits: Vec<usize> = src
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| !l.trim_start().starts_with("//") && l.contains(needle))
+                .map(|(i, _)| i)
+                .collect();
+            assert_eq!(
+                hits.len(),
+                1,
+                "expected exactly one non-comment {what} call site (`{needle}`); found {} — \
+                 the needle has rotted or the call moved, and this guard would pass vacuously",
+                hits.len()
+            );
+            hits[0]
+        };
+
+        let lockdown_line = find_one(lockdown_call, "lockdown re-entry");
+        let connect_line = find_one(mcp_connect, "MCP connect");
+        assert!(
+            lockdown_line < connect_line,
+            "lockdown::init runs at line {} but the MCP connect runs at line {} — the \
+             connect gate reads a flag that is still false, so a restart after a panic \
+             spawns every stdio server and POSTs the Keychain bearer to every remote \
+             endpoint",
+            lockdown_line + 1,
+            connect_line + 1
+        );
+    }
+
     /// REGRESSION: a realm orphaned by an abrupt kill (SIGKILL / power loss —
     /// `RealmTeardown`'s Drop never runs) is a full COW copy of the user's repo
     /// under `state/realms/<ts>/`. Nothing swept it, so they accumulated one per
@@ -6013,4 +6088,39 @@ mod encryption_migration_tests {
         names.dedup();
         assert_eq!(names.len(), n, "a store would be migrated twice");
     }
+    /// LOCKDOWN MUST BE LOADED BEFORE ANYTHING THAT REACHES THE NETWORK IS BUILT.
+    ///
+    /// `McpManager::enabled()` correctly ANDs in `!lockdown::is_locked_down()`, and
+    /// mcp.rs proves that gate behaviorally. But the flag it reads is populated
+    /// ONLY by `lockdown::init`, and `main()` constructed the manager THIRTY-TWO
+    /// LINES BEFORE calling it. So on the restart after a panic — the case the
+    /// persisted marker exists for — the one startup subsystem that reaches the
+    /// network came up consulting a flag that was still false.
+    ///
+    /// `main()` cannot be driven from a unit test, so this pins the ORDER by
+    /// source. It is scoped to `main` and asserts positions, not mere presence:
+    /// asserting both calls "exist" would pass on the broken order, which is the
+    /// whole defect.
+    #[test]
+    fn lockdown_is_initialised_before_the_mcp_manager_is_built() {
+        let src = include_str!("main.rs");
+        // Scope to main(), so a mention in a comment or a test elsewhere in this
+        // file cannot satisfy it.
+        let start = src.find("async fn main()").expect("main must exist");
+        let body = &src[start..];
+
+        let init = body
+            .find("lockdown::init(")
+            .expect("main must load the persisted lockdown marker");
+        let mcp = body
+            .find("McpManager::new(")
+            .expect("main must build the MCP manager");
+        assert!(
+            init < mcp,
+            "lockdown::init must run BEFORE McpManager::new — the manager's gate \
+             reads a flag only init populates, so building it first lets MCP come \
+             up live on the restart after a panic (init at {init}, mcp at {mcp})"
+        );
+    }
+
 }

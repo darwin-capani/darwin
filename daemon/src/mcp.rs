@@ -1235,12 +1235,13 @@ impl McpManager {
         // Lockdown-aware (see `connectable_servers`): a locked-down daemon connects
         // NOTHING, so no subprocess is spawned and no bearer token leaves the host.
         //
-        // ORDERING CAVEAT — STILL OPEN AT THE CALL SITE: `lockdown::is_locked_down`
-        // reads a flag that `lockdown::init` populates from the on-disk marker, and
-        // main.rs currently calls `connect_all` ~30 lines BEFORE `lockdown::init`.
-        // Until that init is moved above the MCP block, a restart on a locked-down
-        // machine still sees the flag false here. This gate is correct and is the
-        // half that belongs in this module; the startup ordering is the other half.
+        // ORDERING — NOW CLOSED AT THE CALL SITE: `lockdown::is_locked_down` reads a
+        // flag that only `lockdown::init` populates from the on-disk marker, and
+        // main.rs used to call `connect_all` ~30 lines BEFORE that init, so a restart
+        // on a locked-down machine read the flag as `false` here and connected
+        // everything anyway. `lockdown::init` now runs ABOVE the MCP block; the
+        // ordering is pinned by main.rs's
+        // `lockdown_is_reentered_before_the_first_networked_subsystem`.
         if !self.enabled() {
             info!("mcp: disabled (config or lockdown) — no server connected");
             return Ok(());

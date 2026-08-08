@@ -347,12 +347,43 @@ pub fn is_live(now: Instant) -> bool {
     match guard.as_ref() {
         Some(p) if now.duration_since(p.created_at) <= PENDING_TTL => true,
         Some(_) => {
-            // Aged out — drop it so a later "yes" can never revive it.
-            *guard = None;
+            // Aged out — drop it so a later "yes" can never revive it, AND drop the
+            // prompt that named it (see `retire_slot`). Note this arm ONLY: on the
+            // LIVE arm above PROMPTED must survive, because `run_pipeline` calls this
+            // predicate on every single utterance.
+            retire_slot(&mut guard);
             false
         }
         None => false,
     }
+}
+
+/// EMPTY THE SLOT AND THE PROMPT TOGETHER. The one place a pending is retired
+/// outside a successful [`take_live`].
+///
+/// THE PAIRING IS THE INVARIANT, AND IT USED TO HOLD IN ONLY ONE DIRECTION.
+/// [`take_live`]'s guard reasons that "nothing nulls PROMPTED without also nulling
+/// the slot" — true, and it is what makes `slot == Some && PROMPTED == None`
+/// diagnostic of an unattended park. But the CONVERSE was false: four paths emptied
+/// the SLOT and left PROMPTED pointing at the retired action — [`is_live`] and
+/// [`peek_pending`] on expiry, and [`confirm_by_id`] / [`deny_by_id`] on both their
+/// matched and expired arms. `is_live` runs on EVERY utterance, so a prompt the user
+/// simply never answered left a permanent stale PROMPTED id behind.
+///
+/// A stale PROMPTED is live authorization for one exact content id. Ids are derived
+/// from `agent || tool || canonical(input)`, and a standing mission re-proposes the
+/// SAME action verbatim on its next tick — so the background park that follows
+/// (correctly `park_ctx(false, ..)`, arming nothing) matched the leftover id anyway,
+/// and the operator's next "yes" to anything at all fired it. That is precisely the
+/// hijack `take_live`'s `p.id == id` check exists to stop, reached through the
+/// leftover instead of through PROMPTED being armed.
+///
+/// Clearing both is RESTRICT-ONLY: it can only turn a would-be match into a refusal.
+/// A park the user was genuinely prompted with re-arms PROMPTED at `park_inner`.
+fn retire_slot(guard: &mut std::sync::MutexGuard<'_, Option<PendingConfirmation>>) {
+    **guard = None;
+    // Same nesting order `take_live` already uses (PENDING outer, PROMPTED inner).
+    *prompted_lock() = None;
 }
 
 /// ATOMICALLY take the live pending confirmation, clearing the slot. Returns
@@ -378,6 +409,12 @@ pub fn take_live(now: Instant) -> Option<PendingConfirmation> {
         // PROMPTED without also nulling the slot: `clear()` nulls both, and a
         // successful `take_live` nulls both. So `slot == Some && PROMPTED == None`
         // holds if and only if the park DECLARED IT DID NOT REACH THE USER.
+        //
+        // The CONVERSE now holds too, and it did not always: every other path that
+        // empties the slot (expiry in `is_live`/`peek_pending`, a by-id confirm or
+        // deny) goes through `retire_slot`, which nulls PROMPTED with it. Without
+        // that, a prompt the operator never answered outlived its action and
+        // authorized the next park carrying the same content id — see `retire_slot`.
         //
         // Which means the fallback fired exactly and only in the case the guard
         // exists to catch. A standing-mission tick, tripwire, durable-mission
@@ -439,7 +476,7 @@ pub fn peek_pending(now: Instant) -> Option<PendingView> {
             preview: p.preview.clone(),
         }),
         Some(_) => {
-            *guard = None; // aged out
+            retire_slot(&mut guard); // aged out — slot AND prompt
             None
         }
         None => None,
@@ -477,19 +514,24 @@ pub enum ByIdConfirm {
 pub fn confirm_by_id(id: &str, now: Instant) -> ByIdConfirm {
     let mut guard = lock();
     match guard.as_ref() {
-        // Live + id matches: take it (clearing the slot) and hand it back.
+        // Live + id matches: take it (clearing the slot) and hand it back. The
+        // PROMPT that named it goes with it (see `retire_slot`) — this action is
+        // answered, so nothing may still be authorized to fire under its id.
         Some(p) if now.duration_since(p.created_at) <= PENDING_TTL && p.id == id => {
-            ByIdConfirm::Matched(guard.take().expect("just matched Some"))
+            let taken = guard.take().expect("just matched Some");
+            *prompted_lock() = None;
+            ByIdConfirm::Matched(taken)
         }
         // Live but the id does NOT match: leave the real pending intact, fire
-        // nothing. A wrong/fabricated id is a no-op, never a replay.
+        // nothing. A wrong/fabricated id is a no-op, never a replay. PROMPTED is
+        // left alone too — the real pending is still awaiting its own answer.
         Some(p) if now.duration_since(p.created_at) <= PENDING_TTL => {
             let _ = p;
             ByIdConfirm::NoMatch
         }
-        // Expired: drop the stale slot, nothing to confirm.
+        // Expired: drop the stale slot AND its prompt, nothing to confirm.
         Some(_) => {
-            *guard = None;
+            retire_slot(&mut guard);
             ByIdConfirm::NoMatch
         }
         None => ByIdConfirm::NoMatch,
@@ -504,18 +546,18 @@ pub fn deny_by_id(id: &str, now: Instant) -> bool {
     let mut guard = lock();
     match guard.as_ref() {
         Some(p) if now.duration_since(p.created_at) <= PENDING_TTL && p.id == id => {
-            *guard = None;
+            retire_slot(&mut guard);
             true
         }
         // Live but non-matching id: leave it alone (a wrong id must not clear
-        // the genuine pending out from under the user).
+        // the genuine pending out from under the user), PROMPTED included.
         Some(p) if now.duration_since(p.created_at) <= PENDING_TTL => {
             let _ = p;
             false
         }
-        // Expired or none: nothing to deny; drop a stale slot if present.
+        // Expired or none: nothing to deny; drop a stale slot AND its prompt.
         Some(_) => {
-            *guard = None;
+            retire_slot(&mut guard);
             false
         }
         None => false,
@@ -1406,6 +1448,99 @@ mod hijack_tests {
         let _guard = slot_guard();
         park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
         let taken = take_live(Instant::now()).expect("the user's own park must confirm");
+        assert_eq!(taken.tool, "gmail_send");
+    }
+
+    /// A PROMPT THAT WAS NEVER ANSWERED MUST NOT AUTHORIZE THE NEXT IDENTICAL PARK.
+    ///
+    /// The slot and the prompt used to come apart. `is_live` — which `run_pipeline`
+    /// calls on EVERY utterance for the self-echo and wake-word guards — dropped an
+    /// EXPIRED pending but left PROMPTED pointing at it. Ids are content-derived
+    /// (`agent || tool || canonical(input)`), and a standing mission re-proposes the
+    /// same action verbatim on its next tick, so the background park that followed —
+    /// correctly declaring `park_ctx(false, ..)` and arming nothing — matched the
+    /// leftover id anyway. `take_live` then handed it over on the operator's next
+    /// "yes" to anything at all: the exact hijack the `p.id == id` check exists to
+    /// stop, reached through the leftover instead of through PROMPTED being armed.
+    ///
+    /// Drives the REAL clock: the pending is backdated past PENDING_TTL rather than
+    /// mocked, so the expiry branch under test is the one production takes.
+    #[test]
+    fn an_expired_prompt_does_not_authorize_an_identical_background_park() {
+        let _guard = slot_guard();
+
+        // The operator IS prompted for ALPHA, and never answers.
+        let mut alpha = pending("orchestrator", "gmail_send", "ALPHA");
+        alpha.created_at = Instant::now() - (PENDING_TTL + Duration::from_secs(1));
+        park_ctx(true, alpha);
+        // PRECONDITION: the slot really did age out, and `is_live` really is the
+        // thing that retires it (this is the call run_pipeline makes every turn).
+        assert!(!is_live(Instant::now()), "the park must be past its TTL");
+        assert!(lock().is_none(), "is_live must have dropped the expired slot");
+
+        // A standing tick re-proposes the SAME action verbatim — same agent, tool
+        // and input, hence the SAME content id — and honestly declares that nobody
+        // was prompted for it.
+        park_ctx(false, pending("orchestrator", "gmail_send", "ALPHA"));
+
+        assert!(
+            take_live(Instant::now()).is_none(),
+            "a stale prompt authorized an unattended re-park: the operator's next \
+             'yes' fires an action they were never read"
+        );
+        // And the background park is still parked, waiting for its own confirm.
+        assert!(lock().is_some(), "the unattended action was consumed as collateral");
+        let _ = take_live(Instant::now());
+    }
+
+    /// The by-id channel answers a prompt too, so it must retire it too.
+    ///
+    /// `confirm_by_id` / `deny_by_id` emptied the slot and left PROMPTED behind — so
+    /// after the operator resolved ALPHA from the HUD, the next background park of an
+    /// identical ALPHA inherited that authorization. Both verbs are covered; the
+    /// non-matching-id arms must still leave a live prompt alone.
+    #[test]
+    fn resolving_by_id_retires_the_prompt_it_answered() {
+        for resolve_by_id in [true, false] {
+            let _guard = slot_guard();
+            park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
+            let id = peek_pending(Instant::now()).expect("parked").id;
+            if resolve_by_id {
+                assert!(
+                    matches!(confirm_by_id(&id, Instant::now()), ByIdConfirm::Matched(_)),
+                    "the id names the parked action"
+                );
+            } else {
+                assert!(deny_by_id(&id, Instant::now()), "the id names the parked action");
+            }
+            assert!(lock().is_none(), "the slot is empty after a by-id resolution");
+
+            // The same action comes back from an unattended tick.
+            park_ctx(false, pending("orchestrator", "gmail_send", "ALPHA"));
+            assert!(
+                take_live(Instant::now()).is_none(),
+                "an already-answered prompt (via {}) still authorized the next \
+                 unattended park of the same action",
+                if resolve_by_id { "confirm_by_id" } else { "deny_by_id" }
+            );
+            let _ = take_live(Instant::now());
+        }
+    }
+
+    /// RESTRICT-ONLY CHECK: retiring the prompt alongside the slot must not break the
+    /// ordinary flow. A live (non-expired) `is_live` / `peek_pending` — both of which
+    /// run on every turn — must LEAVE the prompt armed, and a wrong id must clear
+    /// neither, so the operator's real "confirm" still lands.
+    #[test]
+    fn peeking_at_a_live_pending_leaves_the_prompt_armed() {
+        let _guard = slot_guard();
+        park_ctx(true, pending("orchestrator", "gmail_send", "ALPHA"));
+        assert!(is_live(Instant::now()), "still within the TTL");
+        assert!(peek_pending(Instant::now()).is_some());
+        // A fabricated id must not disarm the real prompt either.
+        assert!(matches!(confirm_by_id("deadbeefdeadbeef", Instant::now()), ByIdConfirm::NoMatch));
+        assert!(!deny_by_id("deadbeefdeadbeef", Instant::now()));
+        let taken = take_live(Instant::now()).expect("the operator's own confirm must still land");
         assert_eq!(taken.tool, "gmail_send");
     }
 
