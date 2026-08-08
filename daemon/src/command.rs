@@ -1207,6 +1207,43 @@ impl LivePipeline {
 
     /// Resolve the requested agent (or the orchestrator when none/unknown). The
     /// returned agent's `tools` is the allowlist `complete_with_tools` enforces.
+    /// Answer with the ON-DEVICE brain: the resident 4B plus the bounded
+    /// local-tool loop. `None` when the local path produced nothing (local tools
+    /// disabled, or the loop fell through without data) — the caller then says so
+    /// honestly rather than inventing an answer.
+    ///
+    /// Shared by BOTH degrade paths so they cannot drift: vault/guest (the cloud
+    /// is refused) and no-key/cloud-error (the cloud is unreachable). Those are
+    /// different reasons for the same situation — no cloud this turn — and the
+    /// user should get the same working assistant either way.
+    async fn answer_locally(
+        &self,
+        text: &str,
+        facts: &[(String, String)],
+        mem: &crate::memory::Memory,
+        agent: &crate::agents::Agent,
+    ) -> Option<String> {
+        let mut infer = crate::inference::InferenceClient::new(self.inference_sock.clone());
+        // The cloud loop takes grounded facts as (key, value) pairs; the local
+        // loop takes them already rendered. Same facts, different shape.
+        let local_facts: Vec<String> =
+            facts.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+        let outcome = crate::anthropic::complete_with_local_tools(
+            &self.cfg,
+            &mut infer,
+            self.max_tokens,
+            text,
+            &[],
+            &local_facts,
+            mem,
+            &agent.tools,
+            &agent.namespace,
+        )
+        .await?;
+        let data = outcome.data.trim();
+        (!data.is_empty()).then(|| data.to_string())
+    }
+
     fn resolve_agent<'a>(&'a self, agent: Option<&str>) -> &'a crate::agents::Agent {
         agent
             .and_then(|a| self.agents.get(a))
@@ -1331,31 +1368,14 @@ impl CommandPipeline for LivePipeline {
         if !cloud_ok {
             // Degrade to the LOCAL tool loop — the same fallback the spoken path
             // takes — rather than refusing the turn outright.
-            let mut infer = crate::inference::InferenceClient::new(self.inference_sock.clone());
-            // The cloud loop takes grounded facts as (key, value) pairs; the local
-            // loop takes them already rendered. Same facts, different shape.
-            let local_facts: Vec<String> =
-                facts.iter().map(|(k, v)| format!("{k}: {v}")).collect();
-            if let Some(outcome) = crate::anthropic::complete_with_local_tools(
-                &self.cfg,
-                &mut infer,
-                self.max_tokens,
-                text,
-                &[],
-                &local_facts,
-                mem,
-                &agent.tools,
-                &agent.namespace,
-            )
-            .await
-            {
-                if !outcome.data.trim().is_empty() {
-                    return outcome.data;
-                }
-            }
-            return "I'm in vault mode, sir — this one stays on the device, so I \
-                    answered it locally."
-                .to_string();
+            return self
+                .answer_locally(text, &facts, mem, agent)
+                .await
+                .unwrap_or_else(|| {
+                    "I'm in vault mode, sir — this one stays on the device, so I \
+                     answered it locally."
+                        .to_string()
+                });
         }
         // Stateless turn: empty history. A consequential tool parks inside the
         // loop (execute_tool) and the returned text is the confirmation prompt —
@@ -1377,9 +1397,34 @@ impl CommandPipeline for LivePipeline {
         .await
         {
             Ok(reply) => reply,
-            // No cloud key / cloud error: an honest, secret-free line (never a
-            // crash, never a leaked error body).
-            Err(_) => "I can't reach the cloud to handle that right now, sir.".to_string(),
+            // NO CLOUD KEY / CLOUD ERROR -> FALL BACK TO THE ON-DEVICE BRAIN.
+            //
+            // WHAT WENT WRONG: this returned "I can't reach the cloud to handle
+            // that right now, sir." and stopped. On a machine with no API key —
+            // the shipped state, since the key is optional — that made the HUD
+            // command deck answer NOTHING useful, ever, while the entire local
+            // stack sat right there: the resident 4B, the bounded local-tool loop
+            // (`[local_tools].enabled` ships TRUE), memory, doc and episodic
+            // recall.
+            //
+            // The inconsistency was the tell. The VAULT branch above already
+            // degrades to exactly this fallback, and config/darwin.toml documents
+            // the intended behavior for the spoken path: "with no key (or on a
+            // cloud error) conversation degrades to the local 4B". Only the typed
+            // path refused — so "go dark" gave you a working assistant and simply
+            // having no key gave you an apology.
+            //
+            // Honest when the local path has nothing either: the message below is
+            // kept for that case, and it no longer claims the cloud is the only
+            // way to answer.
+            Err(_) => self
+                .answer_locally(text, &facts, mem, agent)
+                .await
+                .unwrap_or_else(|| {
+                    "I can't reach the cloud, sir, and the on-device brain had \
+                     nothing to add on that one."
+                        .to_string()
+                }),
         }
     }
 
@@ -1727,6 +1772,53 @@ pub fn write_command_token(root: &Path, token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// BOTH REASONS FOR "NO CLOUD THIS TURN" MUST DEGRADE THE SAME WAY.
+    ///
+    /// The vault/guest branch refuses the cloud deliberately. The Err branch means
+    /// the cloud is unreachable — most commonly NO API KEY, which is the shipped
+    /// state since the key is optional. Those are different reasons for the same
+    /// situation, and the user should get the same working assistant either way.
+    ///
+    /// They did not. Vault degraded to the on-device brain; no-key returned
+    /// "I can't reach the cloud to handle that right now, sir." and stopped. So on
+    /// a machine with no key the HUD command deck answered nothing useful, ever,
+    /// while the resident 4B, the bounded local-tool loop (`[local_tools].enabled`
+    /// ships TRUE), memory and doc/episodic recall sat unused. Saying "go dark"
+    /// got you a working assistant; simply having no key got you an apology.
+    ///
+    /// `ask` reaches the network, so this pins the call sites by SOURCE — scoped
+    /// to the `ask` body, bounded at the next same-indent fn so it cannot drift.
+    #[test]
+    fn both_no_cloud_paths_fall_back_to_the_on_device_brain() {
+        let src = include_str!("command.rs");
+        let start = src
+            .find("    async fn ask(&self, text: &str, agent: Option<&str>) -> String {")
+            .expect("the ask arm must exist");
+        let rest = &src[start + 40..];
+        let end = rest
+            .find("\n    async fn ")
+            .or_else(|| rest.find("\n    fn "))
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let calls = body.matches("self\n                .answer_locally(").count()
+            + body.matches(".answer_locally(").count();
+        assert!(
+            calls >= 2,
+            "both the vault/guest branch AND the cloud-error branch must degrade to \
+             answer_locally; found {calls} call(s) in the ask body"
+        );
+        // The Err arm specifically — a fallback only on the vault side is the bug.
+        let err_arm = body
+            .split("Err(_) =>")
+            .nth(1)
+            .expect("ask must still handle a cloud error");
+        assert!(
+            err_arm[..err_arm.len().min(400)].contains("answer_locally"),
+            "the cloud-error arm must try the on-device brain before giving up"
+        );
+    }
 
     /// ...AND THE `ask` ARM ACTUALLY BRANCHES ON IT.
     ///
