@@ -1459,6 +1459,45 @@ impl CommandPipeline for LivePipeline {
             return intent.ack().to_string();
         }
 
+        // CONTEST A BELIEF — a ROUTER intent with no tool, and a DESTRUCTIVE one.
+        //
+        // The mirror panel's contest control sent {cmd:"ask", text:"that's wrong
+        // about <subject>"}. `contest_belief` is called only from `route()`
+        // (router.rs), the `ask` verb lands in `complete_with_tools`, and the
+        // user_model tool family is query / correct / forget — `correct` OVERRIDES
+        // an observation while contest DROPS it and writes a permanent suppression
+        // tombstone. Different operations, so at best the model silently picked the
+        // wrong one.
+        //
+        // THIS ONE DESTROYS DATA: the belief is dropped AND suppressed, and the
+        // tombstone stops it being re-learned. It is handled here so the typed path
+        // can do what the spoken path does — behind the SAME rails.
+        //
+        // GUEST RAIL: a guest may not edit the owner's model at all. The spoken arm
+        // sits behind the voice-id all-scope gate for the same reason; here that is
+        // `threshold::deny_cloud`, which is false exactly on a guest turn.
+        if let Some(crate::user_model::MirrorIntent::Contest(subject)) =
+            crate::user_model::classify_mirror_intent(text)
+        {
+            if !crate::threshold::deny_cloud(true) {
+                return "Only the owner can change what I've learned, sir.".to_string();
+            }
+            return match crate::user_model::contest_belief(mem, &subject).await {
+                Ok(c) if c.any() => c.text(&subject),
+                // NOTHING MATCHED is not a failure and must not read as one — a
+                // silent "done" on a no-op is how the user believes a belief is
+                // gone when it is not.
+                Ok(_) => format!(
+                    "I don't hold a belief about {subject} to drop, sir — nothing changed."
+                ),
+                Err(e) => {
+                    warn!(error = %e, "contest_belief failed on the command channel");
+                    "I couldn't reach what I've learned just now, sir — nothing was changed."
+                        .to_string()
+                }
+            };
+        }
+
         // VAULT / GUEST: is the cloud reachable for THIS turn at all?
         //
         // WHAT WENT WRONG: this arm called the cloud loop directly, with no
@@ -1888,6 +1927,57 @@ pub fn write_command_token(root: &Path, token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE DESTRUCTIVE ROUTER INTENTS ARE HANDLED BEFORE THE CLOUD, AND BEHIND THE
+    /// SAME RAILS THE SPOKEN PATH USES.
+    ///
+    /// `contest_belief` DROPS a belief and writes a permanent suppression
+    /// tombstone that stops it being re-learned. It was reachable only from
+    /// `route()`; the mirror button sent {cmd:"ask"} and at best the model picked
+    /// `user_model_correct`, which OVERRIDES rather than drops — the wrong
+    /// operation, silently.
+    ///
+    /// Pinned by source, scoped to the `ask` body, asserting ORDER and the rail.
+    #[test]
+    fn the_contest_arm_runs_before_the_cloud_and_keeps_the_guest_rail() {
+        let src = include_str!("command.rs");
+        let start = src
+            .find("    async fn ask(&self, text: &str, agent: Option<&str>) -> String {")
+            .expect("the ask arm must exist");
+        let rest = &src[start + 40..];
+        let end = rest
+            .find("\n    async fn ")
+            .or_else(|| rest.find("\n    fn "))
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let classify = body
+            .find("classify_mirror_intent(text)")
+            .expect("ask must consult the mirror classifier — else the button is dead");
+        let call = body
+            .find("contest_belief(mem, &subject)")
+            .expect("ask must actually contest, not just classify");
+        let cloud = body
+            .find("crate::anthropic::complete_with_tools(")
+            .expect("ask still calls the cloud loop");
+        assert!(classify < call && call < cloud, "classify -> contest -> (never) cloud");
+
+        // The guest rail, bounded to THIS arm — scoping wider self-matches on the
+        // vault gate's own deny_cloud, which is how an earlier guard of mine
+        // passed with the rail deleted.
+        let arm = &body[classify..call];
+        assert!(
+            arm.contains("threshold::deny_cloud"),
+            "a guest must not be able to delete the owner's beliefs"
+        );
+        // A no-op must not read as success: dropping nothing and saying nothing is
+        // how a user believes a belief is gone when it is not.
+        let after = &body[call..cloud];
+        assert!(
+            after.contains("nothing changed"),
+            "a contest that matched no belief must say so, not imply a drop"
+        );
+    }
 
     /// EVERY DAEMON VERB THE HUD CAN SEND MUST EXIST, AND VICE VERSA.
     ///

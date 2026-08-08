@@ -42,6 +42,15 @@ export type CommandVerb =
   // and nothing else — it is never offered a tool to send, post or actuate with.
   // [overnight].enabled ships FALSE and the runner needs a cloud key; the daemon's
   // ack names a missing dependency rather than promising work that will not run.
+  // SELF-DISTILLATION — the on-device personalization loop.
+  //   `distill` trains + stages a LoRA adapter; `distill_promote` makes it live
+  //   ONLY if a held-out eval shows it beats base by [distill].min_improvement
+  //   (so a click cannot install a worse model); `distill_rollback` clears it.
+  // [distill].enabled ships FALSE. Nothing here reaches the network — training,
+  // eval and promotion are on-device.
+  | "distill"
+  | "distill_promote"
+  | "distill_rollback"
   | "overnight";
 
 /** The typed request the deck hands the backend. One shape serves all verbs;

@@ -310,10 +310,16 @@ export default function App() {
   // suppression), and the spoken path is where the router's gates live. Making it
   // clickable would move a destructive op off the gated path, which is a decision
   // for the owner, not a wiring fix.
-  const contestBelief = useCallback((belief: MirrorBelief) => {
+  // The daemon handles this intent on the command channel now (LivePipeline::ask,
+  // before any cloud call), calling the same `user_model::contest_belief` the
+  // router calls and keeping the same guest rail. So the click drops the belief
+  // for real — and the daemon's own words are shown, never a fabricated success:
+  // a contest that matched nothing says so rather than implying a drop.
+  const contestBelief = useCallback(async (belief: MirrorBelief) => {
     const subject = belief.subject.replace(/_/g, " ").trim();
     if (subject === "") return;
-    setContestHint(`Say "that's wrong about ${subject}" out loud — contesting a belief drops it permanently, so it runs on the spoken path where the confirmation gates are.`);
+    const r = await sendCommand({ cmd: "ask", text: `that's wrong about ${subject}` });
+    setContestHint(r.ok ? r.reply || "" : r.error || "command failed");
   }, []);
 
   // Dev-only: lets `vite dev` sessions inject actions/envelopes without a

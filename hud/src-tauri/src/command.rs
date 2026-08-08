@@ -102,6 +102,26 @@ const ALLOWED_COMMANDS: &[&str] = &[
     // the ack names the missing dependency rather than promising work that will
     // not run (see overnight::enqueue).
     "overnight",
+    // SELF-DISTILLATION — the three verbs of the on-device personalization loop.
+    //   `distill`          trains + STAGES a LoRA adapter. Local only.
+    //   `distill_promote`  makes a staged adapter live, IF it measurably helps.
+    //   `distill_rollback` clears the live adapter; the next load serves base.
+    //
+    // WHAT BOUNDS PROMOTE — structural, not a promise. `distill::promote_last`
+    // refuses unless `[distill].enabled` (SHIPS FALSE), a TRAINED manifest exists,
+    // and the staged `adapters.safetensors` is actually on disk ("I won't promote
+    // a phantom"). It then runs a HELD-OUT EVAL, base vs adapter loss over the
+    // run's own test split, and promotes only when the improvement clears
+    // `[distill].min_improvement`. A click cannot install a worse model; the gate
+    // measures first and refuses.
+    //
+    // ROLLBACK is the inverse and is idempotent — with nothing promoted it says so
+    // rather than implying an adapter had been live.
+    //
+    // Nothing here reaches the network: training, eval and promotion are on-device
+    // (mlx-lm on Apple Silicon), and the daemon never fabricates readiness.
+    "distill", "distill_promote", "distill_rollback",
+
     // Phase-3 Compose music — generate a FULL music track from a text PROMPT (the
     // daemon `compose_music` verb). Carries {prompt, length_ms?}: only the text
     // prompt (+ an optional bounded track length) leaves the device; the generated
