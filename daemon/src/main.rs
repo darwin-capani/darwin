@@ -2952,6 +2952,7 @@ async fn main() -> Result<()> {
         let dispatcher = Arc::new(command::LiveDispatcher {
             memory: memory.clone(),
             root: root.clone(),
+                    app_registry: app_registry.clone(),
         });
         // Mint the per-boot command token (off the logged path) and hand it to
         // the Tauri backend OUT-OF-BAND via a 0600 file inside the same 0700

@@ -122,6 +122,12 @@ pub async fn route(
     // persists; it cannot undo an action already executed.
     if crate::lockdown::is_panic_intent(text) {
         let msg = crate::lockdown::panic().await;
+        // End any capture ALREADY RUNNING. `send_op`'s gate stops a new one from
+        // starting; the Vision app is a separate process, so one in flight keeps
+        // going until told otherwise. The HUD panic path sends the same stops, so
+        // the two surfaces behave identically — a panic that closed the lens only
+        // when spoken would be the same split this codebase keeps producing.
+        crate::apps::stop_all_captures(app_registry).await;
         telemetry::emit("system", "lockdown.panic", json!({"via": "voice"}));
         let prime = agents.orchestrator();
         emit_agent_active(prime);

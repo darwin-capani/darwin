@@ -1084,9 +1084,30 @@ where
 pub struct LiveDispatcher {
     pub memory: Arc<crate::memory::Memory>,
     pub root: PathBuf,
+    /// Held so PANIC can end a capture already in flight — the Vision app is a
+    /// separate process and keeps capturing until told otherwise.
+    pub app_registry: Arc<crate::apps::AppRegistry>,
 }
 
 impl Dispatcher for LiveDispatcher {
+    /// PANIC — engage the emergency stop AND end any capture already running.
+    ///
+    /// `lockdown::panic()` sets the flag, drops parked confirmations, stops
+    /// background music, persists the marker and emits the HUD posture. The mic
+    /// stops because audio.rs re-reads the flag per chunk.
+    ///
+    /// Capture is a separate PROCESS. `send_op`'s gate stops a new capture from
+    /// starting, but one already running keeps going until told otherwise — so the
+    /// stop is sent here, and the SPOKEN panic path sends the same stops, so the
+    /// two surfaces behave identically. A panic that closed the lens only when
+    /// typed would be the exact split this codebase keeps producing.
+    async fn panic(&self) -> String {
+        let ack = crate::lockdown::panic().await.to_string();
+        crate::apps::stop_all_captures(&self.app_registry).await;
+        ack
+    }
+
+
     async fn list_pending(&self) -> Value {
         // Faithful, replay-FREE listing: id + agent + tool + preview for the live
         // confirmation, plus the forge proposal ts (if any). No input args cross
@@ -1405,6 +1426,7 @@ fn vault_no_local_answer() -> String {
 }
 
 impl CommandPipeline for LivePipeline {
+
     async fn ask(&self, text: &str, agent: Option<&str>) -> String {
         let agent = self.resolve_agent(agent);
         let mem = self.memory.as_ref();
@@ -3345,7 +3367,17 @@ mod tests {
     fn live_dispatcher(tag: &str) -> (LiveDispatcher, PathBuf) {
         let mem = Arc::new(open_temp_memory(tag));
         let root = std::env::temp_dir().join(format!("darwin-cmd-{tag}-{}", std::process::id()));
-        (LiveDispatcher { memory: mem, root: root.clone() }, root)
+        (
+            LiveDispatcher {
+                memory: mem,
+                root: root.clone(),
+                // Empty registry: this test drives the dispatcher, not the apps.
+                // stop_all_captures over it is a no-op, which is exactly the
+                // behaviour asserted by stopping_captures_with_no_app_running_is_a_no_op.
+                app_registry: crate::apps::AppRegistry::discover(&root),
+            },
+            root,
+        )
     }
 
     /// confirm {id} replays ONLY the exact parked action, and — because the master

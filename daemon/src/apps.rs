@@ -1851,6 +1851,39 @@ fn is_capture_start(op_line: &str) -> bool {
     matches!(op.as_str(), "watch.start" | "screen.context.start" | "describe.capture")
 }
 
+/// Stop every capture in flight. Called by the emergency stop.
+///
+/// `send_op`'s lockdown gate stops a capture from STARTING. This ends one already
+/// running — the Vision app is a separate process, so a capture begun before the
+/// panic keeps going until it is told otherwise, and nothing was telling it.
+///
+/// The stops are sent DIRECTLY on the op queue rather than through `send_op`:
+/// routing them through the gated path would be fine today (the gate only refuses
+/// STARTS), but it would make ending a capture depend on the same predicate that
+/// refuses one — and a future edit to that predicate could silently strand a live
+/// capture the emergency stop exists to end.
+///
+/// Best-effort and never fatal: an app that is not running, or whose queue is
+/// closed, is simply skipped. A panic must not fail because a lens was already
+/// shut.
+pub async fn stop_all_captures(registry: &Arc<AppRegistry>) {
+    const STOPS: &[&str] = &[r#"{"op":"watch.stop"}"#, r#"{"op":"screen.context.stop"}"#];
+    let apps = registry.apps.lock().await;
+    let Some(entry) = apps.get("vision") else {
+        return;
+    };
+    if !entry.running {
+        return;
+    }
+    for op in STOPS {
+        if entry.op_tx.send((*op).to_string()).is_err() {
+            warn!("lockdown: could not queue a capture stop; the app queue is closed");
+            return;
+        }
+    }
+    info!("lockdown: sent capture stops to the vision app");
+}
+
 pub async fn send_op(registry: &Arc<AppRegistry>, name: &str, op_line: &str) -> Result<()> {
     // EMERGENCY STOP: never open a lens while locked down. Restrict-only — with
     // lockdown off (the shipped default) this is byte-for-byte the old path.
@@ -5379,6 +5412,102 @@ mod tests {
         }
 
         let _ = stop(&registry, "vision").await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A PANIC ENDS A CAPTURE ALREADY RUNNING, not just the next one.
+    ///
+    /// `send_op`'s gate stops a capture from STARTING. The Vision app is a separate
+    /// process, so one begun before the panic keeps going until told otherwise —
+    /// and nothing was telling it. This drives the real queue and asserts both
+    /// stops arrive.
+    #[tokio::test]
+    async fn a_panic_sends_capture_stops_to_a_running_app() {
+        let root = PathBuf::from(format!(
+            "/private/tmp/jrv-capstop-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+                % 1_000_000
+        ));
+        let app_dir = root.join("apps/vision");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(root.join("state/ipc/apps")).unwrap();
+        std::fs::write(
+            app_dir.join("manifest.toml"),
+            r#"
+            [app]
+            name = "vision"
+            version = "0.1.0"
+            description = "hermetic capture stand-in"
+            entry = "apps/vision/main.py"
+            runtime = "python"
+            [permissions]
+            audio = false
+            gpu = false
+            net_hosts = []
+            fs_read = []
+            fs_write = ["state/apps/vision"]
+            [ui]
+            surface = "panel"
+            telemetry_topics = ["feed"]
+        "#,
+        )
+        .unwrap();
+        let mut registry = AppRegistry::discover(&root);
+        Arc::get_mut(&mut registry).unwrap().interpreter_override =
+            Some(PathBuf::from("/bin/sleep"));
+        start(&registry, "vision").await.unwrap();
+        let sock = root.join("state/ipc/apps/vision.sock");
+        let mut waited = 0;
+        while !sock.exists() && waited < 60 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            waited += 1;
+        }
+
+        // Play the app and read what the host sends.
+        use tokio::io::AsyncBufReadExt;
+        let stream = UnixStream::connect(&sock).await.expect("connect");
+        let (read_half, _w) = stream.into_split();
+        let mut reader = tokio::io::BufReader::new(read_half);
+        let mut start_line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut start_line))
+            .await
+            .expect("host sends start")
+            .expect("read start");
+
+        stop_all_captures(&registry).await;
+
+        let mut seen: Vec<String> = Vec::new();
+        for _ in 0..2 {
+            let mut l = String::new();
+            tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut l))
+                .await
+                .expect("a capture stop must arrive")
+                .expect("read stop");
+            seen.push(l.trim().to_string());
+        }
+        let joined = seen.join(" ");
+        assert!(joined.contains("watch.stop"), "the camera watch must be stopped: {joined}");
+        assert!(
+            joined.contains("screen.context.stop"),
+            "the screen-context loop must be stopped too: {joined}"
+        );
+
+        let _ = stop(&registry, "vision").await;
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// ...and a panic with nothing running is a no-op, never a failure. An
+    /// emergency stop must not depend on a lens being open.
+    #[tokio::test]
+    async fn stopping_captures_with_no_app_running_is_a_no_op() {
+        let root = PathBuf::from(format!("/private/tmp/jrv-capnoop-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("state/ipc/apps")).unwrap();
+        let registry = AppRegistry::discover(&root);
+        stop_all_captures(&registry).await; // must not panic or hang
         let _ = std::fs::remove_dir_all(&root);
     }
 
