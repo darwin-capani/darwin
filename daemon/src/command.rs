@@ -1205,12 +1205,31 @@ impl LivePipeline {
         }
     }
 
-    /// Resolve the requested agent (or the orchestrator when none/unknown). The
-    /// returned agent's `tools` is the allowlist `complete_with_tools` enforces.
-    /// Answer with the ON-DEVICE brain: the resident 4B plus the bounded
-    /// local-tool loop. `None` when the local path produced nothing (local tools
-    /// disabled, or the loop fell through without data) — the caller then says so
-    /// honestly rather than inventing an answer.
+    /// Answer with the ON-DEVICE brain: the bounded local-tool loop FIRST and,
+    /// when no tool fired, the resident 4B answering the question DIRECTLY.
+    /// `None` only when the on-device brain genuinely produced nothing (the
+    /// inference server is down, or it came back blank) — the caller then says
+    /// so honestly rather than inventing an answer.
+    ///
+    /// WHAT WENT WRONG: this returned ONLY `outcome.data` from
+    /// `complete_with_local_tools`, and that field is documented, at its own
+    /// declaration, as "the concatenated tool RESULTS ... or empty when no tool
+    /// ran". An ordinary question ("explain X", "what did I say about Y") makes
+    /// the 4B emit no tool call at all, so `data` was EMPTY, `answer_locally`
+    /// returned `None`, and the deck replied "I can't reach the cloud, sir, and
+    /// the on-device brain had nothing to add on that one" — WITHOUT EVER ASKING
+    /// THE 4B TO ANSWER. So on the shipped keyless install the HUD command deck
+    /// still answered nothing useful, one layer below the branch that exists to
+    /// fix exactly that. Two more shapes hit the same wall and produced the same
+    /// false line: `[local_tools].enabled = false`, and an agent with no safe
+    /// local tool — both make `complete_with_local_tools` return `None` outright.
+    ///
+    /// THE SPOKEN PATH NEVER HAD THIS HOLE, which is the tell again: when its
+    /// offline loop reports `tools_used == 0` it falls through to the plain
+    /// converse, and its cloud-error arm calls `generate_in_persona` (router.rs).
+    /// Same situation, same resident brain — the typed path just never made the
+    /// second call. `config/darwin.toml` states the intent in as many words:
+    /// "with no key (or on a cloud error) conversation degrades to the local 4B".
     ///
     /// Shared by BOTH degrade paths so they cannot drift: vault/guest (the cloud
     /// is refused) and no-key/cloud-error (the cloud is unreachable). Those are
@@ -1228,7 +1247,13 @@ impl LivePipeline {
         // loop takes them already rendered. Same facts, different shape.
         let local_facts: Vec<String> =
             facts.iter().map(|(k, v)| format!("{k}: {v}")).collect();
-        let outcome = crate::anthropic::complete_with_local_tools(
+        // (1) THE BOUNDED LOCAL-TOOL LOOP. Every gate still applies exactly as
+        // online — `complete_with_local_tools` runs each call through the same
+        // `execute_tool`, so a consequential tool parks offline just as it parks
+        // online. When a safe local tool actually fired, its RESULTS are the
+        // answer. `None`/empty here means no tool ran, NOT that there is nothing
+        // to say — which is the whole point of step (2).
+        if let Some(outcome) = crate::anthropic::complete_with_local_tools(
             &self.cfg,
             &mut infer,
             self.max_tokens,
@@ -1239,11 +1264,38 @@ impl LivePipeline {
             &agent.tools,
             &agent.namespace,
         )
-        .await?;
-        let data = outcome.data.trim();
-        (!data.is_empty()).then(|| data.to_string())
+        .await
+        {
+            let data = outcome.data.trim();
+            if !data.is_empty() {
+                return Some(data.to_string());
+            }
+        }
+        // (2) NO TOOL RAN (the common case for an ordinary question), or the loop
+        // never engaged at all. Ask the resident 4B to ANSWER — the plain converse
+        // the spoken path falls through to. Stateless turn, so no history; the
+        // same grounded facts ride along. This is a LOCAL unix-socket call: it
+        // reaches no cloud, spends nothing, and holds no key.
+        match infer
+            .generate(text, self.max_tokens, &[], &local_facts, None, None)
+            .await
+        {
+            Ok(reply) if !reply.trim().is_empty() => Some(reply.trim().to_string()),
+            // A blank completion is nothing to say, not an answer — fall through
+            // to the caller's honest line rather than returning empty text.
+            Ok(_) => None,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "on-device generate unavailable on the command-deck degrade path"
+                );
+                None
+            }
+        }
     }
 
+    /// Resolve the requested agent (or the orchestrator when none/unknown). The
+    /// returned agent's `tools` is the allowlist `complete_with_tools` enforces.
     fn resolve_agent<'a>(&'a self, agent: Option<&str>) -> &'a crate::agents::Agent {
         agent
             .and_then(|a| self.agents.get(a))
@@ -1329,6 +1381,29 @@ fn render_world_deltas(state: &crate::world_model::WorldState) -> Vec<String> {
     out
 }
 
+/// The honest line for a no-cloud turn under VAULT/GUEST whose on-device brain
+/// produced nothing at all.
+///
+/// WHAT WENT WRONG: the vault arm's fallback said "I'm in vault mode, sir — this
+/// one stays on the device, so I answered it locally." — and that arm is reached
+/// ONLY when `answer_locally` returned `None`, i.e. when NOTHING was answered.
+/// The whole reply was that one sentence, so the user was told an answer had been
+/// produced locally when none had. Its TWIN, the cloud-error arm a few lines
+/// below, already says the true thing ("...and the on-device brain had nothing to
+/// add on that one") — the same "one gate knew the rule, its twin did not" shape
+/// as the two defects this batch fixes, one layer further down.
+///
+/// It stays a REFUSAL, not a forced fallback: there is nothing local left to try
+/// (the inference server is down or came back blank — that is the only way to
+/// reach here now). Vault is still named, because it is the real reason the cloud
+/// was out of play; the reply simply no longer claims an answer that does not
+/// exist.
+fn vault_no_local_answer() -> String {
+    "I'm in vault mode, sir — this one stays on the device, and the on-device \
+     brain isn't answering right now, so I have nothing for you on that one."
+        .to_string()
+}
+
 impl CommandPipeline for LivePipeline {
     async fn ask(&self, text: &str, agent: Option<&str>) -> String {
         let agent = self.resolve_agent(agent);
@@ -1371,11 +1446,7 @@ impl CommandPipeline for LivePipeline {
             return self
                 .answer_locally(text, &facts, mem, agent)
                 .await
-                .unwrap_or_else(|| {
-                    "I'm in vault mode, sir — this one stays on the device, so I \
-                     answered it locally."
-                        .to_string()
-                });
+                .unwrap_or_else(vault_no_local_answer);
         }
         // Stateless turn: empty history. A consequential tool parks inside the
         // loop (execute_tool) and the returned text is the confirmation prompt —
@@ -1580,9 +1651,15 @@ impl CommandPipeline for LivePipeline {
         let (live, _issues) =
             crate::config::Config::load(&self.root.join("config").join("darwin.toml"));
         let agent_name = self.resolve_agent(agent).name.clone();
+        // ...and the SAME rule for the cloud key, the runner's OTHER gate: the
+        // overnight tick `continue`s without one, so "queued for tonight" would
+        // promise work nothing can do. Resolution is cached (a bool only; the key
+        // itself never leaves the resolver) and spends no cloud call.
+        let cloud_key_present = crate::anthropic::resolve_api_key().await.is_some();
         crate::overnight::enqueue(
             &self.root,
             live.overnight.enabled,
+            cloud_key_present,
             task,
             &agent_name,
             &chrono::Utc::now().to_rfc3339(),
@@ -1901,6 +1978,219 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex as StdMutex;
+
+    // -- the on-device degrade actually ANSWERS (hermetic, no cloud) ----------
+
+    /// A fake inference server on a unix socket: one JSON line in, one JSON line
+    /// out, `{id, ok:true, text}` — the same wire `InferenceClient` speaks. Every
+    /// `op` gets the SAME canned prose (no tool-call JSON), which is exactly what
+    /// the resident 4B does on an ordinary question: the offline tool loop parses
+    /// no call and falls through with EMPTY data.
+    ///
+    /// Returns the socket path plus the ops it saw, so a test can assert the
+    /// caller actually made the second (plain `generate`) call rather than that
+    /// the server tolerated one. NOTHING here reaches the network.
+    async fn fake_local_brain(
+        tag: &str,
+        reply: &'static str,
+    ) -> (PathBuf, Arc<StdMutex<Vec<String>>>) {
+        // /tmp (not /var/folders) keeps the sockaddr_un path under macOS's
+        // ~104-byte SUN_LEN cap — the same reason inference.rs's socket tests do.
+        let dir = PathBuf::from("/tmp").join(format!("dw-cmd-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let sock = dir.join("i.sock");
+        let _ = std::fs::remove_file(&sock);
+        let listener = UnixListener::bind(&sock).expect("bind the fake inference socket");
+        let ops = Arc::new(StdMutex::new(Vec::new()));
+        let ops_task = ops.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else { return };
+                let ops_conn = ops_task.clone();
+                let (r, mut w) = tokio::io::split(stream);
+                let mut lines = BufReader::new(r).lines();
+                // One connection carries many requests — the client reuses it.
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let Ok(req) = serde_json::from_str::<Value>(&line) else { return };
+                    let id = req["id"].as_str().unwrap_or("").to_string();
+                    ops_conn
+                        .lock()
+                        .unwrap()
+                        .push(req["op"].as_str().unwrap_or("?").to_string());
+                    let mut out =
+                        serde_json::to_vec(&json!({"id": id, "ok": true, "text": reply})).unwrap();
+                    out.push(b'\n');
+                    if w.write_all(&out).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        });
+        (sock, ops)
+    }
+
+    fn pipeline_over(sock: PathBuf, cfg: crate::config::Config, tag: &str) -> LivePipeline {
+        let root = PathBuf::from("/tmp").join(format!("dw-cmd-root-{tag}-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        let db = root.join("m.db");
+        let _ = std::fs::remove_file(&db);
+        LivePipeline {
+            memory: Arc::new(crate::memory::Memory::open(&db).expect("temp memory")),
+            agents: Arc::new(crate::agents::AgentRegistry::canonical()),
+            heavy_model: "test-model".to_string(),
+            max_tokens: 256,
+            cfg,
+            root,
+            inference_sock: sock,
+        }
+    }
+
+    /// WITH NO CLOUD, THE ON-DEVICE BRAIN MUST ACTUALLY BE ASKED TO ANSWER.
+    ///
+    /// `answer_locally` is the shared degrade both no-cloud branches of `ask`
+    /// call. It returned ONLY `LocalToolLoopOutcome::data` — the concatenated
+    /// tool RESULTS, documented at its own declaration as EMPTY when no tool ran.
+    /// An ordinary question makes the 4B emit no tool call, so `data` was empty,
+    /// `answer_locally` returned `None`, and the deck said "I can't reach the
+    /// cloud, sir, and the on-device brain had nothing to add on that one" —
+    /// having never asked the 4B to answer. On the shipped keyless install that
+    /// is still a deck that answers nothing, one layer below the branch that was
+    /// supposed to fix it.
+    ///
+    /// Driven END TO END against a fake inference socket: no cloud, no key, no
+    /// network. Pre-fix this asserts `None` and fails; the ops log pins that the
+    /// second, plain `generate` call is what produced the answer.
+    #[tokio::test]
+    async fn the_on_device_degrade_answers_when_no_local_tool_fires() {
+        let (sock, ops) = fake_local_brain("nofire", "Paris is the capital of France.").await;
+        // The SHIPPED config: [local_tools].enabled = true. This is the common
+        // shape — the loop engages, the 4B names no tool, data comes back empty.
+        let cfg = crate::config::Config::default();
+        assert!(cfg.local_tools.enabled, "the shipped default must be ON for this to be the real case");
+        let p = pipeline_over(sock.clone(), cfg, "nofire");
+        let agent = p.agents.orchestrator();
+
+        let answer = p
+            .answer_locally("what is the capital of France", &[], p.memory.as_ref(), agent)
+            .await;
+        assert_eq!(
+            answer.as_deref(),
+            Some("Paris is the capital of France."),
+            "no tool fired, so the resident 4B must be asked to ANSWER — not reported as \
+             having nothing to add"
+        );
+        // Two generate calls: the tool-loop round, then the plain answer. The
+        // second one is the fix; one call alone means the loop's empty data was
+        // still the whole story.
+        let seen = ops.lock().unwrap().clone();
+        assert!(
+            seen.iter().filter(|o| *o == "generate").count() >= 2,
+            "the plain-answer generate must actually be issued; ops seen: {seen:?}"
+        );
+    }
+
+    /// ...AND WHEN THE LOOP NEVER ENGAGES AT ALL.
+    ///
+    /// `complete_with_local_tools` returns `None` outright when
+    /// `[local_tools].enabled = false` (and likewise for an agent with no safe
+    /// local tool). The old `.await?` turned that straight into "nothing to add"
+    /// — an operator who turned OFF the offline TOOL loop silently lost the
+    /// ability to get any typed answer at all without a cloud key.
+    #[tokio::test]
+    async fn the_on_device_degrade_answers_even_with_the_local_tool_loop_off() {
+        let (sock, _ops) = fake_local_brain("loopoff", "Two plus two is four.").await;
+        let mut cfg = crate::config::Config::default();
+        cfg.local_tools.enabled = false;
+        let p = pipeline_over(sock, cfg, "loopoff");
+        let agent = p.agents.orchestrator();
+
+        let answer = p
+            .answer_locally("what is two plus two", &[], p.memory.as_ref(), agent)
+            .await;
+        assert_eq!(
+            answer.as_deref(),
+            Some("Two plus two is four."),
+            "the tool loop being off must not disable the on-device ANSWER"
+        );
+    }
+
+    /// THE HONEST `None` SURVIVES: when the on-device brain is genuinely down
+    /// (no socket at all), `answer_locally` still returns `None` so the caller's
+    /// honest "the on-device brain had nothing to add" line is reached — the fix
+    /// must not fabricate an answer out of a dead inference server.
+    #[tokio::test]
+    async fn a_dead_on_device_brain_still_degrades_to_none() {
+        let cfg = crate::config::Config::default();
+        let p = pipeline_over(
+            PathBuf::from("/tmp").join(format!("dw-cmd-absent-{}.sock", std::process::id())),
+            cfg,
+            "absent",
+        );
+        let agent = p.agents.orchestrator();
+        let answer = p
+            .answer_locally("anything at all", &[], p.memory.as_ref(), agent)
+            .await;
+        assert!(answer.is_none(), "a dead local brain must not fabricate an answer: {answer:?}");
+    }
+
+    /// ...AND THE LINE THE CALLER THEN SAYS MUST NOT CLAIM AN ANSWER.
+    ///
+    /// The test above pins that `answer_locally` returns `None` when the
+    /// on-device brain is genuinely down. This pins what the VAULT arm says at
+    /// that point. It said "I'm in vault mode, sir — this one stays on the
+    /// device, so I answered it locally." — the entire reply — while nothing had
+    /// been answered. Its twin, the cloud-error arm, already said the true thing
+    /// ("the on-device brain had nothing to add on that one"); the vault arm did
+    /// not. A refusal here is CORRECT (there is nothing local left to try); the
+    /// defect was the false claim, not the refusal.
+    #[test]
+    fn the_vault_degrade_line_never_claims_an_answer_it_did_not_give() {
+        let line = vault_no_local_answer();
+        assert!(
+            line.contains("vault"),
+            "the real reason the cloud was out of play must still be named: {line}"
+        );
+        assert!(
+            !line.contains("answered it locally") && !line.contains("I answered"),
+            "this line is reached ONLY when nothing was answered — it must not \
+             claim one was: {line}"
+        );
+        assert!(
+            line.contains("nothing for you"),
+            "it must say plainly that no answer was produced: {line}"
+        );
+    }
+
+    /// ...AND THE VAULT ARM ACTUALLY USES IT.
+    ///
+    /// The test above checks the STRING; deleting the call site would leave it
+    /// green, which is precisely the "a correct value nobody consults" shape this
+    /// file has been bitten by before. `ask` cannot be driven from a unit test
+    /// without setting the process-global vault flag (which would race every
+    /// other test in this binary), so the call site is pinned by SOURCE — scoped
+    /// to the VAULT BRANCH ONLY (from the reachability gate to the cloud call, so
+    /// it can neither self-match on `vault_no_local_answer`'s own definition,
+    /// which sits ABOVE `ask`, nor drift into the cloud-error arm below).
+    #[test]
+    fn the_vault_arm_uses_the_honest_no_answer_line() {
+        let src = include_str!("command.rs");
+        let gate = src
+            .find("let cloud_ok = crate::threshold::deny_cloud(")
+            .expect("ask must still consult the reachability gate");
+        let cloud = src
+            .find("match crate::anthropic::complete_with_tools(")
+            .expect("ask must still call the cloud loop");
+        assert!(gate < cloud, "the gate must precede the cloud call");
+        let vault_arm = &src[gate..cloud];
+        assert!(
+            vault_arm.contains("vault_no_local_answer"),
+            "the vault degrade's last-resort line must come from the honest helper"
+        );
+        assert!(
+            !vault_arm.contains("answered it locally"),
+            "the vault arm must not claim it answered when answer_locally returned None"
+        );
+    }
 
     // -- pure decide: size / parse / allowlist / shape ------------------------
 

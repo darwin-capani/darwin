@@ -175,7 +175,29 @@ pub fn plan_enqueue(
 /// `overnight` command verb). `enabled` is the LIVE [overnight].enabled — off
 /// must REFUSE like distill/sync do, never fabricate "queued for tonight" for
 /// work run_pending (gated on the same switch) will never run.
-pub fn enqueue(root: &std::path::Path, enabled: bool, prompt: &str, agent: &str, now_rfc3339: &str) -> String {
+///
+/// `cloud_key_present` is the SECOND half of that same rule, and it was missing.
+/// The runner is cloud-only ([`run_real_task`] is a `complete_plain` call), and
+/// the scheduler in main.rs `continue`s WITHOUT running anything when no key
+/// resolves — deliberately, so a keyless machine does not mark every queued task
+/// Failed. The consequence: on the shipped keyless install this verb answered
+/// "Queued for tonight, sir — 1 task waiting for the next time you're away" for
+/// work that would never run, never fail, and never be mentioned again. That is
+/// precisely the fabricated durable promise the `enabled` branch above exists to
+/// prevent; one gate knew the rule and the other did not.
+///
+/// It is NOT a refusal: the queue is durable and the task runs the first away
+/// window after a key lands, so throwing it away would be the worse answer. It
+/// is queued AND the reply says plainly that nothing will run until a key is on
+/// file. With a key present the copy is byte-for-byte the old ack.
+pub fn enqueue(
+    root: &std::path::Path,
+    enabled: bool,
+    cloud_key_present: bool,
+    prompt: &str,
+    agent: &str,
+    now_rfc3339: &str,
+) -> String {
     if !enabled {
         return "Overnight agents are off, sir — turn on [overnight].enabled and I'll run queued work while you're away.".to_string();
     }
@@ -192,7 +214,17 @@ pub fn enqueue(root: &std::path::Path, enabled: bool, prompt: &str, agent: &str,
                 // fabricate one (the runner reloads from the unwritten file).
                 return "I couldn't save the overnight queue, sir — the task is NOT queued. Check the state directory and try again.".to_string();
             }
-            format!("Queued for tonight, sir — {n} task{} waiting for the next time you're away.", if n == 1 { "" } else { "s" })
+            let plural = if n == 1 { "" } else { "s" };
+            if !cloud_key_present {
+                // Saved, but say the true thing: the runner cannot run without a
+                // key, so "for tonight" would be a promise nothing can keep.
+                return format!(
+                    "Saved to the overnight queue, sir — {n} task{plural} — but there's no \
+                     Anthropic API key on file, so overnight work won't run until one is. \
+                     Add a key and I'll pick it up the next time you're away."
+                );
+            }
+            format!("Queued for tonight, sir — {n} task{plural} waiting for the next time you're away.")
         }
         None => "The overnight queue is full, sir — I'll run the pending ones first.".to_string(),
     }
@@ -389,14 +421,55 @@ mod tests {
         // gated runner would never execute the task. Off must REFUSE (like
         // distill/sync) and persist nothing.
         let dir = tempdir("offq");
-        let reply = enqueue(&dir, false, "look into X", "darwin", "2026-07-13T20:00:00Z");
+        let reply = enqueue(&dir, false, true, "look into X", "darwin", "2026-07-13T20:00:00Z");
         assert!(reply.contains("off"), "honest refusal, not a fabricated ack: {reply}");
         assert!(load_queue(&dir).is_empty(), "no task persisted while off");
-        // On, the same call queues.
-        let reply = enqueue(&dir, true, "look into X", "darwin", "2026-07-13T20:00:00Z");
+        // On (and a key on file), the same call queues with the unchanged ack.
+        let reply = enqueue(&dir, true, true, "look into X", "darwin", "2026-07-13T20:00:00Z");
         assert!(reply.contains("Queued"), "{reply}");
         assert_eq!(load_queue(&dir).len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// THE RUNNER'S OTHER GATE MUST NOT BE FABRICATED AWAY EITHER.
+    ///
+    /// `enqueue` already refused to say "queued for tonight" when
+    /// [overnight].enabled is false, on the stated rule that the verb must never
+    /// promise work the gated runner will never do. The runner has a SECOND gate:
+    /// it is cloud-only, and main.rs's overnight tick `continue`s without an
+    /// Anthropic key. On the shipped keyless install this verb still answered
+    /// "Queued for tonight, sir — 1 task waiting for the next time you're away"
+    /// for work that would never run, never fail, and never be mentioned again.
+    ///
+    /// The task IS still saved (a key can land later and the queue is durable) —
+    /// the fix is the honest sentence, not a refusal. Asserted here BOTH ways so
+    /// the with-key copy cannot silently pick up the caveat.
+    #[test]
+    fn enqueue_does_not_promise_tonight_when_no_cloud_key_can_run_it() {
+        let dir = tempdir("nokeyq");
+        let reply = enqueue(&dir, true, false, "look into X", "darwin", "2026-07-13T20:00:00Z");
+        // Saved — losing the task would be the worse answer.
+        assert_eq!(load_queue(&dir).len(), 1, "the task is still queued: {reply}");
+        assert_eq!(load_queue(&dir)[0].status, TaskStatus::Queued);
+        // ...but the reply must NOT promise tonight, and must name the reason.
+        assert!(
+            !reply.contains("Queued for tonight"),
+            "keyless: must not promise work the cloud-only runner cannot do: {reply}"
+        );
+        assert!(
+            reply.contains("API key"),
+            "keyless: the reply must name the missing key as the reason: {reply}"
+        );
+
+        // WITH a key the ack is the original, unchanged — the caveat is scoped to
+        // the keyless case and does not leak into the normal path.
+        let dir2 = tempdir("keyq");
+        let ok = enqueue(&dir2, true, true, "look into X", "darwin", "2026-07-13T20:00:00Z");
+        assert!(ok.contains("Queued for tonight"), "with a key the ack is unchanged: {ok}");
+        assert!(!ok.contains("API key"), "with a key there is no caveat: {ok}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     #[test]
@@ -407,7 +480,7 @@ mod tests {
         // fail deterministically.
         let dir = tempdir("nosave");
         std::fs::create_dir_all(queue_path(&dir)).unwrap(); // queue.json as a DIR
-        let reply = enqueue(&dir, true, "look into X", "darwin", "2026-07-13T20:00:00Z");
+        let reply = enqueue(&dir, true, true, "look into X", "darwin", "2026-07-13T20:00:00Z");
         assert!(reply.contains("NOT queued"), "honest refusal on failed persist: {reply}");
         let _ = std::fs::remove_dir_all(&dir);
     }
