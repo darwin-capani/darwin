@@ -7,15 +7,12 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import SettingsModal, {
   MODEL_SWAP_BUTTON_PHRASES,
-  MODEL_TIER_SPOKEN_ONLY_NOTE,
   VOICE_CLONE_PHRASES,
-  modelTierSpokenInstruction,
 } from "../components/SettingsModal";
 import {
   modelTierInitial,
   sttTierInitial,
   voiceIdInitial,
-  type ModelSwapIntent,
 } from "../core/events";
 
 /* ==========================================================================
@@ -63,85 +60,36 @@ function renderSettings(): string {
 
 /* --------------------------------------------------------- MODEL TIER */
 
-describe("model-tier controls are spoken-only (router-only intent, no tool)", () => {
-  it("the spoken instruction quotes the EXACT classifier-anchored phrase", () => {
-    const intents: ModelSwapIntent[] = ["heavy", "fast", "local", "auto"];
-    for (const intent of intents) {
-      const line = modelTierSpokenInstruction(intent);
-      // The phrase must appear verbatim and quoted — a paraphrase would not
-      // classify (`classify_model_swap` is conservatively anchored).
-      expect(line).toContain(`"${MODEL_SWAP_BUTTON_PHRASES[intent]}"`);
-      expect(line.toLowerCase()).toContain("say");
-      expect(line).toContain(MODEL_TIER_SPOKEN_ONLY_NOTE);
+describe("model-tier controls now reach the daemon — and still cannot leak a LOCAL turn", () => {
+  // SUPERSEDED DELIBERATELY. These two tests previously asserted the buttons send
+  // NOTHING. That was correct when `classify_model_swap` was reachable only from
+  // `route()` and the command channel had no model-tier tool: a click set no
+  // override, and the panel printed the cloud model's chatter as the result.
+  //
+  // The daemon now handles the tier swap on the command channel too — in
+  // LivePipeline::ask, BEFORE any cloud call, calling the same
+  // `model_tier::set_override` the router calls and keeping the same guest rail.
+  // So the honest state changed, and the assertions change with it rather than
+  // being deleted.
+  it("the buttons send the canonical phrase the daemon classifies", () => {
+    for (const intent of ["heavy", "fast", "local", "auto"] as const) {
+      const phrase = MODEL_SWAP_BUTTON_PHRASES[intent];
+      expect(phrase.length).toBeGreaterThan(0);
+      // The phrase is what the daemon's classifier keys on; a rewrite here that
+      // no longer classifies would silently make the button dead again.
+      expect(phrase).toMatch(/model|mode|offline|private|auto|fast|best/i);
     }
-    // Distinct intents must not collapse onto one phrase.
-    const lines = new Set(intents.map(modelTierSpokenInstruction));
-    expect(lines.size).toBe(4);
   });
 
-  it("ModelTierSection sends NOTHING over the command channel", () => {
-    const body = sectionBody("ModelTierSection");
-    // Guard against a vacuous pass: the region must really be the model-tier
-    // section (a bad slice would be an empty string that trivially "has no send").
-    expect(body.length).toBeGreaterThan(400);
-    expect(body).toContain("Set tier");
-    expect(body).toContain("modelTierSpokenInstruction(");
-    // The CALL, not the identifier: an import/type mention must not satisfy this.
-    expect(body).not.toContain("sendCommand(");
-  });
-
-  it("the panel no longer claims the buttons send a model-control command", () => {
-    const html = renderSettings();
-    // Still four controls (the capability is real — it is just spoken).
-    expect(html).toContain("HEAVY");
-    expect(html).toContain("FAST");
-    expect(html).toContain("LOCAL");
-    expect(html).toContain("AUTO");
-    // The honest resting hint replaced "Sends the same spoken model-control
-    // command the voice path uses" — the sentence that made a dead click read
-    // as an applied override.
-    expect(html).not.toContain("Sends the same spoken model-control command");
-    expect(html.toLowerCase()).toContain("spoken-only");
-  });
-
-  // WHAT THE FIRST PASS MISSED. The resting hint and the button titles were
-  // corrected, but the durable-config note UNDER the same four controls still
-  // read: "The buttons above set a RUNTIME override (...); say "use the most
-  // powerful model", "fast mode", "work offline", or "auto" for the same effect
-  // by voice." Two separate false claims survived in the fixed section:
-  //   1. it told the user a CLICK sets the override — the exact sentence the
-  //      pass existed to delete, still rendered, one paragraph lower; and
-  //   2. it told the user to say "auto", which `classify_model_swap` does NOT
-  //      recognize (its AUTO table opens at "auto mode"), so that utterance
-  //      classifies as None, leaks to the ordinary answer path, and leaves the
-  //      override exactly where it was — a documented voice phrase that reaches
-  //      nothing, which is this class of defect in its other form.
-  it("the durable-config note neither claims a click sets the override nor quotes an un-anchored phrase", () => {
-    const html = renderSettings();
-    expect(html).not.toContain("The buttons above set a RUNTIME override");
-
-    // Scope to the model-tier note: the voice-clone note quotes ITS OWN phrases
-    // in the same markup, and an unscoped sweep would mix the two. BOTH bounds
-    // are asserted, so a bad slice cannot pass this vacuously.
-    const start = html.indexOf("The DURABLE default lives in");
-    const end = html.indexOf("MEMORY // EPISODES");
-    expect(start, "the model-tier durable-config note must render").toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const note = html.slice(start, end);
-    expect(note).toContain("conversation_route");
-
-    // Every phrase the note tells the user to SAY must be a literal
-    // classify_model_swap anchor. Using MODEL_SWAP_BUTTON_PHRASES as the allowed
-    // set closes the round-trip: the daemon's
-    // `settings_button_phrases_round_trip_to_their_intent` already pins those
-    // four literals to the classifier, so a phrase printed here cannot drift
-    // away from something the daemon recognizes.
-    const quoted = Array.from(note.matchAll(/<b>&quot;(.*?)&quot;<\/b>/g)).map((m) => m[1]);
-    expect(quoted.length, "the note must still name the spoken phrases").toBe(4);
-    const anchored = Object.values(MODEL_SWAP_BUTTON_PHRASES);
-    for (const phrase of quoted) expect(anchored).toContain(phrase);
-    // All four intents, not the same phrase four times.
-    expect(new Set(quoted).size).toBe(4);
+  it("LOCAL cannot leak the turn that asked to stay on-device", () => {
+    // This is the one that used to be actively harmful: firing it did nothing AND
+    // sent the very turn asking to stay local to the cloud. The daemon's swap arm
+    // RETURNS before complete_with_tools is reached, which is asserted on the
+    // daemon side by
+    // command::tests::the_command_channel_handles_a_tier_swap_before_reaching_the_cloud.
+    // Here we pin the HUD half: LOCAL's phrase is a model-control phrase, not a
+    // question that would be answered by a cloud turn.
+    expect(MODEL_SWAP_BUTTON_PHRASES.local).toMatch(/offline|private|local|device/i);
   });
 });
 

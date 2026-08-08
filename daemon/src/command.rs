@@ -1420,6 +1420,45 @@ impl CommandPipeline for LivePipeline {
         let personalization = crate::anthropic::grounded_personalization_live(mem).await;
         let persona =
             crate::anthropic::agent_persona_text(&agent.name, agent.is_orchestrator());
+        // MODEL-TIER SWAP — a ROUTER intent with no tool, handled here so the
+        // typed path can do what the spoken path can.
+        //
+        // WHAT WENT WRONG: the four Settings tier buttons sent
+        // {cmd:"ask", text:"use the fast model"}. `classify_model_swap` is called
+        // only from `route()`, the `ask` verb lands in `complete_with_tools`, and
+        // there is no model-tier tool — so the click set no override and the panel
+        // printed the cloud model's chatter back as if it were the result.
+        //
+        // Routing the WHOLE channel through `route()` is not the fix: `route`
+        // takes a `&mut speech::ReplySession` and SPEAKS its reply, while this
+        // channel returns text. So the intents that live only in the router and
+        // have no tool are handled here, one at a time, calling the SAME
+        // functions the router calls.
+        //
+        // GATES INTACT. `threshold::deny_cloud` is the guest rail: a guest turn is
+        // local-only, and re-aiming which brain answers is not a guest's to make —
+        // the spoken arm sits behind the voice-id all-scope gate for the same
+        // reason (an unrecognized bystander must not re-aim the model). A guest
+        // gets an honest refusal, not a silent no-op.
+        if let Some(intent) = crate::model_tier::classify_model_swap(text) {
+            if !crate::threshold::deny_cloud(true) {
+                return "Only the owner can change which model answers, sir."
+                    .to_string();
+            }
+            crate::model_tier::set_override(intent.to_override());
+            telemetry::emit(
+                "system",
+                "model.swap",
+                json!({
+                    "intent": intent.as_str(),
+                    "override": crate::model_tier::current_override().map(|t| t.as_str()),
+                    "manual": intent != crate::model_tier::ModelSwapIntent::Auto,
+                    "via": "command",
+                }),
+            );
+            return intent.ack().to_string();
+        }
+
         // VAULT / GUEST: is the cloud reachable for THIS turn at all?
         //
         // WHAT WENT WRONG: this arm called the cloud loop directly, with no
@@ -1849,6 +1888,74 @@ pub fn write_command_token(root: &Path, token: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE TYPED PATH CAN NOW DO WHAT THE SPOKEN PATH CAN, for the tier swap.
+    ///
+    /// The four Settings tier buttons sent {cmd:"ask", text:"<phrase>"}.
+    /// `classify_model_swap` is called only from `route()`, `ask` lands in
+    /// `complete_with_tools`, and there is no model-tier tool — so the click set
+    /// no override at all and the panel showed the cloud model's chatter.
+    ///
+    /// `ask` reaches the network, so the call site is pinned by source, scoped to
+    /// the `ask` body and bounded at the next same-indent fn. It asserts ORDER:
+    /// the swap must be handled BEFORE the cloud call, or it is not handled.
+    #[test]
+    fn the_command_channel_handles_a_tier_swap_before_reaching_the_cloud() {
+        let src = include_str!("command.rs");
+        let start = src
+            .find("    async fn ask(&self, text: &str, agent: Option<&str>) -> String {")
+            .expect("the ask arm must exist");
+        let rest = &src[start + 40..];
+        let end = rest
+            .find("\n    async fn ")
+            .or_else(|| rest.find("\n    fn "))
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let swap = body
+            .find("crate::model_tier::classify_model_swap(text)")
+            .expect("ask must consult the tier classifier — otherwise the buttons are dead");
+        let set = body
+            .find("crate::model_tier::set_override(")
+            .expect("ask must actually install the override, not just classify");
+        let cloud = body
+            .find("crate::anthropic::complete_with_tools(")
+            .expect("ask still calls the cloud loop");
+        assert!(swap < cloud, "the tier swap must be handled BEFORE the cloud call");
+        assert!(swap < set, "classify, then install");
+        assert!(set < cloud, "the override must be installed before the cloud call");
+
+        // THE GUEST RAIL MUST STILL BE THERE. Re-aiming which brain answers is not
+        // a guest's call — the spoken arm sits behind the voice-id all-scope gate
+        // for exactly that reason.
+        //
+        // Bounded to the SWAP ARM ONLY (classify -> install). Scoping this to
+        // swap..cloud self-matched on the VAULT gate's own `deny_cloud`, which
+        // sits between them, so deleting the rail left this green — the same
+        // self-matching-guard trap that has bitten twice already in this campaign.
+        let arm = &body[swap..set];
+        assert!(
+            arm.contains("threshold::deny_cloud"),
+            "the tier swap must keep the guest rail BETWEEN classify and install: \
+             a guest must not re-aim the model"
+        );
+    }
+
+    /// ...and every tier intent installs the override the router would install.
+    #[test]
+    fn each_tier_intent_maps_to_the_same_override_the_router_uses() {
+        use crate::model_tier::ModelSwapIntent as I;
+        for (intent, expect_some) in
+            [(I::Heavy, true), (I::Fast, true), (I::Local, true), (I::Auto, false)]
+        {
+            assert_eq!(
+                intent.to_override().is_some(),
+                expect_some,
+                "{intent:?} must install the same override the spoken path does \
+                 (Auto CLEARS the override; the others set a tier)"
+            );
+        }
+    }
 
     /// BOTH REASONS FOR "NO CLOUD THIS TURN" MUST DEGRADE THE SAME WAY.
     ///

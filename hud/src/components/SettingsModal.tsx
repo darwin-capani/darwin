@@ -86,11 +86,18 @@ export const MODEL_SWAP_BUTTON_PHRASES: Record<ModelSwapIntent, string> = {
 /** Why the model-tier controls state a phrase instead of acting. Mirrors the
  *  voice-id enrolment controls' spoken-only note: the operation exists, it is
  *  simply not reachable from the command channel this HUD holds. */
+/// SUPERSEDED. These buttons WORK now.
+///
+/// They were spoken-only because `classify_model_swap` was reached only from
+/// `route()`, and the command channel lands in `complete_with_tools` with no
+/// model-tier tool — so a click set nothing and the panel showed the cloud
+/// model's chatter. The daemon now handles the tier swap on the command channel
+/// too, calling the same `set_override` the router calls, behind the same guest
+/// rail. The note is kept only for the case where the daemon is too old to know
+/// the intent.
 export const MODEL_TIER_SPOKEN_ONLY_NOTE =
-  "Re-aiming the model is spoken-only — the command channel this panel uses " +
-  "never reaches the router that interprets a model-control phrase, so a click " +
-  "here cannot set or clear the override. Say the phrase out loud instead; " +
-  '"auto mode" clears the override back to the config default.';
+  "If nothing changed, this daemon predates click-to-switch — say the phrase " +
+  'out loud instead; "auto mode" clears the override back to the config default.';
 
 /** The exact instruction a model-tier control shows for `intent`: the phrase to
  *  say, verbatim from MODEL_SWAP_BUTTON_PHRASES, plus why it is spoken-only.
@@ -992,12 +999,20 @@ function ModelTierSection({ modelTier }: { modelTier: ModelTierStatus }) {
   const reasonLabel = modelTierReasonLabel(modelTier.reason);
   const [note, setNote] = useState("");
 
-  // Each control SHOWS the canonical spoken model-control phrase. It does NOT
-  // send it: the command channel cannot reach classify_model_swap (see the
-  // section doc above), and firing it anyway both did nothing and — for LOCAL —
-  // egressed the very turn that asked to stay on-device.
-  const swap = useCallback((intent: ModelSwapIntent) => {
-    setNote(modelTierSpokenInstruction(intent));
+  // Send the canonical model-control phrase. The daemon handles this intent on
+  // the command channel now (LivePipeline::ask, before any cloud call), calling
+  // the same `model_tier::set_override` the spoken path calls and keeping the
+  // same guest rail — so a click sets the override for real.
+  //
+  // LOCAL is the one that used to be actively harmful: firing it did nothing AND
+  // sent the very turn that asked to stay on-device to the cloud. Now the swap
+  // returns before `complete_with_tools` is reached, so it cannot.
+  const swap = useCallback(async (intent: ModelSwapIntent) => {
+    const r = await sendCommand({ cmd: "ask", text: MODEL_SWAP_BUTTON_PHRASES[intent] });
+    // Show the daemon's own ack; never a fabricated success. An older daemon that
+    // does not know the intent falls through to a normal answer, so the note says
+    // what to do then rather than claiming the switch happened.
+    setNote(r.ok ? r.reply || modelTierSpokenInstruction(intent) : r.error || "command failed");
   }, []);
 
   // The live status line under the section title — the same honest verdict the
