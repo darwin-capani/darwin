@@ -34,8 +34,11 @@ runtime     = ""        # "python" | "binary" | "node", required
 
 [permissions]
 audio     = false       # bool — microphone / audio-route access via the daemon's audio API
-net_hosts = []          # list of host strings the seatbelt profile allows outbound connections to;
-                        # empty list = no network
+net_hosts = []          # MUST BE EMPTY. A direct-egress net scope is NOT GRANTABLE: macOS SBPL has no
+                        # host or IP filtering primitive, so a non-empty list is REFUSED at validation.
+                        # For network access declare `fetch_hosts` below instead.
+fetch_hosts = []        # list of hostnames the app may fetch THROUGH the daemon-mediated fetch proxy
+                        # (https-only, exact-host, SSRF-guarded). This is the ONLY supported egress.
 fs_read   = []          # list of paths the app may read (beyond its own app dir, which is implicit)
 fs_write  = []          # list of paths the app may write; everything else is read-only or denied
 gpu       = false       # bool — Metal/GPU access for the app process
@@ -53,8 +56,9 @@ Derivation rules from manifest to seatbelt profile:
 | Manifest field | Seatbelt effect |
 |---|---|
 | `audio = false` | `(deny device-microphone)`; audio data only via daemon-mediated IPC if granted |
-| `net_hosts = []` | `(deny network*)` |
-| `net_hosts = [...]` | `(deny network*)` plus allow rules for the listed remote hosts only |
+| `net_hosts = []` | `(deny network*)` — the only valid state |
+| `net_hosts = [...]` | **REFUSED at validation.** SBPL cannot express a host filter, so this used to emit a profile `sandbox-exec` rejects (exit 65) and the app never launched. See *A net scope is not grantable* below. |
+| `fetch_hosts = [...]` | **No SBPL network effect at all.** The app keeps a flat `(deny network*)`; egress rides the daemon over `state/ipc/apps/fetch.sock`. |
 | `fs_read` / `fs_write` | deny-by-default filesystem; allow subpath reads/writes for the listed paths, plus implicit read of the app's own directory and read/write of `state/ipc/apps/<name>.sock` |
 | `gpu = false` | deny IOKit GPU clients (no Metal device access) |
 | `jit = false` / `jit = true` | `(deny dynamic-code-generation)` / `(allow dynamic-code-generation)` — explicit + reorder-safe, like `gpu`; the bit is token-bound and consequential to enable (see docs/INTROSPECT.md). Only `dynamic-code-generation` is emitted; legacy `dynamic-signature` is never written. |
@@ -86,7 +90,11 @@ runtime     = "python"
 
 [permissions]
 audio     = false
-net_hosts = ["voron.local", "octoprint.local"]
+# NOTE: this example previously read `net_hosts = ["voron.local", "octoprint.local"]`.
+# That is no longer valid — see "A net scope is not grantable" below. Fab-Link's
+# printer access is an OPEN OWNER DECISION: its Moonraker transport is
+# `ws://voron.local:7125/websocket`, which the fetch proxy cannot carry (wrong
+# scheme, non-443 port, and a private LAN address the SSRF guard refuses).
 fs_read   = ["apps/fab-link/gcode-previews"]
 fs_write  = ["state/tmp/fab-link"]
 gpu       = false
@@ -100,7 +108,7 @@ At launch, `darwind`:
 
 1. Parses the manifest and validates it (name matches directory, runtime known, paths inside allowed roots).
 2. Mints the capability token: `HMAC-SHA256(secret, "fab-link" || canonical(permissions) || nonce)`.
-3. Writes a seatbelt profile allowing: read of `apps/fab-link/`, read of `apps/fab-link/gcode-previews`, write of `state/tmp/fab-link`, socket access to `state/ipc/apps/fab-link.sock`, outbound network to `voron.local` and `octoprint.local` only. Everything else denied — no mic, no GPU, no other filesystem, no other network.
+3. Writes a seatbelt profile allowing: read of `apps/fab-link/`, read of `apps/fab-link/gcode-previews`, write of `state/tmp/fab-link`, socket access to `state/ipc/apps/fab-link.sock`. **No outbound IP network at all** — a direct-egress net scope is not grantable (below), so the profile is a flat `(deny network*)`. Everything else denied — no mic, no GPU, no other filesystem, no network.
 4. Executes `sandbox-exec -f <profile> <venv python3> apps/fab-link/main.py` (the daemon resolves the `.venv/bin/python3` interpreter and appends the project-root-relative entry path) with the token passed via the launch environment.
 5. The app connects to its socket and includes the token in every JSON request; the daemon verifies before acting. Telemetry the app publishes is accepted only on its declared `telemetry_topics` and re-broadcast on 127.0.0.1:7177 to the HUD.
 
@@ -111,7 +119,7 @@ What the sandbox prevents:
 | Escape attempt | Why it fails |
 |---|---|
 | **Arbitrary filesystem access** — reading `~/.ssh`, `state/darwin.db`, other apps' dirs; writing outside its grant | Seatbelt is deny-by-default; only manifest-listed `fs_read`/`fs_write` paths (plus the app's own dir and socket) are allowed. The daemon's secrets and the memory DB are never in any app's grant. |
-| **Arbitrary network** — exfiltration, C2, scanning the LAN | `(deny network*)` unless `net_hosts` lists the host. An app with an empty list has no network at all; Fab-Link can reach its printer and nothing else. |
+| **Arbitrary network** — exfiltration, C2, scanning the LAN | `(deny network*)`, unconditionally, for every app. There is no host allow-list to widen: a net scope is refused at validation and the generator never emits a network grant. The only egress is the daemon-mediated fetch proxy, where the *daemon* makes the request against the app's declared `fetch_hosts`. |
 | **Mic access without grant** — eavesdropping via the microphone | Direct device access is denied by the profile unless `audio = true`. Even with `audio = true`, audio flows through the daemon's audio API over the app socket — the daemon can mute, indicate, and log it. |
 | **IPC impersonation** — one app speaking as another, or replaying old credentials | Per-app sockets plus per-launch HMAC capability tokens bound to name + permission set + session nonce. Wrong app, wrong permission set, or stale nonce → verification fails and the daemon drops the connection. |
 | **Privilege escalation via UI** — spawning windows, capturing the screen, key-logging | Apps have no window-server allowance; their only display path is a surface composited by the HUD (`wgpu` texture or embedded webview). Input reaches an app only when the HUD routes it to that surface. |
@@ -153,7 +161,34 @@ Both caveats remain inherent to SBPL egress *as a mechanism* — but as of the d
 
 The **agent-tool surface invariant is preserved by construction**: `agent_tools` skips any app with non-empty `net_hosts` **or** non-empty `fetch_hosts`, so a tool offered to the model still provably has no network side effects.
 
-**Residual (honest register):** the daemon (the trust root) now performs the fetches, so a compromised daemon fetches as before — same single-UID boundary as everything above. The declared `fetch_hosts` are trusted to be the operator's intent (the manifest is reviewed, not judged, exactly like `net_hosts` was); a hostile *feed server* can still return hostile *content*, which the app must treat as untrusted data (unchanged from direct egress). `net_hosts` remains supported as a mechanism for a future app with a genuine direct-socket need, but the shipped fleet no longer uses it.
+**Residual (honest register):** the daemon (the trust root) now performs the fetches, so a compromised daemon fetches as before — same single-UID boundary as everything above. The declared `fetch_hosts` are trusted to be the operator's intent (the manifest is reviewed, not judged, exactly like `net_hosts` was); a hostile *feed server* can still return hostile *content*, which the app must treat as untrusted data (unchanged from direct egress). `net_hosts` is **no longer supported at all** — see the next section.
+
+### A net scope is not grantable — `net_hosts` REFUSED at validation
+
+**The primitive does not exist.** macOS SBPL has no host or IP filtering rule. `(remote tcp (host-name "x"))` is not valid syntax, and neither is `(remote ip "1.2.3.4:443")` — the compiler accepts only `*` or `localhost` as a host. So the derivation this document used to describe was never enforceable.
+
+**What actually happened.** A non-empty `net_hosts` made `generate_sbpl` emit those rules, `sandbox-exec` rejected the whole profile with **exit 65** (`host must be * or localhost in network address`), and the app **never launched at all**. It failed *closed*, so there was no security exposure — but two shipped apps (`fab-link`, `algo-core`) were unlaunchable, and the failure presented as a crash-loop rather than a permission error. Two string-matching tests over these rules passed the entire time, because they asserted the literals the generator emitted: the generator agreeing with itself. Only handing the profile to `sandbox-exec` ever caught it.
+
+**The decision, now landed.** A net scope is refused at **validation**, in one voice across all three gates (`apps::NET_SCOPE_REFUSAL`):
+
+| Gate | Behaviour |
+|---|---|
+| `AppManifest::validate` (runtime capability ceiling) | a non-empty `net_hosts` is refused; the app is skipped at discovery and surfaced as `app.manifest_invalid` |
+| `forge::validate_permissions` (author-time + `darwind --validate-forge-manifest`) | same refusal; `scripts/apply_forge.sh` will not deploy the app |
+| `plugin_sdk::scope_backed_by_permissions` | a `net` tool scope is **never** backed, with or without hosts |
+
+The old guidance was actively harmful: an author who hit *"tool scope `net` is over-privileged"* was being told to declare `net_hosts`, which is precisely what killed the app. The DLS rule was renamed `net_scope_without_hosts` → **`net_scope_not_grantable`** for the same reason.
+
+`generate_sbpl` now emits `(deny network*)` **unconditionally**, so even a manifest constructed in-process that bypassed validation produces a profile that compiles and grants nothing.
+
+**The supported route is the fetch proxy** (previous section): declare `fetch_hosts`, read `state/ipc/apps/fetch.sock`, and let the daemon make the request.
+
+**Open owner decision — two apps cannot take that route.** Both are spec-only (`SPEC.md` + `manifest.toml`, no implementation), and both were already unlaunchable, so nothing regressed — but neither can be migrated as written:
+
+- **`fab-link`** — Moonraker is `ws://voron.local:7125/websocket`. That fails the proxy on three independent axes: scheme (`ws`, not `https`), port (7125, not 443), and the SSRF guard (a `.local` mDNS name resolves to a private LAN address, which is refused by design). Its control ops (`pause`/`cancel`/`set_temp`) and webcam snapshot pulls are the same shape.
+- **`algo-core`** — market data is persistent WebSocket streaming (`stream.binance.com`, `ws.kraken.com`). The proxy is one-shot request/response and cannot carry a subscription. Its REST order path would proxy fine; the market-data half cannot.
+
+Granting either of them direct egress would require a new mechanism (a daemon-side WebSocket relay, or an explicit LAN-scoped exception to the SSRF guard). **That is an owner decision, not a validator change**, and it is deliberately not taken here.
 
 ### Confused-deputy via the inference socket — CLOSED (daemon-mediated generate proxy)
 

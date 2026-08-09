@@ -537,7 +537,14 @@ max_output_bytes = 262144  # reject any single server response larger than this 
 # read_only_tools = ["list", "read"]   # tools this config asserts are safe to call ungated
 # fs_read = ["/Users/you/proj"]        # extra read subpaths granted in the seatbelt profile
 # fs_write = []                        # extra write subpaths granted
-# net_hosts = []                       # outbound TCP host-names allowed; [] = NO network
+# net_hosts = []                       # [] = NO network. NOTE: a NON-EMPTY list is not
+#                                      # actually enforceable -- macOS SBPL has no host or
+#                                      # IP filter, so the generated profile fails to
+#                                      # COMPILE and the server never starts. Same root
+#                                      # cause as micro-app net_hosts (docs/SANDBOX.md,
+#                                      # "A net scope is not grantable"); unlike that one
+#                                      # this surface is NOT yet refused at validation --
+#                                      # it is an open owner decision. Leave it empty.
 
 [skills]
 # The SKILL LIBRARY (daemon/src/skills/): DARWIN's hand-written, in-tree set of
@@ -929,7 +936,8 @@ enabled = false                # SHIPS OFF (rides [sync], also OFF). Set true (w
 # own KNOWN_KEYS registry, HOVERS a config section against the live capability atlas
 # (capability.rs/atlas.rs), and DIAGNOSES with the daemon's REAL rules — an
 # over-privileged/malformed manifest (plugin_sdk::validate_manifest), a `net` scope
-# without net_hosts, an unknown agent tool (the agents.rs allowlist), a `mode = "auto"`
+# AT ALL (not grantable on this OS -- route egress through the fetch proxy),
+# an unknown agent tool (the agents.rs allowlist), a `mode = "auto"`
 # autonomy lint, and an unknown config key/section (KNOWN_KEYS). It NEVER writes config
 # and takes NO action (the intentional absence of a config-write primitive is preserved);
 # it only assists the human who edits. Point a thin editor shim at 127.0.0.1:<port> and

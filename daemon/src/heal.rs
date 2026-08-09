@@ -2514,6 +2514,20 @@ async fn run_cargo(dir: &Path, args: &[&str], timeout: Duration) -> anyhow::Resu
     })?;
     let child = tokio::process::Command::new(cargo)
         .args(args)
+        // PIN THE TARGET DIR TO THIS CRATE. An inherited CARGO_TARGET_DIR makes
+        // every staged validation share ONE build directory with whatever
+        // invoked the daemon — including, under `cargo test`, the test binary
+        // running this very function. Two consequences, both bad: concurrent
+        // validations serialize on (or fail outright at) cargo's build-directory
+        // lock, and — far worse — the MUTATION PROBE loses its isolation. The
+        // probe reverses a patch's fix and requires the patch's own test to
+        // fail; sharing a build cache with the un-reversed run lets a stale
+        // artifact satisfy the rebuild, the test passes, and the probe reports
+        // "the patch's own test PASSES without the fix, so it does not
+        // demonstrate the defect" for a patch that was actually fine. A gate
+        // that silently mis-scores its own evidence is worse than no gate.
+        // `forge.rs` already pins its nested build the same way.
+        .env("CARGO_TARGET_DIR", dir.join("target"))
         .current_dir(dir)
         // THE STAGED BUILD MUST NOT SHARE A TARGET DIR WITH ANYTHING.
         //

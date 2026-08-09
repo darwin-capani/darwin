@@ -1,3 +1,28 @@
+# =============================================================================
+# BLOCKED — THIS MANIFEST IS REFUSED AT VALIDATION. OWNER DECISION REQUIRED.
+#
+# `net_hosts` below is a direct-egress net scope, which is NOT GRANTABLE: macOS
+# SBPL has no host or IP filtering primitive, so this manifest used to compile
+# to a sandbox profile the OS rejects (exit 65) and Fab-Link NEVER LAUNCHED.
+# That failure was silent and looked like a crash-loop. It is now refused at
+# discovery with a diagnostic instead (docs/SANDBOX.md, "A net scope is not
+# grantable"). Nothing regressed: the app has no implementation
+# (SPEC.md + this manifest only, no main.py) and was already unlaunchable.
+#
+# IT WAS DELIBERATELY *NOT* MIGRATED to the fetch proxy, because it cannot be.
+# Moonraker's transport is `ws://voron.local:7125/websocket`, which fails the
+# proxy on three independent axes:
+#   - scheme  — the proxy is https-only; this is `ws`
+#   - port    — the proxy allows 443 only; this is 7125
+#   - address — `.local` is mDNS and resolves to a private LAN address, which
+#               the proxy's SSRF/rebinding guard refuses BY DESIGN
+# The OctoPrint fallback, the control ops (pause/resume/cancel/set_temp) and the
+# webcam snapshot pulls are all the same shape.
+#
+# Making this app work needs a NEW MECHANISM — a daemon-side WebSocket relay, or
+# an explicit LAN-scoped exception to the SSRF guard. Both widen the egress
+# posture, so both are the owner's call, not a validator change.
+# =============================================================================
 # Fab-Link — 3D-printing telemetry overlay (Moonraker / OctoPrint).
 # Schema: docs/SANDBOX.md. This is also the worked example in that document.
 

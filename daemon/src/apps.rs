@@ -192,10 +192,37 @@ pub enum Runtime {
     Node,
 }
 
+/// THE ONE REFUSAL MESSAGE for a direct-egress net scope, shared verbatim by
+/// every gate that can see one: the runtime capability ceiling
+/// (`validate_capability_ceiling`), the forge author-time gate
+/// (`forge::validate_permissions`), and the plugin scope cross-check
+/// (`plugin_sdk::scope_backed_by_permissions`). ONE implementation, three
+/// callers — the gates cannot drift into saying different things.
+///
+/// WHY A NET SCOPE IS REFUSED, NOT SHAPED: macOS SBPL has NO host or IP
+/// filtering primitive. `(remote tcp (host-name "x"))` and `(remote ip
+/// "1.2.3.4:443")` are both rejected by the compiler ("host must be * or
+/// localhost"), so a NON-EMPTY `net_hosts` produced a profile `sandbox-exec`
+/// refused (exit 65) and the app never launched at all. There is therefore no
+/// hostname list an author can write that works: empty means no network, and
+/// non-empty meant a dead app. The declaration has no satisfying state, so the
+/// honest gate is to refuse it at validation and name the route that does work.
+pub const NET_SCOPE_REFUSAL: &str = "permission not grantable: `net_hosts` (direct outbound network) \
+     cannot be enforced on this platform — macOS SBPL has no host or IP filtering primitive, so a \
+     non-empty list produces a sandbox profile the OS refuses to compile and the app never launches. \
+     Remove `net_hosts` and route the request through the daemon-mediated fetch proxy instead: declare \
+     the hostnames in `fetch_hosts` and fetch over `state/ipc/apps/fetch.sock` (https-only, exact-host, \
+     SSRF-guarded). See docs/SANDBOX.md.";
+
 #[derive(Debug, Clone, PartialEq, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct PermissionsSection {
     pub audio: bool,
+    /// ALWAYS EMPTY IN A VALIDATED MANIFEST — a direct-egress net scope is
+    /// refused at validation (see [`NET_SCOPE_REFUSAL`]). The field is retained
+    /// so a manifest that still declares it parses and reaches that refusal with
+    /// a precise diagnostic, rather than dying on an `unknown field` error that
+    /// names no remedy.
     pub net_hosts: Vec<String>,
     /// Hostnames the app may fetch THROUGH the daemon-mediated fetch proxy
     /// (`fetchproxy.rs`), which the app reaches over `state/ipc/apps/fetch.sock`.
@@ -329,8 +356,8 @@ impl AppManifest {
     ///   - fs_write / fs_read are CONFINED in-project relative paths (no
     ///     absolute path, no `..`/root escape) — a manifest can never declare
     ///     write access to `/` or read access to `../../etc`;
-    ///   - net_hosts are BARE hostnames (never a URL / path / port / space /
-    ///     `..`) and bounded in count.
+    ///   - `net_hosts` is EMPTY — a direct-egress net scope is NOT GRANTABLE on
+    ///     this OS at all (see [`NET_SCOPE_REFUSAL`]); egress rides `fetch_hosts`.
     ///
     /// Every shipped manifest already satisfies this; the ceiling exists to stop
     /// a NEW/edited manifest from widening the sandbox beyond these invariants.
@@ -347,17 +374,12 @@ impl AppManifest {
                 bail!("over-broad permission: fs_read {r:?} is not a confined in-project relative path");
             }
         }
-        if p.net_hosts.len() > MAX_APP_NET_HOSTS {
-            bail!(
-                "over-broad permission: net_hosts declares {} hosts (max {MAX_APP_NET_HOSTS})",
-                p.net_hosts.len()
-            );
-        }
-        for h in &p.net_hosts {
-            let h = h.trim();
-            if h.is_empty() || h.contains('/') || h.contains(':') || h.contains(' ') || h.contains("..") {
-                bail!("over-broad permission: net_hosts entry {h:?} is not a bare hostname");
-            }
+        // A DIRECT-EGRESS NET SCOPE IS NOT GRANTABLE — refuse the declaration
+        // outright rather than shaping it. There is no bare-hostname/count
+        // ceiling to apply any more, because there is no value of `net_hosts`
+        // other than `[]` that this OS can enforce. See `NET_SCOPE_REFUSAL`.
+        if !p.net_hosts.is_empty() {
+            bail!("{NET_SCOPE_REFUSAL}");
         }
         // fetch_hosts (the daemon-mediated fetch proxy allow-list) is ceiling-
         // checked IDENTICALLY to net_hosts: bounded count, each a bare DNS name
@@ -651,9 +673,11 @@ pub fn global_registry() -> Option<Arc<AppRegistry>> {
 ///     roots so the runtime can actually start,
 ///   - file-write* of each manifest `fs_write` path + the app's own per-app
 ///     socket dir (state/ipc/apps) so it can connect,
-///   - network: when `net_hosts` is non-empty, `(system-network)` + outbound
-///     with `remote tcp` host-name filters for the listed hosts (plus DNS);
-///     empty list => no network at all,
+///   - network: NOTHING. `(deny network*)` unconditionally — a direct-egress
+///     net scope is not grantable on this OS (see `NET_SCOPE_REFUSAL`), so no
+///     app gets an IP stack or a resolver. The only outbound grants are AF_UNIX
+///     literals for the app's own socket and any `.sock` it declares (the
+///     fetch/generate proxies), which is how declared egress reaches the daemon,
 ///   - mach lookups the loader needs (dyld, the system framework registry).
 ///     Everything else — other filesystem, other network, the microphone, GPU,
 ///     the window server, the memory DB, secrets — stays denied by the opener.
@@ -952,61 +976,28 @@ pub fn generate_sbpl(
     // SBPL is last-match-wins, so the IP-network deny/allow rules go FIRST and
     // the Unix-socket connect grant goes LAST — otherwise a (deny network*)
     // would clobber the socket grant and the app could never reach its host.
-    if p.net_hosts.is_empty() {
-        s.push_str("\n;; net_hosts = [] -> no outbound IP network at all.\n");
-        s.push_str("(deny network*)\n");
-    } else {
-        s.push_str("\n;; net_hosts non-empty -> outbound TCP to the listed hosts\n");
-        s.push_str(";; only, plus DNS. CAVEAT 1 (coarse host filtering): SBPL\n");
-        s.push_str(";; `remote tcp host-name` matches the connect-time name but\n");
-        s.push_str(";; cannot pin the resolved IP, and a host that resolves to a\n");
-        s.push_str(";; shared CDN may share an allow with unrelated names on that\n");
-        s.push_str(";; CDN. CAVEAT 2 (DNS exfil): allowing DNS at all opens a\n");
-        s.push_str(";; side channel — a malicious app could encode data in query\n");
-        s.push_str(";; labels to an attacker-controlled nameserver, bypassing the\n");
-        s.push_str(";; net_hosts allow-list entirely. We restrict DNS to the\n");
-        s.push_str(";; system resolver address (below) to RAISE the bar, but this\n");
-        s.push_str(";; does NOT close the channel. Both caveats are the headline\n");
-        s.push_str(";; justification for the Phase-4 daemon-mediated fetch proxy\n");
-        s.push_str(";; (app declares URLs, daemon fetches; app gets NO direct\n");
-        s.push_str(";; network or DNS at all). See docs/SANDBOX.md.\n");
-        s.push_str("(system-network)\n");
-        // Deny IP network first, then re-allow only DNS + the declared hosts,
-        // so nothing outside the allow-list survives (last-match-wins).
-        s.push_str("(deny network*)\n");
-        // DNS resolution. Pin to the SYSTEM RESOLVER address(es) from
-        // /etc/resolv.conf when we can read them, so the app cannot send DNS
-        // queries directly to an attacker-controlled nameserver — this raises
-        // the bar on the exfil channel (it does not close it; the resolver
-        // still forwards). If no resolver is readable, fall back to *:53 so
-        // the app can still boot (a host with no resolv.conf is unusual).
-        let resolvers = system_resolvers();
-        if resolvers.is_empty() {
-            s.push_str(";; no /etc/resolv.conf nameserver found -> DNS to any *:53.\n");
-            s.push_str("(allow network-outbound (remote udp \"*:53\"))\n");
-            s.push_str("(allow network-outbound (remote tcp \"*:53\"))\n");
-        } else {
-            s.push_str(";; DNS pinned to the system resolver address(es).\n");
-            for r in &resolvers {
-                s.push_str(&format!(
-                    "(allow network-outbound (remote udp \"{r}:53\"))\n"
-                ));
-                s.push_str(&format!(
-                    "(allow network-outbound (remote tcp \"{r}:53\"))\n"
-                ));
-            }
-        }
-        // Each declared host (the feeds are all HTTPS).
-        let mut hosts: Vec<&str> = p.net_hosts.iter().map(String::as_str).collect();
-        hosts.sort_unstable();
-        hosts.dedup();
-        for host in hosts {
-            s.push_str(&format!(
-                "(allow network-outbound (remote tcp (host-name {})))\n",
-                sbpl_str(Path::new(host))
-            ));
-        }
-    }
+    // A DIRECT-EGRESS NET SCOPE IS NOT GRANTABLE, so there is exactly ONE
+    // network shape: deny it all. `net_hosts` is refused at validation
+    // (`NET_SCOPE_REFUSAL`), so no validated manifest can reach here carrying
+    // hosts — and this branch is unconditional so that even a manifest built
+    // in-process, bypassing validation, still yields a profile that COMPILES
+    // and grants nothing. The old host-list branch emitted
+    // `(remote tcp (host-name …))`, which macOS rejects outright ("host must be
+    // * or localhost"), so it could only ever produce a profile sandbox-exec
+    // refused with exit 65 — a dead app, never a filtered one. Removing it
+    // deletes a code path that had no correct outcome.
+    //
+    // All app egress now rides the daemon-mediated fetch proxy: the app declares
+    // `fetch_hosts`, connects to state/ipc/apps/fetch.sock (an AF_UNIX literal
+    // granted below), and the DAEMON makes the request. That also collapses both
+    // inherent SBPL network caveats that this branch used to document — coarse
+    // host filtering (no IP pinning / CDN co-tenant bleed) and the DNS-label
+    // exfil side channel — because the app gets no IP stack and no resolver at
+    // all. See docs/SANDBOX.md.
+    s.push_str("\n;; A net scope is not grantable on this OS -> no outbound IP\n");
+    s.push_str(";; network, and no DNS, for any app. Declared egress rides the\n");
+    s.push_str(";; daemon-mediated fetch proxy over fetch.sock instead.\n");
+    s.push_str("(deny network*)\n");
     // The app's OWN Unix socket — granted LAST so neither network branch above
     // can clobber it. Connecting to a Unix-domain socket is network-outbound to
     // the socket path.
@@ -1112,35 +1103,6 @@ fn interpreter_install_prefix(interp_real: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(prefix.to_path_buf())
-}
-
-/// The system DNS resolver address(es) from `/etc/resolv.conf`, used to PIN the
-/// app's DNS grant instead of opening `*:53` (raises the bar on the DNS-exfil
-/// side channel). Each entry is validated as a literal IPv4/IPv6 address —
-/// never echoed verbatim into the SBPL — so a tampered resolv.conf cannot
-/// inject profile syntax. Returns an empty Vec when none can be read (the
-/// caller then falls back to `*:53` so the app still boots).
-fn system_resolvers() -> Vec<String> {
-    let Ok(raw) = std::fs::read_to_string("/etc/resolv.conf") else {
-        return Vec::new();
-    };
-    let mut out: Vec<String> = Vec::new();
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.starts_with('#') || line.starts_with(';') {
-            continue;
-        }
-        let Some(rest) = line.strip_prefix("nameserver") else {
-            continue;
-        };
-        let addr = rest.trim();
-        // Only accept a literal IP — reject anything that is not parseable as
-        // one (defensive against a hostile/garbled resolv.conf).
-        if addr.parse::<std::net::IpAddr>().is_ok() && !out.iter().any(|a| a == addr) {
-            out.push(addr.to_string());
-        }
-    }
-    out
 }
 
 // ===========================================================================
@@ -3116,7 +3078,7 @@ mod tests {
             [permissions]
             audio     = false
             gpu       = false
-            net_hosts = ["feeds.npr.org", "hnrss.org"]
+            net_hosts = []
             fs_read   = ["state/ipc/inference.sock"]
             fs_write  = ["state/apps/global-scan"]
 
@@ -3170,29 +3132,44 @@ mod tests {
         .is_ok());
     }
 
+    /// THE CEILING NOW REFUSES *ANY* net_hosts, not just a malformed one.
+    ///
+    /// This replaces `ceiling_rejects_a_non_bare_or_overlong_net_hosts`, which
+    /// asserted the declaration was SHAPED -- bare hostnames, at most 16. Both
+    /// rules are gone, because there is no well-shaped value: macOS SBPL cannot
+    /// express a host filter at all, so a non-empty list only ever produced an
+    /// uncompilable profile. Note the second case below: `octoprint.local` is a
+    /// perfectly bare hostname that the OLD ceiling ACCEPTED, and it is exactly
+    /// what made fab-link unlaunchable. It must now be refused.
     #[test]
-    fn ceiling_rejects_a_non_bare_or_overlong_net_hosts() {
-        // A URL / path / port in net_hosts is refused (must be a bare hostname).
-        for bad in ["https://evil.com", "evil.com/path", "host:8080", "a b"] {
+    fn ceiling_refuses_any_net_hosts_declaration_however_well_formed() {
+        for host in [
+            "https://evil.com", // malformed: was refused before, still refused
+            "evil.com/path",
+            "host:8080",
+            "a b",
+            "octoprint.local", // WELL-FORMED: was ACCEPTED before, refused now
+            "api.binance.com",
+        ] {
+            let err = manifest_with_perms(&format!(
+                "audio=false\ngpu=false\nnet_hosts=[\"{host}\"]\nfs_read=[]\nfs_write=[]"
+            ))
+            .expect_err(&format!("net_hosts {host:?} must be refused"));
+            let msg = format!("{err:#}");
             assert!(
-                manifest_with_perms(&format!(
-                    "audio=false\ngpu=false\nnet_hosts=[\"{bad}\"]\nfs_read=[]\nfs_write=[]"
-                ))
-                .is_err(),
-                "net_host {bad:?} must be rejected"
+                msg.contains("not grantable"),
+                "the refusal must say the scope is not grantable, not that it is malformed: {msg}"
+            );
+            assert!(
+                msg.contains("fetch_hosts"),
+                "the refusal must name the route that works, or it is a dead end: {msg}"
             );
         }
-        // A bare hostname (incl. the .local printer shape fab-link uses) is fine.
+        // An EMPTY list is the only accepted value, and stays accepted.
         assert!(manifest_with_perms(
-            "audio=false\ngpu=false\nnet_hosts=[\"octoprint.local\"]\nfs_read=[]\nfs_write=[]"
+            "audio=false\ngpu=false\nnet_hosts=[]\nfs_read=[]\nfs_write=[]"
         )
         .is_ok());
-        // Over the count ceiling (>16) is refused.
-        let many = (0..17).map(|i| format!("\"h{i}.example\"")).collect::<Vec<_>>().join(",");
-        assert!(manifest_with_perms(&format!(
-            "audio=false\ngpu=false\nnet_hosts=[{many}]\nfs_read=[]\nfs_write=[]"
-        ))
-        .is_err());
     }
 
     #[test]
@@ -3242,7 +3219,7 @@ mod tests {
         assert_eq!(m.app.entry, "apps/global-scan/main.py");
         assert!(!m.permissions.audio);
         assert!(!m.permissions.gpu);
-        assert_eq!(m.permissions.net_hosts, vec!["feeds.npr.org", "hnrss.org"]);
+        assert!(m.permissions.net_hosts.is_empty(), "a validated manifest never carries net_hosts");
         assert_eq!(m.permissions.fs_read, vec!["state/ipc/inference.sock"]);
         assert_eq!(m.permissions.fs_write, vec!["state/apps/global-scan"]);
         assert_eq!(m.ui.surface, "panel");
@@ -3509,9 +3486,9 @@ mod tests {
             !p.contains("(allow network-outbound (literal \"/Users/test/darwin/state/shared/config.json\"))"),
             "a normal file fs_read entry must NOT get a network-outbound grant"
         );
-        // And the grant lands AFTER the (deny network*) for the no-network
-        // branch would; here net_hosts is non-empty so (deny network*) is
-        // present and last-match-wins must keep the connect alive.
+        // And the grant lands AFTER the unconditional (deny network*), because
+        // SBPL is last-match-wins and the deny would otherwise clobber the
+        // AF_UNIX connect the app needs to reach the daemon.
         let deny_idx = p.find("(deny network*)").expect("deny network present");
         let grant_idx = p
             .find("(allow network-outbound (literal \"/Users/test/darwin/state/ipc/apps/generate.sock\"))")
@@ -3519,48 +3496,36 @@ mod tests {
         assert!(grant_idx > deny_idx, "the connect grant must come after the network deny");
     }
 
+    /// THE NET SCOPE IS GONE FROM THE SBPL ENTIRELY. This replaces the old
+    /// `sbpl_network_is_host_filtered_when_listed` (and the two DNS-pinning
+    /// tests that sat beside it), which asserted the literals of a profile macOS
+    /// never accepted: `(remote tcp (host-name ...))` is not valid SBPL, so those
+    /// rules could only ever produce an uncompilable profile. They passed
+    /// because the generator was agreeing with itself.
+    ///
+    /// The contract now: no matter what a manifest carries -- even one built
+    /// in-process that bypassed the validator's refusal -- the profile is a FLAT
+    /// deny with no IP stack, no resolver, and no host filter of any kind.
     #[test]
-    fn sbpl_network_is_host_filtered_when_listed() {
-        let p = gen_profile(&sample_manifest());
-        assert!(p.contains("(system-network)"));
-        assert!(p.contains("(allow network-outbound (remote tcp (host-name \"feeds.npr.org\")))"));
-        assert!(p.contains("(allow network-outbound (remote tcp (host-name \"hnrss.org\")))"));
-        // DNS is granted on port 53 — pinned to the system resolver address(es)
-        // when /etc/resolv.conf is readable, else *:53. Either way a :53 grant
-        // must be present so the app can resolve the feed hosts.
-        assert!(
-            p.contains("(remote udp \"") && p.contains(":53\""),
-            "a DNS (:53) grant must be present"
-        );
-        // No grant for a host that was NOT declared.
-        assert!(!p.contains("host-name \"evil.com\""));
+    fn sbpl_never_grants_direct_network_even_for_a_manifest_carrying_hosts() {
+        let mut m = sample_manifest();
+        // Bypass validation deliberately: this is the belt-and-braces path.
+        m.permissions.net_hosts = vec!["feeds.npr.org".into(), "hnrss.org".into()];
+        let p = gen_profile(&m);
+        assert!(p.contains("(deny network*)"), "the IP network is denied outright");
+        assert!(!p.contains("(system-network)"), "no IP network stack is ever granted");
+        assert!(!p.contains("host-name"), "SBPL has no host filter; none may be emitted");
+        for host in &m.permissions.net_hosts {
+            assert!(
+                !p.contains(host.as_str()),
+                "a declared host ({host}) must not reach the profile at all"
+            );
+        }
+        // ...and no DNS grant survives either -- the resolver grant only ever
+        // existed to serve the host allow-list, and it was the exfil channel.
+        assert!(!p.contains(":53"), "no DNS grant without a net scope to serve");
     }
 
-    #[test]
-    fn sbpl_dns_is_pinned_to_system_resolvers_when_available() {
-        // When /etc/resolv.conf yields resolver IPs, DNS must be pinned to
-        // those addresses (not *:53) — the DNS-exfil-channel hardening. We
-        // assert against the ACTUAL system resolvers so the test reflects the
-        // host it runs on; if none are configured the generator falls back to
-        // *:53 (and this assertion is vacuously satisfied by the fallback).
-        let resolvers = system_resolvers();
-        let p = gen_profile(&sample_manifest());
-        if resolvers.is_empty() {
-            assert!(p.contains("(allow network-outbound (remote udp \"*:53\"))"));
-        } else {
-            // No wildcard DNS grant survived.
-            assert!(
-                !p.contains("\"*:53\""),
-                "wildcard DNS must not be granted when a resolver is known"
-            );
-            for r in &resolvers {
-                assert!(
-                    p.contains(&format!("(remote udp \"{r}:53\")")),
-                    "DNS must be pinned to resolver {r}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn sbpl_exec_is_literal_only_never_a_broad_prefix() {
@@ -3609,30 +3574,6 @@ mod tests {
         );
         // Pathologically shallow prefix -> None (would re-open a broad tree).
         assert_eq!(interpreter_install_prefix(Path::new("/usr/bin/python3")), None);
-    }
-
-    #[test]
-    fn system_resolvers_only_accepts_literal_ips() {
-        // The parser must reject anything that is not a literal IP so a hostile
-        // resolv.conf can never inject SBPL syntax. We exercise the real reader
-        // (it reads the host's /etc/resolv.conf) and assert every returned
-        // entry parses as an IP.
-        for r in system_resolvers() {
-            assert!(
-                r.parse::<std::net::IpAddr>().is_ok(),
-                "system_resolvers returned a non-IP: {r:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn sbpl_no_network_when_net_hosts_empty() {
-        let mut m = sample_manifest();
-        m.permissions.net_hosts.clear();
-        let p = gen_profile(&m);
-        assert!(p.contains("(deny network*)"), "empty net_hosts -> no network");
-        assert!(!p.contains("(system-network)"));
-        assert!(!p.contains("host-name"));
     }
 
     #[test]
@@ -4568,9 +4509,47 @@ mod tests {
             }
             let dir_name = dir.file_name().unwrap().to_str().unwrap().to_string();
             let raw = std::fs::read_to_string(&manifest_path).unwrap();
+
+            // KNOWN-REFUSED: these two declare a direct-egress `net_hosts`, which
+            // is not grantable on this OS and is refused at validation (see
+            // `NET_SCOPE_REFUSAL`). They are spec-only (SPEC.md + manifest, no
+            // main.py) and were ALREADY unlaunchable before the refusal landed --
+            // their profile failed to compile, so they crash-looped instead. They
+            // are deliberately NOT migrated to the fetch proxy because neither
+            // can use it: fab-link needs `ws://voron.local:7125` (wrong scheme,
+            // wrong port, and a private LAN address the SSRF guard refuses), and
+            // algo-core needs persistent WebSocket market-data streams the
+            // one-shot proxy cannot carry. Granting either one egress needs a new
+            // mechanism and is an OWNER DECISION -- see docs/SANDBOX.md.
+            //
+            // Asserted POSITIVELY (not skipped) so this cannot rot into silence:
+            // if one is ever migrated or removed, this arm fails and must be
+            // updated deliberately.
+            if matches!(dir_name.as_str(), "fab-link" | "algo-core") {
+                let err = crate::plugin_sdk::validate_manifest(&raw, &dir_name).expect_err(
+                    &format!("apps/{dir_name}: still declares a net scope, so it MUST be refused"),
+                );
+                assert!(
+                    err.contains("not grantable"),
+                    "apps/{dir_name}: refused for the wrong reason: {err}"
+                );
+                assert!(
+                    err.contains("fetch_hosts"),
+                    "apps/{dir_name}: the refusal must name the supported route: {err}"
+                );
+                continue;
+            }
+
             // The REAL loader contract (deny_unknown_fields) + the SDK contract.
             let manifest = crate::plugin_sdk::validate_manifest(&raw, &dir_name)
                 .unwrap_or_else(|e| panic!("apps/{dir_name}/manifest.toml invalid: {e}"));
+            // EVERY other shipped manifest must be free of a net scope -- a
+            // validator that refuses too much would brick the app deck, and a
+            // manifest that still carried one would be silently undeployable.
+            assert!(
+                manifest.permissions.net_hosts.is_empty(),
+                "apps/{dir_name}: a validated manifest can never carry net_hosts"
+            );
             checked_apps += 1;
 
             // HARNESS GRANT — checked for EVERY python app that imports the shared
@@ -4691,23 +4670,6 @@ mod tests {
                 "#,
             ),
             (
-                "gamma",
-                r#"
-                [app]
-                name = "gamma"
-                version = "0.1.0"
-                description = "network-capable app"
-                entry = "apps/gamma/main.py"
-                runtime = "python"
-                [permissions]
-                net_hosts = ["example.com"]
-                [[tools.exposes]]
-                name = "gamma.fetch"
-                scopes = ["net"]
-                consequential = false
-                "#,
-            ),
-            (
                 "delta",
                 r#"
                 [app]
@@ -4733,19 +4695,20 @@ mod tests {
         let tools = registry.agent_tools().await;
         // alpha.publish (consequential) is filtered; beta's alpha.calc collides
         // with alpha's (same mangled name) and is dropped (alpha sorts first);
-        // gamma.fetch is withheld because gamma grants DIRECT network; delta.pull
-        // is withheld because delta can egress THROUGH the fetch proxy (non-empty
-        // fetch_hosts) — the "no network side effects" promise stays true by
-        // construction for BOTH egress paths.
+        // delta.pull is withheld because delta can egress THROUGH the fetch proxy
+        // (non-empty fetch_hosts) -- the "no network side effects" promise stays
+        // true by construction.
+        //
+        // There is no direct-network fixture here any more: a manifest declaring
+        // net_hosts is REFUSED at discovery now, so such an app can never reach
+        // the registry to be withheld from. The old `gamma` case would still have
+        // passed, but vacuously -- skipped as invalid rather than withheld as
+        // networked -- which is a test that has stopped testing its own claim.
         assert_eq!(tools.len(), 1, "one invocable tool: {tools:?}");
         assert_eq!(tools[0].app, "alpha");
         assert_eq!(tools[0].decl.name, "alpha.calc");
         assert_eq!(tools[0].decl.params.len(), 1);
         assert_eq!(tools[0].decl.params[0].name, "x");
-        assert!(
-            !tools.iter().any(|t| t.app == "gamma"),
-            "a direct-network app's tools are never auto-exposed"
-        );
         assert!(
             !tools.iter().any(|t| t.app == "delta"),
             "a fetch-proxy-capable app's tools are never auto-exposed"
@@ -5203,9 +5166,9 @@ mod tests {
         let mut m = sample_manifest();
         m.app.name = "probe-app".into();
         m.app.runtime = Runtime::Python;
-        // No declared net_hosts: that branch emits SBPL macOS rejects outright
-        // (pinned separately by `a_net_hosts_profile_does_not_compile_today`), and
-        // this test is about the interpreter exec chain, not the network rules.
+        // Belt-and-braces: the generator denies all IP network regardless, but
+        // keep this explicit so the probe is unambiguously about the interpreter
+        // exec chain rather than anything network-shaped.
         m.permissions.net_hosts = Vec::new();
         let profile = generate_sbpl(
             &m,
@@ -5235,30 +5198,57 @@ mod tests {
         );
     }
 
-    /// KNOWN DEFECT, PINNED: a declared `net_hosts` emits SBPL that macOS refuses
-    /// to compile, so the profile is rejected (exit 65) and the app can never
-    /// launch. It fails CLOSED, so there is no security exposure — but two shipped
-    /// apps (fab-link, algo-core) are unlaunchable, and docs/SANDBOX.md describes a
-    /// host-name allow-list and resolver-pinned DNS that this OS has never
-    /// accepted.
+    /// THE FLIP OF `a_net_hosts_profile_does_not_compile_today` (kept, not
+    /// deleted, exactly as that test's own note instructed).
     ///
-    /// The two string-matching tests over these rules pass, because they assert
-    /// the literals the generator emits — the generator agreeing with itself. Only
-    /// handing the profile to `sandbox-exec` catches it.
+    /// WAS: a declared `net_hosts` made `generate_sbpl` emit
+    /// `(remote tcp (host-name ...))`, which macOS refuses to compile
+    /// ("host must be * or localhost"). `sandbox-exec` exited 65, the profile was
+    /// rejected, and the app never launched. It failed CLOSED, so there was no
+    /// security exposure -- but two shipped apps (fab-link, algo-core) were
+    /// unlaunchable and docs/SANDBOX.md described an allow-list this OS never
+    /// accepted. The two string-matching tests over those rules passed the whole
+    /// time, because they asserted the literals the generator emitted -- the
+    /// generator agreeing with itself. Only handing the profile to `sandbox-exec`
+    /// ever caught it.
     ///
-    /// This is not fixable by correcting the syntax: SBPL has NO host or IP
-    /// filtering primitive at all (`(remote ip "1.2.3.4:443")` is rejected too;
-    /// host must be `*` or `localhost`). It needs a decision — refuse `net_hosts`
-    /// at manifest validation and route those apps through the daemon-side fetch
-    /// proxy, or emit a port-scoped `*:443` grant and rewrite the threat model to
-    /// match. WHEN THAT LANDS, THIS TEST SHOULD FLIP, not be deleted.
+    /// NOW: the decision has landed. A net scope is refused at validation
+    /// (`NET_SCOPE_REFUSAL`), and the generator denies all IP network
+    /// unconditionally, so the uncompilable rule can no longer be emitted by any
+    /// input. This test asserts BOTH halves of that, and it is the only one that
+    /// proves the first half against the real OS compiler rather than against our
+    /// own string literals:
+    ///   1. a manifest carrying hosts is REFUSED by the validator, and
+    ///   2. even if one is built in-process (bypassing the validator), the
+    ///      profile it produces COMPILES and grants no network.
     #[test]
     #[cfg(target_os = "macos")]
-    fn a_net_hosts_profile_does_not_compile_today() {
+    fn a_net_hosts_declaration_is_refused_and_can_no_longer_emit_uncompilable_sbpl() {
+        // (1) The validator refuses the declaration outright.
+        let refused = AppManifest::parse(
+            r#"
+            [app]
+            name        = "probe"
+            version     = "0.1.0"
+            description = "declares a net scope"
+            entry       = "apps/probe/main.py"
+            runtime     = "python"
+
+            [permissions]
+            net_hosts = ["voron.local"]
+            "#,
+            "probe",
+        );
+        let err = format!("{:#}", refused.expect_err("a net scope must be refused"));
+        assert!(err.contains("not grantable"), "refusal must name the reason: {err}");
+        assert!(err.contains("fetch_hosts"), "refusal must name the route that works: {err}");
+
+        // (2) And the generator can no longer produce the profile macOS rejected,
+        //     even when handed a manifest that bypassed (1) entirely.
         let root = PathBuf::from(format!("/private/tmp/jrv-nh-{}", std::process::id()));
         std::fs::create_dir_all(root.join("state/ipc/apps")).unwrap();
-        let m = sample_manifest(); // declares net_hosts
-        assert!(!m.permissions.net_hosts.is_empty(), "this probe needs declared net_hosts");
+        let mut m = sample_manifest();
+        m.permissions.net_hosts = vec!["voron.local".into(), "api.binance.com".into()];
         let profile = generate_sbpl(
             &m,
             &root,
@@ -5276,15 +5266,18 @@ mod tests {
             .expect("run sandbox-exec");
         let stderr = String::from_utf8_lossy(&out.stderr).to_string();
         let _ = std::fs::remove_dir_all(&root);
-        assert_eq!(
-            out.status.code(),
-            Some(65),
-            "net_hosts SBPL now compiles — the defect is fixed, so FLIP this test to \
-             assert success rather than deleting it. stderr: {stderr}"
+        assert!(
+            out.status.success(),
+            "the profile must now COMPILE (was exit 65). status: {:?} stderr: {stderr}\n\nprofile:\n{profile}",
+            out.status.code()
         );
         assert!(
-            stderr.contains("host must be * or localhost"),
-            "the failure changed shape; re-read it before assuming it is the same defect: {stderr}"
+            !stderr.contains("host must be * or localhost"),
+            "the uncompilable host rule must be gone: {stderr}"
+        );
+        assert!(
+            !profile.contains("host-name"),
+            "no host filter may reach the profile: {profile}"
         );
     }
 

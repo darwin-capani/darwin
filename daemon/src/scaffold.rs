@@ -143,8 +143,11 @@ if __name__ == "__main__":
         r#"# {app} — scaffolded micro-app manifest. See docs/PLUGIN_SDK.md + docs/SANDBOX.md.
 # [app].name MUST equal this directory name. Permissions are DEFAULT-DENY: this
 # grants only the app's own scratch dir (fs_write) and the shared apps/_sdk
-# harness (fs_read) — add net_hosts / fs_read / gpu / etc. ONLY as the app needs
-# them; every grant widens the seatbelt sandbox.
+# harness (fs_read) — add fs_read / fetch_hosts / gpu / etc. ONLY as the app
+# needs them; every grant widens the seatbelt sandbox. NOTE: `net_hosts` must
+# stay empty — a direct-egress net scope is not grantable and a non-empty list
+# is REFUSED at validation. For network access declare `fetch_hosts` and read
+# state/ipc/apps/fetch.sock (the daemon-mediated fetch proxy). See docs/SANDBOX.md.
 [app]
 name        = "{app}"
 version     = "0.1.0"

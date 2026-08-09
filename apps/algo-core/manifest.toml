@@ -1,3 +1,24 @@
+# =============================================================================
+# BLOCKED — THIS MANIFEST IS REFUSED AT VALIDATION. OWNER DECISION REQUIRED.
+#
+# `net_hosts` below is a direct-egress net scope, which is NOT GRANTABLE: macOS
+# SBPL has no host or IP filtering primitive, so this manifest used to compile
+# to a sandbox profile the OS rejects (exit 65) and Algo-Core NEVER LAUNCHED.
+# It is now refused at discovery with a diagnostic instead (docs/SANDBOX.md,
+# "A net scope is not grantable"). Nothing regressed: the app has no
+# implementation (SPEC.md + this manifest only, no main.py).
+#
+# IT WAS DELIBERATELY *NOT* MIGRATED to the fetch proxy, because only half of it
+# could be. Per SPEC.md section 5, market data is PERSISTENT WEBSOCKET STREAMING
+# (`stream.binance.com`, `ws.kraken.com`); the fetch proxy is one-shot
+# request/response and cannot carry a subscription. The REST order path
+# (`api.binance.com`, `api.kraken.com`, `clob.polymarket.com`) would proxy fine,
+# but an order path without a market-data path is not a working app.
+#
+# Making this app work needs a daemon-side WebSocket relay. NOTE ALSO that this
+# app PLACES ORDERS ON REAL VENUES — granting it egress is a financial-risk
+# decision as much as a sandbox one, and is emphatically the owner's call.
+# =============================================================================
 # Algo-Core — predictive algo-trading daemon with live charting in the HUD.
 # Schema: docs/SANDBOX.md
 

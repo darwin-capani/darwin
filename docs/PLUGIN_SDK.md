@@ -48,7 +48,7 @@ cross-check):
 
 | scope | backed by | meaning |
 |---|---|---|
-| `net` | `net_hosts` non-empty | outbound network to the declared hosts |
+| `net` | **nothing — never grantable** | refused at validation; see below |
 | `fs_read` | `fs_read` non-empty | filesystem read of the declared subpaths |
 | `fs_write` | `fs_write` non-empty | filesystem write of the declared subpaths |
 | `audio` | `audio = true` | the daemon's audio API |
@@ -57,10 +57,19 @@ cross-check):
 | `screen` | `screen = true` | TCC-gated screen **declaration** (TCC is the real gate) |
 | `generate` | — (no extra permission) | the daemon-mediated generate proxy (op=generate only) |
 
-A tool requesting `net` while `net_hosts = []` is **over-privileged**: it claims a
-network the SBPL profile would deny. `validate_manifest` rejects it with a precise
-error (`tool "x": tool scope "net" is over-privileged: …`). This is the literal
-guarantee *"a plugin can NOT request a capability outside the allowed set."*
+A tool requesting `net` is refused **in every state** — with hosts or without.
+It is not an over-privilege the author can resolve by declaring `net_hosts`:
+macOS SBPL has no host or IP filtering primitive, so a non-empty list produced a
+sandbox profile the OS refuses to compile and the app never launched at all. The
+scope is listed in `ALLOWED_SCOPES` purely so it gets that precise diagnostic
+rather than a generic *unknown capability scope*, which would name no remedy.
+
+`validate_manifest` rejects it with `tool scope "net" is not grantable: …`,
+naming `fetch_hosts` and the daemon-mediated fetch proxy as the supported route.
+The other scopes keep the ordinary over-privilege message, because they genuinely
+*are* fixable by declaring the matching permission. See **A net scope is not
+grantable** in [`SANDBOX.md`](SANDBOX.md). This is the literal guarantee *"a
+plugin can NOT request a capability outside the allowed set."*
 
 ## (a) The validator — `validate_manifest(raw, dir_name)`
 

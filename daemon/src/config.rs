@@ -4894,8 +4894,20 @@ pub struct McpServerConfig {
     /// WRITE access to. Empty = none.
     pub fs_write: Vec<String>,
     /// stdio sandbox: outbound TCP host-names the server may reach. Empty = NO
-    /// network at all (default-deny). A network-needing stdio server must
-    /// declare its hosts here, honestly narrowing the profile.
+    /// network at all (default-deny).
+    ///
+    /// KNOWN DEFECT, NOT YET CLOSED — a NON-EMPTY list does not narrow the
+    /// profile, it BREAKS it. `mcp::stdio_sandbox_profile` emits
+    /// `(remote tcp (host-name ...))`, which macOS refuses to compile ("host
+    /// must be * or localhost"), so `sandbox-exec` rejects the profile and the
+    /// server never starts. This is the SAME root cause as micro-app
+    /// `net_hosts`, which is now refused at validation
+    /// (`crate::apps::NET_SCOPE_REFUSAL`) with the fetch proxy as the supported
+    /// route. This surface was deliberately NOT changed alongside it: MCP
+    /// servers are configured by the operator rather than shipped in-tree, so
+    /// refusing the key (or silently downgrading it to "starts, but with no
+    /// network") changes the behaviour of an existing user config. That is an
+    /// OWNER DECISION. Until it is taken, keep this empty.
     pub net_hosts: Vec<String>,
 }
 

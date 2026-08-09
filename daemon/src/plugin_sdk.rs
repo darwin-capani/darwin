@@ -62,7 +62,11 @@ use crate::apps::{verify_token_with_key, AppManifest, PermissionsSection, ToolDe
 /// permission dimensions in `PermissionsSection`). Adding a scope here is a
 /// deliberate widening of the contract, never an accident.
 pub const ALLOWED_SCOPES: &[&str] = &[
-    "net",      // outbound network — requires non-empty net_hosts
+    // NEVER GRANTABLE (see `NET_SCOPE_REFUSAL`). Kept in the allow-list on
+    // purpose: a plugin that declares it gets the precise "not grantable, use
+    // the fetch proxy" refusal instead of a generic "unknown capability scope",
+    // which names no remedy. There is no `[permissions]` value that backs it.
+    "net",
     "fs_read",  // filesystem read — requires non-empty fs_read
     "fs_write", // filesystem write — requires non-empty fs_write
     "audio",    // daemon audio API — requires audio = true
@@ -102,28 +106,20 @@ fn is_well_formed_name(name: &str) -> bool {
 /// "no privilege the sandbox forbids" cross-check.
 fn scope_backed_by_permissions(scope: &str, p: &PermissionsSection) -> Result<(), String> {
     let backed = match scope {
-        // READ THIS BEFORE "FIXING" A NET SCOPE BY ADDING HOSTS.
+        // A NET SCOPE HAS NO SATISFYING STATE, so it is never backed.
         //
-        // The rule above is only half the story, and the missing half is a trap.
-        // TRUE: with `net_hosts` empty the profile emits `(deny network*)`, so a
-        // `"net"` scope claims something the sandbox denies — over-privileged.
-        // NOT TRUE: that a NON-EMPTY list grants it. `generate_sbpl` turns a host
-        // list into SBPL macOS REFUSES TO COMPILE — `sandbox-exec` exits 65 with
-        // "host must be * or localhost in network address" — so the whole profile
-        // is rejected and THE APP NEVER LAUNCHES AT ALL.
+        // This used to read `!p.net_hosts.is_empty()`, which was exactly
+        // backwards as advice: it told an author that declaring hosts would fix
+        // the error. It would not. macOS SBPL has NO host or IP filtering
+        // primitive, so a non-empty list made `generate_sbpl` emit a profile
+        // `sandbox-exec` rejects outright (exit 65) and the app stopped launching
+        // altogether -- a crash-loop rather than a permission message. Empty
+        // meant the scope was denied; non-empty meant the app was dead.
         //
-        // So both states are broken, in opposite directions: empty = scope denied,
-        // non-empty = app dead. Satisfying this validator by declaring hosts trades
-        // a lint for an app that will not start, and the failure looks like a
-        // crash-loop rather than a permission problem.
-        //
-        // SBPL has NO host or IP filtering primitive — `(remote ip "1.2.3.4:443")`
-        // is rejected too. The working path is the daemon-side fetch proxy
-        // (fetchproxy.rs): the daemon holds the allow-list and makes the request,
-        // which is a fence that exists. `a_net_hosts_profile_does_not_compile_today`
-        // in apps.rs pins the compile failure and says to FLIP it, not delete it,
-        // when the declaration is finally refused at validation.
-        "net" => !p.net_hosts.is_empty(),
+        // Both states are now moot: `net_hosts` is refused at validation and the
+        // generator denies all IP network unconditionally. The scope is simply
+        // not grantable, and the error says so and names the fetch proxy.
+        "net" => false,
         "fs_read" => !p.fs_read.is_empty(),
         "fs_write" => !p.fs_write.is_empty(),
         "audio" => p.audio,
@@ -144,17 +140,19 @@ fn scope_backed_by_permissions(scope: &str, p: &PermissionsSection) -> Result<()
         // warning about net_hosts on every fs_read and audio error too — noise that
         // trains a reader to skip the sentence that matters. (My own test caught
         // that.)
-        let hint = if scope == "net" {
-            " NOTE: declaring net_hosts does NOT fix this — macOS SBPL cannot express \
-             a host list, so a non-empty list makes the sandbox profile fail to \
-             compile and the app never launches at all. Route the request through the \
-             daemon's fetch proxy instead."
-        } else {
-            ""
-        };
+        // The net scope is a DIFFERENT kind of failure from the others, so it
+        // gets a different sentence. fs_read/audio/gpu/... are over-privileged
+        // and FIXABLE by declaring the matching permission. `net` is not
+        // over-privileged, it is not grantable at all, and telling an author to
+        // "declare the matching permission" is the one piece of advice that
+        // breaks their app. One shared constant (`NET_SCOPE_REFUSAL`) keeps this
+        // wording identical to what the manifest validator and the forge gate say.
+        if scope == "net" {
+            return Err(format!("tool scope \"net\" is not grantable: {}", crate::apps::NET_SCOPE_REFUSAL));
+        }
         Err(format!(
             "tool scope {scope:?} is over-privileged: the [permissions] block does not grant it \
-             (declare the matching permission, or drop the scope).{hint}"
+             (declare the matching permission, or drop the scope)."
         ))
     }
 }
@@ -497,11 +495,14 @@ mod tests {
     /// outside the allowed set".
     #[test]
     fn validate_rejects_an_overprivileged_tool() {
-        // net scope, but net_hosts is [] in GOOD.
-        let raw = good_for("p").replace(r#"scopes = ["generate"]"#, r#"scopes = ["net"]"#);
+        // A gpu scope with gpu = false in GOOD: claimed but not granted. (The
+        // net scope used to be the example here; it is no longer an
+        // OVER-PRIVILEGE case at all -- see
+        // `a_net_scope_is_refused_as_not_grantable_not_as_over_privileged`.)
+        let raw = good_for("p").replace(r#"scopes = ["generate"]"#, r#"scopes = ["gpu"]"#);
         let err = validate_manifest(&raw, "p").unwrap_err();
         assert!(
-            err.contains("over-privileged") && err.contains("net"),
+            err.contains("over-privileged") && err.contains("gpu"),
             "got: {err}"
         );
 
@@ -526,15 +527,53 @@ mod tests {
         assert!(err.contains("over-privileged") && err.contains("fs_write"), "got: {err}");
     }
 
-    /// A scope that IS backed by the permission set validates (net + a non-empty
-    /// net_hosts).
+    /// A scope that IS backed by the permission set validates.
+    ///
+    /// This replaces `validate_accepts_a_backed_scope`, WHICH ASSERTED THE BUG:
+    /// it required that `net_hosts = ["example.com"]` + a `net` scope validate
+    /// cleanly. That is exactly the manifest that compiled to a sandbox profile
+    /// macOS rejects, so the test was pinning "the validator accepts a manifest
+    /// that produces a dead app" as correct behaviour. The backed-scope contract
+    /// is real, so it is kept here -- demonstrated with a scope that can actually
+    /// be granted.
     #[test]
-    fn validate_accepts_a_backed_scope() {
+    fn validate_accepts_a_genuinely_backed_scope() {
         let raw = r#"
+            [app]
+            name = "reader"
+            version = "0.1.0"
+            description = "a plugin with a backed fs_read scope"
+            entry = "reader"
+            runtime = "binary"
+
+            [permissions]
+            fs_read = ["state/ipc/apps/generate.sock"]
+
+            [[tools.exposes]]
+            name = "reader.load"
+            scopes = ["fs_read"]
+        "#;
+        assert!(validate_manifest(raw, "reader").is_ok(), "a backed fs_read scope validates");
+    }
+
+    /// THE NET SCOPE IS REFUSED AS NOT GRANTABLE -- not as over-privileged, and
+    /// NOT ONLY WHEN `net_hosts` IS EMPTY.
+    ///
+    /// The old pair of tests here encoded the inverted advice: an empty
+    /// `net_hosts` was "over-privileged" (implying: add hosts), and a non-empty
+    /// one was accepted. Following that advice produced a profile `sandbox-exec`
+    /// rejects with exit 65, so the app never launched -- which is how fab-link
+    /// and algo-core came to be shipped-but-unlaunchable.
+    ///
+    /// Both spellings must now be refused, with a diagnostic that names the
+    /// fetch proxy rather than telling the author to declare hosts.
+    #[test]
+    fn a_net_scope_is_refused_as_not_grantable_not_as_over_privileged() {
+        let with_hosts = r#"
             [app]
             name = "netty"
             version = "0.1.0"
-            description = "a plugin with a backed net scope"
+            description = "declares a net scope with hosts"
             entry = "netty"
             runtime = "binary"
 
@@ -545,7 +584,21 @@ mod tests {
             name = "netty.fetch"
             scopes = ["net"]
         "#;
-        assert!(validate_manifest(raw, "netty").is_ok(), "a backed net scope validates");
+        // A NON-EMPTY list -- the shape the old validator ACCEPTED -- is refused,
+        // and it is refused at the manifest level (the permission itself).
+        let err = validate_manifest(with_hosts, "netty").unwrap_err();
+        assert!(err.contains("not grantable"), "got: {err}");
+        assert!(err.contains("fetch_hosts"), "must name the route that works: {err}");
+        assert!(
+            !err.contains("declare the matching permission"),
+            "must NOT advise declaring hosts -- that is the advice that killed the app: {err}"
+        );
+
+        // And an EMPTY list with a net scope is refused too, by the scope check.
+        let empty = with_hosts.replace(r#"net_hosts = ["example.com"]"#, "net_hosts = []");
+        let err = validate_manifest(&empty, "netty").unwrap_err();
+        assert!(err.contains("not grantable"), "got: {err}");
+        assert!(err.contains("fetch_hosts"), "must name the route that works: {err}");
     }
 
     // -- (b) handshake: token verification -----------------------------------
@@ -590,8 +643,14 @@ mod tests {
         // Mint a token over the GOOD permissions...
         let manifest = validate_manifest(GOOD, "example-plugin").unwrap();
         let token = compute_token(&key(), manifest.name(), &manifest.permissions, nonce);
-        // ...then present a manifest that WIDENED net_hosts (a different perm set).
-        let widened = GOOD.replace("net_hosts = []", r#"net_hosts = ["evil.com"]"#);
+        // ...then present a manifest that WIDENED its egress allow-list (a
+        // different perm set). This widens `fetch_hosts`, not `net_hosts`: a
+        // net scope is refused at validation now, so widening THAT would make
+        // register_plugin return InvalidManifest before the token was ever
+        // checked -- the assertion below would still pass, but it would have
+        // stopped exercising token binding entirely.
+        let widened = GOOD.replace("net_hosts = []", r#"net_hosts = []
+        fetch_hosts = ["evil.com"]"#);
         let outcome = register_plugin(&widened, "example-plugin", &token, &key(), nonce);
         assert_eq!(
             outcome,
@@ -696,38 +755,52 @@ mod tests {
             );
         }
     }
-    /// THE "net" SCOPE HAS NO SATISFYING STATE, and the error must say so.
+    /// THE "net" SCOPE IS UNBACKED IN EVERY STATE, and the error must say so.
     ///
-    /// A developer who hits "tool scope \"net\" is over-privileged" will reach for
-    /// the obvious fix: declare `net_hosts`. That makes it WORSE — macOS SBPL has
-    /// no host-filtering primitive, so a non-empty list makes `generate_sbpl`
-    /// produce a profile `sandbox-exec` rejects (exit 65), and the app stops
-    /// launching entirely. The failure then looks like a crash-loop rather than a
-    /// permission problem.
+    /// The previous version of this test asserted the error contained the phrase
+    /// "does NOT fix this" -- a warning bolted onto an over-privilege message
+    /// that still, structurally, told the author to declare the permission. The
+    /// message is no longer a warning wrapped around bad advice: the scope is
+    /// refused as not grantable, full stop, and the remedy it names is the fetch
+    /// proxy.
     ///
-    /// Until the declaration is refused outright at validation, the ERROR TEXT is
-    /// the only thing standing between that developer and a dead app.
+    /// The load-bearing property is that `net` is unbacked REGARDLESS of
+    /// `net_hosts` -- if this ever became state-dependent again, the inverted
+    /// "add hosts to fix it" advice would come straight back.
     #[test]
-    fn the_net_scope_error_warns_against_the_fix_that_breaks_the_app() {
+    fn a_net_scope_is_unbacked_whether_or_not_hosts_are_declared() {
         let mut p = PermissionsSection::default();
+        for hosts in [vec![], vec!["example.com".to_string()]] {
+            p.net_hosts = hosts.clone();
+            let err = scope_backed_by_permissions("net", &p)
+                .expect_err("a net scope is never backed, hosts or no hosts");
+            assert!(
+                err.contains("not grantable"),
+                "the error must say the scope is not grantable (hosts={hosts:?}): {err}"
+            );
+            assert!(
+                err.contains("fetch_hosts"),
+                "the error must name the path that works, or it is a dead end: {err}"
+            );
+            assert!(
+                !err.contains("declare the matching permission"),
+                "must not tell the author to declare net_hosts -- that kills the app: {err}"
+            );
+        }
+
+        // The other scopes keep the plain over-privilege message: they ARE
+        // fixable by declaring the matching permission, and blurring the two
+        // kinds of failure is what made the original message misleading.
         p.net_hosts.clear();
-        let err = scope_backed_by_permissions("net", &p)
-            .expect_err("a net scope with no hosts is over-privileged");
-        assert!(
-            err.contains("does NOT fix this"),
-            "the error must warn that declaring net_hosts makes it worse: {err}"
-        );
-        assert!(
-            err.contains("fetch proxy"),
-            "the error must name the path that works, or it is a dead end: {err}"
-        );
-        // And the other scopes keep their plain message — the warning is specific
-        // to the one scope that has no satisfying state.
         let err_fs = scope_backed_by_permissions("fs_read", &p)
             .expect_err("fs_read with no paths is over-privileged");
         assert!(
-            !err_fs.contains("does NOT fix this"),
-            "fs_read IS fixable by declaring the permission; do not warn there: {err_fs}"
+            err_fs.contains("over-privileged") && err_fs.contains("declare the matching permission"),
+            "fs_read IS fixable by declaring the permission; keep that advice: {err_fs}"
+        );
+        assert!(
+            !err_fs.contains("not grantable"),
+            "fs_read is grantable; do not borrow the net wording: {err_fs}"
         );
     }
 

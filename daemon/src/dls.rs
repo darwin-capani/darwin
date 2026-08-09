@@ -11,7 +11,7 @@
 //!     capability-name hovers);
 //!   - DIAGNOSTICS run the daemon's REAL rules — an over-privileged / malformed
 //!     manifest via [`crate::plugin_sdk::validate_manifest`], an unknown agent tool
-//!     via the `agents.rs` allowlist, a `net` scope without `net_hosts` (a specific
+//!     via the `agents.rs` allowlist, a `net` scope at all (a specific
 //!     over-privilege the manifest validator rejects), a `mode = "auto"` autonomy
 //!     lint, and an unknown config key/section via `KNOWN_KEYS`.
 //!
@@ -107,8 +107,16 @@ pub enum Rule {
     ModeAutoDanger,
     /// A manifest tool scope not backed by the `[permissions]` block.
     OverPrivilegedManifest,
-    /// The specific over-privilege of a `net` scope with empty `net_hosts`.
-    NetScopeWithoutHosts,
+    /// A tool declaring a `net` scope AT ALL. Not an over-privilege that the
+    /// author can resolve by declaring hosts -- a direct-egress net scope is not
+    /// grantable on this platform in ANY state (macOS SBPL has no host or IP
+    /// filter), so the remedy is the daemon-mediated fetch proxy.
+    ///
+    /// WAS `NetScopeWithoutHosts`, whose whole framing was inverted: it fired
+    /// only on an EMPTY `net_hosts` and thereby told the author to add hosts --
+    /// which produced a sandbox profile the OS refuses to compile and an app
+    /// that never launched at all.
+    NetScopeNotGrantable,
     /// A manifest that fails the base contract (name != dir, bad names, bad TOML).
     MalformedManifest,
     /// An agent tool literal not in the daemon's tool allowlist.
@@ -358,14 +366,17 @@ fn diagnose_manifest(text: &str, dir_name: &str) -> Vec<Diagnostic> {
         Ok(_) => Vec::new(),
         Err(msg) => {
             // The rule is classified from the validator's OWN message (no re-derived
-            // logic): an over-privileged error names the offending scope in quotes,
-            // so a `"net"` scope surfaces as the specific net-without-hosts rule.
-            let rule = if msg.contains("over-privileged") {
-                if msg.contains("\"net\"") {
-                    Rule::NetScopeWithoutHosts
-                } else {
-                    Rule::OverPrivilegedManifest
-                }
+            // logic). ORDER MATTERS: a net scope is refused as NOT GRANTABLE, which
+            // is a different failure from over-privilege, and it is raised from two
+            // places with the same shared wording -- the manifest-level permission
+            // ceiling (`net_hosts` declared at all) and the tool-scope cross-check
+            // (a `net` scope declared at all). Both say "not grantable", neither
+            // says "over-privileged", so this arm must be tested FIRST and must not
+            // depend on the scope name being quoted in the message.
+            let rule = if msg.contains("not grantable") {
+                Rule::NetScopeNotGrantable
+            } else if msg.contains("over-privileged") {
+                Rule::OverPrivilegedManifest
             } else {
                 Rule::MalformedManifest
             };
@@ -472,7 +483,7 @@ pub fn status_frame(cfg: &DlsConfig) -> Value {
         "keys": keys,
         "rules": [
             "unknown_section", "unknown_key", "mode_auto_danger",
-            "over_privileged_manifest", "net_scope_without_hosts", "unknown_agent_tool",
+            "over_privileged_manifest", "net_scope_not_grantable", "unknown_agent_tool",
         ],
         "note": "READ-ONLY loopback LSP: never writes config, takes no action; it only assists a human editor.",
     })
@@ -830,7 +841,8 @@ mod tests {
         scopes = ["fs_write"]
     "#;
 
-    const NET_WITHOUT_HOSTS: &str = r#"
+    /// A net scope with an EMPTY host list.
+    const NET_SCOPE_EMPTY: &str = r#"
         [app]
         name = "netty"
         version = "0.1.0"
@@ -846,11 +858,14 @@ mod tests {
         scopes = ["net"]
     "#;
 
-    const GOOD_MANIFEST: &str = r#"
+    /// A net scope WITH hosts -- the spelling the old validator accepted, and
+    /// the one that produced an uncompilable sandbox profile. Both spellings are
+    /// the same diagnostic now.
+    const NET_SCOPE_WITH_HOSTS: &str = r#"
         [app]
         name = "netty"
         version = "0.1.0"
-        description = "a plugin with a backed net scope"
+        description = "a net scope with hosts declared"
         entry = "netty"
         runtime = "binary"
 
@@ -860,6 +875,24 @@ mod tests {
         [[tools.exposes]]
         name = "netty.fetch"
         scopes = ["net"]
+    "#;
+
+    /// A clean manifest: egress via the fetch proxy, which IS grantable.
+    const GOOD_MANIFEST: &str = r#"
+        [app]
+        name = "netty"
+        version = "0.1.0"
+        description = "a plugin that egresses through the fetch proxy"
+        entry = "netty"
+        runtime = "binary"
+
+        [permissions]
+        fetch_hosts = ["example.com"]
+        fs_read = ["state/ipc/apps/fetch.sock"]
+
+        [[tools.exposes]]
+        name = "netty.fetch"
+        scopes = ["fs_read"]
     "#;
 
     #[test]
@@ -872,13 +905,35 @@ mod tests {
         assert!(diags[0].message.contains("over-privileged") && diags[0].message.contains("fs_write"));
     }
 
+    /// A net scope is flagged as its own rule IN BOTH SPELLINGS, and the
+    /// diagnostic points at the fetch proxy.
+    ///
+    /// This replaces `a_net_scope_without_hosts_is_flagged_as_its_own_rule`,
+    /// which only covered the empty-list case -- the very framing that told
+    /// authors to add hosts. The with-hosts case used to be the "GOOD" fixture
+    /// and was asserted to produce NO diagnostics at all.
     #[test]
-    fn a_net_scope_without_hosts_is_flagged_as_its_own_rule() {
+    fn a_net_scope_is_flagged_as_not_grantable_in_both_spellings() {
         let kind = DocKind::Manifest { dir_name: "netty".to_string() };
-        let diags = diagnose(&kind, NET_WITHOUT_HOSTS, &BTreeSet::new());
-        assert_eq!(diags.len(), 1);
-        assert_eq!(diags[0].rule, Rule::NetScopeWithoutHosts);
-        assert!(diags[0].message.contains("net"), "names the net scope: {}", diags[0].message);
+        for (label, src) in [
+            ("empty net_hosts", NET_SCOPE_EMPTY),
+            ("declared net_hosts", NET_SCOPE_WITH_HOSTS),
+        ] {
+            let diags = diagnose(&kind, src, &BTreeSet::new());
+            assert_eq!(diags.len(), 1, "{label}: {diags:?}");
+            assert_eq!(diags[0].rule, Rule::NetScopeNotGrantable, "{label}");
+            assert_eq!(diags[0].severity, Severity::Error, "{label}");
+            assert!(
+                diags[0].message.contains("fetch_hosts"),
+                "{label}: the diagnostic must route the author to the fetch proxy: {}",
+                diags[0].message
+            );
+            assert!(
+                !diags[0].message.contains("declare the matching permission"),
+                "{label}: must not tell the author to declare net_hosts: {}",
+                diags[0].message
+            );
+        }
     }
 
     #[test]

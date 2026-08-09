@@ -175,7 +175,9 @@ fn draft_prompt(goal: &str) -> String {
            author).\n\
          - fs_write: at most the app's own state dir, exactly \"state/apps/<name>\". Nothing else.\n\
          - fs_read: only paths inside the project (relative, no \"..\", no leading \"/\"). Prefer none.\n\
-         - net_hosts: only the exact hostnames the app must reach (at most {MAX_NET_HOSTS}); prefer none.\n\
+         - net_hosts: NEVER declare this. A direct-egress net scope is not grantable and the \
+           manifest will be refused. If the app must reach the network, declare the hostnames in \
+           fetch_hosts (at most {MAX_NET_HOSTS}) and read state/ipc/apps/fetch.sock instead.\n\
          - The app MUST build and pass `cargo test` (Rust) / py_compile (python) OFFLINE, with no \
            network and no new system dependencies.\n\n\
          Author the complete bundle now.",
@@ -363,7 +365,8 @@ pub(crate) fn is_confined_relpath(p: &str) -> bool {
 ///   - no device access at all (audio/gpu/camera/screen must be false);
 ///   - fs_write only to the app's OWN state dir ("state/apps/<name>");
 ///   - fs_read only to confined, in-project relative paths (no escapes);
-///   - net_hosts capped, each a plausible hostname (no schemes, no slashes).
+///   - net_hosts EMPTY (a direct-egress net scope is not grantable at all);
+///     fetch_hosts capped, each a plausible hostname (no schemes, no slashes).
 ///     Returns Ok(()) on a minimal manifest, Err(reason) on an over-broad one.
 fn validate_permissions(name: &str, p: &PermissionsSection) -> Result<()> {
     if p.audio {
@@ -413,26 +416,18 @@ fn validate_permissions(name: &str, p: &PermissionsSection) -> Result<()> {
         }
     }
 
-    if p.net_hosts.len() > MAX_NET_HOSTS {
-        bail!(
-            "over-broad permission: net_hosts requests {} hosts (max {} for a forged app)",
-            p.net_hosts.len(),
-            MAX_NET_HOSTS
-        );
+    // A NET SCOPE IS REFUSED OUTRIGHT -- there is nothing to shape.
+    //
+    // This replaces a count cap (`MAX_NET_HOSTS`) and a bare-hostname check that
+    // are now dead code: both only ever ran on a non-empty list, and a non-empty
+    // list is no longer a validatable state anywhere in the daemon. Keeping them
+    // would imply a well-formed `net_hosts` exists, which is the belief that
+    // shipped two unlaunchable apps.
+    if !p.net_hosts.is_empty() {
+        bail!("{}", crate::apps::NET_SCOPE_REFUSAL);
     }
-    for h in &p.net_hosts {
-        let h = h.trim();
-        if h.is_empty()
-            || h.contains('/')
-            || h.contains(':')
-            || h.contains(' ')
-            || h.contains("..")
-        {
-            bail!("over-broad permission: net_hosts entry {:?} is not a bare hostname", h);
-        }
-    }
-    // fetch_hosts (the daemon-mediated fetch-proxy allow-list) gets the SAME
-    // count + bare-hostname ceiling as net_hosts. A forged app may declare it
+    // fetch_hosts (the daemon-mediated fetch-proxy allow-list) keeps a count +
+    // bare-hostname ceiling of its own. A forged app may declare it
     // (the proxy is strictly safer than direct egress — https-only, exact-host,
     // SSRF/rebind-guarded), but never a malformed or over-broad list.
     if p.fetch_hosts.len() > MAX_NET_HOSTS {
@@ -1690,12 +1685,14 @@ mod tests {
         assert!(validate_permissions("tool", &PermissionsSection::default()).is_ok());
         // The app's own state dir as the only write target is accepted.
         assert!(validate_permissions("tool", &perms(|p| p.fs_write = vec!["state/apps/tool".into()])).is_ok());
-        // A small confined read + a couple of hosts is accepted.
+        // A small confined read + a fetch-proxy allow-list is accepted. (This
+        // used to declare `net_hosts` and assert it PASSED -- the assertion that
+        // let unlaunchable apps through the gate. Egress moved to fetch_hosts.)
         assert!(validate_permissions(
             "tool",
             &perms(|p| {
                 p.fs_read = vec!["apps/tool/data".into()];
-                p.net_hosts = vec!["example.com".into(), "api.example.org".into()];
+                p.fetch_hosts = vec!["example.com".into(), "api.example.org".into()];
             })
         )
         .is_ok());
@@ -1723,14 +1720,24 @@ mod tests {
         assert!(validate_permissions("tool", &perms(|p| p.fs_read = vec!["../../etc".into()])).is_err());
         assert!(validate_permissions("tool", &perms(|p| p.fs_read = vec!["/etc/passwd".into()])).is_err());
 
-        // Too many hosts / malformed host -> rejected.
-        let many: Vec<String> = (0..MAX_NET_HOSTS + 1).map(|i| format!("h{i}.example.com")).collect();
-        assert!(validate_permissions("tool", &perms(|p| p.net_hosts = many)).is_err());
+        // ANY net_hosts -> refused, however well-formed. The count cap and the
+        // bare-hostname check that used to live here are gone: they only ever
+        // ran on a non-empty list, which is no longer a validatable state.
+        // NOTE the first case -- a single bare hostname -- USED TO PASS.
+        let err = validate_permissions("tool", &perms(|p| p.net_hosts = vec!["api.example.com".into()]))
+            .expect_err("a well-formed net_hosts must now be refused")
+            .to_string();
+        assert!(err.contains("not grantable"), "the reason must be non-grantability: {err}");
+        assert!(err.contains("fetch_hosts"), "the refusal must name the working route: {err}");
         assert!(validate_permissions("tool", &perms(|p| p.net_hosts = vec!["http://x.com".into()])).is_err());
         assert!(validate_permissions("tool", &perms(|p| p.net_hosts = vec!["x.com:443".into()])).is_err());
+        // An EMPTY list is the only accepted value.
+        assert!(validate_permissions("tool", &perms(|p| p.net_hosts = vec![])).is_ok());
 
-        // fetch_hosts gets the SAME ceiling: a bare-hostname list is accepted, a
-        // malformed entry or an over-long list is rejected.
+        // fetch_hosts keeps a ceiling of its own (net_hosts no longer has one to
+        // share): a bare-hostname list is accepted, a malformed entry or an
+        // over-long list is rejected. This is the route net_hosts authors are
+        // now sent to, so its bounds are load-bearing.
         assert!(validate_permissions("tool", &perms(|p| p.fetch_hosts = vec!["api.example.com".into()])).is_ok());
         let many_fetch: Vec<String> = (0..MAX_NET_HOSTS + 1).map(|i| format!("f{i}.example.com")).collect();
         assert!(validate_permissions("tool", &perms(|p| p.fetch_hosts = many_fetch)).is_err());
@@ -1831,7 +1838,7 @@ mod tests {
         // (c) MINIMAL valid manifest still ACCEPTS (the gate is not a blanket no).
         let good = "[app]\nname = \"reverser\"\nversion = \"0.1.0\"\n\
             description = \"reverse a string\"\nentry = \"reverser\"\nruntime = \"binary\"\n\
-            [permissions]\nfs_write = [\"state/apps/reverser\"]\nnet_hosts = [\"api.example.com\"]\n";
+            [permissions]\nfs_write = [\"state/apps/reverser\"]\nfetch_hosts = [\"api.example.com\"]\n";
         let p = write(good);
         validate_manifest_file(&p, "reverser", &root)
             .expect("minimal manifest must pass the deploy-time gate");
@@ -2130,7 +2137,7 @@ mod tests {
     //        defense against a hand-edited proposal. It must refuse over-broad
     //        grants even when they are smuggled across MULTI-LINE TOML arrays
     //        (whose opening `key = [` line carries no quoted tokens), and it must
-    //        enforce the net_hosts COUNT cap. These tests shell out to the REAL
+    //        refuse a net scope outright. These tests shell out to the REAL
     //        scripts/apply_forge.sh against a HERMETIC temp root (a copy of the
     //        script is run so its `ROOT=$(dirname)/..` resolves to the temp dir,
     //        never the live tree) and assert non-zero exit + apps/ untouched. ---
@@ -2162,58 +2169,67 @@ mod tests {
         copied
     }
 
-    /// Resolve an already-built darwind that implements the deploy-time gate, for
+    /// Resolve a FRESHLY BUILT darwind that implements the deploy-time gate, for
     /// the hermetic apply_forge.sh harness (which runs the script in a temp ROOT
-    /// with no daemon/ tree to build). Prefer an existing release/debug binary
-    /// under this crate's target/; build the release binary once if neither
-    /// exists. The script PROVES the binary rejects an over-broad probe before
-    /// trusting it, so this only supplies a binary — it cannot weaken the gate.
+    /// with no daemon/ tree to build). The script PROVES the binary rejects an
+    /// over-broad probe before trusting it, so this only supplies a binary — it
+    /// cannot weaken the gate.
+    ///
+    /// ALWAYS REBUILDS. This used to prefer any existing release/debug binary and
+    /// build only when neither was present, which silently handed the gate a
+    /// STALE darwind: after an edit to `validate_permissions`, these tests kept
+    /// exercising the previously-built binary and reported its OLD verdict, so a
+    /// gate change appeared to work when it had never run. That is precisely what
+    /// `scripts/apply_forge.sh` warns about in its own rebuild-before-use note.
+    /// The build is incremental, so this is a no-op when already up to date.
     fn resolve_gate_binary() -> PathBuf {
-        // CARGO_TARGET_DIR MOVES THE BINARY, AND THIS DID NOT LOOK THERE.
-        //
-        // With CARGO_TARGET_DIR set — every per-agent CI layout, and any developer
-        // who shares one build dir — `<crate>/target/` is empty, so neither candidate
-        // was found; the fallback `cargo build --release` ALSO honours the variable
-        // and wrote the binary somewhere else; and this returned
-        // `<crate>/target/release/darwind`, which does not exist. `[ -x ]` in
-        // apply_forge.sh then failed, the script fell through to
-        // `cd "$ROOT/daemon" && cargo build` inside a HERMETIC temp root that has no
-        // daemon/ tree, and both apply_forge tests died on
-        //     cd: <temp>/daemon: No such file or directory
-        //     RESULT: failed could not build darwind to run the deploy-time
-        //             permission gate
-        // — a test reporting the deploy gate broken because of an environment
-        // variable. MEASURED at untouched HEAD: 2 of the 3 baseline failures.
-        //
-        // Search BOTH roots, and re-scan after the build instead of assuming where
-        // cargo put it.
-        let mut roots: Vec<PathBuf> = Vec::new();
-        if let Some(t) = std::env::var_os("CARGO_TARGET_DIR") {
-            roots.push(PathBuf::from(t));
-        }
-        roots.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
-        for root in &roots {
-            for prof in ["release", "debug"] {
-                let cand = root.join(prof).join("darwind");
-                if cand.is_file() {
-                    return cand;
-                }
-            }
-        }
-        // Neither exists in this checkout — build the release binary once.
-        let status = std::process::Command::new(env!("CARGO"))
-            .args(["build", "--release", "--bin", "darwind"])
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .status()
-            .expect("build darwind for the apply_forge gate test");
-        assert!(status.success(), "building darwind for the gate test failed");
-        for root in &roots {
-            let cand = root.join("release").join("darwind");
-            if cand.is_file() {
-                return cand;
-            }
-        }
-        panic!("darwind built, but is in none of {roots:?} — cannot run the deploy gate test");
+        // ...AND IT REBUILDS RATHER THAN REUSING AN EXISTING BINARY, WHICH IS
+        // LOAD-BEARING. An earlier version preferred whatever `darwind` was already
+        // on disk. MEASURED: that made this gate report "FORGE MANIFEST OK" on a
+        // manifest the CURRENT source refuses, because the binary it ran predated
+        // the change under test — a gate silently executing yesterday's rules and
+        // reporting a pass. apply_forge.sh documents the same hazard for its own
+        // gate binary. A stale gate is worse than no gate: it is a green light.
+        // BUILT EXACTLY ONCE per test process. Every caller of this helper runs
+        // in the same binary, and cargo takes an exclusive lock on the build
+        // directory: two tests each spawning their own `cargo build` fought over
+        // that lock and one of them simply failed. A OnceLock makes the rebuild
+        // both fresh AND serialized -- the second caller waits for the first
+        // result instead of racing it.
+        static GATE_BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+        GATE_BIN
+            .get_or_init(|| {
+                // HONOR CARGO_TARGET_DIR. Hardcoding <manifest>/target made these
+                // tests fail whenever the build used an out-of-tree target dir:
+                // the nested `cargo build` wrote the binary into the REAL target
+                // dir while this function returned a path under <manifest>/target
+                // that never existed, so DARWIND_VALIDATE_BIN pointed at nothing,
+                // apply_forge.sh fell back to building from a hermetic temp ROOT
+                // that has no daemon/ tree, and the gate under test never ran.
+                let target = match std::env::var_os("CARGO_TARGET_DIR") {
+                    Some(dir) => PathBuf::from(dir),
+                    None => Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+                };
+                let out = std::process::Command::new(env!("CARGO"))
+                    .args(["build", "--release", "--bin", "darwind"])
+                    .current_dir(env!("CARGO_MANIFEST_DIR"))
+                    .output()
+                    .expect("build darwind for the apply_forge gate test");
+                assert!(
+                    out.status.success(),
+                    "building darwind for the gate test failed:\n{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let bin = target.join("release").join("darwind");
+                assert!(
+                    bin.is_file(),
+                    "darwind missing at {} after a successful build — the target \
+                     dir was resolved wrongly, and the gate would silently not run",
+                    bin.display()
+                );
+                bin
+            })
+            .clone()
     }
 
     /// Run the copied apply_forge.sh `<ts> --yes` and return (success, combined
@@ -2238,7 +2254,8 @@ mod tests {
     /// over-broad grant across a MULTI-LINE TOML array must be REFUSED by
     /// apply_forge.sh — the script can no longer be fooled by the opening
     /// `key = [` line carrying no quoted tokens. Covers fs_write, fs_read, and
-    /// net_hosts (escape + count cap), plus a non-bare host. apps/ stays empty.
+    /// net_hosts (now refused outright, in both a well-formed and a malformed
+    /// spelling). apps/ stays empty.
     #[test]
     fn apply_forge_refuses_multiline_overbroad_manifests() {
         // Each case: (tag, name, manifest, expected substring of the refusal).
@@ -2267,19 +2284,24 @@ mod tests {
                 "fs_read",
             ),
             (
-                // Multi-line net_hosts COUNT > MAX_NET_HOSTS (each bare, too many).
-                "net_count",
+                // Multi-line net_hosts, every entry a well-formed bare hostname.
+                // This case USED TO BE ACCEPTED by the count cap and the
+                // bare-hostname check (it was under the old 6-host limit only
+                // when trimmed); now ANY net_hosts is refused as not grantable,
+                // so the multi-line smuggling path is closed by construction
+                // rather than by counting.
+                "net_declared",
                 "evil",
                 "[app]\nname = \"evil\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\
                  runtime = \"python\"\nentry = \"main.py\"\n\n\
                  [permissions]\nfs_write = [\"state/apps/evil\"]\nfs_read = []\n\
-                 net_hosts = [\n  \"h1.test\", \"h2.test\",\n  \"h3.test\", \"h4.test\",\n  \
-                 \"h5.test\", \"h6.test\",\n  \"h7.test\"\n]\n"
+                 net_hosts = [\n  \"h1.test\",\n  \"h2.test\"\n]\n"
                     .to_string(),
-                "net_hosts requests 7 hosts",
+                "not grantable",
             ),
             (
-                // Multi-line net_hosts with a non-bare host (scheme/port).
+                // Multi-line net_hosts with a non-bare host (scheme/port): still
+                // refused, but now for the scope, not the shape.
                 "net_bare",
                 "evil",
                 "[app]\nname = \"evil\"\nversion = \"0.1.0\"\ndescription = \"d\"\n\
@@ -2287,7 +2309,7 @@ mod tests {
                  [permissions]\nfs_write = [\"state/apps/evil\"]\nfs_read = []\n\
                  net_hosts = [\n  \"ok.test\",\n  \"attacker.test:4444\"\n]\n"
                     .to_string(),
-                "not a bare hostname",
+                "not grantable",
             ),
             (
                 // NEW: the parser-differential the OLD text scan missed — top-level
@@ -2353,7 +2375,7 @@ mod tests {
              entry = \"main.py\"\n\n[permissions]\naudio = false\ngpu = false\n\
              fs_write = [\n  \"state/apps/reverser\"\n]\n\
              fs_read = [\n  \"apps/reverser/data\"\n]\n\
-             net_hosts = [\n  \"example.com\",\n  \"api.example.org\"\n]\n"
+             fetch_hosts = [\n  \"example.com\",\n  \"api.example.org\"\n]\n"
             .to_string();
         let script = plant_proposal_and_script(&root.0, ts, "reverser", &manifest);
         let (ok, output) = run_apply_forge(&script, ts);
