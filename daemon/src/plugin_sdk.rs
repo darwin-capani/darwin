@@ -102,6 +102,27 @@ fn is_well_formed_name(name: &str) -> bool {
 /// "no privilege the sandbox forbids" cross-check.
 fn scope_backed_by_permissions(scope: &str, p: &PermissionsSection) -> Result<(), String> {
     let backed = match scope {
+        // READ THIS BEFORE "FIXING" A NET SCOPE BY ADDING HOSTS.
+        //
+        // The rule above is only half the story, and the missing half is a trap.
+        // TRUE: with `net_hosts` empty the profile emits `(deny network*)`, so a
+        // `"net"` scope claims something the sandbox denies — over-privileged.
+        // NOT TRUE: that a NON-EMPTY list grants it. `generate_sbpl` turns a host
+        // list into SBPL macOS REFUSES TO COMPILE — `sandbox-exec` exits 65 with
+        // "host must be * or localhost in network address" — so the whole profile
+        // is rejected and THE APP NEVER LAUNCHES AT ALL.
+        //
+        // So both states are broken, in opposite directions: empty = scope denied,
+        // non-empty = app dead. Satisfying this validator by declaring hosts trades
+        // a lint for an app that will not start, and the failure looks like a
+        // crash-loop rather than a permission problem.
+        //
+        // SBPL has NO host or IP filtering primitive — `(remote ip "1.2.3.4:443")`
+        // is rejected too. The working path is the daemon-side fetch proxy
+        // (fetchproxy.rs): the daemon holds the allow-list and makes the request,
+        // which is a fence that exists. `a_net_hosts_profile_does_not_compile_today`
+        // in apps.rs pins the compile failure and says to FLIP it, not delete it,
+        // when the declaration is finally refused at validation.
         "net" => !p.net_hosts.is_empty(),
         "fs_read" => !p.fs_read.is_empty(),
         "fs_write" => !p.fs_write.is_empty(),
@@ -119,9 +140,21 @@ fn scope_backed_by_permissions(scope: &str, p: &PermissionsSection) -> Result<()
     if backed {
         Ok(())
     } else {
+        // The net note is SCOPE-SPECIFIC. Appending it to the shared message put a
+        // warning about net_hosts on every fs_read and audio error too — noise that
+        // trains a reader to skip the sentence that matters. (My own test caught
+        // that.)
+        let hint = if scope == "net" {
+            " NOTE: declaring net_hosts does NOT fix this — macOS SBPL cannot express \
+             a host list, so a non-empty list makes the sandbox profile fail to \
+             compile and the app never launches at all. Route the request through the \
+             daemon's fetch proxy instead."
+        } else {
+            ""
+        };
         Err(format!(
             "tool scope {scope:?} is over-privileged: the [permissions] block does not grant it \
-             (declare the matching permission, or drop the scope)"
+             (declare the matching permission, or drop the scope).{hint}"
         ))
     }
 }
@@ -663,4 +696,39 @@ mod tests {
             );
         }
     }
+    /// THE "net" SCOPE HAS NO SATISFYING STATE, and the error must say so.
+    ///
+    /// A developer who hits "tool scope \"net\" is over-privileged" will reach for
+    /// the obvious fix: declare `net_hosts`. That makes it WORSE — macOS SBPL has
+    /// no host-filtering primitive, so a non-empty list makes `generate_sbpl`
+    /// produce a profile `sandbox-exec` rejects (exit 65), and the app stops
+    /// launching entirely. The failure then looks like a crash-loop rather than a
+    /// permission problem.
+    ///
+    /// Until the declaration is refused outright at validation, the ERROR TEXT is
+    /// the only thing standing between that developer and a dead app.
+    #[test]
+    fn the_net_scope_error_warns_against_the_fix_that_breaks_the_app() {
+        let mut p = PermissionsSection::default();
+        p.net_hosts.clear();
+        let err = scope_backed_by_permissions("net", &p)
+            .expect_err("a net scope with no hosts is over-privileged");
+        assert!(
+            err.contains("does NOT fix this"),
+            "the error must warn that declaring net_hosts makes it worse: {err}"
+        );
+        assert!(
+            err.contains("fetch proxy"),
+            "the error must name the path that works, or it is a dead end: {err}"
+        );
+        // And the other scopes keep their plain message — the warning is specific
+        // to the one scope that has no satisfying state.
+        let err_fs = scope_backed_by_permissions("fs_read", &p)
+            .expect_err("fs_read with no paths is over-privileged");
+        assert!(
+            !err_fs.contains("does NOT fix this"),
+            "fs_read IS fixable by declaring the permission; do not warn there: {err_fs}"
+        );
+    }
+
 }
