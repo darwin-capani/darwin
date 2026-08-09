@@ -1556,7 +1556,29 @@ async fn stage_and_validate_inner(
         test_args.push("--skip");
         test_args.push(t);
     }
-    let stages: [(&str, Vec<&str>); 2] = [("check", vec!["check"]), ("test", test_args)];
+    // THE GATE MUST BE AT LEAST AS STRICT AS THE ONE A HUMAN PASSES.
+    //
+    // It was `check` + `test`. This project's actual merge standard is
+    // `cargo clippy --all-targets -- -D warnings` — zero warnings — and a
+    // self-heal patch could satisfy check+test, be APPROVED, be APPLIED to live
+    // sources, and only then break the gate its author has to pass. The system
+    // would be handing its owner a patch it had "validated" and a broken lint run.
+    //
+    // Ordered clippy BEFORE test: it subsumes `check`, catches the cheap class
+    // (unused fields, dead methods, expect-with-format) in a fraction of the test
+    // suite's time, and — the reason it matters here — a never-called method in
+    // the wrong impl block compiles and passes tests. That exact mistake happened
+    // in this file's own capture-teardown work; `-D warnings` was what caught it.
+    //
+    // `check` is kept as a separate first stage so a plain compile error reports
+    // as "check" rather than as a lint failure, which is what the operator needs
+    // to read.
+    let clippy_args = vec!["clippy", "--all-targets", "--", "-D", "warnings"];
+    let stages: [(&str, Vec<&str>); 3] = [
+        ("check", vec!["check"]),
+        ("clippy", clippy_args),
+        ("test", test_args),
+    ];
     for (stage, args) in stages {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
@@ -3068,6 +3090,59 @@ mod tests {
             "apply_heal.sh must CALL mirror_runtime_test_inputs during staging — \
              without it the staged suite cannot run and every apply fails"
         );
+    }
+
+    /// THE SELF-HEAL GATE MUST BE AT LEAST AS STRICT AS THE HUMAN ONE.
+    ///
+    /// It ran `check` + `test`. This project's real merge standard is
+    /// `cargo clippy --all-targets -- -D warnings`, so a patch could pass the
+    /// staged gate, be APPROVED, be APPLIED to live sources, and only then break
+    /// the gate its author has to pass — the system handing its owner a patch it
+    /// had "validated" plus a broken lint run.
+    ///
+    /// Clippy is not a nicety here. A never-called method in the wrong impl block
+    /// COMPILES and PASSES TESTS; `-D warnings` is what catches it. That exact
+    /// mistake happened in this file's own capture-teardown work, and the full
+    /// suite stayed green through it.
+    #[test]
+    fn the_staged_gate_runs_clippy_between_check_and_test() {
+        let src = include_str!("heal.rs");
+        // Scope to the validation routine, not the whole file — the strings appear
+        // in prose elsewhere, and a file-wide search would self-match on this very
+        // test.
+        let start = src
+            .find("let clippy_args = vec![")
+            .expect("the staged gate must build clippy args");
+        let region = &src[start..start + 700.min(src.len() - start)];
+        assert!(
+            region.contains("\"--all-targets\"") && region.contains("\"-D\", \"warnings\""),
+            "the staged clippy must be --all-targets with -D warnings, or it is a \
+             weaker bar than the human gate: {region}"
+        );
+        // ORDER: clippy before test. It subsumes check and is far cheaper than the
+        // suite, so a lint failure must not wait behind 3000 tests.
+        let stages = src
+            .find("let stages: [(&str, Vec<&str>); 3]")
+            .expect("the gate must have three stages");
+        let tail = &src[stages..stages + 400.min(src.len() - stages)];
+        let ci = tail.find("(\"clippy\"").expect("clippy must be a stage");
+        let ti = tail.find("(\"test\"").expect("test must be a stage");
+        assert!(ci < ti, "clippy must run BEFORE the test suite");
+    }
+
+    /// ...and the APPLY script must run the same three, or the two gates disagree.
+    ///
+    /// A patch the daemon REJECTED for a lint could otherwise still be applied by
+    /// hand, and one it ACCEPTED would be re-proven against a weaker bar.
+    #[test]
+    fn the_apply_script_gate_matches_the_daemon_gate() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        for stage in ["cargo check", "cargo clippy --all-targets -- -D warnings", "cargo test"] {
+            assert!(
+                script.contains(stage),
+                "apply_heal.sh must run `{stage}` — the two gates must not disagree"
+            );
+        }
     }
 
 }

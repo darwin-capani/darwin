@@ -443,6 +443,15 @@ fi
 if ! (cd "$CRATE" && cargo check); then
   fail "cargo check failed in staging — live daemon/src NOT modified"
 fi
+
+# THE APPLY GATE MUST MATCH THE DAEMON'S. The daemon's staged validation runs
+# check -> clippy -> test (daemon/src/heal.rs); if this script skipped clippy, a
+# patch the daemon REJECTED for a lint could still be applied by hand here, and a
+# patch it ACCEPTED would be re-proven against a weaker bar. Both directions are
+# wrong. `-D warnings` is this project's real merge standard.
+if ! (cd "$CRATE" && cargo clippy --all-targets -- -D warnings); then
+  fail "cargo clippy failed in staging (-D warnings) — live daemon/src NOT modified"
+fi
 # Three tests cannot run inside a stage and are skipped BY NAME, matching
 # daemon/src/heal.rs UNRUNNABLE_IN_STAGE. The two apply_forge tests shell out to
 # a script that cd's into a full repo layout; the heal pipeline test runs this
