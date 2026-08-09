@@ -1555,9 +1555,22 @@ mod tests {
 
         // The report must point the human at the apply script (the only deploy
         // path), never an automatic one.
+        //
+        // ON A CODE LINE, IN THE PRODUCTION HALF. This module's own doc comments name
+        // `scripts/apply_forge.sh` six times and the test module names it again, so the
+        // whole-file `contains` was satisfied entirely by prose — PROVED: deleting the
+        // pointer from BOTH production code lines (the report body and the tracing
+        // line) left this test passing.
+        let prod = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("forge.rs has a production section before the tests");
         assert!(
-            src.contains("scripts/apply_forge.sh"),
-            "the report must point the human at the apply script"
+            prod.lines()
+                .map(str::trim_start)
+                .any(|l| !l.starts_with("//") && l.contains("scripts/apply_forge.sh")),
+            "the report must point the human at the apply script on a CODE line — a doc \
+             comment mentioning the script is not the pointer"
         );
     }
 
@@ -2156,11 +2169,35 @@ mod tests {
     /// exists. The script PROVES the binary rejects an over-broad probe before
     /// trusting it, so this only supplies a binary — it cannot weaken the gate.
     fn resolve_gate_binary() -> PathBuf {
-        let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("target");
-        for prof in ["release", "debug"] {
-            let cand = target.join(prof).join("darwind");
-            if cand.is_file() {
-                return cand;
+        // CARGO_TARGET_DIR MOVES THE BINARY, AND THIS DID NOT LOOK THERE.
+        //
+        // With CARGO_TARGET_DIR set — every per-agent CI layout, and any developer
+        // who shares one build dir — `<crate>/target/` is empty, so neither candidate
+        // was found; the fallback `cargo build --release` ALSO honours the variable
+        // and wrote the binary somewhere else; and this returned
+        // `<crate>/target/release/darwind`, which does not exist. `[ -x ]` in
+        // apply_forge.sh then failed, the script fell through to
+        // `cd "$ROOT/daemon" && cargo build` inside a HERMETIC temp root that has no
+        // daemon/ tree, and both apply_forge tests died on
+        //     cd: <temp>/daemon: No such file or directory
+        //     RESULT: failed could not build darwind to run the deploy-time
+        //             permission gate
+        // — a test reporting the deploy gate broken because of an environment
+        // variable. MEASURED at untouched HEAD: 2 of the 3 baseline failures.
+        //
+        // Search BOTH roots, and re-scan after the build instead of assuming where
+        // cargo put it.
+        let mut roots: Vec<PathBuf> = Vec::new();
+        if let Some(t) = std::env::var_os("CARGO_TARGET_DIR") {
+            roots.push(PathBuf::from(t));
+        }
+        roots.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("target"));
+        for root in &roots {
+            for prof in ["release", "debug"] {
+                let cand = root.join(prof).join("darwind");
+                if cand.is_file() {
+                    return cand;
+                }
             }
         }
         // Neither exists in this checkout — build the release binary once.
@@ -2170,7 +2207,13 @@ mod tests {
             .status()
             .expect("build darwind for the apply_forge gate test");
         assert!(status.success(), "building darwind for the gate test failed");
-        target.join("release").join("darwind")
+        for root in &roots {
+            let cand = root.join("release").join("darwind");
+            if cand.is_file() {
+                return cand;
+            }
+        }
+        panic!("darwind built, but is in none of {roots:?} — cannot run the deploy gate test");
     }
 
     /// Run the copied apply_forge.sh `<ts> --yes` and return (success, combined

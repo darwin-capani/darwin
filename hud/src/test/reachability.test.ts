@@ -2,6 +2,7 @@
 // @types/node, which this tsconfig does not carry). Used only for the
 // source-anchored guards below.
 import SETTINGS_MODAL_SRC from "../components/SettingsModal.tsx?raw";
+import APP_SRC from "../App.tsx?raw";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
@@ -81,6 +82,41 @@ describe("model-tier controls now reach the daemon — and still cannot leak a L
     }
   });
 
+  // ROUND 2 — THE SAME CLASS WITH THE SIGN FLIPPED. Wiring the buttons made the
+  // surrounding copy false: four tooltips still said "spoken only; shows the
+  // phrase to say" and the panel body still said "The controls above do NOT set
+  // the override". A working control the UI disclaims is as unreachable as a dead
+  // one, and it is the harder defect to notice because everything WORKS.
+  it("the tier controls no longer disclaim the capability they now have", () => {
+    const body = sectionBody("ModelTierSection");
+    expect(body.length).toBeGreaterThan(400);
+    // The section really does send — that is what makes the old copy false, and
+    // without this the guard below would pass on a section that sends nothing.
+    expect(body).toContain('sendCommand({ cmd: "ask", text: MODEL_SWAP_BUTTON_PHRASES[intent] })');
+    expect(body).not.toContain("spoken only; shows the phrase to say");
+    expect(body).not.toContain("do NOT set the override");
+    // ...and it is gone from what actually RENDERS, not merely from the source.
+    const html = renderSettings();
+    expect(html).toContain("Set tier");
+    expect(html).not.toContain("do NOT set the override");
+  });
+
+  // The retracted rule must not survive above the code that breaks it: 20c617b
+  // wired the contest button and appended its explanation, leaving "CONTEST IS
+  // SPOKEN-ONLY" and "Not routed here deliberately" standing directly above the
+  // handler that now routes it. Bounded at BOTH ends — the 2000 chars of comment
+  // immediately preceding the handler — because an unscoped search over App.tsx
+  // would run through unrelated code and prove nothing about this block.
+  it("the contest handler carries no superseded spoken-only rule above it", () => {
+    const at = APP_SRC.indexOf("const contestBelief = useCallback");
+    expect(at).toBeGreaterThan(-1);
+    const preamble = APP_SRC.slice(Math.max(0, at - 2000), at);
+    // The window really is the comment block (else the two absences are vacuous).
+    expect(preamble).toContain("user_model::contest_belief");
+    expect(preamble).not.toContain("CONTEST IS SPOKEN-ONLY");
+    expect(preamble).not.toContain("Not routed here deliberately");
+  });
+
   it("LOCAL cannot leak the turn that asked to stay on-device", () => {
     // This is the one that used to be actively harmful: firing it did nothing AND
     // sent the very turn asking to stay local to the cloud. The daemon's swap arm
@@ -134,6 +170,63 @@ describe("voice-clone controls send nothing (consent machine is spoken-path)", (
 // to pick a working feature, and disabled it in practice.
 
 /* ------------------------------------------------- GREP-VISIBLE SOURCE */
+
+/* ------------------------------------- THE PHRASE TABLES' OWN DOCS */
+
+/* Round 2 caught the tooltips and the panel body. It did not catch the two
+ * module-scope doc blocks, because its guard is scoped to sectionBody(...) and
+ * these sit above every section. Both stated a rule their own code had already
+ * retracted:
+ *   - MODEL_TIER_SPOKEN_ONLY_NOTE's JSDoc explained why the tier controls state
+ *     a phrase INSTEAD of acting — one line above the `/// SUPERSEDED. These
+ *     buttons WORK now.` that retracts it;
+ *   - VOICE_CLONE_PHRASES' JSDoc opened by describing the command-channel sends
+ *     that a565029 deleted, which the test above pins as absent.
+ * Each window is bounded at BOTH ends by the block's own delimiters and asserts
+ * a PRECONDITION first, so a bound that captured nothing cannot pass it
+ * vacuously. A FIXED-SPAN window was tried first and was WRONG: 1400 chars back
+ * from `export const VOICE_CLONE_PHRASES` starts INSIDE a 1601-char block, past
+ * the very opening line under test, and the mutation restoring that line
+ * SURVIVED. The bound is the block delimiter now, not a guessed number. */
+describe("the phrase tables' docs match what their controls actually do", () => {
+  /** The doc comment block immediately preceding `marker`: from the `/**` that
+   *  opens it (the last one before the marker) up to the marker itself. */
+  function docAbove(marker: string): string {
+    const at = SETTINGS_MODAL_SRC.indexOf(marker);
+    expect(at, `${marker} must exist in SettingsModal.tsx`).toBeGreaterThan(-1);
+    const open = SETTINGS_MODAL_SRC.lastIndexOf("\n/**", at);
+    expect(open, `${marker} must carry a doc block`).toBeGreaterThan(-1);
+    return SETTINGS_MODAL_SRC.slice(open, at);
+  }
+
+  it("the model-tier note is not introduced as a reason the controls do not act", () => {
+    // PRECONDITION: the section really does send, which is what makes the old
+    // doc false. Without it this test would pass on a dead control.
+    expect(sectionBody("ModelTierSection")).toContain(
+      'sendCommand({ cmd: "ask", text: MODEL_SWAP_BUTTON_PHRASES[intent] })',
+    );
+    const doc = docAbove("export const MODEL_TIER_SPOKEN_ONLY_NOTE");
+    // The window really is the doc block (else the absences below are vacuous).
+    expect(doc).toContain("SUPERSEDED");
+    expect(doc).not.toContain("state a phrase instead of acting");
+    expect(doc).not.toContain("not reachable from the command channel this HUD holds");
+    const helper = docAbove("export function modelTierSpokenInstruction");
+    expect(helper).toContain("MODEL_SWAP_BUTTON_PHRASES");
+    expect(helper).not.toContain("why it is spoken-only");
+  });
+
+  it("the voice-clone table is not introduced as phrases the control sends", () => {
+    // PRECONDITION: the section really sends nothing — the fact the doc denied.
+    expect(sectionBody("VoiceCloneSection")).not.toContain("sendCommand(");
+    const doc = docAbove("export const VOICE_CLONE_PHRASES");
+    // The window must reach the block's FIRST line, which is where the retracted
+    // claim lived; a short window would silently skip past it.
+    expect(doc).toContain("voiceclone::classify_intent");
+    expect(doc).toContain("QUOTES for the user to SAY");
+    expect(doc).not.toContain("sends over the command channel");
+    expect(doc).not.toContain("a single click can never upload");
+  });
+});
 
 describe("HUD sources stay greppable", () => {
   it("SettingsModal.tsx carries no raw NUL byte", () => {

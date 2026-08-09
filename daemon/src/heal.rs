@@ -24,6 +24,17 @@
 //!      -> mutation probe: the fix is reverse-applied and the patch's own test
 //!      must then FAIL, else the candidate is rejected as unproven). Any candidate
 //!      that fails a hunk/compile/test is DISCARDED. Gates reused unchanged.
+//!      EVERY ONE OF THOSE GATES IS BLIND TO THE DIAGNOSIS — a patch that fixes
+//!      something ELSE, with a real test that really bites, clears all of them —
+//!      so each candidate is also scored for RESPONSIVENESS (DIRECT / SUBSYSTEM
+//!      / SIGNATURE / UNRELATED / INDETERMINATE) against the burst that
+//!      triggered it. That verdict is SURFACED, NEVER ENFORCED (a correct fix
+//!      often lives one layer up from the line that screamed): it goes into the
+//!      validation tail the reviewer reads, report.md's header and
+//!      heal.proposal, and scripts/apply_heal.sh re-derives it from the same
+//!      code via `darwind --heal-responsiveness` — one implementation, two
+//!      callers, like `--split-heal-diff`. Running OUT OF BUDGET is reported as
+//!      its own stage, `deadline`, and never as a rejection on the merits.
 //!   6. ADVERSARIAL SELF-REVIEW (v2) — a second cloud call judges each
 //!      surviving (validated) diff against the diagnosis + its test output:
 //!      does it fix the ROOT CAUSE (not just silence the symptom)? Returns a
@@ -68,7 +79,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
@@ -339,7 +350,8 @@ fn scan_tail(tail: String) -> LogScan {
 
 /// A structured root-cause diagnosis built from the burst, before any cloud
 /// work. Serialized verbatim to state/heal/proposals/<ts>/diagnosis.json.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Diagnosis {
     /// The dominant error signature(s) — the message text of the ERROR lines
     /// with volatile tails (timestamps, paths, "error=...") trimmed, so a
@@ -611,6 +623,223 @@ fn diff_size(diff: &str) -> usize {
         .count()
 }
 
+// ---------------------------------------------------------------------------
+// RESPONSIVENESS — does this candidate answer the fault that TRIGGERED it?
+//
+// check -> clippy -> test -> mutation prove that a candidate COMPILES, LINTS,
+// PASSES, and that its own new test BITES. Not one of those four stages ever
+// looks at the DIAGNOSIS. A patch that fixes something else entirely — a real
+// bug, in a file the burst never named, with a genuine regression test that
+// really does fail when its fix is reversed — clears every gate and is handed
+// to the owner as "the fix" for an error burst it never touched. That is not a
+// hypothetical: `an_unresponsive_candidate_clears_every_gate` below builds one
+// and walks it through the whole chain.
+//
+// THIS IS ADVISORY AND NEVER REJECTS. A correct fix routinely lives in a file
+// the log never cited — the cause is usually one layer up from the line that
+// screamed, and a hard reject on a heuristic would throw exactly those away.
+// So the verdict is COMPUTED and SURFACED: into the validation tail (which the
+// adversarial reviewer reads and is told to weight), into report.md's header,
+// onto heal.proposal for the HUD, and re-derived and re-printed by
+// scripts/apply_heal.sh before the human commits.
+//
+// ONE IMPLEMENTATION, TWO CALLERS — the daemon gate calls `responsiveness()`
+// directly; the shell gate shells out to `darwind --heal-responsiveness`, the
+// same pattern `--split-heal-diff` uses, because two gates that each carry
+// their own copy of a rule is the defect shape this file has produced more than
+// any other.
+// ---------------------------------------------------------------------------
+
+/// How well a candidate patch answers the diagnosis that triggered the heal.
+/// These are KINDS OF EVIDENCE, not a ranking; only `Unrelated` is a warning,
+/// and even that is a warning and not a verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Responsiveness {
+    /// The patch edits a file the error burst itself named.
+    Direct,
+    /// No cited file is edited, but an edited path belongs to the implicated
+    /// subsystem (`src/<subsystem>.rs`, or anything under `src/<subsystem>/`).
+    Subsystem,
+    /// Neither, but an error signature from the burst appears verbatim in the
+    /// patch body — the drafter is editing the code that logs it.
+    Signature,
+    /// The diagnosis carried something to match on, and NOTHING matched.
+    Unrelated,
+    /// The diagnosis carried nothing to match on (no cited file, no known
+    /// subsystem, no distinctive message text). No opinion is possible, and
+    /// manufacturing one would be the same dishonesty in the other direction.
+    Indeterminate,
+}
+
+impl Responsiveness {
+    /// The single word both gates print and telemetry carries.
+    pub fn word(self) -> &'static str {
+        match self {
+            Responsiveness::Direct => "DIRECT",
+            Responsiveness::Subsystem => "SUBSYSTEM",
+            Responsiveness::Signature => "SIGNATURE",
+            Responsiveness::Unrelated => "UNRELATED",
+            Responsiveness::Indeterminate => "INDETERMINATE",
+        }
+    }
+}
+
+/// Shortest error signature distinctive enough to search for verbatim inside a
+/// diff. Below this, a message fragment ("failed", "timeout", "no such file")
+/// matches half the crate and the signal is noise.
+const SIGNATURE_MATCH_MIN: usize = 12;
+
+/// The files a unified diff actually EDITS: the `+++` headers, with the one
+/// component `patch -p1` eats stripped off.
+///
+/// Deliberately NOT `extract_source_files()`, which scans the entire text — that
+/// would count a `src/…` path merely MENTIONED in a context line, an added
+/// comment or a doc string as a file the patch touches, and a drafter that
+/// name-drops the cited file in a comment would score DIRECT for free. Only a
+/// `+++` header means "this patch writes here".
+fn patched_files(diff: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for line in diff.lines() {
+        let Some(rest) = line.strip_prefix("+++ ") else { continue };
+        let path = rest.split('\t').next().unwrap_or(rest).trim();
+        if path == "/dev/null" {
+            continue; // new-file/deleted-file sentinel, not a target
+        }
+        let stripped = match path.find('/') {
+            Some(i) => &path[i + 1..],
+            None => path,
+        };
+        if !stripped.is_empty() && !out.iter().any(|p| p == stripped) {
+            out.push(stripped.to_string());
+        }
+    }
+    out
+}
+
+/// The same file, tolerating a differing number of leading components
+/// (`src/router.rs` vs `daemon/src/router.rs`). Compared at a path BOUNDARY: a
+/// bare `ends_with` would call `src/tools.rs` a match for a cited `s.rs`.
+fn same_file(a: &str, b: &str) -> bool {
+    a == b || a.ends_with(&format!("/{b}")) || b.ends_with(&format!("/{a}"))
+}
+
+/// Does `path` belong to `subsystem`? `src/audio.rs`, or anything under a
+/// directory component named `audio`. Component-exact — no substring matching,
+/// so `src/audiobook.rs` is NOT the `audio` subsystem.
+fn path_in_subsystem(path: &str, subsystem: &str) -> bool {
+    let p = Path::new(path);
+    if p.file_stem().and_then(|s| s.to_str()) == Some(subsystem) {
+        return true;
+    }
+    p.parent()
+        .map(|d| d.components().any(|c| c.as_os_str() == subsystem))
+        .unwrap_or(false)
+}
+
+/// Note naming the files the burst cited but the patch does not edit, for the
+/// weaker verdicts. Empty when the burst cited nothing.
+fn cited_but_untouched(files: &[String]) -> String {
+    if files.is_empty() {
+        String::new()
+    } else {
+        format!(" (the burst named {}, which this patch does not edit)", files.join(", "))
+    }
+}
+
+/// Judge a candidate patch against the diagnosis that triggered the heal.
+///
+/// PURE — no cloud, no filesystem, no build — so the rule is unit-tested
+/// directly and BOTH gates can share this one implementation.
+pub fn responsiveness(d: &Diagnosis, diff: &str) -> (Responsiveness, String) {
+    let touched = patched_files(diff);
+    let shown = if touched.is_empty() {
+        "(no +++ header — nothing identifiable)".to_string()
+    } else {
+        touched.join(", ")
+    };
+
+    let hit: Vec<&str> = d
+        .files
+        .iter()
+        .filter(|c| touched.iter().any(|t| same_file(t, c)))
+        .map(|c| c.as_str())
+        .collect();
+    if !hit.is_empty() {
+        return (
+            Responsiveness::Direct,
+            format!(
+                "DIRECT — the patch edits {}, which the error burst itself named.",
+                hit.join(", ")
+            ),
+        );
+    }
+
+    let known_subsystem = !d.subsystem.trim().is_empty() && d.subsystem != "unknown";
+    if known_subsystem {
+        if let Some(t) = touched.iter().find(|t| path_in_subsystem(t, &d.subsystem)) {
+            return (
+                Responsiveness::Subsystem,
+                format!(
+                    "SUBSYSTEM — the patch edits {t}, which belongs to the implicated subsystem \
+                     `{}`{}.",
+                    d.subsystem,
+                    cited_but_untouched(&d.files)
+                ),
+            );
+        }
+    }
+
+    let lower_diff = diff.to_lowercase();
+    let sig_hit = d
+        .signatures
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| s.chars().count() >= SIGNATURE_MATCH_MIN)
+        .find(|s| lower_diff.contains(&s.to_lowercase()));
+    if let Some(sig) = sig_hit {
+        return (
+            Responsiveness::Signature,
+            format!(
+                "SIGNATURE — the patch body carries the burst's own error text \"{sig}\", so it \
+                 edits the code that logs it{}.",
+                cited_but_untouched(&d.files)
+            ),
+        );
+    }
+
+    let matchable = !d.files.is_empty()
+        || known_subsystem
+        || d
+            .signatures
+            .iter()
+            .any(|s| s.trim().chars().count() >= SIGNATURE_MATCH_MIN);
+    if !matchable {
+        return (
+            Responsiveness::Indeterminate,
+            format!(
+                "INDETERMINATE — the burst named no source file, no known subsystem and no \
+                 distinctive error text, so there is nothing to check the patch ({shown}) \
+                 against. Judge it on the diff alone."
+            ),
+        );
+    }
+    (
+        Responsiveness::Unrelated,
+        format!(
+            "UNRELATED — the patch edits {shown}. The diagnosis implicated {} (subsystem `{}`), \
+             and none of its error signatures appear in the patch. THIS IS NOT A REJECTION — a \
+             correct fix often lives one layer up from the line that screamed — but NOTHING here \
+             connects this patch to the fault that triggered the heal. Read it on that basis.",
+            if d.files.is_empty() {
+                "no file by name".to_string()
+            } else {
+                d.files.join(", ")
+            },
+            d.subsystem
+        ),
+    )
+}
+
 /// The v2 multi-candidate drafter prompt: diagnosis in, N labelled diffs out.
 fn draft_prompt(d: &Diagnosis, n: usize) -> String {
     let file_list = if d.files.is_empty() {
@@ -682,7 +911,11 @@ fn review_prompt(d: &Diagnosis, diff: &str, validation_tail: &str) -> String {
          the test kept — see the validation tail for whether that came back PROVEN, UNPROVEN or \
          INCONCLUSIVE, and weight your confidence accordingly). Judge \
          whether it fixes the ROOT CAUSE of the fault below, not merely silences the symptom, and \
-         whether it has any obvious side effects or regressions.\n\n\
+         whether it has any obvious side effects or regressions. The tail also carries a \
+         RESPONSIVENESS line (DIRECT / SUBSYSTEM / SIGNATURE / UNRELATED / INDETERMINATE): the \
+         staged gates are BLIND to the diagnosis, so an UNRELATED patch passes all of them. \
+         Treat UNRELATED as a strong reason for LOW confidence unless the diff itself explains \
+         why the true cause lives where it does.\n\n\
          Fault diagnosis:\n\
          - subsystem: {subsystem}\n\
          - signature(s): {sigs}\n\n\
@@ -915,6 +1148,7 @@ fn render_report(ts: u64, model: &str, d: &Diagnosis, winner: &Survivor) -> Stri
     format!(
         "# Self-heal proposal — {ts}\n\n\
          - verdict: VALIDATED (cargo check + clippy -D warnings + cargo test + mutation probe)\n\
+         - responsiveness: {responsiveness}\n\
          - model: {model}\n\
          - subsystem: {subsystem}\n\
          - files touched: {files}\n\
@@ -931,6 +1165,11 @@ fn render_report(ts: u64, model: &str, d: &Diagnosis, winner: &Survivor) -> Stri
          Review the diff above, then apply it with:\n\n\
          ```\nscripts/apply_heal.sh {ts}\n```\n",
         subsystem = d.subsystem,
+        // VALIDATED says the patch is SOUND. This says whether it is an ANSWER.
+        // The four staged gates never look at the diagnosis, so a patch that
+        // fixes something else entirely reaches this report with the same
+        // "VALIDATED" on the line above.
+        responsiveness = responsiveness(d, &winner.diff).1,
         index = winner.index,
         confidence = winner.confidence,
         sigs = sigs,
@@ -1081,7 +1320,7 @@ async fn run_pipeline(
     let daemon_dir = root.join("daemon");
     let heal_root = root.join("state").join("heal");
     match run_attempt(&daemon_dir, &heal_root, ts, &cfg.cloud.heavy_model, brain, scan).await {
-        AttemptResult::Proposed { diff, report, files, confidence, extra } => match action {
+        AttemptResult::Proposed { diff, report, files, confidence, responsiveness, extra } => match action {
             HealAction::Propose => {
                 // Pass `extra` THROUGH. It used to be swallowed by the `..` in this
                 // destructuring pattern and the no-extra `propose` wrapper hard-coded
@@ -1094,7 +1333,18 @@ async fn run_pipeline(
                 // per-gate fates, the entire point of the multi-candidate v2 design,
                 // were invisible. The only writer of those three files was the
                 // #[ignore]d cloud drill and the REJECTED path.
-                propose(memory, &heal_root, ts, &diff, &report, &files, confidence, &extra).await;
+                propose(
+                    memory,
+                    &heal_root,
+                    ts,
+                    &diff,
+                    &report,
+                    &files,
+                    confidence,
+                    responsiveness,
+                    &extra,
+                )
+                .await;
                 // CHANGE QUEUE (changeq.rs): ALSO register this propose-only artifact
                 // into the unified git-native review lane. Pure bookkeeping — the
                 // validated patch was already written to state/heal/proposals/<ts>/;
@@ -1111,7 +1361,8 @@ async fn run_pipeline(
                         crate::changeq::fingerprint(diff.as_bytes()),
                     ),
                     format!(
-                        "validated patch, {} file{}, review confidence {confidence:.2}",
+                        "validated patch, {} file{}, review confidence {confidence:.2}, \
+                         responsiveness {responsiveness}",
                         files.len(),
                         if files.len() == 1 { "" } else { "s" }
                     ),
@@ -1207,9 +1458,13 @@ async fn run_attempt(
     let mut survivors: Vec<Survivor> = Vec::new();
     let mut outcomes: Vec<CandidateOutcome> = Vec::new();
     let mut last_stage = "patch";
+    // Deadline exhaustion and a real gate failure are OPPOSITE messages to the
+    // operator; counted separately so the rejection report can tell them apart.
+    let mut deadline_hits = 0usize;
+    let mut merit_rejects = 0usize;
     for (i, diff) in candidate_diffs.iter().enumerate() {
         let files = extract_source_files(diff);
-        match stage_and_validate(daemon_dir, heal_root, ts, i, diff).await {
+        match stage_and_validate(daemon_dir, heal_root, ts, i, diff, &diagnosis).await {
             Ok(StageResult::Validated { validation_tail }) => {
                 // (6) Adversarial review of this survivor.
                 let (verdict, confidence) =
@@ -1242,6 +1497,11 @@ async fn run_attempt(
             }
             Ok(StageResult::Rejected { stage, detail }) => {
                 last_stage = stage;
+                if stage == "deadline" {
+                    deadline_hits += 1;
+                } else {
+                    merit_rejects += 1;
+                }
                 outcomes.push(CandidateOutcome {
                     index: i + 1,
                     diff: diff.clone(),
@@ -1254,6 +1514,7 @@ async fn run_attempt(
             }
             Err(e) => {
                 warn!(error = %e, candidate = i + 1, "heal: staging infrastructure failed");
+                merit_rejects += 1;
                 outcomes.push(CandidateOutcome {
                     index: i + 1,
                     diff: diff.clone(),
@@ -1273,7 +1534,7 @@ async fn run_attempt(
             ts,
             model,
             &diagnosis,
-            "No candidate passed the staged check / clippy / test / mutation gates.",
+            &rejection_summary(deadline_hits, merit_rejects),
         );
         // Persist candidates.md alongside the rejection so the human can see
         // what was tried.
@@ -1290,6 +1551,7 @@ async fn run_attempt(
         };
     };
     let winner = survivors[win_idx].clone();
+    let responsiveness_word = responsiveness(&diagnosis, &winner.diff).0.word();
     let report = render_report(ts, model, &diagnosis, &winner);
     let review_md = render_review_md(&winner);
     let diagnosis_json = diagnosis_json(&diagnosis);
@@ -1299,6 +1561,7 @@ async fn run_attempt(
         report,
         files: winner.files.clone(),
         confidence: winner.confidence,
+        responsiveness: responsiveness_word,
         extra: ProposalArtifacts {
             diagnosis_json,
             candidates_md,
@@ -1315,6 +1578,10 @@ enum AttemptResult {
         report: String,
         files: Vec<String>,
         confidence: f64,
+        /// Whether the chosen patch actually answers the diagnosis
+        /// (`Responsiveness::word()`). Carried out so the propose path can put
+        /// it on the wire — the gate chain itself is blind to it.
+        responsiveness: &'static str,
         extra: ProposalArtifacts,
     },
     /// A model/patch/validation failure — we have a verdict (no candidate is
@@ -1365,6 +1632,7 @@ async fn propose(
     report: &str,
     files: &[String],
     confidence: f64,
+    responsiveness: &str,
     extra: &ProposalArtifacts,
 ) {
     let dir = heal_root.join("proposals");
@@ -1378,7 +1646,16 @@ async fn propose(
     telemetry::emit(
         "system",
         "heal.proposal",
-        json!({"ts": ts, "files": files, "validated": true, "confidence": confidence}),
+        json!({
+            "ts": ts,
+            "files": files,
+            "validated": true,
+            "confidence": confidence,
+            // VALIDATED IS NOT RESPONSIVE. Four gates prove the patch compiles,
+            // lints, passes and that its test bites; none of them prove it
+            // addresses the burst. The HUD's Accept button needs both words.
+            "responsiveness": responsiveness,
+        }),
     );
 }
 
@@ -1508,9 +1785,11 @@ async fn stage_and_validate(
     ts: u64,
     candidate: usize,
     diff: &str,
+    diagnosis: &Diagnosis,
 ) -> anyhow::Result<StageResult> {
     let staging = heal_root.join(staging_dir_name(ts, candidate));
-    let out = stage_and_validate_inner(source_dir, heal_root, ts, candidate, diff).await;
+    let out =
+        stage_and_validate_inner(source_dir, heal_root, ts, candidate, diff, diagnosis).await;
     // Best-effort: a tree we could not remove is wasted disk, never a broken heal.
     if let Err(e) = tokio::fs::remove_dir_all(&staging).await {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -1532,6 +1811,7 @@ async fn stage_and_validate_inner(
     ts: u64,
     candidate: usize,
     diff: &str,
+    diagnosis: &Diagnosis,
 ) -> anyhow::Result<StageResult> {
     let staging = heal_root.join(staging_dir_name(ts, candidate));
     // `staging` is a miniature REPO ROOT; the crate itself lands one level down.
@@ -1597,10 +1877,11 @@ async fn stage_and_validate_inner(
     for (stage, args) in stages {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            return Ok(StageResult::Rejected {
-                stage,
-                detail: format!("{combined}\n[validation deadline exhausted before cargo {stage}]"),
-            });
+            // RUNNING OUT OF TIME IS NOT A VERDICT ON THE PATCH. Filed under the
+            // stage name it never reached, this reported as `heal.rejected
+            // {stage:"test"}` and rendered as "no candidate passed the gates" —
+            // which an operator reads as "the model drafted three bad patches".
+            return Ok(budget_exhausted(stage, &combined, None));
         }
         match run_cargo(&crate_dir, &args, remaining).await {
             Ok(out) => {
@@ -1610,14 +1891,21 @@ async fn stage_and_validate_inner(
                     return Ok(StageResult::Rejected { stage, detail: combined });
                 }
             }
-            Err(e) => {
-                return Ok(StageResult::Rejected {
-                    stage,
-                    detail: format!("{combined}\n[cargo {stage} failed to run: {e}]"),
-                })
-            }
+            Err(e) => return Ok(stage_failure(stage, &combined, &e)),
         }
     }
+
+    // ---- RESPONSIVENESS (advisory; NEVER rejects) --------------------------
+    //
+    // The three stages above, and the mutation probe below, are all blind to the
+    // DIAGNOSIS. This is the one line in the tail that says whether the patch has
+    // anything to do with the burst that triggered it. It is written into
+    // `combined`, so it reaches the adversarial reviewer (whose prompt is handed
+    // this very tail), report.md and candidates.md — all three from one place.
+    combined.push_str(&format!(
+        "\n$ responsiveness probe\n{}\n",
+        responsiveness(diagnosis, diff).1
+    ));
 
     // ---- STAGE 4: MUTATION PROOF -------------------------------------------
     //
@@ -1656,6 +1944,21 @@ async fn stage_and_validate_inner(
             // Fix removed, test kept. The suite MUST now fail.
             Ok(r) if r.ok => {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                if remaining.is_zero() {
+                    // No guard lived here, so a zero budget went straight into
+                    // `tokio::time::timeout(Duration::ZERO, …)`, which fires
+                    // instantly, and the Err arm below returned VALIDATED with
+                    // "the probe could not run (… timed out after 0s)". A
+                    // never-run probe must not read as a technical hiccup.
+                    combined.push_str(
+                        "\n$ mutation probe\nINCONCLUSIVE: the staged-validation budget was \
+                         exhausted before the probe could run, so this patch is NOT \
+                         mutation-proven.\n",
+                    );
+                    return Ok(StageResult::Validated {
+                        validation_tail: tail_chars(&combined, REPORT_TAIL_CHARS),
+                    });
+                }
                 match run_cargo(&crate_dir, &test_args, remaining).await {
                     Ok(o) if !o.ok => "PROVEN: the patch's test FAILS once its fix is taken away.",
                     Ok(o) => {
@@ -1690,6 +1993,74 @@ async fn stage_and_validate_inner(
     Ok(StageResult::Validated {
         validation_tail: tail_chars(&combined, REPORT_TAIL_CHARS),
     })
+}
+
+/// The marker `run_cargo` puts in its timeout error, and the ONLY thing
+/// `is_deadline_error` looks for. Both sides read this one constant so the
+/// classifier cannot drift away from the message it classifies.
+const CARGO_DEADLINE_MARKER: &str = "exceeded the staged-validation budget";
+
+/// True when a `run_cargo` error is the deadline running out rather than the
+/// toolchain being missing or unspawnable.
+fn is_deadline_error(e: &anyhow::Error) -> bool {
+    e.to_string().contains(CARGO_DEADLINE_MARKER)
+}
+
+/// THE GATE RAN OUT OF TIME. Reported under its own stage name, never under the
+/// stage it was trying to run, because `heal.rejected{stage:"test"}` +
+/// "no candidate passed the staged gates" is read by an operator as "the model
+/// drafted three bad patches" when in fact no patch was ever judged.
+fn budget_exhausted(stage: &'static str, combined: &str, err: Option<&anyhow::Error>) -> StageResult {
+    let secs = VALIDATE_TIMEOUT.as_secs();
+    let when = match err {
+        Some(e) => format!("ran out DURING `cargo {stage}` ({e})"),
+        None => format!("was already spent before `cargo {stage}` could start"),
+    };
+    StageResult::Rejected {
+        stage: "deadline",
+        detail: format!(
+            "{combined}\n[the {secs}s staged-validation budget {when}. This candidate was never \
+             judged on its merits — it is a capacity failure of the gate, not a verdict on the \
+             patch.]"
+        ),
+    }
+}
+
+/// Classify a `run_cargo` error: a blown deadline is `budget_exhausted`,
+/// anything else (no toolchain, spawn failure) stays filed under the stage.
+fn stage_failure(stage: &'static str, combined: &str, e: &anyhow::Error) -> StageResult {
+    if is_deadline_error(e) {
+        return budget_exhausted(stage, combined, Some(e));
+    }
+    StageResult::Rejected {
+        stage,
+        detail: format!("{combined}\n[cargo {stage} failed to run: {e}]"),
+    }
+}
+
+/// Summarize WHY every candidate was discarded, distinguishing "all three were
+/// bad" from "the gate could not finish in its budget". They are opposite
+/// instructions to the operator and used to render as the same sentence.
+fn rejection_summary(deadline_hits: usize, merit_rejects: usize) -> String {
+    if deadline_hits > 0 && merit_rejects == 0 {
+        return format!(
+            "NO CANDIDATE WAS EVER JUDGED. The {}s staged-validation budget ran out on every \
+             candidate ({deadline_hits} of them) before a gate could return a verdict. This says \
+             nothing about the drafted patches — it says the gate cannot finish a full \
+             check + clippy + test + mutation-rerun cycle on this machine in that budget.",
+            VALIDATE_TIMEOUT.as_secs()
+        );
+    }
+    let mut out =
+        "No candidate passed the staged check / clippy / test / mutation gates.".to_string();
+    if deadline_hits > 0 {
+        out.push_str(&format!(
+            " ({deadline_hits} of them never finished: the {}s validation budget ran out, so those \
+             were not judged on their merits.)",
+            VALIDATE_TIMEOUT.as_secs()
+        ));
+    }
+    out
 }
 
 /// Stage the crate for validation. `staging` becomes a miniature REPO ROOT and
@@ -2144,6 +2515,26 @@ async fn run_cargo(dir: &Path, args: &[&str], timeout: Duration) -> anyhow::Resu
     let child = tokio::process::Command::new(cargo)
         .args(args)
         .current_dir(dir)
+        // THE STAGED BUILD MUST NOT SHARE A TARGET DIR WITH ANYTHING.
+        //
+        // This inherited the daemon's whole environment, so an exported
+        // CARGO_TARGET_DIR — or a `.cargo/config.toml` `build.target-dir`, which is
+        // an ordinary developer setting — sent every staged check / clippy / test /
+        // mutation-probe build into ONE shared directory. The staged crate is a
+        // byte-for-byte copy of daemon/: SAME package name, SAME version. MEASURED
+        // on this repo at HEAD: two staged crates with DIFFERENT sources resolved to
+        // the same artifact, `synthetic_clamp-0eb738ba7de7e68e`, and the second run
+        // reported `Finished ... in 0.34s` and then executed the FIRST one's test
+        // binary — so `heal::tests::the_gate_validates_and_marks_proven_a_patch_whose
+        // _test_bites` and its rejecting twin swapped verdicts between runs.
+        //
+        // A gate whose "cargo test passed in staging" can be answered by a DIFFERENT
+        // candidate's compiled code — or by the unpatched live tree's, which shares
+        // the same name and version — is not a gate. Pin the build inside the staging
+        // tree, which is where `stage_sources` already assumes it goes (it refuses to
+        // copy `target/`, and apply_heal.sh's selftest asserts that). An env var beats
+        // `.cargo/config.toml`, so this closes the config route too.
+        .env("CARGO_TARGET_DIR", dir.join("target"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -2151,7 +2542,11 @@ async fn run_cargo(dir: &Path, args: &[&str], timeout: Duration) -> anyhow::Resu
         .spawn()?;
     let out = match tokio::time::timeout(timeout, child.wait_with_output()).await {
         Ok(result) => result?,
-        Err(_) => anyhow::bail!("cargo {} timed out after {}s", args.join(" "), timeout.as_secs()),
+        Err(_) => anyhow::bail!(
+            "cargo {} {CARGO_DEADLINE_MARKER} ({}s remained)",
+            args.join(" "),
+            timeout.as_secs()
+        ),
     };
     Ok(CmdOutput {
         ok: out.status.success(),
@@ -2236,7 +2631,7 @@ pub async fn run_heal_drill(model: &str) -> anyhow::Result<PathBuf> {
     }
 
     match result {
-        AttemptResult::Proposed { diff, report, files, confidence, extra } => {
+        AttemptResult::Proposed { diff, report, files, confidence, responsiveness, extra } => {
             // Write the proposal artifacts exactly as the propose path does,
             // WITHOUT touching meta or emitting heal.proposal into a live HUD
             // (no Memory here): the drill proves the loop, it is not a live heal.
@@ -2250,7 +2645,7 @@ pub async fn run_heal_drill(model: &str) -> anyhow::Result<PathBuf> {
             telemetry::emit(
                 "system",
                 "heal.proposal",
-                json!({"ts": ts, "files": files, "validated": true, "confidence": confidence, "drill": true}),
+                json!({"ts": ts, "files": files, "validated": true, "confidence": confidence, "responsiveness": responsiveness, "drill": true}),
             );
             info!(
                 proposal = %dir.display(),
@@ -2868,9 +3263,10 @@ mod tests {
              }}\n"
         );
 
-        let result = stage_and_validate(&crate_dir, &heal_root, 1_770_000_001, 0, &vacuous)
-            .await
-            .unwrap();
+        let result =
+            stage_and_validate(&crate_dir, &heal_root, 1_770_000_001, 0, &vacuous, &diag_for(&["src/lib.rs"], "router"))
+                .await
+                .unwrap();
         match result {
             StageResult::Rejected { stage, detail } => {
                 assert_eq!(stage, "mutation", "wrong stage rejected:\n{detail}");
@@ -2912,9 +3308,10 @@ mod tests {
              }}\n"
         );
 
-        let result = stage_and_validate(&crate_dir, &heal_root, 1_770_000_002, 0, &biting)
-            .await
-            .unwrap();
+        let result =
+            stage_and_validate(&crate_dir, &heal_root, 1_770_000_002, 0, &biting, &diag_for(&["src/lib.rs"], "router"))
+                .await
+                .unwrap();
         match result {
             StageResult::Validated { validation_tail } => assert!(
                 validation_tail.contains("PROVEN: the patch's test FAILS"),
@@ -2924,6 +3321,380 @@ mod tests {
                 panic!("a biting test must validate, rejected at {stage}:\n{detail}")
             }
         }
+    }
+
+    /// A minimal diagnosis for the staged-gate tests: what the burst cited.
+    fn diag_for(files: &[&str], subsystem: &str) -> Diagnosis {
+        Diagnosis {
+            signatures: vec!["synthetic burst".to_string()],
+            files: files.iter().map(|f| (*f).to_string()).collect(),
+            line_numbers: vec![],
+            subsystem: subsystem.to_string(),
+            log_context: String::new(),
+            burst_lines: vec![],
+            source_excerpts: vec![],
+        }
+    }
+
+    // -- RESPONSIVENESS: the gate proves SOUND, not RESPONSIVE ---------------
+
+    /// A crate with the DIAGNOSED subsystem in one file and an entirely separate
+    /// latent bug in another. The burst names `src/audio.rs`; the patch below
+    /// never goes near it.
+    fn write_two_module_crate(dir: &Path) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"synthetic-split\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("src").join("lib.rs"), "pub mod audio;\npub mod colorlab;\n")
+            .unwrap();
+        // The implicated subsystem. Untouched by the candidate under test.
+        std::fs::write(
+            dir.join("src").join("audio.rs"),
+            "pub fn capture_gain() -> i32 {\n    1\n}\n",
+        )
+        .unwrap();
+        // A DIFFERENT file with a DIFFERENT, genuine bug (no upper clamp) and
+        // enough padding that its fix and its test cannot land in one hunk.
+        std::fs::write(
+            dir.join("src").join("colorlab.rs"),
+            "pub fn clamp_pct(x: i32) -> i32 {\n\
+             \x20   x\n\
+             }\n\
+             \n\
+             pub fn pad_a() {}\n\
+             pub fn pad_b() {}\n\
+             pub fn pad_c() {}\n\
+             pub fn pad_d() {}\n\
+             pub fn pad_e() {}\n\
+             pub fn pad_f() {}\n\
+             \n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+             \x20   #[test]\n\
+             \x20   fn baseline() {\n\
+             \x20       assert_eq!(super::clamp_pct(5), 5);\n\
+             \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+    }
+
+    /// THE GAP THIS WHOLE SECTION EXISTS FOR, CONSTRUCTED AND WALKED THROUGH.
+    ///
+    /// The burst implicates `src/audio.rs`, subsystem `audio`. This candidate
+    /// patches `src/colorlab.rs` instead: a real bug, a real fix, and a
+    /// regression test that genuinely FAILS when the fix is reversed. It
+    /// therefore clears `patch`, `cargo check`, `cargo clippy -D warnings`,
+    /// `cargo test` AND the mutation probe — every stage the gate had — and
+    /// before this change it was proposed to the owner as the fix for an error
+    /// burst it has nothing to do with, under the header "verdict: VALIDATED".
+    ///
+    /// The fix is NOT to reject it (a correct fix often lives one layer up from
+    /// the line that screamed). It is to SAY SO. So this asserts both halves:
+    /// the candidate still validates, and the validation tail — the same text
+    /// the adversarial reviewer is handed and report.md embeds — now names it
+    /// UNRELATED.
+    #[tokio::test]
+    async fn an_unresponsive_candidate_clears_every_gate() {
+        let root = TempRoot::new("unresponsive");
+        let crate_dir = root.0.join("daemon");
+        let heal_root = root.0.join("state").join("heal");
+        write_two_module_crate(&crate_dir);
+
+        let elsewhere = "--- a/src/colorlab.rs\n\
+                         +++ b/src/colorlab.rs\n\
+                         @@ -1,4 +1,4 @@\n \
+                         pub fn clamp_pct(x: i32) -> i32 {\n\
+                         -    x\n\
+                         +    x.min(100)\n \
+                         }\n \
+                         \n\
+                         @@ -15,4 +15,9 @@\n \
+                         \x20   fn baseline() {\n \
+                         \x20       assert_eq!(super::clamp_pct(5), 5);\n \
+                         \x20   }\n\
+                         +\n\
+                         +    #[test]\n\
+                         +    fn clamps_above_one_hundred() {\n\
+                         +        assert_eq!(super::clamp_pct(150), 100);\n\
+                         +    }\n \
+                         }\n";
+
+        let diagnosis = Diagnosis {
+            signatures: vec!["audio capture stopped".to_string()],
+            files: vec!["src/audio.rs".to_string()],
+            line_numbers: vec![2],
+            subsystem: "audio".to_string(),
+            log_context: String::new(),
+            burst_lines: vec![],
+            source_excerpts: vec![],
+        };
+
+        let result =
+            stage_and_validate(&crate_dir, &heal_root, 1_780_000_001, 0, elsewhere, &diagnosis)
+                .await
+                .unwrap();
+
+        let tail = match result {
+            StageResult::Validated { validation_tail } => validation_tail,
+            StageResult::Rejected { stage, detail } => panic!(
+                "the gap must be reproduced, not hidden: this candidate is SOUND and must still \
+                 validate — rejected at {stage}:\n{detail}"
+            ),
+        };
+        // It really did clear all four stages — otherwise this test proves nothing.
+        assert!(tail.contains("cargo clippy"), "never reached clippy:\n{tail}");
+        assert!(
+            tail.contains("PROVEN: the patch's test FAILS"),
+            "the candidate must be genuinely mutation-proven, or it is not the \
+             hard case:\n{tail}"
+        );
+        // ...and the gate now SAYS it answers a different question than the one asked.
+        assert!(
+            tail.contains("$ responsiveness probe"),
+            "the validation tail carries no responsiveness verdict at all:\n{tail}"
+        );
+        assert!(
+            tail.contains("UNRELATED — the patch edits src/colorlab.rs"),
+            "a patch that touches neither the cited file nor the implicated subsystem \
+             must be flagged UNRELATED:\n{tail}"
+        );
+        assert!(
+            tail.contains("NOT A REJECTION"),
+            "the flag must say plainly that it is advisory, or the next reader will \
+             treat it as a verdict:\n{tail}"
+        );
+    }
+
+    /// The other half of the pair: a patch that DOES answer the burst must not be
+    /// smeared. A flag that fires on everything is not a flag.
+    #[tokio::test]
+    async fn a_responsive_candidate_is_marked_direct() {
+        let root = TempRoot::new("responsive");
+        let crate_dir = root.0.join("daemon");
+        let heal_root = root.0.join("state").join("heal");
+        write_clamp_crate(&crate_dir);
+
+        let biting = format!(
+            "{CLAMP_FIX_HUNK}\
+             @@ -15,4 +15,9 @@\n \
+             \x20   fn baseline() {{\n \
+             \x20       assert_eq!(super::clamp_pct(5), 5);\n \
+             \x20   }}\n\
+             +\n\
+             +    #[test]\n\
+             +    fn clamps_above_one_hundred() {{\n\
+             +        assert_eq!(super::clamp_pct(150), 100);\n\
+             +    }}\n \
+             }}\n"
+        );
+        let result = stage_and_validate(
+            &crate_dir,
+            &heal_root,
+            1_780_000_002,
+            0,
+            &biting,
+            &diag_for(&["src/lib.rs"], "router"),
+        )
+        .await
+        .unwrap();
+        match result {
+            StageResult::Validated { validation_tail } => assert!(
+                validation_tail.contains("DIRECT — the patch edits src/lib.rs"),
+                "a patch on the cited file must read DIRECT:\n{validation_tail}"
+            ),
+            StageResult::Rejected { stage, detail } => panic!("rejected at {stage}:\n{detail}"),
+        }
+    }
+
+    /// The five verdicts, each on its own evidence. Pure — no build, no cloud.
+    #[test]
+    fn responsiveness_grades_each_kind_of_evidence() {
+        let hdr = |f: &str| format!("--- a/{f}\n+++ b/{f}\n@@ -1,1 +1,1 @@\n-a\n+b\n");
+        let full = Diagnosis {
+            signatures: vec!["audio capture stopped".to_string()],
+            files: vec!["src/nexus.rs".to_string()],
+            line_numbers: vec![],
+            subsystem: "audio".to_string(),
+            log_context: String::new(),
+            burst_lines: vec![],
+            source_excerpts: vec![],
+        };
+        assert_eq!(responsiveness(&full, &hdr("src/nexus.rs")).0, Responsiveness::Direct);
+        assert_eq!(responsiveness(&full, &hdr("src/audio.rs")).0, Responsiveness::Subsystem);
+        assert_eq!(
+            responsiveness(&full, &hdr("src/audio/mixer.rs")).0,
+            Responsiveness::Subsystem,
+            "a file under src/<subsystem>/ belongs to that subsystem"
+        );
+        assert_eq!(responsiveness(&full, &hdr("src/colorlab.rs")).0, Responsiveness::Unrelated);
+        // The signature route: a different file, but it carries the burst's text.
+        let sig_diff = "--- a/src/pipeline.rs\n+++ b/src/pipeline.rs\n@@ -1,1 +1,2 @@\n \
+                        ok\n+    error!(\"audio capture stopped\");\n";
+        assert_eq!(responsiveness(&full, sig_diff).0, Responsiveness::Signature);
+        // Nothing to match on -> no opinion, and NOT a warning.
+        let blind = Diagnosis {
+            signatures: vec!["boom".to_string()],
+            files: vec![],
+            line_numbers: vec![],
+            subsystem: "unknown".to_string(),
+            log_context: String::new(),
+            burst_lines: vec![],
+            source_excerpts: vec![],
+        };
+        assert_eq!(
+            responsiveness(&blind, &hdr("src/colorlab.rs")).0,
+            Responsiveness::Indeterminate,
+            "an empty diagnosis must not be reported as an unrelated patch"
+        );
+    }
+
+    /// A patch scores DIRECT only when it WRITES the cited file. Merely naming it
+    /// in a context line, an added comment or a doc string is not a fix, and
+    /// `extract_source_files` — which scans the whole text — would have scored it
+    /// DIRECT for free, which is how a heuristic becomes a rubber stamp.
+    #[test]
+    fn only_the_plus_plus_plus_header_counts_as_touching_a_file() {
+        let d = Diagnosis {
+            signatures: vec![],
+            files: vec!["src/router.rs".to_string()],
+            line_numbers: vec![],
+            subsystem: "router".to_string(),
+            log_context: String::new(),
+            burst_lines: vec![],
+            source_excerpts: vec![],
+        };
+        let name_dropping = "--- a/src/colorlab.rs\n\
+                             +++ b/src/colorlab.rs\n\
+                             @@ -1,1 +1,2 @@\n \
+                             fn f() {}\n\
+                             +// see also src/router.rs for the real dispatch\n";
+        assert_eq!(patched_files(name_dropping), vec!["src/colorlab.rs".to_string()]);
+        assert_eq!(
+            responsiveness(&d, name_dropping).0,
+            Responsiveness::Unrelated,
+            "mentioning the cited file in a comment must not score as fixing it"
+        );
+        // ...and the boundary rule: src/tools.rs is not a cited `s.rs`.
+        assert!(!same_file("src/tools.rs", "s.rs"));
+        assert!(same_file("daemon/src/router.rs", "src/router.rs"));
+        // ...and a subsystem match is component-exact, not a substring.
+        assert!(!path_in_subsystem("src/audiobook.rs", "audio"));
+        assert!(path_in_subsystem("src/audio.rs", "audio"));
+    }
+
+    /// The verdict has to REACH the humans and the reviewer, not just exist.
+    /// report.md is what a person reads before running apply_heal.sh.
+    #[test]
+    fn the_report_header_carries_the_responsiveness_verdict() {
+        let d = Diagnosis {
+            signatures: vec!["audio capture stopped".to_string()],
+            files: vec!["src/nexus.rs".to_string()],
+            line_numbers: vec![],
+            subsystem: "audio".to_string(),
+            log_context: String::new(),
+            burst_lines: vec![],
+            source_excerpts: vec![],
+        };
+        let w = Survivor {
+            index: 1,
+            diff: "--- a/src/colorlab.rs\n+++ b/src/colorlab.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n"
+                .to_string(),
+            files: vec!["src/colorlab.rs".to_string()],
+            validation_tail: "tail".to_string(),
+            review_verdict: "ok".to_string(),
+            confidence: 0.9,
+            size: 2,
+        };
+        let report = render_report(7, "m", &d, &w);
+        assert!(
+            report.contains("- responsiveness: UNRELATED"),
+            "report.md must state responsiveness beside VALIDATED:\n{report}"
+        );
+        // And the adversarial reviewer must be told what the line means, or it
+        // will read UNRELATED as noise in a validation dump.
+        let rp = review_prompt(&d, &w.diff, "…RESPONSIVENESS…");
+        assert!(
+            rp.contains("RESPONSIVENESS line") && rp.contains("BLIND to the diagnosis"),
+            "the reviewer is never told the gates cannot see the diagnosis:\n{rp}"
+        );
+    }
+
+    // -- the 10-minute budget: exhaustion is not a verdict --------------------
+
+    /// A blown deadline must be classifiable from the error `run_cargo` really
+    /// produces — not from a string this test invents. So this drives the REAL
+    /// producer with a zero budget and asserts the REAL classifier agrees.
+    #[tokio::test]
+    async fn a_blown_cargo_deadline_is_recognizable_as_one() {
+        let root = TempRoot::new("deadline");
+        // `expect_err` would require CmdOutput: Debug; match instead so the
+        // struct's (potentially huge) captured output stays out of Debug.
+        let err = match run_cargo(&root.0, &["--version"], Duration::ZERO).await {
+            Err(e) => e,
+            Ok(_) => panic!("a zero budget must not succeed"),
+        };
+        assert!(
+            is_deadline_error(&err),
+            "run_cargo's timeout message and its classifier have drifted apart: {err}"
+        );
+        // ...and an error that is NOT a timeout must not be mistaken for one.
+        assert!(!is_deadline_error(&anyhow::anyhow!("cargo not found on this machine")));
+    }
+
+    /// EXHAUSTION MUST NOT LOOK LIKE A REJECTION ON THE MERITS. Filed under the
+    /// stage it never reached, a blown budget reported as
+    /// `heal.rejected{stage:"test"}` + "no candidate passed the staged gates" —
+    /// which an operator reads as "the model drafted three bad patches".
+    #[test]
+    fn deadline_exhaustion_reports_itself_as_a_deadline() {
+        let timeout = anyhow::anyhow!("cargo test {CARGO_DEADLINE_MARKER} (0s remained)");
+        match stage_failure("test", "…", &timeout) {
+            StageResult::Rejected { stage, detail } => {
+                assert_eq!(stage, "deadline", "a blown budget must not be filed under `test`");
+                assert!(detail.contains("never judged on its merits"), "{detail}");
+            }
+            StageResult::Validated { .. } => panic!("a blown budget is not a validation"),
+        }
+        // A genuine infrastructure failure still reports under its stage.
+        match stage_failure("check", "…", &anyhow::anyhow!("cargo not found")) {
+            StageResult::Rejected { stage, .. } => assert_eq!(stage, "check"),
+            StageResult::Validated { .. } => panic!("unexpected"),
+        }
+        // And the pre-stage guard names the stage that never started.
+        match budget_exhausted("clippy", "…", None) {
+            StageResult::Rejected { stage, detail } => {
+                assert_eq!(stage, "deadline");
+                assert!(detail.contains("before `cargo clippy` could start"), "{detail}");
+            }
+            StageResult::Validated { .. } => panic!("unexpected"),
+        }
+    }
+
+    /// ...and the rejection REPORT has to say the same thing. "No candidate
+    /// passed the gates" is a statement about the patches; when the budget ran
+    /// out it is a statement about the machine, and they are opposite
+    /// instructions to whoever reads it.
+    #[test]
+    fn the_rejection_report_separates_a_blown_budget_from_bad_patches() {
+        let all_timed_out = rejection_summary(3, 0);
+        assert!(
+            all_timed_out.contains("NO CANDIDATE WAS EVER JUDGED"),
+            "{all_timed_out}"
+        );
+        assert!(
+            !all_timed_out.contains("No candidate passed the staged"),
+            "a budget failure must not be phrased as a verdict on the patches: {all_timed_out}"
+        );
+        let genuinely_bad = rejection_summary(0, 3);
+        assert!(genuinely_bad.contains("No candidate passed the staged"), "{genuinely_bad}");
+        // Mixed: say both, and say how many were never judged.
+        let mixed = rejection_summary(1, 2);
+        assert!(mixed.contains("No candidate passed the staged"), "{mixed}");
+        assert!(mixed.contains("1 of them never finished"), "{mixed}");
     }
 
     /// Classification is by POSITION, not by the word `#[test]`: the fix hunk
@@ -3156,9 +3927,16 @@ mod tests {
                                   -    x * q\n\
                                   +    x * 3\n \
                                   }\n";
-        let result = stage_and_validate(&crate_dir, &heal_root, 1_760_000_002, 0, wrong_context_diff)
-            .await
-            .unwrap();
+        let result = stage_and_validate(
+            &crate_dir,
+            &heal_root,
+            1_760_000_002,
+            0,
+            wrong_context_diff,
+            &diag_for(&["src/lib.rs"], "router"),
+        )
+        .await
+        .unwrap();
         match result {
             StageResult::Rejected { stage, .. } => assert_eq!(stage, "patch"),
             StageResult::Validated { .. } => panic!("a failed hunk must reject"),
@@ -3181,9 +3959,16 @@ mod tests {
                             -    x * y\n\
                             +    x * z\n \
                             }\n";
-        let result = stage_and_validate(&crate_dir, &heal_root, 1_760_000_003, 0, useless_diff)
-            .await
-            .unwrap();
+        let result = stage_and_validate(
+            &crate_dir,
+            &heal_root,
+            1_760_000_003,
+            0,
+            useless_diff,
+            &diag_for(&["src/lib.rs"], "router"),
+        )
+        .await
+        .unwrap();
         match result {
             StageResult::Rejected { stage, detail } => {
                 assert_eq!(stage, "check");
@@ -3202,9 +3987,16 @@ mod tests {
         let heal_root = root.0.join("state").join("heal");
         write_synthetic_crate(&crate_dir);
         let fixing = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n pub fn double(x: i32) -> i32 {\n-    x * y\n+    x * 2\n }\n";
-        let result = stage_and_validate(&crate_dir, &heal_root, 1_760_000_001, 0, fixing)
-            .await
-            .expect("staging infrastructure must work");
+        let result = stage_and_validate(
+            &crate_dir,
+            &heal_root,
+            1_760_000_001,
+            0,
+            fixing,
+            &diag_for(&["src/lib.rs"], "router"),
+        )
+        .await
+        .expect("staging infrastructure must work");
         match result {
             StageResult::Validated { validation_tail } => {
                 assert!(validation_tail.contains("cargo"));
@@ -3435,6 +4227,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// THE STAGED BUILD MUST BE ISOLATED, NOT MERELY "IN THE STAGING DIR".
+    ///
+    /// `run_cargo` runs in the staged CRATE, but it also inherited the daemon's
+    /// environment — so CARGO_TARGET_DIR (or `.cargo/config.toml`
+    /// `build.target-dir`) put the ARTIFACTS somewhere else, shared. Two staged
+    /// crates are byte-copies of daemon/ with the same package name and version;
+    /// measured on this repo, they resolved to the SAME artifact hash and one
+    /// candidate's compiled test binary answered another candidate's gate.
+    ///
+    /// This is scoped to `run_cargo`'s own body (the needle appears in this test
+    /// too) and pinned to ONE definition, so the guard cannot window onto its own
+    /// text, and it requires the CALL on a non-comment line rather than the name.
+    #[test]
+    fn the_staged_cargo_pins_its_target_dir_inside_the_staging_tree() {
+        let src = include_str!("heal.rs");
+        let anchor = concat!("async fn ", "run_cargo(");
+        assert_eq!(
+            src.matches(anchor).count(),
+            1,
+            "`{anchor}` must name exactly ONE site \u{2014} the definition; with more, this \
+             guard can window onto the wrong region and pass without reading the spawn"
+        );
+        let start = src.find(anchor).expect("run_cargo moved; re-point this guard");
+        let rest = &src[start..];
+        let end = rest
+            .find("\n}\n")
+            .map(|e| e + 2)
+            .expect("run_cargo must close at column 0 so this window is bounded");
+        let body = &rest[..end];
+        assert!(
+            body.lines()
+                .map(str::trim_start)
+                .any(|l| !l.starts_with("//") && l.contains(".env(\"CARGO_TARGET_DIR\"")),
+            "the staged cargo must PIN CARGO_TARGET_DIR into the staging tree on a code \
+             line \u{2014} inheriting it lets one staged candidate's artifacts answer \
+             another's gate:\n{body}"
+        );
+    }
+
     /// THE SKIP FLAGS MUST REACH THE TEST HARNESS, NOT CARGO.
     ///
     /// `--skip` is a libtest flag. Passed as `cargo test --skip X` it produces
@@ -3456,16 +4287,35 @@ mod tests {
         );
         // ...and every name skipped must be a real test in this crate, or the skip
         // is silently covering nothing (or, worse, a typo hiding a real failure).
-        for name in [
-            "forge::tests::apply_forge_accepts_legit_multiline_manifest",
-            "forge::tests::apply_forge_refuses_multiline_overbroad_manifests",
-            "heal::tests::full_pipeline_via_mock_brain_rejects_when_no_candidate_validates",
-        ] {
-            let leaf = name.rsplit("::").next().unwrap();
+        // THE LIST ITSELF, NOT A HAND-WRITTEN COPY OF IT. This iterated a literal
+        // duplicate of UNRUNNABLE_IN_STAGE, so the names actually handed to `--skip`
+        // were never the names checked: a FOURTH entry added to the real list — or an
+        // existing one retyped there — was not existence-checked at all, which is the
+        // very "a skip that names nothing is a hole in the gate" case below. The
+        // sibling parity test already iterates UNRUNNABLE_IN_STAGE; this one must too.
+        // PROVED: appending "heal::tests::this_test_does_not_exist" to
+        // UNRUNNABLE_IN_STAGE left this test green.
+        for name in UNRUNNABLE_IN_STAGE {
+            // THE DEFINITION, NOT THE NAME — this SELF-MATCHED. The leaf already
+            // occurs in heal.rs twice: in UNRUNNABLE_IN_STAGE itself and in this
+            // test's own array above. `src.contains(leaf)` was therefore satisfied
+            // by the very skip list it exists to validate, so renaming or deleting
+            // a skipped test left the skip naming nothing, the gate holed, and this
+            // guard green. PROVED: renaming
+            // forge::tests::apply_forge_accepts_legit_multiline_manifest left this
+            // test passing.
+            let (path, leaf) =
+                name.rsplit_once("::").expect("a skip name is <module>::tests::<leaf>");
+            let owner = match path.split("::").next().unwrap() {
+                "heal" => src,
+                "forge" => include_str!("forge.rs"),
+                other => panic!("skip {name} names module {other}, which this guard cannot read"),
+            };
+            let def = format!("fn {leaf}(");
             assert!(
-                src.contains(leaf) || include_str!("forge.rs").contains(leaf),
-                "skipped test {name} does not exist — a skip that names nothing is a \
-                 hole in the gate"
+                owner.contains(def.as_str()),
+                "skipped test {name} is not DEFINED (`{def}` is absent from the {path} module) — \
+                 a skip that names nothing is a hole in the gate"
             );
         }
     }
@@ -3484,11 +4334,57 @@ mod tests {
     #[test]
     fn the_apply_script_skips_the_same_unrunnable_tests_as_the_daemon_gate() {
         let script = include_str!("../../scripts/apply_heal.sh");
+        // Comment lines are NOT the gate. `--skip`, `cargo test` and the test names
+        // all appear in this script's prose (it documents the libtest-separator
+        // hazard verbatim), so a name-anywhere search passes even with every real
+        // invocation deleted — the source-anchored-guard trap. Read CODE only.
+        let code: String = script
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        // Every `cargo test` gate in the script, and every name it skips.
+        let gates = code.matches("cargo test --").count();
+        assert!(gates >= 1, "apply_heal.sh must actually run `cargo test --` somewhere");
+        // Trim the shell punctuation that abuts the LAST name in each list — the
+        // final `--skip <name>);` carries a `);` with no space before it, and a
+        // token-equality check against it silently reports a drift that is not
+        // there. A test path is only `[A-Za-z0-9_:]`.
+        let script_skips: Vec<&str> = code
+            .split("--skip ")
+            .skip(1)
+            .filter_map(|s| s.split_whitespace().next())
+            .map(|s| {
+                s.trim_end_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == ':'))
+            })
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(!script_skips.is_empty(), "apply_heal.sh passes no --skip at all");
+
+        // DIRECTION 1 — the script must skip everything the daemon skips, in EVERY
+        // gate. A gate that skips only some of them rejects a candidate the daemon
+        // proved, for a reason that is not the patch.
         for name in UNRUNNABLE_IN_STAGE {
+            let n = script_skips.iter().filter(|s| s == &name).count();
+            assert_eq!(
+                n, gates,
+                "apply_heal.sh has {gates} `cargo test --` gate(s) but skips {name} in \
+                 only {n} of them — a candidate the daemon proved is rejected at apply \
+                 time for the wrong reason"
+            );
+        }
+        // DIRECTION 2 — and NOTHING MORE. This is the dangerous direction and it was
+        // unchecked: a name skipped by the script but RUN by the daemon makes the
+        // apply gate WEAKER than the gate that proved the patch, so a patch that
+        // genuinely breaks that test can still be applied to live sources by hand or
+        // by the HUD Accept button. Containment would never catch it; set equality
+        // does.
+        for s in &script_skips {
             assert!(
-                script.contains(name),
-                "apply_heal.sh must skip {name} too — otherwise a candidate the \
-                 daemon proved is rejected at apply time for the wrong reason"
+                UNRUNNABLE_IN_STAGE.contains(s),
+                "apply_heal.sh skips {s}, which the daemon's own gate RUNS — the apply \
+                 gate must never be weaker than the one that proved the patch"
             );
         }
         // ...and the script must pass them to the HARNESS, not to cargo.
@@ -3562,10 +4458,23 @@ mod tests {
     #[test]
     fn the_apply_script_gate_matches_the_daemon_gate() {
         let script = include_str!("../../scripts/apply_heal.sh");
+        // A COMMENT NAMING THE STAGE IS NOT THE STAGE. `cargo check` appears SIX
+        // times in this script's prose header and once more inside its own
+        // `fail "cargo check failed in staging"` message; `cargo test` appears nine
+        // times. A whole-file `contains` was satisfied by all of that, so deleting
+        // the real invocation left this green — PROVED: replacing
+        // `cd "$CRATE" && cargo check` with `cargo build` did not fail this test.
+        // Match the INVOCATION, on a non-comment line: every stage is run as
+        // `cd "$CRATE" && <stage>`.
         for stage in ["cargo check", "cargo clippy --all-targets -- -D warnings", "cargo test"] {
+            let invocation = format!("cd \"$CRATE\" && {stage}");
             assert!(
-                script.contains(stage),
-                "apply_heal.sh must run `{stage}` — the two gates must not disagree"
+                script
+                    .lines()
+                    .map(str::trim_start)
+                    .any(|l| !l.starts_with('#') && l.contains(invocation.as_str())),
+                "apply_heal.sh must RUN `{stage}` (as `{invocation}`) on a code line — the \
+                 two gates must not disagree, and prose naming a stage is not the stage"
             );
         }
     }
@@ -3604,6 +4513,27 @@ mod tests {
             "a surviving test must FAIL the apply, not just warn:\n{probe}"
         );
 
+        // ...AND IT MUST SPLIT THE PATCH BEING APPLIED. The `script.contains(
+        // "--split-heal-diff")` assertion above is satisfied by this stage's own prose
+        // header and by the fail-closed `grep -q -- '--split-heal-diff'` that only
+        // proves the staged BINARY knows the flag — nothing here required the live
+        // invocation to name $PATCH_FILE. Re-point it at the self-proof fixture
+        // ("$PROBE/sep.diff") and every assertion in this test stays green while the
+        // operator's actual patch is never probed: $SPLIT_DIR/fix.diff then describes
+        // the wrong hunks, the reverse-apply fails, and stage 4 falls into its
+        // ADVISORY "INCONCLUSIVE" branch instead of refusing. PROVED: that exact
+        // re-point left this test passing. Require the invocation itself, on a
+        // non-comment line, inside stage 4, naming $PATCH_FILE.
+        assert!(
+            probe.lines().map(str::trim_start).any(|l| {
+                !l.starts_with('#')
+                    && l.contains("--split-heal-diff")
+                    && l.contains("\"$PATCH_FILE\"")
+            }),
+            "stage 4 must run `--split-heal-diff \"$PATCH_FILE\"` on a code line — a probe \
+             that splits anything but the patch being applied proves nothing:\n{probe}"
+        );
+
         // FAIL CLOSED, three ways. An unrecognized flag makes darwind fall
         // through to ORDINARY DAEMON STARTUP — it would boot a daemon instead of
         // answering, and the gate would be skipped rather than enforced.
@@ -3626,6 +4556,265 @@ mod tests {
         );
     }
 
+    /// The responsiveness block of apply_heal.sh, BOUNDED at BOTH ends. Slicing
+    /// "everything after the marker" would run on into the live apply below and
+    /// report on unrelated lines; binding only the head is the too-wide-window
+    /// trap this file has already been bitten by.
+    fn responsiveness_block(script: &str) -> &str {
+        let after = script
+            .split("RESPONSIVENESS PROBE (advisory)")
+            .nth(1)
+            .expect("apply_heal.sh has no responsiveness block");
+        let end = after
+            .find("echo \"RESPONSIVENESS: $RESP_WORD\"")
+            .expect("the responsiveness block does not end where it is supposed to");
+        &after[..end]
+    }
+
+    /// ...and the window must actually BIND. A window can bind so tightly it
+    /// matches nothing, and then every assertion inside it passes vacuously.
+    #[test]
+    fn the_responsiveness_window_binds_to_a_real_block() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        let block = responsiveness_block(script);
+        assert!(!block.trim().is_empty(), "the responsiveness window is empty");
+        assert!(
+            block.len() < script.len() / 2,
+            "the window swallowed most of the script ({} of {} bytes) — it is not bounded",
+            block.len(),
+            script.len()
+        );
+        // It must NOT have run on into the live apply.
+        assert!(
+            !block.contains("stage \"applying\""),
+            "the window runs past its block into the live apply:\n{block}"
+        );
+    }
+
+    /// BOTH GATES OR NEITHER. The daemon computes responsiveness inside its
+    /// staged validation; if the apply script did not re-derive it, a proposal
+    /// could be applied by hand or by the HUD Accept button with the one signal
+    /// that says "this patch is about something else" never shown to the person
+    /// clicking the button.
+    #[test]
+    fn the_apply_script_runs_the_same_responsiveness_probe_as_the_daemon_gate() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        let block = responsiveness_block(script);
+        assert!(
+            block.contains("--heal-responsiveness \"$DIR/diagnosis.json\" \"$PATCH_FILE\""),
+            "the apply gate must judge THIS proposal's patch against THIS \
+             proposal's diagnosis:\n{block}"
+        );
+        // FAIL-SAFE: an unknown flag boots a daemon instead of answering, and
+        // this script would hang on it. The flag must be confirmed present in
+        // the STAGED source first.
+        assert!(
+            block.contains("grep -q -- '--heal-responsiveness' \"$CRATE/src/main.rs\""),
+            "the probe must confirm the staged daemon implements the flag, or a \
+             mismatched source boots a daemon instead of answering:\n{block}"
+        );
+        // A probe that always answers the same word is not a probe.
+        assert!(
+            block.contains("does not discriminate"),
+            "the probe must be proven to discriminate before its verdict is \
+             believed:\n{block}"
+        );
+        // An unrecognized verdict must be reported as unknown, never passed on.
+        assert!(
+            block.contains("unrecognized verdict"),
+            "an unknown verdict must not be passed through as a real one:\n{block}"
+        );
+    }
+
+    /// ADVISORY, IN BOTH GATES. A hard reject on this heuristic would throw away
+    /// a correct fix whose true cause lives in a file the log never cited — a
+    /// worse failure than the hole it closes. The daemon side is proved
+    /// behaviourally by `an_unresponsive_candidate_clears_every_gate` (it still
+    /// VALIDATES); this is the shell side.
+    #[test]
+    fn the_apply_script_never_refuses_on_responsiveness() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        let block = responsiveness_block(script);
+        for line in block.lines() {
+            assert!(
+                !line.trim_start().starts_with("fail ") && !line.contains("; fail "),
+                "the responsiveness probe must never refuse an apply — a correct fix \
+                 often touches a file the log never named:\n{line}"
+            );
+        }
+    }
+
+    /// ONE implementation, TWO callers. A bash (or duplicated Rust) copy of the
+    /// scoring rule is the gates-drift-apart defect by construction — the same
+    /// reason --split-heal-diff exists as a flag rather than a shell function.
+    #[test]
+    fn the_responsiveness_rule_has_exactly_one_implementation() {
+        let main_rs = include_str!("main.rs");
+        assert!(
+            main_rs.contains("--heal-responsiveness"),
+            "the shared flag must exist, or apply_heal.sh's grep guard silently \
+             disables the probe forever"
+        );
+        assert!(
+            main_rs.contains("heal::responsiveness(&diagnosis, &diff)"),
+            "the CLI must CALL heal::responsiveness, not reimplement the rule"
+        );
+        // The script must not parse the diff itself in that block — that would be
+        // a second classifier, free to disagree with the first.
+        let block = responsiveness_block(include_str!("../../scripts/apply_heal.sh"));
+        for line in block.lines() {
+            if line.contains("$PATCH_FILE") {
+                assert!(
+                    line.contains("--heal-responsiveness"),
+                    "the block reads the patch outside the shared probe, so there are \
+                     now two classifiers that can disagree:\n{line}"
+                );
+            }
+        }
+    }
+
+    /// ORDER, NOT JUST PRESENCE. The mutation probe reverse-applies the patch's
+    /// FIX into the staged crate and never restores it — and a crate with its
+    /// fix lifted out routinely no longer COMPILES, which that probe ACCEPTS as
+    /// PROVEN (all it asks is whether `cargo test` exits non-zero). `cargo run
+    /// --bin darwind` cannot build such a tree, so a responsiveness block placed
+    /// after the reverse-apply gets two empty self-proof answers, concludes the
+    /// probe "does not discriminate", and prints RESPONSIVENESS: UNKNOWN for
+    /// every patch of that shape — the shell half of the gate inert, and blaming
+    /// the wrong thing. It must run while the crate is still the patched, green
+    /// tree the gates above built.
+    #[test]
+    fn the_responsiveness_probe_runs_before_the_mutation_reverse_apply() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        let probe_at = script
+            .find("RESPONSIVENESS PROBE (advisory)")
+            .expect("apply_heal.sh has no responsiveness block");
+        let reverse_at = script
+            .find("-R <\"$SPLIT_DIR/fix.diff\"")
+            .expect("apply_heal.sh no longer reverse-applies the fix");
+        assert!(
+            probe_at < reverse_at,
+            "the responsiveness probe (at {probe_at}) runs AFTER the mutation \
+             reverse-apply (at {reverse_at}); that crate often no longer compiles, so \
+             `cargo run --bin darwind` answers nothing and every verdict degrades to \
+             UNKNOWN with 'does not discriminate' as the stated reason"
+        );
+        // ...and still inside the re-validation gate. Printing it once daemon/src
+        // has already been mutated would be too late to inform anybody.
+        let apply_at = script
+            .find("stage \"applying\"")
+            .expect("apply_heal.sh has no live-apply stage");
+        assert!(
+            probe_at < apply_at,
+            "the responsiveness verdict prints after the live apply ({probe_at} > {apply_at})"
+        );
+    }
+
+    /// THE WRITER AND THE READER MUST AGREE ON THE ARTIFACT BETWEEN THEM.
+    ///
+    /// apply_heal.sh hands `$DIR/diagnosis.json` — written by `diagnosis_json`
+    /// — to `darwind --heal-responsiveness`, which parses it straight back into
+    /// a `Diagnosis`. That struct carries `#[serde(default)]`, so a renamed or
+    /// reshaped field does NOT error: it silently yields an EMPTY diagnosis,
+    /// every shell-side verdict collapses to INDETERMINATE, and the script's own
+    /// self-proof cannot notice — it feeds a hand-written JSON literal, not the
+    /// daemon's real output. `diagnosis_json_roundtrips` only proves the file is
+    /// valid JSON, never that this struct can read it back. So round-trip the
+    /// REAL artifact and require the VERDICT to survive the trip.
+    #[test]
+    fn the_written_diagnosis_json_is_what_the_responsiveness_probe_reads_back() {
+        let now = Utc::now().to_rfc3339();
+        let tail = (0..5)
+            .map(|_| {
+                format!(
+                    "{now} ERROR darwin_core::router: converse failed at src/router.rs:122 \
+                     error=dispatch exploded"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let written = build_diagnosis(&scan_tail(tail));
+        assert!(
+            !written.files.is_empty() && written.subsystem == "router",
+            "the fixture must produce a diagnosis there is something to match on: {written:?}"
+        );
+
+        let json = diagnosis_json(&written);
+        let read_back: Diagnosis = serde_json::from_str(&json)
+            .expect("the daemon writes a diagnosis.json its own --heal-responsiveness cannot parse");
+        assert_eq!(
+            read_back.files, written.files,
+            "`files` did not survive the artifact round-trip, so the apply gate judges \
+             every patch against an empty diagnosis and can only ever say INDETERMINATE"
+        );
+        assert_eq!(read_back.subsystem, written.subsystem, "`subsystem` did not survive");
+        assert_eq!(read_back.signatures, written.signatures, "`signatures` did not survive");
+
+        let diff = "--- a/src/router.rs\n+++ b/src/router.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n";
+        assert_eq!(
+            responsiveness(&written, diff).0,
+            Responsiveness::Direct,
+            "fixture sanity: the daemon-side verdict must be DIRECT"
+        );
+        assert_eq!(
+            responsiveness(&read_back, diff).0,
+            Responsiveness::Direct,
+            "the two gates disagree about the SAME patch because the artifact between \
+             them lost a field — one implementation, but not one input"
+        );
+    }
+
+    /// THE MUTATION PROBE'S OWN TEST RUN NEEDS A ZERO-BUDGET GUARD TOO — and
+    /// nothing tested the one that was just added.
+    ///
+    /// This is `run_cargo`'s FOURTH call, handed whatever survives the 600s
+    /// budget after check + clippy + test (measured at ~87% of it on a warm
+    /// M1 Pro). With nothing left, `tokio::time::timeout(Duration::ZERO, …)`
+    /// fires instantly, the Err arm below reports "the probe could not run",
+    /// and the candidate is returned VALIDATED as if the probe had merely
+    /// hiccuped — a never-run proof reading as a technical blip. The staged
+    /// loop above has such a guard; this call site had none.
+    ///
+    /// SOURCE-ANCHORED because `VALIDATE_TIMEOUT` is a compile-time constant
+    /// with no injection seam, so the state cannot be reached from a test. The
+    /// window is bounded at BOTH ends — the reverse-patch success arm .. that
+    /// fourth `run_cargo` — and both anchors are built with `concat!` so this
+    /// test's own source can never satisfy its own search.
+    #[test]
+    fn the_mutation_probes_second_test_run_is_guarded_against_a_spent_budget() {
+        let src = include_str!("heal.rs");
+        let arm = concat!("            Ok(r) if ", "r.ok => {");
+        let rerun = concat!("match run_cargo(&crate_dir, ", "&test_args, remaining).await {");
+        let start = src
+            .find(arm)
+            .expect("the mutation probe no longer has a reverse-patch success arm");
+        let rest = &src[start..];
+        let end = rest.find(rerun).expect("the mutation probe no longer re-runs the suite");
+        let window = &rest[..end];
+        // The window must actually BIND: one that matched nothing, or swallowed
+        // the rest of the file, would pass every assertion below for free.
+        assert!(
+            !window.trim().is_empty() && window.len() < 3_000,
+            "the guard window did not bind ({} bytes)",
+            window.len()
+        );
+        assert!(
+            window.contains("combined.push_str("),
+            "the window is not the mutation probe's success arm:
+{window}"
+        );
+        assert!(
+            window.contains("if remaining.is_zero()"),
+            "the mutation probe re-runs the suite with no check that any budget is              LEFT; a spent budget goes into timeout(Duration::ZERO), returns through              the Err arm as 'the probe could not run', and the candidate is proposed              VALIDATED with a proof that never executed:
+{window}"
+        );
+        assert!(
+            window.contains("mutation-proven"),
+            "the spent-budget path must SAY the patch is not mutation-proven, not              blame a technical failure:
+{window}"
+        );
+    }
+
     /// The split must have exactly ONE implementation. A bash reimplementation
     /// of the hunk classifier is the gates-drift-apart defect by construction —
     /// so the script has to call the daemon binary, not parse the diff itself.
@@ -3636,6 +4825,15 @@ mod tests {
         // The precise property: the patch is READ only by the splitter. If bash
         // ever touched $PATCH_FILE for any other purpose here, that would be a
         // second classifier — and the two could then disagree.
+        // A FOR-ALL OVER NOTHING IS NOT A CHECK. If $PATCH_FILE stops appearing in
+        // stage 4 at all — renamed, or the probe re-pointed at a fixture — this loop
+        // iterates zero matching lines and reports "no second classifier" having read
+        // none of them. PROVED: re-pointing the split invocation at "$PROBE/sep.diff"
+        // left this test green. Pin the floor before scanning.
+        assert!(
+            probe.lines().any(|l| l.contains("$PATCH_FILE")),
+            "stage 4 never names $PATCH_FILE, so this guard scanned nothing:\n{probe}"
+        );
         for line in probe.lines() {
             if line.contains("$PATCH_FILE") {
                 assert!(

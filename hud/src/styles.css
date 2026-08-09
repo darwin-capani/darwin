@@ -1110,6 +1110,14 @@ svg.tri circle {
   letter-spacing: 0.04em;
 }
 
+/* The RESPONSIVENESS row when the patch answers a different question than the
+   one that was asked. Amber, not red: it is advisory — a correct fix often
+   lives one layer up from the line that logged the error. */
+.sh-warn {
+  color: var(--warn-amber);
+  letter-spacing: 0.04em;
+}
+
 .sh-note {
   font-size: 9.5px;
   line-height: 1.5;

@@ -2085,6 +2085,51 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Operator/gate entrypoint: the SHARED responsiveness probe.
+    //
+    //   darwind --heal-responsiveness <diagnosis.json> <patch.diff>
+    //
+    // The staged self-heal gate proves a candidate COMPILES, LINTS, PASSES and
+    // that its own test BITES. Not one of those stages looks at the DIAGNOSIS,
+    // so a patch that fixes something else entirely clears all of them. This
+    // answers the missing question, and — exactly like --split-heal-diff — it is
+    // the DAEMON'S OWN FUNCTION, so scripts/apply_heal.sh and the daemon gate
+    // cannot drift into two different opinions.
+    //
+    // Line 1 is the verdict word (DIRECT | SUBSYSTEM | SIGNATURE | UNRELATED |
+    // INDETERMINATE), line 2 the sentence for a human. Exit 0 on any verdict;
+    // exit 2 is reserved for bad usage / unreadable input, so a caller can tell
+    // "cannot judge this patch" from "this command was called wrong".
+    if let Some(pos) = std::env::args().position(|a| a == "--heal-responsiveness") {
+        let diag_path = std::env::args().nth(pos + 1).unwrap_or_default();
+        let patch_path = std::env::args().nth(pos + 2).unwrap_or_default();
+        if diag_path.trim().is_empty() || patch_path.trim().is_empty() {
+            eprintln!("usage: darwind --heal-responsiveness <diagnosis.json> <patch.diff>");
+            std::process::exit(2);
+        }
+        let diagnosis: heal::Diagnosis = match std::fs::read_to_string(&diag_path)
+            .map_err(|e| e.to_string())
+            .and_then(|t| serde_json::from_str(&t).map_err(|e| e.to_string()))
+        {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("cannot read a diagnosis from {diag_path}: {e}");
+                std::process::exit(2);
+            }
+        };
+        let diff = match std::fs::read_to_string(&patch_path) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("cannot read {patch_path}: {e}");
+                std::process::exit(2);
+            }
+        };
+        let (verdict, detail) = heal::responsiveness(&diagnosis, &diff);
+        println!("{}", verdict.word());
+        println!("{detail}");
+        return Ok(());
+    }
+
     if let Some(pos) = std::env::args().position(|a| a == "--validate-forge-manifest") {
         let manifest_path = std::env::args().nth(pos + 1).unwrap_or_default();
         let app_name = std::env::args().nth(pos + 2).unwrap_or_default();
@@ -3161,8 +3206,9 @@ async fn main() -> Result<()> {
     // binary's signing/notarization (codesign/spctl ASSESSMENT reads, never
     // executions) + the Gatekeeper switch. It seeds a baseline on first run, then
     // emits security.persistence (counts + any new/removed/unsigned anomalies) and
-    // folds a summary into the posture readout. DARWIN's own two launch items are
-    // labeled self, never alarmed on. It never mutates any OS surface; only its own
+    // folds a summary into the posture readout. DARWIN's own three launch items
+    // (daemon / inference / hud — exactly what scripts/install_boot.sh installs)
+    // are labeled self, never alarmed on. It never mutates any OS surface; only its own
     // baseline store is written. Ships ON ([persistence].enabled); with it false
     // the loop is not spawned.
     if let Some(persistence_baseline) = persistence_baseline {
@@ -6096,10 +6142,23 @@ mod encryption_migration_tests {
 
         // Find every state_dir join of a .db file handed to an opener alongside
         // master_key. The opener calls span lines, so scan a window after each key use.
+        // THE SCRAPE MUST STILL FIND THE OPENERS, AND IT MUST NOT COUNT ITSELF.
+        // The needle `master_key.as_ref()` occurs in THIS TEST's own source, so a
+        // rename of the production binding left exactly one "site" — the guard's own
+        // line — and the check passed having read no opener at all. PROVED: renaming
+        // the `master_key` binding to `mkey` in main() left this test passing with
+        // ZERO production sites scanned. Scan only the production half and require
+        // the seven openers that exist.
+        let prod = src
+            .split("#[cfg(test)]")
+            .next()
+            .expect("main.rs has a production section before the tests");
+        let mut sites = 0usize;
         let mut missing: Vec<String> = Vec::new();
-        for (idx, _) in src.match_indices("master_key.as_ref()") {
-            let start = src[..idx].rfind("open_").unwrap_or(idx);
-            let window = &src[start.saturating_sub(200)..idx];
+        for (idx, _) in prod.match_indices("master_key.as_ref()") {
+            sites += 1;
+            let start = prod[..idx].rfind("open_").unwrap_or(idx);
+            let window = &prod[start.saturating_sub(200)..idx];
             for (jdx, _) in window.match_indices(".join(\"") {
                 let rest = &window[jdx + 7..];
                 if let Some(end) = rest.find('"') {
@@ -6110,6 +6169,11 @@ mod encryption_migration_tests {
                 }
             }
         }
+        assert!(
+            sites >= 7,
+            "the keyed-open scrape found only {sites} `master_key.as_ref()` site(s) in \
+             production code; the needle has rotted and this guard is reading nothing"
+        );
         missing.sort();
         missing.dedup();
         assert!(

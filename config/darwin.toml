@@ -410,8 +410,9 @@ rss_growth_ratio   = 3.0    # RSS growth multiple over baseline that counts as a
 #     — ASSESSMENT reads only, never executions)
 # It keeps a baseline and reports DELTAS (a NEW / REMOVED / newly-UNSIGNED
 # autostart item) via the `security.persistence` telemetry frame + a summary in
-# the posture readout. DARWIN's own two launch items (com.darwin.daemon /
-# com.darwin.inference) are LABELED as self and are NEVER alarmed on. STRICTLY
+# the posture readout. DARWIN's own three launch items (com.darwin.daemon /
+# com.darwin.inference / com.darwin.hud — exactly what scripts/install_boot.sh
+# installs) are LABELED as self and are NEVER alarmed on. STRICTLY
 # READ-ONLY: no writes to user data, no kills, no unloads, no remediation.
 # SHIPS ON (full-power default); with it false the sentinel loop is not spawned.
 enabled = true

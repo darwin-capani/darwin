@@ -1501,23 +1501,57 @@ impl CommandPipeline for LivePipeline {
         if let Some(crate::user_model::MirrorIntent::Contest(subject)) =
             crate::user_model::classify_mirror_intent(text)
         {
-            if !crate::threshold::deny_cloud(true) {
-                return "Only the owner can change what I've learned, sir.".to_string();
-            }
-            return match crate::user_model::contest_belief(mem, &subject).await {
-                Ok(c) if c.any() => c.text(&subject),
-                // NOTHING MATCHED is not a failure and must not read as one — a
-                // silent "done" on a no-op is how the user believes a belief is
-                // gone when it is not.
-                Ok(_) => format!(
-                    "I don't hold a belief about {subject} to drop, sir — nothing changed."
-                ),
-                Err(e) => {
-                    warn!(error = %e, "contest_belief failed on the command channel");
-                    "I couldn't reach what I've learned just now, sir — nothing was changed."
-                        .to_string()
+            // THE MASTER SWITCH THE SPOKEN ARM HAS AND THIS ONE DID NOT.
+            //
+            // router.rs wraps the WHOLE mirror family in `if cfg.mirror.enabled`
+            // (router.rs:1247). This arm was wired without it, and `cfg.mirror`
+            // had exactly ONE reader in the tree — so `[mirror].enabled = false`
+            // switched the VOICE route off and left the HUD button still dropping
+            // beliefs and writing permanent tombstones. The shipped config line
+            // promises the opposite in as many words: `Off => "why do you
+            // think…" / "that's wrong…" fall through to the model.` 20c617b said
+            // this arm sits "behind the SAME rails the spoken path uses" and
+            // listed three; this is the fourth.
+            //
+            // RESTRICT-ONLY: [mirror] SHIPS ON, so with the default config this is
+            // byte-for-byte the previous behaviour. Off, the turn falls through to
+            // the normal answer path — which is what the config says it does.
+            if self.cfg.mirror.enabled {
+                if !crate::threshold::deny_cloud(true) {
+                    return "Only the owner can change what I've learned, sir.".to_string();
                 }
-            };
+                return match crate::user_model::contest_belief(mem, &subject).await {
+                    Ok(c) => {
+                        // ...AND THE PANEL HAS TO SEE IT. Every router mirror arm
+                        // emits the secret-free `mirror.belief` frame straight after
+                        // the operation; this one emitted nothing, so a click DID
+                        // drop the belief and MirrorPanel went on listing it until
+                        // the next reflection cycle or a restart — while App.tsx's
+                        // own comment promised "The refreshed mirror.belief frame
+                        // updates this panel". Same frame, same action label, same
+                        // found flag as router.rs's Contest arm; no new data and no
+                        // new consumer, only the refresh the click was missing.
+                        let found = c.any();
+                        crate::user_model::emit_belief_frame(mem, "contest", &subject, found)
+                            .await;
+                        if found {
+                            c.text(&subject)
+                        } else {
+                            // NOTHING MATCHED is not a failure and must not read as
+                            // one — a silent "done" on a no-op is how the user
+                            // believes a belief is gone when it is not.
+                            format!(
+                                "I don't hold a belief about {subject} to drop, sir — nothing changed."
+                            )
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "contest_belief failed on the command channel");
+                        "I couldn't reach what I've learned just now, sir — nothing was changed."
+                            .to_string()
+                    }
+                };
+            }
         }
 
         // VAULT / GUEST: is the cloud reachable for THIS turn at all?
@@ -2001,6 +2035,62 @@ mod tests {
         );
     }
 
+    /// THE CONTEST ARM CARRIES ITS MASTER SWITCH, AND REFRESHES THE PANEL.
+    ///
+    /// Two things 20c617b left out and the round-2 sweep did not catch:
+    ///   * `[mirror].enabled` gates the whole mirror family in router.rs and
+    ///     nothing here, so turning the subsystem OFF stopped the voice route and
+    ///     left the button dropping beliefs and writing permanent tombstones;
+    ///   * no `mirror.belief` frame was emitted on this path, so a click dropped
+    ///     the belief for real and MirrorPanel kept showing it — the advertised
+    ///     effect of the control simply did not happen.
+    ///
+    /// Bounded to the ARM, both ends, for the reason the sibling test records: a
+    /// wider scope self-matches on the vault gate's own `deny_cloud`, and the same
+    /// trap applies to a bare `mirror.enabled` search over the whole body.
+    #[test]
+    fn the_contest_arm_carries_the_mirror_master_switch_and_refreshes_the_panel() {
+        let src = include_str!("command.rs");
+        let start = src
+            .find("    async fn ask(&self, text: &str, agent: Option<&str>) -> String {")
+            .expect("the ask arm must exist");
+        let rest = &src[start + 40..];
+        let end = rest
+            .find("\n    async fn ")
+            .or_else(|| rest.find("\n    fn "))
+            .unwrap_or(rest.len());
+        let body = &rest[..end];
+
+        let classify = body
+            .find("classify_mirror_intent(text)")
+            .expect("ask must consult the mirror classifier — else the button is dead");
+        let call = body
+            .find("contest_belief(mem, &subject)")
+            .expect("ask must actually contest, not just classify");
+        let cloud = body
+            .find("crate::anthropic::complete_with_tools(")
+            .expect("ask still calls the cloud loop");
+        assert!(classify < call && call < cloud, "classify -> contest -> (never) cloud");
+
+        // THE MASTER SWITCH, between the classifier and the destructive call.
+        let gate = &body[classify..call];
+        assert!(
+            gate.contains("self.cfg.mirror.enabled"),
+            "the typed contest arm must sit behind [mirror].enabled, exactly like the \
+             spoken arm — otherwise the master switch turns the voice route off and \
+             leaves the button dropping beliefs"
+        );
+        // THE PANEL REFRESH, after the call and still before any cloud turn.
+        let after = &body[call..cloud];
+        assert!(
+            after.contains("emit_belief_frame(mem, \"contest\", &subject, found)"),
+            "a click that drops a belief must emit the same mirror.belief frame the \
+             spoken arm emits, or MirrorPanel keeps listing what was just dropped"
+        );
+        // ...and the no-op line the sibling test pins must survive the restructure.
+        assert!(after.contains("nothing changed"));
+    }
+
     /// EVERY DAEMON VERB THE HUD CAN SEND MUST EXIST, AND VICE VERSA.
     ///
     /// The reachability hunt found SEVEN daemon verbs with no client at all —
@@ -2055,11 +2145,143 @@ mod tests {
                  that button answers \"unknown command\" forever"
             );
         }
-        // `overnight` specifically: the verb this test was written alongside.
+        // ------------------------------------------------------------------
+        // DIRECTION 2, FOR REAL: A RELAYED VERB NO SHIPPED CONTROL SENDS.
+        //
+        // This test's own commit claimed it "pins BOTH directions". It did not.
+        // Direction 2 was one hard-coded `allowed.contains("overnight")`, which
+        // asks whether the BACKEND MAY RELAY the verb — not whether anything in
+        // the shipped UI ever sends it. `overnight` satisfied that assertion the
+        // instant it was added to the allow-list, and stayed exactly as
+        // unreachable as the commit said it had been: `overnight::enqueue` has
+        // ONE caller in the tree (this file's Overnight arm), so the queue the
+        // HUD's OvernightPanel reports on can never be filled, by click or by
+        // voice. The distill trio landed the same way an hour later, and the
+        // guard could not see any of it.
+        //
+        // So direction 2 is measured against the SENDERS now. Every verb the
+        // backend relays must appear at a `cmd: "<verb>"` send site in a shipped
+        // front-end source, or be named below with the reason it does not.
+        const HUD_SENDERS: &[&str] = &[
+            include_str!("../../hud/src/App.tsx"),
+            include_str!("../../hud/src/components/CommandDeck.tsx"),
+            include_str!("../../hud/src/components/CommandPalette.tsx"),
+            include_str!("../../hud/src/components/MemoryPanel.tsx"),
+            include_str!("../../hud/src/components/SettingsModal.tsx"),
+            include_str!("../../hud/src/components/StatusBar.tsx"),
+            include_str!("../../hud/src/components/SuggestionsPanel.tsx"),
+            include_str!("../../hud/src/components/SystemSettingsPanel.tsx"),
+            include_str!("../../hud/src/core/palette.ts"),
+        ];
+        // COMMENT LINES ARE SKIPPED, and that is load-bearing: SystemSettingsPanel's
+        // doc block discusses a hypothetical `{cmd:"enroll"}` verb in PROSE, and
+        // reading that as a send site would invent a control that does not exist —
+        // the "a comment stating a rule is not the rule" trap, in scrape form.
+        let mut sent: Vec<&str> = Vec::new();
+        for src in HUD_SENDERS {
+            for line in src.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") || t.starts_with('*') || t.starts_with("/*") {
+                    continue;
+                }
+                let mut rest = line;
+                while let Some(i) = rest.find("cmd:") {
+                    rest = &rest[i + 4..];
+                    if let Some(q) = rest.trim_start().strip_prefix('"') {
+                        if let Some((verb, _)) = q.split_once('"') {
+                            if !verb.is_empty()
+                                && verb.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+                            {
+                                sent.push(verb);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sent.sort_unstable();
+        sent.dedup();
+        // A scrape that matches NOTHING would pass every loop below vacuously —
+        // which is how the first version of this test's allow-list scrape read the
+        // word "unavailable" out of a comment and reported it as a verb.
+        assert!(sent.len() > 5, "the send-site scrape found too few: {sent:?}");
+        // ...AND A FLOOR IS NOT ENOUGH. If the scrape OVER-matched — counting a verb
+        // named in a comment as a send site — direction 2 below would silently pass
+        // for a verb nothing sends, which is the exact failure this test exists to
+        // catch, and no assertion here would notice. So pin the comment-skip itself:
+        // SystemSettingsPanel's doc block discusses a hypothetical `{cmd:"enroll"}`
+        // in PROSE and there is no such control anywhere. If `enroll` shows up as
+        // sent, the skip has stopped working and every result below is suspect.
         assert!(
-            allowed.contains(&"overnight"),
-            "overnight is implemented and gated daemon-side; it must be reachable"
+            !sent.contains(&"enroll"),
+            "the scrape counted a verb that appears only in a COMMENT — it is now \
+             inventing controls that do not exist: {sent:?}"
         );
+
+        // Verbs the backend relays that NO `send_command` control sends. The first
+        // four ARE reachable — a DEDICATED Tauri command drives them instead of the
+        // shared relay — and saying so here is what keeps this list from reading as
+        // six findings plus four false ones. The last six are genuinely
+        // unreachable: wiring or removing them is the owner's call, not a repair.
+        const RELAYED_WITHOUT_A_DECK_CONTROL: &[(&str, &str)] = &[
+            ("play_cue", "REACHABLE: AudioIoPanel -> playSfxCue -> the `play_sfx_cue` command"),
+            ("design_voice", "REACHABLE: AudioIoPanel -> designVoice -> the `design_voice` command"),
+            ("create_pronunciation", "REACHABLE: AudioIoPanel -> createPronunciation -> its own command"),
+            ("compose_music", "REACHABLE: AudioIoPanel -> composeMusic -> the `compose_music` command"),
+            ("roster", "NO CONTROL. Otherwise reachable as ask \"list my agents\"."),
+            ("state", "NO CONTROL. The same constellation + pending state arrives on telemetry."),
+            ("overnight", "NO CONTROL, and overnight::enqueue has no other caller — the queue OvernightPanel reports on can never be filled. WIRING, owner's call."),
+            ("distill", "NO CONTROL, and distill::distill_now has no other caller — DistillPanel's ARMED pipeline can never train. WIRING, owner's call."),
+            ("distill_promote", "NO CONTROL, and it swaps which model answers, so wiring it is a decision, not a repair."),
+            ("distill_rollback", "NO CONTROL. The inverse of promote; same call."),
+        ];
+        for v in &allowed {
+            assert!(
+                sent.contains(v) || RELAYED_WITHOUT_A_DECK_CONTROL.iter().any(|(n, _)| n == v),
+                "the backend relays {v:?} and no shipped control sends it — wire a control, \
+                 or record it in RELAYED_WITHOUT_A_DECK_CONTROL with the reason"
+            );
+        }
+        // ...and the record must not outlive its entries. Once a control lands the
+        // entry has to go, or the list quietly becomes the next stale claim.
+        for (v, _) in RELAYED_WITHOUT_A_DECK_CONTROL {
+            assert!(
+                allowed.contains(v),
+                "RELAYED_WITHOUT_A_DECK_CONTROL names {v:?}, which the backend no longer relays"
+            );
+            assert!(
+                !sent.contains(v),
+                "RELAYED_WITHOUT_A_DECK_CONTROL says nothing sends {v:?}, but a control does \
+                 now — drop the entry"
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // DIRECTION 3: A DAEMON VERB NO CLIENT CAN EVEN RELAY. Four verbs sat
+        // here silently; `vault` is the only one that is deliberate.
+        const NO_HUD_CLIENT: &[(&str, &str)] = &[
+            ("vault", "DELIBERATE: the 'go dark' toggle ships no client (see Command::Vault)."),
+            ("sync", "NO CLIENT. sync::sync_now has no other caller; SyncPanel is read-only."),
+            ("handoff", "NO CLIENT. handoff::build_capsule has no other caller; HandoffPanel is read-only."),
+            ("resume", "NO CLIENT. The consumer half of handoff."),
+        ];
+        for v in &daemon_verbs {
+            assert!(
+                allowed.contains(v) || NO_HUD_CLIENT.iter().any(|(n, _)| n == v),
+                "the daemon implements {v:?} and no client can send it — wire it, or record \
+                 it in NO_HUD_CLIENT with the reason"
+            );
+        }
+        for (v, _) in NO_HUD_CLIENT {
+            assert!(
+                daemon_verbs.contains(v),
+                "NO_HUD_CLIENT names {v:?}, which is no longer a daemon verb"
+            );
+            assert!(
+                !allowed.contains(v),
+                "NO_HUD_CLIENT says {v:?} has no client, but the backend relays it — drop the entry"
+            );
+        }
     }
 
     /// THE TYPED PATH CAN NOW DO WHAT THE SPOKEN PATH CAN, for the tier swap.

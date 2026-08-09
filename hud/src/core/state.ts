@@ -437,6 +437,12 @@ export interface HealProposal {
    *  (event-echoed, else the last heal.diagnosing for the same burst). */
   subsystem: string;
   signature: string;
+  /** Does the patch ADDRESS the diagnosis? `validated` says the patch is SOUND
+   *  (it compiles, lints, passes, and its own test bites); this says whether it
+   *  is an ANSWER. The staged gates never look at the diagnosis, so an
+   *  UNRELATED patch carries validated=true too — the person clicking ACCEPT
+   *  needs both words. "" for an older daemon that does not send it. */
+  responsiveness: string;
   ts: string; // envelope ts of the heal.proposal
 }
 
@@ -2471,6 +2477,7 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
           confidence: num(env.data, "confidence"),
           subsystem: str(env.data, "subsystem") ?? diag?.subsystem ?? "",
           signature: str(env.data, "signature") ?? diag?.signature ?? "",
+          responsiveness: str(env.data, "responsiveness") ?? "",
           ts: env.ts,
         },
       };

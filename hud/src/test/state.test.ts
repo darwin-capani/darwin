@@ -714,6 +714,30 @@ describe("self-heal events", () => {
     expect(s.healProposal).toMatchObject({ subsystem: "audio", signature: "deadlock in mixer", confidence: 0.6 });
   });
 
+  it("heal.proposal carries the RESPONSIVENESS verdict alongside validated", () => {
+    // VALIDATED and RESPONSIVE are different claims: the daemon's staged gates
+    // (check/clippy/test/mutation) never look at the diagnosis, so a patch that
+    // fixes something else entirely arrives validated=true. The person clicking
+    // ACCEPT & APPLY needs both words, so the reducer must not drop one.
+    const s = tel(
+      connected(),
+      env("heal.proposal", {
+        ts: 1765432300,
+        files: ["src/colorlab.rs"],
+        validated: true,
+        confidence: 0.8,
+        responsiveness: "UNRELATED",
+      }),
+    );
+    expect(s.healProposal?.validated).toBe(true);
+    expect(s.healProposal?.responsiveness).toBe("UNRELATED");
+  });
+
+  it("heal.proposal without responsiveness leaves it blank (older daemon)", () => {
+    const s = tel(connected(), env("heal.proposal", { ts: 1765432310, files: [], validated: true }));
+    expect(s.healProposal?.responsiveness).toBe("");
+  });
+
   it("heal.proposal without confidence leaves it null (older daemon)", () => {
     const s = tel(connected(), env("heal.proposal", { ts: 1765432100, files: ["src/x.rs"], validated: true }));
     expect(s.healProposal?.confidence).toBeNull();

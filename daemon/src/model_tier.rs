@@ -1130,10 +1130,7 @@ pub fn classify_model_swap(utterance: &str) -> Option<ModelSwapIntent> {
         if let Some(intent) = match_control_phrase(head) {
             return Some(intent);
         }
-        match strip_one_command_lead(head) {
-            Some(rest) => head = rest,
-            None => return None,
-        }
+        head = strip_one_command_lead(head)?;
     }
 }
 
@@ -1759,18 +1756,29 @@ mod tests {
     //     and would leak to the normal answer path instead of clearing the
     //     override), this test fails. Locks the round-trip neither suite covered.
     //
-    //     THE CONTROLS DO NOT SEND THESE OVER THE COMMAND CHANNEL, and this comment
-    //     used to say they did. `classify_model_swap` is called from `router.rs`
-    //     ONLY (the SPOKEN path); the HUD's `{cmd:"ask"}` reaches
-    //     `LivePipeline::ask` -> `complete_with_tools`, which never enters the
-    //     router and has no model-tier tool. A clicked phrase therefore reached the
-    //     cloud brain as ordinary chat and set no override — so the LOCAL control
-    //     ("work offline, stay on device") egressed the very turn it was asking to
-    //     keep on-device. The HUD now shows the phrase to SAY instead of firing it,
-    //     which is why these literals still have to classify.
+    //     THE CONTROLS DO SEND THESE OVER THE COMMAND CHANNEL. This paragraph
+    //     asserted the opposite until now — in the file that owns the classifier,
+    //     directly above the test other commits cite as their proof that the
+    //     buttons work.
+    //
+    //     WHAT WENT WRONG, kept because it is the class: `classify_model_swap` was
+    //     called from `router.rs` ONLY (the SPOKEN path), while the HUD's
+    //     `{cmd:"ask"}` reached `LivePipeline::ask` -> `complete_with_tools`, which
+    //     never enters the router and has no model-tier tool. A clicked phrase went
+    //     to the cloud brain as ordinary chat and set no override — so the LOCAL
+    //     control ("work offline, stay on device") egressed the very turn it was
+    //     asking to keep on-device.
+    //
+    //     f15f257 FIXED THAT: `LivePipeline::ask` consults `classify_model_swap`
+    //     before any cloud call and installs the same override the router installs,
+    //     behind the same guest rail (command.rs). SettingsModal's four buttons send
+    //     these literals as `{cmd:"ask", text}`, so the round-trip below is the
+    //     CLICK path as well as the spoken one. Pinned to the code, not to this
+    //     prose, by the test that follows it.
     #[test]
     fn settings_button_phrases_round_trip_to_their_intent() {
-        // (control label, exact phrase the SettingsModal tells the user to SAY, intent)
+        // (control label, the exact phrase the SettingsModal button SENDS — and
+        //  also quotes as the spoken alternative — and the intent it must classify as)
         let cases: &[(&str, &str, ModelSwapIntent)] = &[
             ("HEAVY", "use the most powerful model", ModelSwapIntent::Heavy),
             ("FAST", "use the fast model", ModelSwapIntent::Fast),
@@ -1794,6 +1802,73 @@ mod tests {
             None,
             "the AUTO button must clear the override back to the config default"
         );
+    }
+
+    /// THE PROSE ABOVE THAT ROUND-TRIP MUST AGREE WITH THE CODE IT DESCRIBES.
+    ///
+    /// The block above `settings_button_phrases_round_trip_to_their_intent` said
+    /// the Settings controls do NOT send these phrases over the command channel
+    /// and that the HUD only shows a phrase to say. Both stopped being true when
+    /// `LivePipeline::ask` began consulting `classify_model_swap`, and the prose
+    /// stayed for two commits — inside the very test cited elsewhere as proof the
+    /// buttons work. A comment stating a rule is not the rule, so the rule is
+    /// read from command.rs and the comment is held to it.
+    ///
+    /// DISSOLVES ON ITS OWN: if the command channel ever stops handling the swap,
+    /// the disclaimer becomes true again and this test stops forbidding it.
+    ///
+    /// Bounded at BOTH ends — the section header down to the round-trip test's own
+    /// `fn` line — so the window cannot run past the block into this test's own
+    /// assertion strings (which would make it self-matching), and it asserts the
+    /// window really captured the block before testing the claim.
+    #[test]
+    fn the_round_trip_comment_agrees_with_command_rs_on_whether_a_click_sends() {
+        // THE FACT, read from the code: does the command channel handle the swap?
+        // Scoped to the `ask` body exactly as command.rs's own guard scopes it.
+        let cmd = include_str!("command.rs");
+        let ask_at = cmd
+            .find("    async fn ask(&self, text: &str, agent: Option<&str>) -> String {")
+            .expect("the ask arm must exist");
+        let rest = &cmd[ask_at + 40..];
+        let ask_end = rest
+            .find("\n    async fn ")
+            .or_else(|| rest.find("\n    fn "))
+            .unwrap_or(rest.len());
+        let ask_body = &rest[..ask_end];
+        assert!(
+            ask_body.contains("crate::anthropic::complete_with_tools("),
+            "the ask-body window missed the arm it scopes — a window that captured \
+             nothing would decide the claim below vacuously"
+        );
+        let click_sends = ask_body.contains("crate::model_tier::classify_model_swap(text)");
+
+        // THE PROSE, bounded at both ends.
+        let src = include_str!("model_tier.rs");
+        let start = src
+            .find("    // --- INTEGRATION SEAM: the HUD Settings model-tier controls")
+            .expect("the round-trip seam comment must exist");
+        let after = &src[start..];
+        let end = after
+            .find("    fn settings_button_phrases_round_trip_to_their_intent()")
+            .expect("the seam comment must sit directly above its test");
+        let note = &after[..end];
+        assert!(
+            note.contains("MODEL_SWAP_BUTTON_PHRASES"),
+            "the comment window missed the literals it documents:\n{note}"
+        );
+
+        if click_sends {
+            assert!(
+                !note.contains("THE CONTROLS DO NOT SEND THESE OVER THE COMMAND CHANNEL"),
+                "LivePipeline::ask handles the tier swap, so a click DOES send these \
+                 phrases — this comment says it does not:\n{note}"
+            );
+            assert!(
+                !note.contains("shows the phrase to SAY instead of firing it"),
+                "LivePipeline::ask handles the tier swap, so the HUD fires the phrase \
+                 as well as quoting it:\n{note}"
+            );
+        }
     }
 
     #[test]

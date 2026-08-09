@@ -371,6 +371,34 @@ fn is_credentialed_url(token: &str) -> bool {
     }
 }
 
+/// Known provider secret PREFIXES, compared against an ASCII-lowercased token
+/// (so the entries are themselves lowercase; `akia`/`asia` are the AWS long-term
+/// and TEMPORARY access-key ids, `xoxa-` a Slack app token).
+///
+/// ONE TABLE, TWO CALLERS. [`is_secret_shaped`] (the redactor) and
+/// [`crate::changeq::looks_secretish`] (the change-queue trailer guard) enforce the
+/// same rule — "does this token carry a known credential prefix" — and they HAD
+/// drifted: changeq kept a hand-copied list that was missing `xoxa-` and `asia`, so
+/// a Slack app token or an AWS TEMPORARY session key read as secret-free and was
+/// written verbatim into a queued change's provenance trailer, which the redactor
+/// on the very next line would have caught. Two copies of a deny-list drift toward
+/// the shorter one, and the short side is always the leaky side — so there is now
+/// exactly one list and `changeq` reads it.
+pub(crate) const SECRET_PREFIXES: &[&str] = &[
+    "sk-",
+    "pk-",
+    "rk-",
+    "ghp_",
+    "gho_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "akia",
+    "asia",
+];
+
 /// A token that looks like an API key / token / secret. Two routes:
 ///   1. A known secret PREFIX / inline-assignment shape, OR
 ///   2. A long mixed-alphanumeric run (>= 20 chars containing BOTH a letter and
@@ -385,10 +413,9 @@ fn is_secret_shaped(token: &str) -> bool {
             return true;
         }
     }
-    // Known provider secret prefixes (case-sensitive where the real ones are).
-    const PREFIXES: &[&str] = &["sk-", "pk-", "rk-", "ghp_", "gho_", "ghs_", "github_pat_", "xoxb-", "xoxp-", "xoxa-", "akia", "asia"];
+    // Known provider secret prefixes — see [`SECRET_PREFIXES`], the ONE table.
     let lead_lower = lower.as_str();
-    for p in PREFIXES {
+    for p in SECRET_PREFIXES {
         if lead_lower.starts_with(p) && token.len() >= p.len() + 8 {
             return true;
         }

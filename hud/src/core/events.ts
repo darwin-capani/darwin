@@ -241,6 +241,12 @@ export interface HealProposalData {
   confidence?: number; // v2: review confidence 0..1 (optional for older daemon)
   subsystem?: string; // v2: echoed from the diagnosis
   signature?: string; // v2: echoed from the diagnosis
+  /** Whether the patch actually ADDRESSES the diagnosis that triggered the heal
+   *  (DIRECT | SUBSYSTEM | SIGNATURE | UNRELATED | INDETERMINATE). `validated`
+   *  is a different claim: the staged gates (check/clippy/test/mutation) are
+   *  blind to the diagnosis, so an UNRELATED patch is VALIDATED too. Optional —
+   *  an older daemon does not send it. */
+  responsiveness?: string;
 }
 
 /** system / heal.rejected — validation failed at some stage. */

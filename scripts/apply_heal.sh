@@ -25,6 +25,12 @@
 #     code, so the two gates cannot drift), the fix is reverse-applied, and the
 #     suite must then FAIL. A test that passes without its fix proves nothing
 #     about the fix, and the apply is refused,
+#   - print the RESPONSIVENESS verdict (`darwind --heal-responsiveness`, the
+#     daemon's own function again): whether the patch actually addresses the
+#     diagnosis that triggered the heal. Every gate above proves the patch is
+#     SOUND; none of them proves it is an ANSWER. This one is ADVISORY and never
+#     refuses — a correct fix often lives one layer up from the line that
+#     screamed,
 #   - and ONLY on green apply the same patch to the real daemon/, rebuild the
 #     release binary, and clear the meta.heal_pending marker.
 # Any gate failure exits non-zero and leaves daemon/src untouched.
@@ -469,6 +475,79 @@ if ! (cd "$CRATE" && cargo test -- \
         --skip forge::tests::apply_forge_refuses_multiline_overbroad_manifests \
         --skip heal::tests::full_pipeline_via_mock_brain_rejects_when_no_candidate_validates); then
   fail "cargo test failed in staging — live daemon/src NOT modified"
+fi
+
+# ------------------------------------------- RESPONSIVENESS PROBE (advisory)
+# Every gate in this script — patch, check, clippy and test above, and the
+# mutation probe below — proves the patch is SOUND. Not one of them proves it is
+# an ANSWER: none of them ever looks at the DIAGNOSIS that triggered the heal, so
+# a patch that fixes something else entirely (a real bug, with a real test that
+# really fails when its fix is reversed) clears all five and is handed to the
+# operator labelled "VALIDATED".
+#
+# This re-derives the verdict from `darwind --heal-responsiveness` — the
+# daemon's OWN function, the same one-implementation-two-callers shape as
+# --split-heal-diff — and PRINTS it, so the person about to mutate a privileged
+# daemon (or the HUD's Accept button, which reads this stdout) sees whether the
+# patch has anything to do with the burst.
+#
+# IT NEVER REFUSES. A correct fix routinely lives one layer up from the line
+# that screamed; hard-rejecting on that heuristic would throw away exactly those
+# patches, which is a worse failure than the hole it closes.
+#
+# ORDER MATTERS: THIS MUST RUN *BEFORE* THE MUTATION PROBE, NOT AFTER IT. That
+# probe reverse-applies the patch's FIX into $CRATE and never puts it back, and
+# a crate with its fix lifted out very often no longer COMPILES — which the
+# probe ACCEPTS as PROVEN, because all it asks is whether `cargo test` fails.
+# `cargo run --bin darwind` cannot build such a tree: both self-proof calls come
+# back empty, this block decides the probe "does not discriminate", and every
+# patch of that shape gets RESPONSIVENESS: UNKNOWN — the shell half of the gate
+# silently inert, and blaming the wrong thing. Run it here, against the patched,
+# green crate the gates above just built. Pinned by
+# heal.rs::the_responsiveness_probe_runs_before_the_mutation_reverse_apply.
+RESP_WORD="UNKNOWN"
+RESP_DETAIL="no diagnosis.json in the proposal — nothing to check the patch against"
+if [ -f "$DIR/diagnosis.json" ]; then
+  # An unrecognized flag makes darwind fall through to ORDINARY DAEMON STARTUP,
+  # which would HANG this script on a booted daemon. Never invoke it unguarded
+  # (the same hazard --split-heal-diff and apply_forge.sh document).
+  if ! grep -q -- '--heal-responsiveness' "$CRATE/src/main.rs"; then
+    RESP_DETAIL="the staged daemon does not implement --heal-responsiveness (older source)"
+  else
+    # A probe that always answers the same word is not a probe. Prove it
+    # discriminates on two synthetic pairs before any verdict is believed.
+    RP="$STAGING/responsiveness-selfproof"
+    rm -rf "$RP"; mkdir -p "$RP"
+    printf '%s' '{"signatures":["router dispatch exploded"],"files":["src/router.rs"],"line_numbers":[],"subsystem":"router","log_context":"","burst_lines":[],"source_excerpts":[]}' > "$RP/d.json"
+    printf -- '--- a/src/router.rs\n+++ b/src/router.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n'     > "$RP/hit.diff"
+    printf -- '--- a/src/colorlab.rs\n+++ b/src/colorlab.rs\n@@ -1,1 +1,1 @@\n-a\n+b\n' > "$RP/miss.diff"
+    RP_HIT=$( (cd "$CRATE" && cargo run --quiet --bin darwind -- \
+                 --heal-responsiveness "$RP/d.json" "$RP/hit.diff"  2>/dev/null) | head -1 || true)
+    RP_MISS=$( (cd "$CRATE" && cargo run --quiet --bin darwind -- \
+                 --heal-responsiveness "$RP/d.json" "$RP/miss.diff" 2>/dev/null) | head -1 || true)
+    if [ "$RP_HIT" != "DIRECT" ] || [ "$RP_MISS" != "UNRELATED" ]; then
+      RESP_DETAIL="the responsiveness probe does not discriminate (hit=>'$RP_HIT', miss=>'$RP_MISS') — no verdict is trustworthy"
+    else
+      RESP_OUT=$( (cd "$CRATE" && cargo run --quiet --bin darwind -- \
+                     --heal-responsiveness "$DIR/diagnosis.json" "$PATCH_FILE" 2>/dev/null) || true)
+      RESP_WORD=$(printf '%s\n' "$RESP_OUT" | head -1 || true)
+      RESP_DETAIL=$(printf '%s\n' "$RESP_OUT" | tail -n +2 || true)
+      case "$RESP_WORD" in
+        DIRECT | SUBSYSTEM | SIGNATURE | UNRELATED | INDETERMINATE) ;;
+        # Not a verdict this script knows. Say so; never pass it through as one.
+        *)
+          RESP_WORD="UNKNOWN"
+          RESP_DETAIL="the responsiveness probe returned an unrecognized verdict"
+          ;;
+      esac
+    fi
+  fi
+fi
+echo "RESPONSIVENESS: $RESP_WORD"
+# A bare `[ -n "$X" ] && printf ...` as the last command of a block returns 1
+# when X is empty, and `set -e` would kill the script on an EMPTY DETAIL LINE.
+if [ -n "$RESP_DETAIL" ]; then
+  printf '%s\n' "$RESP_DETAIL"
 fi
 
 # STAGE 4: MUTATION PROOF. check+clippy+test prove the patch compiles, lints and

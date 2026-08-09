@@ -83,10 +83,17 @@ export const MODEL_SWAP_BUTTON_PHRASES: Record<ModelSwapIntent, string> = {
   auto: "auto mode",
 };
 
-/** Why the model-tier controls state a phrase instead of acting. Mirrors the
- *  voice-id enrolment controls' spoken-only note: the operation exists, it is
- *  simply not reachable from the command channel this HUD holds. */
+/** The line a model-tier control falls back to when the daemon acknowledges
+ *  nothing. NOT a disclaimer that the control is inert — a click installs the
+ *  override; see the retraction below. */
 /// SUPERSEDED. These buttons WORK now.
+///
+/// AND THE JSDOC LINE ABOVE USED TO SAY THE OPPOSITE, one line up: it explained
+/// why these controls only STATED a phrase rather than acting, which is exactly
+/// the claim this paragraph retracts. Two docs on one const, opposite rules,
+/// and the next reader takes the first — the same defect round 2 fixed in
+/// App.tsx and in the panel body, missed here because the round-2 guard was
+/// scoped to ModelTierSection and this const sits at module scope.
 ///
 /// They were spoken-only because `classify_model_swap` was reached only from
 /// `route()`, and the command channel lands in `complete_with_tools` with no
@@ -99,26 +106,36 @@ export const MODEL_TIER_SPOKEN_ONLY_NOTE =
   "If nothing changed, this daemon predates click-to-switch — say the phrase " +
   'out loud instead; "auto mode" clears the override back to the config default.';
 
-/** The exact instruction a model-tier control shows for `intent`: the phrase to
- *  say, verbatim from MODEL_SWAP_BUTTON_PHRASES, plus why it is spoken-only.
+/** The FALLBACK line a model-tier control shows for `intent` when the daemon
+ *  replied ok with no text of its own: the phrase to say, verbatim from
+ *  MODEL_SWAP_BUTTON_PHRASES, plus MODEL_TIER_SPOKEN_ONLY_NOTE. Speaking is the
+ *  ALTERNATIVE route — and the only one left against a daemon too old to know
+ *  the intent — not the reason the control acts, because it does act.
  *  PURE — no I/O, nothing sent. */
 export function modelTierSpokenInstruction(intent: ModelSwapIntent): string {
   return `Say "${MODEL_SWAP_BUTTON_PHRASES[intent]}" out loud. ${MODEL_TIER_SPOKEN_ONLY_NOTE}`;
 }
 
 /**
- * The EXACT spoken phrases the voice-clone control sends over the command channel
- * as `{cmd:"ask", text}` — interpreted by the daemon's CONSENT-GATED clone machine
- * (daemon/src/voiceclone.rs). They are anchored to that classifier so a phrase edit
- * on either side fails CI:
+ * The EXACT phrases the voice-clone panel QUOTES for the user to SAY. THE PANEL
+ * SENDS NOTHING — a565029 removed the `{cmd:"ask", text}` sends because the
+ * consent machine (daemon/src/voiceclone.rs) is reached only from `route()`, so
+ * a click pushed the bare confirmation and the forget phrase into
+ * `complete_with_tools`, which holds forget-shaped tools of its own, while the
+ * panel reported success. This doc block went on describing that send flow
+ * afterwards — the retracted-rule defect the sends themselves were fixed for,
+ * and `reachability.test.ts` already asserts the section contains no
+ * `sendCommand(`. The phrases stay anchored to the classifier so a phrase edit
+ * on either side still fails CI:
  *   - `propose`  -> `voiceclone::classify_intent` must return `CloneIntent::Clone`,
  *     which PARKS `CloneState::Pending` and SPEAKS the honest consent prompt. NOTHING
  *     leaves the device on this turn — the daemon is now AWAITING a spoken yes.
  *   - `confirm`  -> on the NEXT turn `voiceclone::is_confirmation` must read this as a
- *     clear YES, so the parked clone proceeds (the sample is uploaded). The HUD never
- *     uploads itself and adds NO new authority — it asks the daemon, exactly like the
- *     voice path, and the two-step (propose, then a SEPARATE explicit confirm) mirrors
- *     the daemon's own cross-turn consent gate so a single click can never upload.
+ *     clear YES, so the parked clone proceeds (the sample is uploaded). BOTH turns are
+ *     SPOKEN. There is no click that reaches either, so the upload step cannot be
+ *     triggered from this HUD at all — which is stronger than the 'a single click can
+ *     never upload' this bullet used to claim for a two-step click flow that no longer
+ *     exists.
  *   - `forget`  -> `voiceclone::classify_intent` must return `CloneIntent::Forget`,
  *     which drops the stored clone slot (back to Kokoro / the existing voice).
  */
@@ -1047,28 +1064,28 @@ function ModelTierSection({ modelTier }: { modelTier: ModelTierStatus }) {
           <button
             className="icon-btn"
             onClick={() => swap("heavy")}
-            title="Pin the cloud HEAVY model (most capable; needs a cloud key) — spoken only; shows the phrase to say"
+            title="Pin the cloud HEAVY model (most capable; needs a cloud key) — sets the runtime override now; the line below is the daemon's own ack"
           >
             HEAVY
           </button>
           <button
             className="icon-btn"
             onClick={() => swap("fast")}
-            title="Pin the cloud FAST model (quick + cheap; needs a cloud key) — spoken only; shows the phrase to say"
+            title="Pin the cloud FAST model (quick + cheap; needs a cloud key) — sets the runtime override now; the line below is the daemon's own ack"
           >
             FAST
           </button>
           <button
             className="icon-btn"
             onClick={() => swap("local")}
-            title="Pin the on-device model — NO cloud call (private), capability-limited — spoken only; shows the phrase to say"
+            title="Pin the on-device model — NO cloud call (private), capability-limited — sets the runtime override now; the line below is the daemon's own ack"
           >
             LOCAL
           </button>
           <button
             className="icon-btn"
             onClick={() => swap("auto")}
-            title="Clear the override — AUTO picks per turn by a heuristic (the config default resumes) — spoken only; shows the phrase to say"
+            title="Clear the override — AUTO picks per turn by a heuristic (the config default resumes) — clears the override now; the line below is the daemon's own ack"
           >
             AUTO
           </button>
@@ -1095,13 +1112,16 @@ function ModelTierSection({ modelTier }: { modelTier: ModelTierStatus }) {
             capable tier. This is a routing HEURISTIC, not a measured accuracy.
           </li>
         </ul>
-        The controls above do NOT set the override — they show the phrase to say.
-        A SPOKEN swap sets a RUNTIME override (it resets to the{" "}
+        The controls above SET the override: the daemon handles the tier swap on
+        the command channel, calling the same <code>set_override</code> the spoken
+        path calls and keeping the same guest rail, and the line under the buttons
+        is the daemon&rsquo;s own ack — never a fabricated success. A swap, clicked
+        or spoken, sets a RUNTIME override (it resets to the{" "}
         <code>conversation_route</code> default on restart); say{" "}
         <b>&quot;{MODEL_SWAP_BUTTON_PHRASES.heavy}&quot;</b>,{" "}
         <b>&quot;{MODEL_SWAP_BUTTON_PHRASES.fast}&quot;</b>,{" "}
         <b>&quot;{MODEL_SWAP_BUTTON_PHRASES.local}&quot;</b>, or{" "}
-        <b>&quot;{MODEL_SWAP_BUTTON_PHRASES.auto}&quot;</b> out loud to change it.
+        <b>&quot;{MODEL_SWAP_BUTTON_PHRASES.auto}&quot;</b> out loud instead of clicking.
         Going LOCAL/offline is
         a REAL privacy choice — the utterance and content stay on-device with no
         cloud call — but the on-device model is capability-limited and is NOT a

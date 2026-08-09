@@ -298,8 +298,31 @@ function Proposal({
       </div>
       <div className="sh-row">
         <span className="sh-k">VALIDATION</span>
-        <span className="sh-v sh-pass">PASSED — cargo check + full cargo test</span>
+        <span className="sh-v sh-pass">
+          PASSED — check + clippy -D warnings + test + mutation probe
+        </span>
       </div>
+      {/* VALIDATED IS NOT RESPONSIVE. The four staged gates never look at the
+          diagnosis, so a patch that fixes something else entirely arrives here
+          with the green PASSED row above. This row is the only place the person
+          about to click ACCEPT can see whether the patch is even about the fault
+          that triggered it. Advisory — the daemon does not reject on it. */}
+      {proposal.responsiveness ? (
+        <div className="sh-row">
+          <span className="sh-k">ADDRESSES</span>
+          <span
+            className={
+              proposal.responsiveness === "UNRELATED"
+                ? "sh-v sh-warn"
+                : "sh-v"
+            }
+          >
+            {proposal.responsiveness === "UNRELATED"
+              ? "UNRELATED — touches neither the cited file nor the implicated subsystem"
+              : proposal.responsiveness}
+          </span>
+        </div>
+      ) : null}
 
       <ConfidenceGauge confidence={proposal.confidence} />
 

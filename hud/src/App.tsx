@@ -292,24 +292,16 @@ export default function App() {
   // user.model tier, DROPS it, and writes a suppression tombstone the consolidation
   // pass never re-derives past — reduce-only, and structurally unable to touch a
   // private agent.* note. The refreshed mirror.belief frame updates this panel.
-  // CONTEST IS SPOKEN-ONLY, and this button no longer pretends otherwise.
+  // WHAT WENT WRONG (the original defect, kept because it is the class):
+  // this sent {cmd:"ask", text:`that's wrong about ${subject}`}, and
+  // "that's wrong about X" was mapped to `user_model::contest_belief` ONLY by the
+  // ROUTER — which `LivePipeline::ask` bypasses, going straight to
+  // `complete_with_tools`. There was no contest tool for the model to reach
+  // either: the user_model family is query / correct / forget, and
+  // `user_model_correct` OVERRIDES an observation while contest DROPS it and
+  // writes a suppression tombstone. Different operations, so the click did
+  // nothing reliable and the belief the user pointed at was not contested.
   //
-  // WHAT WENT WRONG: it sent {cmd:"ask", text:`that's wrong about ${subject}`}.
-  // "that's wrong about X" is mapped to `user_model::contest_belief` by the
-  // ROUTER (router.rs:1263) — and `LivePipeline::ask` bypasses the router
-  // entirely, going straight to `complete_with_tools`. There is no contest tool
-  // for the model to reach either: the user_model family is query / correct /
-  // forget. `user_model_correct` OVERRIDES an observation; contest DROPS the
-  // belief and writes a suppression tombstone. Different operations.
-  //
-  // So the click did nothing reliable. At best the model chose `user_model_correct`
-  // — the wrong operation, silently — and at worst it just talked about it. Either
-  // way the belief the user pointed at was not contested.
-  //
-  // Not routed here deliberately: contest is DESTRUCTIVE (drop + permanent
-  // suppression), and the spoken path is where the router's gates live. Making it
-  // clickable would move a destructive op off the gated path, which is a decision
-  // for the owner, not a wiring fix.
   // The daemon handles this intent on the command channel now (LivePipeline::ask,
   // before any cloud call), calling the same `user_model::contest_belief` the
   // router calls and keeping the same guest rail. So the click drops the belief

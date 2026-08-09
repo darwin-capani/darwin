@@ -19,8 +19,9 @@
 //!   * HONESTY: a surface that needs a privilege the no-sudo daemon lacks (login
 //!     items need Automation TCC) degrades to an explicit SKIP — never a
 //!     fabricated empty list;
-//!   * DARWIN's own two launch items (`com.darwin.daemon` / `com.darwin.inference`)
-//!     are LABELED as self and are NEVER alarmed on.
+//!   * DARWIN's own three launch items (`com.darwin.daemon` / `com.darwin.inference`
+//!     / `com.darwin.hud` — exactly what `scripts/install_boot.sh` installs) are
+//!     LABELED as self and are NEVER alarmed on.
 //!
 //! STRICTLY READ-ONLY: no file writes to user data, no kills, no unloads, no
 //! remediation — not even a gated one. It reports where the user's autostart
@@ -68,7 +69,18 @@ const LOGIN_ITEMS_SCRIPT: &str =
     "tell application \"System Events\" to get the name of every login item";
 
 /// DARWIN's own launch items — labeled as self, never alarmed on.
-const SELF_LABELS: &[&str] = &["com.darwin.daemon", "com.darwin.inference"];
+///
+/// ONE RULE, TWO PLACES. `scripts/install_boot.sh` is the installer's own
+/// `LABELS=(...)` array and is the single source of truth for which LaunchAgents
+/// DARWIN installs; this list must name the same three, or the sentinel alarms on
+/// its own product. It shipped naming only two: `com.darwin.hud` was added to the
+/// installer with HUD autostart and never added here, so DARWIN's OWN HUD agent was
+/// inventoried as a third-party autostart item, assessed by `codesign`, and reported
+/// as a NEW (and, on an ad-hoc-signed build, `[UNSIGNED]`) persistence finding —
+/// contradicting this module's stated contract in as many words.
+/// `self_labels_match_the_installers_launchagents` pins the two together.
+const SELF_LABELS: &[&str] =
+    &["com.darwin.daemon", "com.darwin.inference", "com.darwin.hud"];
 
 // ---------------------------------------------------------------------------
 // Surfaces + records
@@ -1403,8 +1415,128 @@ mod tests {
     fn self_label_matches_only_darwin_own_items() {
         assert!(is_self_label("com.darwin.daemon"));
         assert!(is_self_label("com.darwin.inference"));
+        assert!(is_self_label("com.darwin.hud"));
         assert!(!is_self_label("com.darwin.evil"));
         assert!(!is_self_label("com.example.agent"));
+    }
+
+    /// THE SENTINEL MUST NOT ALARM ON ITS OWN PRODUCT.
+    ///
+    /// `SELF_LABELS` and `scripts/install_boot.sh`'s `LABELS=(...)` are the same rule
+    /// written twice: "which LaunchAgents are DARWIN's own". The installer array is
+    /// the source of truth (it is what actually gets bootstrapped); this list is what
+    /// the sentinel excludes from the anomaly diff and from `codesign` assessment.
+    ///
+    /// They HAD drifted. The installer bootstraps three agents — inference, daemon and
+    /// (since HUD autostart) `com.darwin.hud` — while `SELF_LABELS` still named two.
+    /// So DARWIN's own HUD LaunchAgent was inventoried as a third-party autostart
+    /// item, `codesign`-assessed, and surfaced through `security.persistence` + the
+    /// posture readout as a NEW (and, on an ad-hoc-signed build, `[UNSIGNED]`)
+    /// persistence finding. A security sentinel whose loudest recurring alarm is
+    /// itself teaches its operator to ignore it.
+    ///
+    /// DIRECTION OF DANGER, both ways: a label MISSING here is a permanent false
+    /// alarm on self; a label here that the installer does NOT install is a blind
+    /// spot — anything that plants an agent under that name is silently excused.
+    /// So this pins SET EQUALITY, not containment.
+    #[test]
+    fn self_labels_match_the_installers_launchagents() {
+        let installer = include_str!("../../scripts/install_boot.sh");
+        // Bound the window at BOTH ends: the `LABELS=(` assignment through its
+        // closing paren. Reading "everything after LABELS=(" would run on into the
+        // rest of the script and scoop up every quoted string in it.
+        let open = installer
+            .find("\nLABELS=(")
+            .expect("install_boot.sh must declare LABELS=( ... ) — re-point this guard");
+        let rest = &installer[open + "\nLABELS=(".len()..];
+        let close = rest
+            .find(')')
+            .expect("install_boot.sh's LABELS=( ... ) is not closed on one line");
+        let mut from_installer: Vec<String> = rest[..close]
+            .split('"')
+            .filter(|s| s.starts_with("com.darwin."))
+            .map(str::to_string)
+            .collect();
+        from_installer.sort();
+        from_installer.dedup();
+        assert!(
+            from_installer.len() >= 2,
+            "the installer window matched almost nothing ({from_installer:?}) — the \
+             guard is bound too tightly to prove anything"
+        );
+
+        let mut ours: Vec<String> = SELF_LABELS.iter().map(|s| s.to_string()).collect();
+        ours.sort();
+        assert_eq!(
+            ours, from_installer,
+            "SELF_LABELS and scripts/install_boot.sh's LABELS must name the SAME \
+             LaunchAgents: a missing label makes the persistence sentinel alarm on \
+             DARWIN itself, an extra one is a blind spot for anything planted under \
+             that name"
+        );
+        // ...and every one of them really is excused by the live predicate.
+        for label in &from_installer {
+            assert!(is_self_label(label), "{label} is installed by DARWIN but not self-labeled");
+        }
+    }
+
+    /// THE PROSE IS THE SAME RULE, WRITTEN THREE MORE TIMES.
+    ///
+    /// `SELF_LABELS` is not stated twice, it is stated FIVE times: the const, this
+    /// module's header, the `[persistence]` section contract in `config.rs`, the
+    /// sentinel's spawn-site comment in `main.rs`, and the shipped
+    /// `config/darwin.toml` an operator actually reads. When `com.darwin.hud` was
+    /// added to the installer, all five went stale together; fixing the const and
+    /// one header leaves three documents still promising that only two agents are
+    /// excused — which is precisely how the operator concludes a `com.darwin.hud`
+    /// row in `security.persistence` is a real finding.
+    ///
+    /// So derive the COUNT WORD from the live table and refuse any other one. The
+    /// wrong words are built with `format!` rather than written out, so this guard
+    /// cannot self-match on its own source (it include_str!s the file it lives in).
+    #[test]
+    fn every_doc_copy_of_the_self_label_count_agrees_with_the_table() {
+        let expected = match SELF_LABELS.len() {
+            1 => "one",
+            2 => "two",
+            3 => "three",
+            4 => "four",
+            5 => "five",
+            n => panic!("SELF_LABELS now has {n} entries — extend this guard's number words"),
+        };
+        let sites: [(&str, &str); 4] = [
+            ("daemon/src/persistence.rs", include_str!("persistence.rs")),
+            ("daemon/src/config.rs", include_str!("config.rs")),
+            ("daemon/src/main.rs", include_str!("main.rs")),
+            ("config/darwin.toml", include_str!("../../config/darwin.toml")),
+        ];
+        let mut stated = 0usize;
+        let right = format!("own {expected} launch items");
+        for (name, src) in sites {
+            for wrong in ["one", "two", "three", "four", "five"] {
+                if wrong == expected {
+                    continue;
+                }
+                let phrase = format!("own {wrong} launch items");
+                assert!(
+                    !src.contains(&phrase),
+                    "{name} still says \"{phrase}\" but SELF_LABELS names {} — a reader \
+                     of that document will treat DARWIN's own agent as a third-party \
+                     persistence finding",
+                    SELF_LABELS.len()
+                );
+            }
+            if src.contains(&right) {
+                stated += 1;
+            }
+        }
+        // Not vacuous: the phrase this guard polices must actually be in use, or a
+        // future rewording would silence it instead of failing it.
+        assert!(
+            stated >= 3,
+            "only {stated} document(s) state the launch-item count in the form this \
+             guard checks — reword the guard, do not let it go quiet"
+        );
     }
 
     #[test]

@@ -338,6 +338,70 @@ pub(crate) fn synthetic_weights(dec_bias: f32) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// THE WEIGHT LAYOUT IS ONE CONTRACT WRITTEN IN TWO LANGUAGES.
+    ///
+    /// `inference/coreml_vad.py::NATIVE_TENSORS` WRITES the flat weights file and
+    /// [`WEIGHT_SPEC`] READS it. The module header says the two "MUST stay in
+    /// lockstep"; nothing enforced it, and the failure is not loud. The loader
+    /// validates per-tensor lengths and the exact total, so a shape change is caught
+    /// — but a REORDER of two same-length tensors (`lstm_wih`/`lstm_whh`,
+    /// `enc1_b`/`enc2_b`, `enc0_b`/`enc3_b`) passes every one of those checks and
+    /// loads a model built from the wrong weights. The VAD then scores speech as
+    /// noise with no error anywhere: the capture loop simply stops hearing.
+    ///
+    /// So compare NAME AND ELEMENT COUNT IN FILE ORDER, not just the total.
+    #[test]
+    fn the_weight_spec_matches_the_python_exporters_tensor_table() {
+        let py = include_str!("../../inference/coreml_vad.py");
+        // Bound the table at BOTH ends — from the assignment to the line that closes
+        // it. Taking "everything after NATIVE_TENSORS" would run into the functions
+        // below and pick up every tuple in the file.
+        let at = py
+            .find("\nNATIVE_TENSORS = (")
+            .expect("coreml_vad.py's NATIVE_TENSORS moved — re-point this guard");
+        let rest = &py[at..];
+        let end = rest
+            .find("\n)\n")
+            .expect("NATIVE_TENSORS is not closed by a lone `)` line");
+        let table = &rest[..end];
+
+        // ("name", (d0, d1, ...)) -> (name, product of dims).
+        let mut theirs: Vec<(String, usize)> = Vec::new();
+        for entry in table.split("(\"").skip(1) {
+            let (name, after) = entry.split_once('"').expect("unterminated tensor name");
+            let dims_open = after.find('(').expect("tensor entry has no shape tuple");
+            let dims_close = after[dims_open..].find(')').expect("unterminated shape tuple");
+            let n: usize = after[dims_open + 1..dims_open + dims_close]
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse::<usize>().expect("non-integer tensor dimension"))
+                .product();
+            theirs.push((name.to_string(), n));
+        }
+        assert!(
+            theirs.len() > 10,
+            "parsed only {} tensors out of coreml_vad.py — the window is bound too \
+             tightly to prove anything",
+            theirs.len()
+        );
+
+        let ours: Vec<(String, usize)> =
+            WEIGHT_SPEC.iter().map(|(n, c)| ((*n).to_string(), *c)).collect();
+        assert_eq!(
+            ours, theirs,
+            "WEIGHT_SPEC and coreml_vad.NATIVE_TENSORS must agree on NAME and ELEMENT \
+             COUNT in FILE ORDER — a same-length reorder passes every length check the \
+             loader makes and yields a silently wrong VAD"
+        );
+        // The magic byte string is part of the same contract.
+        assert!(
+            py.contains(&format!("NATIVE_WEIGHTS_MAGIC = b\"{}\"", "DVADRS1\\n")),
+            "the exporter's file magic must match this loader's MAGIC"
+        );
+        assert_eq!(MAGIC, b"DVADRS1\n");
+    }
+
     #[test]
     fn parse_rejects_malformed_files() {
         assert!(SileroModel::parse(b"short").is_err(), "too short");

@@ -153,11 +153,9 @@ pub fn plan_enqueue(
     enqueued: &str,
 ) -> Option<Vec<OvernightTask>> {
     if tasks.len() >= MAX_QUEUE {
-        if let Some(pos) = tasks.iter().position(|t| t.status != TaskStatus::Queued) {
-            tasks.remove(pos);
-        } else {
-            return None; // all queued, at cap -> refuse rather than grow
-        }
+        // `?`: all queued and at cap -> refuse rather than grow.
+        let pos = tasks.iter().position(|t| t.status != TaskStatus::Queued)?;
+        tasks.remove(pos);
     }
     tasks.push(OvernightTask {
         id: derive_id(prompt, enqueued),

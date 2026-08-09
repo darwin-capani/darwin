@@ -298,9 +298,16 @@ fn sanitize_trailer_value(s: &str) -> String {
 
 /// Whether a value looks like a secret/token (a known secret prefix, an inline
 /// `key=`/`token=` assignment, or a long mixed alphanumeric run). Conservative +
-/// pure — the change queue's trailers must never carry one. Mirrors the shape of
-/// [`crate::optimize`]'s redactor's secret rule, kept local (no cross-module
-/// private coupling).
+/// pure — the change queue's trailers must never carry one.
+///
+/// The PREFIX half is [`crate::optimize::SECRET_PREFIXES`], the redactor's own
+/// table, read directly rather than copied. It used to be a hand-copied local list
+/// and it had already drifted two entries short (`xoxa-`, `asia`), which is a
+/// silent leak: `is_secret_free` answered TRUE for a Slack app token and for an AWS
+/// TEMPORARY session key, and the trailer carried the credential verbatim. The
+/// length/entropy arm below stays local — it is deliberately stricter here (24 vs
+/// the redactor's 20) because a trailer is short, structured text where a long
+/// mixed run is far more likely to be a real token than prose.
 fn looks_secretish(v: &str) -> bool {
     let lower = v.to_ascii_lowercase();
     for key in ["api_key=", "apikey=", "api-key=", "token=", "secret=", "password=", "bearer "] {
@@ -310,9 +317,10 @@ fn looks_secretish(v: &str) -> bool {
     }
     for tok in v.split_whitespace() {
         let l = tok.to_ascii_lowercase();
-        const PREFIXES: &[&str] =
-            &["sk-", "pk-", "rk-", "ghp_", "gho_", "ghs_", "github_pat_", "xoxb-", "xoxp-", "akia"];
-        if PREFIXES.iter().any(|p| l.starts_with(p) && tok.len() >= p.len() + 8) {
+        if crate::optimize::SECRET_PREFIXES
+            .iter()
+            .any(|p| l.starts_with(p) && tok.len() >= p.len() + 8)
+        {
             return true;
         }
         // A long, high-entropy-ish run mixing letters and digits.
@@ -1224,6 +1232,48 @@ mod tests {
         );
         // A long non-secret model id (all letters/dashes, no digits) is fine.
         assert!(Provenance::new("steve", "claude-opus-4-8", "1700", "abcdef0123456789").is_secret_free());
+    }
+
+    /// ONE PREFIX TABLE, TWO CALLERS — proved by exercising EVERY entry here.
+    ///
+    /// This guard exists because the two copies had already drifted. `changeq` kept
+    /// a hand-copied list missing `xoxa-` (a Slack app token) and `asia` (an AWS
+    /// TEMPORARY session-key id), so `is_secret_free` answered TRUE for both and the
+    /// credential was written verbatim into a queued change's provenance trailer —
+    /// while `optimize`'s redactor, one module away, would have caught either.
+    ///
+    /// Looping over `optimize::SECRET_PREFIXES` rather than a literal list is the
+    /// point: a prefix added to the table is covered here the day it lands, and a
+    /// re-copied local list fails the moment the two disagree.
+    #[test]
+    fn every_optimize_secret_prefix_is_also_caught_by_the_changeq_trailer_guard() {
+        let table = crate::optimize::SECRET_PREFIXES;
+        assert!(table.len() >= 10, "the shared prefix table shrank unexpectedly: {table:?}");
+        // The two entries the drifted local copy was missing, named so a future
+        // deletion from the table reads as a deliberate act, not an accident.
+        assert!(table.contains(&"xoxa-"), "the Slack app-token prefix must be in the table");
+        assert!(table.contains(&"asia"), "the AWS TEMPORARY access-key prefix must be in the table");
+
+        for p in table {
+            // A realistic token: the prefix plus a >=8-char tail (the length gate).
+            let token = format!("{p}0123456789ABCDEF");
+            assert!(
+                looks_secretish(&token),
+                "{p}… must be caught by the trailer guard, or a queued change carries \
+                 the credential verbatim"
+            );
+            assert!(
+                !Provenance::new("steve", "opus", &token, "h").is_secret_free(),
+                "a {p}-shaped run id must never read as secret-free"
+            );
+            // ...and the redactor's own rule agrees, which is what "one table" means.
+            assert!(
+                crate::optimize::redact(&format!("value {token} here")).contains("[redacted]"),
+                "the redactor must also treat {p}… as a secret"
+            );
+        }
+        // The guard is not a rubber stamp: ordinary prose is still let through.
+        assert!(!looks_secretish("claude-opus-4-8 forged by steve"));
     }
 
     #[test]

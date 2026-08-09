@@ -448,10 +448,8 @@ fn run(mut rx: mpsc::UnboundedReceiver<PlayCmd>) {
 /// shared device sink — only a second Player is created.
 fn start_music(output: &mut Option<DeviceOutput>, bytes: Vec<u8>) -> Option<Player> {
     if output.is_none() {
-        match open_device() {
-            Some(dev) => *output = Some(dev),
-            None => return None, // open_device already logged the reason
-        }
+        // `?`: open_device already logged the reason it failed.
+        *output = Some(open_device()?);
     }
     let device = output.as_ref().expect("output set above");
     // `connect_new` is infallible in rodio 0.22; the fallible step is opening
@@ -481,10 +479,8 @@ fn ensure_sink<'a>(
     sink: &'a mut Option<Player>,
 ) -> Option<&'a Player> {
     if output.is_none() {
-        match open_device() {
-            Some(dev) => *output = Some(dev),
-            None => return None, // open_device already logged the reason
-        }
+        // `?`: open_device already logged the reason it failed.
+        *output = Some(open_device()?);
     }
     if sink.is_none() {
         let device = output.as_ref().expect("output set above");

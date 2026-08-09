@@ -58,7 +58,9 @@ pub struct Config {
     /// LaunchDaemons, login items, cron, third-party kexts) + each backing binary's
     /// signing/notarization + the Gatekeeper switch via FIXED-ARG bounded
     /// subprocesses, keeps a baseline, and flags what is NEW / REMOVED / newly
-    /// UNSIGNED. DARWIN's own two launch items are labeled self, never alarmed on. It
+    /// UNSIGNED. DARWIN's own three launch items (daemon / inference / hud —
+    /// exactly what scripts/install_boot.sh installs) are labeled self, never
+    /// alarmed on. It
     /// emits `security.persistence` for the HUD/posture and takes NO action —
     /// remediating a finding would be consequential and is out of scope. Honest SKIP
     /// when a read needs a privilege the no-sudo daemon lacks (login items ->
@@ -967,9 +969,17 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     ("screen_context", &["enabled", "interval_secs", "cap"]),
     // [lumen] — LUMEN: the accessibility SCREEN NARRATOR + hands-free VOICE
     // NAVIGATION (lumen.rs).
-    //   - `narrate` (SHIPS OFF): CONTINUOUS focus-change narration is EXPLICIT
-    //     opt-in; off is a strict no-op (Lumen speaks nothing on its own). The
-    //     explicit "read me the screen" request path is unaffected.
+    //   - `narrate` (SHIPS OFF): it INSTALLS THE SETTING AND CHANGES NOTHING.
+    //     This note used to promise "CONTINUOUS focus-change narration" from
+    //     turning it on. lumen.rs's own header says the opposite in as many words:
+    //     the gate's only consumer, `narrate_on_focus_change`, has ZERO call sites
+    //     outside that file's tests, and there is no focus-change source in the
+    //     daemon to call it from — so ON emits a `lumen.configured` frame and
+    //     Lumen still speaks nothing. Two docs, one flag, opposite claims, and the
+    //     settings whitelist is the one a settings reviewer reads. Wiring it needs
+    //     a focus-change event source AND a speech call at the vision relay;
+    //     neither exists. The explicit "read me the screen" request path is a
+    //     DIFFERENT path (router.rs) and is unaffected either way.
     //   - `max_controls` (DEFAULT 20, floored >= 1): the hard bound on how many
     //     on-screen controls one readout narrates / offers for selection.
     // Narration is READ-ONLY; a voice action only SELECTS the ONE target and hands
@@ -5255,6 +5265,45 @@ mod tests {
         );
     }
 
+    /// A CONFIG NOTE MUST NOT PROMISE WHAT THE FEATURE DOES NOT DO — and the two
+    /// halves must stay pinned together, because one of them will be edited alone.
+    ///
+    /// lumen.rs reports the narration half UNWIRED; the settings whitelist promised
+    /// continuous narration from the same flag. This holds them in parity from the
+    /// SOURCE rather than from a promise: while lumen.rs still says the feature has
+    /// no caller, the whitelist note must say the flag changes nothing — and the
+    /// day someone wires it, lumen.rs's own banner goes and this assertion stops
+    /// demanding the disclaimer.
+    ///
+    /// The window is bounded at BOTH ends (the [lumen] header to the [pasteboard]
+    /// header) so it cannot drift into a neighbouring section, and it asserts it
+    /// actually captured the key it documents before testing the claim.
+    #[test]
+    fn the_lumen_whitelist_note_agrees_with_lumen_on_whether_narration_is_wired() {
+        let unwired = include_str!("lumen.rs").contains("NOT WIRED TO ANY CALLER TODAY");
+        let cfg = include_str!("config.rs");
+        let start = cfg
+            .find("    // [lumen] — LUMEN: the accessibility SCREEN NARRATOR")
+            .expect("the [lumen] whitelist note must exist");
+        let rest = &cfg[start..];
+        let end = rest
+            .find("    // [pasteboard] — SEMANTIC PASTEBOARD")
+            .expect("the [lumen] note must be bounded by the next section's header");
+        let note = &rest[..end];
+        assert!(
+            note.contains("`narrate` (SHIPS OFF)"),
+            "the window missed the key it documents — a window that captures nothing \
+             would pass the claim check vacuously:\n{note}"
+        );
+        if unwired {
+            assert!(
+                note.contains("INSTALLS THE SETTING AND CHANGES NOTHING"),
+                "lumen.rs still reports narration UNWIRED, so the settings note must not \
+                 promise narration:\n{note}"
+            );
+        }
+    }
+
     // --- #37 SPECULATIVE DECODING + #39 QUANTIZATION defaults (OFF/neutral) ----
 
     /// #37 + #39: speculative SHIPS OFF and `draft_model` ships "", because our own
@@ -5609,6 +5658,192 @@ mod tests {
             defaults.router.cloud_confidence_threshold
         );
         assert_eq!(cfg.router.conversation_route, defaults.router.conversation_route);
+    }
+
+    /// WHOLE-FILE LOCKSTEP — every key, not a hand-picked sixteen.
+    ///
+    /// config/darwin.toml's header promises the daemon "falls back to these EXACT
+    /// values as hardcoded defaults if this file is missing". The sibling test above
+    /// pins ~16 fields BY NAME and says so honestly: "drift in any other shipped key
+    /// does NOT fail this test". That gap is how `[aperture] poll_interval_secs = 5`
+    /// shipped against a compiled default of 20 — deleting the file quietly changed
+    /// the sampling cadence of a PRIVACY-SENSITIVE surface by 4x — and it was found
+    /// by hand, not by a gate. A hand-maintained list of what to compare is itself
+    /// the same rule written twice.
+    ///
+    /// `Config` is Deserialize-only, so there is no `Serialize` round-trip — but it
+    /// derives `Debug`, and `{:#?}` renders EVERY field of EVERY section. Comparing
+    /// the two renderings pins all ~220 shipped scalars in one assertion, and a new
+    /// section is covered the day it is added rather than when someone remembers.
+    ///
+    /// THE THREE EXEMPTIONS ARE DELIBERATE AND STATED: [vision].model,
+    /// [vision].ocr_model and [image].model name an installer-BUNDLED checkpoint
+    /// while the compiled defaults are empty (documented at their Default impls —
+    /// the daemon must not claim a model it did not download). They are normalized
+    /// away here, and each one is first PROVEN to still be a real override, so this
+    /// exemption cannot quietly become a blanket.
+    #[test]
+    fn every_shipped_config_value_matches_its_compiled_default() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("config")
+            .join("darwin.toml");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        let (mut cfg, issues) = Config::parse(&raw);
+        assert!(issues.is_empty(), "shipped config has diagnostics: {issues:?}");
+        let defaults = Config::default();
+
+        // Each exemption must still BE one: a bundled id on the file side, empty on
+        // the compiled side. If that ever stops being true the normalization below is
+        // hiding a real comparison and these three lines must be deleted.
+        for (name, shipped, compiled) in [
+            ("vision.model", &cfg.vision.model, &defaults.vision.model),
+            ("vision.ocr_model", &cfg.vision.ocr_model, &defaults.vision.ocr_model),
+            ("image.model", &cfg.image.model, &defaults.image.model),
+        ] {
+            assert!(
+                compiled.is_empty() && !shipped.is_empty(),
+                "{name} is exempted as an installer-bundled override, but it no longer \
+                 looks like one (shipped {shipped:?}, compiled {compiled:?}) — delete \
+                 the exemption instead of widening it"
+            );
+        }
+        cfg.vision.model.clone_from(&defaults.vision.model);
+        cfg.vision.ocr_model.clone_from(&defaults.vision.ocr_model);
+        cfg.image.model.clone_from(&defaults.image.model);
+
+        let shipped_render = format!("{cfg:#?}");
+        let default_render = format!("{defaults:#?}");
+        if shipped_render != default_render {
+            // Name the offending lines rather than dumping two 200-line structs.
+            let diff: Vec<String> = shipped_render
+                .lines()
+                .zip(default_render.lines())
+                .filter(|(a, b)| a != b)
+                .map(|(a, b)| format!("  shipped: {} | default: {}", a.trim(), b.trim()))
+                .take(20)
+                .collect();
+            panic!(
+                "config/darwin.toml has drifted from the compiled defaults it promises \
+                 to reproduce — {} differing field(s):\n{}",
+                shipped_render.lines().zip(default_render.lines()).filter(|(a, b)| a != b).count(),
+                diff.join("\n")
+            );
+        }
+        // The comparison is only worth anything if it actually looked at the whole
+        // struct: a `{:#?}` that rendered nothing would compare equal trivially.
+        assert!(
+            shipped_render.lines().count() > 200,
+            "the Debug rendering is implausibly short ({} lines) — this guard is not \
+             comparing what it claims to",
+            shipped_render.lines().count()
+        );
+    }
+
+    /// Every `"..."` literal inside the first `open`..`close` window after `anchor`.
+    /// Used by the cross-language lockstep guards below. Bounded at BOTH ends on
+    /// purpose: slicing "everything after the anchor" runs on into unrelated code and
+    /// scoops up literals that were never part of the list.
+    fn literals_in_window<'a>(
+        src: &'a str,
+        anchor: &str,
+        open: char,
+        close: char,
+    ) -> Vec<&'a str> {
+        let at = src
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{anchor:?} moved — re-point this lockstep guard"));
+        let rest = &src[at..];
+        let o = rest
+            .find(open)
+            .unwrap_or_else(|| panic!("no {open:?} after {anchor:?}"));
+        let c = rest[o..]
+            .find(close)
+            .unwrap_or_else(|| panic!("no {close:?} closing {anchor:?}"));
+        rest[o..o + c].split('"').skip(1).step_by(2).collect()
+    }
+
+    /// THE QUANT ALLOW-LIST IS ONE RULE IN FOUR FILES.
+    ///
+    /// `InferenceConfig::ALLOWED_QUANT` (the daemon's parse-time validation),
+    /// `inference/server.py::ALLOWED_QUANT` (the server's `validate_quant`, which
+    /// RAISES), `hud/src-tauri/src/config_settings.rs` (the enum the Settings UI lets
+    /// the operator pick from) and `hud/src/core/events.ts::KNOWN_QUANTS` (the badge
+    /// tone) all encode "which quantization values are legal". Both comments already
+    /// say "MUST match" — nothing enforced it.
+    ///
+    /// Drift is silent in both directions: a value the daemon accepts but the server
+    /// rejects turns every model load into a raise the operator sees as an inference
+    /// outage; a value the server gained but the daemon still rejects is silently
+    /// rewritten to "auto", so the operator's chosen quantization is simply not the
+    /// one running. Read the other three files' literals and compare.
+    #[test]
+    fn the_quant_allow_list_agrees_across_the_daemon_server_and_hud() {
+        let ours: Vec<&str> = super::InferenceConfig::ALLOWED_QUANT.to_vec();
+        assert_eq!(ours.first(), Some(&"auto"), "\"auto\" must stay the neutral default");
+
+        let server = include_str!("../../inference/server.py");
+        let theirs = literals_in_window(server, "\nALLOWED_QUANT = (", '(', ')');
+        assert_eq!(
+            ours, theirs,
+            "daemon ALLOWED_QUANT and inference/server.py's must match: a value only \
+             the daemon allows becomes a server raise on every load; a value only the \
+             server allows is silently rewritten to \"auto\""
+        );
+
+        let tauri = include_str!("../../hud/src-tauri/src/config_settings.rs");
+        let hud_enum = literals_in_window(
+            tauri,
+            "Setting { section: \"inference\", key: \"quant\"",
+            '[',
+            ']',
+        );
+        assert_eq!(
+            ours, hud_enum,
+            "the HUD Settings enum for inference.quant must offer exactly the allowed \
+             values — a stale entry is a control that writes a config the daemon then \
+             rewrites to \"auto\" behind the operator's back"
+        );
+
+        let events = include_str!("../../hud/src/core/events.ts");
+        let mut badge = literals_in_window(events, "const KNOWN_QUANTS = new Set(", '[', ']');
+        let mut sorted = ours.clone();
+        badge.sort_unstable();
+        sorted.sort_unstable();
+        assert_eq!(
+            sorted, badge,
+            "hud KNOWN_QUANTS must cover exactly the allowed quants, or a legal quant \
+             renders as an unknown-value badge"
+        );
+    }
+
+    /// THE OPENER BANK IS ONE LIST IN THREE FILES, AND THE INDEX IS LOAD-BEARING.
+    ///
+    /// `inference/server.py` synthesizes `[speech].openers` to
+    /// `state/openers/opener-<idx>.wav` at preload; the daemon plays one the instant
+    /// an utterance ends and maps FILENAME INDEX back to its own list. So the shipped
+    /// file, the compiled `SpeechConfig::default()` and the server's
+    /// `DEFAULT_OPENERS` fallback must agree ELEMENT-WISE AND IN ORDER — not just as
+    /// sets. Both sides' comments say "must stay in lockstep"; nothing checked it.
+    ///
+    /// Drift is audible and wrong rather than merely absent: a reordered list makes
+    /// DARWIN speak a different acknowledgement than the one it believes it played,
+    /// and a shorter server list leaves a high index with no file at all — silence
+    /// where an opener was promised.
+    #[test]
+    fn the_opener_bank_agrees_between_the_daemon_and_the_inference_server() {
+        let ours = super::SpeechConfig::default().openers;
+        assert!(!ours.is_empty(), "the compiled opener bank must not be empty");
+
+        let server = include_str!("../../inference/server.py");
+        let theirs = literals_in_window(server, "\nDEFAULT_OPENERS = [", '[', ']');
+        assert_eq!(
+            ours, theirs,
+            "the opener bank must match inference/server.py's DEFAULT_OPENERS IN ORDER \
+             — the daemon plays opener-<idx>.wav by index, so a reorder makes DARWIN \
+             say something other than what it thinks it said"
+        );
     }
 
     /// CONTINUOUS SCREEN CONTEXT (#42): [screen_context] SHIPS ON (full-power
@@ -7276,13 +7511,25 @@ mod lifelog_switch_tests {
         let i = router
             .find("classify_lifelog_intent(text)")
             .expect("the lifelog dispatch moved; re-point this guard");
-        let window = &router[i..(i + 1200).min(router.len())];
-        assert!(
-            window.contains("!cfg.lifelog.enabled"),
-            "the life-log digest dispatches without consulting its master switch"
-        );
-        let gate = window.find("!cfg.lifelog.enabled").unwrap();
-        let build = window.find("build_digest").unwrap_or(window.len());
+        // BOUND THE WINDOW AT BOTH ENDS, AND REQUIRE BOTH NEEDLES. The window was a
+        // fixed 1200 chars; `build_digest(` sits ~1600 chars in, OUTSIDE it. So
+        // `find("build_digest").unwrap_or(window.len())` was ALWAYS window.len() and
+        // the order assertion below was a tautology in the shipped source — and worse,
+        // `unwrap_or` meant RENAMING the digest builder silently satisfied it.
+        // PROVED: renaming `build_digest` to `assemble_digest` left this test passing.
+        // The window now ends at the `}` that closes the life-log `if let` block at
+        // this fn's 4-space indent, and both needles are `expect`ed, never defaulted.
+        let rest = &router[i..];
+        let end = rest
+            .find("\n    }\n")
+            .expect("the life-log dispatch block must close at the fn's own indent");
+        let window = &rest[..end];
+        let gate = window
+            .find("!cfg.lifelog.enabled")
+            .expect("the life-log digest dispatches without consulting its master switch");
+        let build = window
+            .find("build_digest(")
+            .expect("the life-log dispatch no longer builds a digest; re-point this guard");
         assert!(
             gate < build,
             "the switch is checked AFTER the digest is built, which is not a gate"

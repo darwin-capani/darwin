@@ -492,6 +492,20 @@ mod tests {
         assert_eq!(VadMode::from_config_str("energy"), VadMode::Silero);
     }
 
+    /// A PARITY TEST THAT NEVER READ THE OTHER SIDE.
+    ///
+    /// This test is NAMED for a cross-language contract — `DEFAULT_PROB_THRESHOLD`
+    /// "MUST match `coreml_vad.DEFAULT_THRESHOLD`" — and pinned only THIS side to
+    /// the literal `0.5`. Change `DEFAULT_THRESHOLD` in `inference/coreml_vad.py`
+    /// and every assertion below still passes: the guard states the rule and cannot
+    /// enforce it, which is the same shape as the `apply_heal.sh` gate check that
+    /// self-matched on its own comments. Read the Python literal and compare.
+    ///
+    /// `NATIVE_WEIGHTS_NAME` is the second half of the same file contract and had
+    /// NO guard at all. Its drift is quieter and worse: the exporter writes one
+    /// filename, the daemon opens another, the weights are never found, and the
+    /// learned VAD silently stays on the RMS gate forever — a downgrade with no
+    /// error anywhere.
     #[test]
     fn default_prob_threshold_matches_the_python_backend() {
         // The learned VAD's operating point MUST match coreml_vad.DEFAULT_THRESHOLD
@@ -499,6 +513,44 @@ mod tests {
         assert_eq!(DEFAULT_PROB_THRESHOLD, 0.5);
         assert!(prob_is_voiced(0.6, DEFAULT_PROB_THRESHOLD));
         assert!(!prob_is_voiced(0.4, DEFAULT_PROB_THRESHOLD));
+
+        let py = include_str!("../../inference/coreml_vad.py");
+        // Bound the read at BOTH ends: the assignment through the end of its line.
+        // "everything after the name" would run into the rest of the module and the
+        // f-string at the bottom that also mentions this constant.
+        let at = py
+            .find("\nDEFAULT_THRESHOLD = ")
+            .expect("coreml_vad.py's DEFAULT_THRESHOLD moved — re-point this guard");
+        let rest = &py[at + "\nDEFAULT_THRESHOLD = ".len()..];
+        let line = &rest[..rest.find('\n').expect("unterminated DEFAULT_THRESHOLD line")];
+        let theirs: f32 = line
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("DEFAULT_THRESHOLD is not a float: {line:?} ({e})"));
+        assert_eq!(
+            DEFAULT_PROB_THRESHOLD, theirs,
+            "the learned VAD's operating point must match coreml_vad.DEFAULT_THRESHOLD \
+             — the committed eval was measured at ONE operating point, and a split \
+             threshold means the shipped gate is not the one that was evaluated"
+        );
+
+        // The weights FILENAME is the other half of the same flat-file contract and
+        // had no guard at all: a drift means the exporter writes a file the daemon
+        // never opens, and the learned VAD silently stays on the RMS gate.
+        let at = py
+            .find("\nNATIVE_WEIGHTS_NAME = ")
+            .expect("coreml_vad.py's NATIVE_WEIGHTS_NAME moved — re-point this guard");
+        let rest = &py[at..];
+        let name = rest
+            .split('"')
+            .nth(1)
+            .expect("NATIVE_WEIGHTS_NAME is not a double-quoted literal");
+        assert_eq!(
+            NATIVE_WEIGHTS_NAME, name,
+            "the daemon opens <root>/state/models/{NATIVE_WEIGHTS_NAME} but the \
+             exporter writes {name} — the learned VAD would never arm and would \
+             never say why"
+        );
     }
 
     #[test]
