@@ -19,7 +19,12 @@
 #     out-of-crate include_str!, as a miniature repo root under
 #     state/heal/apply-staging-<ts>/ — the crate lands at .../<ts>/daemon/,
 #   - apply patch.diff with /usr/bin/patch -p1 --batch (dry-run, then real),
-#   - cargo check && cargo test in the staged CRATE dir,
+#   - in the staged CRATE dir: cargo check, cargo clippy --all-targets -D warnings,
+#     cargo test, and then the MUTATION PROBE — the patch is split into its fix
+#     side and its test side (by `darwind --split-heal-diff`, the daemon's own
+#     code, so the two gates cannot drift), the fix is reverse-applied, and the
+#     suite must then FAIL. A test that passes without its fix proves nothing
+#     about the fix, and the apply is refused,
 #   - and ONLY on green apply the same patch to the real daemon/, rebuild the
 #     release binary, and clear the meta.heal_pending marker.
 # Any gate failure exits non-zero and leaves daemon/src untouched.
@@ -465,6 +470,72 @@ if ! (cd "$CRATE" && cargo test -- \
         --skip heal::tests::full_pipeline_via_mock_brain_rejects_when_no_candidate_validates); then
   fail "cargo test failed in staging — live daemon/src NOT modified"
 fi
+
+# STAGE 4: MUTATION PROOF. check+clippy+test prove the patch compiles, lints and
+# passes; none of them prove its new test would CATCH THE BUG COMING BACK. So the
+# patch is split into its FIX side and its TEST side, the fix is reverse-applied,
+# and the suite must now FAIL. If it still passes, the test does not demonstrate
+# the defect and this refuses to touch the live tree.
+#
+# The split is NOT reimplemented here. `darwind --split-heal-diff` is the very
+# function daemon/src/heal.rs uses, so the two gates cannot drift apart — a bash
+# copy of a hunk classifier would be that drift by construction. It runs from the
+# STAGED crate, which is already built by the gates above.
+SPLIT_DIR="$STAGING/mutation-split"
+rm -rf "$SPLIT_DIR"
+
+# The staged daemon MUST implement the probe. An older or mismatched source would
+# not know `--split-heal-diff` and would fall through to ORDINARY DAEMON STARTUP
+# inside this script — booting a daemon instead of answering, and skipping the
+# gate entirely. apply_forge.sh documents this exact hazard for its own gate flag.
+# Checked against the staged source, so it cannot hang waiting on a daemon.
+if ! grep -q -- '--split-heal-diff' "$CRATE/src/main.rs"; then
+  fail "the staged daemon does not implement the mutation probe — live daemon/src NOT modified"
+fi
+
+# ... and PROVE the binary actually discriminates before any verdict from it is
+# trusted, again mirroring apply_forge.sh. A gate that always answers the same
+# word is not a gate. One synthetic patch that IS separable and one that is NOT:
+# both answers must come back right, or this fails closed.
+PROBE="$STAGING/mutation-selfproof"
+rm -rf "$PROBE"; mkdir -p "$PROBE/src"
+printf 'fn a() {}\nfn b() {}\nfn c() {}\n#[cfg(test)]\nmod t {}\n' > "$PROBE/src/lib.rs"
+printf -- '--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-fn a() {}\n+fn a() { }\n@@ -5,1 +5,2 @@\n mod t {}\n+// t\n' > "$PROBE/sep.diff"
+printf -- '--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,5 +1,6 @@\n-fn a() {}\n+fn a() { }\n fn b() {}\n fn c() {}\n #[cfg(test)]\n mod t {}\n+// t\n' > "$PROBE/mixed.diff"
+SP_SEP=$(cd "$CRATE" && cargo run --quiet --bin darwind -- \
+      --split-heal-diff "$PROBE/sep.diff" "$PROBE" "$PROBE/out" 2>/dev/null || true)
+SP_MIX=$(cd "$CRATE" && cargo run --quiet --bin darwind -- \
+      --split-heal-diff "$PROBE/mixed.diff" "$PROBE" "$PROBE/out2" 2>/dev/null || true)
+if [ "$SP_SEP" != "PROVABLE" ] || [ "$SP_MIX" != "UNSPLITTABLE" ]; then
+  fail "the mutation probe does not discriminate (separable=>'$SP_SEP', mixed=>'$SP_MIX') — live daemon/src NOT modified"
+fi
+
+if ! SPLIT_VERDICT=$(cd "$CRATE" && cargo run --quiet --bin darwind -- \
+      --split-heal-diff "$PATCH_FILE" "$CRATE" "$SPLIT_DIR" 2>/dev/null); then
+  fail "could not split the patch for the mutation probe — live daemon/src NOT modified"
+fi
+
+case "$SPLIT_VERDICT" in
+  PROVABLE)
+    # Take the fix away, keep the test. The suite MUST fail now.
+    if ! confined_patch "$CRATE" -p1 --batch -R <"$SPLIT_DIR/fix.diff" >/dev/null 2>&1; then
+      echo "MUTATION: INCONCLUSIVE — the fix could not be lifted back out of the patch"
+    elif (cd "$CRATE" && cargo test -- \
+            --skip forge::tests::apply_forge_accepts_legit_multiline_manifest \
+            --skip forge::tests::apply_forge_refuses_multiline_overbroad_manifests \
+            --skip heal::tests::full_pipeline_via_mock_brain_rejects_when_no_candidate_validates \
+            >/dev/null 2>&1); then
+      fail "the patch's own test PASSES without the patch's fix — it does not demonstrate the defect; live daemon/src NOT modified"
+    else
+      echo "MUTATION: PROVEN — the patch's test fails once its fix is taken away"
+    fi
+    ;;
+  NO_TESTS)   echo "MUTATION: UNPROVEN — the patch adds no test" ;;
+  TESTS_ONLY) echo "MUTATION: N/A — the patch is tests only" ;;
+  UNSPLITTABLE) echo "MUTATION: INCONCLUSIVE — the fix and its test share a hunk" ;;
+  # Anything else is not a verdict this script knows. Do not pass it through.
+  *)          fail "the mutation probe returned an unrecognized verdict '$SPLIT_VERDICT' — live daemon/src NOT modified" ;;
+esac
 
 # ----------------------------------------------------------------- apply (live)
 # Green. Apply the SAME patch to the real daemon/ tree. Dry-run first here too.

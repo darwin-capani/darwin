@@ -393,11 +393,34 @@ REPO_ROOT="$(cd "$HERE/.." && pwd -P)"
 REAL_CRATE="$REPO_ROOT/daemon"
 STAGE_ROOT="$WORK/stagecheck"
 
-STAGE_FNS="$(load_fn stage_crate)"$'\n'"$(load_fn mirror_out_of_crate_includes)"
+STAGE_FNS="$(load_fn stage_crate)"$'\n'"$(load_fn mirror_out_of_crate_includes)"$'\n'"$(load_fn mirror_runtime_test_inputs)"
 case "$STAGE_FNS" in
-  *"stage_crate() {"*"mirror_out_of_crate_includes() {"*) ;;
-  *) bad "could not slice stage_crate + mirror_out_of_crate_includes out of apply_heal.sh" ;;
+  *"stage_crate() {"*"mirror_out_of_crate_includes() {"*"mirror_runtime_test_inputs() {"*) ;;
+  *) bad "could not slice stage_crate + its mirror helpers out of apply_heal.sh" ;;
 esac
+
+# The slice above is BY NAME, so adding a helper to stage_crate without adding it
+# here leaves the sliced copy calling an undefined function: `stage_crate` then
+# dies, returns '', and the staging-completeness check below fails for a reason
+# that has nothing to do with staging. That is exactly what happened when
+# mirror_runtime_test_inputs was introduced. So: verify the slice is CLOSED —
+# every apply_heal.sh function the slice calls must itself be in the slice.
+DEFINED_ALL="$(grep -oE '^[a-z_][a-z0-9_]*\(\) \{' "$SCRIPT" | sed 's/() {//')"
+SLICE_MISSING=""
+for fn in $DEFINED_ALL; do
+  case "$STAGE_FNS" in
+    *"$fn() {"*) continue ;;                      # already in the slice
+  esac
+  # Called by the slice (as a command word) but not defined in it?
+  if printf '%s\n' "$STAGE_FNS" | grep -qE "(^|[;&|(]|then |else |do )[[:space:]]*$fn([[:space:]]|$)"; then
+    SLICE_MISSING="$SLICE_MISSING $fn"
+  fi
+done
+if [ -n "$SLICE_MISSING" ]; then
+  bad "the staging slice calls apply_heal.sh helpers it does not include:$SLICE_MISSING (add load_fn for each)"
+else
+  ok "the staging function slice is closed — every helper it calls is included"
+fi
 
 if [ ! -d "$REAL_CRATE/src" ]; then
   bad "staging completeness: no daemon crate at $REAL_CRATE (cannot verify the staging copy)"

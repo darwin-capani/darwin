@@ -20,7 +20,9 @@
 //!      each minimal, no new deps). Each is parsed/cleaned; non-diffs rejected.
 //!   5. STAGE + VALIDATE EACH (v2) — every candidate is staged independently
 //!      in state/heal/staging-<ts>-c<i>/ (sources copied, diff applied with
-//!      /usr/bin/patch -p1 --batch, cargo check && cargo test). Any candidate
+//!      /usr/bin/patch -p1 --batch, then check -> clippy -D warnings -> test
+//!      -> mutation probe: the fix is reverse-applied and the patch's own test
+//!      must then FAIL, else the candidate is rejected as unproven). Any candidate
 //!      that fails a hunk/compile/test is DISCARDED. Gates reused unchanged.
 //!   6. ADVERSARIAL SELF-REVIEW (v2) — a second cloud call judges each
 //!      surviving (validated) diff against the diagnosis + its test output:
@@ -114,7 +116,8 @@ const REVIEW_SYSTEM: &str = "You are DARWIN's adversarial self-repair reviewer: 
      (not merely silences the symptom) and has no obvious side effects. Be harsh; a passing \
      test suite is necessary but NOT sufficient.";
 
-/// Staging validation: cargo check && cargo test share this deadline.
+/// Staging validation: check, clippy, test and the mutation probe share this
+/// deadline.
 const VALIDATE_TIMEOUT: Duration = Duration::from_secs(600);
 const PATCH_BIN: &str = "/usr/bin/patch";
 /// Validation output tail kept in report.md / candidates.md.
@@ -649,7 +652,15 @@ fn draft_prompt(d: &Diagnosis, n: usize) -> String {
          - Paths relative to the crate root with a/ and b/ prefixes (e.g. --- a/src/router.rs).\n\
          - Touch only the implicated files; make the smallest change that fixes the cause.\n\
          - No new dependencies; do not modify Cargo.toml or Cargo.lock.\n\
-         - Each diff must apply cleanly with `patch -p1` and pass `cargo check` and `cargo test`.\n\
+         - Each diff must apply cleanly with `patch -p1` and pass `cargo check`, \
+           `cargo clippy --all-targets -- -D warnings`, and `cargo test`.\n\
+         - EVERY diff MUST add a regression test, inside the file's `#[cfg(test)] mod tests`, \
+           that FAILS without your fix. The gate re-runs the suite with your fix REVERSED and \
+           your test kept: if the test still passes, the candidate is REJECTED as unproven. \
+           Assert the specific behaviour the bug got wrong — a test that merely exercises the \
+           code path, or asserts something true before and after, will be thrown out.\n\
+         - Put the fix and the test in SEPARATE hunks (fix at the call site, test in the test \
+           module). A single hunk containing both cannot be separated and cannot be proven.\n\
          - No prose inside or between the diffs beyond the `=== CANDIDATE i ===` markers.",
         subsystem = d.subsystem,
         sigs = sigs,
@@ -666,7 +677,10 @@ fn review_prompt(d: &Diagnosis, diff: &str, validation_tail: &str) -> String {
         d.signatures.join("; ")
     };
     format!(
-        "A candidate patch PASSED staged validation (`cargo check` + full `cargo test`). Judge \
+        "A candidate patch PASSED staged validation (`cargo check`, `cargo clippy -D warnings`, \
+         full `cargo test`, and a mutation probe that re-ran the suite with the fix REVERSED and \
+         the test kept — see the validation tail for whether that came back PROVEN, UNPROVEN or \
+         INCONCLUSIVE, and weight your confidence accordingly). Judge \
          whether it fixes the ROOT CAUSE of the fault below, not merely silences the symptom, and \
          whether it has any obvious side effects or regressions.\n\n\
          Fault diagnosis:\n\
@@ -900,7 +914,7 @@ fn render_report(ts: u64, model: &str, d: &Diagnosis, winner: &Survivor) -> Stri
     };
     format!(
         "# Self-heal proposal — {ts}\n\n\
-         - verdict: VALIDATED (cargo check + cargo test passed in staging)\n\
+         - verdict: VALIDATED (cargo check + clippy -D warnings + cargo test + mutation probe)\n\
          - model: {model}\n\
          - subsystem: {subsystem}\n\
          - files touched: {files}\n\
@@ -1212,7 +1226,8 @@ async fn run_attempt(
                     diff: diff.clone(),
                     validated: true,
                     detail: format!(
-                        "kept — passed cargo check + cargo test; review confidence {confidence:.2}"
+                        "kept — passed cargo check + clippy + cargo test + mutation probe; \
+                         review confidence {confidence:.2}"
                     ),
                 });
                 survivors.push(Survivor {
@@ -1258,7 +1273,7 @@ async fn run_attempt(
             ts,
             model,
             &diagnosis,
-            "No candidate passed the staged cargo check + cargo test gates.",
+            "No candidate passed the staged check / clippy / test / mutation gates.",
         );
         // Persist candidates.md alongside the rejection so the human can see
         // what was tried.
@@ -1475,7 +1490,7 @@ struct CmdOutput {
 
 /// Copy the crate sources (src/, Cargo.toml, Cargo.lock if present — NOT
 /// target/) into the staging dir, apply the diff with patch -p1 --batch
-/// (reject on any hunk failure), then cargo check && cargo test under one
+/// (reject on any hunk failure), then check + clippy + test + mutation under one
 /// 10-minute deadline.
 /// Wrapper that guarantees the staging tree is REMOVED on every exit.
 ///
@@ -1577,7 +1592,7 @@ async fn stage_and_validate_inner(
     let stages: [(&str, Vec<&str>); 3] = [
         ("check", vec!["check"]),
         ("clippy", clippy_args),
-        ("test", test_args),
+        ("test", test_args.clone()),
     ];
     for (stage, args) in stages {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
@@ -1603,6 +1618,75 @@ async fn stage_and_validate_inner(
             }
         }
     }
+
+    // ---- STAGE 4: MUTATION PROOF -------------------------------------------
+    //
+    // The three stages above prove the patch COMPILES, LINTS and PASSES. None of
+    // them prove its new test would CATCH THE BUG COMING BACK — and a test that
+    // passes against the broken code is the failure this project produces most.
+    // In one sweep it happened five separate times: three source-anchored guards
+    // that matched their own definition, a mutation that edited a string no
+    // longer in the file (a no-op, indistinguishable from a surviving test), and
+    // a fix one layer too shallow whose test still went green.
+    //
+    // So: take the patch's TEST hunks and REVERSE-APPLY everything else. That
+    // leaves the new test present and the fix absent — the precise state the
+    // test claims to detect. The suite must now FAIL. If it still passes, the
+    // test does not demonstrate the defect and the candidate is rejected.
+    //
+    // The staged tree is not read after this point (only `validation_tail` is),
+    // so the reverse patch is applied in place: the build is warm, so this costs
+    // an incremental rebuild rather than a second full one.
+    let split = split_test_hunks(diff, &|f: &str| cfg_test_boundary(&crate_dir, f));
+    let (test_hunks, source_hunks) = match split {
+        Ok(pair) => pair,
+        Err(e) => (String::new(), format!("__unsplittable__ {e}")),
+    };
+    let mutation = if source_hunks.starts_with("__unsplittable__") {
+        "INCONCLUSIVE: the fix and its test share a hunk and cannot be separated."
+    } else if test_hunks.trim().is_empty() {
+        // Not a rejection. A doc fix or a pure refactor legitimately adds no
+        // test — but the reviewer must see "green" and "proven" as different
+        // words, so this says which one it got.
+        "UNPROVEN: the patch adds no test, so nothing here shows the fix works."
+    } else if source_hunks.trim().is_empty() {
+        "N/A: the patch is tests only — there is no fix to take away."
+    } else {
+        match reverse_patch(&crate_dir, &source_hunks).await {
+            // Fix removed, test kept. The suite MUST now fail.
+            Ok(r) if r.ok => {
+                let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                match run_cargo(&crate_dir, &test_args, remaining).await {
+                    Ok(o) if !o.ok => "PROVEN: the patch's test FAILS once its fix is taken away.",
+                    Ok(o) => {
+                        return Ok(StageResult::Rejected {
+                            stage: "mutation",
+                            detail: format!(
+                                "{combined}\n$ mutation probe (fix reverted, test kept)\n{}\n\
+                                 [the patch's own test PASSES without the patch's fix, so it does \
+                                 not demonstrate the defect — this candidate is unproven]",
+                                tail_chars(&o.output, 2000)
+                            ),
+                        })
+                    }
+                    Err(e) => {
+                        // Say inconclusive rather than claim a proof we do not have.
+                        combined.push_str(&format!(
+                            "\n$ mutation probe\nINCONCLUSIVE: the probe could not run ({e})\n"
+                        ));
+                        return Ok(StageResult::Validated {
+                            validation_tail: tail_chars(&combined, REPORT_TAIL_CHARS),
+                        });
+                    }
+                }
+            }
+            // The source hunks do not lift out on their own — they share context
+            // with the test hunks. Honest, and not the candidate's fault.
+            _ => "INCONCLUSIVE: the fix could not be separated from the test to take it away.",
+        }
+    };
+    combined.push_str(&format!("\n$ mutation probe\n{mutation}\n"));
+
     Ok(StageResult::Validated {
         validation_tail: tail_chars(&combined, REPORT_TAIL_CHARS),
     })
@@ -1861,9 +1945,136 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 
 /// /usr/bin/patch -p1 --batch with the diff on stdin, cwd = `dir`. Exit
 /// status != 0 (any failed hunk, malformed input) is a rejection.
-async fn apply_patch(dir: &Path, diff: &str) -> anyhow::Result<CmdOutput> {
+/// Line number (1-based) of the first `#[cfg(test)]` in `<root>/<path>`, or
+/// `usize::MAX` when the file has no test module — which makes every line of it
+/// "before the boundary", i.e. fix-side, which is the honest default.
+pub fn cfg_test_boundary(root: &Path, path: &str) -> usize {
+    std::fs::read_to_string(root.join(path))
+        .ok()
+        .and_then(|t| {
+            t.lines()
+                .position(|l| l.trim_start().starts_with("#[cfg(test)]"))
+                .map(|i| i + 1)
+        })
+        .unwrap_or(usize::MAX)
+}
+
+/// Split a unified diff into (TEST side, FIX side) so the fix can be taken back
+/// out while the test stays.
+///
+/// Classification is POSITIONAL, not keyword-based: for each hunk, every added
+/// line's position in the patched file is compared against that file's
+/// `#[cfg(test)]` line. Added lines at or past it are test code; before it, fix
+/// code. Matching on `#[test]` text instead would call a hunk containing BOTH a
+/// fix and a test "a test hunk" and silently skip the probe on the exact patch
+/// shape it most needs to check.
+///
+/// A hunk whose added lines fall on BOTH sides cannot be separated, and this
+/// returns `Err` rather than guess — the probe then reports itself inconclusive.
+/// Deletion-only hunks are placed by the position they delete at.
+///
+/// `boundary` is injected so this is testable without a filesystem.
+pub fn split_test_hunks(
+    diff: &str,
+    boundary: &dyn Fn(&str) -> usize,
+) -> Result<(String, String), String> {
+    let (mut tests, mut fixes) = (String::new(), String::new());
+    let mut header = String::new();
+    let mut file = String::new();
+    let mut cur = String::new();
+    let mut newln = 0usize;
+    let mut saw_test = false;
+    let mut saw_fix = false;
+    let mut pending: Option<()> = None;
+
+    // Close the hunk held in `cur`, appending it to whichever side it belongs to.
+    macro_rules! flush {
+        () => {
+            if pending.take().is_some() {
+                if saw_test && saw_fix {
+                    return Err(format!(
+                        "a hunk in {file} spans both the fix and its test; they cannot be \
+                         separated"
+                    ));
+                }
+                let dest = if saw_test { &mut tests } else { &mut fixes };
+                if !dest.ends_with(&header) {
+                    dest.push_str(&header);
+                }
+                dest.push_str(&cur);
+                cur.clear();
+                saw_test = false;
+                saw_fix = false;
+            }
+        };
+    }
+
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("--- ") {
+            flush!();
+            let _ = rest;
+            header = format!("{line}\n");
+        } else if let Some(rest) = line.strip_prefix("+++ ") {
+            header.push_str(line);
+            header.push('\n');
+            // `+++ b/src/foo.rs` -> `src/foo.rs`; trailing tab-separated
+            // timestamps are stripped, as is the `b/` level `patch -p1` eats.
+            let raw = rest.split('\t').next().unwrap_or(rest).trim();
+            file = raw.split_once('/').map(|(_, r)| r).unwrap_or(raw).to_string();
+        } else if line.starts_with("@@") {
+            flush!();
+            // `@@ -a,b +c,d @@` — `c` is where this hunk starts in the new file.
+            newln = line
+                .split('+')
+                .nth(1)
+                .and_then(|s| s.split([',', ' ']).next())
+                .and_then(|s| s.parse::<usize>().ok())
+                .unwrap_or(1);
+            cur.push_str(line);
+            cur.push('\n');
+            pending = Some(());
+        } else if pending.is_some() {
+            let b = boundary(&file);
+            match line.chars().next() {
+                Some('+') => {
+                    if newln >= b {
+                        saw_test = true;
+                    } else {
+                        saw_fix = true;
+                    }
+                    newln += 1;
+                }
+                // A removal does not advance the new-file counter, but it still
+                // has a side: whichever region it is being removed from.
+                Some('-') => {
+                    if newln >= b {
+                        saw_test = true;
+                    } else {
+                        saw_fix = true;
+                    }
+                }
+                // Context (' '), and the `\ No newline` marker, advance only.
+                _ => newln += 1,
+            }
+            cur.push_str(line);
+            cur.push('\n');
+        }
+    }
+    flush!();
+    // The final `flush!` resets these; nothing reads them afterwards.
+    let _ = (saw_test, saw_fix);
+    Ok((tests, fixes))
+}
+
+/// Reverse-apply `diff` — used by the mutation probe to take a patch's FIX back
+/// out of an already-patched tree while leaving its new test in place.
+async fn reverse_patch(dir: &Path, diff: &str) -> anyhow::Result<CmdOutput> {
+    run_patch(dir, diff, &["-p1", "--batch", "-R"]).await
+}
+
+async fn run_patch(dir: &Path, diff: &str, args: &[&str]) -> anyhow::Result<CmdOutput> {
     let mut child = tokio::process::Command::new(PATCH_BIN)
-        .args(["-p1", "--batch"])
+        .args(args)
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -1883,6 +2094,10 @@ async fn apply_patch(dir: &Path, diff: &str) -> anyhow::Result<CmdOutput> {
             String::from_utf8_lossy(&out.stderr)
         ),
     })
+}
+
+async fn apply_patch(dir: &Path, diff: &str) -> anyhow::Result<CmdOutput> {
+    run_patch(dir, diff, &["-p1", "--batch"]).await
 }
 
 /// `cargo <args>` in `dir`, output captured, bounded by `timeout`. Uses the
@@ -2584,6 +2799,216 @@ mod tests {
         .unwrap();
     }
 
+    /// A crate whose fix site and test module are far enough apart that a
+    /// unified diff cannot merge them into one hunk — the realistic shape.
+    fn write_clamp_crate(dir: &Path) {
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"synthetic-clamp\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("src").join("lib.rs"),
+            "pub fn clamp_pct(x: i32) -> i32 {\n\
+             \x20   x\n\
+             }\n\
+             \n\
+             pub fn pad_a() {}\n\
+             pub fn pad_b() {}\n\
+             pub fn pad_c() {}\n\
+             pub fn pad_d() {}\n\
+             pub fn pad_e() {}\n\
+             pub fn pad_f() {}\n\
+             \n\
+             #[cfg(test)]\n\
+             mod tests {\n\
+             \x20   #[test]\n\
+             \x20   fn baseline() {\n\
+             \x20       assert_eq!(super::clamp_pct(5), 5);\n\
+             \x20   }\n\
+             }\n",
+        )
+        .unwrap();
+    }
+
+    /// The fix hunk, identical in both candidates below.
+    const CLAMP_FIX_HUNK: &str = "--- a/src/lib.rs\n\
+                                  +++ b/src/lib.rs\n\
+                                  @@ -1,4 +1,4 @@\n \
+                                  pub fn clamp_pct(x: i32) -> i32 {\n\
+                                  -    x\n\
+                                  +    x.min(100)\n \
+                                  }\n \
+                                  \n";
+
+    /// STAGE 4, THE POINT OF IT. Two candidates carry the SAME fix. One's test
+    /// asserts the clamp; the other's asserts a value the bug never affected.
+    /// Both compile, both lint clean, both pass — the first three stages cannot
+    /// tell them apart. Only taking the fix away can.
+    #[tokio::test]
+    async fn the_gate_rejects_a_patch_whose_test_passes_without_its_fix() {
+        let root = TempRoot::new("mutvacuous");
+        let crate_dir = root.0.join("daemon");
+        let heal_root = root.0.join("state").join("heal");
+        write_clamp_crate(&crate_dir);
+
+        // Asserts clamp_pct(5) == 5 — true with the fix AND without it.
+        let vacuous = format!(
+            "{CLAMP_FIX_HUNK}\
+             @@ -15,4 +15,9 @@\n \
+             \x20   fn baseline() {{\n \
+             \x20       assert_eq!(super::clamp_pct(5), 5);\n \
+             \x20   }}\n\
+             +\n\
+             +    #[test]\n\
+             +    fn passes_small_values_through() {{\n\
+             +        assert_eq!(super::clamp_pct(5), 5);\n\
+             +    }}\n \
+             }}\n"
+        );
+
+        let result = stage_and_validate(&crate_dir, &heal_root, 1_770_000_001, 0, &vacuous)
+            .await
+            .unwrap();
+        match result {
+            StageResult::Rejected { stage, detail } => {
+                assert_eq!(stage, "mutation", "wrong stage rejected:\n{detail}");
+                assert!(
+                    detail.contains("PASSES without the patch's fix"),
+                    "rejection does not say why:\n{detail}"
+                );
+                // It must have got PAST the first three stages — otherwise this
+                // test is passing for the wrong reason entirely.
+                assert!(detail.contains("cargo clippy"), "never reached clippy:\n{detail}");
+            }
+            StageResult::Validated { validation_tail } => {
+                panic!("a test that survives its own fix's removal must not validate:\n{validation_tail}")
+            }
+        }
+    }
+
+    /// The other half of the pair: same fix, a test that DOES bite. It must
+    /// validate, and say so — a gate that rejected both would be useless.
+    #[tokio::test]
+    async fn the_gate_validates_and_marks_proven_a_patch_whose_test_bites() {
+        let root = TempRoot::new("mutproven");
+        let crate_dir = root.0.join("daemon");
+        let heal_root = root.0.join("state").join("heal");
+        write_clamp_crate(&crate_dir);
+
+        // Asserts clamp_pct(150) == 100 — only true once the fix is present.
+        let biting = format!(
+            "{CLAMP_FIX_HUNK}\
+             @@ -15,4 +15,9 @@\n \
+             \x20   fn baseline() {{\n \
+             \x20       assert_eq!(super::clamp_pct(5), 5);\n \
+             \x20   }}\n\
+             +\n\
+             +    #[test]\n\
+             +    fn clamps_above_one_hundred() {{\n\
+             +        assert_eq!(super::clamp_pct(150), 100);\n\
+             +    }}\n \
+             }}\n"
+        );
+
+        let result = stage_and_validate(&crate_dir, &heal_root, 1_770_000_002, 0, &biting)
+            .await
+            .unwrap();
+        match result {
+            StageResult::Validated { validation_tail } => assert!(
+                validation_tail.contains("PROVEN: the patch's test FAILS"),
+                "a biting test must be reported as proven:\n{validation_tail}"
+            ),
+            StageResult::Rejected { stage, detail } => {
+                panic!("a biting test must validate, rejected at {stage}:\n{detail}")
+            }
+        }
+    }
+
+    /// Classification is by POSITION, not by the word `#[test]`: the fix hunk
+    /// here contains no test marker and the test hunk does, but what decides is
+    /// which side of `#[cfg(test)]` each added line lands on.
+    #[test]
+    fn split_test_hunks_separates_by_the_cfg_test_boundary() {
+        let diff = "--- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,2 +1,2 @@\n\
+                    -    x\n\
+                    +    x.min(100)\n\
+                    @@ -20,1 +20,3 @@\n\
+                    +    #[test]\n\
+                    +    fn t() {}\n \
+                    }\n";
+        let (tests, fixes) = split_test_hunks(diff, &|_| 12).unwrap();
+        assert!(fixes.contains("x.min(100)") && !fixes.contains("fn t()"), "fixes:\n{fixes}");
+        assert!(tests.contains("fn t()") && !tests.contains("x.min(100)"), "tests:\n{tests}");
+        // Each half must carry the file header, or it is not a usable patch.
+        assert!(fixes.starts_with("--- a/src/lib.rs\n+++ b/src/lib.rs\n"), "{fixes}");
+        assert!(tests.starts_with("--- a/src/lib.rs\n+++ b/src/lib.rs\n"), "{tests}");
+    }
+
+    /// A hunk holding the fix AND the test cannot be separated. Guessing would
+    /// mean skipping the probe on the very shape it most needs to check, so this
+    /// refuses and the gate reports itself inconclusive.
+    #[test]
+    fn split_test_hunks_refuses_a_hunk_that_spans_both_sides() {
+        let diff = "--- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,2 +1,20 @@\n\
+                    -    x\n\
+                    +    x.min(100)\n\
+                    +    #[test]\n\
+                    +    fn t() {}\n";
+        let err = split_test_hunks(diff, &|_| 3).unwrap_err();
+        assert!(err.contains("cannot be separated"), "{err}");
+    }
+
+    /// No test module in the patched file means no test-side hunks at all, so
+    /// the gate reports UNPROVEN rather than silently claiming a proof.
+    #[test]
+    fn split_test_hunks_puts_everything_fix_side_when_there_is_no_test_module() {
+        let diff = "--- a/src/lib.rs\n\
+                    +++ b/src/lib.rs\n\
+                    @@ -1,2 +1,2 @@\n\
+                    -    x\n\
+                    +    x.min(100)\n";
+        let (tests, fixes) = split_test_hunks(diff, &|_| usize::MAX).unwrap();
+        assert!(tests.is_empty(), "tests:\n{tests}");
+        assert!(fixes.contains("x.min(100)"));
+    }
+
+    /// The gate rejects a candidate whose test survives its fix's removal. If the
+    /// DRAFTING prompt does not say so, the model keeps producing exactly those
+    /// candidates and every cycle burns a cloud draft to be thrown away. The
+    /// requirement has to reach the model, not just the validator.
+    #[test]
+    fn the_draft_prompt_demands_a_test_that_fails_without_the_fix() {
+        let d = Diagnosis {
+            subsystem: "audio".to_string(),
+            signatures: vec!["capture stopped".to_string()],
+            log_context: "…".to_string(),
+            files: vec!["src/nexus.rs".to_string()],
+            line_numbers: vec![],
+            burst_lines: vec![],
+            source_excerpts: vec![],
+        };
+        let p = draft_prompt(&d, 3);
+        assert!(
+            p.contains("FAILS without your fix"),
+            "the drafter is never told its test must bite:\n{p}"
+        );
+        assert!(
+            p.contains("REJECTED as unproven"),
+            "the drafter is never told the consequence:\n{p}"
+        );
+        // And the shape requirement, without which the probe cannot separate them.
+        assert!(
+            p.contains("SEPARATE hunks"),
+            "the drafter is never told to keep fix and test in separate hunks:\n{p}"
+        );
+    }
+
     struct TempRoot(PathBuf);
     impl TempRoot {
         fn new(tag: &str) -> Self {
@@ -3143,6 +3568,88 @@ mod tests {
                 "apply_heal.sh must run `{stage}` — the two gates must not disagree"
             );
         }
+    }
+
+    /// The stage-4 block of apply_heal.sh, BOUNDED at its closing `esac`.
+    /// Slicing merely "everything after the marker" would run on to the real
+    /// apply below it, and a guard that matches too widely reports the wrong
+    /// line — which is exactly what it did the first time this was written.
+    fn stage_four_block(script: &str) -> &str {
+        let after = script
+            .split("STAGE 4: MUTATION PROOF")
+            .nth(1)
+            .expect("stage 4 block missing");
+        let end = after.find("\nesac\n").expect("stage 4 block is not esac-terminated");
+        &after[..end]
+    }
+
+    /// Stage 4 parity. The daemon rejects a patch whose test survives its fix's
+    /// removal; if the apply script did not, that patch could still be applied
+    /// by hand or by the HUD Accept button, which is the whole hole.
+    #[test]
+    fn the_apply_script_runs_the_same_mutation_probe_as_the_daemon_gate() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        assert!(
+            script.contains("--split-heal-diff"),
+            "apply_heal.sh must run the mutation probe"
+        );
+        assert!(
+            script.contains("-R <\"$SPLIT_DIR/fix.diff\""),
+            "the probe must REVERSE-apply the fix half — applying it forward proves nothing"
+        );
+        // It must FAIL the apply, not merely print a note, when the test survives.
+        let probe = stage_four_block(script);
+        assert!(
+            probe.contains("fail \"the patch's own test PASSES without the patch's fix"),
+            "a surviving test must FAIL the apply, not just warn:\n{probe}"
+        );
+
+        // FAIL CLOSED, three ways. An unrecognized flag makes darwind fall
+        // through to ORDINARY DAEMON STARTUP — it would boot a daemon instead of
+        // answering, and the gate would be skipped rather than enforced.
+        // apply_forge.sh documents this hazard for its own gate flag.
+        assert!(
+            probe.contains("grep -q -- '--split-heal-diff' \"$CRATE/src/main.rs\""),
+            "the probe must confirm the staged daemon implements it, or a mismatched \
+             source boots a daemon instead of answering:\n{probe}"
+        );
+        assert!(
+            probe.contains("does not discriminate"),
+            "the probe binary must be PROVEN to discriminate before its verdict is \
+             trusted — a gate that always answers the same word is not a gate:\n{probe}"
+        );
+        // An unknown verdict must refuse, not fall through as an advisory note.
+        let default_arm = probe.rsplit("*)").next().unwrap_or("");
+        assert!(
+            default_arm.contains("fail "),
+            "an unrecognized verdict must refuse the apply, not pass through:\n{default_arm}"
+        );
+    }
+
+    /// The split must have exactly ONE implementation. A bash reimplementation
+    /// of the hunk classifier is the gates-drift-apart defect by construction —
+    /// so the script has to call the daemon binary, not parse the diff itself.
+    #[test]
+    fn the_apply_script_does_not_reimplement_the_hunk_split() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        let probe = stage_four_block(script);
+        // The precise property: the patch is READ only by the splitter. If bash
+        // ever touched $PATCH_FILE for any other purpose here, that would be a
+        // second classifier — and the two could then disagree.
+        for line in probe.lines() {
+            if line.contains("$PATCH_FILE") {
+                assert!(
+                    line.contains("--split-heal-diff"),
+                    "the probe reads the patch outside the splitter, so there are now two \
+                     classifiers that can disagree:\n{line}"
+                );
+            }
+        }
+        // And what gets reverse-applied must be the file the SPLITTER wrote.
+        assert!(
+            probe.contains("$SPLIT_DIR/fix.diff"),
+            "the probe must reverse the splitter's own fix half:\n{probe}"
+        );
     }
 
 }

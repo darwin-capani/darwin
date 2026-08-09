@@ -2030,6 +2030,61 @@ async fn main() -> Result<()> {
     // Side-effect-free beyond reading: it deploys NOTHING and touches neither apps/
     // nor any config. No daemon starts; no tracing/Keychain. It DOES read the
     // (pure, file-only) Config to learn the [registry] posture for gate (2).
+    // Split a heal patch into its FIX side and its TEST side, so a caller can
+    // take the fix back out and check the test notices. `scripts/apply_heal.sh`
+    // uses this rather than reimplementing the split in bash: the daemon gate
+    // and the apply gate disagreeing is the single defect shape this file's
+    // history has produced most, and two copies of a hunk classifier would be
+    // exactly that waiting to happen.
+    //
+    //   darwind --split-heal-diff <patch.diff> <patched_crate_dir> <out_dir>
+    //
+    // Writes <out_dir>/fix.diff and <out_dir>/test.diff, prints one verdict word
+    // (PROVABLE | NO_TESTS | TESTS_ONLY | UNSPLITTABLE) and exits 0. Exit 2 is
+    // reserved for bad usage, so a caller can tell "cannot prove this patch"
+    // from "this command was called wrong".
+    if let Some(pos) = std::env::args().position(|a| a == "--split-heal-diff") {
+        let patch = std::env::args().nth(pos + 1).unwrap_or_default();
+        let crate_dir = std::env::args().nth(pos + 2).unwrap_or_default();
+        let out_dir = std::env::args().nth(pos + 3).unwrap_or_default();
+        if patch.trim().is_empty() || crate_dir.trim().is_empty() || out_dir.trim().is_empty() {
+            eprintln!("usage: darwind --split-heal-diff <patch.diff> <crate_dir> <out_dir>");
+            std::process::exit(2);
+        }
+        let diff = match std::fs::read_to_string(&patch) {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("cannot read {patch}: {e}");
+                std::process::exit(2);
+            }
+        };
+        let crate_dir = PathBuf::from(&crate_dir);
+        let verdict = match heal::split_test_hunks(&diff, &|f: &str| {
+            heal::cfg_test_boundary(&crate_dir, f)
+        }) {
+            Err(_) => "UNSPLITTABLE",
+            Ok((tests, fixes)) => {
+                if tests.trim().is_empty() {
+                    "NO_TESTS"
+                } else if fixes.trim().is_empty() {
+                    "TESTS_ONLY"
+                } else {
+                    let out = Path::new(&out_dir);
+                    if let Err(e) = std::fs::create_dir_all(out)
+                        .and_then(|_| std::fs::write(out.join("fix.diff"), &fixes))
+                        .and_then(|_| std::fs::write(out.join("test.diff"), &tests))
+                    {
+                        eprintln!("cannot write split to {out_dir}: {e}");
+                        std::process::exit(2);
+                    }
+                    "PROVABLE"
+                }
+            }
+        };
+        println!("{verdict}");
+        return Ok(());
+    }
+
     if let Some(pos) = std::env::args().position(|a| a == "--validate-forge-manifest") {
         let manifest_path = std::env::args().nth(pos + 1).unwrap_or_default();
         let app_name = std::env::args().nth(pos + 2).unwrap_or_default();

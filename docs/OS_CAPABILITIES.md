@@ -24,7 +24,7 @@ The entire second section of the spec describes what darwind already is.
 | Continuously ingest its own error logs | ✅ **Built** | `heal.rs` — tails `state/logs/daemon.log`, edge-triggered error-burst detection |
 | Read-only introspection of its OWN sandboxed apps (integrity + resource + module attestation) | ✅ **Built** | `introspect.rs` — SBPL profile-drift, RSS/CPU anomalies, cooperative dyld module attestation, capability inventory; surfaced via `aegis_introspect`/`aegis_report` + HUD. See `docs/INTROSPECT.md` |
 | Write its own patches | ✅ **Built** (propose-only) | `heal.rs` — on a confirmed crash-loop, Opus drafts a unified diff; it is validated and written to `state/heal/proposals/<ts>/`; a human applies it via `scripts/apply_heal.sh` |
-| Dynamically compile its modules on the fly | ✅ **Built**, human-gated | `scripts/apply_heal.sh` — revalidates the patch in a staging copy (`cargo check` + `cargo test`), then applies to `daemon/` + `--release` rebuild; never automatic |
+| Dynamically compile its modules on the fly | ✅ **Built**, human-gated | `scripts/apply_heal.sh` — revalidates the patch in a staging copy (check + clippy `-D warnings` + test + a mutation probe that reverses the fix and requires the patch's own test to fail), then applies to `daemon/` + `--release` rebuild; never automatic |
 
 **The honest carve-out on self-healing:** the mechanical version of "writes its
 own patches and recompiles unsupervised" is buildable, but a daemon that
