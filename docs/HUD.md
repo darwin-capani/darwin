@@ -147,7 +147,7 @@ Per `docs/SANDBOX.md`, micro-apps never open windows; the HUD composites their s
 | Class | Composition |
 |---|---|
 | `panel` | Floating glass panel in the right-side panel rail; user-arrangeable; max 3 visible, the rest collapse to tabs |
-| `overlay` | Translucent layer over the main scene (e.g. Fab-Link toolpath); no fill, strokes only; never occludes the status bar |
+| `overlay` | Translucent layer over the main scene; no fill, strokes only; never occludes the status bar. (No shipped app uses this class yet — the design that did, Fab-Link, is BLOCKED and unbuilt; see `docs/ROADMAP.md`.) |
 | `fullscreen` | Takes the whole stage; core shrinks to a 48 px status orb top-right; exit via the same chord that opened it |
 
 Two transport tiers, matching the roadmap honestly:
@@ -169,6 +169,24 @@ A `panel`-class glass surface (chord `⌥⌘,`) for the runtime knobs that shoul
 - The status bar shows a cloud-key indicator: green when a key is present and the last test passed, amber when absent — cloud routes then degrade to local, per ARCHITECTURE's routing policy, and the panel says so.
 
 Other v1 entries (all daemon-owned, same apply path): `[speech]` voice pick from the audition bank, `[router]` cloud confidence threshold, `[cloud]` model ids. Everything else stays in `config/darwin.toml`.
+
+### 5.2 Operator controls on the queue panels
+
+Four panels used to **report** on work that nothing in the shipped UI could start. Their daemon verbs were implemented, gated and tested, and each had exactly one caller — its own command arm. OvernightPanel counted "N queued" for a queue that could not be filled; DistillPanel's "ARMED · GATHERING" described a pipeline that could never train. They now carry the control that drives them:
+
+| Panel | Control | Verb | What a click actually does |
+|---|---|---|---|
+| OVERNIGHT | task box + **QUEUE** | `overnight` | Local write into the overnight queue. The runner is **tool-less** (`run_real_task` is a `complete_plain` call with no tool loop), so queued work can draft text and nothing else. |
+| SELF-DISTILL | **TRAIN + STAGE** | `distill` | On-device train; **stages only**, never swaps the answering model. Nothing reaches the network. |
+| SELF-DISTILL | **PROMOTE…** / **ROLL BACK…** | `distill_promote` / `distill_rollback` | Changes **which model answers you**. Two-step confirm (below). Promotion is still gated daemon-side on a measured held-out win, so a click cannot install a worse model. |
+| SYNC | **SYNC NOW** | `sync` | Seals this device's syncable facts into the local outbox and merges any sealed bundle a paired device left in the inbox. **This is the one control here that can reach the network:** with `[sync].peer_endpoint` configured, `sync_now` also POSTs the sealed bundle to it (`transport_push`). "Armed-but-inert" is the *unpaired* case only — the daemon derives `transport_inert = !peer_configured` for exactly that reason — so the panel footnote and the button's title say which of the two a click is. With no pairing key it refuses rather than writing in the clear. |
+| HANDOFF | **HAND OFF THIS SESSION** / **RESUME STAGED** | `handoff` / `resume` | Seals a redacted, credential-free capsule to the paired Mac's outbox / restores a staged capsule and **parks**. Restoring context restores no permission. |
+
+**The two-step confirm.** Promote and rollback swap which brain answers the owner, so they reuse the self-heal panel's ACCEPT & APPLY gate rather than shipping a bare button: the first click **arms** a distinct confirm state, and the commit is honored only on a second click at least `REARM_MS` later — a double-click cannot skip the confirm. The gate is per-action (arming PROMOTE cannot commit a ROLLBACK) and the verb sent is read back off the armed state. One implementation (`core/heal.ts::twoStepConfirmReady`), two callers.
+
+Every one of these controls surfaces the **daemon's own reply** — off / no key / thin dataset / queue full / nothing staged / "I won't promote a phantom". The HUD never fabricates a success it did not get, and a control is disabled only for a reason it can know for certain (no desktop shell, a request in flight, an empty required field, or a master switch the daemon reports OFF).
+
+**Not wired, on purpose: `vault`.** The "go dark" verb ships with no HUD client. It is already reachable — by voice — and a button could *lift* go-dark, which loosens the posture. See `SECURITY.md § VAULT mode`.
 
 ---
 

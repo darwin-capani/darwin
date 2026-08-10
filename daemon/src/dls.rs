@@ -116,6 +116,13 @@ pub enum Rule {
     /// only on an EMPTY `net_hosts` and thereby told the author to add hosts --
     /// which produced a sandbox profile the OS refuses to compile and an app
     /// that never launched at all.
+    ///
+    /// RAISED ON BOTH SURFACES that carry the primitive: a micro-app manifest
+    /// (`net_hosts` / a `net` tool scope) and a `[[mcp.servers]]` entry in the
+    /// config. Same OS limitation, one rule key, and in each case the message is
+    /// the daemon's own (`apps::NET_SCOPE_REFUSAL` / `mcp::net_scope_verdict`)
+    /// rather than one this module writes -- the editor cannot drift from the
+    /// gate.
     NetScopeNotGrantable,
     /// A manifest that fails the base contract (name != dir, bad names, bad TOML).
     MalformedManifest,
@@ -340,6 +347,31 @@ fn diagnose_config(text: &str) -> Vec<Diagnostic> {
                                 ),
                                 line: key_line(text, key),
                             });
+                        }
+                    }
+                    // [[mcp.servers]].net_hosts — the SAME rule the manifest
+                    // surface raises, on the OTHER surface that carries the same
+                    // ungrantable primitive. Grounded in the daemon's real
+                    // decision function (`mcp::net_scope_verdict`), not a
+                    // re-derived one, so the editor and the daemon cannot drift.
+                    if section == "mcp" {
+                        if let Some(servers) = entries.get("servers").and_then(toml::Value::as_array) {
+                            for sv in servers {
+                                let cfg: crate::config::McpServerConfig = match sv.clone().try_into() {
+                                    Ok(c) => c,
+                                    // A malformed entry is the parse layer's problem,
+                                    // not this rule's — say nothing rather than guess.
+                                    Err(_) => continue,
+                                };
+                                if let Some((_refuse, detail)) = crate::mcp::net_scope_verdict(&cfg) {
+                                    out.push(Diagnostic {
+                                        severity: Severity::Error,
+                                        rule: Rule::NetScopeNotGrantable,
+                                        message: format!("[[mcp.servers]] {:?}: {detail}", cfg.name),
+                                        line: key_line(text, "net_hosts"),
+                                    });
+                                }
+                            }
                         }
                     }
                     // mode=auto autonomy lint — grounded: self_heal / forge / optimize
@@ -940,6 +972,38 @@ mod tests {
     fn a_clean_manifest_produces_no_diagnostics() {
         let kind = DocKind::Manifest { dir_name: "netty".to_string() };
         assert!(diagnose(&kind, GOOD_MANIFEST, &BTreeSet::new()).is_empty());
+    }
+
+    /// ONE VOICE ACROSS BOTH SURFACES: the config's `[[mcp.servers]].net_hosts`
+    /// carries the identical ungrantable primitive as a micro-app manifest's, so
+    /// the editor raises the identical rule -- and gets the wording from the
+    /// daemon's own decision function, not a second copy of the rule.
+    #[test]
+    fn an_mcp_server_net_scope_is_flagged_with_the_same_rule_as_a_manifest() {
+        let src = "[mcp]\nenabled = true\n\n[[mcp.servers]]\nname = \"weather\"\ntransport = \"stdio\"\ncommand = \"/usr/bin/srv\"\nnet_hosts = [\"api.weather.example\"]\n";
+        let diags = diagnose(&DocKind::Config, src, &BTreeSet::new());
+        let d = diags
+            .iter()
+            .find(|d| d.rule == Rule::NetScopeNotGrantable)
+            .unwrap_or_else(|| panic!("an MCP net scope must be diagnosed: {diags:?}"));
+        assert_eq!(d.severity, Severity::Error);
+        assert!(d.message.contains("weather"), "must name the server: {}", d.message);
+        assert!(d.message.contains("not grantable"), "{}", d.message);
+        assert!(
+            !d.message.contains("fetch_hosts"),
+            "an MCP server has NO fetch proxy -- pointing it at one would be a fiction: {}",
+            d.message
+        );
+        assert_eq!(d.line, key_line(src, "net_hosts"), "localized to the offending key");
+
+        // The healthy state is silent.
+        let clean = src.replace("net_hosts = [\"api.weather.example\"]", "net_hosts = []");
+        assert!(
+            !diagnose(&DocKind::Config, &clean, &BTreeSet::new())
+                .iter()
+                .any(|d| d.rule == Rule::NetScopeNotGrantable),
+            "an empty list is the only healthy state and must not be flagged"
+        );
     }
 
     #[test]

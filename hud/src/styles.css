@@ -1287,6 +1287,20 @@ svg.tri circle {
   margin-top: 5px;
 }
 
+/* The adversarial reviewer's own sentence, beside the button that installs the
+ * patch. Every staged gate is mechanical and blind to the diagnosis; this is
+ * the only line on the surface that says what a reviewer THOUGHT of it. */
+.sh-review-verdict {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 9.5px;
+  line-height: 1.5;
+  margin-top: 5px;
+  padding-left: 8px;
+  border-left: 2px solid rgba(255, 180, 84, 0.4);
+}
+
 /* Mandatory safety copy beneath the command line. */
 .sh-safety {
   font-size: 9.5px;
@@ -10528,6 +10542,114 @@ body,
 .overnight-item-prompt { color: var(--fg, rgba(255, 255, 255, 0.85)); }
 .overnight-item-result { font-size: 0.9em; overflow-wrap: anywhere; }
 .overnight-foot { margin-top: 4px; }
+
+/* ------------------------------------- controls for the four QUEUE panels ---
+   OVERNIGHT / SELF-DISTILL / SYNC / HANDOFF each shipped read-only, reporting on
+   work nothing could start. These are the send controls. One shared look: a thin
+   outlined mono button, dimmed + non-interactive when the daemon's own gate is
+   shut (the title carries the honest reason). The distill COMMIT is the one
+   affirmative control that borrows the alert colour, because it is the only one
+   here that changes which model answers you. */
+.overnight-queue,
+.distill-controls,
+.sync-controls,
+.handoff-controls {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 3px;
+}
+
+.overnight-task {
+  flex: 1 1 12ch;
+  min-width: 0;
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  padding: 5px 7px;
+  background: rgba(0, 0, 0, 0.28);
+  border: 1px solid rgba(120, 190, 230, 0.32);
+  color: #c5d6e2;
+}
+
+.overnight-task::placeholder { color: rgba(197, 214, 226, 0.4); }
+.overnight-task:focus { outline: 1px solid var(--cyan-bright); outline-offset: 0; }
+.overnight-task:disabled { opacity: 0.4; }
+
+.overnight-queue-btn,
+.distill-btn,
+.distill-commit,
+.distill-cancel,
+.sync-btn,
+.handoff-btn {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.12em;
+  padding: 5px 9px;
+  background: transparent;
+  border: 1px solid rgba(120, 190, 230, 0.45);
+  color: #9fd0e8;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.overnight-queue-btn:hover:not(:disabled),
+.distill-btn:hover:not(:disabled),
+.distill-cancel:hover:not(:disabled),
+.sync-btn:hover:not(:disabled),
+.handoff-btn:hover:not(:disabled) {
+  background: rgba(120, 190, 230, 0.14);
+}
+
+.overnight-queue-btn:disabled,
+.distill-btn:disabled,
+.distill-commit:disabled,
+.distill-cancel:disabled,
+.sync-btn:disabled,
+.handoff-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.overnight-result,
+.distill-result,
+.sync-result,
+.handoff-result {
+  font-size: 0.68em;
+  line-height: 1.4;
+  overflow-wrap: anywhere;
+  margin-top: 2px;
+}
+
+/* The two-step model-swap confirm — the second step of the promote/rollback
+   gate, reusing the self-heal ACCEPT & APPLY posture. */
+.distill-confirm {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 3px;
+}
+
+.distill-confirm-q {
+  font-family: var(--mono);
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  line-height: 1.4;
+  color: #c5d6e2;
+  flex: 1 1 16ch;
+}
+
+/* The ONE affirmative control in these panels that borrows the alert colour: it
+   swaps which model answers the owner. ARMING… (disabled) until the re-arm
+   window elapses, so a double-click cannot blow through the confirm. */
+.distill-commit {
+  border-color: var(--alert-red);
+  color: var(--alert-red);
+}
+
+.distill-commit:hover:not(:disabled) { background: rgba(255, 59, 78, 0.12); }
 
 /* ------------------------------------------------------- CHANGE QUEUE panel */
 /* CHANGE QUEUE // REVIEW LANE — the read-only surface for the unified git-native

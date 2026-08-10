@@ -14,8 +14,9 @@
 //!     a permission, a gate, a confirm, a voice-id, a lockdown, an autonomy
 //!     level, or a consequential action. The type literally cannot express
 //!     "enable a side effect" or "loosen a gate" — so `apply_profile` cannot
-//!     return one. (See the `tuned_behavior_has_no_permission_field` doc-level
-//!     reasoning + the property tests.)
+//!     return one. (See `tuned_behavior_has_only_non_consequential_knobs`, whose
+//!     exhaustive destructuring stops compiling the moment a field is added, plus
+//!     the property tests.)
 //!
 //!   * Every knob a profile touches is RESTRICT-ONLY relative to the base:
 //!       - the surfacing set is always a SUBSET of the base's set (a profile may

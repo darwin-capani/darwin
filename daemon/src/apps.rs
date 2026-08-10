@@ -230,10 +230,16 @@ pub struct PermissionsSection {
     /// the hosts it needs, the daemon fetches each URL (https-only, exact-host,
     /// SSRF/rebind-guarded, redirect-bounded, body-capped) and returns the body.
     /// An app can therefore keep a flat `(deny network*)` SBPL profile while still
-    /// reaching declared hosts — collapsing the two INHERENT network caveats
-    /// (coarse host filtering + DNS exfil, docs/SANDBOX.md). Validated with the
-    /// SAME bare-DNS-name/count ceiling as `net_hosts`, and bound into the
-    /// capability token (see `canonical_permissions`). `#[serde(default)]` (=>
+    /// reaching declared hosts. It is the ONLY filtered egress DARWIN has: the
+    /// sandbox has none to offer, because SBPL cannot filter network at all (the
+    /// two "INHERENT caveats" this doc used to cite -- coarse host filtering and
+    /// a DNS side channel -- described rules that never compiled; docs/SANDBOX.md
+    /// -> "A net scope is not grantable"). The allow-listing, SSRF guard and
+    /// redirect re-authorization live in Rust, where they actually run. Ceiling-
+    /// checked as a bare DNS name with a bounded count (`MAX_APP_FETCH_HOSTS` --
+    /// `net_hosts` has no ceiling any more because no non-empty value is
+    /// accepted), and bound into the capability token (see
+    /// `canonical_permissions`). `#[serde(default)]` (=>
     /// empty) so EVERY existing manifest that omits the key parses unchanged and
     /// stays fetch-denied for everything.
     pub fetch_hosts: Vec<String>,
@@ -362,7 +368,11 @@ impl AppManifest {
     /// Every shipped manifest already satisfies this; the ceiling exists to stop
     /// a NEW/edited manifest from widening the sandbox beyond these invariants.
     fn validate_capability_ceiling(&self) -> Result<()> {
-        const MAX_APP_NET_HOSTS: usize = 16;
+        // Named for the surface it actually bounds. It used to be
+        // MAX_APP_NET_HOSTS and was left pointing at `fetch_hosts` when the net
+        // scope was refused -- a name that implied a net_hosts ceiling still
+        // existed, when in fact NO net_hosts value other than [] is accepted.
+        const MAX_APP_FETCH_HOSTS: usize = 16;
         let p = &self.permissions;
         for w in &p.fs_write {
             if !crate::forge::is_confined_relpath(w) {
@@ -386,9 +396,9 @@ impl AppManifest {
         // (no scheme / path / port / whitespace / `..`). The proxy re-validates
         // each URL at fetch time, but this stops a NEW/edited manifest from
         // declaring a malformed or over-broad fetch allow-list at discovery.
-        if p.fetch_hosts.len() > MAX_APP_NET_HOSTS {
+        if p.fetch_hosts.len() > MAX_APP_FETCH_HOSTS {
             bail!(
-                "over-broad permission: fetch_hosts declares {} hosts (max {MAX_APP_NET_HOSTS})",
+                "over-broad permission: fetch_hosts declares {} hosts (max {MAX_APP_FETCH_HOSTS})",
                 p.fetch_hosts.len()
             );
         }
@@ -989,11 +999,12 @@ pub fn generate_sbpl(
     //
     // All app egress now rides the daemon-mediated fetch proxy: the app declares
     // `fetch_hosts`, connects to state/ipc/apps/fetch.sock (an AF_UNIX literal
-    // granted below), and the DAEMON makes the request. That also collapses both
-    // inherent SBPL network caveats that this branch used to document — coarse
-    // host filtering (no IP pinning / CDN co-tenant bleed) and the DNS-label
-    // exfil side channel — because the app gets no IP stack and no resolver at
-    // all. See docs/SANDBOX.md.
+    // granted below), and the DAEMON makes the request. This branch used to
+    // document two "inherent" SBPL network caveats — coarse host filtering (no IP
+    // pinning / CDN co-tenant bleed) and a DNS-label exfil channel — as costs the
+    // proxy collapsed. It collapsed neither, because neither ever ran: the rules
+    // that would have opened them did not compile, so no app ever held an IP
+    // stack or a resolver. See docs/SANDBOX.md.
     s.push_str("\n;; A net scope is not grantable on this OS -> no outbound IP\n");
     s.push_str(";; network, and no DNS, for any app. Declared egress rides the\n");
     s.push_str(";; daemon-mediated fetch proxy over fetch.sock instead.\n");
@@ -3775,8 +3786,9 @@ mod tests {
         assert!(p.contains("(allow network-outbound (literal \"/Users/op/darwin/state/ipc/apps/generate.sock\"))"));
         // NO direct network: net_hosts is empty, so the profile is a FLAT
         // (deny network*) with NO (system-network) and NO host-name filters at
-        // all — all feed egress now flows through the fetch proxy. This is the
-        // Phase-4 collapse of both inherent SBPL network caveats.
+        // all — all feed egress now flows through the fetch proxy, which is the
+        // ONLY filtered egress there is (the two "inherent SBPL caveats" this
+        // comment used to invoke described rules that never compiled).
         assert!(m.permissions.net_hosts.is_empty(), "shipped global-scan must declare no direct net_hosts");
         assert!(p.contains("(deny network*)"));
         assert!(!p.contains("(system-network)"), "no direct IP network stack");
@@ -4537,6 +4549,37 @@ mod tests {
                     err.contains("fetch_hosts"),
                     "apps/{dir_name}: the refusal must name the supported route: {err}"
                 );
+                // AND THE STATE MUST BE VISIBLE WHERE A HUMAN MEETS IT. A
+                // refusal the daemon knows about is worthless if the tree still
+                // reads like a live design: an author opening SPEC.md would
+                // implement against it, and the manifest is what they would copy.
+                // Both files must carry the loud marker, name the owner decision,
+                // and say the app does not run. (Retention is deliberate -- see
+                // docs/SANDBOX.md; if the owner instead decides to DELETE these
+                // apps, this whole arm goes with them.)
+                for (label, path) in [("SPEC.md", dir.join("SPEC.md")), ("manifest.toml", manifest_path.clone())] {
+                    let text = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("apps/{dir_name}/{label} must exist: {e}"));
+                    let head: String = text.chars().take(2500).collect();
+                    assert!(
+                        head.contains("BLOCKED"),
+                        "apps/{dir_name}/{label}: must open with the BLOCKED marker -- a refused app that reads as a live design is how someone implements against it"
+                    );
+                    assert!(
+                        head.contains("REFUSED"),
+                        "apps/{dir_name}/{label}: must say the manifest is REFUSED, not merely unbuilt"
+                    );
+                    assert!(
+                        head.contains("OWNER DECISION") || head.contains("owner's decision") || head.contains("owner decides"),
+                        "apps/{dir_name}/{label}: must name whose decision unblocks it"
+                    );
+                }
+                // ...and neither may sprout an implementation while refused: a
+                // main.py here would be dead code the loader can never start.
+                assert!(
+                    !dir.join("main.py").exists(),
+                    "apps/{dir_name}: has an implementation but its manifest is refused -- it can never launch"
+                );
                 continue;
             }
 
@@ -4616,6 +4659,63 @@ mod tests {
         }
         assert!(checked_apps >= 30, "the fleet registered ({checked_apps} apps)");
         assert!(tool_decls >= 30, "the agent-tool surface is live ({tool_decls} tools)");
+    }
+
+    /// THE SCHEMA DOC'S WORKED EXAMPLE MUST BE AN APP THAT ACTUALLY VALIDATES.
+    ///
+    /// docs/SANDBOX.md is what an app author copies a manifest from, and its
+    /// worked example was `apps/fab-link/manifest.toml` -- a manifest this
+    /// daemon REFUSES -- complete with a five-step "at launch, darwind ..."
+    /// sequence that never happened on any machine. It was moved to a shipped,
+    /// running app; NOTHING made that stick, so nothing stopped the next edit
+    /// putting a blocked app back in the one block authors copy.
+    ///
+    /// This does. It reads `[app].name` out of the fenced block that follows the
+    /// "## Worked example" heading -- bounded at BOTH ends (heading -> opening
+    /// fence -> closing fence), so it can neither self-match on the heading nor
+    /// run past the block into the rest of the document -- and requires that
+    /// app's REAL manifest to pass the SAME validator the loader runs. Point the
+    /// doc at fab-link or algo-core again and this test fails.
+    #[test]
+    fn the_sandbox_doc_worked_example_names_an_app_whose_manifest_validates() {
+        let doc = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/SANDBOX.md");
+        let text = std::fs::read_to_string(&doc).expect("docs/SANDBOX.md is present");
+        let after = text
+            .split_once("## Worked example")
+            .expect("docs/SANDBOX.md still has a Worked example section")
+            .1;
+        let fenced = after
+            .split_once("```toml")
+            .expect("the worked example still carries a toml block")
+            .1;
+        let block = fenced.split_once("```").expect("that toml block is closed").0;
+        // The window must not have bound to nothing (a bound-at-both-ends slice
+        // can bind so tightly it matches an empty string).
+        assert!(
+            block.contains("[app]") && block.contains("[permissions]"),
+            "the extracted example block is not a manifest -- the window slipped: {block:?}"
+        );
+        let name = block
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with("name"))
+            .and_then(|l| l.split_once('='))
+            .map(|(_, v)| v.trim().trim_matches('"').to_string())
+            .expect("the worked example declares [app].name");
+        assert!(!name.is_empty(), "the example names an app");
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../apps")
+            .join(&name)
+            .join("manifest.toml");
+        let raw = std::fs::read_to_string(&manifest_path).unwrap_or_else(|e| {
+            panic!("docs/SANDBOX.md's worked example is apps/{name}, which must be a real shipped app: {e}")
+        });
+        crate::plugin_sdk::validate_manifest(&raw, &name).unwrap_or_else(|e| {
+            panic!(
+                "docs/SANDBOX.md's worked example is apps/{name}, whose manifest the daemon REFUSES ({e}) \
+                 -- an author copying the schema doc's canonical example would build an app that can never load"
+            )
+        });
     }
 
     /// agent_tools() offers ONLY consequential=false declarations, sorted by

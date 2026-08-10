@@ -2130,6 +2130,42 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    // Operator/gate entrypoint: the SHARED review-confidence floor.
+    //
+    //   darwind --heal-confidence <report.md>
+    //
+    // The daemon refuses to PROPOSE a patch the adversarial reviewer scored
+    // below heal::CONFIDENCE_FLOOR. scripts/apply_heal.sh has to refuse to
+    // INSTALL one for the same reason — otherwise a proposal written by an older
+    // daemon, or one edited by hand, would be applied under a weaker bar than
+    // the one that would have blocked it being written. It calls this rather
+    // than grepping report.md in bash: a second parser and a second copy of the
+    // threshold is the two-gates-disagree defect this file has produced most,
+    // which is exactly why --split-heal-diff and --heal-responsiveness exist.
+    //
+    // Line 1 is the verdict word (ABOVE_FLOOR | BELOW_FLOOR | NO_SCORE), line 2
+    // the sentence for a human. Exit 0 on any verdict; exit 2 is reserved for
+    // bad usage / unreadable input, so a caller can tell "cannot judge this
+    // proposal" from "this command was called wrong".
+    if let Some(pos) = std::env::args().position(|a| a == "--heal-confidence") {
+        let report_path = std::env::args().nth(pos + 1).unwrap_or_default();
+        if report_path.trim().is_empty() {
+            eprintln!("usage: darwind --heal-confidence <report.md>");
+            std::process::exit(2);
+        }
+        let report = match std::fs::read_to_string(&report_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("cannot read {report_path}: {e}");
+                std::process::exit(2);
+            }
+        };
+        let (verdict, detail) = heal::confidence_gate(&report);
+        println!("{}", verdict.word());
+        println!("{detail}");
+        return Ok(());
+    }
+
     if let Some(pos) = std::env::args().position(|a| a == "--validate-forge-manifest") {
         let manifest_path = std::env::args().nth(pos + 1).unwrap_or_default();
         let app_name = std::env::args().nth(pos + 2).unwrap_or_default();
@@ -3014,8 +3050,13 @@ async fn main() -> Result<()> {
     // a SEPARATE, op-restricted socket the app reaches instead of holding direct
     // network egress. Only op=fetch, token-gated, host-allow-listed, SSRF/rebind
     // guarded, redirect-bounded, body-capped, and rate-limited — so no micro-app
-    // has direct network access and both INHERENT SBPL network caveats (coarse
-    // host filtering + DNS exfil) collapse. Started before autostart so it is
+    // has direct network access. (CORRECTED: this used to say the proxy collapses
+    // "both INHERENT SBPL network caveats (coarse host filtering + DNS exfil)".
+    // It collapses neither, because neither existed: SBPL has no host or IP
+    // filter, the rules that would have created those channels never compiled,
+    // and no app ever had an IP stack or a resolver. The proxy is not the better
+    // of two egress designs — it is the ONLY one. docs/SANDBOX.md → "A net scope
+    // is not grantable".) Started before autostart so it is
     // listening when the first app launches. The fetch.sock path is built exactly
     // like generate.sock above.
     {

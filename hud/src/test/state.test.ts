@@ -682,6 +682,7 @@ describe("self-heal events", () => {
         files: ["src/router.rs"],
         validated: true,
         confidence: 0.82,
+        confidence_floor: 0.25,
         subsystem: "router",
         signature: "route timeout",
       }),
@@ -691,6 +692,9 @@ describe("self-heal events", () => {
       files: ["src/router.rs"],
       validated: true,
       confidence: 0.82,
+      // The bar the score had to clear, as the DAEMON reports it — the HUD
+      // keeps no copy of the threshold.
+      confidenceFloor: 0.25,
       subsystem: "router",
       signature: "route timeout",
     });
@@ -708,6 +712,9 @@ describe("self-heal events", () => {
     );
     expect(s.healDiagnosing).not.toBeNull();
     s = tel(s, env("heal.proposal", { ts: 1765432200, files: ["src/audio.rs"], validated: true, confidence: 0.6 }));
+    // An older daemon sends no confidence_floor: it must come through as null,
+    // never as a number the HUD made up.
+    expect(s.healProposal?.confidenceFloor).toBeNull();
     // diagnosing is retired once the proposal lands
     expect(s.healDiagnosing).toBeNull();
     // subsystem/signature carried forward from the diagnosis
@@ -757,9 +764,23 @@ describe("self-heal events", () => {
     let s = tel(connected(), env("heal.diagnosing", { signature: "x", subsystem: "router", files: [] }));
     s = tel(s, env("heal.rejected", { ts: 1765432100, stage: "cargo_check" }));
     expect(s.healAlert?.kind).toBe("rejected");
+    // An unknown token still falls back to the raw stage.
     expect(s.healAlert?.detail).toBe("STAGE: cargo_check");
     expect(s.healDiagnosing).toBeNull();
     expect(s.healProposal).toBeNull();
+  });
+
+  it("a below-floor rejection does not read as a gate failure", () => {
+    // "STAGE: confidence" and "STAGE: deadline" say OPPOSITE things about what
+    // happened, and NEITHER of them is "a gate failed" — but the banner rendered
+    // the bare token, which an operator reads as "the model drafted bad
+    // patches". This is the one surface that tells them otherwise.
+    let s = tel(connected(), env("heal.rejected", { ts: 1, stage: "confidence" }));
+    expect(s.healAlert?.detail).toContain("REVIEW FLOOR");
+    expect(s.healAlert?.detail).toContain("passed every staged gate");
+    s = tel(connected(), env("heal.rejected", { ts: 2, stage: "deadline" }));
+    expect(s.healAlert?.detail).toContain("BUDGET");
+    expect(s.healAlert?.detail).toContain("NOT a verdict");
   });
 
   it("heal.blocked raises a red alert with the reason and clears diagnosing", () => {

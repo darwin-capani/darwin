@@ -413,7 +413,7 @@ mod tests {
         let b = parse_battery("Now drawing from 'AC Power'");
         assert_eq!(b.percent, None, "no battery line => None, never a fabricated low");
         // Desktop on AC is a REAL read of AC power (Some(true)), distinct from a
-        // read failure (None) — see `to_json_read_miss_on_ac_is_null`.
+        // read failure (None) — see `to_json_read_miss_on_ac_is_null_not_fabricated_true`.
         assert_eq!(b.on_ac, Some(true));
         assert_eq!(b.state, BatteryState::Unknown);
     }

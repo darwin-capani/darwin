@@ -7203,7 +7203,10 @@ async fn execute_mcp_tool(
     // q=<the user's remembered facts>" POSTs those facts straight to the server's
     // remote host. Refuse it BEFORE any transport is touched whenever the
     // arguments would leave the device (`server_reaches_network`: an http server,
-    // or a stdio server granted outbound hosts). A CONSEQUENTIAL tool is NOT
+    // or a stdio server that DECLARES `net_hosts` — no profile ever GRANTS a host
+    // and such a server is now refused at connect, so that arm is fail-safe cover
+    // for a config that asked for egress, never a description of one that got it).
+    // A CONSEQUENTIAL tool is NOT
     // refused here: it parks for a fresh human confirm that shows the exact
     // arguments (its DryRun preview performs no call), which is the stronger gate.
     // A user-originated call (call 0) is unaffected.
@@ -21144,10 +21147,35 @@ mod tests {
         let end = body.find("\nfn proposal_ts(").expect("run_forge_app body end");
         let body = &body[..end];
 
-        // The tool path drafts via the PROPOSE-ONLY core, not the deploy step.
+        // The tool path drafts via the PROPOSE-ONLY core, not the deploy step —
+        // ON A CODE LINE. This body OPENS with a comment reading "We call the
+        // Memory-free core forge::forge_draft directly (not forge_app)", so a
+        // whole-body `contains` was satisfied by PROSE alone. PROVED: rewriting the
+        // call as `crate::forge :: forge_draft(` — same function, same behaviour,
+        // no longer spelled with the needle — left this assertion GREEN with the
+        // only textual evidence of the propose-only core being a sentence. The
+        // sibling loop below already reads code lines only; this one did not.
+        let code: Vec<&str> = body
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .collect();
         assert!(
-            body.contains("forge::forge_draft"),
-            "the tool must drive the PROPOSE-ONLY core forge_draft"
+            code.iter().any(|l| l.contains("crate::forge::forge_draft(")),
+            "the tool must CALL the PROPOSE-ONLY core forge_draft on a CODE line — a \
+             comment naming it is not the call"
+        );
+        // NEGATIVE PIN: the comment-skip is what makes the assertion above mean
+        // anything HERE, so prove the filter is doing work. If the prose copy ever
+        // goes away this fires, and whoever removes it re-reads the line above
+        // instead of inheriting a guard that quietly went back to reading comments.
+        assert!(
+            body.lines().any(|l| {
+                let t = l.trim_start();
+                t.starts_with("//") && t.contains("forge::forge_draft")
+            }),
+            "the prose occurrence this guard must NOT count has moved; re-check that \
+             the code-line filter above is still doing any work"
         );
         // It must NOT construct a live apps/ path, write to apps/, or shell out
         // to the apply script (deploy is ONLY the human's manual command).

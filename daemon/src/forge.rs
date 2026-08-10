@@ -83,10 +83,18 @@ const VALIDATE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Report tail kept from validation output (chars).
 const REPORT_TAIL_CHARS: usize = 4000;
 
-/// A forged app may declare at most this many outbound hosts. A larger ask is
-/// rejected as over-broad (a freshly-authored app with no track record has no
-/// business reaching dozens of hosts).
-const MAX_NET_HOSTS: usize = 6;
+/// A forged app may declare at most this many FETCH-PROXY hosts (`fetch_hosts`).
+/// A larger ask is rejected as over-broad (a freshly-authored app with no track
+/// record has no business reaching dozens of hosts). NOTE these are not hosts the
+/// APP reaches — the daemon reaches them on its behalf; the app itself has a flat
+/// `(deny network*)`.
+///
+/// NAMED FOR WHAT IT BOUNDS. It was `MAX_NET_HOSTS` and was left pointing at
+/// `fetch_hosts` when the net scope was refused — a name asserting a `net_hosts`
+/// ceiling that no longer exists, since no non-empty `net_hosts` is accepted at
+/// all and there is nothing left to cap. Same correction as
+/// `apps.rs::MAX_APP_FETCH_HOSTS`.
+const MAX_FORGE_FETCH_HOSTS: usize = 6;
 
 /// Largest single authored source file we accept (bytes). A wildly large file
 /// is a sign the model went off the rails; reject rather than stage it.
@@ -177,7 +185,7 @@ fn draft_prompt(goal: &str) -> String {
          - fs_read: only paths inside the project (relative, no \"..\", no leading \"/\"). Prefer none.\n\
          - net_hosts: NEVER declare this. A direct-egress net scope is not grantable and the \
            manifest will be refused. If the app must reach the network, declare the hostnames in \
-           fetch_hosts (at most {MAX_NET_HOSTS}) and read state/ipc/apps/fetch.sock instead.\n\
+           fetch_hosts (at most {MAX_FORGE_FETCH_HOSTS}) and read state/ipc/apps/fetch.sock instead.\n\
          - The app MUST build and pass `cargo test` (Rust) / py_compile (python) OFFLINE, with no \
            network and no new system dependencies.\n\n\
          Author the complete bundle now.",
@@ -418,9 +426,11 @@ fn validate_permissions(name: &str, p: &PermissionsSection) -> Result<()> {
 
     // A NET SCOPE IS REFUSED OUTRIGHT -- there is nothing to shape.
     //
-    // This replaces a count cap (`MAX_NET_HOSTS`) and a bare-hostname check that
-    // are now dead code: both only ever ran on a non-empty list, and a non-empty
-    // list is no longer a validatable state anywhere in the daemon. Keeping them
+    // This replaces a count cap and a bare-hostname check that are now dead code
+    // for THIS key: both only ever ran on a non-empty list, and a non-empty list
+    // is no longer a validatable state anywhere in the daemon. (The cap itself
+    // survives under its honest name, `MAX_FORGE_FETCH_HOSTS`, bounding
+    // `fetch_hosts` — the route that actually works.) Keeping them
     // would imply a well-formed `net_hosts` exists, which is the belief that
     // shipped two unlaunchable apps.
     if !p.net_hosts.is_empty() {
@@ -430,11 +440,11 @@ fn validate_permissions(name: &str, p: &PermissionsSection) -> Result<()> {
     // bare-hostname ceiling of its own. A forged app may declare it
     // (the proxy is strictly safer than direct egress — https-only, exact-host,
     // SSRF/rebind-guarded), but never a malformed or over-broad list.
-    if p.fetch_hosts.len() > MAX_NET_HOSTS {
+    if p.fetch_hosts.len() > MAX_FORGE_FETCH_HOSTS {
         bail!(
             "over-broad permission: fetch_hosts requests {} hosts (max {} for a forged app)",
             p.fetch_hosts.len(),
-            MAX_NET_HOSTS
+            MAX_FORGE_FETCH_HOSTS
         );
     }
     for h in &p.fetch_hosts {
@@ -1739,7 +1749,7 @@ mod tests {
         // over-long list is rejected. This is the route net_hosts authors are
         // now sent to, so its bounds are load-bearing.
         assert!(validate_permissions("tool", &perms(|p| p.fetch_hosts = vec!["api.example.com".into()])).is_ok());
-        let many_fetch: Vec<String> = (0..MAX_NET_HOSTS + 1).map(|i| format!("f{i}.example.com")).collect();
+        let many_fetch: Vec<String> = (0..MAX_FORGE_FETCH_HOSTS + 1).map(|i| format!("f{i}.example.com")).collect();
         assert!(validate_permissions("tool", &perms(|p| p.fetch_hosts = many_fetch)).is_err());
         assert!(validate_permissions("tool", &perms(|p| p.fetch_hosts = vec!["https://x.com".into()])).is_err());
         assert!(validate_permissions("tool", &perms(|p| p.fetch_hosts = vec!["x.com:443".into()])).is_err());
@@ -2569,14 +2579,69 @@ mod validation_sandbox_tests {
         let rest = &body[i..];
         let end = rest.find("\n}\n").map(|e| e + 2).unwrap_or(rest.len());
         let f = &rest[..end];
+        // THE FAIL-CLOSED GUARD ITSELF, not "some bail! somewhere in run_capture".
+        // run_capture holds a SECOND `bail!` — the timeout arm at the bottom — so
+        // `f.contains("bail!")` was satisfied with the seatbelt check DELETED, and
+        // `f.contains("SANDBOX_EXEC")` stayed true because the spawn still names the
+        // binary. PROVED: replacing
+        //     if !Path::new(SANDBOX_EXEC).exists() { bail!(...) }
+        // with a warn-and-continue left BOTH old assertions green, on the one spawn
+        // in this daemon that compiles and runs code an untrusted cloud model wrote.
+        let check = f
+            .find("if !Path::new(crate::shell::SANDBOX_EXEC).exists() {")
+            .expect(
+                "run_capture must TEST for the seatbelt before spawning — without that \
+                 check a missing sandbox-exec is never detected, and validation runs \
+                 model-authored code unconfined",
+            );
+        let branch = &f[check..];
+        let branch_end = branch
+            .find("\n    }\n")
+            .expect("the seatbelt-missing branch must close at run_capture's own indent");
+        // ...ON A CODE LINE. AMENDMENT (adversary re-probe): the hardened form
+        // above is still a whole-region `contains`, which is the exact PROSE MATCH
+        // shape this same ledger fixed in anthropic.rs and heal.rs — left in place
+        // on the one seam that matters most. PROVED: with the fix applied,
+        //     if !Path::new(crate::shell::SANDBOX_EXEC).exists() {
+        //         // NOTE: we used to bail! here; the host is trusted, so warn instead.
+        //         eprintln!(...);
+        //     }
+        // ran GREEN (`test result: ok. 1 passed`). That is not a contrived input: a
+        // developer who deletes a fail-closed branch writes exactly that sentence,
+        // and the branch then runs model-authored code with the sandbox gone.
+        let branch_code: Vec<&str> = branch[..branch_end]
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//"))
+            .collect();
         assert!(
-            f.contains("SANDBOX_EXEC"),
-            "validation no longer runs under the seatbelt"
+            branch_code.iter().any(|l| l.contains("bail!")),
+            "the seatbelt-missing branch does not bail ON A CODE LINE; a comment \
+             recording that it used to is not the check, and failing open is how \
+             unconfined execution comes back:\n{}",
+            &branch[..branch_end]
         );
+        // OVER-MATCH PIN. The branch window is bounded at BOTH ends, and the second
+        // bound is the thing that makes the assertion above mean anything: if
+        // `\n    }\n` ever stops closing THIS branch, the window runs on through
+        // run_capture and finds the TIMEOUT arm's `bail!` instead — the original
+        // vacuity, re-created by a bound rather than by a needle. A window that
+        // reaches the spawn is that window.
         assert!(
-            f.contains("bail!"),
-            "a missing seatbelt must be an ERROR; failing open is how unconfined \
-             execution comes back"
+            !branch[..branch_end].contains("tokio::process::Command::new"),
+            "the seatbelt-missing branch window has run past the branch it bounds \
+             (it now reaches the spawn), so the assertion above can be satisfied by a \
+             `bail!` that belongs to some other arm; re-bound it:\n{}",
+            &branch[..branch_end]
+        );
+        // ...and the check must sit BEFORE the spawn it guards: a test after the
+        // process starts is not a test.
+        let spawn = f
+            .find("tokio::process::Command::new(crate::shell::SANDBOX_EXEC)")
+            .expect("validation no longer spawns under the seatbelt");
+        assert!(
+            check < spawn,
+            "the seatbelt check runs AFTER the spawn, which is not a check"
         );
     }
 }

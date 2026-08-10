@@ -1,11 +1,13 @@
 import { describe, expect, it } from "vitest";
 import {
   applyReduce,
+  confidenceNote,
   confidencePct,
   confirmReady,
   initialApplyState,
   litSegments,
   REARM_MS,
+  reviewVerdict,
   stageLabel,
   type ApplyState,
 } from "../core/heal";
@@ -180,12 +182,88 @@ describe("apply lifecycle", () => {
 
 describe("stage labels", () => {
   it("maps script stage tokens to human spinner text", () => {
-    expect(stageLabel("revalidating")).toMatch(/cargo check \+ full test/i);
+    // THE LABEL MUST NAME THE GATES THAT RUN. It said "cargo check + full
+    // test" long after the script grew clippy -D warnings, the mutation probe
+    // and the review-confidence floor — understating what the operator's click
+    // was doing by three gates. Assert each of them by name.
+    const revalidating = stageLabel("revalidating");
+    for (const gate of ["clippy", "test", "mutation", "review floor"]) {
+      expect(revalidating.toLowerCase()).toContain(gate);
+    }
     expect(stageLabel("applying")).toBe("Applying…");
     expect(stageLabel("rebuilding")).toBe("Rebuilding…");
     expect(stageLabel("")).toBe("Starting…");
     expect(stageLabel("starting…")).toBe("Starting…");
     // unknown token still renders something sensible
     expect(stageLabel("whatever")).toBe("whatever…");
+  });
+});
+
+/* ------------------------------------------------------------------------ *
+ * The review score against its FLOOR, and the reviewer's own sentence.
+ *
+ * The gauge used to render a bare percentage: 8% and 88% looked like the same
+ * kind of fact next to an ACCEPT & APPLY button, and the adversarial review is
+ * the ONLY stage in the pipeline that judges whether the patch is a good idea
+ * (every staged gate is mechanical and blind to the diagnosis).
+ * ------------------------------------------------------------------------ */
+describe("review confidence against the daemon's floor", () => {
+  it("calls out a score BELOW the floor and names the bar", () => {
+    const note = confidenceNote(0.1, 0.25);
+    expect(note.belowFloor).toBe(true);
+    expect(note.text).toContain("10%");
+    expect(note.text).toContain("25%");
+    expect(note.text.toUpperCase()).toContain("BELOW");
+  });
+
+  it("a score at or above the floor is not a warning", () => {
+    expect(confidenceNote(0.82, 0.25).belowFloor).toBe(false);
+    // INCLUSIVE AT THE BAR, exactly like heal::meets_confidence_floor
+    // (`confidence >= CONFIDENCE_FLOOR`). An exclusive comparison here would
+    // paint the one score the daemon deliberately allows as a failure.
+    expect(confidenceNote(0.25, 0.25).belowFloor).toBe(false);
+    expect(confidenceNote(0.82, 0.25).text).toContain("floor 25%");
+  });
+
+  it("NEVER invents a floor the daemon did not send", () => {
+    // An older daemon sends no confidence_floor. Rendering a hard-coded one
+    // here would be a second copy of a threshold — the drift shape this whole
+    // change exists to avoid.
+    const note = confidenceNote(0.05, null);
+    expect(note.belowFloor).toBe(false);
+    expect(note.text).toContain("5%");
+    expect(note.text).toMatch(/not reported/i);
+    expect(confidenceNote(null, 0.25).text).toMatch(/no score/i);
+  });
+});
+
+describe("the reviewer's verdict, extracted from report.md", () => {
+  const report = [
+    "# Self-heal proposal — 1765432100",
+    "",
+    "- review confidence: 0.82 (floor 0.25 — cleared)",
+    "",
+    "## Adversarial review verdict",
+    "",
+    "Fixes the root cause; the guard is in the wrong layer but harmless.",
+    "",
+    "## Validation output (tail)",
+    "",
+    "```",
+    "$ cargo test",
+    "```",
+  ].join("\n");
+
+  it("returns the verdict section, and NOTHING after it", () => {
+    const v = reviewVerdict(report);
+    expect(v).toBe("Fixes the root cause; the guard is in the wrong layer but harmless.");
+    // A window bounded only at its head runs on into the validation tail and
+    // the fenced diff below it — the too-wide-window trap.
+    expect(v).not.toContain("cargo test");
+  });
+
+  it("returns empty for a report with no verdict section", () => {
+    expect(reviewVerdict("# Self-heal REJECTED — 1\n\nno candidate passed")).toBe("");
+    expect(reviewVerdict("")).toBe("");
   });
 });

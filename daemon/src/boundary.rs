@@ -573,8 +573,9 @@ static TURN_TRIM: Mutex<Option<TrimSpec>> = Mutex::new(None);
 /// anthropic::response_voice's set/clear/TurnLangGuard, which main.rs installs in
 /// run_pipeline). The read side ([`gate_and_trim`] -> [`current_turn_trim`]) is
 /// already live; wiring the command arm + the run_pipeline guard install is the
-/// integration step. Fully exercised by the `per_turn_override_takes_precedence`
-/// test, so the mechanism is proven even before the arm lands.
+/// integration step. Fully exercised by the
+/// `per_turn_override_takes_precedence_and_clears` test, so the mechanism is
+/// proven even before the arm lands.
 #[allow(dead_code)]
 pub fn set_turn_trim(spec: Option<TrimSpec>) {
     *TURN_TRIM.lock().unwrap_or_else(|p| p.into_inner()) = spec;

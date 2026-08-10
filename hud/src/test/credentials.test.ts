@@ -298,6 +298,30 @@ describe("panel scope hints (UI-only, outside the lockstep registry)", () => {
     );
   });
 
+  // REGRESSION: the ElevenLabs hint used to read "OFF by default: the cloud
+  // voice tier ships disabled". It is not off — config/darwin.toml and
+  // config.rs both ship [voice].cloud_tier = true and [voice].cloud_stt = true,
+  // and [voice].voices already maps darwin to a premade EL voice. The tier is
+  // inert ONLY because the key is missing, so pasting the key IS the activation
+  // and the owner has to be told that at the field, not after the fact.
+  it("tells the truth about the EL cloud tier: pasting the key ACTIVATES it", () => {
+    const hint = hintForId("elevenlabs_api_key") ?? "";
+    expect(hint).not.toBe("");
+    const low = hint.toLowerCase();
+    // NEGATIVE PIN — the false reassurances, in any of their shapes.
+    expect(low).not.toContain("off by default");
+    expect(low).not.toContain("ships disabled");
+    expect(low).not.toContain("ships off");
+    expect(low).not.toContain("disabled by default");
+    // POSITIVE PIN — it must name the tier as shipped-ON, say that adding the
+    // key activates it, and disclose the separate VOICE AUDIO switch.
+    expect(low).toContain("ships on");
+    expect(low).toContain("activates");
+    expect(low).toContain("cloud_stt");
+    expect(low).toContain("voice audio");
+    expect(low).toContain("leaves the device");
+  });
+
   it("tells the user where the Google client id comes from", () => {
     expect(hintForId("google_client_id")).toContain("Desktop app");
     expect(hintForId("google_client_id")).toContain(
@@ -380,6 +404,33 @@ describe("panel scope hints (UI-only, outside the lockstep registry)", () => {
     expect(hint).toContain("Google Maps Platform");
     // Honest scope: reads routes/places/times, never books or pays.
     expect(hint.toLowerCase()).toContain("never books or pays");
+  });
+
+  // REGRESSION: this hint used to send the owner off to provision a BILLED
+  // Google Maps Platform key ("with Directions, Places, and Distance Matrix
+  // enabled") and promise "VOYAGER reads routes, places, and travel times" —
+  // while daemon/src/integrations/maps.rs carries a measured KNOWN
+  // NON-FUNCTIONAL banner: the legacy maps.googleapis.com endpoints read the
+  // key from ?key= ONLY, DARWIN sends X-Goog-Api-Key because SECURITY.md §8
+  // forbids a credential in a URL, so Google sees no credential, every
+  // voyager_* call returns REQUEST_DENIED, and map_provider_status renders
+  // "check your Maps Platform API key … in Settings" — blaming a correct key
+  // that was never read. The credential FIELD is where that has to be said.
+  it("warns at the Maps field that the key does not work yet, and why", () => {
+    const low = (hintForId("maps_api_key") ?? "").toLowerCase();
+    expect(low).not.toBe("");
+    // POSITIVE PINS — the four facts an owner needs before paying Google.
+    expect(low).toContain("not working today");
+    expect(low).toContain("not your key");
+    expect(low).toContain("request_denied");
+    expect(low).toContain("maps.googleapis.com");
+    // NEGATIVE PIN — the bare unqualified promise must not come back. The
+    // capability sentence may stay, but only alongside the warning above.
+    const promise = "voyager reads routes, places, and travel times";
+    const warned =
+      low.indexOf("not working today") < low.indexOf(promise) ||
+      !low.includes(promise);
+    expect(warned).toBe(true);
   });
 
   it("tells the user where the HIBP key comes from and that AEGIS is defensive", () => {

@@ -40,8 +40,11 @@
 //!   * SANDBOXED (stdio) / TLS-TRUSTED (http). For a LOCAL stdio server,
 //!     [`stdio_sandbox_profile`] derives a default-deny seatbelt (SBPL) profile —
 //!     reusing apps.rs's `(deny default)` + `bsd.sb` base + `sbpl_str` quoting —
-//!     that grants ONLY the exec, the filesystem subpaths, and the network
-//!     host-names the server's config declares. A REMOTE http server CANNOT be
+//!     that grants ONLY the exec and the filesystem subpaths the server's config
+//!     declares, and NO NETWORK AT ALL — `(deny network*)` is unconditional,
+//!     because macOS SBPL has no host or IP filtering primitive, so a `net_hosts`
+//!     list is not a narrowing this OS can express. A server that declares one is
+//!     REFUSED before it is spawned ([`MCP_NET_SCOPE_REFUSAL`]). A REMOTE http server CANNOT be
 //!     SBPL-sandboxed (it runs elsewhere — there is no local process to wrap);
 //!     its layers are instead TLS (https-only), Keychain bearer auth, the bounded
 //!     SSE read, and the SAME gate + per-agent allowlist + per-call bounds as
@@ -91,6 +94,61 @@ pub const PROTOCOL_VERSION: &str = "2024-11-05";
 /// orchestrator included ([`McpManager::agent_may_use`]). Kept in lockstep with
 /// agents.rs by a test.
 const ORCHESTRATOR: &str = "darwin";
+
+/// THE ONE REFUSAL MESSAGE for a **stdio** MCP server that declares `net_hosts`.
+/// Sibling of [`crate::apps::NET_SCOPE_REFUSAL`] (micro-apps) — same root cause,
+/// a DIFFERENT remedy, because an MCP server has no fetch proxy to route through.
+/// Shared verbatim by both gates that can see one: config load
+/// ([`crate::config::Config::parse`]) and the connect gate
+/// ([`McpManager::connectable_servers`]).
+///
+/// WHY REFUSED AND NOT COLLAPSED TO A SILENT DENY: macOS SBPL has no host or IP
+/// filtering primitive. `(remote tcp (host-name "x"))` is rejected by the
+/// compiler, so a non-empty `net_hosts` made `stdio_sandbox_profile` emit a
+/// profile `sandbox-exec` refuses (exit 65) and the server NEVER STARTED — a
+/// silent spawn failure with nothing naming the cause. The three candidate end
+/// states were: refuse, start-with-no-network, or leave it. Starting the server
+/// while silently ignoring a declared restriction is the worst of the three — it
+/// is exactly the "claims a rule the code does not enforce" defect this refusal
+/// exists to close, and an operator who wrote a host list would believe a filter
+/// was live. So the declaration is refused, loudly, and the server does not run.
+pub const MCP_NET_SCOPE_REFUSAL: &str = "`net_hosts` is not grantable for a stdio MCP server: macOS SBPL has \
+     no host or IP filtering primitive, so a non-empty list produces a sandbox profile the OS refuses to \
+     compile (exit 65) and the server never starts at all. There is no non-empty value that works, so the \
+     key is refused rather than shaped, and this server will NOT be connected. Remove `net_hosts` to run it \
+     sandboxed with no outbound network — that is the only network posture a seatbelt profile can express \
+     here. A stdio server that genuinely needs the network cannot be sandboxed by DARWIN; whether to run it \
+     unsandboxed as a remote `transport = \"http\"` server (TLS + Keychain token, explicitly NOT sandboxed) \
+     is an operator decision, not a substitute grant. See docs/SANDBOX.md.";
+
+/// THE ONE MESSAGE for `net_hosts` on an **http** MCP server, where the key is
+/// not merely unenforceable but wholly INERT: an http server runs on someone
+/// else's machine, so there is no local process to wrap and no filter is applied
+/// to anything. Reported (the operator is told the restriction is fiction) but
+/// NOT refused — unlike stdio, an http server with this key set works today, and
+/// refusing it would break a live config to fix a comment.
+pub const MCP_NET_SCOPE_INERT_HTTP: &str = "`net_hosts` has NO effect on an `http` MCP server: the server \
+     runs on someone else's machine, so there is no local process to sandbox and no host filter is applied \
+     to it at all. Remove the key — leaving it asserts a restriction nothing enforces. (On a `stdio` server \
+     the same key is refused outright.) See docs/SANDBOX.md.";
+
+/// Does this server config declare a net scope this daemon cannot honour, and if
+/// so what should the operator be told? PURE — the single decision both the
+/// config-load reporter and the connect gate read, so the two can never drift.
+///
+/// Returns `None` for the only healthy state (`net_hosts` empty, either
+/// transport). `Some((refuse, message))` otherwise, where `refuse` is true only
+/// for stdio: a stdio server with a net scope is not connected at all, while an
+/// http server keeps working and is merely told the key is fiction.
+pub fn net_scope_verdict(s: &McpServerConfig) -> Option<(bool, &'static str)> {
+    if s.net_hosts.is_empty() {
+        return None;
+    }
+    match s.transport {
+        McpTransportKind::Stdio => Some((true, MCP_NET_SCOPE_REFUSAL)),
+        McpTransportKind::Http => Some((false, MCP_NET_SCOPE_INERT_HTTP)),
+    }
+}
 
 // ===========================================================================
 // Result / classification types
@@ -1198,8 +1256,15 @@ impl McpManager {
 
     /// The servers config admits to connect, after the master switch + bounds:
     /// empty when disabled; otherwise the first `max_servers` configured servers
-    /// whose names are valid. Pure (no IO), so the gating is unit-testable without
-    /// spawning anything.
+    /// whose names are valid AND which do not declare an ungrantable net scope.
+    /// Pure (no IO), so the gating is unit-testable without spawning anything.
+    ///
+    /// NET SCOPE = REFUSED, NOT DOWNGRADED. A stdio server declaring `net_hosts`
+    /// is dropped here (see [`MCP_NET_SCOPE_REFUSAL`]) rather than started with a
+    /// silently-denied network: it could never have started anyway (its profile
+    /// failed to compile), and starting it while ignoring the declaration would
+    /// leave the operator believing a host filter was enforcing something. The
+    /// refusal is announced by `connect_all`, which walks the SAME verdict.
     pub fn connectable_servers(&self) -> Vec<&McpServerConfig> {
         // `self.enabled()`, NOT `self.cfg.enabled` — the lockdown overlay must
         // cover the CONNECT path too. `call_tool` and `tool_defs_for_agent` were
@@ -1218,6 +1283,11 @@ impl McpManager {
             .servers
             .iter()
             .filter(|s| mcp_token_account(&s.name).is_some()) // valid name shape
+            // An ungrantable net scope is refused, not downgraded. `refuse` is
+            // true only for stdio; an http server keeps connecting (the key is
+            // inert there, and breaking a working remote server to correct a
+            // comment would be a worse trade).
+            .filter(|s| !matches!(net_scope_verdict(s), Some((true, _))))
             .take(self.cfg.max_servers)
             .collect()
     }
@@ -1245,6 +1315,22 @@ impl McpManager {
         if !self.enabled() {
             info!("mcp: disabled (config or lockdown) — no server connected");
             return Ok(());
+        }
+        // NET SCOPE — SAY IT OUT LOUD. `connectable_servers` has already dropped
+        // every stdio server declaring `net_hosts`; a drop with no explanation is
+        // the silent failure this whole change exists to end, so announce each one
+        // (and each inert http declaration) with the SAME verdict the gate used.
+        // Config load has already surfaced these as `config.invalid` for the HUD;
+        // this is the boot-log half, for the operator reading `darwind` output.
+        for s in &self.cfg.servers {
+            if let Some((refuse, msg)) = net_scope_verdict(s) {
+                warn!(
+                    server = %s.name,
+                    refused = refuse,
+                    "mcp: {}",
+                    msg
+                );
+            }
         }
         let timeout = Duration::from_millis(self.cfg.call_timeout_ms);
         let max_tools = self.cfg.max_tools_per_server;
@@ -1401,9 +1487,17 @@ impl McpManager {
 
     /// Do this server's tool ARGUMENTS leave the device when it is called? TRUE for
     /// an `http` server (they are POSTed to the remote endpoint) and for a stdio
-    /// server whose sandbox profile grants outbound hosts (`net_hosts`); FALSE only
-    /// for a local subprocess with `(deny network*)`. FAIL-SAFE: an unknown server
-    /// counts as reaching the network.
+    /// server that DECLARES `net_hosts`; FALSE only for a local subprocess with
+    /// `(deny network*)`. FAIL-SAFE: an unknown server counts as reaching the
+    /// network.
+    ///
+    /// The `net_hosts` arm is now a DECLARATION check, not a profile-grant check:
+    /// no profile ever grants a host (the generator denies network unconditionally)
+    /// and such a stdio server is refused at connect, so this arm should be
+    /// unreachable in practice. It is kept TRUE deliberately — the conservative
+    /// answer for a config that asked for egress — because this predicate feeds the
+    /// prompt-injection egress guard, where guessing "no network" is the unsafe
+    /// direction.
     ///
     /// The prompt-injection egress guard uses this: on a tool CONTINUATION the
     /// model may be acting on instructions inside fetched/MCP/email content, and a
@@ -1646,12 +1740,20 @@ pub fn is_mcp_flat_name(name: &str) -> bool {
 /// <command> <args...>`. Writes the derived profile to a per-server file under
 /// `state/mcp/` and returns `(sandbox-exec, [-f, profile, command, args...])`.
 ///
-/// RESIDUAL TRUST (honest): `sandbox-exec` is deprecated-but-functional on macOS
-/// and the same coarse-DNS / shared-CDN caveats apps.rs documents apply here. The
-/// profile bounds the server's filesystem + network to what its config declares;
-/// it does NOT make an untrusted server safe — the gate + allowlist + bounds are
-/// the other layers. A server whose binary itself is malicious is constrained,
-/// not neutralized.
+/// RESIDUAL TRUST (honest): `sandbox-exec` is deprecated-but-functional on macOS.
+/// The profile bounds the server's FILESYSTEM to what its config declares and
+/// grants NO network at all; it does NOT make an untrusted server safe — the
+/// gate, the per-agent allowlist and the per-call bounds are the other layers. A
+/// server whose binary itself is malicious is constrained, not neutralized.
+///
+/// CORRECTED (this doc was left behind by the net-scope refusal): it used to cite
+/// "the same coarse-DNS / shared-CDN caveats apps.rs documents" and claim the
+/// profile bounds the server's NETWORK to what its config declares. Neither is
+/// true and neither ever was — SBPL has no host or IP filtering primitive,
+/// apps.rs documents no such caveats any more, and [`stdio_sandbox_profile`]
+/// emits a flat `(deny network*)` whatever the config says. A server that
+/// declares `net_hosts` never reaches this function ([`MCP_NET_SCOPE_REFUSAL`]).
+/// docs/SANDBOX.md → *A net scope is not grantable*.
 fn sandbox_wrapped_argv(
     s: &McpServerConfig,
     project_root: &Path,
@@ -1679,8 +1781,13 @@ fn sandbox_wrapped_argv(
 ///   * exec of the server command + its own directory,
 ///   * read of the command's dir + each declared `fs_read` subpath,
 ///   * write of each declared `fs_write` subpath,
-///   * outbound TCP to each declared `net_hosts` host (+ DNS); EMPTY net_hosts =>
-///     `(deny network*)` — no network at all.
+///   * NO network at all — `(deny network*)`, UNCONDITIONALLY. There is no
+///     `net_hosts` branch: macOS SBPL has no host or IP filter, so the rules this
+///     generator used to emit for a non-empty list did not compile and the server
+///     never started (exit 65). Such a server is now refused before it is spawned
+///     ([`MCP_NET_SCOPE_REFUSAL`]); the branch is DELETED here as well so no
+///     input — including a config built in-process that skipped the gate — can
+///     produce a profile the OS rejects.
 ///     Everything else — the mic, GPU, the rest of the filesystem, the memory DB,
 ///     secrets — stays denied by the opener. PURE (no IO), so the profile is fully
 ///     unit-testable, mirroring apps.rs's `generate_sbpl`.
@@ -1731,31 +1838,18 @@ pub fn stdio_sandbox_profile(s: &McpServerConfig, project_root: &Path) -> String
     }
 
     // --- network -------------------------------------------------------
-    // Same last-match-wins discipline as apps.rs: deny network*, then re-allow
-    // DNS + the declared host-names. Empty net_hosts => no network at all.
-    if s.net_hosts.is_empty() {
-        p.push_str("\n;; net_hosts = [] -> no outbound network at all.\n");
-        p.push_str("(deny network*)\n");
-    } else {
-        p.push_str("\n;; net_hosts non-empty -> outbound TCP to the listed hosts\n");
-        p.push_str(";; only, plus DNS. CAVEAT: SBPL host-name filtering is coarse\n");
-        p.push_str(";; (cannot pin the resolved IP) and allowing DNS opens a side\n");
-        p.push_str(";; channel — see docs/SANDBOX.md. This RAISES the bar, it does\n");
-        p.push_str(";; not close it.\n");
-        p.push_str("(system-network)\n");
-        p.push_str("(deny network*)\n");
-        p.push_str("(allow network-outbound (remote udp \"*:53\"))\n");
-        p.push_str("(allow network-outbound (remote tcp \"*:53\"))\n");
-        let mut hosts: Vec<&str> = s.net_hosts.iter().map(String::as_str).collect();
-        hosts.sort_unstable();
-        hosts.dedup();
-        for host in hosts {
-            p.push_str(&format!(
-                "(allow network-outbound (remote tcp (host-name {})))\n",
-                sbpl_str(Path::new(host))
-            ));
-        }
-    }
+    // NO NETWORK, UNCONDITIONALLY — mirrors apps.rs's `generate_sbpl`. A host
+    // allow-list is not expressible in SBPL, so there is nothing to branch on:
+    // the old non-empty arm emitted `(remote tcp (host-name …))`, which the
+    // profile compiler rejects outright ("host must be * or localhost"), taking
+    // the whole profile with it. A server that declares `net_hosts` is refused
+    // before it reaches this function (see `MCP_NET_SCOPE_REFUSAL`); deleting the
+    // branch means even an in-process config that bypassed that gate still gets a
+    // profile that COMPILES and grants nothing.
+    p.push_str("\n;; NO outbound network, always: a host allow-list is not a thing\n");
+    p.push_str(";; SBPL can express, so `net_hosts` is refused at config load and\n");
+    p.push_str(";; no host filter is ever emitted here. docs/SANDBOX.md.\n");
+    p.push_str("(deny network*)\n");
 
     // Note: project_root is accepted for parity with apps.rs and future grants
     // (e.g. a per-server socket); referenced here so the signature is stable.
@@ -3135,15 +3229,139 @@ data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"mine\":true}}\n\
         assert!(profile.contains("(deny device-microphone)"));
     }
 
+    /// THIS TEST USED TO ASSERT THE BUG. It required the profile to contain
+    /// `(host-name "api.weather.example")` and a `*:53` DNS allow — the exact
+    /// rules macOS refuses to compile, which made `sandbox-exec` reject the whole
+    /// profile (exit 65) so the server never started. It passed for as long as it
+    /// existed because it only ever asked the generator to agree with itself; no
+    /// test handed the text to the profile compiler. It now asserts the opposite:
+    /// a declared `net_hosts` produces NO host filter, NO DNS, NO
+    /// `(system-network)` — just the same flat deny an empty list produces.
     #[test]
-    fn stdio_sandbox_profile_grants_only_declared_hosts() {
+    fn stdio_sandbox_profile_never_emits_a_host_filter_even_when_hosts_declared() {
         let mut s = server("weather");
         s.command = "/opt/mcp/weather".into();
         s.net_hosts = vec!["api.weather.example".into()];
         let profile = stdio_sandbox_profile(&s, Path::new("/r"));
-        assert!(profile.contains("(host-name \"api.weather.example\")"));
-        // DNS allowed (with the documented caveat) but nothing else.
-        assert!(profile.contains("\"*:53\""));
+        assert!(
+            !profile.contains("host-name"),
+            "SBPL cannot express a host filter; emitting one makes the profile uncompilable: {profile}"
+        );
+        assert!(!profile.contains("api.weather.example"), "the host must not appear at all");
+        assert!(!profile.contains(":53"), "no DNS re-allow");
+        assert!(!profile.contains("(system-network)"), "no IP stack");
+        assert!(profile.contains("(deny network*)"), "flat deny is the only network posture");
+        // ...and it is byte-identical to the same server with no hosts declared:
+        // the field cannot change the emitted profile at all.
+        let mut clean = s.clone();
+        clean.net_hosts.clear();
+        assert_eq!(
+            profile,
+            stdio_sandbox_profile(&clean, Path::new("/r")),
+            "net_hosts must have NO effect on the generated profile"
+        );
+    }
+
+    /// PROVED AGAINST THE OS COMPILER, NOT AGAINST OUR OWN STRING LITERALS.
+    ///
+    /// Every other assertion about this profile — including the one directly
+    /// above — is a string match on text this module emits: the generator
+    /// agreeing with itself. That is precisely how the uncompilable host rule
+    /// survived on the micro-app side for months (docs/SANDBOX.md → *A net scope
+    /// is not grantable*: "Only handing the profile to `sandbox-exec` ever caught
+    /// it"), and apps.rs grew
+    /// `a_net_hosts_declaration_is_refused_and_can_no_longer_emit_uncompilable_sbpl`
+    /// for exactly that reason. The MCP profile — same machinery, same defect,
+    /// same fix — had NO such test.
+    ///
+    /// This hands the derived profile to the real `sandbox-exec` and requires it
+    /// to COMPILE and run the wrapped command, in the state that used to make it
+    /// fail: `net_hosts` declared. With the deleted host-filter branch restored,
+    /// this test dies with exit 65 — which no string assertion can detect.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn stdio_profile_compiles_under_the_real_sandbox_compiler_even_with_hosts_declared() {
+        if !Path::new(crate::apps::SANDBOX_EXEC).exists() {
+            eprintln!("skipping: sandbox-exec is not present on this host");
+            return;
+        }
+        let mut s = server("probe");
+        // /usr/bin/true is what the profile grants exec of, so a compiling
+        // profile also RUNS — a plain exit 0 means "the OS accepted every rule".
+        s.command = "/usr/bin/true".into();
+        s.net_hosts = vec!["api.weather.example".into(), "stream.binance.com".into()];
+        let profile = stdio_sandbox_profile(&s, Path::new("/private/tmp"));
+        let path = std::env::temp_dir().join(format!("darwin-mcp-probe-{}.sb", std::process::id()));
+        std::fs::write(&path, &profile).expect("write the probe profile");
+        let out = std::process::Command::new(crate::apps::SANDBOX_EXEC)
+            .arg("-f")
+            .arg(&path)
+            .arg("/usr/bin/true")
+            .output()
+            .expect("run sandbox-exec");
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            out.status.success(),
+            "the profile must COMPILE and run (a host filter made this exit 65 and the server never started). status: {:?}\nstderr: {stderr}\n\nprofile:\n{profile}",
+            out.status.code()
+        );
+        assert!(
+            !stderr.contains("host-name") && !stderr.contains("host must be"),
+            "no host-rule compile error may appear: {stderr}"
+        );
+    }
+
+    /// The refusal is a REFUSAL, not a downgrade: a stdio server declaring
+    /// `net_hosts` is dropped from `connectable_servers` entirely, so it is never
+    /// spawned. Starting it with a silently-denied network was the option
+    /// explicitly rejected — it would leave the operator believing a host filter
+    /// was live.
+    #[test]
+    fn stdio_server_declaring_net_hosts_is_refused_not_silently_denied() {
+        let mut with_hosts = server("weather");
+        with_hosts.net_hosts = vec!["api.weather.example".into()];
+        let clean = server("files");
+        let cfg = McpConfig {
+            enabled: true,
+            servers: vec![with_hosts, clean],
+            ..Default::default()
+        };
+        let mgr = McpManager::new(cfg);
+        let names: Vec<&str> = mgr.connectable_servers().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["files"], "the net-declaring stdio server must not connect");
+        // The verdict says so, in the shared voice, and it must not tell the
+        // operator to fix it by editing the host list -- that is the guidance
+        // that produced an app/server which never starts.
+        let (refuse, msg) = net_scope_verdict(&mgr.cfg.servers[0]).expect("a net scope is a verdict");
+        assert!(refuse, "stdio + net_hosts must be REFUSED");
+        assert!(msg.contains("not grantable"), "one voice with apps::NET_SCOPE_REFUSAL: {msg}");
+        assert!(msg.contains("never starts"), "must name what actually happened: {msg}");
+        assert!(
+            !msg.to_lowercase().contains("add ") && !msg.to_lowercase().contains("declare the host"),
+            "must never tell the operator to declare hosts: {msg}"
+        );
+        assert!(net_scope_verdict(&mgr.cfg.servers[1]).is_none(), "an empty list is the healthy state");
+    }
+
+    /// On an `http` server the key is INERT, not merely unenforceable — there is
+    /// no local process to wrap. It is REPORTED but NOT refused: unlike stdio,
+    /// such a server works today, and breaking a live remote connector to correct
+    /// a fiction would trade a bigger regression for a smaller one.
+    #[test]
+    fn http_server_declaring_net_hosts_is_reported_but_still_connectable() {
+        let mut s = server("remote");
+        s.transport = McpTransportKind::Http;
+        s.url = "https://mcp.example/rpc".into();
+        s.net_hosts = vec!["mcp.example".into()];
+        let cfg = McpConfig { enabled: true, servers: vec![s], ..Default::default() };
+        let mgr = McpManager::new(cfg);
+        assert_eq!(mgr.connectable_servers().len(), 1, "an http server is not refused for this");
+        let (refuse, msg) = net_scope_verdict(&mgr.cfg.servers[0]).expect("still a verdict");
+        assert!(!refuse, "http must not be refused");
+        assert!(msg.contains("NO effect"), "must say the key does nothing: {msg}");
+        // ...and the egress guard still treats it as reaching the network.
+        assert!(mgr.server_reaches_network("remote"));
     }
 
     #[test]

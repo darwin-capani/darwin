@@ -236,8 +236,13 @@ pub struct Config {
     /// indicator; recall is read-only.
     pub screen_context: ScreenContextConfig,
     /// [lumen] — LUMEN: the accessibility SCREEN NARRATOR + hands-free VOICE
-    /// NAVIGATION (lumen.rs). `narrate` (continuous focus-change narration) SHIPS
-    /// OFF (explicit opt-in; off is a strict no-op); `max_controls` bounds one
+    /// NAVIGATION (lumen.rs). `narrate` SHIPS OFF — and turning it ON also
+    /// CHANGES NOTHING: focus-change narration has no caller. lumen.rs's own
+    /// header records that `narrate_on_focus_change` has ZERO call sites outside
+    /// that file's tests and that the daemon has no focus-change event source to
+    /// call it from, so ON emits a `lumen.configured` frame and Lumen still speaks
+    /// nothing. The explicit "read me the screen" request path is a DIFFERENT path
+    /// (router.rs) and works either way. `max_controls` bounds one
     /// readout. Narration is READ-ONLY; a voice action only SELECTS the ONE target
     /// and hands it to the UNCHANGED `ui_actuate` CAPSTONE, which owns every
     /// actuation gate. DEVICE-gated (the locate is the Vision `read.screen`; the
@@ -3364,11 +3369,16 @@ impl ScreenContextConfig {
 /// the consequential spoken confirm PER ACTION, the master switch, voice-id,
 /// `!lockdown`). Lumen weakens none of it.
 ///
-///   - `narrate` (SHIPS OFF, default false): CONTINUOUS focus-change narration is
-///     EXPLICIT opt-in. OFF => the focus-change path is a strict NO-OP (Lumen
-///     speaks nothing on its own); the explicit "read me the screen" request path
-///     is unaffected. Continuous narration reads on-screen text aloud, so it is
-///     off until the user asks for it.
+///   - `narrate` (SHIPS OFF, default false): nominally the opt-in for CONTINUOUS
+///     focus-change narration — except that turning it ON CHANGES NOTHING today.
+///     OFF => the focus-change path is a strict NO-OP (Lumen speaks nothing on its
+///     own). ON => it is STILL a no-op: the gate's only consumer,
+///     `lumen::narrate_on_focus_change`, has ZERO call sites outside lumen.rs's own
+///     tests, and the daemon has no focus-change event source to call it from
+///     (lumen.rs's header says so in as many words). Wiring it needs BOTH a
+///     focus-change source AND a speech call at the vision relay; neither exists.
+///     The explicit "read me the screen" request path is a DIFFERENT path
+///     (router.rs) and is unaffected either way.
 ///   - `max_controls` (DEFAULT 20): the HARD bound on how many on-screen controls
 ///     one readout narrates / offers for selection — a huge screen is never read
 ///     wholesale. Floored to >= 1.
@@ -4893,21 +4903,31 @@ pub struct McpServerConfig {
     /// stdio sandbox: extra absolute filesystem subpaths the server is granted
     /// WRITE access to. Empty = none.
     pub fs_write: Vec<String>,
-    /// stdio sandbox: outbound TCP host-names the server may reach. Empty = NO
-    /// network at all (default-deny).
+    /// MUST BE EMPTY. A stdio server's seatbelt profile is a flat
+    /// `(deny network*)` and there is no other posture available: macOS SBPL has
+    /// no host or IP filtering primitive, so a host allow-list is not something
+    /// this OS can enforce. A non-empty list is **REFUSED** — reported as a config
+    /// issue at load and dropped from `mcp::McpManager::connectable_servers`, so
+    /// the server is not connected (see `crate::mcp::MCP_NET_SCOPE_REFUSAL`).
     ///
-    /// KNOWN DEFECT, NOT YET CLOSED — a NON-EMPTY list does not narrow the
-    /// profile, it BREAKS it. `mcp::stdio_sandbox_profile` emits
-    /// `(remote tcp (host-name ...))`, which macOS refuses to compile ("host
-    /// must be * or localhost"), so `sandbox-exec` rejects the profile and the
-    /// server never starts. This is the SAME root cause as micro-app
-    /// `net_hosts`, which is now refused at validation
-    /// (`crate::apps::NET_SCOPE_REFUSAL`) with the fetch proxy as the supported
-    /// route. This surface was deliberately NOT changed alongside it: MCP
-    /// servers are configured by the operator rather than shipped in-tree, so
-    /// refusing the key (or silently downgrading it to "starts, but with no
-    /// network") changes the behaviour of an existing user config. That is an
-    /// OWNER DECISION. Until it is taken, keep this empty.
+    /// WHY REFUSED RATHER THAN IGNORED. A non-empty list never narrowed the
+    /// profile, it BROKE it: `mcp::stdio_sandbox_profile` used to emit
+    /// `(remote tcp (host-name ...))`, which macOS refuses to compile ("host must
+    /// be * or localhost"), so `sandbox-exec` rejected the whole profile and the
+    /// server never started — a silent spawn failure naming no cause. The three
+    /// candidate end states were refuse, start-with-no-network, and leave it.
+    /// Starting the server while silently discarding a declared restriction is the
+    /// worst of the three: it is precisely the "claims a rule the code does not
+    /// enforce" defect, and it would let an operator believe a host filter was
+    /// live. Nothing that worked has been taken away — this configuration could
+    /// never start a server. Same root cause as micro-app `net_hosts`
+    /// (`crate::apps::NET_SCOPE_REFUSAL`); the remedy differs because an MCP
+    /// server has no fetch proxy to route through.
+    ///
+    /// On an `http` server the key is INERT rather than fatal (the server runs on
+    /// someone else's machine; nothing local is being filtered). It is reported —
+    /// declaring it asserts a restriction nothing enforces — but the server still
+    /// connects, because refusing would break a configuration that works today.
     pub net_hosts: Vec<String>,
 }
 
@@ -5118,6 +5138,24 @@ impl Config {
                 issues.push(issue);
             }
         }
+        // [[mcp.servers]].net_hosts — an UNGRANTABLE net scope, reported at load.
+        // macOS SBPL has no host or IP filter, so a non-empty list is not a
+        // narrowing this daemon can honour: on a stdio server it produced a
+        // profile the OS refused to compile (the server never started), and on an
+        // http server it is inert (there is no local process to wrap). Reporting
+        // it here is the half the operator sees in the HUD (`config.invalid`);
+        // `mcp::McpManager::connectable_servers` refuses the stdio case outright
+        // and `connect_all` logs the same verdict at boot. The value is left AS
+        // CONFIGURED on purpose — clearing it would erase the very declaration
+        // the connect gate and the egress guard read, which is how a refusal
+        // silently becomes an ignore.
+        for s in &cfg.mcp.servers {
+            if let Some((_refuse, detail)) = crate::mcp::net_scope_verdict(s) {
+                let issue = format!("mcp.servers[{}]: {detail}", s.name);
+                warn!("{issue}");
+                issues.push(issue);
+            }
+        }
         (cfg, issues)
     }
 }
@@ -5313,6 +5351,61 @@ mod tests {
                 "lumen.rs still reports narration UNWIRED, so the settings note must not \
                  promise narration:\n{note}"
             );
+        }
+    }
+
+    /// COMPANION to `the_lumen_whitelist_note_agrees_with_lumen_on_whether_narration_is_wired`.
+    /// That guard bound its window to the KNOWN_KEYS whitelist note — and so covered
+    /// ONE of the THREE places config.rs documents `[lumen].narrate`. The other two
+    /// (the `Config::lumen` field doc and the `LumenConfig` doc) went right on
+    /// promising "CONTINUOUS focus-change narration" from a flag whose only consumer
+    /// has no caller. A per-site window is exactly what let that survive, so this
+    /// guard is a GLOBAL rule instead: while lumen.rs still reports the path
+    /// UNWIRED, every mention of focus-change narration in the PRODUCTION half of
+    /// config.rs must sit beside the "CHANGES NOTHING" disclaimer.
+    ///
+    /// Bounded at both ends: the window is `config.rs` up to its FIRST
+    /// `#[cfg(test)]`, so this test's own prose (which necessarily says the phrase)
+    /// cannot self-match, and a floor asserts the window and the needle both still
+    /// find something.
+    #[test]
+    fn every_config_mention_of_focus_change_narration_says_the_flag_is_inert() {
+        let unwired = include_str!("lumen.rs").contains("NOT WIRED TO ANY CALLER TODAY");
+        let cfg = include_str!("config.rs");
+        let cut = cfg.find("#[cfg(test)]").expect("config.rs has a test module");
+        let prod = &cfg[..cut];
+        assert!(cut > 100_000, "the production window collapsed: {cut}");
+        assert!(cfg.len() - cut > 10_000, "the test window collapsed — marker matched too late");
+        let needle = "focus-change narration";
+        let sites: Vec<usize> = prod.match_indices(needle).map(|(i, _)| i).collect();
+        // FLOOR: config.rs documents this flag in three places. If the phrase stops
+        // appearing at all this test must fail rather than pass vacuously.
+        assert!(
+            sites.len() >= 3,
+            "expected at least 3 mentions of {needle:?} in config.rs, found {} — if the              wording changed, re-derive this guard rather than deleting it",
+            sites.len()
+        );
+        // NEGATIVE PIN: a phrase that is not there must find nothing, so a window
+        // that silently matched everything could not pass the check above.
+        assert_eq!(prod.matches("focus-change narrationx").count(), 0);
+        if unwired {
+            for i in sites {
+                // Widen to a char boundary by hand — `floor_char_boundary` is not
+                // stable, and config.rs is full of em dashes.
+                let mut lo = i.saturating_sub(700);
+                while lo > 0 && !prod.is_char_boundary(lo) {
+                    lo -= 1;
+                }
+                let mut hi = (i + 700).min(prod.len());
+                while hi < prod.len() && !prod.is_char_boundary(hi) {
+                    hi += 1;
+                }
+                let around = &prod[lo..hi];
+                assert!(
+                    around.contains("CHANGES NOTHING"),
+                    "lumen.rs still reports focus-change narration UNWIRED, so this mention                      must say the flag changes nothing:\n{around}"
+                );
+            }
         }
     }
 
@@ -7358,6 +7451,82 @@ mod tests {
         assert!(cfg.mcp.servers.is_empty(), "the bad section falls back to defaults");
     }
 
+    /// A declared `net_hosts` on a stdio MCP server is REPORTED AT LOAD, in the
+    /// same voice the connect gate refuses it with. The alternative that was
+    /// rejected — parse it, start the server, silently grant no network — is the
+    /// exact "claims a rule the code does not enforce" defect, so the load path
+    /// must not stay quiet. The value is deliberately NOT cleared: the connect
+    /// gate and the egress guard both read the declaration.
+    #[test]
+    fn mcp_stdio_net_hosts_is_reported_at_load_and_left_as_written() {
+        let raw = r#"
+            [mcp]
+            enabled = true
+            [[mcp.servers]]
+            name = "weather"
+            transport = "stdio"
+            command = "/usr/bin/srv"
+            net_hosts = ["api.weather.example"]
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        let hit = issues
+            .iter()
+            .find(|i| i.contains("mcp.servers[weather]"))
+            .unwrap_or_else(|| panic!("a declared net scope must be reported: {issues:?}"));
+        assert!(hit.contains("not grantable"), "one voice with the refusal: {hit}");
+        assert!(hit.contains("never starts"), "must say what actually happened: {hit}");
+        assert_eq!(
+            cfg.mcp.servers[0].net_hosts,
+            vec!["api.weather.example".to_string()],
+            "the declaration must survive parsing — the connect gate reads it"
+        );
+        // ...and that server is not connectable.
+        let mgr = crate::mcp::McpManager::new(cfg.mcp);
+        assert!(mgr.connectable_servers().is_empty(), "refused, not started");
+    }
+
+    /// On an `http` server the same key is inert, not fatal. It is still
+    /// reported (it asserts a restriction nothing enforces) but the server is
+    /// NOT refused — a validator that refuses too much breaks working configs.
+    #[test]
+    fn mcp_http_net_hosts_is_reported_but_the_server_still_connects() {
+        let raw = r#"
+            [mcp]
+            enabled = true
+            [[mcp.servers]]
+            name = "remote"
+            transport = "http"
+            url = "https://mcp.example/rpc"
+            net_hosts = ["mcp.example"]
+        "#;
+        let (cfg, issues) = Config::parse(raw);
+        assert!(
+            issues.iter().any(|i| i.contains("mcp.servers[remote]") && i.contains("NO effect")),
+            "an inert net_hosts must still be reported: {issues:?}"
+        );
+        let mgr = crate::mcp::McpManager::new(cfg.mcp);
+        assert_eq!(mgr.connectable_servers().len(), 1, "http must not be refused for this");
+    }
+
+    /// LOCKSTEP WITH THE SHIPPED CONFIG: `config/darwin.toml` must load with no
+    /// net-scope issue at all. If refusing this key ever broke the config this
+    /// repo ships, that config would have to be migrated in the same change —
+    /// this is the test that would say so.
+    #[test]
+    fn shipped_config_declares_no_mcp_net_scope() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../config/darwin.toml");
+        assert!(path.is_file(), "the shipped config is present");
+        let (cfg, issues) = Config::load(&path);
+        assert!(
+            cfg.mcp.servers.iter().all(|s| s.net_hosts.is_empty()),
+            "no shipped MCP server may declare a net scope"
+        );
+        assert!(
+            !issues.iter().any(|i| i.contains("not grantable") || i.contains("NO effect")),
+            "the shipped config must not trip the net-scope report: {issues:?}"
+        );
+    }
+
     /// A typo'd top-level [mcp] key is reported (unknown-key diagnostic), not
     /// silently swallowed — the operator must know their bound did not apply.
     #[test]
@@ -7601,6 +7770,20 @@ mod posture_claim_tests {
                 ships_on || !claims_on,
                 "{name}'s header claims the subsystem ships ON, but its default is \
                  enabled = false"
+            );
+            // A FLOOR. Both assertions above are conditional on the header making a
+            // claim at all, so a header that states NO posture satisfied every one of
+            // them — and this guard is named for headers that STATE the posture.
+            // PROVED: deleting `Ships ON:` from optimize.rs's header left this test
+            // green while the file no longer told an operator anything about whether
+            // the subsystem is armed. It also means a REWORDED claim (one none of the
+            // phrase lists above recognise) fails here instead of going quiet.
+            assert!(
+                claims_on || claims_off,
+                "{name}'s header states no shipped posture in any form this guard \
+                 recognises, so nothing holds it to the real default ({}) — say it in \
+                 one of the pinned phrasings, or extend the lists above deliberately",
+                if ships_on { "enabled = true" } else { "enabled = false" }
             );
         }
     }

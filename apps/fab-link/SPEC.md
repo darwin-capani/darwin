@@ -1,10 +1,36 @@
 # Fab-Link — SPEC
 
-3D-printing telemetry: Moonraker/OctoPrint live data, a toolpath render synced to print progress, thermal and timelapse panels, and a reserved hook for Phase-3 vision-based failure detection. Phase-4 implementation against `docs/SANDBOX.md`; HUD surface contract per `docs/HUD.md` §5. This app is also the worked example in SANDBOX.md.
+> ## ⛔ BLOCKED — SPEC ONLY. THIS APP DOES NOT RUN, AND CANNOT BE BUILT AS WRITTEN.
+>
+> **Status: `manifest.toml` is REFUSED at validation. Nothing here is shipped
+> behaviour.** There is no implementation (this file + `manifest.toml`, no
+> `main.py`), the app does not appear on the HUD App Deck, and it has never
+> launched on any machine — before the refusal landed, its sandbox profile failed
+> to compile and the process died at `sandbox-exec` (exit 65).
+>
+> **Why, and what would unblock it.** The design below depends on a `net_hosts`
+> host allow-list, which **does not exist as a mechanism**: macOS SBPL has no host
+> or IP filtering primitive, so a net scope is not grantable at all
+> (`docs/SANDBOX.md` → *A net scope is not grantable*). The supported egress route
+> is the daemon-mediated fetch proxy (`fetch_hosts`), and **Fab-Link cannot use
+> it**: Moonraker is `ws://voron.local:7125/websocket`, which fails the proxy on
+> three independent axes — scheme (`ws`, not `https`), port (7125, not 443), and
+> the SSRF guard (a `.local` mDNS name resolves to a private LAN address, refused
+> by design). The control ops and webcam pulls are the same shape.
+>
+> Making this app real therefore needs a **new mechanism** — a daemon-side
+> WebSocket relay, or an explicit LAN-scoped exception to the SSRF guard. Both
+> **widen DARWIN's egress posture**, so both are the **owner's decision**, and the
+> decision has not been taken. Until it is, read everything below as a design
+> record, not as a description of anything that works. Do not implement against
+> it, and do not copy its permission block into a new manifest — the schema's
+> worked example is in `docs/SANDBOX.md`, not here.
 
-## Sandbox contract (binding: `manifest.toml`)
+3D-printing telemetry: Moonraker/OctoPrint live data, a toolpath render synced to print progress, thermal and timelapse panels, and a reserved hook for Phase-3 vision-based failure detection. Phase-4 implementation against `docs/SANDBOX.md`; HUD surface contract per `docs/HUD.md` §5.
 
-- `net_hosts = ["voron.local", "octoprint.local"]` — printer endpoints only.
+## Sandbox contract (NOT BINDING — the manifest it describes is refused)
+
+- ~~`net_hosts = ["voron.local", "octoprint.local"]`~~ — **NOT GRANTABLE.** A direct-egress net scope cannot be expressed in SBPL and is refused at validation; this line is why the app does not load. See the banner above.
 - `fs_read = apps/fab-link/gcode-previews`, `fs_write = state/tmp/fab-link` (frame cache, parsed-toolpath cache).
 - `gpu = false` — Fab-Link does **no GPU rendering**. It parses and publishes geometry; the HUD (which owns the GPU) draws it. This is the honest split for an `overlay`-class surface.
 - IPC: JSONL over `state/ipc/apps/fab-link.sock`, capability token per message.

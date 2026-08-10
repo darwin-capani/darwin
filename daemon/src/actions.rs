@@ -269,10 +269,23 @@ fn quit_script(app: &str) -> String {
 /// Fallback when a named browser cannot be honored is the system default —
 /// failing the whole request over a browser nit would be worse than a note.
 ///
-/// URL safety (hard contract): only http/https ever reaches `open`. The
-/// normalizer rejects every other scheme (file:, javascript:, data:, ...),
-/// embedded whitespace, and host-less strings, on EVERY path into `open` —
-/// router, cloud tool, and search alike.
+/// URL safety (hard contract): only http/https ever reaches `open` AS A
+/// CALLER-SUPPLIED URL. The normalizer rejects every other scheme (file:,
+/// javascript:, data:, ...), embedded whitespace, and host-less strings, on
+/// every path into THIS function — router, cloud tool, and search alike.
+///
+/// It is NOT true that nothing else in this module spawns `open`; three other
+/// call sites do, and none of them takes a caller-supplied URL:
+///   * `launch_match` (behind [`open_app`]) passes `-a <app>`, an app STEM
+///     matched against the installed set — never a URL;
+///   * [`open_path`] passes a CANONICALIZED filesystem path confined to `$HOME`
+///     or `/Applications` — never a URL;
+///   * [`open_settings_pane`] passes one of the fixed `x-apple.systempreferences:`
+///     literals in the hardcoded [`SETTINGS_PANES`] allowlist — deliberately not
+///     normalized (the normalizer would rightly refuse the scheme), and gated
+///     consequential so it only fires after a fresh human confirm.
+///
+/// `open_spawn_sites_are_the_five_audited_ones` fails if a sixth appears.
 pub async fn open_url(url: &str, browser: Option<&str>) -> Result<String> {
     let normalized = normalize_url(url)?;
     let (app, note) = match browser.map(str::trim).filter(|b| !b.is_empty()) {
@@ -1243,6 +1256,54 @@ mod tests {
         assert!(out.starts_with("[dry run]"), "must be a dry-run preview: {out}");
         assert!(out.contains("Network Firewall"), "names the exact pane: {out}");
         assert!(out.to_lowercase().contains("change nothing"), "states it changes nothing: {out}");
+    }
+
+    /// GUARD for the URL-safety contract on `open_url`. That contract is
+    /// http/https-only for a CALLER-SUPPLIED URL; the module additionally spawns
+    /// `open` from three audited non-URL call sites (`launch_match` with `-a`,
+    /// `open_path` with a path canonicalized into $HOME or /Applications, and
+    /// `open_settings_pane` with a fixed allowlisted `x-apple.systempreferences:`
+    /// literal). FIVE spawn sites across those four call paths (`open_url` has
+    /// two: the named-browser `open -a <app> <url>` and the bare `open <url>`) —
+    /// a SIXTH one is a new way for a string to reach `open` and must be
+    /// reviewed, not merged silently.
+    ///
+    /// Source-anchored, so it is bounded at BOTH ends: the window is the
+    /// production half of this file only (everything BEFORE the `#[cfg(test)]`
+    /// marker), so the needles inside these tests cannot self-match.
+    #[test]
+    fn open_spawn_sites_are_the_five_audited_ones() {
+        let src = include_str!("actions.rs");
+        let marker = "#[cfg(test)]";
+        let cut = src.find(marker).expect("actions.rs has a test module");
+        let prod = &src[..cut];
+        assert!(cut > 10_000, "the production window collapsed to nothing: {cut}");
+        assert!(
+            src.len() - cut > 1_000,
+            "the test window collapsed — the marker matched too late"
+        );
+        let needle = "run_command(\"/usr/bin/open\"";
+        let sites = prod.matches(needle).count();
+        assert_eq!(
+            sites, 5,
+            "actions.rs spawns /usr/bin/open from {sites} production call sites, not the 5 \
+             audited ones (launch_match -a, open_url x2 normalized, open_path \
+             canonicalized, open_settings_pane allowlisted). A new one needs a URL-safety \
+             review — see the hard contract on open_url."
+        );
+        // FLOOR + NEGATIVE PIN: prove the window and the needle are both real,
+        // so a window that silently matched nothing cannot pass this test.
+        assert!(sites > 0, "the needle stopped matching — re-derive it");
+        assert_eq!(
+            prod.matches("run_command(\"/usr/bin/definitely-not-open\"").count(),
+            0,
+            "sanity: a bogus needle must not match"
+        );
+        // And the normalizer really is the only thing standing between a
+        // caller-supplied string and `open`.
+        assert!(normalize_url("javascript:alert(1)").is_err());
+        assert!(normalize_url("file:///etc/passwd").is_err());
+        assert!(normalize_url("x-apple.systempreferences:com.apple.evil").is_err());
     }
 
     #[test]

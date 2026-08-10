@@ -18,8 +18,10 @@
 #     (refuse anything outside that tree — no path traversal, no symlink escape),
 #   - copy the proposed app/<name>/ into a FRESH re-validation staging dir,
 #   - RE-CHECK the manifest + permission minimization (no device perms; fs_write
-#     only to the app's own state dir; confined fs_read; capped bare-host
-#     net_hosts) by handing the manifest to `darwind --validate-forge-manifest`,
+#     only to the app's own state dir; confined fs_read; NO net_hosts at all --
+#     a direct-egress net scope is not grantable on this OS and is refused
+#     outright, there is no host list to cap) by handing the manifest to
+#     `darwind --validate-forge-manifest`,
 #     which runs the SAME forge::validate_manifest gate the draft path runs over
 #     the manifest as the daemon's OWN toml parser sees it. This is deliberately
 #     NOT a textual scan: a text scan is a TOML parser-differential (it can't see
@@ -170,8 +172,9 @@ fi
 # same forge::validate_manifest gate the draft path runs (schema +
 # deny_unknown_fields + name == dir + permission minimization + default-deny SBPL
 # derivability) over the manifest as the daemon's toml crate actually parses it.
-# Any over-broad grant, any escaping read/write, too many net_hosts, a malformed
-# host, a device permission, or a parse error -> non-zero exit -> deploy refused,
+# Any over-broad grant, any escaping read/write, ANY net_hosts (a net scope is not
+# grantable and is refused however well-formed), a device permission, or a parse
+# error -> non-zero exit -> deploy refused,
 # apps/ untouched. This gate CANNOT diverge from what the daemon would grant.
 
 # Resolve the daemon binary that runs the gate. By default, build it FRESH from

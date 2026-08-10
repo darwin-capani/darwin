@@ -248,6 +248,7 @@ import { agentProfile, normalizeHue } from "./agents";
 import { type ChangeqState, changeqReduce, parseChangeqList } from "./changeq";
 import { type HardwareVitals, parseVitals } from "./vitals";
 import { type ProcessesFrame, parseProcesses } from "./procwatch";
+import { rejectionDetail } from "./heal";
 
 /* ------------------------------------------------------------------------ */
 
@@ -433,6 +434,11 @@ export interface HealProposal {
   validated: boolean;
   /** Adversarial-review confidence 0..1, or null for an older daemon. */
   confidence: number | null;
+  /** The floor that score had to clear, as the DAEMON reports it
+   *  (`confidence_floor`). Sent with the score so the HUD never keeps a second
+   *  copy of the threshold — two copies of a bar drift apart, and the daemon is
+   *  the one that enforces it. null for an older daemon that does not send it. */
+  confidenceFloor: number | null;
   /** Subsystem/signature carried forward from the diagnosis when available
    *  (event-echoed, else the last heal.diagnosing for the same burst). */
   subsystem: string;
@@ -2475,6 +2481,7 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
           files,
           validated,
           confidence: num(env.data, "confidence"),
+          confidenceFloor: num(env.data, "confidence_floor"),
           subsystem: str(env.data, "subsystem") ?? diag?.subsystem ?? "",
           signature: str(env.data, "signature") ?? diag?.signature ?? "",
           responsiveness: str(env.data, "responsiveness") ?? "",
@@ -2495,7 +2502,7 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
           ts: env.ts,
           refTs: num(env.data, "ts"),
           files: [],
-          detail: `STAGE: ${str(env.data, "stage") ?? "unknown"}`,
+          detail: rejectionDetail(str(env.data, "stage") ?? "unknown"),
         },
       };
     }

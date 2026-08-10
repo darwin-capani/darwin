@@ -1,17 +1,29 @@
-//! Daemon-mediated `fetch` proxy — the Phase-4 fix for the two INHERENT network
-//! caveats the seatbelt sandbox cannot close (docs/SANDBOX.md → *Honest
-//! limitations*).
+//! Daemon-mediated `fetch` proxy — the ONLY filtered egress DARWIN has, because
+//! a seatbelt profile can express no network posture but "none" (docs/SANDBOX.md
+//! → *A net scope is not grantable*). It was BUILT as the Phase-4 fix for two
+//! network caveats believed inherent to SBPL egress; read the CORRECTION below
+//! before that framing — the egress those caveats described never ran, which
+//! makes this proxy the only design rather than the better of two.
 //!
-//! BACKGROUND. Global-Scan was the ONLY shipped micro-app with direct network
-//! egress: its manifest granted `net_hosts` = 9 public RSS hosts, and the
-//! generated SBPL allowed outbound TCP to those `host-name`s plus DNS. That
-//! left two caveats OPEN by construction:
+//! BACKGROUND. Global-Scan was the ONLY shipped micro-app that DECLARED direct
+//! network egress: its manifest listed `net_hosts` = 9 public RSS hosts, and the
+//! generator emitted outbound TCP to those `host-name`s plus DNS. Two caveats
+//! were understood to be open by construction:
 //!   1. COARSE HOST FILTERING — `(remote tcp (host-name ...))` matches the
 //!      connect-time NAME, not the resolved IP, so a feed host on a shared CDN
 //!      shares its allow with unrelated co-tenant names on that CDN.
 //!   2. DNS EXFIL — permitting DNS at all lets a compromised app encode data in
 //!      query labels to an attacker-controlled nameserver, bypassing the
 //!      allow-list entirely.
+//!
+//! CORRECTION, RECORDED HONESTLY (docs/SANDBOX.md -> "A net scope is not
+//! grantable"): neither caveat ever described running code. macOS SBPL has NO
+//! host or IP filtering rule, so those emitted lines did not compile -- the
+//! profile was rejected wholesale (exit 65) and such an app never launched. The
+//! two caveats above are what we BELIEVED we had bought; what we actually had
+//! was nothing. That does not weaken the case for this proxy, it strengthens it:
+//! host allow-listing has to happen in the daemon because it cannot happen in
+//! the sandbox at all. A net scope is now refused at validation outright.
 //!
 //! THE FIX. The daemon fronts micro-app HTTP with a **daemon-mediated fetch
 //! proxy** on a SEPARATE, restricted Unix socket `state/ipc/apps/fetch.sock`.

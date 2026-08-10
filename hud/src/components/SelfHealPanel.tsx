@@ -2,11 +2,12 @@ import { useEffect, useReducer, useRef, useState } from "react";
 import {
   applyReduce,
   CONFIDENCE_SEGMENTS,
-  confidencePct,
+  confidenceNote,
   confirmReady,
   initialApplyState,
   litSegments,
   REARM_MS,
+  reviewVerdict,
   stageLabel,
 } from "../core/heal";
 import type { HealDiagnosing, HealProposal } from "../core/state";
@@ -31,9 +32,16 @@ import Frame from "./Frame";
  * "CONFIRM — APPLY & REBUILD" state, and only the second click (after a short
  * re-arm window so a double-click cannot skip the confirm) calls heal_apply,
  * which runs scripts/apply_heal.sh <ts> --yes — the SAME gates as the terminal
- * path (fresh staging copy + cargo check + full cargo test) and refuses to
- * touch daemon/src if validation fails. The read-only terminal command line is
- * kept too. self_heal still ships enabled=false.
+ * path (fresh staging copy + cargo check + clippy -D warnings + full cargo test
+ * + the mutation probe + the review-confidence floor) and refuses to touch
+ * daemon/src if validation fails. The read-only terminal command line is kept
+ * too.
+ *
+ * POSTURE: self_heal ships enabled=TRUE, mode=propose. This comment claimed
+ * "enabled=false" for a long time, on a block labelled SAFETY CONTRACT — the
+ * worst possible place for a stale claim, since it is exactly what a reader
+ * consults to decide whether autonomy is armed. heal.rs's own module doc
+ * carries the same correction.
  *
  * The proposal is rendered only when the daemon reports validated=true (the
  * only thing it ever emits as heal.proposal); a defensive guard below keeps it
@@ -46,7 +54,13 @@ import Frame from "./Frame";
  * never churns the global HUD tree.
  */
 
-function ConfidenceGauge({ confidence }: { confidence: number | null }) {
+function ConfidenceGauge({
+  confidence,
+  floor,
+}: {
+  confidence: number | null;
+  floor: number | null;
+}) {
   if (confidence === null) {
     return (
       <div className="sh-conf">
@@ -56,7 +70,10 @@ function ConfidenceGauge({ confidence }: { confidence: number | null }) {
     );
   }
   const lit = litSegments(confidence);
-  const pct = confidencePct(confidence);
+  // A BARE PERCENTAGE IS NOT A JUDGEMENT. The score is rendered against the
+  // daemon's own floor (sent on the event, never a second copy of the number
+  // here), and below it the row is a warning rather than a neutral stat.
+  const note = confidenceNote(confidence, floor);
   return (
     <div className="sh-conf">
       <span className="sh-conf-label">REVIEW CONFIDENCE</span>
@@ -65,7 +82,9 @@ function ConfidenceGauge({ confidence }: { confidence: number | null }) {
           <i key={i} className={i < lit ? "on" : ""} />
         ))}
       </span>
-      <span className="sh-conf-pct">{pct}%</span>
+      <span className={note.belowFloor ? "sh-conf-pct sh-warn" : "sh-conf-pct"}>
+        {note.text}
+      </span>
     </div>
   );
 }
@@ -159,10 +178,22 @@ function DiffReview({ ts }: { ts: number }) {
     .slice(0, 3)
     .join("  ·  ");
 
+  // WHAT THE REVIEWER ACTUALLY THOUGHT. The adversarial review is the only
+  // stage that judges whether the patch is a good IDEA — every staged gate is
+  // mechanical and blind to the diagnosis — and its sentence was written to
+  // report.md and then never shown next to the button that installs the patch.
+  const verdict = reviewVerdict(report);
+
   return (
     <>
       {reportHead ? (
         <div className="sh-report-head dim-note">{reportHead}</div>
+      ) : null}
+      {verdict ? (
+        <div className="sh-review-verdict">
+          <span className="sh-k">REVIEWER</span>
+          <span className="sh-v">{verdict}</span>
+        </div>
       ) : null}
       <pre className="sh-diff" tabIndex={0} aria-label="staged diff for review">
         {diff}
@@ -324,7 +355,10 @@ function Proposal({
         </div>
       ) : null}
 
-      <ConfidenceGauge confidence={proposal.confidence} />
+      <ConfidenceGauge
+        confidence={proposal.confidence}
+        floor={proposal.confidenceFloor}
+      />
 
       {/* The actual code change, for HUMAN REVIEW. */}
       {ts !== null ? (
@@ -349,8 +383,10 @@ function Proposal({
       ) : null}
 
       <div className="sh-safety dim-note">
-        Accepting re-validates the patch (cargo check + full test) and will not
-        apply if validation fails.
+        Accepting RE-VALIDATES the patch from scratch — check, clippy -D
+        warnings, the full test suite, the mutation probe, and the same
+        review-confidence floor the daemon applied — and will not apply if any
+        of them fails.
       </div>
 
       {/* Apply lifecycle status line. */}

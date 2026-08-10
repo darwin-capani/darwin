@@ -35,12 +35,29 @@
 //!      code via `darwind --heal-responsiveness` — one implementation, two
 //!      callers, like `--split-heal-diff`. Running OUT OF BUDGET is reported as
 //!      its own stage, `deadline`, and never as a rejection on the merits.
+//!      THE BUDGET IS AN ATTEMPT-WIDE CEILING, NOT A PER-CANDIDATE ALLOWANCE:
+//!      each candidate may take up to VALIDATE_TIMEOUT, but only out of the one
+//!      ATTEMPT_BUDGET all CANDIDATE_COUNT of them share, and each stage is
+//!      capped so a slow one cannot starve the stages behind it. A candidate the
+//!      attempt cannot afford is reported as `deadline` WITHOUT being staged.
+//!      ONLY TIME SPENT INSIDE stage_and_validate IS CHARGED TO IT — the draft
+//!      and review cloud calls carry their own timeouts and are not the
+//!      machine's to pay for.
 //!   6. ADVERSARIAL SELF-REVIEW (v2) — a second cloud call judges each
 //!      surviving (validated) diff against the diagnosis + its test output:
 //!      does it fix the ROOT CAUSE (not just silence the symptom)? Returns a
-//!      verdict + confidence 0..1.
+//!      verdict + confidence 0..1. This is a CLOUD call, and it is NOT charged
+//!      to the staged-validation budget described under (5): that budget bounds
+//!      what the MACHINE compiles, and a slow review API must not spend it.
 //!   7. SELECT — prefer the MINIMAL patch with the HIGHEST review confidence
-//!      among those that PASSED validation.
+//!      among those that PASSED validation, and PROPOSE NOTHING when even the
+//!      best of them is below CONFIDENCE_FLOOR: the four staged gates are blind
+//!      to whether the patch is a good idea, the reviewer is the only stage that
+//!      judges that, and "best of three the reviewer disbelieved" is not a
+//!      proposal. Rejected-at-the-floor attempts still write every candidate,
+//!      the review and the diagnosis under state/heal/rejected/<ts>/, and
+//!      scripts/apply_heal.sh enforces the same floor on the report.md of
+//!      whatever it is asked to install, via `darwind --heal-confidence`.
 //!      8a. mode="propose" (default) — write state/heal/proposals/<ts>/{patch.diff,
 //!      report.md, diagnosis.json, candidates.md, review.md}, stamp
 //!      meta.heal_pending=<ts>, emit heal.proposal{ts, files, validated:true,
@@ -127,9 +144,85 @@ const REVIEW_SYSTEM: &str = "You are DARWIN's adversarial self-repair reviewer: 
      (not merely silences the symptom) and has no obvious side effects. Be harsh; a passing \
      test suite is necessary but NOT sufficient.";
 
-/// Staging validation: check, clippy, test and the mutation probe share this
-/// deadline.
-const VALIDATE_TIMEOUT: Duration = Duration::from_secs(600);
+/// PER-CANDIDATE staged-validation budget: check, clippy, test and the mutation
+/// probe share it.
+///
+/// MEASURED COLD on an M1 Pro, in a tree staged exactly as `stage_sources`
+/// builds one: check 92s + clippy --all-targets -D warnings 184s + test 214s +
+/// mutation re-run 33s = 523s of the 600s this replaces — 87% of the budget,
+/// ~77s of headroom, on a machine that (by the definition of self-heal firing)
+/// is ALREADY MISBEHAVING and is very likely slower than the one that number
+/// came from. A candidate that runs 15% slow is not judged badly; it is not
+/// judged AT ALL, and the attempt reports "NO CANDIDATE WAS EVER JUDGED".
+///
+/// This is NOT a licence to spend more wall clock. The whole attempt is capped
+/// at [`ATTEMPT_BUDGET`] across all [`CANDIDATE_COUNT`] candidates, so the
+/// worst case is UNCHANGED from the 3 x 600s it replaces — the time is simply
+/// allowed to go where it is needed instead of being handed out in three equal
+/// slices that each fall just short.
+const VALIDATE_TIMEOUT: Duration = Duration::from_secs(900);
+
+/// THE CEILING THAT ACTUALLY BOUNDS THE MACHINE.
+///
+/// Before this existed, each of [`CANDIDATE_COUNT`] candidates got its own
+/// independent [`VALIDATE_TIMEOUT`], so one attempt could occupy every core for
+/// `CANDIDATE_COUNT * VALIDATE_TIMEOUT` of compilation — on a box that is
+/// already misbehaving, which is the only time any of this runs. Raising the
+/// per-candidate budget without this would have multiplied that.
+///
+/// 1800s is exactly the old 3 x 600s worst case: the total a self-heal attempt
+/// may spend in cargo is unchanged, and a slow machine now spends it finishing
+/// ONE OR TWO real verdicts instead of timing out three times at 87%.
+///
+/// IT IS A CARGO BUDGET, NOT A WALL CLOCK — only time spent inside
+/// `stage_and_validate` is charged to it.
+///
+/// It was first written as a wall-clock deadline spanning the whole candidate
+/// loop, which charged the ADVERSARIAL REVIEW's cloud latency to the machine.
+/// The arithmetic is unforgiving: at the MEASURED 523s cycle the first two
+/// candidates leave 1800 - 1046 = 754s, and the third is only staged when at
+/// least [`minimum_viable_budget`] (750s) is left — so roughly TWO SECONDS of
+/// total review latency was enough to refuse candidate 3, on a perfectly
+/// healthy machine, with the message "the earlier candidates used the machine
+/// up". A third of every attempt's drafted (and paid-for) candidates was being
+/// discarded because an API was slow, and the operator was told their box was.
+const ATTEMPT_BUDGET: Duration = Duration::from_secs(1800);
+
+/// Floor for the `check` stage — the cheapest gate, and the one whose failure
+/// is the plain "this does not compile" message an operator needs first.
+const CHECK_STAGE_FLOOR: Duration = Duration::from_secs(150);
+/// Floor for `clippy --all-targets -D warnings`, the widest compile of the four
+/// (it builds the test targets too).
+const CLIPPY_STAGE_FLOOR: Duration = Duration::from_secs(300);
+/// Seconds of a candidate's budget reserved for the `test` stage, so a
+/// pathologically slow earlier stage cannot eat the budget and leave the stage
+/// that actually exercises the patch with a few seconds and a `deadline`.
+const TEST_STAGE_FLOOR: Duration = Duration::from_secs(240);
+/// ...and for the mutation re-run, the one stage that proves the patch's own
+/// test would catch the bug coming back. Measured at ~33s; 60s is a floor, not
+/// an allowance.
+const MUTATION_STAGE_FLOOR: Duration = Duration::from_secs(60);
+
+/// THE ADVERSARIAL REVIEWER'S FLOOR. Below this confidence nothing is proposed.
+///
+/// `select_winner` takes the BEST-reviewed survivor, and "best" of three bad
+/// patches is still a bad patch: a candidate the reviewer scored 0.05 — or one
+/// whose review call never came back, which is recorded as 0.0 — cleared the
+/// four mechanical gates and was surfaced to the operator as a
+/// PROPOSAL READY FOR REVIEW with an ACCEPT & APPLY button next to it. The
+/// gates are blind to intent (see the responsiveness probe); the reviewer is
+/// the only stage that judges whether the patch is a good idea, and its verdict
+/// had no effect on whether anything was proposed at all.
+///
+/// 0.25 is deliberately low: this is a floor against "the reviewer did not
+/// believe this", not a quality bar. Everything a below-floor attempt produced
+/// is still written under `state/heal/rejected/<ts>/`, so nothing is lost —
+/// the operator can read every candidate, they just do not get a one-click
+/// apply for a patch nobody vouched for. `scripts/apply_heal.sh` enforces the
+/// SAME constant through `darwind --heal-confidence` (one implementation, two
+/// callers, like `--split-heal-diff`), so a proposal written by an older daemon
+/// cannot be applied under a weaker bar either.
+const CONFIDENCE_FLOOR: f64 = 0.25;
 const PATCH_BIN: &str = "/usr/bin/patch";
 /// Validation output tail kept in report.md / candidates.md.
 const REPORT_TAIL_CHARS: usize = 4000;
@@ -1056,6 +1149,11 @@ struct Survivor {
     validation_tail: String,
     review_verdict: String,
     confidence: f64,
+    /// Did the adversarial reviewer actually ANSWER? A failed review call is
+    /// recorded as confidence 0.0, which is indistinguishable from a reviewer
+    /// saying "I do not believe this patch" — and they are opposite facts. The
+    /// confidence floor rejects both, but the report has to say which happened.
+    reviewed: bool,
     /// Added/removed line count — the min-patch tiebreak.
     size: usize,
 }
@@ -1109,10 +1207,97 @@ fn parse_confidence(s: &str) -> f64 {
     num.parse::<f64>().unwrap_or(0.0)
 }
 
+/// Does a review confidence clear [`CONFIDENCE_FLOOR`]?
+///
+/// THE ONE COMPARISON. The daemon's own selection and
+/// `darwind --heal-confidence` — which `scripts/apply_heal.sh` shells out to,
+/// exactly like `--split-heal-diff` — both call this, so the two gates cannot
+/// drift into two different bars. `pub` for that CLI caller.
+pub fn meets_confidence_floor(confidence: f64) -> bool {
+    confidence >= CONFIDENCE_FLOOR
+}
+
+/// What the shared confidence gate says about one proposal. Printed as its word
+/// by `darwind --heal-confidence` and consumed by `scripts/apply_heal.sh`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ConfidenceGate {
+    Above,
+    Below,
+    /// report.md carries no parseable confidence at all. NOT the same as a low
+    /// score, and the apply gate refuses on it rather than guessing.
+    NoScore,
+}
+
+impl ConfidenceGate {
+    pub fn word(self) -> &'static str {
+        match self {
+            ConfidenceGate::Above => "ABOVE_FLOOR",
+            ConfidenceGate::Below => "BELOW_FLOOR",
+            ConfidenceGate::NoScore => "NO_SCORE",
+        }
+    }
+}
+
+/// Read the adversarial-review confidence back out of a proposal's `report.md`.
+///
+/// The line it reads is the one [`render_report`] writes, in this same module —
+/// one type owns both ends, so the format cannot drift out from under the
+/// reader (`report_confidence_survives_the_round_trip` pins that). Returns None
+/// when there is no such line or it carries no digits, which is deliberately
+/// distinguishable from a real `0.00`.
+pub fn parse_report_confidence(report: &str) -> Option<f64> {
+    for line in report.lines() {
+        let t = line.trim().trim_start_matches("- ").trim();
+        if let Some(rest) = strip_label(t, "review confidence") {
+            if !rest.chars().any(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            return Some(parse_confidence(rest).clamp(0.0, 1.0));
+        }
+    }
+    None
+}
+
+/// THE SHARED CONFIDENCE GATE — one implementation, two callers.
+///
+/// The daemon applies [`meets_confidence_floor`] when it decides whether to
+/// propose at all; `scripts/apply_heal.sh` applies THIS to the report.md of the
+/// proposal it is about to install, through `darwind --heal-confidence`. A
+/// proposal written by an older daemon (or by hand) therefore cannot be applied
+/// under a weaker bar than the one that would have blocked it being written.
+/// Returns the verdict and the sentence a human reads.
+pub fn confidence_gate(report: &str) -> (ConfidenceGate, String) {
+    match parse_report_confidence(report) {
+        None => (
+            ConfidenceGate::NoScore,
+            "report.md carries no `review confidence` line — there is no adversarial review \
+             to stand behind this patch, and this gate does not guess one"
+                .to_string(),
+        ),
+        Some(c) if meets_confidence_floor(c) => (
+            ConfidenceGate::Above,
+            format!("review confidence {c:.2} clears the {CONFIDENCE_FLOOR:.2} floor"),
+        ),
+        Some(c) => (
+            ConfidenceGate::Below,
+            format!(
+                "review confidence {c:.2} is BELOW the {CONFIDENCE_FLOOR:.2} floor — the \
+                 adversarial reviewer did not back this patch, so it is not installed by a \
+                 one-click apply"
+            ),
+        ),
+    }
+}
+
 /// Selection policy (v2): among PASSED candidates, prefer the HIGHEST review
 /// confidence; break ties toward the MINIMAL patch (smallest add/remove count).
 /// Returns the index into `survivors` of the winner, or None when empty. Pure
 /// so the rule is unit-tested without the cloud.
+///
+/// SELECTING A WINNER IS NOT THE SAME AS HAVING ONE WORTH PROPOSING: this
+/// function answers "which is best", and `meets_confidence_floor` answers
+/// "is best good enough". Both are needed — the best of three patches the
+/// reviewer disbelieved is still a patch the reviewer disbelieved.
 fn select_winner(survivors: &[Survivor]) -> Option<usize> {
     survivors
         .iter()
@@ -1153,7 +1338,8 @@ fn render_report(ts: u64, model: &str, d: &Diagnosis, winner: &Survivor) -> Stri
          - subsystem: {subsystem}\n\
          - files touched: {files}\n\
          - chosen candidate: #{index}\n\
-         - review confidence: {confidence:.2}\n\n\
+         - review confidence: {confidence:.2} (floor {floor:.2} — cleared)\n\
+         - adversarial reviewer said: {verdict_line}\n\n\
          ## Diagnosis\n\n\
          - signature(s):\n  - {sigs}\n\
          - cited line numbers: {lines}\n\n\
@@ -1172,6 +1358,12 @@ fn render_report(ts: u64, model: &str, d: &Diagnosis, winner: &Survivor) -> Stri
         responsiveness = responsiveness(d, &winner.diff).1,
         index = winner.index,
         confidence = winner.confidence,
+        floor = CONFIDENCE_FLOOR,
+        // THE HEADER, NOT ONLY THE SECTION 60 LINES DOWN. A reader skimming the
+        // top of report.md (and the HUD, which shows its first lines) got a bare
+        // number with no bar beside it and no word from the only stage that
+        // judged whether the patch is a good IDEA.
+        verdict_line = first_chars(winner.review_verdict.trim(), 200),
         sigs = sigs,
         lines = if d.line_numbers.is_empty() {
             "(none)".to_string()
@@ -1221,13 +1413,23 @@ fn render_candidates_md(outcomes: &[CandidateOutcome]) -> String {
     out
 }
 
-/// review.md: the chosen candidate's adversarial review verdict + confidence.
+/// review.md: the chosen candidate's adversarial review verdict + confidence,
+/// against the floor it had to clear (a bare score with no bar beside it is not
+/// something an operator can act on).
 fn render_review_md(winner: &Survivor) -> String {
     format!(
         "# Adversarial self-review — chosen candidate #{index}\n\n\
-         - confidence: {confidence:.2}\n\n## Verdict\n\n{verdict}\n",
+         - confidence: {confidence:.2} (floor {floor:.2}: {stance})\n\
+         - reviewed: {reviewed}\n\n## Verdict\n\n{verdict}\n",
         index = winner.index,
         confidence = winner.confidence,
+        floor = CONFIDENCE_FLOOR,
+        stance = if meets_confidence_floor(winner.confidence) { "cleared" } else { "BELOW" },
+        reviewed = if winner.reviewed {
+            "yes"
+        } else {
+            "NO — the review call failed, so 0.00 is the absence of a review, not a verdict"
+        },
         verdict = winner.review_verdict,
     )
 }
@@ -1462,18 +1664,46 @@ async fn run_attempt(
     // operator; counted separately so the rejection report can tell them apart.
     let mut deadline_hits = 0usize;
     let mut merit_rejects = 0usize;
+    // THE ATTEMPT-WIDE CEILING. Each candidate used to get its own independent
+    // budget, so an attempt could occupy every core for CANDIDATE_COUNT times
+    // that — on a machine that is misbehaving, which is the only time this code
+    // runs at all. One clock for the whole attempt: a candidate may take up to
+    // VALIDATE_TIMEOUT, but only out of what is left of ATTEMPT_BUDGET.
+    let mut attempt_spent = Duration::ZERO;
     for (i, diff) in candidate_diffs.iter().enumerate() {
         let files = extract_source_files(diff);
-        match stage_and_validate(daemon_dir, heal_root, ts, i, diff, &diagnosis).await {
+        let budget = candidate_budget(ATTEMPT_BUDGET.saturating_sub(attempt_spent), VALIDATE_TIMEOUT);
+        let started = tokio::time::Instant::now();
+        let staged =
+            stage_and_validate(daemon_dir, heal_root, ts, i, diff, &diagnosis, budget).await;
+        // CHARGE THE MACHINE, NOT THE NETWORK.
+        //
+        // This accumulates only what the STAGED VALIDATION used. A wall-clock
+        // deadline across the whole loop also charged the adversarial review
+        // below — a cloud call with its own REVIEW_TIMEOUT of up to 180s — to a
+        // budget whose entire purpose is stopping one heal from occupying every
+        // core. At the measured 523s cycle that left candidate 3 exactly 4s of
+        // slack (1800 - 2 x 523 - 750), so any real review latency refused it,
+        // and refused it as `deadline` with "the attempt-wide budget was already
+        // spent by the earlier candidates" — a statement about the machine, for
+        // something the machine did not do.
+        attempt_spent = attempt_spent.saturating_add(started.elapsed());
+        match staged {
             Ok(StageResult::Validated { validation_tail }) => {
                 // (6) Adversarial review of this survivor.
-                let (verdict, confidence) =
+                let (verdict, confidence, reviewed) =
                     match brain.review(&diagnosis, diff, &validation_tail).await {
-                        Ok(raw) => parse_review(&raw),
+                        Ok(raw) => {
+                            let (v, c) = parse_review(&raw);
+                            (v, c, true)
+                        }
                         Err(e) => {
                             warn!(error = %e, candidate = i + 1, "heal: review call failed; \
                                  treating as zero-confidence");
-                            ("review call failed".to_string(), 0.0)
+                            // NOT the same fact as "the reviewer scored it 0.0",
+                            // and the confidence floor's report must not say it
+                            // was. Carried as `reviewed: false`.
+                            ("review call failed".to_string(), 0.0, false)
                         }
                     };
                 outcomes.push(CandidateOutcome {
@@ -1492,6 +1722,7 @@ async fn run_attempt(
                     validation_tail,
                     review_verdict: verdict,
                     confidence,
+                    reviewed,
                     size: diff_size(diff),
                 });
             }
@@ -1551,6 +1782,35 @@ async fn run_attempt(
         };
     };
     let winner = survivors[win_idx].clone();
+
+    // (7b) THE CONFIDENCE FLOOR. Every gate above is mechanical and blind to
+    // whether the patch is a good IDEA; the adversarial reviewer is the only
+    // stage that judges that, and until now its verdict could not stop anything
+    // — `select_winner` returned the best of the survivors and the best of three
+    // patches the reviewer disbelieved was proposed with an ACCEPT & APPLY
+    // button beside it. Below the floor nothing is proposed. Nothing is lost:
+    // the diffs, the reviews and the diagnosis are written under
+    // state/heal/rejected/<ts>/ for anyone who wants to apply one by hand.
+    if !meets_confidence_floor(winner.confidence) {
+        warn!(
+            confidence = winner.confidence,
+            floor = CONFIDENCE_FLOOR,
+            reviewed = winner.reviewed,
+            "heal: the best candidate is below the review-confidence floor; proposing nothing"
+        );
+        let summary = below_floor_summary(&winner, survivors.len());
+        let report = render_rejection_report(ts, model, &diagnosis, &summary);
+        let dir = heal_root.join("rejected");
+        record_artifact(&dir, ts, "candidates.md", &candidates_md);
+        record_artifact(&dir, ts, "diagnosis.json", &diagnosis_json(&diagnosis));
+        record_artifact(&dir, ts, "review.md", &render_review_md(&winner));
+        return AttemptResult::Rejected {
+            stage: "confidence",
+            diff: winner.diff.clone(),
+            report,
+        };
+    }
+
     let responsiveness_word = responsiveness(&diagnosis, &winner.diff).0.word();
     let report = render_report(ts, model, &diagnosis, &winner);
     let review_md = render_review_md(&winner);
@@ -1651,6 +1911,11 @@ async fn propose(
             "files": files,
             "validated": true,
             "confidence": confidence,
+            // THE BAR THE SCORE HAD TO CLEAR, sent with the score. Without it the
+            // HUD had to hard-code a second copy of the floor to render "is this
+            // a good number?", and two copies of a threshold drift. The daemon
+            // owns the number; the HUD renders what it is told.
+            "confidence_floor": CONFIDENCE_FLOOR,
             // VALIDATED IS NOT RESPONSIVE. Four gates prove the patch compiles,
             // lints, passes and that its test bites; none of them prove it
             // addresses the burst. The HUD's Accept button needs both words.
@@ -1767,8 +2032,11 @@ struct CmdOutput {
 
 /// Copy the crate sources (src/, Cargo.toml, Cargo.lock if present — NOT
 /// target/) into the staging dir, apply the diff with patch -p1 --batch
-/// (reject on any hunk failure), then check + clippy + test + mutation under one
-/// 10-minute deadline.
+/// (reject on any hunk failure), then check + clippy + test + mutation under the
+/// `budget` the caller hands down: at most VALIDATE_TIMEOUT, and only out of the
+/// single ATTEMPT_BUDGET every candidate of the attempt shares. (This read "one
+/// 10-minute deadline" for as long as the constant was 600s and per-candidate.
+/// Neither of those is true any more.)
 /// Wrapper that guarantees the staging tree is REMOVED on every exit.
 ///
 /// stage_and_validate creates state/heal/staging-<ts>-c<i>/ per candidate and copies
@@ -1786,10 +2054,20 @@ async fn stage_and_validate(
     candidate: usize,
     diff: &str,
     diagnosis: &Diagnosis,
+    budget: Duration,
 ) -> anyhow::Result<StageResult> {
+    // NOT ENOUGH TIME LEFT IN THE ATTEMPT TO REACH A VERDICT. Say so before
+    // copying a crate tree and applying a patch: staging costs disk and IO on a
+    // machine that is already misbehaving, and every gate below would then be
+    // handed a slice too small to finish, producing the same rejection with more
+    // work done. Reported as `deadline`, never as a verdict on the patch.
+    if budget < minimum_viable_budget() {
+        return Ok(budget_exhausted("check", "", None, budget, BudgetStop::Attempt));
+    }
     let staging = heal_root.join(staging_dir_name(ts, candidate));
     let out =
-        stage_and_validate_inner(source_dir, heal_root, ts, candidate, diff, diagnosis).await;
+        stage_and_validate_inner(source_dir, heal_root, ts, candidate, diff, diagnosis, budget)
+            .await;
     // Best-effort: a tree we could not remove is wasted disk, never a broken heal.
     if let Err(e) = tokio::fs::remove_dir_all(&staging).await {
         if e.kind() != std::io::ErrorKind::NotFound {
@@ -1812,6 +2090,7 @@ async fn stage_and_validate_inner(
     candidate: usize,
     diff: &str,
     diagnosis: &Diagnosis,
+    budget: Duration,
 ) -> anyhow::Result<StageResult> {
     let staging = heal_root.join(staging_dir_name(ts, candidate));
     // `staging` is a miniature REPO ROOT; the crate itself lands one level down.
@@ -1827,7 +2106,7 @@ async fn stage_and_validate_inner(
         });
     }
 
-    let deadline = tokio::time::Instant::now() + VALIDATE_TIMEOUT;
+    let deadline = tokio::time::Instant::now() + budget;
     let mut combined = String::new();
     // TESTS THAT CANNOT RUN IN A STAGE, skipped BY NAME and stated in the report.
     //
@@ -1869,21 +2148,44 @@ async fn stage_and_validate_inner(
     // as "check" rather than as a lint failure, which is what the operator needs
     // to read.
     let clippy_args = vec!["clippy", "--all-targets", "--", "-D", "warnings"];
-    let stages: [(&str, Vec<&str>); 3] = [
-        ("check", vec!["check"]),
-        ("clippy", clippy_args),
-        ("test", test_args.clone()),
+    // Each stage carries the FLOOR it needs. A stage may use everything left
+    // except the floors of the stages after it (plus MUTATION_STAGE_FLOOR for
+    // the probe, which is not in this table) — so a pathologically slow clippy
+    // is stopped at its own share instead of eating the budget and leaving
+    // `test`, the stage that actually exercises the patch, three seconds and a
+    // `deadline`. The floors never bite a healthy run: measured cold on an M1
+    // Pro they are ~2x what each stage actually takes.
+    let stages: [(&str, Vec<&str>, Duration); 3] = [
+        ("check", vec!["check"], CHECK_STAGE_FLOOR),
+        ("clippy", clippy_args, CLIPPY_STAGE_FLOOR),
+        ("test", test_args.clone(), TEST_STAGE_FLOOR),
     ];
-    for (stage, args) in stages {
+    for i in 0..stages.len() {
+        let (stage, args, _) = &stages[i];
+        let (stage, args) = (*stage, args);
+        // Everything after this stage still has to run: their floors, plus the
+        // mutation probe's.
+        let reserved_for_later: Duration = stages[i + 1..]
+            .iter()
+            .map(|(_, _, floor)| *floor)
+            .sum::<Duration>()
+            + MUTATION_STAGE_FLOOR;
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
             // RUNNING OUT OF TIME IS NOT A VERDICT ON THE PATCH. Filed under the
             // stage name it never reached, this reported as `heal.rejected
             // {stage:"test"}` and rendered as "no candidate passed the gates" —
             // which an operator reads as "the model drafted three bad patches".
-            return Ok(budget_exhausted(stage, &combined, None));
+            return Ok(budget_exhausted(stage, &combined, None, budget, BudgetStop::Candidate));
         }
-        match run_cargo(&crate_dir, &args, remaining).await {
+        let cap = stage_cap(remaining, budget, reserved_for_later);
+        // The cap bit, not the clock: this stage is out of its SHARE while the
+        // candidate still has time reserved for the stages behind it.
+        let capped = cap < remaining;
+        if cap.is_zero() {
+            return Ok(budget_exhausted(stage, &combined, None, budget, BudgetStop::StageShare));
+        }
+        match run_cargo(&crate_dir, args, cap).await {
             Ok(out) => {
                 combined.push_str(&format!("\n$ cargo {}\n", args.join(" ")));
                 combined.push_str(&out.output);
@@ -1891,7 +2193,16 @@ async fn stage_and_validate_inner(
                     return Ok(StageResult::Rejected { stage, detail: combined });
                 }
             }
-            Err(e) => return Ok(stage_failure(stage, &combined, &e)),
+            Err(e) if capped && is_deadline_error(&e) => {
+                return Ok(budget_exhausted(
+                    stage,
+                    &combined,
+                    Some(&e),
+                    budget,
+                    BudgetStop::StageShare,
+                ))
+            }
+            Err(e) => return Ok(stage_failure(stage, &combined, &e, budget)),
         }
     }
 
@@ -2006,31 +2317,105 @@ fn is_deadline_error(e: &anyhow::Error) -> bool {
     e.to_string().contains(CARGO_DEADLINE_MARKER)
 }
 
+/// How much of [`ATTEMPT_BUDGET`] one candidate may take: its own ceiling,
+/// clamped by whatever the earlier candidates left of the attempt-wide one.
+/// PURE, so the rule is unit-tested without a clock.
+fn candidate_budget(attempt_remaining: Duration, per_candidate: Duration) -> Duration {
+    if attempt_remaining < per_candidate {
+        attempt_remaining
+    } else {
+        per_candidate
+    }
+}
+
+/// The floors every stage of one candidate needs before that candidate is worth
+/// starting at all. A candidate handed less than this cannot reach a verdict, so
+/// staging the tree and applying the patch would only burn the machine.
+fn minimum_viable_budget() -> Duration {
+    CHECK_STAGE_FLOOR + CLIPPY_STAGE_FLOOR + TEST_STAGE_FLOOR + MUTATION_STAGE_FLOOR
+}
+
+/// The slice one stage may take: everything left EXCEPT the floors reserved for
+/// the stages that still have to run after it.
+///
+/// The ceiling is computed from the candidate's WHOLE budget, not from what is
+/// left of it: a reserve subtracted from an already-depleted remainder shrinks
+/// every stage as the budget drains, and would hand a late stage zero while real
+/// time was still on the clock. `remaining` still wins when it is the smaller of
+/// the two — a stage never gets more time than exists.
+fn stage_cap(remaining: Duration, budget: Duration, reserved_for_later: Duration) -> Duration {
+    let ceiling = budget.saturating_sub(reserved_for_later);
+    if remaining < ceiling {
+        remaining
+    } else {
+        ceiling
+    }
+}
+
+/// WHICH ceiling stopped a candidate. They are opposite instructions to the
+/// operator and used to render as one sentence: a spent candidate budget says
+/// this machine cannot finish a validation cycle, a blown stage share says ONE
+/// stage ran away with the time, and a spent attempt budget says the candidate
+/// was never started because its predecessors used the machine up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum BudgetStop {
+    Candidate,
+    StageShare,
+    Attempt,
+}
+
 /// THE GATE RAN OUT OF TIME. Reported under its own stage name, never under the
 /// stage it was trying to run, because `heal.rejected{stage:"test"}` +
 /// "no candidate passed the staged gates" is read by an operator as "the model
 /// drafted three bad patches" when in fact no patch was ever judged.
-fn budget_exhausted(stage: &'static str, combined: &str, err: Option<&anyhow::Error>) -> StageResult {
-    let secs = VALIDATE_TIMEOUT.as_secs();
+fn budget_exhausted(
+    stage: &'static str,
+    combined: &str,
+    err: Option<&anyhow::Error>,
+    budget: Duration,
+    stop: BudgetStop,
+) -> StageResult {
+    let secs = budget.as_secs();
     let when = match err {
         Some(e) => format!("ran out DURING `cargo {stage}` ({e})"),
         None => format!("was already spent before `cargo {stage}` could start"),
     };
+    let detail = match stop {
+        BudgetStop::Candidate => format!(
+            "the {secs}s staged-validation budget for this candidate {when}"
+        ),
+        BudgetStop::StageShare => format!(
+            "`cargo {stage}` exceeded its SHARE of the {secs}s candidate budget \
+             (the rest is reserved so a slow stage cannot starve the ones after it) ({})",
+            err.map(|e| e.to_string()).unwrap_or_else(|| "no time left for it at all".into())
+        ),
+        BudgetStop::Attempt => format!(
+            "the {}s attempt-wide budget was already spent by the earlier candidates, so \
+             this one was never started (it would have had {secs}s, below the {}s a \
+             candidate needs to reach any verdict)",
+            ATTEMPT_BUDGET.as_secs(),
+            minimum_viable_budget().as_secs()
+        ),
+    };
     StageResult::Rejected {
         stage: "deadline",
         detail: format!(
-            "{combined}\n[the {secs}s staged-validation budget {when}. This candidate was never \
-             judged on its merits — it is a capacity failure of the gate, not a verdict on the \
-             patch.]"
+            "{combined}\n[{detail}. This candidate was never judged on its merits — it is a \
+             capacity failure of the gate, not a verdict on the patch.]"
         ),
     }
 }
 
 /// Classify a `run_cargo` error: a blown deadline is `budget_exhausted`,
 /// anything else (no toolchain, spawn failure) stays filed under the stage.
-fn stage_failure(stage: &'static str, combined: &str, e: &anyhow::Error) -> StageResult {
+fn stage_failure(
+    stage: &'static str,
+    combined: &str,
+    e: &anyhow::Error,
+    budget: Duration,
+) -> StageResult {
     if is_deadline_error(e) {
-        return budget_exhausted(stage, combined, Some(e));
+        return budget_exhausted(stage, combined, Some(e), budget, BudgetStop::Candidate);
     }
     StageResult::Rejected {
         stage,
@@ -2044,23 +2429,72 @@ fn stage_failure(stage: &'static str, combined: &str, e: &anyhow::Error) -> Stag
 fn rejection_summary(deadline_hits: usize, merit_rejects: usize) -> String {
     if deadline_hits > 0 && merit_rejects == 0 {
         return format!(
-            "NO CANDIDATE WAS EVER JUDGED. The {}s staged-validation budget ran out on every \
+            "NO CANDIDATE WAS EVER JUDGED. The staged-validation budget ran out on every \
              candidate ({deadline_hits} of them) before a gate could return a verdict. This says \
              nothing about the drafted patches — it says the gate cannot finish a full \
-             check + clippy + test + mutation-rerun cycle on this machine in that budget.",
-            VALIDATE_TIMEOUT.as_secs()
+             check + clippy + test + mutation-rerun cycle on this machine inside {}s per \
+             candidate / {}s per attempt.",
+            VALIDATE_TIMEOUT.as_secs(),
+            ATTEMPT_BUDGET.as_secs()
         );
     }
     let mut out =
         "No candidate passed the staged check / clippy / test / mutation gates.".to_string();
     if deadline_hits > 0 {
         out.push_str(&format!(
-            " ({deadline_hits} of them never finished: the {}s validation budget ran out, so those \
-             were not judged on their merits.)",
-            VALIDATE_TIMEOUT.as_secs()
+            " ({deadline_hits} of them never finished: the {}s per-candidate / {}s per-attempt \
+             validation budget ran out, so those were not judged on their merits.)",
+            VALIDATE_TIMEOUT.as_secs(),
+            ATTEMPT_BUDGET.as_secs()
         ));
     }
     out
+}
+
+/// A rejection STAGE token as a sentence, for the surfaces that only have the
+/// token. `deadline` and `confidence` are NOT gate failures and must not be
+/// reported as "rejected every candidate at stage X": the first means nothing
+/// was ever judged, and the second means every mechanical gate PASSED and only
+/// the adversarial reviewer withheld its backing. The HUD draws the same
+/// distinction from the same token (`hud/src/core/heal.ts::rejectionDetail`);
+/// `--heal-drill` — the surface the verifier actually reads — had only the bare
+/// word, and `confidence` became reachable the moment the floor landed.
+fn drill_rejection_sentence(stage: &str) -> String {
+    match stage {
+        "deadline" => "the staged-validation budget ran out before ANY candidate could be \
+             judged. That is a capacity failure of the gate on this machine, not a verdict on \
+             the drafted patches"
+            .to_string(),
+        "confidence" => format!(
+            "candidates passed every staged gate, but the adversarial reviewer backed none of \
+             them (below the {CONFIDENCE_FLOOR:.2} confidence floor), so nothing was proposed. \
+             That is the reviewer's verdict, not a gate failure"
+        ),
+        other => format!("every candidate was rejected at stage `{other}`"),
+    }
+}
+
+/// Everything a fully-rejected attempt owes the operator when candidates DID
+/// pass every mechanical gate but none of them convinced the adversarial
+/// reviewer. This is not a gate failure and must not read as one: the patches
+/// compile, lint, pass and their tests bite — the reviewer simply did not back
+/// any of them, and all of them are on disk under `state/heal/rejected/<ts>/`
+/// for a human who wants to look.
+fn below_floor_summary(best: &Survivor, survivors: usize) -> String {
+    let scored = if best.reviewed {
+        format!("the best of them scored {:.2}", best.confidence)
+    } else {
+        "the adversarial review call never came back for any of them (recorded as 0.00, \
+         which is NOT the reviewer saying the patch is bad — it is no review at all)"
+            .to_string()
+    };
+    format!(
+        "NOTHING WAS PROPOSED, AND NOT BECAUSE THE PATCHES FAILED A GATE. {survivors} \
+         candidate(s) passed staged check + clippy -D warnings + test + the mutation probe, but \
+         {scored}, below the {CONFIDENCE_FLOOR:.2} review-confidence floor. A patch nobody \
+         vouched for does not get a one-click APPLY button next to it. Every candidate, its \
+         diff and its review are in this directory — apply one by hand if you disagree."
+    )
 }
 
 /// Stage the crate for validation. `staging` becomes a miniature REPO ROOT and
@@ -2659,7 +3093,7 @@ pub async fn run_heal_drill(model: &str) -> anyhow::Result<PathBuf> {
             telemetry::emit(
                 "system",
                 "heal.proposal",
-                json!({"ts": ts, "files": files, "validated": true, "confidence": confidence, "responsiveness": responsiveness, "drill": true}),
+                json!({"ts": ts, "files": files, "validated": true, "confidence": confidence, "confidence_floor": CONFIDENCE_FLOOR, "responsiveness": responsiveness, "drill": true}),
             );
             info!(
                 proposal = %dir.display(),
@@ -2669,7 +3103,7 @@ pub async fn run_heal_drill(model: &str) -> anyhow::Result<PathBuf> {
             Ok(dir)
         }
         AttemptResult::Rejected { stage, .. } => {
-            anyhow::bail!("heal drill: pipeline rejected every candidate at stage `{stage}`")
+            anyhow::bail!("heal drill: {}", drill_rejection_sentence(stage))
         }
         AttemptResult::Aborted { stage } => {
             anyhow::bail!("heal drill: pipeline aborted at stage `{stage}` (cloud/infra failure)")
@@ -3081,6 +3515,7 @@ mod tests {
             validation_tail: "ok".to_string(),
             review_verdict: "v".to_string(),
             confidence,
+            reviewed: true,
             size,
         }
     }
@@ -3119,6 +3554,7 @@ mod tests {
             validation_tail: "$ cargo check\n    Finished dev profile\n$ cargo test\ntest result: ok".to_string(),
             review_verdict: "Fixes the root cause; no side effects.".to_string(),
             confidence: 0.91,
+            reviewed: true,
             size: 2,
         };
         let report = render_report(1_760_000_000, "claude-opus-4-8", &d, &winner);
@@ -3278,7 +3714,7 @@ mod tests {
         );
 
         let result =
-            stage_and_validate(&crate_dir, &heal_root, 1_770_000_001, 0, &vacuous, &diag_for(&["src/lib.rs"], "router"))
+            stage_and_validate(&crate_dir, &heal_root, 1_770_000_001, 0, &vacuous, &diag_for(&["src/lib.rs"], "router"), VALIDATE_TIMEOUT)
                 .await
                 .unwrap();
         match result {
@@ -3323,7 +3759,7 @@ mod tests {
         );
 
         let result =
-            stage_and_validate(&crate_dir, &heal_root, 1_770_000_002, 0, &biting, &diag_for(&["src/lib.rs"], "router"))
+            stage_and_validate(&crate_dir, &heal_root, 1_770_000_002, 0, &biting, &diag_for(&["src/lib.rs"], "router"), VALIDATE_TIMEOUT)
                 .await
                 .unwrap();
         match result {
@@ -3448,7 +3884,7 @@ mod tests {
         };
 
         let result =
-            stage_and_validate(&crate_dir, &heal_root, 1_780_000_001, 0, elsewhere, &diagnosis)
+            stage_and_validate(&crate_dir, &heal_root, 1_780_000_001, 0, elsewhere, &diagnosis, VALIDATE_TIMEOUT)
                 .await
                 .unwrap();
 
@@ -3512,6 +3948,7 @@ mod tests {
             0,
             &biting,
             &diag_for(&["src/lib.rs"], "router"),
+            VALIDATE_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3621,6 +4058,7 @@ mod tests {
             validation_tail: "tail".to_string(),
             review_verdict: "ok".to_string(),
             confidence: 0.9,
+            reviewed: true,
             size: 2,
         };
         let report = render_report(7, "m", &d, &w);
@@ -3637,7 +4075,7 @@ mod tests {
         );
     }
 
-    // -- the 10-minute budget: exhaustion is not a verdict --------------------
+    // -- the staged-validation budget: exhaustion is not a verdict ------------
 
     /// A blown deadline must be classifiable from the error `run_cargo` really
     /// produces — not from a string this test invents. So this drives the REAL
@@ -3666,7 +4104,7 @@ mod tests {
     #[test]
     fn deadline_exhaustion_reports_itself_as_a_deadline() {
         let timeout = anyhow::anyhow!("cargo test {CARGO_DEADLINE_MARKER} (0s remained)");
-        match stage_failure("test", "…", &timeout) {
+        match stage_failure("test", "…", &timeout, VALIDATE_TIMEOUT) {
             StageResult::Rejected { stage, detail } => {
                 assert_eq!(stage, "deadline", "a blown budget must not be filed under `test`");
                 assert!(detail.contains("never judged on its merits"), "{detail}");
@@ -3674,12 +4112,12 @@ mod tests {
             StageResult::Validated { .. } => panic!("a blown budget is not a validation"),
         }
         // A genuine infrastructure failure still reports under its stage.
-        match stage_failure("check", "…", &anyhow::anyhow!("cargo not found")) {
+        match stage_failure("check", "…", &anyhow::anyhow!("cargo not found"), VALIDATE_TIMEOUT) {
             StageResult::Rejected { stage, .. } => assert_eq!(stage, "check"),
             StageResult::Validated { .. } => panic!("unexpected"),
         }
         // And the pre-stage guard names the stage that never started.
-        match budget_exhausted("clippy", "…", None) {
+        match budget_exhausted("clippy", "…", None, VALIDATE_TIMEOUT, BudgetStop::Candidate) {
             StageResult::Rejected { stage, detail } => {
                 assert_eq!(stage, "deadline");
                 assert!(detail.contains("before `cargo clippy` could start"), "{detail}");
@@ -3948,6 +4386,7 @@ mod tests {
             0,
             wrong_context_diff,
             &diag_for(&["src/lib.rs"], "router"),
+            VALIDATE_TIMEOUT,
         )
         .await
         .unwrap();
@@ -3980,6 +4419,7 @@ mod tests {
             0,
             useless_diff,
             &diag_for(&["src/lib.rs"], "router"),
+            VALIDATE_TIMEOUT,
         )
         .await
         .unwrap();
@@ -4008,6 +4448,7 @@ mod tests {
             0,
             fixing,
             &diag_for(&["src/lib.rs"], "router"),
+            VALIDATE_TIMEOUT,
         )
         .await
         .expect("staging infrastructure must work");
@@ -4456,8 +4897,14 @@ mod tests {
         );
         // ORDER: clippy before test. It subsumes check and is far cheaper than the
         // suite, so a lint failure must not wait behind 3000 tests.
+        // THE ANCHOR HAS TO TRACK THE CODE IT GUARDS. The stage table grew a
+        // per-stage FLOOR (`(&str, Vec<&str>, Duration)`), and a guard whose
+        // anchor no longer matches does not fail at the thing it protects — it
+        // panics on its own `expect`, which reads as "the gate lost its stages"
+        // when nothing about the stages changed. Built with `concat!` so this
+        // test's own source can never be what the search finds.
         let stages = src
-            .find("let stages: [(&str, Vec<&str>); 3]")
+            .find(concat!("let stages: [(&str, ", "Vec<&str>, Duration); 3]"))
             .expect("the gate must have three stages");
         let tail = &src[stages..stages + 400.min(src.len() - stages)];
         let ci = tail.find("(\"clippy\"").expect("clippy must be a stage");
@@ -4664,10 +5111,33 @@ mod tests {
     #[test]
     fn the_responsiveness_rule_has_exactly_one_implementation() {
         let main_rs = include_str!("main.rs");
+        // THE ARGV MATCH, ON A CODE LINE. main.rs names `--heal-responsiveness`
+        // three more times in PROSE (the entrypoint comment block above the handler
+        // and the usage string), so a whole-file `contains` was satisfied with the
+        // handler's own literal renamed. PROVED: changing
+        // `|a| a == "--heal-responsiveness"` to `"--heal-responsivenes"` left this
+        // test green. That is not cosmetic: apply_heal.sh's fail-closed
+        // `grep -q -- '--heal-responsiveness' "$CRATE/src/main.rs"` reads the SAME
+        // prose, so the script would clear its own guard and then invoke a flag the
+        // staged daemon does not implement — and an unknown flag falls through to
+        // ORDINARY DAEMON STARTUP rather than erroring.
         assert!(
-            main_rs.contains("--heal-responsiveness"),
-            "the shared flag must exist, or apply_heal.sh's grep guard silently \
-             disables the probe forever"
+            main_rs.lines().map(str::trim_start).any(|l| {
+                !l.starts_with("//") && l.contains("a == \"--heal-responsiveness\"")
+            }),
+            "main's argv scan must MATCH --heal-responsiveness on a code line, or \
+             apply_heal.sh's grep guard passes on a comment and the probe invocation \
+             boots a daemon instead of answering"
+        );
+        // NEGATIVE PIN: the prose copies are what made the old assertion vacuous, so
+        // prove the comment filter above is actually doing work. If they ever go,
+        // whoever removes them re-reads this instead of inheriting a quiet guard.
+        assert!(
+            main_rs.lines().map(str::trim_start).any(|l| {
+                l.starts_with("//") && l.contains("--heal-responsiveness")
+            }),
+            "the prose occurrences this guard must NOT count are gone; re-check that \
+             the code-line filter above is still doing any work"
         );
         assert!(
             main_rs.contains("heal::responsiveness(&diagnosis, &diff)"),
@@ -4781,9 +5251,12 @@ mod tests {
     /// THE MUTATION PROBE'S OWN TEST RUN NEEDS A ZERO-BUDGET GUARD TOO — and
     /// nothing tested the one that was just added.
     ///
-    /// This is `run_cargo`'s FOURTH call, handed whatever survives the 600s
-    /// budget after check + clippy + test (measured at ~87% of it on a warm
-    /// M1 Pro). With nothing left, `tokio::time::timeout(Duration::ZERO, …)`
+    /// This is `run_cargo`'s FOURTH call, handed whatever survives the
+    /// per-candidate budget after check + clippy + test — 523s of the old 600s,
+    /// ~87%, measured cold on an M1 Pro. MUTATION_STAGE_FLOOR is now reserved
+    /// for it by every stage ahead of it, but a reserve is not a guarantee (the
+    /// last stage may still overrun into it), so the guard stays. With nothing
+    /// left, `tokio::time::timeout(Duration::ZERO, …)`
     /// fires instantly, the Err arm below reports "the probe could not run",
     /// and the candidate is returned VALIDATED as if the probe had merely
     /// hiccuped — a never-run proof reading as a technical blip. The staged
@@ -4864,4 +5337,594 @@ mod tests {
         );
     }
 
+    // -- (9) THE BUDGET: one attempt-wide ceiling, floors behind each stage ---
+
+    /// THE CONSTANTS HAVE TO FIT EACH OTHER. Floors that sum past the
+    /// per-candidate budget make every stage's cap zero and the gate can never
+    /// run; a per-candidate budget above the attempt budget makes the
+    /// attempt-wide ceiling decorative; and an attempt budget above the 3x600s
+    /// worst case this replaced would be a straight resource regression on a
+    /// machine that is, by definition of self-heal firing, already struggling.
+    #[test]
+    fn the_budget_constants_can_actually_fit_a_candidate() {
+        assert!(
+            minimum_viable_budget() <= VALIDATE_TIMEOUT,
+            "the stage floors ({}s) exceed the per-candidate budget ({}s): every stage's cap \
+             would be zero and no candidate could ever be judged",
+            minimum_viable_budget().as_secs(),
+            VALIDATE_TIMEOUT.as_secs()
+        );
+        assert!(
+            VALIDATE_TIMEOUT <= ATTEMPT_BUDGET,
+            "a candidate may not be allowed more than the whole attempt"
+        );
+        assert!(
+            ATTEMPT_BUDGET <= Duration::from_secs(1800),
+            "the attempt-wide ceiling ({}s) is above the 3 x 600s worst case it replaced — \
+             this change must not buy headroom with the operator's machine",
+            ATTEMPT_BUDGET.as_secs()
+        );
+        // ...and the budget must actually be bigger than the measured cycle it
+        // has to fit (523s cold on an M1 Pro), or nothing was fixed.
+        assert!(
+            VALIDATE_TIMEOUT >= Duration::from_secs(700),
+            "the per-candidate budget is back below the measured 523s cycle plus a slow-machine \
+             margin; the 87% squeeze this replaced is reopened"
+        );
+    }
+
+    /// THE ATTEMPT MUST BE ABLE TO AFFORD EVERY CANDIDATE IT DRAFTS.
+    ///
+    /// `CANDIDATE_COUNT` diffs are paid for at the heavy model and then staged in
+    /// order, and the LAST of them is staged only when its predecessors left at
+    /// least `minimum_viable_budget()`. "On a healthy machine all of them still
+    /// get a real verdict" is therefore not a hope — it is this inequality, and
+    /// nothing else in the file enforces it. Raise a stage floor, or the measured
+    /// cycle, without raising ATTEMPT_BUDGET and the last candidate is drafted,
+    /// paid for, and then SILENTLY never judged: refused as `deadline` and billed
+    /// to the operator's machine.
+    #[test]
+    fn the_attempt_budget_can_afford_every_candidate() {
+        // MEASURED cold on an M1 Pro in a tree staged exactly as `stage_sources`
+        // builds one: check 92 + clippy 184 + test 214 + mutation re-run 33.
+        const MEASURED_CYCLE: Duration = Duration::from_secs(523);
+        let predecessors = MEASURED_CYCLE * (CANDIDATE_COUNT as u32 - 1);
+        let needed = predecessors + minimum_viable_budget();
+        assert!(
+            ATTEMPT_BUDGET >= needed,
+            "the {}s attempt budget cannot afford {CANDIDATE_COUNT} candidates: the first {} \
+             at the measured {}s cycle leave {}s, below the {}s the last one needs before it \
+             is staged at all",
+            ATTEMPT_BUDGET.as_secs(),
+            CANDIDATE_COUNT - 1,
+            MEASURED_CYCLE.as_secs(),
+            ATTEMPT_BUDGET.saturating_sub(predecessors).as_secs(),
+            minimum_viable_budget().as_secs()
+        );
+        // The slack this passes with is 1800 - 2 x 523 - 750 = 4s. It is REAL,
+        // not comfortable, and that is exactly why it is pinned: any nudge to a
+        // floor, to CANDIDATE_COUNT or to the cycle now fails loudly here instead
+        // of quietly dropping the last candidate in production.
+    }
+
+    /// CLOUD LATENCY IS NOT THE MACHINE'S TO PAY FOR.
+    ///
+    /// The attempt budget bounds COMPILATION. The adversarial review that runs
+    /// between candidates is a cloud call with its own REVIEW_TIMEOUT, and a
+    /// wall-clock deadline spanning the loop charged it here: with 4s of slack
+    /// (see above), two seconds of review latency refused candidate 3 and told
+    /// the operator the earlier candidates had used their machine up.
+    ///
+    /// The loop is driven by a real clock and a real cargo, so this cannot be
+    /// reached from a unit test; it is pinned at the source. Bounded at BOTH ends,
+    /// and every needle is built with `concat!` so this test's own text cannot
+    /// satisfy the search.
+    #[test]
+    fn the_candidate_loop_does_not_charge_cloud_latency_to_the_machine() {
+        let src = include_str!("heal.rs");
+        let start_anchor = concat!("let mut attempt_spent = ", "Duration::ZERO;");
+        let end_anchor = concat!("let candidates_md = ", "render_candidates_md(&outcomes);");
+        let start = src.find(start_anchor).expect("the attempt accumulator is gone");
+        let rest = &src[start..];
+        let end = rest
+            .find(end_anchor)
+            .expect("the candidate loop no longer ends where it did");
+        let window = &rest[..end];
+        assert!(
+            !window.trim().is_empty() && window.len() < 8_000,
+            "the window did not bind ({} bytes)",
+            window.len()
+        );
+        assert!(
+            window.contains(concat!("ATTEMPT_BUDGET.saturating_sub(", "attempt_spent)")),
+            "the candidate budget is not taken from the ACCUMULATED staged time:\n{window}"
+        );
+        assert!(
+            !window.contains(concat!("attempt_", "deadline")),
+            "a wall-clock attempt deadline is back — it charges the review call's latency to \
+             the machine and refuses the last candidate with 'the earlier candidates used the \
+             machine up':\n{window}"
+        );
+        let charge = window
+            .find(concat!("attempt_spent.saturating_add(", "started.elapsed())"))
+            .expect("the loop never charges the staged time it used");
+        let review = window
+            .find(concat!("brain.", "review("))
+            .expect("the loop no longer reviews its survivors");
+        assert!(
+            charge < review,
+            "the staged time is charged AFTER the review call, so the review's latency is \
+             inside the charged interval again"
+        );
+    }
+
+    /// A candidate gets its own ceiling — but only out of what the earlier
+    /// candidates left. Without this, CANDIDATE_COUNT independent budgets let one
+    /// attempt occupy every core for CANDIDATE_COUNT x VALIDATE_TIMEOUT.
+    #[test]
+    fn candidate_budget_is_clamped_by_what_the_attempt_has_left() {
+        let per = Duration::from_secs(900);
+        // Plenty left: the candidate gets its full ceiling, not the remainder.
+        assert_eq!(candidate_budget(Duration::from_secs(1800), per), per);
+        assert_eq!(candidate_budget(per, per), per);
+        // Squeezed: it gets exactly what is left, never more.
+        assert_eq!(
+            candidate_budget(Duration::from_secs(400), per),
+            Duration::from_secs(400)
+        );
+        assert_eq!(candidate_budget(Duration::ZERO, per), Duration::ZERO);
+    }
+
+    /// A slow stage must not eat the budget of the stages behind it. The cap is
+    /// computed off the WHOLE budget (not the depleted remainder), so the floors
+    /// do not shrink as the clock runs down.
+    #[test]
+    fn stage_cap_reserves_the_floors_of_the_stages_behind_it() {
+        let budget = Duration::from_secs(900);
+        // First stage, 600s reserved behind it -> capped at 300s even though the
+        // full 900s is still on the clock.
+        assert_eq!(
+            stage_cap(budget, budget, Duration::from_secs(600)),
+            Duration::from_secs(300)
+        );
+        // Last stage: nothing behind it, so it may use everything that is left.
+        assert_eq!(
+            stage_cap(Duration::from_secs(120), budget, Duration::ZERO),
+            Duration::from_secs(120)
+        );
+        // REMAINING STILL WINS WHEN IT IS SMALLER — a stage never gets more time
+        // than exists.
+        assert_eq!(
+            stage_cap(Duration::from_secs(90), budget, Duration::from_secs(600)),
+            Duration::from_secs(90)
+        );
+        // A reserve larger than the budget yields zero, not a panic (Duration
+        // subtraction underflows by panicking; saturating_sub is load-bearing).
+        assert_eq!(
+            stage_cap(budget, budget, Duration::from_secs(5000)),
+            Duration::ZERO
+        );
+    }
+
+    /// THE DRILL'S ONLY FAILURE SURFACE. `--heal-drill` is what the verifier
+    /// runs, and it reported every outcome as "pipeline rejected every candidate
+    /// at stage `X`". With the confidence floor in place that sentence is false
+    /// twice for the outcome it is most likely to hit: nothing was rejected by a
+    /// gate, and the reader is told the model drafted bad patches.
+    #[test]
+    fn the_drill_does_not_report_a_review_floor_as_a_gate_failure() {
+        let floor = drill_rejection_sentence("confidence");
+        assert!(
+            floor.contains("passed every staged gate") && floor.contains("0.25"),
+            "a below-floor drill must say the gates passed and name the bar:\n{floor}"
+        );
+        assert!(
+            !floor.contains("rejected"),
+            "a below-floor outcome is not a rejection by any gate:\n{floor}"
+        );
+        let budget = drill_rejection_sentence("deadline");
+        assert!(
+            budget.contains("not a verdict"),
+            "a drill that ran out of budget judged nothing:\n{budget}"
+        );
+        // A real gate failure still says so, plainly.
+        assert!(
+            drill_rejection_sentence("clippy").contains("rejected at stage `clippy`"),
+            "an ordinary gate rejection must still name its stage"
+        );
+    }
+
+    /// The three ways a candidate runs out of time are three different messages.
+    /// They all used to render as one sentence about "the 600s budget", which
+    /// tells an operator to do the wrong thing in two cases out of three.
+    #[test]
+    fn budget_exhausted_says_which_ceiling_stopped_the_candidate() {
+        let budget = Duration::from_secs(900);
+        let text = |stop| match budget_exhausted("clippy", "tail", None, budget, stop) {
+            StageResult::Rejected { stage, detail } => {
+                assert_eq!(stage, "deadline", "never filed under the stage it never reached");
+                detail
+            }
+            other => panic!("expected a rejection, got {other:?}"),
+        };
+        let candidate = text(BudgetStop::Candidate);
+        assert!(candidate.contains("900s"), "{candidate}");
+        assert!(candidate.contains("for this candidate"), "{candidate}");
+
+        let share = text(BudgetStop::StageShare);
+        assert!(share.contains("SHARE"), "a blown stage share must say so:\n{share}");
+        assert!(
+            share.contains("starve"),
+            "it must say WHY the rest was withheld:\n{share}"
+        );
+
+        let attempt = text(BudgetStop::Attempt);
+        assert!(
+            attempt.contains("attempt-wide") && attempt.contains("never started"),
+            "a candidate the attempt could not afford must say it was never started, not that \
+             a gate failed:\n{attempt}"
+        );
+        // All three keep the "not a verdict on the patch" clause: that sentence is
+        // the whole reason `deadline` is its own stage.
+        for d in [candidate, share, attempt] {
+            assert!(d.contains("never judged on its merits"), "{d}");
+        }
+    }
+
+    /// A candidate the attempt cannot afford is refused BEFORE a tree is copied
+    /// and a patch applied. Staging costs disk and IO on a machine that is
+    /// already misbehaving, and every gate would then be handed a slice too small
+    /// to reach a verdict — the same rejection, with the machine punished for it.
+    #[tokio::test]
+    async fn a_candidate_the_attempt_cannot_afford_is_rejected_without_being_staged() {
+        let root = TempRoot::new("budget-skip");
+        let crate_dir = root.0.join("daemon");
+        let heal_root = root.0.join("state").join("heal");
+        write_synthetic_crate(&crate_dir);
+        let ts = 1_760_000_099u64;
+        let diff = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n pub fn double(x: i32) -> i32 {\n-    x * y\n+    x * 2\n }\n";
+
+        let out = stage_and_validate(
+            &crate_dir,
+            &heal_root,
+            ts,
+            0,
+            diff,
+            &diag_for(&["src/lib.rs"], "router"),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("staging must not error");
+
+        match out {
+            StageResult::Rejected { stage, detail } => {
+                assert_eq!(stage, "deadline", "a capacity failure is never a merit verdict");
+                assert!(detail.contains("attempt-wide"), "{detail}");
+            }
+            other => panic!("expected a deadline rejection, got {other:?}"),
+        }
+        assert!(
+            !heal_root.join(staging_dir_name(ts, 0)).exists(),
+            "the candidate was staged anyway — the whole point of the pre-check is that a \
+             candidate the attempt cannot afford costs nothing"
+        );
+    }
+
+    /// C PROVES THE FUNCTION, NOT THAT ANYONE CALLS IT. The stage loop is driven
+    /// by a wall clock and a real cargo, so the capping cannot be reached from a
+    /// unit test; this pins that the loop asks `stage_cap` for its slice and
+    /// reports a blown share as one. Bounded at BOTH ends, and the anchors are
+    /// built with `concat!` so this test's own source cannot satisfy the search.
+    #[test]
+    fn the_stage_loop_asks_stage_cap_for_every_slice() {
+        let src = include_str!("heal.rs");
+        let start_anchor = concat!("let stages: [(&str, ", "Vec<&str>, Duration); 3]");
+        let end_anchor = concat!("---- RESPONSIVENESS (advisory; ", "NEVER rejects)");
+        let start = src.find(start_anchor).expect("the stage table is gone");
+        let rest = &src[start..];
+        let end = rest.find(end_anchor).expect("the stage loop no longer ends where it did");
+        let window = &rest[..end];
+        assert!(
+            !window.trim().is_empty() && window.len() < 4_000,
+            "the window did not bind ({} bytes)",
+            window.len()
+        );
+        assert!(
+            window.contains(concat!("stage_cap(remaining, ", "budget, reserved_for_later)")),
+            "the loop does not cap its stages, so one slow stage can still eat the budget \
+             and leave `test` a few seconds and a deadline:\n{window}"
+        );
+        assert!(
+            window.contains("BudgetStop::StageShare"),
+            "a stage stopped at its share must be reported as that, not as the candidate's \
+             whole budget running out:\n{window}"
+        );
+        assert!(
+            window.contains("MUTATION_STAGE_FLOOR"),
+            "the mutation probe is not in the stage table, so its floor has to be added to \
+             every stage's reserve explicitly — or the probe is the stage that gets starved, \
+             and an unproven patch is exactly what this gate exists to catch:\n{window}"
+        );
+    }
+
+    // -- (10) THE REVIEW-CONFIDENCE FLOOR -----------------------------------
+
+    /// The bar is INCLUSIVE. An exclusive comparison would reject the one score
+    /// the floor is documented to allow, and the HUD (which renders the same
+    /// boundary) would disagree with the daemon about it.
+    #[test]
+    fn the_confidence_floor_is_inclusive_at_the_bar() {
+        assert!(meets_confidence_floor(CONFIDENCE_FLOOR));
+        assert!(meets_confidence_floor(1.0));
+        assert!(!meets_confidence_floor(CONFIDENCE_FLOOR - 0.01));
+        assert!(!meets_confidence_floor(0.0));
+        // A FLOOR OF 0.0 WOULD NOT BE A FLOOR — it would let a failed review
+        // call (recorded as 0.0) through as a proposal. That is exactly what the
+        // `!meets_confidence_floor(0.0)` assertion above pins, so setting
+        // CONFIDENCE_FLOOR = 0.0 fails this test rather than silently disarming
+        // the gate. (Asserting on the constant directly is a clippy
+        // `assertions_on_constants` error, and the indirect assertion is the
+        // stronger one anyway: it goes through the comparison both gates use.)
+    }
+
+    /// THE WRITER AND THE READER OF report.md MUST AGREE. `apply_heal.sh` hands
+    /// the file `render_report` wrote to `darwind --heal-confidence`, which parses
+    /// the score straight back out of it. A reworded header line would silently
+    /// turn every proposal into NO_SCORE and the apply gate into a wall.
+    #[test]
+    fn report_confidence_survives_the_round_trip() {
+        let d = diag_for(&["src/router.rs"], "router");
+        let mut w = survivor(2, 0.82, 7);
+        w.review_verdict = "Fixes the root cause.".to_string();
+        let report = render_report(1_760_000_123, "mock-model", &d, &w);
+        assert_eq!(
+            parse_report_confidence(&report),
+            Some(0.82),
+            "the daemon writes a report.md its own confidence gate cannot read back:\n{report}"
+        );
+        assert_eq!(confidence_gate(&report).0, ConfidenceGate::Above);
+        // The reviewer's own sentence must be in the HEADER, not only in the
+        // section far below it — the HUD shows the first lines of this file.
+        let head: String = report.lines().take(12).collect::<Vec<_>>().join("\n");
+        assert!(
+            head.contains("Fixes the root cause."),
+            "the reviewer's verdict is not in the report header:\n{head}"
+        );
+        assert!(head.contains("floor"), "the score is stated with no bar beside it:\n{head}");
+    }
+
+    /// A GATE THAT ALWAYS ANSWERS THE SAME WORD IS NOT A GATE — and this one is
+    /// what apply_heal.sh proves itself against before believing any verdict.
+    #[test]
+    fn the_confidence_gate_discriminates_across_its_three_verdicts() {
+        assert_eq!(confidence_gate("- review confidence: 0.95\n").0, ConfidenceGate::Above);
+        assert_eq!(confidence_gate("- review confidence: 0.01\n").0, ConfidenceGate::Below);
+        assert_eq!(confidence_gate("- no score in this report\n").0, ConfidenceGate::NoScore);
+        // The three words the shell case-arms match on.
+        assert_eq!(ConfidenceGate::Above.word(), "ABOVE_FLOOR");
+        assert_eq!(ConfidenceGate::Below.word(), "BELOW_FLOOR");
+        assert_eq!(ConfidenceGate::NoScore.word(), "NO_SCORE");
+        // NO SCORE IS NOT A ZERO SCORE. A missing line parsed as 0.0 would be
+        // reported as "the reviewer did not back this", which is a different
+        // (and false) statement about what happened.
+        assert_eq!(parse_report_confidence("- review confidence: none\n"), None);
+        assert_eq!(parse_report_confidence("- review confidence: 0.00\n"), Some(0.0));
+        // ...and the below-floor sentence has to name the number and the bar.
+        let (_, detail) = confidence_gate("- review confidence: 0.01\n");
+        assert!(detail.contains("0.01") && detail.contains("0.25"), "{detail}");
+    }
+
+    /// "The reviewer scored it 0.00" and "the review call never came back" are
+    /// opposite facts that both arrive as 0.0. The rejection report must say
+    /// which one happened.
+    #[test]
+    fn below_floor_summary_distinguishes_a_low_score_from_no_review() {
+        let mut scored = survivor(1, 0.08, 4);
+        scored.reviewed = true;
+        let s = below_floor_summary(&scored, 2);
+        assert!(s.contains("0.08"), "{s}");
+        assert!(s.contains("0.25"), "the floor it fell under must be stated:\n{s}");
+        assert!(
+            s.contains("NOT BECAUSE THE PATCHES FAILED A GATE"),
+            "a below-floor attempt must not read as a gate failure:\n{s}"
+        );
+
+        let mut unreviewed = survivor(1, 0.0, 4);
+        unreviewed.reviewed = false;
+        let u = below_floor_summary(&unreviewed, 1);
+        assert!(
+            u.contains("never came back"),
+            "a failed review call must not be reported as the reviewer's verdict:\n{u}"
+        );
+    }
+
+    /// THE WHOLE POINT, END TO END: three candidates, the best of them scored
+    /// below the floor by the adversarial reviewer, and NOTHING is proposed.
+    /// Before this, `select_winner` handed that patch to the operator with an
+    /// ACCEPT & APPLY button beside it and a 0.10 gauge nobody had to read.
+    #[tokio::test]
+    async fn nothing_is_proposed_when_the_best_review_is_below_the_floor() {
+        let root = TempRoot::new("floor-e2e");
+        let crate_dir = root.0.join("daemon");
+        let heal_root = root.0.join("state").join("heal");
+        write_synthetic_crate(&crate_dir);
+        let ts = 1_760_000_011u64;
+
+        // One candidate, and it VALIDATES (it is the real fix) — so nothing
+        // mechanical stops it. Only the reviewer's score does.
+        let draft = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n pub fn double(x: i32) -> i32 {\n-    x * y\n+    x * 2\n }\n";
+        let brain = MockBrain {
+            draft: draft.to_string(),
+            reviews: vec![("x * 2".to_string(), 0.10)],
+        };
+
+        let result =
+            run_attempt(&crate_dir, &heal_root, ts, "mock-model", &brain, &burst_scan_for_lib())
+                .await;
+
+        match result {
+            AttemptResult::Rejected { stage, report, .. } => {
+                assert_eq!(
+                    stage, "confidence",
+                    "a below-floor attempt is its own outcome, not a gate failure"
+                );
+                assert!(report.contains("0.10"), "the score must be in the report:\n{report}");
+                assert!(report.contains("0.25"), "so must the floor:\n{report}");
+            }
+            AttemptResult::Proposed { confidence, .. } => panic!(
+                "a patch the reviewer scored {confidence:.2} was proposed for one-click apply"
+            ),
+            AttemptResult::Aborted { stage } => panic!("aborted at {stage}"),
+        }
+        // NOTHING IS LOST: the candidate, its review and the diagnosis are on
+        // disk for a human who wants to apply one by hand.
+        let dir = heal_root.join("rejected").join(ts.to_string());
+        for f in ["candidates.md", "diagnosis.json", "review.md"] {
+            assert!(dir.join(f).exists(), "{f} was not written to {}", dir.display());
+        }
+        assert!(
+            !heal_root.join("proposals").join(ts.to_string()).exists(),
+            "a below-floor attempt must not write a proposal directory — apply_heal.sh takes \
+             a <ts> and would install it"
+        );
+        assert!(
+            std::fs::read_to_string(crate_dir.join("src").join("lib.rs"))
+                .unwrap()
+                .contains("x * y"),
+            "propose mode must never touch the source tree"
+        );
+    }
+
+    /// The confidence block of apply_heal.sh, BOUNDED at BOTH ends (its own
+    /// `esac`). A head-only slice would run on into the mutation probe and the
+    /// live apply below it and report on the wrong lines.
+    fn confidence_block(script: &str) -> &str {
+        let after = script
+            .split("REVIEW-CONFIDENCE FLOOR (REFUSES)")
+            .nth(1)
+            .expect("apply_heal.sh has no review-confidence block");
+        let end = after
+            .find("\nesac\n")
+            .expect("the confidence block is not esac-terminated");
+        &after[..end]
+    }
+
+    /// ...and the window must actually BIND. One that matched nothing would make
+    /// every assertion below pass vacuously.
+    #[test]
+    fn the_confidence_window_binds_to_a_real_block() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        let block = confidence_block(script);
+        assert!(!block.trim().is_empty(), "the confidence window is empty");
+        assert!(
+            block.len() < script.len() / 2,
+            "the window swallowed most of the script ({} of {} bytes)",
+            block.len(),
+            script.len()
+        );
+        assert!(
+            !block.contains("stage \"applying\""),
+            "the window runs past its block into the live apply:\n{block}"
+        );
+    }
+
+    /// BOTH GATES OR NEITHER. The daemon refuses to PROPOSE below the floor; if
+    /// the apply script did not refuse to INSTALL below it, a proposal written by
+    /// an older daemon — or edited by hand — would be applied by the HUD's ACCEPT
+    /// button under a weaker bar than the one that would have blocked writing it.
+    #[test]
+    fn the_apply_script_enforces_the_same_confidence_floor() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        let block = confidence_block(script);
+        // It must judge THIS proposal's report, on a code line.
+        assert!(
+            block.lines().map(str::trim_start).any(|l| {
+                !l.starts_with('#')
+                    && l.contains("--heal-confidence")
+                    && l.contains("\"$DIR/report.md\"")
+            }),
+            "the gate must run `--heal-confidence \"$DIR/report.md\"` on a code line — a gate \
+             that scores anything but the proposal being installed proves nothing:\n{block}"
+        );
+        // FAIL CLOSED: an unknown flag makes darwind boot a daemon instead of
+        // answering, so the flag is confirmed in the STAGED source first.
+        assert!(
+            block.contains("grep -q -- '--heal-confidence' \"$CRATE/src/main.rs\""),
+            "the gate must confirm the staged daemon implements the flag:\n{block}"
+        );
+        assert!(
+            block.contains("does not discriminate"),
+            "the binary must be PROVEN to discriminate before its verdict is trusted:\n{block}"
+        );
+        // AND IT MUST REFUSE — unlike the responsiveness probe, which is advisory.
+        for verdict in ["BELOW_FLOOR", "NO_SCORE"] {
+            assert!(
+                block.lines().any(|l| l.contains(verdict) && l.contains("fail ")),
+                "`{verdict}` must FAIL the apply, not print a note:\n{block}"
+            );
+        }
+        // An unrecognized verdict must refuse too, never pass through.
+        let default_arm = block.rsplit("*)").next().unwrap_or("");
+        assert!(
+            default_arm.contains("fail "),
+            "an unrecognized verdict must refuse the apply:\n{default_arm}"
+        );
+    }
+
+    /// ONE implementation, TWO callers — the reason this is a flag and not a
+    /// `grep`+`bc` in bash. Two copies of a threshold is the gates-drift-apart
+    /// defect by construction.
+    #[test]
+    fn the_confidence_floor_has_exactly_one_implementation() {
+        let main_rs = include_str!("main.rs");
+        assert!(
+            main_rs.contains("--heal-confidence"),
+            "the shared flag must exist, or apply_heal.sh's grep guard fails the apply forever"
+        );
+        assert!(
+            main_rs.contains("heal::confidence_gate(&report)"),
+            "the CLI must CALL heal::confidence_gate, not reimplement the comparison"
+        );
+        // The script must not read the score itself anywhere in that block.
+        let block = confidence_block(include_str!("../../scripts/apply_heal.sh"));
+        for line in block.lines() {
+            if line.contains("$DIR/report.md") {
+                assert!(
+                    line.contains("--heal-confidence") || line.trim_start().starts_with('#')
+                        || line.contains("-f \"$DIR/report.md\""),
+                    "the block reads report.md outside the shared gate, so there are now two \
+                     parsers that can disagree:\n{line}"
+                );
+            }
+        }
+        // ...and the number itself lives in Rust, not in the script.
+        assert!(
+            !block.contains("0.25"),
+            "the threshold is hard-coded in the shell — that is a second copy of the bar:\n{block}"
+        );
+    }
+
+    /// ORDER. Like the responsiveness probe, this needs a crate that still
+    /// COMPILES: the mutation probe below reverse-applies the patch's fix and
+    /// leaves it out, and `cargo run --bin darwind` cannot be built from such a
+    /// tree — every verdict would degrade to the self-proof failing and the apply
+    /// would be refused for a reason that has nothing to do with the patch.
+    #[test]
+    fn the_confidence_gate_runs_before_the_mutation_reverse_apply() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        let gate_at = script
+            .find("REVIEW-CONFIDENCE FLOOR (REFUSES)")
+            .expect("apply_heal.sh has no review-confidence block");
+        let reverse_at = script
+            .find("-R <\"$SPLIT_DIR/fix.diff\"")
+            .expect("apply_heal.sh no longer reverse-applies the fix");
+        let apply_at = script.find("stage \"applying\"").expect("no live-apply stage");
+        assert!(
+            gate_at < reverse_at,
+            "the confidence gate (at {gate_at}) runs after the mutation reverse-apply (at \
+             {reverse_at}); that crate often no longer compiles and the gate's own self-proof \
+             would fail for reasons unrelated to the patch"
+        );
+        assert!(gate_at < apply_at, "the confidence gate runs after the live apply");
+    }
 }

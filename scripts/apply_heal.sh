@@ -31,6 +31,13 @@
 #     SOUND; none of them proves it is an ANSWER. This one is ADVISORY and never
 #     refuses — a correct fix often lives one layer up from the line that
 #     screamed,
+#   - enforce the REVIEW-CONFIDENCE FLOOR (`darwind --heal-confidence`, the
+#     daemon's own function a third time). The daemon refuses to PROPOSE a patch
+#     the adversarial reviewer scored below heal::CONFIDENCE_FLOOR; this refuses
+#     to INSTALL one, so an older or hand-edited proposal cannot be applied under
+#     a weaker bar than the one that would have blocked it. This one DOES refuse
+#     — it is the reviewer's explicit verdict on this patch, not a heuristic
+#     about where a fix ought to live,
 #   - and ONLY on green apply the same patch to the real daemon/, rebuild the
 #     release binary, and clear the meta.heal_pending marker.
 # Any gate failure exits non-zero and leaves daemon/src untouched.
@@ -549,6 +556,70 @@ echo "RESPONSIVENESS: $RESP_WORD"
 if [ -n "$RESP_DETAIL" ]; then
   printf '%s\n' "$RESP_DETAIL"
 fi
+
+# ------------------------------------- REVIEW-CONFIDENCE FLOOR (REFUSES)
+# The daemon will not PROPOSE a patch the adversarial reviewer scored below
+# heal::CONFIDENCE_FLOOR — the four staged gates are all mechanical and blind to
+# whether the patch is a good IDEA, and the reviewer is the only stage that
+# judges that. This refuses to INSTALL one for the same reason, so a proposal
+# written by an OLDER daemon (or edited by hand) cannot be applied under a
+# weaker bar than the one that would have stopped it being written.
+# BOTH GATES OR NEITHER.
+#
+# UNLIKE THE RESPONSIVENESS PROBE ABOVE, THIS ONE REFUSES. That probe is a
+# heuristic about WHERE a fix lives and hard-rejecting on it would throw away
+# correct patches; this is the reviewer's own explicit verdict on the patch in
+# front of it, and "nobody vouched for this" is not something to install with
+# one click.
+#
+# The threshold and the parser are NOT reimplemented here. `darwind
+# --heal-confidence` is the daemon's own function — the same
+# one-implementation-two-callers shape as --split-heal-diff and
+# --heal-responsiveness — because a bash copy of a threshold is the
+# gates-drift-apart defect by construction.
+#
+# ORDER: like the responsiveness probe, this must run while $CRATE is still the
+# patched, GREEN tree the gates above built. The mutation probe below
+# reverse-applies the fix and leaves a crate that routinely no longer compiles,
+# and `cargo run --bin darwind` cannot be built from that one.
+if ! grep -q -- '--heal-confidence' "$CRATE/src/main.rs"; then
+  fail "the staged daemon does not implement --heal-confidence — live daemon/src NOT modified"
+fi
+# A gate that always answers the same word is not a gate. Prove it discriminates
+# across all three verdicts before believing anything it says about the real
+# proposal (the same self-proof --split-heal-diff and apply_forge.sh do).
+CP="$STAGING/confidence-selfproof"
+rm -rf "$CP"; mkdir -p "$CP"
+printf -- '- review confidence: 0.95\n' > "$CP/high.md"
+printf -- '- review confidence: 0.01\n' > "$CP/low.md"
+printf -- '- no score in this report\n' > "$CP/none.md"
+CF_HIGH=$( (cd "$CRATE" && cargo run --quiet --bin darwind -- \
+              --heal-confidence "$CP/high.md" 2>/dev/null) | head -1 || true)
+CF_LOW=$(  (cd "$CRATE" && cargo run --quiet --bin darwind -- \
+              --heal-confidence "$CP/low.md"  2>/dev/null) | head -1 || true)
+CF_NONE=$( (cd "$CRATE" && cargo run --quiet --bin darwind -- \
+              --heal-confidence "$CP/none.md" 2>/dev/null) | head -1 || true)
+if [ "$CF_HIGH" != "ABOVE_FLOOR" ] || [ "$CF_LOW" != "BELOW_FLOOR" ] || [ "$CF_NONE" != "NO_SCORE" ]; then
+  fail "the confidence gate does not discriminate (high=>'$CF_HIGH', low=>'$CF_LOW', none=>'$CF_NONE') — live daemon/src NOT modified"
+fi
+if [ ! -f "$DIR/report.md" ]; then
+  fail "the proposal has no report.md, so no adversarial review stands behind it — live daemon/src NOT modified"
+fi
+CONF_OUT=$( (cd "$CRATE" && cargo run --quiet --bin darwind -- \
+               --heal-confidence "$DIR/report.md" 2>/dev/null) || true)
+CONF_WORD=$(printf '%s\n' "$CONF_OUT" | head -1 || true)
+CONF_DETAIL=$(printf '%s\n' "$CONF_OUT" | tail -n +2 || true)
+echo "REVIEW CONFIDENCE: $CONF_WORD"
+if [ -n "$CONF_DETAIL" ]; then
+  printf '%s\n' "$CONF_DETAIL"
+fi
+case "$CONF_WORD" in
+  ABOVE_FLOOR) ;;
+  BELOW_FLOOR) fail "the adversarial reviewer did not back this patch — live daemon/src NOT modified" ;;
+  NO_SCORE)    fail "this proposal carries no review confidence — live daemon/src NOT modified" ;;
+  # Not a verdict this script knows. Never pass it through as one.
+  *)           fail "the confidence gate returned an unrecognized verdict '$CONF_WORD' — live daemon/src NOT modified" ;;
+esac
 
 # STAGE 4: MUTATION PROOF. check+clippy+test prove the patch compiles, lints and
 # passes; none of them prove its new test would CATCH THE BUG COMING BACK. So the

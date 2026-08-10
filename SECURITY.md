@@ -43,9 +43,16 @@ pass, and none of which is a default you can flip away:
    inert** until you supply a dependency (an API key, a downloaded model, a macOS TCC
    grant, an allowlisted folder, or a configured server/mapping). Self-heal, app
    forge, and the optimizer ship ON but are **PROPOSE-ONLY** — they write a validated
-   proposal a human applies; there is no auto-apply path. The one deliberate OFF
+   proposal a human applies; there is no auto-apply path. Among those layered gates the one deliberate OFF
    default is **`[voice_id]`** (a fail-closed gate, enrolled explicitly), plus at-rest
    encryption (`[security].encrypt_memory`, an irreversible on-disk migration).
+   Separately, a handful of *opt-in* subsystems also ship OFF because turning them
+   on changes behaviour rather than relaxing a gate; they include `[runbook]`
+   (multi-step DAG), `[distill]` (on-device fine-tuning), `[captions]`,
+   `[interpret].live`, `[aperture]`, `[handoff]`, `[fleet]`, `[dls]`,
+   `[vault]` (restrict-only), `[sync]` (which `[handoff]` rides), and the
+   `[overnight]`, `[pasteboard]` and `[scene]` sections, which default OFF in
+   `config.rs` and are not written into `config/darwin.toml` at all.
 2. **Per-action confirmation gate.** Even with the master switch armed, each
    consequential action parks behind a fresh, cross-turn spoken confirmation.
    There is no batching past the gate: a macro or standing mission re-runs every
@@ -68,8 +75,12 @@ pass, and none of which is a default you can flip away:
 6. **Benign-only core actuator.** The built-in actuator
    (`daemon/src/actions.rs`) is benign-only by hard contract: no shell
    passthrough, no deleting/moving/writing user files, no keystroke synthesis.
-   Only `http`/`https` URLs reach `open`; `file:`/`javascript:`/`data:` schemes
-   are refused.
+   A caller-supplied URL reaches `open` only as `http`/`https`;
+   `file:`/`javascript:`/`data:` schemes are refused by the normalizer. The
+   actuator's only other `open` spawns take no caller-supplied URL: an installed
+   app name (`open -a`), a canonicalized path confined to `$HOME` or
+   `/Applications`, and a fixed `x-apple.systempreferences:` deep link from a pane
+   allowlist (consequential, so it needs a fresh confirm).
 7. **Sandboxed micro-apps.** Apps run under a default-deny sandbox profile with
    minimal declared permissions (see `docs/SANDBOX.md`).
 8. **Secrets never on disk in plaintext.** API keys (Anthropic, ElevenLabs) live
@@ -93,6 +104,24 @@ Some capabilities require macOS to grant runtime consent (TCC) — a config flag
   defaults.
 
 These prompts come from the OS and are yours to approve or deny.
+
+## VAULT mode ("go dark") is deliberately voice-only
+
+VAULT mode forces the current session **local-only** — no cloud escalation, and
+CUSTOMS at its maximal reduce-only trim. It is **restrict-only**: engaging it can
+only ever remove cloud access and tighten the egress trim, never add either.
+
+**How you reach it: by speaking.** Say *"go dark"* or *"vault mode on"* to engage,
+*"vault mode off"* or *"come back online"* to lift. The router matches only that
+imperative phrase set, handles it before any normal routing, and never sends it to
+a model. The HUD's VAULT chip is **read-only on purpose** and its tooltip names the
+phrase.
+
+**Why there is no button.** Engaging vault only tightens, but *lifting* it re-opens
+cloud routing and relaxes the trim. Putting that one unattended click into the HUD
+would widen the security posture, so the daemon's `vault` command verb ships with
+no client in the HUD relay, and a regression test pins that omission. If you want a
+HUD toggle, that is a deliberate decision to make — not a gap to be quietly filled.
 
 ## Reporting scope
 

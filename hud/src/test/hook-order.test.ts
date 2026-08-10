@@ -2,6 +2,10 @@ import { describe, it, expect } from "vitest";
 import React from "react";
 import CommandPalette from "../components/CommandPalette";
 import CommandDeck from "../components/CommandDeck";
+import DistillPanel from "../components/DistillPanel";
+import HandoffPanel from "../components/HandoffPanel";
+import OvernightPanel from "../components/OvernightPanel";
+import SyncPanel from "../components/SyncPanel";
 
 /**
  * A COMPONENT MUST CALL THE SAME HOOKS WHETHER IT IS OPEN OR CLOSED.
@@ -59,6 +63,51 @@ function hookSequence(Comp: (p: Props) => unknown, props: Props): string[] {
 
 const PALETTE_PROPS = { onClose: () => {}, sources: { apps: [], agents: [] } };
 
+/* Minimal real-shaped statuses for the four queue panels (see below). */
+const OVERNIGHT_STATUS = {
+  enabled: true,
+  cloudKeyPresent: true,
+  depVerified: false,
+  dependency: "an Anthropic API key",
+  runsTools: false,
+  queued: 1,
+  done: 0,
+  failed: 0,
+  items: [],
+};
+const DISTILL_STATUS = {
+  enabled: true,
+  depVerified: false,
+  dependency: "Apple Silicon + mlx-lm (verified only on-device)",
+  examplesReady: 40,
+  minExamples: 32,
+  readyToTrain: true,
+  gatedPromotion: true,
+  adapterLive: false,
+  adapterPointer: "none",
+  lastRun: null,
+  promoted: null,
+};
+const SYNC_STATUS = {
+  enabled: true,
+  keyPresent: true,
+  peerConfigured: true,
+  transportInert: true,
+  syncableFacts: 3,
+  pendingConflicts: 0,
+  deletesPropagate: false,
+};
+const HANDOFF_STATUS = {
+  enabled: true,
+  keyPresent: true,
+  peerConfigured: true,
+  transportInert: true,
+  carriesCredentials: false,
+  restoreParks: true,
+  pendingCapsule: false,
+  device: "studio",
+};
+
 describe("hook order across an open/closed transition", () => {
   it("CommandPalette calls identical hooks closed and open", () => {
     const closed = hookSequence(CommandPalette as never, { ...PALETTE_PROPS, open: false });
@@ -77,4 +126,41 @@ describe("hook order across an open/closed transition", () => {
     const opened = hookSequence(CommandDeck as never, { ...props, open: true });
     expect(opened).toEqual(closed);
   });
+});
+
+/**
+ * THE SAME TRAP, ONE STATUS FRAME LATER.
+ *
+ * The four queue panels each render `null` until the daemon emits their startup
+ * snapshot, then re-render with a real status — the identical two-render shape
+ * that blanked the HUD on the first Cmd-K. They were pure props-only components
+ * (no hooks at all) until they gained the controls that fill their queues; now
+ * each holds `useState`/`useCallback` (DistillPanel a `useReducer`, `useRef` and
+ * `useEffect` too), so an early `if (status === null) return null` placed ABOVE
+ * those calls would make the FIRST status frame throw "Rendered more hooks than
+ * during the previous render" — and because the throw escapes the per-column
+ * boundary it reaches the root one, replacing the whole interface.
+ *
+ * Nothing else in the suite can see this: the markup tests are fresh mounts, and
+ * one mount is always internally consistent.
+ */
+describe("hook order across the null -> first-status transition", () => {
+  const cases: Array<[string, (p: Props) => unknown, string, Props]> = [
+    ["OvernightPanel", OvernightPanel as never, "overnight", OVERNIGHT_STATUS],
+    ["DistillPanel", DistillPanel as never, "distill", DISTILL_STATUS],
+    ["SyncPanel", SyncPanel as never, "sync", SYNC_STATUS],
+    ["HandoffPanel", HandoffPanel as never, "handoff", HANDOFF_STATUS],
+  ];
+
+  for (const [name, Comp, prop, status] of cases) {
+    it(`${name} calls identical hooks with a null status and with a real one`, () => {
+      const empty = hookSequence(Comp, { [prop]: null });
+      const filled = hookSequence(Comp, { [prop]: status });
+      // Guard the test's own precondition. These components had NO hooks before
+      // they gained controls, and a recorder that captured nothing would make the
+      // comparison below trivially true for exactly the components most at risk.
+      expect(empty.length).toBeGreaterThan(0);
+      expect(filled).toEqual(empty);
+    });
+  }
 });

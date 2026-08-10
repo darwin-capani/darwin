@@ -1,12 +1,14 @@
 # Micro-App Sandboxing Blueprint
 
-Status: **IMPLEMENTED.** The runtime substrate (`daemon/src/apps.rs` — manifest parsing, SBPL profile generation, capability tokens, per-app socket, supervised lifecycle, telemetry relay) is live, and the first app, **Global-Scan** (`apps/global-scan/`), runs on it. **Nexus** (`apps/nexus/` — full Python app + `core/` + tests) and **Silicon Canvas** (`apps/silicon-canvas/` — a full Rust crate) also run on this substrate, alongside vision, mark-forge, example-plugin and the utility micro-apps under `apps/`. The remaining two launch apps, **Algo-Core** and **Fab-Link**, still ship spec-only manifests against this schema; they have not been built yet.
+Status: **IMPLEMENTED.** The runtime substrate (`daemon/src/apps.rs` — manifest parsing, SBPL profile generation, capability tokens, per-app socket, supervised lifecycle, telemetry relay) is live, and the first app, **Global-Scan** (`apps/global-scan/`), runs on it. **Nexus** (`apps/nexus/` — full Python app + `core/` + tests) and **Silicon Canvas** (`apps/silicon-canvas/` — a full Rust crate) also run on this substrate, alongside vision, mark-forge, example-plugin and the utility micro-apps under `apps/`.
+
+The remaining two launch apps, **Algo-Core** and **Fab-Link**, are **⛔ BLOCKED — spec-only AND REFUSED**. Their manifests declare `net_hosts`, which is not grantable on this OS at all, so validation refuses them: they never load, they are absent from the App Deck, and they never launched even before the refusal (their profile failed to compile, exit 65). They are not "not built yet" — they cannot be built as specified until the owner decides on a mechanism that would widen egress. See *A net scope is not grantable* below, and the ⛔ banner at the top of each `SPEC.md`.
 
 Implementation notes (read these — they record the real boundary, not the ideal one):
 
 - **`sandbox-exec` is deprecated-but-functional.** The host launches apps via `/usr/bin/sandbox-exec -f <profile>`. Apple has deprecated the *CLI* (it prints a notice) but the underlying seatbelt *kernel enforcement* is fully live and is what Apple's own daemon profiles use. The manifest→profile derivation in `generate_sbpl` is the stable part; Phase-4+ may migrate the launch mechanism to a `sandboxd` profile or App Sandbox entitlements without changing the derivation.
 - **The generated profile is default-deny.** Every profile opens with `(deny default)`, imports Apple's stock `bsd.sb` (so the process can boot — dyld, frameworks, base syscalls — without opening the filesystem, network, mic, or GPU), then adds *only* the grants the manifest declares. See `daemon/src/apps.rs::generate_sbpl` and its unit tests (default-deny asserted, exact allows asserted, no stray grants asserted).
-- **Honest SBPL limitations** (documented rather than hidden — see the Threat-model caveats below): coarse host-name network filtering, an inherent DNS side channel, and the fact that same-UID is the trust boundary for the per-app socket.
+- **Honest SBPL limitations** (documented rather than hidden — see the Threat-model caveats below): SBPL has **no network filtering primitive at all** (no host, no IP), so the sandbox's only expressible network posture is *none*; and same-UID is the trust boundary for the per-app socket.
 
 ## Model
 
@@ -78,39 +80,44 @@ The Vision micro-app (`apps/vision`; needs the screen capability — declared as
 
 ## Worked example
 
-`apps/fab-link/manifest.toml` — a 3D-printing telemetry overlay that polls a Moonraker/OctoPrint endpoint and renders progress inside the HUD:
+**This example is a SHIPPED, RUNNING app.** It used to be `apps/fab-link/manifest.toml` — which was a bad choice on two counts: that app has no implementation, and its manifest is now *refused* (see *A net scope is not grantable*), so the schema doc's canonical example was a manifest the daemon rejects and a launch sequence that never happened. The example below is `apps/global-scan/manifest.toml`, abridged: the first app on the substrate, live today, and the one that demonstrates the *only* supported egress route.
 
 ```toml
 [app]
-name        = "fab-link"
+name        = "global-scan"
 version     = "0.1.0"
-description = "3D-printing telemetry overlay: polls Moonraker/OctoPrint and renders job progress, temperatures, and ETA in the HUD."
-entry       = "apps/fab-link/main.py"
+description = "Intel feed aggregator: polls reputable public RSS/Atom feeds, dedupes and ranks the latest items, optionally adds a neutral local-LLM summary, and renders the result as a HUD panel."
+entry       = "apps/global-scan/main.py"
 runtime     = "python"
 
 [permissions]
 audio     = false
-# NOTE: this example previously read `net_hosts = ["voron.local", "octoprint.local"]`.
-# That is no longer valid — see "A net scope is not grantable" below. Fab-Link's
-# printer access is an OPEN OWNER DECISION: its Moonraker transport is
-# `ws://voron.local:7125/websocket`, which the fetch proxy cannot carry (wrong
-# scheme, non-443 port, and a private LAN address the SSRF guard refuses).
-fs_read   = ["apps/fab-link/gcode-previews"]
-fs_write  = ["state/tmp/fab-link"]
 gpu       = false
+# NO direct network. This is the ONLY valid value: a direct-egress net scope is
+# not grantable on this OS, and a non-empty list is REFUSED at validation.
+net_hosts = []
+# Egress rides the daemon-mediated fetch proxy instead: the app names hostnames,
+# the DAEMON makes the request (https-only, exact-host, SSRF-guarded).
+fetch_hosts = ["feeds.npr.org", "feeds.bbci.co.uk", "hnrss.org"]  # …9 in the real file
+fs_read   = [
+  "state/ipc/apps/fetch.sock",    # the fetch proxy (feed bodies; NO direct net)
+  "state/ipc/apps/generate.sock", # op-restricted generate proxy (NOT raw inference.sock)
+  "apps/_sdk",                    # shared read-only dyld module-report stub
+]
+fs_write  = ["state/apps/global-scan"]
 
 [ui]
-surface          = "overlay"
-telemetry_topics = ["fab.progress", "fab.temps", "fab.eta", "fab.alerts"]
+surface          = "panel"
+telemetry_topics = ["feed"]
 ```
 
 At launch, `darwind`:
 
-1. Parses the manifest and validates it (name matches directory, runtime known, paths inside allowed roots).
-2. Mints the capability token: `HMAC-SHA256(secret, "fab-link" || canonical(permissions) || nonce)`.
-3. Writes a seatbelt profile allowing: read of `apps/fab-link/`, read of `apps/fab-link/gcode-previews`, write of `state/tmp/fab-link`, socket access to `state/ipc/apps/fab-link.sock`. **No outbound IP network at all** — a direct-egress net scope is not grantable (below), so the profile is a flat `(deny network*)`. Everything else denied — no mic, no GPU, no other filesystem, no network.
-4. Executes `sandbox-exec -f <profile> <venv python3> apps/fab-link/main.py` (the daemon resolves the `.venv/bin/python3` interpreter and appends the project-root-relative entry path) with the token passed via the launch environment.
-5. The app connects to its socket and includes the token in every JSON request; the daemon verifies before acting. Telemetry the app publishes is accepted only on its declared `telemetry_topics` and re-broadcast on 127.0.0.1:7177 to the HUD.
+1. Parses the manifest and validates it (name matches directory, runtime known, paths inside allowed roots, **`net_hosts` empty**). A manifest that fails any of these is skipped at discovery and surfaced as `app.manifest_invalid` on the HUD's App Deck — it never launches.
+2. Mints the capability token: `HMAC-SHA256(secret, "global-scan" || canonical(permissions) || nonce)`.
+3. Writes a seatbelt profile allowing: read of `apps/global-scan/`, read of each `fs_read` path, write of `state/apps/global-scan`, and socket access to `state/ipc/apps/global-scan.sock` plus the `.sock` paths it declared. **No outbound IP network at all** — the profile is a flat `(deny network*)`, unconditionally, for every app. Everything else denied — no mic, no GPU, no other filesystem.
+4. Executes `sandbox-exec -f <profile> <venv python3> apps/global-scan/main.py` (the daemon resolves the `.venv/bin/python3` interpreter and appends the project-root-relative entry path) with the token passed via the launch environment.
+5. The app connects to its socket and includes the token in every JSON request; the daemon verifies before acting. Telemetry the app publishes is accepted only on its declared `telemetry_topics` and re-broadcast on 127.0.0.1:7177 to the HUD. Feed fetches go out over `fetch.sock` and are performed **by the daemon**, authorized against `fetch_hosts`.
 
 ## Threat model
 
@@ -132,24 +139,22 @@ The one place a model-authored change can reach `darwind`'s own source tree is t
 
 - **`self_heal` ships `enabled = true` but PROPOSE-ONLY** (`mode = "propose"`, inert without a cloud key). With the gate off, an error burst only emits `heal.suppressed`; even on, nothing touches the live tree without the human-gated `scripts/apply_heal.sh`.
 - **The GUI Accept button is human-gated and two-step.** The HUD's SELF-REPAIR // PROPOSALS modal fetches and shows the **actual staged diff** (`heal_proposal_detail`) for review. **ACCEPT & APPLY** arms a distinct **CONFIRM — APPLY & REBUILD** state; only a second click (after a re-arm window so a double-click cannot skip it) calls `heal_apply`.
-- **Re-validation is mandatory and non-bypassable.** `heal_apply` spawns `scripts/apply_heal.sh <ts> --yes` (args-only, `ts` validated **digits-only** — no path traversal). `--yes` skips **only** the script's `read -r` keystroke; the script still stages a fresh copy of `daemon/` and re-runs `/usr/bin/patch -p1 --batch` + `cargo check` + `cargo clippy -D warnings` + full `cargo test` — then prints the **responsiveness** verdict (`darwind --heal-responsiveness` — advisory only; every gate here is blind to the diagnosis, so a patch that fixes something else entirely passes all of them) — then runs the mutation probe (fix reversed, the patch's own test must fail). The responsiveness probe runs **before** the mutation probe on purpose: that probe reverse-applies the fix into the staged crate and leaves it there, and a crate with its fix lifted out often no longer compiles, so `darwind` could not be run from it. The script then **refuses to touch `daemon/src` if anything fails** (the UI surfaces the failure in alert-red; the live code stays untouched). There is no flag that weakens this gate.
+- **Re-validation is mandatory and non-bypassable.** `heal_apply` spawns `scripts/apply_heal.sh <ts> --yes` (args-only, `ts` validated **digits-only** — no path traversal). `--yes` skips **only** the script's `read -r` keystroke; the script still stages a fresh copy of `daemon/` and re-runs `/usr/bin/patch -p1 --batch` + `cargo check` + `cargo clippy -D warnings` + full `cargo test` — then prints the **responsiveness** verdict (`darwind --heal-responsiveness` — advisory only; every gate here is blind to the diagnosis, so a patch that fixes something else entirely passes all of them) — then enforces the **review-confidence floor** (`darwind --heal-confidence` on the proposal's `report.md` — the same `CONFIDENCE_FLOOR` the daemon refuses to *propose* below, so an older or hand-edited proposal cannot be installed under a weaker bar; unlike the responsiveness verdict, this one **refuses**) — then runs the mutation probe (fix reversed, the patch's own test must fail). Both of those probes run **before** the mutation probe on purpose: that probe reverse-applies the fix into the staged crate and leaves it there, and a crate with its fix lifted out often no longer compiles, so `darwind` could not be run from it. The script then **refuses to touch `daemon/src` if anything fails** (the UI surfaces the failure in alert-red; the live code stays untouched). There is no flag that weakens this gate.
 - This GUI apply, and the doubly-opt-in `mode = "auto"`, are the **only** sanctioned paths that change the live `daemon/` tree. The HUD reaches the daemon only over the one-way telemetry WS; the apply work is done by the HUD-Tauri backend spawning the repo script directly (filesystem + `cargo`), after which the daemon restarts to run the healed binary.
 
 ## Honest limitations of the current seatbelt implementation
 
-These were surfaced by an isolation review of `daemon/src/apps.rs`. The first three are *closed* in the generator; the last two are *inherent* to permitting network/DNS via SBPL and to the single-UID model, and are documented here as the boundary of what the sandbox claims.
+These were surfaced by an isolation review of `daemon/src/apps.rs`. The first three are *closed* in the generator. The fourth is not a limitation of the sandbox but of the OS — SBPL cannot filter network at all — and the fifth is inherent to the single-UID model. Together they are the boundary of what this sandbox claims.
 
 - **Metadata side channel — CLOSED.** Earlier the profile emitted a bare `(allow file-read-metadata)` (no path filter), which let an app `stat`/test-existence on the *entire* filesystem (probe that `~/.ssh/id_rsa` exists and its size/mtime) even though contents stayed denied. The generator now scopes `file-read-metadata` to the *same subpaths* it grants `file-read*` on (app dir, runtime install prefix, venv, `fs_read`, socket) — never a blanket grant. dyld's startup stats of `/` and the firmlink ancestors are covered by the `bsd.sb`/`system.sb` import, so no blanket grant is needed to boot.
 - **Over-broad exec — CLOSED.** Earlier python/node apps were granted `process-exec*` on the *entire* `/opt/homebrew` and `/usr/local` trees (to reach the symlinked venv interpreter), letting an app exec any `bash`/`curl`/`git`/compiler planted under those user-writable prefixes. The generator now resolves the interpreter once (`std::fs::canonicalize`) and grants `process-exec*` only on the configured interpreter path *literal* plus its *resolved* path literal — never a prefix subpath. Read of the stdlib is scoped to the interpreter's own install prefix (the Cellar version dir holding `lib/pythonX.Y`), not all of Homebrew.
 - **Socket ownership — CLOSED (defense-in-depth).** The per-app Unix socket at `state/ipc/apps/<name>.sock` is now `chmod 0600` after bind, and its parent dir `state/ipc/apps` is `0700`, so an unrelated same-UID process cannot casually `connect()` to read the host's start/refresh/stop command stream or wedge the accept path (a local DoS). Token verification already blocked *injection* (a connector cannot forge the per-launch HMAC), so this only closes the casual-connect leak. It does not stop a same-UID attacker who can `chmod` — same-UID is the trust boundary either way.
-- **Coarse host-name network filtering — INHERENT.** `(allow network-outbound (remote tcp (host-name ...)))` matches the *connect-time name*, not the resolved IP. A feed host on a shared CDN can therefore share its allow with unrelated co-tenant names on that CDN. It is a meaningful narrowing, not an IP allow-list.
-- **DNS exfiltration channel — INHERENT (bar raised, not closed).** Permitting DNS at all lets a malicious app encode data in query labels to an attacker-controlled authoritative nameserver, fully bypassing the `net_hosts` allow-list. The generator pins DNS to the *system resolver address(es)* from `/etc/resolv.conf` (rather than `*:53`) to raise the bar, but the resolver still forwards, so the channel is not closed.
-
-Both caveats remain inherent to SBPL egress *as a mechanism* — but as of the daemon-mediated **fetch proxy** (below), **no shipped micro-app uses SBPL egress at all**: every formerly net-declaring app fetches through the daemon and is granted **no direct network or DNS whatsoever**, which collapses both channels for the fleet.
+- **Filtered network egress — NOT AVAILABLE (this entry replaces two that were wrong).** This section used to list *coarse host-name filtering* and a *DNS exfiltration side channel* as the two INHERENT costs of SBPL egress, describing the first as "a meaningful narrowing, not an IP allow-list". **Both descriptions were fiction: SBPL has no host or IP filtering rule whatsoever.** The rules the generator emitted for a non-empty `net_hosts` did not narrow anything — the profile compiler rejected them, so `sandbox-exec` refused the whole profile and the app never launched (full account in *A net scope is not grantable* below). There is therefore no coarse filter to reason about and no DNS channel to raise the bar on, because no app was ever granted DNS. The seatbelt's only expressible network posture is `(deny network*)`, which is what every profile now emits unconditionally. **Filtered egress exists in DARWIN, but it lives in the daemon, not the sandbox:** the fetch proxy below does the host allow-listing, the SSRF/rebinding guard, and the redirect re-authorization in Rust, where those checks can actually run.
+- **Same-UID trust boundary — INHERENT.** The per-app socket is `0600` under a `0700` dir, but a same-UID attacker who can `chmod` is inside the boundary either way; see the socket-ownership entry above. The daemon is the trust root, and nothing here defends against a compromised `darwind`.
 
 ### Direct app egress — CLOSED (daemon-mediated fetch proxy)
 
-**Was:** Global-Scan (the only shipped net-declaring app) held `net_hosts = [9 RSS hosts]`, compiled to `(system-network)` + pinned DNS + per-host `(remote tcp (host-name …))` allows — subject to both inherent caveats above (CDN co-tenant bleed; DNS-label exfiltration).
+**Was:** Global-Scan (the only shipped net-declaring app) held `net_hosts = [9 RSS hosts]`, which the generator turned into `(system-network)` + pinned DNS + per-host `(remote tcp (host-name …))` allows. **Note the correction:** that text is what was *emitted*, not what was *enforced* — those rules do not compile (see *A net scope is not grantable*), so the profile was rejected outright. The proxy below was built to close two caveats that, as it turned out, described a mechanism that never ran. It is still the right design; it is simply the *only* egress design, not the better of two.
 
 **Now:** the daemon fronts app fetches with a **daemon-mediated fetch proxy** (`daemon/src/fetchproxy.rs`), a sibling of the generate proxy on its own socket `state/ipc/apps/fetch.sock` (`0600`, parent `0700`). Global-Scan's manifest declares `fetch_hosts = [the same 9 hosts]` and `net_hosts = []` — its SBPL is now a **flat `(deny network*)` with no `(system-network)`, no DNS, and no host-name allows at all**. The proxy enforces, daemon-side:
 
@@ -167,7 +172,7 @@ The **agent-tool surface invariant is preserved by construction**: `agent_tools`
 
 **The primitive does not exist.** macOS SBPL has no host or IP filtering rule. `(remote tcp (host-name "x"))` is not valid syntax, and neither is `(remote ip "1.2.3.4:443")` — the compiler accepts only `*` or `localhost` as a host. So the derivation this document used to describe was never enforceable.
 
-**What actually happened.** A non-empty `net_hosts` made `generate_sbpl` emit those rules, `sandbox-exec` rejected the whole profile with **exit 65** (`host must be * or localhost in network address`), and the app **never launched at all**. It failed *closed*, so there was no security exposure — but two shipped apps (`fab-link`, `algo-core`) were unlaunchable, and the failure presented as a crash-loop rather than a permission error. Two string-matching tests over these rules passed the entire time, because they asserted the literals the generator emitted: the generator agreeing with itself. Only handing the profile to `sandbox-exec` ever caught it.
+**What actually happened.** A non-empty `net_hosts` made `generate_sbpl` emit those rules, `sandbox-exec` rejected the whole profile with **exit 65**, and the app **never launched at all**. (Measured on this machine, both forms and both messages: `(remote tcp (host-name "example.com"))` → `sandbox-exec: unbound variable: host-name`; `(remote ip "1.2.3.4:443")` → `sandbox-exec: host must be * or localhost in network address`. This document previously quoted only the second, for a failure caused by the first.) It failed *closed*, so there was no security exposure — but two shipped apps (`fab-link`, `algo-core`) were unlaunchable, and the failure presented as a crash-loop rather than a permission error. Two string-matching tests over these rules passed the entire time, because they asserted the literals the generator emitted: the generator agreeing with itself. Only handing the profile to `sandbox-exec` ever caught it.
 
 **The decision, now landed.** A net scope is refused at **validation**, in one voice across all three gates (`apps::NET_SCOPE_REFUSAL`):
 
@@ -183,12 +188,28 @@ The old guidance was actively harmful: an author who hit *"tool scope `net` is o
 
 **The supported route is the fetch proxy** (previous section): declare `fetch_hosts`, read `state/ipc/apps/fetch.sock`, and let the daemon make the request.
 
-**Open owner decision — two apps cannot take that route.** Both are spec-only (`SPEC.md` + `manifest.toml`, no implementation), and both were already unlaunchable, so nothing regressed — but neither can be migrated as written:
+#### The same primitive in `[[mcp.servers]]` — also REFUSED
+
+An MCP stdio server's config carried the identical unenforceable key, and it was left un-refused when the app surface was closed. It is closed now, the same way and for the same reason: `mcp::stdio_sandbox_profile` no longer has a `net_hosts` branch (it emits `(deny network*)` unconditionally, like `generate_sbpl`), a stdio server declaring `net_hosts` is **reported at config load and dropped from `McpManager::connectable_servers`** so it is never spawned, and the boot log says so with the same message (`mcp::MCP_NET_SCOPE_REFUSAL`). The DLS raises `net_scope_not_grantable` on it, exactly as it does on a manifest.
+
+Three end states were considered. **Refuse** (chosen): the server does not run, and the operator is told why, in three places. **Start it with a silently-denied network** (rejected): this is the worst of the three — it is *precisely* the "claims a rule the code does not enforce" defect, and an operator who had written a host list would carry on believing a filter was live. **Leave it** (rejected): the config key would keep documenting a capability that does not exist. Nothing that worked was taken away — a stdio server in this state could never start, because its profile did not compile.
+
+The remedy is **not** the fetch proxy — that is a micro-app mechanism and an MCP server has no access to it. It is: remove `net_hosts` and run the server sandboxed with no network (the only posture a seatbelt profile can express), or accept that a server which genuinely needs the network cannot be sandboxed here. Running it as a remote `transport = "http"` server is a **different trust posture** (TLS + Keychain token, explicitly *not* sandboxed) and is an operator decision, not a substitute grant. On an `http` server the key is INERT rather than fatal — there is no local process to filter — so it is reported but not refused; refusing it would break a configuration that works today.
+
+No config shipped in this repo declares `net_hosts` on any MCP server (`config/darwin.toml` ships the key commented out and `servers` empty), so nothing in-tree needed migrating. That is pinned by `config::tests::shipped_config_declares_no_mcp_net_scope`.
+
+#### Open owner decision — two apps cannot take any route
+
+`fab-link` and `algo-core` are spec-only (`SPEC.md` + `manifest.toml`, no implementation) and were already unlaunchable, so nothing regressed — but neither can be migrated as written:
 
 - **`fab-link`** — Moonraker is `ws://voron.local:7125/websocket`. That fails the proxy on three independent axes: scheme (`ws`, not `https`), port (7125, not 443), and the SSRF guard (a `.local` mDNS name resolves to a private LAN address, which is refused by design). Its control ops (`pause`/`cancel`/`set_temp`) and webcam snapshot pulls are the same shape.
 - **`algo-core`** — market data is persistent WebSocket streaming (`stream.binance.com`, `ws.kraken.com`). The proxy is one-shot request/response and cannot carry a subscription. Its REST order path would proxy fine; the market-data half cannot.
 
-Granting either of them direct egress would require a new mechanism (a daemon-side WebSocket relay, or an explicit LAN-scoped exception to the SSRF guard). **That is an owner decision, not a validator change**, and it is deliberately not taken here.
+Granting either of them direct egress would require a new mechanism (a daemon-side WebSocket relay, or an explicit LAN-scoped exception to the SSRF guard). **That is an owner decision, not a validator change**, and it is deliberately not taken here. `algo-core` additionally **places real orders on real venues** per its spec, which makes its egress a financial-risk decision as much as a sandbox one.
+
+**Where that state is now stated, so nobody meets these apps believing they work:** a ⛔ banner at the top of each `manifest.toml` *and* each `SPEC.md`; the *Status* line of this document; the Phase-4 section of `docs/ROADMAP.md` (they are listed as **BLOCKED**, not "still to build"); and the App Deck, where they are absent from the fleet and appear only under **MANIFEST ERRORS**. Their retention in the tree is deliberate — see the note below.
+
+**Why the source is retained rather than deleted.** The owner's open decision is *"a new mechanism, or deletion"*. Deleting the specs would quietly take the second branch, and it would destroy the design record that a future decision needs — while the refusal already makes them harmless (they cannot load, cannot appear on the deck, and `apps::tests::shipped_manifests_all_validate_and_declared_tools_are_served` asserts *positively* that each is refused, so the state cannot rot into silence). The confusion risk that argues for deletion is addressed by marking, which is cheap and reversible; deletion is not. If the owner decides against the mechanism, `rm -rf apps/fab-link apps/algo-core` plus that test arm is the whole change.
 
 ### Confused-deputy via the inference socket — CLOSED (daemon-mediated generate proxy)
 
@@ -212,7 +233,7 @@ DARWIN is an **opt-in MCP _host_**: it can connect to external [Model Context Pr
 
 **Ships ON, but INERT WITH ZERO SERVERS by default.** `[mcp].enabled = true` is the default, but the `servers` list ships EMPTY — so no server connects and no MCP tool exists for any agent until you add at least one `[[mcp.servers]]` entry. There is no auto-discovery and no bundled server.
 
-**Layer 1 — per-server default-deny sandbox (stdio).** Each stdio server is wrapped by the **same `sandbox-exec`/SBPL machinery as micro-apps** (`apps.rs`). `stdio_sandbox_profile` derives a per-server `.sb` profile that is **deny-by-default** and grants only: exec of the configured `command`, the paths the server's config declares in `fs_read`/`fs_write`, and outbound network to the hosts the server declares in `net_hosts` (empty list ⇒ no network at all). The profile filename stem is the strict-validated server name. **Honest residual trust:** `sandbox-exec` is Apple-deprecated-but-functional; host-name network rules match the *connect-time name*, not the resolved IP (CDN co-tenant bleed); and permitting any DNS leaves the **DNS-label side channel** open — exactly the two *inherent* caveats in *Honest limitations* above. The profile **bounds** an untrusted server; it does **not** make a malicious server binary *safe*.
+**Layer 1 — per-server default-deny sandbox (stdio).** Each stdio server is wrapped by the **same `sandbox-exec`/SBPL machinery as micro-apps** (`apps.rs`). `stdio_sandbox_profile` derives a per-server `.sb` profile that is **deny-by-default** and grants only: exec of the configured `command` and the paths the server's config declares in `fs_read`/`fs_write`. **It grants no network whatsoever** — `(deny network*)`, unconditionally. A `net_hosts` list is not a narrowing this OS can express (see *A net scope is not grantable*), so a stdio server that declares one is **refused**: reported at config load, dropped from `connectable_servers`, never spawned. The profile filename stem is the strict-validated server name. **Honest residual trust:** `sandbox-exec` is Apple-deprecated-but-functional, and same-UID remains the trust boundary. The profile **bounds** an untrusted server; it does **not** make a malicious server binary *safe* — and a sandboxed stdio server that needs the network cannot be run here at all.
 
 **Layer 1 (remote `http`) — TLS + token, NOT sandboxed.** A server configured with `transport = "http"` is a **remote** MCP server speaking MCP Streamable-HTTP/SSE (`daemon/src/mcp.rs::HttpTransport`, wired into `McpManager::connect_one`). It runs on **someone else's machine**, so — stated plainly — it **cannot be SBPL-sandboxed**: there is no local process to wrap in seatbelt, and we do **not** claim a remote server is sandboxed. Its protections are a *different, still-layered* set: **TLS-only** (the url **must** be `https://` — a non-https url is refused at construction so a bearer token never rides plaintext); **Keychain bearer auth** (the token resolves from `mcp_<server>_token` and rides the `Authorization` header **only** — never the URL, a log, or `Debug`); the **same** confirmation gate + per-agent allowlist + per-call bounds (timeout / output-size cap, plus a hard cap on SSE events and total bytes) as stdio; and a friendly, **secret-free** error map (a 4xx/5xx body is never echoed). **Honest residual trust:** the layers above bound the blast radius and keep the secret clean, but ultimately **you trust the remote operator** with the arguments you send and the results you receive — they do not neutralize a malicious operator. The single network leg (`HttpTransport::post`) is **runtime-gated**: it is reached only when `[mcp].enabled = true` **and** an `http` server with an `https://` url is configured; **no test ever touches the wire** — the SSE/JSON-RPC reply parsing is a pure function (`parse_sse_events` / `extract_rpc_response`) unit-tested with canned bytes, and the manager path is driven by a `MockTransport`.
 
@@ -228,7 +249,7 @@ DARWIN is an **opt-in MCP _host_**: it can connect to external [Model Context Pr
 
 ## Plugin SDK — the formalized capability-module contract (#36)
 
-The optional `[intents]` / `[tools]` block a plugin's `manifest.toml` may declare — *what intents it answers and what tools it exposes, with the capability scopes each requests* — is formalized and **validated** by `daemon/src/plugin_sdk.rs`. Full detail in [`PLUGIN_SDK.md`](PLUGIN_SDK.md). In short: `validate_manifest` (pure) rejects a malformed manifest (bad intent/tool name) and an **over-privileged** one (a tool requesting a scope outside `ALLOWED_SCOPES`, or a scope the `[permissions]` block does not back — e.g. `net` with `net_hosts = []`); the register-on-launch handshake (`register_plugin`, gated by `[plugin_sdk].enabled`, ships **ON**) re-validates the manifest and **verifies the capability token** with the same HMAC/nonce machinery the per-app relay uses before scoping the plugin's intents. Declaring an intent grants nothing — the `generate_sbpl` derivation above is unchanged, and a consequential tool still rides the confirmation gate. Reference plugin: `apps/example-plugin/`.
+The optional `[intents]` / `[tools]` block a plugin's `manifest.toml` may declare — *what intents it answers and what tools it exposes, with the capability scopes each requests* — is formalized and **validated** by `daemon/src/plugin_sdk.rs`. Full detail in [`PLUGIN_SDK.md`](PLUGIN_SDK.md). In short: `validate_manifest` (pure) rejects a malformed manifest (bad intent/tool name) and an **over-privileged** one (a tool requesting a scope outside `ALLOWED_SCOPES`, or a scope the `[permissions]` block does not back; and `net` **in every state**, because a net scope is not grantable at all — with hosts or without); the register-on-launch handshake (`register_plugin`, gated by `[plugin_sdk].enabled`, ships **ON**) re-validates the manifest and **verifies the capability token** with the same HMAC/nonce machinery the per-app relay uses before scoping the plugin's intents. Declaring an intent grants nothing — the `generate_sbpl` derivation above is unchanged, and a consequential tool still rides the confirmation gate. Reference plugin: `apps/example-plugin/`.
 
 ## Webhook triggers — an inbound, authenticated, loopback-default surface (#35)
 

@@ -586,7 +586,8 @@ mod tests {
 
     /// A config with the suggester explicitly OFF — its master gate; with it off NO
     /// suggestion surfaces. NOT the default: the shipped default is
-    /// `suggest = true` (see `the_suggester_gate_ships_on`), which is why this
+    /// `suggest = true` (see `the_shipped_default_config_has_the_suggestion_gate_on`),
+    /// which is why this
     /// helper writes the flag rather than relying on `Default`.
     fn cfg_off() -> ProactiveConfig {
         ProactiveConfig { suggest: false, ..Default::default() }

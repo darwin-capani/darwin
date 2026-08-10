@@ -1,12 +1,39 @@
 # Algo-Core — SPEC
 
+> ## ⛔ BLOCKED — SPEC ONLY. THIS APP DOES NOT RUN, AND CANNOT BE BUILT AS WRITTEN.
+>
+> **Status: `manifest.toml` is REFUSED at validation. Nothing here is shipped
+> behaviour.** There is no implementation (this file + `manifest.toml`, no
+> `main.py`), the app does not appear on the HUD App Deck, and it has never
+> launched on any machine — before the refusal landed, its sandbox profile failed
+> to compile and the process died at `sandbox-exec` (exit 65). **No order has ever
+> been placed by this code, because this code does not exist.**
+>
+> **Why, and what would unblock it.** The design below depends on a `net_hosts`
+> host allow-list, which **does not exist as a mechanism**: macOS SBPL has no host
+> or IP filtering primitive, so a net scope is not grantable at all
+> (`docs/SANDBOX.md` → *A net scope is not grantable*). The supported egress route
+> is the daemon-mediated fetch proxy (`fetch_hosts`), and **Algo-Core cannot use
+> it**: market data here is persistent WebSocket streaming (`stream.binance.com`,
+> `ws.kraken.com`) and the proxy is one-shot request/response — it cannot carry a
+> subscription. The REST order path would proxy fine, but an order path with no
+> market-data path is not a working app.
+>
+> Making this app real therefore needs a **new mechanism** (a daemon-side
+> WebSocket relay), which **widens DARWIN's egress posture**. That is the
+> **owner's decision**, and it has not been taken. It is a heavier decision than
+> Fab-Link's: this app **places real orders on real venues** (§5–§7), so granting
+> it egress is a financial-risk decision as much as a sandbox one. Until the owner
+> takes it, read everything below as a design record, not as a description of
+> anything that works.
+
 Event-driven trading engine with sandboxed WASM strategies, mandatory walk-forward validation, hard risk limits, and a signed audit log. Phase-4 implementation against `docs/SANDBOX.md`; HUD panel contract per `docs/HUD.md` §5.
 
 **Scope statement: this is an engineering spec.** It defines correctness, isolation, auditability, and safety properties of an order-management system. It makes **no profitability claims** — a strategy passing every harness in this document can still lose money.
 
-## Sandbox contract (binding: `manifest.toml`)
+## Sandbox contract (NOT BINDING — the manifest it describes is refused)
 
-- `net_hosts`: `api.binance.com`, `stream.binance.com`, `api.kraken.com`, `ws.kraken.com`, `clob.polymarket.com` — adapters may speak to these and nothing else.
+- ~~`net_hosts`: `api.binance.com`, `stream.binance.com`, `api.kraken.com`, `ws.kraken.com`, `clob.polymarket.com`~~ — **NOT GRANTABLE.** A direct-egress net scope cannot be expressed in SBPL and is refused at validation; this line is why the app does not load. See the banner above.
 - `fs_read = apps/algo-core/strategies` (WASM modules + configs), `fs_write = apps/algo-core/data` (SQLite, journals, keys).
 - IPC: JSONL over `state/ipc/apps/algo-core.sock`, capability token per message.
 - UI: `surface = "panel"`. Topics: `algo.prices`, `algo.signals`, `algo.orders`, `algo.positions`, `algo.pnl`.

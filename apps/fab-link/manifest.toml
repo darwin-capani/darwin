@@ -24,7 +24,10 @@
 # posture, so both are the owner's call, not a validator change.
 # =============================================================================
 # Fab-Link — 3D-printing telemetry overlay (Moonraker / OctoPrint).
-# Schema: docs/SANDBOX.md. This is also the worked example in that document.
+# Schema: docs/SANDBOX.md. (This manifest USED TO BE that document's worked
+# example. It is not any more and must not become one again: the schema doc's
+# example is now apps/global-scan/manifest.toml — a shipped app that validates.
+# A REFUSED manifest is the worst possible thing for an author to copy from.)
 
 [app]
 name        = "fab-link"

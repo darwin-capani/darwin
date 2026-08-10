@@ -759,7 +759,8 @@ pub enum ThrottleReason {
     /// Adaptive throttling is OFF ([power].adaptive=false): neutral plan, the
     /// live reader is never consulted. NOT the shipped default — `[power].adaptive`
     /// SHIPS ON (config.rs `impl Default for PowerConfig`, pinned by
-    /// `power_adaptive_ships_on` below), so `Disabled` is emitted ONLY when an
+    /// `config::tests::power_adaptive_defaults_on_and_keys_known` — which lives in
+    /// config.rs, NOT below this line), so `Disabled` is emitted ONLY when an
     /// operator explicitly turns the flag off. On a shipped install the live
     /// `pmset -g batt` + thermalState read DOES run on local turns.
     Disabled,

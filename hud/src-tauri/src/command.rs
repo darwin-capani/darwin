@@ -121,6 +121,40 @@ const ALLOWED_COMMANDS: &[&str] = &[
     // Nothing here reaches the network: training, eval and promotion are on-device
     // (mlx-lm on Apple Silicon), and the daemon never fabricates readiness.
     "distill", "distill_promote", "distill_rollback",
+    // CONTINUITY + FEDERATED MEMORY — the three operator-triggered verbs behind
+    // SyncPanel and HandoffPanel, which shipped read-only over queues nothing
+    // could fill.
+    //   `sync`    seals THIS device's syncable facts into the outbox.
+    //   `handoff` seals the current session's REDACTED capsule to the paired
+    //             Mac's inbox.
+    //   `resume`  opens + restores every capsule a paired Mac staged, and PARKS.
+    //
+    // ADDS NO NEW AUTHORITY — but `sync` DOES ADD NETWORK REACH, and the wording
+    // that stood here ("the network transport is armed-but-inert, so no byte
+    // leaves the box on a click") was wrong. `sync::sync_now` calls
+    // `transport_push` — a reqwest POST of the sealed bundle — whenever
+    // `[sync].peer_endpoint` is non-empty; "armed-but-inert" describes the
+    // UNPAIRED case only, which is exactly why `sync::status_payload` derives
+    // `transport_inert = !peer_configured` instead of pinning it true. Its only
+    // other caller is its own command arm, so allow-listing this verb makes a HUD
+    // click the FIRST shipped way to fire that POST. That is the trade this entry
+    // makes, stated plainly rather than denied: sealed facts, to the owner's OWN
+    // paired Mac, over the network. SyncPanel's footnote and the button's title
+    // are conditioned on `peer_configured` so an operator reads it before
+    // clicking rather than after.
+    //
+    // `handoff` and `resume` really are local. `hand_off` seals a capsule into a
+    // LOCAL outbox and NOTHING delivers it (handoff.rs's own header records that
+    // the peer-conditional line was removed for asserting a delivery that can
+    // never happen); `resume` only reads the local inbox. All three are bare
+    // verbs (no payload), and a bundle is never written in the clear (no
+    // shared key => an honest refusal, not a plaintext export). The capsule is
+    // redacted at build and carries no resolved credential or bearer. `resume`
+    // restores CONTEXT and PARKS: it restores no permission, so every
+    // consequential step on this Mac still re-hits the fresh confirm + voice-id +
+    // master switch. [sync].enabled and [handoff].enabled both ship FALSE, and
+    // each verb names its own missing dependency rather than faking a transfer.
+    "sync", "handoff", "resume",
 
     // Phase-3 Compose music — generate a FULL music track from a text PROMPT (the
     // daemon `compose_music` verb). Carries {prompt, length_ms?}: only the text
@@ -353,6 +387,28 @@ pub fn build_request(req: &CommandRequest, token: &str) -> Result<Value, String>
                 obj.insert("name".to_string(), json!(name));
             }
         }
+        "overnight" => {
+            // {prompt, agent?}. THIS ARM WAS MISSING. `overnight` was added to
+            // ALLOWED_COMMANDS with no case here, so it fell through the `_ => {}`
+            // default and `{token, cmd:"overnight"}` — with NO prompt — went on the
+            // wire; the daemon's `decide` then answered BadRequest("overnight
+            // requires a non-empty task") for every possible request. The verb was
+            // not merely un-clicked, it was un-sendable: even a hand-rolled call
+            // through the relay could not queue anything.
+            //
+            // Mirror the daemon floor so a blank request never spends a round-trip:
+            // a non-empty task (clamped to the same MAX_TEXT_CHARS) and an OPTIONAL
+            // agent, omitted when blank (the daemon resolves the default agent).
+            let prompt = req.prompt.as_deref().map(clamp_text).unwrap_or_default();
+            let prompt = prompt.trim();
+            if prompt.is_empty() {
+                return Err("overnight requires a non-empty task".to_string());
+            }
+            obj.insert("prompt".to_string(), json!(prompt));
+            if let Some(agent) = req.agent.as_deref().map(str::trim).filter(|a| !a.is_empty()) {
+                obj.insert("agent".to_string(), json!(agent));
+            }
+        }
         "compose_music" => {
             // {prompt, length_ms?}. Mirror the daemon floor: a non-empty prompt is
             // required (a blank request never spends a cloud op). The OPTIONAL
@@ -373,6 +429,16 @@ pub fn build_request(req: &CommandRequest, token: &str) -> Result<Value, String>
         // emergency-stop verbs `panic` / `unlock` are also bare (the daemon calls
         // lockdown::panic()/unlock() directly — no payload to validate), so they
         // fall through here intentionally: just `{token, cmd}` rides the wire.
+        // So are the three self-distillation verbs (`distill` / `distill_promote`
+        // / `distill_rollback`) and the three continuity verbs (`sync` /
+        // `handoff` / `resume`) — every one is a bare verb daemon-side too, so
+        // there is nothing to validate and nothing extra to carry.
+        //
+        // BEWARE: falling through here is correct ONLY for a verb the daemon's
+        // `decide` also treats as bare. `overnight` sat in this default for its
+        // whole life and was silently unusable because its required `prompt`
+        // never rode the wire; it has its own arm above now. Anything added to
+        // ALLOWED_COMMANDS that carries a field needs an arm, not this default.
         _ => {}
     }
     Ok(Value::Object(obj))
@@ -1337,6 +1403,94 @@ mod tests {
             // No stray fields beyond token + cmd.
             assert_eq!(v.as_object().unwrap().len(), 2, "{cmd} carries only token+cmd");
         }
+    }
+
+    /// THE OVERNIGHT RELAY CARRIES THE TASK.
+    ///
+    /// `overnight` was allowlisted with NO arm in `build_request`, so it fell
+    /// through the bare `_ => {}` default and `{token, cmd:"overnight"}` went on
+    /// the wire with no `prompt` at all. The daemon's `decide` answers
+    /// BadRequest("overnight requires a non-empty task") for exactly that shape,
+    /// so the verb was un-sendable, not merely un-clicked: the queue
+    /// OvernightPanel reports on could not have been filled even by hand.
+    ///
+    /// This pins the FIELD, not just the verb — the assertion that a bare
+    /// `{token, cmd}` is not what rides is the one that would have caught it.
+    #[test]
+    fn build_request_overnight_carries_the_task_and_the_optional_agent() {
+        let mut r = req("overnight");
+        r.prompt = Some("  look into the Kessler syndrome papers  ".into());
+        let v = build_request(&r, "TOK").expect("overnight builds with a task");
+        assert_eq!(v["cmd"], "overnight");
+        assert_eq!(v["token"], "TOK");
+        // THE FIELD ITSELF — trimmed, present, verbatim.
+        assert_eq!(v["prompt"], "look into the Kessler syndrome papers");
+        // No agent supplied => the field is omitted (the daemon resolves default).
+        assert_eq!(v.as_object().unwrap().len(), 3, "token + cmd + prompt only");
+        assert!(v.get("agent").is_none());
+
+        // With an agent, it rides too.
+        let mut with_agent = req("overnight");
+        with_agent.prompt = Some("draft the quarterly summary".into());
+        with_agent.agent = Some(" edith ".into());
+        let v = build_request(&with_agent, "TOK").expect("overnight builds with an agent");
+        assert_eq!(v["agent"], "edith");
+        assert_eq!(v["prompt"], "draft the quarterly summary");
+
+        // A blank agent is dropped rather than sent empty.
+        let mut blank_agent = req("overnight");
+        blank_agent.prompt = Some("read the RFC".into());
+        blank_agent.agent = Some("   ".into());
+        let v = build_request(&blank_agent, "TOK").expect("blank agent is simply dropped");
+        assert!(v.get("agent").is_none());
+
+        // The daemon floor is mirrored: an absent / whitespace task never rides.
+        assert!(build_request(&req("overnight"), "T").is_err());
+        let mut blank = req("overnight");
+        blank.prompt = Some("   \n ".into());
+        assert!(build_request(&blank, "T").is_err());
+
+        // ...and the task is clamped exactly like every other free-text field, so
+        // an oversized task cannot be silently truncated at the far end.
+        let mut huge = req("overnight");
+        huge.prompt = Some("x".repeat(MAX_TEXT_CHARS + 500));
+        let v = build_request(&huge, "T").expect("oversized clamps rather than fails");
+        assert_eq!(v["prompt"].as_str().unwrap().chars().count(), MAX_TEXT_CHARS);
+    }
+
+    /// THE SIX BARE PANEL VERBS BUILD, AND CARRY NOTHING ELSE.
+    ///
+    /// The self-distillation trio and the continuity trio are all bare daemon
+    /// verbs, so the `_ => {}` default is the CORRECT handling for them — but
+    /// "correct by default" is exactly how `overnight` shipped broken, so each
+    /// one is pinned here as `{token, cmd}` and nothing more.
+    #[test]
+    fn build_request_admits_the_bare_distill_and_continuity_verbs() {
+        for cmd in
+            ["distill", "distill_promote", "distill_rollback", "sync", "handoff", "resume"]
+        {
+            let v = build_request(&req(cmd), "TOK").expect("bare verb builds");
+            assert_eq!(v["cmd"], cmd);
+            assert_eq!(v["token"], "TOK");
+            assert_eq!(v.as_object().unwrap().len(), 2, "{cmd} carries only token+cmd");
+        }
+    }
+
+    /// VAULT STAYS OUT OF THE RELAY — a deliberate omission, pinned.
+    ///
+    /// `vault {on:false}` LIFTS "go dark", which LOOSENS the posture, and that is
+    /// the owner's decision to expose, not a repair. The shipped vault surfaces
+    /// are the spoken route (router.rs `classify_vault_command`) and the READ-ONLY
+    /// VaultIndicator chip whose tooltip names the phrase. If a future edit adds
+    /// "vault" to ALLOWED_COMMANDS, this fails and the decision gets made on
+    /// purpose instead of by drift.
+    #[test]
+    fn build_request_still_refuses_the_vault_posture_verb() {
+        assert!(!ALLOWED_COMMANDS.contains(&"vault"));
+        let mut on = req("vault");
+        on.text = Some("true".into());
+        assert_eq!(build_request(&on, "TOK"), Err("unknown_command".into()));
+        assert_eq!(build_request(&req("vault"), "TOK"), Err("unknown_command".into()));
     }
 
     #[test]

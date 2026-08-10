@@ -51,7 +51,28 @@ export type CommandVerb =
   | "distill"
   | "distill_promote"
   | "distill_rollback"
-  | "overnight";
+  | "overnight"
+  // CONTINUITY + FEDERATED MEMORY — the three operator-triggered verbs behind
+  // SyncPanel / HandoffPanel. All bare (no fields).
+  //   `sync`    seals THIS device's syncable facts into the outbox;
+  //   `handoff` seals the current session's REDACTED capsule to the paired Mac;
+  //   `resume`  restores every staged capsule and PARKS.
+  // A bundle/capsule is never written in the clear (no shared key => an honest
+  // refusal), and restoring context restores NO permission. [sync] and [handoff]
+  // both ship FALSE and each verb names its own missing dependency.
+  //
+  // `sync` CAN REACH THE NETWORK — do not restate the "no byte leaves the box on
+  // a click" claim that used to sit here. `sync::sync_now` POSTs the sealed
+  // bundle to `[sync].peer_endpoint` (`transport_push`) whenever that endpoint is
+  // non-empty; "armed-but-inert" is the UNPAIRED case only, which is why the
+  // daemon derives `transport_inert = !peer_configured`. `handoff` genuinely has
+  // NO transport at all (handoff.rs stages to a local outbox and nothing delivers
+  // it — its own header says the peer-conditional wording was removed for
+  // asserting a delivery that can never happen), and `resume` only reads the
+  // local inbox.
+  | "sync"
+  | "handoff"
+  | "resume";
 
 /** The typed request the deck hands the backend. One shape serves all verbs;
  *  per-verb requirements are enforced backend-side (and mirrored in the deck UI

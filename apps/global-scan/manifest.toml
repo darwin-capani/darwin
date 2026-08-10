@@ -7,9 +7,14 @@
 # NO direct network: net_hosts is EMPTY, so darwind's seatbelt profile is a flat
 # (deny network*). Feeds are fetched THROUGH the daemon-mediated fetch proxy
 # (state/ipc/apps/fetch.sock) — the daemon resolves, SSRF/rebind-guards, follows
-# redirects within the allow-list, and returns the body — collapsing the two
-# INHERENT SBPL network caveats (coarse host filtering + DNS exfil, docs/
-# SANDBOX.md → the Phase-4 fetch proxy). LLM summaries still ride the separate
+# redirects within the allow-list, and returns the body. This is the ONLY
+# filtered egress DARWIN has: a seatbelt profile can express no network posture
+# but "none" (macOS SBPL has no host or IP filter), so a direct-egress net scope
+# is refused outright — docs/SANDBOX.md → "A net scope is not grantable".
+# (CORRECTED: this header used to say the proxy collapsed "the two INHERENT SBPL
+# network caveats"; those caveats described rules that never compiled, so there
+# was never a coarse filter or a DNS grant to collapse.)
+# LLM summaries still ride the separate
 # generate proxy socket; neither reaches the raw inference.sock (finding #4).
 
 [app]

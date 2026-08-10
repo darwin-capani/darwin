@@ -537,14 +537,27 @@ max_output_bytes = 262144  # reject any single server response larger than this 
 # read_only_tools = ["list", "read"]   # tools this config asserts are safe to call ungated
 # fs_read = ["/Users/you/proj"]        # extra read subpaths granted in the seatbelt profile
 # fs_write = []                        # extra write subpaths granted
-# net_hosts = []                       # [] = NO network. NOTE: a NON-EMPTY list is not
-#                                      # actually enforceable -- macOS SBPL has no host or
-#                                      # IP filter, so the generated profile fails to
-#                                      # COMPILE and the server never starts. Same root
-#                                      # cause as micro-app net_hosts (docs/SANDBOX.md,
-#                                      # "A net scope is not grantable"); unlike that one
-#                                      # this surface is NOT yet refused at validation --
-#                                      # it is an open owner decision. Leave it empty.
+# net_hosts = []                       # MUST BE EMPTY -- and you may simply omit it. A
+#                                      # sandboxed stdio server gets NO outbound network;
+#                                      # that is the only posture macOS SBPL can express,
+#                                      # because it has no host or IP filtering rule. A
+#                                      # NON-EMPTY list is REFUSED: it is reported as a
+#                                      # config issue at load and the server is NOT
+#                                      # connected. (It could never have started anyway --
+#                                      # the generated profile failed to COMPILE, exit 65,
+#                                      # so this takes away nothing that worked.) It is
+#                                      # refused rather than ignored on purpose: starting
+#                                      # the server while silently discarding a declared
+#                                      # host list would let you believe a filter was live.
+#                                      # There is no fetch proxy for MCP -- if the server
+#                                      # truly needs the network it cannot be sandboxed
+#                                      # here; running it unsandboxed as a remote
+#                                      # transport = "http" server is a DIFFERENT trust
+#                                      # posture and your call, not a substitute grant.
+#                                      # On an http server the key is inert (nothing local
+#                                      # to filter): reported, but not refused.
+#                                      # Same root cause as micro-app net_hosts --
+#                                      # docs/SANDBOX.md, "A net scope is not grantable".
 
 [skills]
 # The SKILL LIBRARY (daemon/src/skills/): DARWIN's hand-written, in-tree set of
@@ -936,7 +949,8 @@ enabled = false                # SHIPS OFF (rides [sync], also OFF). Set true (w
 # own KNOWN_KEYS registry, HOVERS a config section against the live capability atlas
 # (capability.rs/atlas.rs), and DIAGNOSES with the daemon's REAL rules — an
 # over-privileged/malformed manifest (plugin_sdk::validate_manifest), a `net` scope
-# AT ALL (not grantable on this OS -- route egress through the fetch proxy),
+# AT ALL (not grantable on this OS -- route egress through the fetch proxy) on
+# EITHER surface that carries it: a micro-app manifest and a [[mcp.servers]] entry,
 # an unknown agent tool (the agents.rs allowlist), a `mode = "auto"`
 # autonomy lint, and an unknown config key/section (KNOWN_KEYS). It NEVER writes config
 # and takes NO action (the intentional absence of a config-write primitive is preserved);

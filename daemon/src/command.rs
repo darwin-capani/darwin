@@ -232,6 +232,17 @@ pub enum Command {
     /// there is no dependency to supply; no client can reach the arm. The vault
     /// FEATURE works, but through the spoken path (router.rs), not this verb.
     ///
+    /// AND THAT STAYS TRUE ON PURPOSE. When the other five dead panel verbs were
+    /// wired (overnight + the distill trio, sync/handoff/resume), this one was
+    /// deliberately left alone: `vault {on:false}` LIFTS go-dark, and lifting
+    /// re-opens cloud routing + relaxes the CUSTOMS trim. Engaging only ever
+    /// tightens, but a single unattended HUD click that can LOOSEN the posture is
+    /// the owner's decision to add, not an audit's to make. The honest fix was to
+    /// say so: SECURITY.md "VAULT mode (go dark) is deliberately voice-only" and
+    /// docs/HUD.md 5.2 now document the spoken route as THE surface, and the Tauri
+    /// crate's `build_request_still_refuses_the_vault_posture_verb` pins the
+    /// omission so it cannot be undone by drift.
+    ///
     /// A DEDICATED
     /// verb, NOT `ask` — it NEVER reaches the model/tool loop; the daemon flips the
     /// process-global vault mode directly (`vault::set`). NOTHING CONSEQUENTIAL: it
@@ -2153,23 +2164,29 @@ mod tests {
         // asks whether the BACKEND MAY RELAY the verb — not whether anything in
         // the shipped UI ever sends it. `overnight` satisfied that assertion the
         // instant it was added to the allow-list, and stayed exactly as
-        // unreachable as the commit said it had been: `overnight::enqueue` has
+        // unreachable as the commit said it had been: `overnight::enqueue` had
         // ONE caller in the tree (this file's Overnight arm), so the queue the
-        // HUD's OvernightPanel reports on can never be filled, by click or by
+        // HUD's OvernightPanel reported on could not be filled, by click or by
         // voice. The distill trio landed the same way an hour later, and the
         // guard could not see any of it.
         //
         // So direction 2 is measured against the SENDERS now. Every verb the
         // backend relays must appear at a `cmd: "<verb>"` send site in a shipped
-        // front-end source, or be named below with the reason it does not.
+        // front-end source, or be named below with the reason it does not. That
+        // is what closed the six: the panels below are in this list precisely so
+        // the wiring is proved by a scrape rather than asserted by a comment.
         const HUD_SENDERS: &[&str] = &[
             include_str!("../../hud/src/App.tsx"),
             include_str!("../../hud/src/components/CommandDeck.tsx"),
             include_str!("../../hud/src/components/CommandPalette.tsx"),
+            include_str!("../../hud/src/components/DistillPanel.tsx"),
+            include_str!("../../hud/src/components/HandoffPanel.tsx"),
             include_str!("../../hud/src/components/MemoryPanel.tsx"),
+            include_str!("../../hud/src/components/OvernightPanel.tsx"),
             include_str!("../../hud/src/components/SettingsModal.tsx"),
             include_str!("../../hud/src/components/StatusBar.tsx"),
             include_str!("../../hud/src/components/SuggestionsPanel.tsx"),
+            include_str!("../../hud/src/components/SyncPanel.tsx"),
             include_str!("../../hud/src/components/SystemSettingsPanel.tsx"),
             include_str!("../../hud/src/core/palette.ts"),
         ];
@@ -2221,8 +2238,21 @@ mod tests {
         // Verbs the backend relays that NO `send_command` control sends. The first
         // four ARE reachable — a DEDICATED Tauri command drives them instead of the
         // shared relay — and saying so here is what keeps this list from reading as
-        // six findings plus four false ones. The last six are genuinely
-        // unreachable: wiring or removing them is the owner's call, not a repair.
+        // findings plus four false ones.
+        //
+        // THE SIX GENUINELY-DEAD ENTRIES ARE GONE, AND THE GUARD BELOW IS WHAT
+        // PROVES IT. `overnight`, `distill`, `distill_promote` and
+        // `distill_rollback` now have shipped controls (OvernightPanel's task box,
+        // DistillPanel's TRAIN + the two-step PROMOTE / ROLL BACK gate), and their
+        // send sites are in HUD_SENDERS above, so the loop after this list — not a
+        // comment — is what keeps them reachable. `overnight` needed more than a
+        // button: the Tauri relay had NO `build_request` arm for it, so the verb
+        // rode the wire with no `prompt` and the daemon BadRequested every possible
+        // request. `sync` / `handoff` / `resume` moved out of NO_HUD_CLIENT below
+        // for the same reason.
+        //
+        // Only the two READ-ONLY verbs remain: both are genuinely reachable as
+        // information, just not by a button, and neither reports on a queue.
         const RELAYED_WITHOUT_A_DECK_CONTROL: &[(&str, &str)] = &[
             ("play_cue", "REACHABLE: AudioIoPanel -> playSfxCue -> the `play_sfx_cue` command"),
             ("design_voice", "REACHABLE: AudioIoPanel -> designVoice -> the `design_voice` command"),
@@ -2230,10 +2260,6 @@ mod tests {
             ("compose_music", "REACHABLE: AudioIoPanel -> composeMusic -> the `compose_music` command"),
             ("roster", "NO CONTROL. Otherwise reachable as ask \"list my agents\"."),
             ("state", "NO CONTROL. The same constellation + pending state arrives on telemetry."),
-            ("overnight", "NO CONTROL, and overnight::enqueue has no other caller — the queue OvernightPanel reports on can never be filled. WIRING, owner's call."),
-            ("distill", "NO CONTROL, and distill::distill_now has no other caller — DistillPanel's ARMED pipeline can never train. WIRING, owner's call."),
-            ("distill_promote", "NO CONTROL, and it swaps which model answers, so wiring it is a decision, not a repair."),
-            ("distill_rollback", "NO CONTROL. The inverse of promote; same call."),
         ];
         for v in &allowed {
             assert!(
@@ -2257,13 +2283,31 @@ mod tests {
         }
 
         // ------------------------------------------------------------------
-        // DIRECTION 3: A DAEMON VERB NO CLIENT CAN EVEN RELAY. Four verbs sat
-        // here silently; `vault` is the only one that is deliberate.
+        // DIRECTION 3: A DAEMON VERB NO CLIENT CAN EVEN RELAY. Four verbs sat here
+        // silently. Three now have one — SyncPanel's SYNC NOW and HandoffPanel's
+        // HAND OFF / RESUME STAGED — and each is a bare verb, so the relay's
+        // default arm is the correct handling (pinned in the Tauri crate's
+        // `build_request_admits_the_bare_distill_and_continuity_verbs`).
+        //
+        // `vault` STAYS OUT, deliberately, and this is the one entry here that is a
+        // decision rather than a gap:
+        //   * IT IS NOT UNREACHABLE. The vault FEATURE ships with a real client —
+        //     the SPOKEN route. router.rs consults `vault::classify_vault_command`
+        //     BEFORE normal routing, so "go dark" / "vault mode on|off" / "come
+        //     back online" flip the same process-global mode this verb flips, emit
+        //     the same `vault.status` frame, and never reach the model. The HUD's
+        //     VaultIndicator chip is read-only ON PURPOSE and its tooltip names the
+        //     phrase. So the honest fix here was documentation, not a button, and
+        //     the docs now say so (SECURITY.md "VAULT mode", docs/HUD.md 5.2).
+        //   * A BUTTON WOULD WIDEN THE POSTURE. `vault {on:false}` LIFTS go-dark.
+        //     Engaging only ever tightens, but lifting re-opens cloud routing and
+        //     relaxes the CUSTOMS trim, and putting that one click from an
+        //     unattended HUD is a security decision for the owner to make
+        //     deliberately — not a repair an audit gets to perform. The Tauri
+        //     crate's `build_request_still_refuses_the_vault_posture_verb` pins the
+        //     omission so it cannot be undone by drift.
         const NO_HUD_CLIENT: &[(&str, &str)] = &[
-            ("vault", "DELIBERATE: the 'go dark' toggle ships no client (see Command::Vault)."),
-            ("sync", "NO CLIENT. sync::sync_now has no other caller; SyncPanel is read-only."),
-            ("handoff", "NO CLIENT. handoff::build_capsule has no other caller; HandoffPanel is read-only."),
-            ("resume", "NO CLIENT. The consumer half of handoff."),
+            ("vault", "DELIBERATE: reachable by VOICE (router.rs classify_vault_command: 'go dark' / 'vault mode off'); the VaultIndicator chip is read-only and names the phrase. A button could LIFT go-dark, which loosens posture — the owner's call, not an audit's."),
         ];
         for v in &daemon_verbs {
             assert!(
@@ -2282,6 +2326,149 @@ mod tests {
                 "NO_HUD_CLIENT says {v:?} has no client, but the backend relays it — drop the entry"
             );
         }
+    }
+
+    /// A RELAYED VERB THAT NEEDS A FIELD MUST HAVE A `build_request` ARM.
+    ///
+    /// THE TRAP THE SIBLING TEST ABOVE CANNOT SEE. `overnight` was in
+    /// ALLOWED_COMMANDS (direction 1 passed), the daemon implements it
+    /// (direction 3 passed), and a control now sends it (direction 2 passes) —
+    /// but the Tauri relay had NO arm for it, so it fell through `_ => {}` and
+    /// `{token, cmd:"overnight"}` rode the wire with no `prompt`. `decide`
+    /// answers BadRequest("overnight requires a non-empty task") for exactly that
+    /// shape, so the verb was UN-SENDABLE: every reachability assertion in the
+    /// tree was green while the queue OvernightPanel counted could not be filled
+    /// by ANY client, hand-rolled ones included.
+    ///
+    /// Adding the arm fixed `overnight`. It did NOT fix the class — the next
+    /// field-carrying verb allow-listed without an arm fails the same way, just
+    /// as silently — and the only thing standing in its way was a warning comment
+    /// in the default arm. A comment stating a rule is not the rule.
+    ///
+    /// So derive the rule. Every `Decision::BadRequest` reason in `decide` opens
+    /// with the verb it belongs to ("overnight requires a non-empty task"), which
+    /// makes FIELD-CARRYING a scrape rather than a hand-list free to go stale.
+    /// Each such verb the backend relays must have an explicit arm in
+    /// `build_request` — bounded to that fn at BOTH ends, because the verb string
+    /// also appears in ALLOWED_COMMANDS and in the crate's own tests, and an
+    /// unbounded `contains` would pass on either and prove nothing.
+    #[test]
+    fn every_relayed_field_carrying_verb_has_a_build_request_arm() {
+        let daemon_src = include_str!("command.rs");
+        let tauri = include_str!("../../hud/src-tauri/src/command.rs");
+
+        // THE DAEMON SIDE: which verbs refuse a bare request. Bounded to the body
+        // of `decide`, so a `reason:` in a test fixture or a later fn can never be
+        // read as a command requirement.
+        let d_start = daemon_src
+            .find("fn decide(raw: &str) -> Decision {")
+            .expect("the request classifier must exist");
+        let d_rest = &daemon_src[d_start..];
+        let d_end = d_rest.find("\n}\n").expect("decide must close at column 0");
+        let decide_body = &d_rest[..d_end];
+        // BOUNDED AT BOTH ENDS, AND PROVED SO. Lower bound: the window holds the
+        // FIRST and LAST arms of the classifier, so it did not bind to nothing.
+        // Upper bound: it stops before the next item in the file, so a `reason:`
+        // string added to a LATER fn can never be read as a command requirement.
+        // If either marker moves this fails loudly and the anchors get re-cut —
+        // the alternative is a window that slides silently and then matches too
+        // much, or binds so tightly it matches nothing at all.
+        assert!(
+            decide_body.contains("\"ask\" =>")
+                && decide_body.contains("\"overnight\" =>")
+                && decide_body.contains("\"compose_music\" =>"),
+            "the decide window bound to nothing recognisable — re-anchor it"
+        );
+        assert!(
+            !decide_body.contains("struct RateLimiter"),
+            "the decide window ran past the classifier into the rest of the file"
+        );
+
+        let mut needs_a_field: Vec<&str> = decide_body
+            .match_indices("reason: \"")
+            .filter_map(|(i, m)| decide_body[i + m.len()..].split('"').next())
+            .filter_map(|reason| reason.split(' ').next())
+            .filter(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .collect();
+        needs_a_field.sort_unstable();
+        needs_a_field.dedup();
+        // NON-VACUITY, and that the scrape DISCRIMINATES instead of listing every
+        // verb: ask/overnight require a field, the bare panel verbs do not. A
+        // scrape that matched everything would demand arms nobody needs; one that
+        // matched nothing would pass the loop below vacuously.
+        assert!(
+            needs_a_field.contains(&"ask") && needs_a_field.contains(&"overnight"),
+            "the BadRequest scrape missed a known field-carrying verb: {needs_a_field:?}"
+        );
+        for bare in
+            ["brief", "panic", "distill", "distill_promote", "distill_rollback", "sync", "handoff", "resume"]
+        {
+            assert!(
+                !needs_a_field.contains(&bare),
+                "{bare:?} takes no field, so the scrape is over-matching: {needs_a_field:?}"
+            );
+        }
+
+        // THE RELAY SIDE: the allow-list, and `build_request`'s arms.
+        let allowed: Vec<&str> = tauri
+            .split("const ALLOWED_COMMANDS: &[&str] = &[")
+            .nth(1)
+            .and_then(|r| r.split_once("];"))
+            .map(|(b, _)| b)
+            .expect("the Tauri allow-list must exist")
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .flat_map(|l| l.split('"').skip(1).step_by(2))
+            .filter(|t| !t.is_empty() && t.chars().all(|c| c.is_ascii_lowercase() || c == '_'))
+            .collect();
+        assert!(allowed.len() > 8, "the allow-list scrape found too few: {allowed:?}");
+
+        let b_start = tauri
+            .find("pub fn build_request(req: &CommandRequest, token: &str) -> Result<Value, String> {")
+            .expect("build_request must exist");
+        let b_rest = &tauri[b_start..];
+        let b_end = b_rest.find("\n}\n").expect("build_request must close at column 0");
+        let build_body = &b_rest[..b_end];
+        // Same discipline on this side. Lower bound: the first arm and the
+        // default arm are both inside. Upper bound: the window stops before
+        // `parse_reply`, so the crate's OWN tests — which quote every verb name
+        // many times over — can never be mistaken for relay arms.
+        assert!(
+            build_body.contains("\"ask\" =>") && build_body.contains("_ => {}"),
+            "the build_request window bound to nothing recognisable — re-anchor it"
+        );
+        assert!(
+            !build_body.contains("pub fn parse_reply"),
+            "the build_request window ran past the fn into the rest of the file"
+        );
+
+        // An ARM is a NON-COMMENT line inside that window carrying the quoted verb
+        // AND a `=>`, so `"confirm" | "deny" => {` counts for both of them and the
+        // default arm's prose about `overnight` counts for none.
+        let has_arm = |verb: &str| {
+            let quoted = format!("\"{verb}\"");
+            build_body.lines().any(|l| {
+                let t = l.trim_start();
+                !t.starts_with("//") && t.contains(&quoted) && t.contains("=>")
+            })
+        };
+
+        let mut checked = 0usize;
+        for v in &needs_a_field {
+            // Not relayed at all (`vault`) is direction 3's business, not this test's.
+            if !allowed.contains(v) {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                has_arm(v),
+                "the HUD relays {v:?} and the daemon REFUSES it without a field, but \
+                 build_request has no arm for it — the request falls through `_ => {{}}` \
+                 and rides the wire bare, which `decide` BadRequests every time. That is \
+                 exactly how `overnight` shipped un-sendable."
+            );
+        }
+        assert!(checked >= 5, "this guard checked almost nothing: {checked}");
     }
 
     /// THE TYPED PATH CAN NOW DO WHAT THE SPOKEN PATH CAN, for the tier swap.
@@ -2381,12 +2568,48 @@ mod tests {
             .unwrap_or(rest.len());
         let body = &rest[..end];
 
-        let calls = body.matches("self\n                .answer_locally(").count()
-            + body.matches(".answer_locally(").count();
+        // COUNT ONCE, THEN PIN EACH ARM. The old count added
+        // `self\n<indent>.answer_locally(` to `.answer_locally(` — and the first
+        // CONTAINS the second, so every multi-line call was counted TWICE. Both call
+        // sites are multi-line, so the honest 2 read as 4 and the `>= 2` floor was
+        // met by ONE arm. PROVED: replacing the vault/guest branch's fallback with a
+        // bare `return vault_no_local_answer();` left this test GREEN — the exact
+        // half of "both paths" its own name promises to cover.
+        // CODE LINES ONLY. AMENDMENT (adversary re-probe): counting over the raw
+        // body counts COMMENTS, so the de-duplicated count is still satisfiable by
+        // prose. PROVED: with the ledger fix applied, deleting the vault/guest
+        // fallback and leaving
+        //     // was: self.answer_locally(text, &facts, mem, agent) — dropped.
+        //     return vault_no_local_answer();
+        // ran GREEN — one real call plus one sentence made two. Same class the
+        // ledger fixed in anthropic.rs and heal.rs, same file it was fixing.
+        let calls = body
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| !l.starts_with("//") && l.contains(".answer_locally("))
+            .count();
         assert!(
             calls >= 2,
             "both the vault/guest branch AND the cloud-error branch must degrade to \
-             answer_locally; found {calls} call(s) in the ask body"
+             answer_locally; found {calls} call site(s) in the ask body"
+        );
+        // ...and a count cannot say WHICH arm, so pin the vault/guest arm by window:
+        // the reachability gate through to the cloud call.
+        let gate = body
+            .find("if !cloud_ok {")
+            .expect("the ask arm must still branch on the reachability gate");
+        let cloud = body
+            .find("match crate::anthropic::complete_with_tools(")
+            .expect("ask still calls the cloud loop");
+        assert!(gate < cloud, "the gate must precede the cloud call");
+        assert!(
+            body[gate..cloud]
+                .lines()
+                .map(str::trim_start)
+                .any(|l| !l.starts_with("//") && l.contains(".answer_locally(")),
+            "the vault/guest branch must degrade to the on-device brain, not refuse \
+             the turn outright — on a CODE line; the comment block inside this very \
+             window is what made the count above satisfiable by prose"
         );
         // The Err arm specifically — a fallback only on the vault side is the bug.
         let err_arm = body
@@ -2394,8 +2617,13 @@ mod tests {
             .nth(1)
             .expect("ask must still handle a cloud error");
         assert!(
-            err_arm[..err_arm.len().min(400)].contains("answer_locally"),
-            "the cloud-error arm must try the on-device brain before giving up"
+            err_arm[..err_arm.len().min(400)]
+                .lines()
+                .map(str::trim_start)
+                .any(|l| !l.starts_with("//") && l.contains("answer_locally")),
+            "the cloud-error arm must try the on-device brain before giving up — on a \
+             CODE line. A comment recording that it used to is not the fallback, and \
+             this is the arm that runs on the shipped no-API-key machine"
         );
     }
 
