@@ -231,6 +231,10 @@ where
             // Record the OS restore point into the reversible journal so
             // "undo that" can name it. Secret-free (label + ts + fixed reason).
             journal::anchor_restore_point(&label, &now, reason.label());
+            // PIXEL-FREE(diagnostic): a restore point taken BEFORE a consequential
+            // step. The consequential step is what the operator is watching and it
+            // has its own surface (the confirm gate); the anchor is the record that
+            // makes "undo that" nameable, and journal.rs is where it is read from.
             crate::telemetry::emit(
                 "system",
                 "snapshot.anchor",
@@ -244,6 +248,7 @@ where
             SnapshotAnchor::Anchored { label, ts: now }
         }
         SnapshotOutcome::WouldHave { reason: why } => {
+            // PIXEL-FREE(diagnostic): twin of the Created frame above.
             crate::telemetry::emit(
                 "system",
                 "snapshot.anchor",

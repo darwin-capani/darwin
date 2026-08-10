@@ -41,6 +41,22 @@ fn sticky_key(event: &str, data: &Value) -> Option<String> {
         // 15s cadence), so retain the latest frame — a HUD that connects after a
         // toggle must still learn the current vault state to render its indicator.
         "vault.status" => Some(event.to_string()),
+        // MICROPHONE NEVER ACQUIRED (audio.rs): `acquire_input_device()` failed, so
+        // the capture thread PARKS for the life of the process and no `audio.level`
+        // is ever produced again. There is no cadence behind this frame and no
+        // retry — it is emitted exactly once, from `spawn_capture`, seconds to
+        // minutes after boot. darwind starts under launchd at login and the HUD
+        // connects later, so at that instant the hub has no subscriber and `send`
+        // drops the frame on the floor. Unretained, the MIC OFFLINE banner is
+        // unreachable in the deployed configuration — a pixel for a frame that
+        // cannot arrive, which is the same "built but inert" failure the DEFERRED
+        // STARTUP FRAMES block in main.rs exists to remember. Same shape as
+        // vault.status: rare, event-driven, and true until the process restarts.
+        //
+        // Its twin `audio.capture_stopped` is deliberately NOT retained: capture
+        // dying mid-run drops `tx` and ends main, so a replayed frame would tell a
+        // later client about a process that no longer exists.
+        "capture.unavailable" => Some(event.to_string()),
         // SAFETY SNAPSHOT (snapshot.rs): an anchored APFS restore point is a rare,
         // event-driven state (not a 15s cadence), so retain the LATEST frame so a
         // client connecting later still learns the current restore point. Latest wins.
@@ -359,6 +375,34 @@ mod tests {
         assert!(sticky_key("mirror.belief", &serde_json::json!({"action": "explain"})).is_none());
         assert!(sticky_key("mirror.belief", &serde_json::json!({"action": "contest"})).is_none());
         assert!(sticky_key("mirror.belief", &serde_json::json!({})).is_none());
+    }
+
+    /// The MIC OFFLINE banner exists only if this frame survives to the HUD's
+    /// connect. `audio.rs` emits `capture.unavailable` ONCE, from the capture
+    /// thread, which then parks forever — no cadence, no retry, no later frame.
+    /// darwind starts under launchd at login and the HUD attaches afterwards, so
+    /// an unretained frame goes to a hub with no subscriber and is gone. Retention
+    /// is the whole difference between a banner and a pixel-free emit with a
+    /// reducer case in front of it.
+    #[test]
+    fn capture_unavailable_is_retained_so_a_late_hud_still_learns_the_mic_is_dead() {
+        assert_eq!(
+            sticky_key(
+                "capture.unavailable",
+                &serde_json::json!({"error": "no default input device"}),
+            )
+            .as_deref(),
+            Some("capture.unavailable"),
+        );
+        // THE RISK THIS OPENS is replaying a frame that has gone stale, so the
+        // twin must stay unretained: `audio.capture_stopped` means capture died
+        // mid-run, which drops `tx` and ends main — replaying it to a client that
+        // connects later would describe a process that no longer exists.
+        assert!(
+            sticky_key("audio.capture_stopped", &serde_json::json!({"reason": "device error"}))
+                .is_none(),
+            "audio.capture_stopped precedes daemon exit; a replayed copy would be a lie",
+        );
     }
 
     #[test]

@@ -2252,6 +2252,10 @@ impl DocIndex {
                     let hypo = hypo.trim().to_string();
                     if !hypo.is_empty() {
                         q_texts.push(hypo);
+                        // PIXEL-FREE(diagnostic): a retrieval-internal trace. The
+                        // HUD shows the RESULT (docsearch.searched); which of the
+                        // two query vectors found it is an eval/tuning question,
+                        // answered off the live stream, not an operator-facing one.
                         crate::telemetry::emit("docsearch", "hyde", serde_json::json!({"expanded": true}));
                     }
                 }

@@ -405,18 +405,74 @@ mod tests {
     /// ratchets: the count may shrink, never grow. Closing one means deleting its
     /// line and moving the sentence into the ordinary corpus.
     ///
-    /// The untouched branches behind them, from the adversarial pass: markforge
-    /// LAUNCH / STEP+PAUSE / GRAVITY / SPAWN, silicon LAUNCH, and genimage's
-    /// remaining hole — which is grammatical PERSON, not vocabulary, so it needs a
-    /// POS tagger rather than another lexical rule.
+    /// FOUR OF THE ORIGINAL SEVEN ARE NOW CLOSED and live in
+    /// `router_ordinary.json`, where the corpus enforces them: the two markforge
+    /// STEP/PAUSE sentences and the two markforge LAUNCH sentences. Their branches
+    /// got the closed-vocabulary context their siblings (world reset, bare spawn)
+    /// already carried. The same pass enumerated all 14 branches of the three
+    /// classifiers named here and found 9 defective; 25 further ordinary sentences
+    /// went into the corpus with them (markforge launch/step/pause/gravity/spawn/
+    /// state, silicon launch), 29 in all.
+    ///
+    /// RECALL WAS UNCHANGED AT 191/202, PER-GATE TOO — AND THAT IS A STATEMENT
+    /// ABOUT THE FIXTURE, NOT ABOUT THE BRANCHES. `router_recall.json` carries 6
+    /// markforge probes for 7 branches and 10 silicon probes, and every one of
+    /// them either NAMES the app ("open mark forge", "reset the physics world") or
+    /// is exactly the bare idiom the new closed vocabularies were written around
+    /// ("spawn a cube", "advance 5 frames"), so the fixture cannot see what those
+    /// vocabularies drop. Measured separately, against 49 constructed commands the
+    /// same branches SERVED at HEAD: 27 are now refused. One adjective or one
+    /// trailing "right now" beside the loose noun is enough —
+    ///   "drop a big box in the sandbox"        "spawn a red cube in the sandbox"
+    ///   "add a crate to the sandbox"           "pause the simulation for a second"
+    ///   "step the simulation forward by two frames"   (digits pass, number WORDS
+    ///                                                  are not in the step list)
+    ///   "turn off gravity in the sandbox"      (the gravity list holds no locus
+    ///                                           noun at all: 5 of 8 lost)
+    ///   "what is the current physics state"    "show me the sandbox right now"
+    ///   "open the schematic right now"         (`NEXUS_BARE_GAIN_VOCAB` in
+    ///                                           router.rs records this exact
+    ///                                           lesson: "set the gain to -6 RIGHT
+    ///                                           NOW died while set the gain to -6
+    ///                                           worked")
+    /// Naming the engine still works in every one of those cases ("drop a big box
+    /// in the PHYSICS sandbox"). That is the price of the precision; it is not
+    /// zero, and it is not visible in the number above. Buying some of it back is
+    /// cheap and safe in shape — each of these lists is ANDed AFTER its branch's
+    /// existing gate, so a word added to one can only move behaviour back toward
+    /// HEAD, never past it — but which phrasings are worth re-admitting on a branch
+    /// that WRITES A GRAVITY VECTOR or SPAWNS A BODY is an owner judgement, not an
+    /// agent's, so it is recorded here rather than taken.
+    ///
+    /// WHAT REMAINS IS GENIMAGE, AND IT IS NOT A VOCABULARY PROBLEM.
+    /// A request to DARWIN is an IMPERATIVE; present-tense narration reuses the
+    /// SAME base verb form in the SAME verb-object shape, so "draw a picture of X"
+    /// and "we draw a picture of X every christmas" are lexically identical up to
+    /// the subject. Rule 2 in `image_noun_is_commanded` already drops the inflected
+    /// forms (drew / draws / painted / created), which is why only 1st/2nd-person
+    /// and plural narration survives — exactly these.
+    ///
+    /// A subject-pronoun rule ("we"/"you"/"they"/"I" immediately before the verb,
+    /// absent subject-auxiliary inversion) would close all three. IT WAS MEASURED
+    /// AND NOT TAKEN: it closes the PRONOUN class and leaves the equally ordinary
+    /// PLURAL-NOUN class wide open — "the kids draw a picture of the dog every
+    /// week" and "they make art with recycled bottles at the co-op" still fire, as
+    /// does "i paint a picture of the coast every summer" if the pronoun list is
+    /// bounded any tighter. Closing three named sentences while an identical
+    /// sentence one noun away still renders an image would make this ratchet read
+    /// CLOSED while the hole stays open — the "right and misleading" shape this
+    /// campaign keeps finding. Separating them needs a POS tagger (or the
+    /// classifier reporting its own near-miss), not another list. Left visible on
+    /// purpose.
     const KNOWN_OPEN_HIJACKS: &[&str] = &[
         "we make art with the kids on saturdays",
         "you cannot paint a picture with only one color",
         "we draw a picture of the family every christmas",
-        "she took a step into a whole new world after graduation",
-        "hold on, the world is not ending today",
-        "they start the simulation training for new nurses next month",
-        "show me the sandbox where the kids play at the park",
+        // NOT one of the original seven — measured by the same enumeration and
+        // added here rather than left unstated, because it is the class the
+        // pronoun rule above would NOT have closed. The list is honest about its
+        // own breadth or it is not a ratchet.
+        "the kids draw a picture of the dog every week",
     ];
 
     #[test]
@@ -552,9 +608,10 @@ mod tests {
              consults these gates when the cloud answers): {pre_h}/{pre_t} \
              probes = {:.1}% of the fixture — {:?}. A hoist of the four \
              non-capture gates was measured and REFUSED (see the block above \
-             `needs_deep_reasoning` in router.rs): four of their branches are \
-             not precise enough to be FIRST, and the other four each actuate a \
-             CAPTURE, which is an owner consent decision",
+             `needs_deep_reasoning` in router.rs): five of the six branches that \
+             blocked it are now closed, ONE (genimage's grammatical-person hole) \
+             is not, and the other four gates each actuate a CAPTURE, which is an \
+             owner consent decision",
             pre_t as f64 / total as f64 * 100.0,
             CLOUD_PREEMPTED,
         );

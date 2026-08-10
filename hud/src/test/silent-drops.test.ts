@@ -1,8 +1,10 @@
+import { readFileSync } from "node:fs";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vitest";
 import DiagnosticsPanel from "../components/DiagnosticsPanel";
 import MemoryPanel from "../components/MemoryPanel";
+import MicOfflineBanner from "../components/MicOfflineBanner";
 import {
   configIssueLines,
   CONFIG_ISSUE_CAP,
@@ -170,6 +172,97 @@ describe("a failed memory consolidation is visible", () => {
       }),
     );
     expect(html).not.toContain("CONSOLIDATION FAILING");
+  });
+});
+
+/**
+ * THE MICROPHONE THAT WAS NEVER ACQUIRED.
+ *
+ * `audio.rs`'s `acquire_input_device()` was measured blocking 173-450s on this
+ * machine and then failing. Returning `Err` there used to drop `tx` and end main,
+ * so launchd relaunched into the same hang every ~450s; the fix parks the capture
+ * thread forever instead and lets the router, scheduler, HUD feed and tool host
+ * keep running. Correct — and it means NO AUDIO FRAME IS EVER PRODUCED for the
+ * life of the process, with nothing in-process that retries.
+ *
+ * The daemon says so on `capture.unavailable`. `applyEnvelope` had no case, so the
+ * HUD rendered its idle ring: pixel-for-pixel what it renders while listening to a
+ * quiet room. A user could sit in front of a fully live appliance talking to a
+ * microphone the OS never handed over, and the only difference on screen was the
+ * absence of something that is also absent in silence.
+ */
+describe("a microphone that was never acquired says so", () => {
+  it("raises the sticky MIC OFFLINE state with the acquisition error", () => {
+    const s = apply(initialState(), "capture.unavailable", {
+      error: "no default input device",
+    });
+    expect(s.micOffline).toBe("no default input device");
+  });
+
+  it("drops the core state to idle — a listening ring would be the lie itself", () => {
+    let s = apply(initialState(), "audio.level", { rms: 0.9, speaking: false });
+    s = { ...s, coreState: "listening" };
+    const dead = apply(s, "capture.unavailable", { error: "device busy" });
+    expect(dead.coreState).toBe("idle");
+  });
+
+  it("survives a payload with no error field rather than throwing", () => {
+    const s = apply(initialState(), "capture.unavailable", {});
+    expect(s.micOffline).toBe("");
+    expect(() => apply(initialState(), "capture.unavailable", {})).not.toThrow();
+  });
+
+  it("does not churn state on a replayed frame", () => {
+    const first = apply(initialState(), "capture.unavailable", { error: "e" });
+    const second = apply(first, "capture.unavailable", { error: "e" });
+    expect(second).toBe(first);
+  });
+
+  it("clears on the first real audio frame, and only then", () => {
+    const down = apply(initialState(), "capture.unavailable", { error: "e" });
+    // Something unrelated must NOT clear it.
+    expect(apply(down, "daemon.started", { cloud_key: true }).micOffline).toBe("e");
+    // An actual audio frame proves capture is alive again.
+    expect(apply(down, "audio.level", { rms: 0.02, speaking: false }).micOffline).toBeNull();
+  });
+
+  it("does not churn on audio.level once the banner is already down", () => {
+    const s = apply(initialState(), "audio.level", { rms: 0.01, speaking: false });
+    expect(apply(s, "audio.level", { rms: 0.01, speaking: false })).toBe(s);
+  });
+
+  /* REGRESSION — THE PIXELS. `micOffline` set by the reducer and read by nothing
+     is the same silence one layer up: that is exactly how `configIssues` above and
+     `consolidationStale` below each shipped. Assert the rendered banner. */
+  it("RENDERS the banner, and says NOT LISTENING in those words", () => {
+    const s = apply(initialState(), "capture.unavailable", { error: "device busy" });
+    const html = renderToStaticMarkup(
+      createElement(MicOfflineBanner, { error: s.micOffline }),
+    );
+    expect(html).toContain("MICROPHONE OFFLINE");
+    expect(html).toContain("NOT LISTENING");
+    expect(html).toContain("device busy");
+    expect(html).toContain("visible");
+  });
+
+  it("renders NOTHING visible while the microphone is fine", () => {
+    const html = renderToStaticMarkup(
+      createElement(MicOfflineBanner, { error: initialState().micOffline }),
+    );
+    expect(html).not.toContain("visible");
+    expect(html).not.toContain("device busy");
+  });
+
+  /* …and the banner has to be MOUNTED. Every assertion above passes for a
+     component nobody renders — the identical shape of the `configIssues` drop
+     this file was opened for, one layer further out. App.tsx pulls in three.js
+     and the Tauri API and cannot be imported in the node test environment, so
+     this reads the source: narrow, anchored at both ends, and it cannot
+     self-match (the string it looks for lives in App.tsx, not here). */
+  it("is actually MOUNTED in App.tsx, fed from state.micOffline", () => {
+    const app = readFileSync(new URL("../App.tsx", import.meta.url), "utf8");
+    expect(app).toContain('import MicOfflineBanner from "./components/MicOfflineBanner"');
+    expect(app).toMatch(/<MicOfflineBanner\s+error=\{state\.micOffline\}\s*\/>/);
   });
 });
 

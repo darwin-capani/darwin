@@ -128,6 +128,10 @@ pub async fn route(
         // the two surfaces behave identically — a panic that closed the lens only
         // when spoken would be the same split this codebase keeps producing.
         crate::apps::stop_all_captures(app_registry).await;
+        // PIXEL-FREE(diagnostic): the LOCK is already a pixel — `lockdown::panic`
+        // emits lockdown.status{locked:true} (lockdown.rs), which drives the HUD's
+        // LockdownChip, and that frame is sticky so a HUD connecting later still
+        // sees it. This one adds only the CHANNEL (voice vs the HUD verb).
         telemetry::emit("system", "lockdown.panic", json!({"via": "voice"}));
         let prime = agents.orchestrator();
         emit_agent_active(prime);
@@ -159,6 +163,8 @@ pub async fn route(
     // what PANIC_CONFIRMATION now tells the user.
     if crate::lockdown::is_unlock_intent(text) {
         let msg = crate::lockdown::unlock().await;
+        // PIXEL-FREE(diagnostic): twin of lockdown.panic above — `lockdown::unlock`
+        // emits lockdown.status{locked:false}, which is what the chip reads.
         telemetry::emit("system", "lockdown.unlock", json!({"via": "voice"}));
         let prime = agents.orchestrator();
         emit_agent_active(prime);
@@ -1434,40 +1440,23 @@ pub async fn route(
     // Suppressing the two returns for the turns those gates claim gives them
     // first refusal on everything that currently reaches cloud conversation —
     // which is only safe if all four classifiers are precise enough to be FIRST.
-    // Four of them are not. Sentences constructed against the branches' own
-    // trigger vocabulary, each ordinary English, each of which the gates claim
-    // TODAY (they are live on the offline / vault / guest path, and a hoist would
-    // make them live on the shipped path too):
     //
-    //   markforge LAUNCH   `mentions_mark_forge` still admits the bare nouns "the
-    //                      simulation" / "the sandbox", so with one of four
-    //                      ordinary verbs it opens the engine —
-    //                      "they start the simulation training for new nurses
-    //                      next month", "show me the sandbox where the kids play
-    //                      at the park", "I need to open the sandbox account
-    //                      before the demo tomorrow". `names_mark_forge` (added
-    //                      for the reset branch) is the fix this branch needs.
-    //   markforge STEP     `physics_ctx` accepts the bare whole words "world" /
-    //                      "physics" / "frames", so any sentence carrying one plus
-    //                      step/advance/pause/freeze/hold/halt advances or freezes
-    //                      the world — "she took a step into a whole new world
-    //                      after graduation", "hold on, the world is not ending
-    //                      today", "pause the video during the physics lecture".
-    //   markforge GRAVITY  the ordinary English idiom "the gravity of <X>" plus
-    //                      any of ten set-ish verbs plus an ordinary target word
-    //                      writes the world's gravity vector — "put the gravity of
-    //                      the situation aside, nothing about this is normal",
-    //                      "we should change how gravity is taught in earth
-    //                      science", "turn to the gravity chapter and read about
-    //                      the moon".
-    //   markforge SPAWN    `spawn_context` also takes `mentions_mark_forge`, so a
-    //                      child's sandbox spawns a rigid body — "throw the ball
-    //                      into the sandbox at the playground".
-    //   silicon   LAUNCH   `mentions_silicon_canvas` admits the bare "the
-    //                      schematic" and this branch's verbs are still
-    //                      `contains` — "show the schematic to the electrician
-    //                      when he arrives", "the schematic showed a startling
-    //                      amount of detail".
+    // FIVE OF THE SIX BRANCHES NAMED HERE ARE NOW CLOSED. All 14 branches of the
+    // three classifiers were enumerated against sentences written from each
+    // branch's OWN trigger vocabulary: 9 of 14 were defective, 35 of 59 ordinary
+    // utterances actuated. markforge LAUNCH / STEP+PAUSE / GRAVITY / SPAWN /
+    // STATE and silicon LAUNCH each got the shape their hardened siblings already
+    // carried — the utterance must NAME the engine, or be nothing but that
+    // branch's bare idiom (a closed vocabulary, ANDed after the existing gate so
+    // it can only narrow). 35 of those sentences are now in
+    // `fixtures/router_ordinary.json` and enforced at zero captures (435 -> 470);
+    // router recall was unchanged at 191/202, per-gate as well as in total — which
+    // is a fact about the fixture and not about the branches, and
+    // `recall_probe::tests::KNOWN_OPEN_HIJACKS` carries the 27-of-49 phrasings that
+    // narrowing cost.
+    //
+    // ONE REMAINS, AND IT IS NOT A VOCABULARY PROBLEM:
+    //
     //   genimage           the remaining hole is grammatical PERSON, not
     //                      vocabulary: a request to DARWIN is an IMPERATIVE, and
     //                      present-tense narration reuses the base form in the
@@ -1476,14 +1465,20 @@ pub async fn route(
     //                      with only one color", "we make art with the kids on
     //                      saturdays". Verb POSITION (utterance-initial modulo a
     //                      bounded politeness prefix) is the missing rule; verb
-    //                      FORM alone does not separate them.
+    //                      FORM alone does not separate them. A subject-pronoun
+    //                      rule was measured and REFUSED: it closes those three
+    //                      and leaves "the kids draw a picture of the dog every
+    //                      week" firing, which would make the ratchet read closed
+    //                      while the hole stayed open. See
+    //                      `recall_probe::tests::KNOWN_OPEN_HIJACKS`.
     //
-    // So the ORDER of operations is: harden those six branches, re-prove each
-    // against sentences written for the NEW rule, and only then hoist. Hoisting
-    // first buys 13.9% reachability by re-opening the defect class this campaign
-    // spent the most effort closing — 317 of 1,897 ordinary utterances captured by
-    // app gates, a tornado-watch question that turned the camera on. The gain is
-    // real and it is not worth that.
+    // So the ORDER of operations is unchanged and one item shorter: close
+    // genimage's person rule, re-prove it against sentences written for the NEW
+    // rule, and only then hoist. Hoisting first buys 13.9% reachability by
+    // re-opening the defect class this campaign spent the most effort closing —
+    // 317 of 1,897 ordinary utterances captured by app gates, a tornado-watch
+    // question that turned the camera on. The gain is real and it is not worth
+    // that.
     //
     // The OTHER four (describe / sound / lumen / vision) are a separate question
     // and a harder one: each actuates a camera, a screen read, a mic clip or a UI
@@ -3794,15 +3789,62 @@ enum AppRequest {
     Launch,
     Quit,
     Web,
+    /// An `app.control` utterance that names no app at all. Refused, never
+    /// guessed — see [`classify_app_request`].
+    Unnamed,
 }
 
-/// Pure decision: quit-class verbs first (a quit must NEVER feed the
-/// launcher — audit fix), then the app.launch->web reroute (belt and
-/// suspenders against the classifier missing web.open), else launch. The
-/// web probe is the extracted remainder, or the whole utterance when no
-/// trigger verb was found (the launcher would fall back to the whole
-/// utterance too).
+/// Pure decision: an UNNAMED app.control first, then quit-class verbs (a quit
+/// must NEVER feed the launcher — audit fix), then the app.launch->web reroute
+/// (belt and suspenders against the classifier missing web.open), else launch.
+/// The web probe is the extracted remainder, or the whole utterance when no
+/// trigger verb was found (the launcher would fall back to the whole utterance
+/// too).
+///
+/// WHAT WENT WRONG. `extract_app_name` returns "" when the utterance contains
+/// no trigger verb at all, and `open_app_with_fallback`/`quit_app_with_fallback`
+/// then hand the WHOLE SENTENCE to `match_app`, whose token-subset tier resolves
+/// any installed app whose stem tokens all appear in it. That tier exists to dig
+/// a name out of "could you open google chrome for me" — where a name WAS
+/// extracted and merely failed to match. Applied to a sentence with no trigger
+/// verb it is not a fallback, it is a guess, and MEASURED on this machine (158
+/// installed apps) the guess fired: with the on-device classifier's own labels,
+/// "mute the tv, the ad is unbearable" resolved TV and ran `open -a TV` —
+/// LAUNCHING the television app the owner asked to silence — "turn down the
+/// music, i am on a call" and "queue up some background music" both launched
+/// Music, and the ordinary sentence "set channel 1 to the news at six" launched
+/// News. No lexical gate stands in front of any of the four (all 35 in
+/// `recall_probe::GATES` were checked; none fires).
+///
+/// So: an app.control utterance with NO extracted name has no app, and DARWIN
+/// says so instead of opening whatever the sentence happens to mention. Scoped
+/// to app.control — `app.control` means "operate an app that is already open",
+/// so LAUNCHING one is never the right answer to it, and `app.launch` (whose
+/// utterances carry a trigger verb by construction) keeps today's ladder
+/// byte-for-byte.
+///
+/// STILL OPEN, and measured rather than assumed: this closes the EMPTY-extraction
+/// half ONLY. When a trigger verb IS present the extractor returns a sentence
+/// FRAGMENT, and `match_app`'s substring and token-subset tiers resolve an app
+/// from that fragment itself — the whole-utterance retry is not even reached, so
+/// scoping THAT retry would close nothing (checked: the primary-only match and
+/// the full-ladder match agree on every case below). Against this machine's 158
+/// installed apps, with the labels this revision's classifier actually produces:
+/// "stop watching the news, it is too depressing" (app.control/light, no gate,
+/// extracts "watching news too depressing") resolves News and QUITS it; "reset
+/// the game and start over" (extracts "over") substring-matches CrossOver and
+/// LAUNCHES it; "kill the music, i need to concentrate" (extracts "music i need
+/// concentrate") resolves Music and quits it. The last is app.control at HEAD
+/// too; the first two are conversation/heavy at HEAD, so the prompt write-up is
+/// what makes them reachable. Over 561 utterances (60 app-op probes + 435
+/// `fixtures/router_ordinary.json` + 66 adversarial) unintended app actions go
+/// 4 -> 3 overall and 2 -> 0 on the ordinary corpus alone. Closing the residue
+/// needs a change to `match_app`'s tiers, which `app.launch` shares and which
+/// nothing here measured, so it is RECORDED rather than taken.
 fn classify_app_request(intent: &str, text: &str, extracted: &str) -> AppRequest {
+    if intent == "app.control" && extracted.trim().is_empty() {
+        return AppRequest::Unnamed;
+    }
     if wants_quit(text) {
         return AppRequest::Quit;
     }
@@ -3884,12 +3926,23 @@ async fn handle_app_intent(
                         format!("The {app} panel could not be stopped: {e}")
                     }
                 },
-                AppRequest::Web => unreachable!("guarded by the matches! above"),
+                AppRequest::Web | AppRequest::Unnamed => {
+                    unreachable!("guarded by the matches! above")
+                }
             };
         }
     }
 
     match request {
+        // No app was named — refuse cleanly. See `classify_app_request`: the
+        // alternative is the whole-utterance token-subset guess, which LAUNCHED
+        // the TV app on "mute the tv".
+        AppRequest::Unnamed => {
+            info!(text, "app.control names no app; refusing rather than guessing one");
+            "I don't have an app operation for that, sir — and I won't guess at an \
+             app you didn't name. Tell me which app, or open it and say it again."
+                .to_string()
+        }
         AppRequest::Web => handle_web_open(text, args).await,
         AppRequest::Quit => match actions::quit_app_with_fallback(&extracted, text).await {
             Ok(outcome) => {
@@ -4818,12 +4871,44 @@ pub enum SiliconCanvasCommand {
 /// "silicon-canvas", "the canvas"). Used to gate the launch phrase and to
 /// disambiguate a bare "open" so an unrelated "open safari" is never captured.
 fn mentions_silicon_canvas(lower: &str) -> bool {
-    lower.contains("silicon canvas")
-        || lower.contains("silicon-canvas")
-        || lower.contains("siliconcanvas")
+    names_silicon_canvas(lower)
         || lower.contains("the schematic")
         || lower.contains("the board view")
 }
+
+/// The half of [`mentions_silicon_canvas`] that actually NAMES this app.
+///
+/// `mentions_silicon_canvas` also admits the bare nouns "the schematic" / "the
+/// board view", which are ordinary English about a wiring diagram, a floor plan,
+/// a plot outline or a dashboard. That is fine for a branch that has ANOTHER
+/// anchor (a net label, a component designator, an ERC verb), and not fine for
+/// the LAUNCH branch, where the co-word IS the anchor — see it for the sentences
+/// that walked in.
+fn names_silicon_canvas(lower: &str) -> bool {
+    lower.contains("silicon canvas")
+        || lower.contains("silicon-canvas")
+        || lower.contains("siliconcanvas")
+}
+
+/// The bare Silicon-Canvas LAUNCH idiom — "open the schematic", "show me the
+/// schematic", "bring up the board view", "launch the board view", "open the
+/// schematic on my screen" (every one of them a shipped, test-pinned phrasing).
+///
+/// Same closed-vocabulary shape as the Mark-Forge bare idioms and chosen for the
+/// same reason: it cannot be satisfied by ADDING words. It is ANDed AFTER
+/// `mentions_silicon_canvas`, so it only ever narrows.
+const SILICON_BARE_LAUNCH_VOCAB: &[&str] = &[
+    // BASE FORMS ONLY, for the same reason `mentions_mark_forge_launch_verb`
+    // matches whole words: "the schematic SHOWED a startling amount of detail" is
+    // a narration, not an instruction. The verb test below refuses the inflected
+    // forms too — on the arm this vocabulary does not cover.
+    "open", "launch", "start", "show", "bring",
+    "up", "the", "a", "an", "my", "me", "us", "it", "on", "in",
+    "silicon", "canvas", "siliconcanvas", "schematic", "board", "view", "layout", "screen",
+    "sandbox",
+    "please", "darwin", "hey", "ok", "okay", "now", "just", "can", "could", "would", "you",
+    "and", "for",
+];
 
 // ---------------------------------------------------------------------------
 // THE GATES. Every op below used to fire on a bare substring, which is how a
@@ -5573,13 +5658,26 @@ pub fn silicon_canvas_command(text: &str) -> Option<SiliconCanvasCommand> {
     // open-class verb — "open silicon canvas", "show me silicon canvas",
     // "bring up the schematic". This is last so an op phrase that also says
     // "show" (e.g. "show me the 3V3 net") was already handled above.
-    if mentions_silicon_canvas(&lower)
-        && (lower.contains("open")
-            || lower.contains("launch")
-            || lower.contains("start")
-            || lower.contains("bring up")
-            || lower.contains("show"))
-    {
+    //
+    // WHAT WENT WRONG: the co-word half of `mentions_silicon_canvas` is the bare
+    // "the schematic" / "the board view" — ordinary English for a wiring diagram,
+    // a floor plan, a plot outline — and the verbs beside it were `contains`, so
+    // even a PAST TENSE narration opened the app:
+    //   "show the schematic to the electrician when he arrives"
+    //   "the schematic showed a startling amount of detail"   ("show" in "showed")
+    //   "start the schematic review with the vendor on friday"
+    //   "open the board view of the museum floor plan"
+    // (all four measured). Two fixes, the same two the Mark-Forge launch branch
+    // needed: WHOLE-WORD verbs, so a narration is not an instruction; and a
+    // context that either NAMES the app or is nothing but the bare launch idiom.
+    // The verb SET is unchanged (open / launch / start / show / "bring up") —
+    // this fix must not widen while it narrows, so no verb was added.
+    let launch_verb =
+        crate::utterance::mentions_any_word(&lower, &["open", "launch", "start", "show"])
+            || lower.contains("bring up");
+    let launch_context = names_silicon_canvas(&lower)
+        || nexus_closed_vocabulary(&lower, SILICON_BARE_LAUNCH_VOCAB, false);
+    if mentions_silicon_canvas(&lower) && launch_verb && launch_context {
         return Some(SiliconCanvasCommand::Launch);
     }
 
@@ -9672,6 +9770,35 @@ const MARK_FORGE_BARE_SPAWN_VOCAB: &[&str] = &[
     "of", "in", "into", "onto", "on", "here", "there",
     "ball", "balls", "sphere", "spheres", "marble", "marbles",
     "box", "boxes", "cube", "cubes", "crate", "crates", "block", "blocks",
+    // The physics LOCUS words. They are here ONLY because `spawn_context` no
+    // longer accepts `mentions_mark_forge`'s loose halves, and "drop a box in
+    // the sandbox" (a shipped phrasing, pinned in
+    // `mark_forge_drop_box_maps_to_body_spawn_cuboid`) has to keep working.
+    //
+    // EXACTLY THE TWO NOUNS THE REMOVED HALF CARRIED, AND NO MORE. This list
+    // first also held "world", "scene", "sim" and "physics", and that was a
+    // MEASURED WIDENING rather than a restatement: `mentions_mark_forge` never
+    // admitted any of those four, so every sentence they let in was one this
+    // branch refused at HEAD. 18 of 20 constructed sentences that were CLEAN at
+    // HEAD spawned a rigid body with them present — the English idiom "drop the
+    // ball" beside the most ordinary noun on the list ("in the world you can
+    // drop the ball", "the world can drop a ball on you", "drop the ball on us
+    // and one more for the world"), and the stagecraft sense of "scene" ("add a
+    // crate in the scene", "drop a marble in the scene", "can you add a crate in
+    // the scene for me"). A precision fix that opens a new hijack class is not a
+    // precision fix, so the list is bounded to the two nouns `mentions_mark_forge`
+    // actually carried; all 18 are refused again and every shipped spawn phrasing
+    // still routes.
+    //
+    // WHAT IS STILL NEWLY ADMITTED, since a bound has to be stated as a set and
+    // not as an adjective: an all-idiom utterance naming a sandbox or a simulation
+    // WITHOUT the definite article the removed half required — "drop a box in a
+    // sandbox", "add a crate into some simulation", "throw a ball in one sandbox",
+    // "drop the ball in a simulation" (4 of 4 constructed; each reads as a physics
+    // command). The bare "drop the ball" idiom itself was already a capture at
+    // HEAD via this same vocabulary and is NOT created here — see
+    // `mark_forge_command_ignores_unrelated_utterances` for what the idiom costs.
+    "sandbox", "simulation",
     "please", "darwin", "hey", "ok", "okay", "now", "just", "can", "could", "would", "you",
     "and", "for", "me", "us",
 ];
@@ -9710,6 +9837,87 @@ const MARK_FORGE_BARE_RESET_VOCAB: &[&str] = &[
     "world", "scene", "bodies", "body", "simulation", "sandbox", "physics", "sim",
     "please", "darwin", "hey", "ok", "okay", "now", "just", "can", "could", "would", "you",
     "and", "for", "me", "us",
+];
+
+/// The bare STEP/PAUSE idiom — "step the simulation", "advance 5 frames",
+/// "pause the simulation", "freeze the physics".
+///
+/// WHY THIS EXISTS: `physics_ctx` is a PRESENCE test over "world" / "physics" /
+/// "simulation" / "sim" / "frames", and every one of those is ordinary English,
+/// so any sentence carrying one beside step/advance/pause/freeze/hold/halt drove
+/// the engine: "she took a step into a whole new world after graduation" and
+/// "hold on, the world is not ending today" both fired (measured, from the
+/// known-open ratchet), as did "pause the video during the physics lecture" and
+/// "advance the world clock an hour for daylight saving".
+///
+/// This list is ANDed AFTER `physics_ctx`, exactly as the reset branch's
+/// vocabulary is ANDed after its co-word test, so it can only ever NARROW — a
+/// word added here cannot make an utterance a command that was not already one.
+const MARK_FORGE_BARE_STEP_VOCAB: &[&str] = &[
+    "step", "steps", "advance", "advances", "pause", "pauses", "freeze", "freezes",
+    "hold", "holds", "halt", "halts",
+    "the", "a", "an", "this", "my", "one", "by", "forward", "more",
+    "world", "scene", "simulation", "sim", "sandbox", "physics",
+    "frame", "frames", "time", "times",
+    "please", "darwin", "hey", "ok", "okay", "now", "just", "can", "could", "would", "you",
+    "and", "for", "me", "us", "it",
+];
+
+/// The bare GRAVITY idiom — "set gravity to the moon", "turn off gravity",
+/// "moon gravity", "set gravity to -9.8".
+///
+/// WHY THIS EXISTS: `gravity_commanded` accepts any of TEN ordinary set-ish
+/// verbs anywhere in the sentence, and "the gravity of <X>" is an everyday
+/// English idiom, so "put the gravity of the situation aside, nothing about this
+/// is normal", "we should change how gravity is taught in earth science", "turn
+/// to the gravity chapter and read about the moon" and "make sure the kids
+/// understand zero gravity before the field trip" all WROTE THE WORLD'S GRAVITY
+/// VECTOR (measured). Same ANDed-after shape as the step list: narrowing only.
+const MARK_FORGE_BARE_GRAVITY_VOCAB: &[&str] = &[
+    "set", "turn", "make", "change", "switch", "put", "use", "give", "raise", "lower",
+    "gravity", "zero", "no", "normal", "earth", "moon", "lunar", "mars", "martian",
+    "off", "on", "to", "back", "up", "down",
+    "the", "a", "an", "my", "this", "it", "its",
+    "minus", "negative", "point", "g", "gs",
+    "please", "darwin", "hey", "ok", "okay", "now", "just", "can", "could", "would", "you",
+    "and", "for", "me", "us",
+];
+
+/// The bare STATE-READ idiom — "what's the physics state", "what's the state of
+/// the sandbox".
+///
+/// WHY THIS EXISTS: the six bound phrases are substrings, so "the physics state
+/// OF MATTER unit is next week" and "what is the state of the sandbox ACCOUNT
+/// they set up" both read the sandbox (measured). Read-only, so the cost is a
+/// wrong answer rather than a wrong action — but it is still an answer the owner
+/// did not get. Same ANDed-after shape: narrowing only.
+const MARK_FORGE_BARE_STATE_VOCAB: &[&str] = &[
+    "what", "whats", "s", "is", "are", "tell", "show", "give", "the", "a", "of", "in",
+    "state", "status", "physics", "sandbox", "simulation", "sim", "world", "scene",
+    "mark", "forge", "markforge",
+    "please", "darwin", "hey", "ok", "okay", "now", "just", "can", "could", "would", "you",
+    "and", "for", "me", "us", "it", "right",
+];
+
+/// The bare LAUNCH idiom — "show me the sandbox", "open the physics sandbox".
+///
+/// WHY THIS EXISTS: `mentions_mark_forge` admits the bare nouns "the simulation"
+/// / "the sandbox", which are ordinary English about anything anyone models or
+/// any walled-off environment, and this branch's only other requirement is one
+/// of four open-class verbs. So "they start the simulation training for new
+/// nurses next month", "show me the sandbox where the kids play at the park",
+/// "i need to open the sandbox account before the demo tomorrow" and "launch day
+/// for the simulation game is in march" all OPENED THE ENGINE (measured; the
+/// first two are ratchet entries). `names_mark_forge` is the sibling fix, and
+/// this list is what keeps the shipped bare phrasing "show me the sandbox" —
+/// pinned in `mark_forge_launch_phrases` — alive beside it.
+const MARK_FORGE_BARE_LAUNCH_VOCAB: &[&str] = &[
+    "open", "opens", "launch", "launches", "start", "starts", "show", "shows", "bring", "fire",
+    "up", "the", "a", "an", "my", "me", "us", "it",
+    "world", "scene", "simulation", "sim", "sandbox", "physics", "engine", "mark", "forge",
+    "markforge",
+    "please", "darwin", "hey", "ok", "okay", "now", "just", "can", "could", "would", "you",
+    "and", "for",
 ];
 
 /// Whether the utterance carries an open-class launch verb.
@@ -9776,8 +9984,17 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
     // because it cannot be satisfied by adding words. One content word from
     // outside the list ("calendar", "post", "office", "dog", "eve") and it is
     // somebody talking about their life, not driving a physics engine.
-    let spawn_context =
-        mentions_mark_forge(&lower) || nexus_closed_vocabulary(&lower, MARK_FORGE_BARE_SPAWN_VOCAB, true);
+    //
+    // ...and `mentions_mark_forge` was the WRONG half to spend on that first
+    // way in: its loose nouns ("the simulation", "the sandbox") are exactly the
+    // ordinary English this branch was supposed to be protected from, so "throw
+    // the ball into the sandbox at the playground" and "drop the boxes in the
+    // simulation lab when you get there" spawned bodies. The reset branch beside
+    // this one already uses `names_mark_forge`; this one now does too, and the
+    // physics LOCUS words moved into the closed vocabulary instead — where the
+    // rest of the utterance still has to be drawn from the idiom.
+    let spawn_context = names_mark_forge(&lower)
+        || nexus_closed_vocabulary(&lower, MARK_FORGE_BARE_SPAWN_VOCAB, true);
     if spawn_verb && spawn_context {
         if mentions_word(&lower, "ball")
             || mentions_word(&lower, "balls")
@@ -9865,7 +10082,17 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
                         "moon" | "lunar" | "mars" | "martian" | "earth" | "zero" | "no" | "normal"
                     )
             });
-    if lower.contains("gravity") && gravity_commanded {
+    // ...AND "the gravity of <X>" IS ORDINARY ENGLISH. `gravity_commanded` is
+    // satisfied by any of ten everyday set-ish verbs sitting anywhere in the
+    // sentence, so the idiom plus a stray "moon"/"zero"/"normal" wrote the
+    // world's gravity vector: "put the gravity of the situation aside, nothing
+    // about this is normal", "turn to the gravity chapter and read about the
+    // moon", "make sure the kids understand zero gravity before the field trip".
+    // Same answer as the sibling branches — the utterance NAMES the engine, or
+    // the WHOLE utterance is nothing but the gravity idiom.
+    let gravity_context = names_mark_forge(&lower)
+        || nexus_closed_vocabulary(&lower, MARK_FORGE_BARE_GRAVITY_VOCAB, true);
+    if lower.contains("gravity") && gravity_commanded && gravity_context {
         if let Some(y) = gravity_target(&lower) {
             return Some(MarkForgeCommand::Op(op_set_gravity(y)));
         }
@@ -9897,7 +10124,26 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
     //
     // Neither bought anything: "step the simulation" and "advance 5 frames" are
     // already admitted by `physics_ctx`, which matches the same words WHOLE.
-    if crate::utterance::mentions_any_word(&lower, &["step", "steps", "advance"]) && physics_ctx {
+    //
+    // ...AND `physics_ctx` IS A PRESENCE TEST OVER ORDINARY ENGLISH. Whole-word
+    // matching fixed the substring escapes above and left the real hole open:
+    // "world", "physics", "simulation" and "frames" are words people say, so any
+    // sentence carrying one beside a step/pause verb drove the engine —
+    //   "she took a step into a whole new world after graduation"   -> world.step
+    //   "hold on, the world is not ending today"                    -> world.step{0}
+    //   "pause the video during the physics lecture"                -> world.step{0}
+    //   "advance the world clock an hour for daylight saving"       -> world.step
+    //   "the physics department will advance her to candidacy"      -> world.step
+    // (the first two are ratchet entries; all five measured). The reset and spawn
+    // branches already carry the answer: NAME the engine, or be nothing but the
+    // bare idiom. `step_context` is ANDed AFTER `physics_ctx`, so it can only
+    // narrow — a real "step the simulation 10 frames" is untouched.
+    let step_context = names_mark_forge(&lower)
+        || nexus_closed_vocabulary(&lower, MARK_FORGE_BARE_STEP_VOCAB, true);
+    if crate::utterance::mentions_any_word(&lower, &["step", "steps", "advance"])
+        && physics_ctx
+        && step_context
+    {
         let n = extract_step_count(&lower).unwrap_or(1);
         return Some(MarkForgeCommand::Op(op_world_step(n)));
     }
@@ -9909,6 +10155,7 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
         || mentions_word(&lower, "hold")
         || mentions_word(&lower, "halt"))
         && physics_ctx
+        && step_context
     {
         return Some(MarkForgeCommand::Op(op_world_step(0)));
     }
@@ -9930,12 +10177,21 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
     // unclear" and "what's the state of the simulation they ran", both CLEAN at
     // HEAD, and the shipped probe ("what's the physics state") never needed
     // them. Only the phrases that name THIS app or its physics remain.
-    if lower.contains("physics state")
+    // ...and the six that remain are still SUBSTRINGS of ordinary English, which
+    // the same adversarial enumeration caught: "the physics state OF MATTER unit
+    // is next week" and "what is the state of the sandbox ACCOUNT they set up"
+    // both read this sandbox. Read-only, so the cost is a wrong ANSWER rather
+    // than a wrong action — but the owner still never gets the answer they asked
+    // for. Same ANDed-after closed vocabulary as the sibling branches.
+    let state_context = names_mark_forge(&lower)
+        || nexus_closed_vocabulary(&lower, MARK_FORGE_BARE_STATE_VOCAB, false);
+    if (lower.contains("physics state")
         || lower.contains("state of the physics")
         || lower.contains("sandbox state")
         || lower.contains("state of the sandbox")
         || lower.contains("mark forge state")
-        || lower.contains("mark-forge state")
+        || lower.contains("mark-forge state"))
+        && state_context
     {
         return Some(MarkForgeCommand::Op(op_mark_forge_state_get()));
     }
@@ -9944,7 +10200,22 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
     // Only when the utterance actually names Mark-Forge / the sandbox AND carries
     // an open-class verb. Last so a control phrase that also says "open" was
     // already handled above.
-    if mentions_mark_forge(&lower) && mentions_mark_forge_launch_verb(&lower) {
+    //
+    // ...AND "THE SIMULATION" / "THE SANDBOX" ARE NOT A NAME. `mentions_mark_forge`
+    // admits both, and with one of four open-class verbs that was the whole gate,
+    // so ordinary English opened the engine:
+    //   "they start the simulation training for new nurses next month"
+    //   "show me the sandbox where the kids play at the park"
+    //   "i need to open the sandbox account before the demo tomorrow"
+    //   "launch day for the simulation game is in march"
+    //   "start the simulation of the evacuation drill at ten"
+    // (the first two are ratchet entries; all five measured). The world-reset
+    // branch already answered this question with `names_mark_forge` and this
+    // branch never got it. The closed vocabulary keeps the shipped bare phrasing
+    // "show me the sandbox" — which is why the loose nouns were there at all.
+    let launch_context = names_mark_forge(&lower)
+        || nexus_closed_vocabulary(&lower, MARK_FORGE_BARE_LAUNCH_VOCAB, false);
+    if mentions_mark_forge(&lower) && mentions_mark_forge_launch_verb(&lower) && launch_context {
         return Some(MarkForgeCommand::Launch);
     }
 
@@ -10845,6 +11116,229 @@ mod tests {
         assert!(!wants_quit("darwin please open up google chrome"));
     }
 
+    /// The intent classifier's own prompt is the taxonomy every local handler
+    /// dispatches on (`handle_local`, and `route`'s "app.launch" | "app.control"
+    /// arm). An intent listed there but never DEFINED and never SHOWN keeps its
+    /// plumbing and loses its meaning: the model has a label it was taught
+    /// nothing about, so utterances that belong to it scatter into whatever
+    /// neighbour has examples.
+    ///
+    /// MEASURED, before `app.control` was written up: over 60 app-operation
+    /// utterances drawn from the ops the four op-speaking apps actually expose,
+    /// the on-device classifier put 23 into file.op, 5 into memory.recall, 3
+    /// into memory.store, 2 into docsearch.index and 1 into docsearch.forget,
+    /// and marked 29 of the 60 "heavy" — and a heavy turn returns from the cloud
+    /// tool loop, whose catalogue has no app op, WITHOUT ever consulting the
+    /// lexical gate that would have run it. 20 of the 44 probes whose gate is
+    /// proven to fire by `fixtures/router_recall.json` never reached it.
+    ///
+    /// So: every intent in the "MUST be one of" list needs a definition line or
+    /// a worked example. `KNOWN_UNDOCUMENTED` is the residue this wave did not
+    /// measure and therefore did not touch; adding a NEW intent without writing
+    /// it up, or deleting an existing write-up, fails here.
+    #[test]
+    fn every_intent_in_the_classifier_taxonomy_is_defined_or_exemplified() {
+        const PROMPT: &str = include_str!("../../inference/prompts/intent_classifier.txt");
+        /// Listed, but neither defined nor exemplified. Both predate this test and
+        /// are OPEN — the same defect class `app.control` had, unmeasured here.
+        const KNOWN_UNDOCUMENTED: &[&str] = &["system.query", "memory.recall"];
+
+        let must_line = PROMPT
+            .lines()
+            .find(|l| l.contains("MUST be one of:"))
+            .expect("prompt no longer declares the intent list");
+        let intents: Vec<String> = must_line
+            .split("MUST be one of:")
+            .nth(1)
+            .expect("checked by contains")
+            .trim_end_matches('.')
+            .split(',')
+            .map(|s| s.trim().trim_end_matches('.').to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        // The parse itself must not go vacuous — a reworded prompt that yields
+        // one bogus "intent" would otherwise make every assertion below trivial.
+        assert!(
+            intents.len() >= 11 && intents.iter().all(|i| i.contains('.') || i == "conversation"),
+            "intent list parse looks wrong: {intents:?}"
+        );
+        assert!(intents.iter().any(|i| i == "app.control"), "taxonomy lost app.control");
+
+        let body: String = PROMPT
+            .lines()
+            .filter(|l| !l.contains("MUST be one of:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let undocumented: Vec<&String> = intents
+            .iter()
+            .filter(|i| {
+                // Shown: a worked example emitting this intent.
+                let exemplified = body.contains(&format!("{{\"intent\": \"{i}\""));
+                // Defined: a prose line that OPENS with the intent name, which is
+                // how the prompt writes up docsearch.*/web.* (a bare mention
+                // inside another intent's sentence is not a definition).
+                let defined = body.lines().any(|l| l.starts_with(&format!("{i} ")));
+                !exemplified && !defined
+            })
+            .collect();
+        for i in &undocumented {
+            assert!(
+                KNOWN_UNDOCUMENTED.contains(&i.as_str()),
+                "intent {i:?} is declared in the classifier taxonomy but has neither a \
+                 definition line nor a worked example — the model is asked to emit a label \
+                 it was taught nothing about. Write it up in \
+                 inference/prompts/intent_classifier.txt."
+            );
+        }
+
+        // AND THE ALLOWLIST MUST SHRINK. The loop above is only half a ratchet:
+        // it fires when a name LEAVES the documented set and never when one
+        // JOINS it. ADVERSARY-MEASURED on this revision — give `system.query` a
+        // real definition line in the prompt and this test stays GREEN with a
+        // now-false exemption still listed; from then on an edit that DELETED
+        // that write-up would pass too, which is the exact regression the test
+        // exists to catch. So every name here must still be declared AND still
+        // be undocumented: writing one up forces its removal from the list.
+        for known in KNOWN_UNDOCUMENTED {
+            assert!(
+                intents.iter().any(|i| i.as_str() == *known),
+                "KNOWN_UNDOCUMENTED names {known:?}, which the taxonomy no longer \
+                 declares — drop it from the list"
+            );
+            assert!(
+                undocumented.iter().any(|i| i.as_str() == *known),
+                "KNOWN_UNDOCUMENTED still exempts {known:?}, but the prompt now \
+                 defines or exemplifies it — delete it from the list, or the next \
+                 edit that removes that write-up passes unnoticed"
+            );
+        }
+    }
+
+    /// MEASURED — the taxonomy's write-up must SHOW a quit, not only an open.
+    ///
+    /// The prompt says "Opening or quitting an app is app.launch, NOT
+    /// app.control" in prose while showing two OPEN examples and no quit. With
+    /// that shape the on-device classifier answered "close safari" with the
+    /// intent `app.close` — a label the taxonomy does not declare and
+    /// `handle_local` has no arm for, so DARWIN replied "No local handler exists
+    /// for intent 'app.close'" to a command that works at HEAD (where it is
+    /// app.control and quits Safari). Deterministic, 2/2 runs; 13 sibling
+    /// phrasings ("close notes", "close spotify", …) were unaffected, so the
+    /// prose alone was carrying the whole quit family.
+    ///
+    /// The mirror risk of teaching "close X" is that ordinary "close …" speech
+    /// becomes app.launch and QUITS something. MEASURED with the quit example
+    /// added: on `fixtures/router_ordinary.json` (435) app.launch stays at ZERO,
+    /// app.control is unmoved at 21, and the count reaching the local gate seam
+    /// falls 46 -> 43; on the 60 app-op probes not one label moves; across all
+    /// 561 utterances re-run through the real dispatch against this machine's 158
+    /// installed apps, the set of app actions is unchanged (the same three
+    /// residues recorded on `classify_app_request`, and no fourth).
+    /// `wants_quit` is the router's OWN quit-verb rule, so this test and the
+    /// dispatcher cannot drift apart on what a quit is.
+    #[test]
+    fn the_classifier_prompt_shows_a_quit_example_not_only_an_open() {
+        const PROMPT: &str = include_str!("../../inference/prompts/intent_classifier.txt");
+        let examples = PROMPT
+            .split("Examples:")
+            .nth(1)
+            .expect("prompt no longer has an examples block");
+        let lines: Vec<&str> = examples.lines().collect();
+        let (mut opens, mut quits) = (0usize, 0usize);
+        for w in lines.windows(2) {
+            let Some(u) = w[0].strip_prefix("Utterance: ") else { continue };
+            if !w[1].contains("\"intent\": \"app.launch\"") {
+                continue;
+            }
+            if wants_quit(&u.trim().trim_matches('"').to_lowercase()) {
+                quits += 1;
+            } else {
+                opens += 1;
+            }
+        }
+        // Non-vacuous: the parse must actually have found app.launch examples.
+        assert!(opens >= 1, "no OPEN app.launch example found — parse is broken");
+        assert!(
+            quits >= 1,
+            "the prompt shows only OPEN examples for app.launch. Measured: with no worked \
+             quit, the on-device classifier answers \"close safari\" with the \
+             out-of-taxonomy intent app.close, which handle_local cannot dispatch."
+        );
+    }
+
+    /// MEASURED REGRESSION — an `app.control` utterance that names no app must
+    /// NEVER reach the macOS launcher, because the launcher's whole-utterance
+    /// token-subset tier resolves any installed app whose stem tokens appear
+    /// anywhere in the sentence.
+    ///
+    /// Every sentence below is one the ON-DEVICE classifier labels app.control
+    /// (0.92-0.95, light) and that NO gate in `recall_probe::GATES` catches, so
+    /// it reaches `handle_app_intent`. With the real /Applications list on the
+    /// development machine each one resolved a real app and ran `open -a`:
+    /// TV, Music, Music, News. Asked to MUTE the television, DARWIN OPENED it.
+    ///
+    /// The stems here are a fixed list, not the host's — the defect is the
+    /// matcher tier, not any one Mac, and a machine without Music.app installed
+    /// must not silently turn this test green (trap: a test that cannot fail).
+    #[test]
+    fn app_control_without_a_named_app_is_refused_not_launched() {
+        let stems: Vec<String> = ["TV", "Music", "News", "Notes", "Home", "Safari", "Preview"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        for text in [
+            "mute the tv, the ad is unbearable",
+            "turn down the music, i am on a call",
+            "queue up some background music",
+            "set channel 1 to the news at six",
+            "set the flux capacitor to 88 gigawatts",
+        ] {
+            let extracted = extract_app_name(text);
+            assert!(
+                extracted.is_empty(),
+                "precondition: no trigger verb, so nothing is extracted from {text:?} \
+                 (got {extracted:?}) — without that the launcher guess never engages"
+            );
+            assert_eq!(
+                classify_app_request("app.control", text, &extracted),
+                AppRequest::Unnamed,
+                "app.control naming no app must be refused, not launched: {text}"
+            );
+        }
+        // PRECONDITION, asserted so this test cannot pass vacuously: the launcher
+        // really would have resolved an app from three of those raw sentences.
+        // If `match_app` is ever narrowed so it does not, this fires and tells
+        // whoever narrowed it that the guard above is now redundant.
+        for (text, app) in [
+            ("mute the tv, the ad is unbearable", "TV"),
+            ("turn down the music, i am on a call", "Music"),
+            ("set channel 1 to the news at six", "News"),
+        ] {
+            assert_eq!(
+                crate::actions::match_app(&stems, text),
+                crate::actions::AppMatch::Resolved(app.to_string()),
+                "precondition: the whole-utterance tier resolves {app} from {text:?}"
+            );
+        }
+        // NOT over-broad: app.control that DOES name an app still dispatches, and
+        // app.launch is untouched — the same unnamed sentences stay launches there.
+        assert_eq!(
+            classify_app_request("app.control", "close silicon canvas", "silicon canvas"),
+            AppRequest::Quit
+        );
+        assert_eq!(
+            classify_app_request("app.control", "open nexus", "nexus"),
+            AppRequest::Launch
+        );
+        for text in ["mute the tv, the ad is unbearable", "queue up some background music"] {
+            assert_eq!(
+                classify_app_request("app.launch", text, &extract_app_name(text)),
+                AppRequest::Launch,
+                "app.launch must keep today's ladder byte-for-byte: {text}"
+            );
+        }
+    }
+
     /// Belt-and-suspenders reroute: an app.launch whose remainder smells of
     /// the web goes to the web.open handling — the original failing case
     /// must trigger it even if the classifier says app.launch.
@@ -11278,6 +11772,63 @@ mod tests {
         assert!(silicon_canvas_command("the whole board").is_none());
         assert!(silicon_canvas_command("trace this charge").is_none());
         assert!(silicon_canvas_command("the batt net").is_none());
+    }
+
+    /// THE LAUNCH BRANCH WAS THE LAST `contains` VERB IN THIS FILE.
+    ///
+    /// The five op branches above were hardened with whole-word matching, object
+    /// position and closed continuation sets. LAUNCH kept `lower.contains("show")`
+    /// beside `mentions_silicon_canvas`'s bare "the schematic" / "the board view",
+    /// so a PAST-TENSE NARRATION opened the app ("the schematic SHOWED a startling
+    /// amount of detail") and so did any sentence that merely mentioned a wiring
+    /// diagram near an open-class verb. Two fixes, both already precedented in this
+    /// file: whole-word verbs (`mentions_mark_forge_launch_verb`'s rule) and a
+    /// context that NAMES the app or is nothing but the bare launch idiom. The verb
+    /// SET is unchanged — this narrows without widening.
+    #[test]
+    fn the_silicon_launch_branch_no_longer_takes_ordinary_speech() {
+        for u in [
+            "show the schematic to the electrician when he arrives",
+            "the schematic showed a startling amount of detail",
+            "start the schematic review with the vendor on friday",
+            "open the board view of the museum floor plan",
+            // WRITTEN AGAINST THE VERB RULE SPECIFICALLY. The four above are all
+            // refused by the closed vocabulary on their content words, so they do
+            // not prove the whole-word verb change at all — under a mutation that
+            // restores `contains`, they still pass. This one takes the OTHER arm:
+            // it NAMES the app, so no vocabulary applies, and the only thing
+            // standing between it and a launch is that "showed" is not "show".
+            "the silicon canvas project showed real promise",
+            "we started the silicon canvas rebuild last quarter",
+        ] {
+            assert_eq!(
+                silicon_canvas_command(u),
+                None,
+                "{u:?} is ordinary speech and must not open silicon canvas"
+            );
+        }
+        // ...and every shipped launch phrasing survives, including the two bare
+        // ones ("open the schematic", "bring up the board view") that are the whole
+        // reason `mentions_silicon_canvas` carries the loose nouns.
+        for u in [
+            "open silicon canvas",
+            "launch silicon canvas",
+            "bring up silicon canvas",
+            "darwin, show me silicon canvas",
+            "can you open silicon canvas for me",
+            "open silicon canvas in the sandbox",
+            "open the schematic",
+            "show me the schematic",
+            "open the schematic on my screen",
+            "bring up the board view",
+            "launch the board view",
+        ] {
+            assert_eq!(
+                silicon_canvas_command(u),
+                Some(SiliconCanvasCommand::Launch),
+                "{u:?} is a shipped launch phrasing"
+            );
+        }
     }
 
     // ======================================================================
@@ -13825,6 +14376,195 @@ mod tests {
                 .unwrap_or_else(|| panic!("{u:?} is a real command and must still work"));
             let MarkForgeCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
             assert!(line.contains(op), "{u:?} -> {line}, expected {op}");
+        }
+    }
+
+    /// THE FIVE UNTOUCHED BRANCHES, CLOSED.
+    ///
+    /// The world-reset branch was hardened in an earlier pass and the five beside
+    /// it were not, so each still took ordinary English through its own loose
+    /// half. Enumerating all 14 branches of `mark_forge_command` /
+    /// `silicon_canvas_command` / `generate_image_command` against sentences
+    /// written from each branch's OWN trigger vocabulary put 35 of 59 ordinary
+    /// utterances into an app; 9 of the 14 branches were defective. These are the
+    /// mark-forge ones. Four of them (the two STEP/PAUSE and the two LAUNCH) were
+    /// `recall_probe::KNOWN_OPEN_HIJACKS` entries and have moved into
+    /// `router_ordinary.json`.
+    ///
+    /// Every fix is the SIBLING SHAPE, not a new idea: the utterance must NAME the
+    /// engine (`names_mark_forge`) or be nothing but the branch's bare idiom (a
+    /// closed vocabulary). Each new vocabulary is ANDed AFTER the branch's existing
+    /// gate, so none of them can turn a non-command into a command.
+    #[test]
+    fn the_five_untouched_mark_forge_branches_no_longer_take_ordinary_speech() {
+        for u in [
+            // LAUNCH — "the simulation" / "the sandbox" are not a name.
+            "they start the simulation training for new nurses next month",
+            "show me the sandbox where the kids play at the park",
+            "i need to open the sandbox account before the demo tomorrow",
+            "launch day for the simulation game is in march",
+            "start the simulation of the evacuation drill at ten",
+            // STEP — `physics_ctx` is a presence test over ordinary English.
+            "she took a step into a whole new world after graduation",
+            "the world will step up when it matters",
+            "advance the world clock an hour for daylight saving",
+            "i want to step away from the simulation of being fine",
+            "the physics department will advance her to candidacy",
+            // PAUSE — same gate, and "hold"/"freeze"/"halt" are ordinary English.
+            "hold on, the world is not ending today",
+            "pause the video during the physics lecture",
+            "freeze, the whole world is watching this play",
+            "halt, the world does not revolve around you",
+            "hold my calls during the simulation training",
+            // GRAVITY — "the gravity of <X>" is an English idiom, and any of ten
+            // everyday set-ish verbs satisfied `gravity_commanded`.
+            "put the gravity of the situation aside, nothing about this is normal",
+            "we should change how gravity is taught in earth science",
+            "turn to the gravity chapter and read about the moon",
+            "make sure the kids understand zero gravity before the field trip",
+            // SPAWN — the loose halves were the first of its two ways in.
+            "throw the ball into the sandbox at the playground",
+            "drop the boxes in the simulation lab when you get there",
+            // STATE — read-only, but the owner still loses the answer.
+            "what is the state of the sandbox account they set up",
+            "the physics state of matter unit is next week",
+        ] {
+            assert_eq!(
+                mark_forge_command(u),
+                None,
+                "{u:?} is ordinary speech and must not reach the physics sandbox"
+            );
+        }
+    }
+
+    /// ...and the SHIPPED phrasings of those same five branches all survive.
+    ///
+    /// This is the half that stops the fix above from being a deletion. "show me
+    /// the sandbox" is the reason the loose nouns were in `mentions_mark_forge` at
+    /// all, "drop a box in the sandbox" is why the spawn branch accepted them, and
+    /// "set gravity back to earth" / "advance 5 frames" / "what's the physics
+    /// state" are the branch phrasings the recall fixture and the wire-form tests
+    /// pin. All of them route through the closed vocabularies now.
+    #[test]
+    fn the_five_hardened_branches_keep_every_shipped_phrasing() {
+        for u in [
+            "show me the sandbox",
+            "open the physics sandbox",
+            "start mark forge",
+            "fire up the physics engine",
+        ] {
+            assert_eq!(
+                mark_forge_command(u),
+                Some(MarkForgeCommand::Launch),
+                "{u:?} is a shipped launch phrasing"
+            );
+        }
+        for (u, op) in [
+            ("step the simulation", "world.step"),
+            ("step the simulation 10 times", "world.step"),
+            ("advance 5 frames", "world.step"),
+            ("advance the physics", "world.step"),
+            ("pause the simulation", "world.step"),
+            ("hold the simulation", "world.step"),
+            ("freeze the physics", "world.step"),
+            ("set gravity to the moon", "set.gravity"),
+            ("set gravity back to earth", "set.gravity"),
+            ("set gravity to -9.8", "set.gravity"),
+            ("turn off gravity", "set.gravity"),
+            ("moon gravity", "set.gravity"),
+            ("drop a box", "body.spawn"),
+            ("darwin, drop a box in the sandbox", "body.spawn"),
+            ("what's the physics state", "state.get"),
+            ("what's the state of the sandbox", "state.get"),
+        ] {
+            let got = mark_forge_command(u)
+                .unwrap_or_else(|| panic!("{u:?} is a real command and must still work"));
+            let MarkForgeCommand::Op(line) = got else { panic!("{u:?} must be an Op") };
+            assert!(line.contains(op), "{u:?} -> {line}, expected {op}");
+        }
+    }
+
+    /// THE ONE PLACE THIS PASS WIDENED ANYTHING, STATED AND BOUNDED.
+    ///
+    /// Every other new vocabulary is ANDed after an existing gate and can only
+    /// narrow. The SPAWN vocabulary is the exception: `spawn_context` dropped
+    /// `mentions_mark_forge`, so its two locus nouns ("sandbox", "simulation") had
+    /// to move INTO the closed list to keep "drop a box in the sandbox" working.
+    ///
+    /// THE FIRST VERSION OF THAT LIST ALSO HELD "world", "scene", "sim" AND
+    /// "physics", AND THAT WAS A NEW HIJACK CLASS. `mentions_mark_forge` never
+    /// admitted those four, so they were not restoring anything — they were adding
+    /// reach. Measured: 18 of 20 constructed sentences that are CLEAN at HEAD
+    /// became `body.spawn`, an ACT that drops a 1 kg rigid body into the owner's
+    /// scene. All 18 are the negative half of this test, so the bound is a set and
+    /// not an adjective. Six of them are also in `router_ordinary.json`, where the
+    /// corpus enforces them at zero captures.
+    ///
+    /// The positive half is what the locus nouns exist for, and it is the guard
+    /// against the opposite failure — a vocabulary tightened until it matches
+    /// nothing. Removing the locus nouns entirely fails it (and
+    /// `mark_forge_drop_box_maps_to_body_spawn_cuboid` with it).
+    #[test]
+    fn the_spawn_locus_words_admit_commands_and_still_refuse_ordinary_speech() {
+        // The shipped phrasings the locus nouns are here for.
+        for u in [
+            "drop a box in the sandbox",
+            "darwin, drop a box in the sandbox",
+            "drop two boxes into the simulation please",
+            "throw a ball into the sandbox",
+            "drop a box into the sandbox now",
+            "drop a box in the sandbox for me",
+        ] {
+            assert!(
+                matches!(mark_forge_command(u), Some(MarkForgeCommand::Op(_))),
+                "{u:?} is a spawn command the locus nouns exist to keep"
+            );
+        }
+        // THE WIDENING "world"/"scene"/"sim"/"physics" OPENED. Every one of these
+        // is CLEAN at HEAD and was captured while those four were in the list. The
+        // first two groups are the two ordinary senses that walked in: the idiom
+        // "drop the ball" (= to fail) beside "world", and the stagecraft/film sense
+        // of "scene".
+        for u in [
+            "in the world you can drop the ball",
+            "the world can drop a ball on you",
+            "drop the ball on us and one more for the world",
+            "some of you can drop the ball for the world",
+            "drop the ball on the world",
+            "drop the ball in the world and add one more",
+            "drop a box in the world",
+            "you can throw a ball in the world of physics",
+            "physics can drop a ball on you",
+            "add a crate in the scene",
+            "add a box for the scene",
+            "can you add a crate in the scene for me",
+            "drop a marble in the scene",
+            "throw a ball into the scene",
+            "throw one more ball in the scene here",
+            "the scene can drop a box on you",
+            "just drop a block in the sim",
+            "throw a ball in the sim",
+        ] {
+            assert_eq!(
+                mark_forge_command(u),
+                None,
+                "{u:?} was clean at HEAD and must not spawn a rigid body"
+            );
+        }
+        // ...and the original probes, which take the other arm: the locus noun IS
+        // admitted here, and the content word from outside the idiom is what
+        // refuses them.
+        for u in [
+            "drop the ball in the scene where she cries",
+            "add a block of time to the world tour schedule",
+            "they throw a ball around the sandbox at recess",
+            "the box office numbers for that simulation movie dropped",
+        ] {
+            assert_eq!(
+                mark_forge_command(u),
+                None,
+                "{u:?} carries a content word from outside the spawn idiom"
+            );
         }
     }
 

@@ -126,10 +126,15 @@ pub fn start_and_report() {
     match start() {
         Ok(()) => {
             info!("endpoint-security NOTIFY client active (watching mprotect/mmap/get_task/signal)");
+            // PIXEL-FREE(diagnostic): the ES client's own liveness. What it FINDS
+            // does reach a pixel (introspect.security_event / introspect.anomaly
+            // both have applyEnvelope cases); whether the seam started is a
+            // build/entitlement fact for the log and the live stream.
             crate::telemetry::emit("system", "introspect.es", serde_json::json!({"active": true}));
         }
         Err(reason) => {
             warn!(%reason, "endpoint-security unavailable; the light introspect path continues");
+            // PIXEL-FREE(diagnostic): twin of the active=true frame above.
             crate::telemetry::emit(
                 "system",
                 "introspect.es",

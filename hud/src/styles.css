@@ -838,6 +838,21 @@ svg.tri circle {
   animation: offlinePulse 2s ease-in-out infinite;
 }
 
+/* Offset so a dead mic and a dead inference server are both readable at once —
+   an acquisition failure often arrives in the same second as everything else
+   the machine is failing to give the daemon. */
+.banner.mic {
+  top: 118px;
+}
+
+.banner .banner-detail {
+  display: block;
+  margin-top: 3px;
+  letter-spacing: 0.08em;
+  opacity: 0.75;
+  text-transform: none;
+}
+
 /* ------------------------------------------------------------- alert panel */
 
 .alert-panel {

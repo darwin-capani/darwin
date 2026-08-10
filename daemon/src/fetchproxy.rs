@@ -604,7 +604,7 @@ async fn handle_conn<F: UrlFetcher>(
 /// SECRET-FREE: only the app name, the op, and a stable reason — never the URL
 /// or the body.
 ///
-/// DIAGNOSTIC — like the OpNotPermitted site below, this frame has no
+/// PIXEL-FREE(diagnostic): like the OpNotPermitted site below, this frame has no
 /// `applyEnvelope` case and so reaches no pixel. Kept for the operator's live
 /// telemetry stream; the app itself only learns the stable `reason`.
 fn deny(name: &str, reason: &str) -> Option<Value> {
@@ -635,7 +635,7 @@ async fn handle_line<F: UrlFetcher>(
         }
         Decision::OpNotPermitted { name, op } => {
             // Privileged/unknown op: rejected here, never fetched. The op string
-            // is echoed onto telemetry as a DIAGNOSTIC — NOT, as this comment used
+            // is echoed onto telemetry as a PIXEL-FREE(diagnostic) — NOT, as this used
             // to claim, "visible to the HUD": `applyEnvelope` is an exact-match
             // switch with no `app.proxy_denied` case, so this frame reaches no
             // pixel. It is kept because a probe belongs in the operator's live

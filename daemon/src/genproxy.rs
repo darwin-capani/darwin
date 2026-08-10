@@ -329,7 +329,7 @@ async fn handle_line<F: Forwarder>(
         }
         Decision::OpNotPermitted { name, op } => {
             // Privileged/unknown op: rejected here, never forwarded. The op
-            // string is echoed onto telemetry as a DIAGNOSTIC — NOT "visible to the
+            // string is echoed as PIXEL-FREE(diagnostic) telemetry — NOT "visible to the
             // HUD", which this comment used to claim: there is no
             // `app.proxy_denied` case in `applyEnvelope`, so the frame reaches no
             // pixel. Kept for the operator's live stream (same call as
@@ -360,7 +360,7 @@ async fn handle_line<F: Forwarder>(
             };
             if !allowed {
                 warn!(app = %name, "generate proxy rate limit tripped");
-                // DIAGNOSTIC (same as the OpNotPermitted site above): no
+                // PIXEL-FREE(diagnostic) (same as the OpNotPermitted site above): no
                 // `app.proxy_denied` case in `applyEnvelope`, so this reaches no
                 // pixel. The `warn!` on the line above is the surface an operator
                 // actually reads; the frame is its live-stream twin.

@@ -2812,6 +2812,10 @@ async fn tool_loop(
             // error-retried mutating action fires exactly once.
             if let Some(prior) = seen.get(&signature) {
                 warn!(tool = %name, "duplicate tool call this turn; skipping re-execution");
+                // PIXEL-FREE(diagnostic): the dedup is a CORRECTNESS guarantee, not
+                // news — the user asked for one action and gets one action, and the
+                // action itself already rendered via action.executed. Surfacing the
+                // suppression would report a bug the user does not have.
                 telemetry::emit(
                     "system",
                     "action.deduped",

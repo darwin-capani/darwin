@@ -305,6 +305,9 @@ fn record_at(
     }
     drop(g);
 
+    // PIXEL-FREE(diagnostic): the journal's own append. The HUD already renders
+    // the ACTION (action.executed) and the undo affordance (undo.armed); a second
+    // frame per action would be one ticker row per row already shown.
     crate::telemetry::emit(
         "system",
         "journal.recorded",

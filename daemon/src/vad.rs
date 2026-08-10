@@ -273,6 +273,10 @@ impl LearnedVad {
                     weights = %self.weights_path.display(),
                     "learned VAD live: in-process Silero (rust port) now decides speech frames"
                 );
+                // PIXEL-FREE(diagnostic): which VAD decides speech frames is a
+                // startup/tuning fact, not an operator decision — and it flips
+                // silently mid-run as the weights land. The `info!` above is the
+                // surface that gets read; this is its live-stream twin.
                 telemetry::emit(
                     "audio",
                     "vad.backend_live",
@@ -289,6 +293,9 @@ impl LearnedVad {
                         "learned VAD weights unavailable; capture runs on the RMS gate until the \
                          inference server's preload exports them (retrying)"
                     );
+                    // PIXEL-FREE(diagnostic): twin of vad.backend_live above. The
+                    // RMS gate is a working fallback, not a degradation the
+                    // operator must act on, and it self-heals on the next retry.
                     telemetry::emit(
                         "audio",
                         "vad.backend_fallback",

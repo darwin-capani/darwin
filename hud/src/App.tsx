@@ -28,6 +28,7 @@ import ForgePanel from "./components/ForgePanel";
 import GlobalScanPanel, { GLOBAL_SCAN_APP } from "./components/GlobalScanPanel";
 import ImagePanel from "./components/ImagePanel";
 import InferencePerfPanel from "./components/InferencePerfPanel";
+import MicOfflineBanner from "./components/MicOfflineBanner";
 import JournalPanel from "./components/JournalPanel";
 import KnowledgeGraphPanel from "./components/KnowledgeGraphPanel";
 import LatencyStrip from "./components/LatencyStrip";
@@ -633,6 +634,10 @@ export default function App() {
       <div className={`banner ${state.inferenceOffline ? "visible" : ""}`}>
         <span className="pulse">LOCAL INFERENCE OFFLINE</span>
       </div>
+
+      {/* The idle ring looks identical whether DARWIN is hearing a quiet room or
+          holding a microphone the OS never handed over. Only this says which. */}
+      <MicOfflineBanner error={state.micOffline} />
 
       <AlertPanel alert={state.healAlert} onDismiss={() => dispatch({ type: "alert.dismiss" })} />
       <SelfHealPanel

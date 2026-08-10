@@ -119,8 +119,21 @@ pub fn match_app(stems: &[String], query: &str) -> AppMatch {
         .filter(|s| s.to_lowercase().starts_with(&q))
         .cloned()
         .collect();
+    // ...and the substring tier must align to a TOKEN BOUNDARY inside the stem.
+    //
+    // A bare `contains` matched any infix, so the fragment "over" resolved
+    // CROSSOVER and "reset the game and start over" LAUNCHED IT. MEASURED
+    // against this machine's 158 installed apps. The tier exists so "code"
+    // finds "Visual Studio Code" and "photo" finds "Photoshop" — both of which
+    // align to the start of a token — so requiring that alignment keeps every
+    // real use and drops the accidental infix.
+    //
+    // Deliberately still a PREFIX-within-token rather than a whole-token match:
+    // "photo" -> "Photoshop" is a real and common way to name an app, and losing
+    // it would trade one wrong launch for a dozen missed ones.
     for stem in stems {
-        if stem.to_lowercase().contains(&q) && !close.contains(stem) {
+        let lower = stem.to_lowercase();
+        if tokens(&lower).iter().any(|t| t.starts_with(&q)) && !close.contains(stem) {
             close.push(stem.clone());
         }
     }
@@ -944,6 +957,44 @@ async fn run_command(program: &str, args: &[&str]) -> Result<std::process::Outpu
 
 #[cfg(test)]
 mod tests {
+
+    /// AN INFIX IS NOT A NAME. MEASURED against 158 installed apps: the fragment
+    /// "over" — which the classifier extracts from "reset the game and start
+    /// over" — resolved CROSSOVER and launched it. The substring tier is there so
+    /// "code" reaches Visual Studio Code; that use aligns to a token boundary and
+    /// an accidental infix does not.
+    #[test]
+    fn a_bare_infix_never_resolves_an_app() {
+        let stems = vec![
+            "crossover".to_string(),
+            "visual studio code".to_string(),
+            "photoshop".to_string(),
+            "news".to_string(),
+        ];
+        assert!(
+            matches!(super::match_app(&stems, "over"), super::AppMatch::NotFound),
+            "the fragment \"over\" resolved an app — it is an infix of CrossOver, not a name"
+        );
+        assert!(matches!(super::match_app(&stems, "ssov"), super::AppMatch::NotFound));
+    }
+
+    /// ...AND THE TIER STILL DOES ITS JOB. Losing these would trade one wrong
+    /// launch for many missed ones, which is the wrong direction for a matcher
+    /// whose failure mode is "the owner names an app and nothing happens".
+    #[test]
+    fn a_token_aligned_fragment_still_resolves() {
+        let stems = vec![
+            "crossover".to_string(),
+            "visual studio code".to_string(),
+            "photoshop".to_string(),
+        ];
+        for (q, want) in [("code", "visual studio code"), ("photo", "photoshop"), ("cross", "crossover")] {
+            match super::match_app(&stems, q) {
+                super::AppMatch::Resolved(a) => assert_eq!(a, want, "{q:?} resolved wrongly"),
+                other => panic!("{q:?} must still resolve, got {other:?}"),
+            }
+        }
+    }
     use super::*;
     use crate::telemetry::SystemSnapshot;
 
@@ -1363,3 +1414,4 @@ mod tests {
         );
     }
 }
+

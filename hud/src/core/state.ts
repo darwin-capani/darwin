@@ -726,6 +726,16 @@ export interface HudState {
   cloudKeyPresent: boolean | null; // daemon.started data (contract #2)
   daemonRoot: string | null;
   inferenceOffline: boolean; // sticky banner; cleared only by proof events
+  /**
+   * The microphone could not be ACQUIRED at capture start. `audio.rs` parks the
+   * capture thread forever in that case (deliberately — a device that cannot be
+   * opened must not take the router, scheduler, HUD feed and tool host down with
+   * it on a launchd restart loop), so nothing ever recovers it in-process and no
+   * further audio frame is ever produced. Sticky until the daemon restarts: the
+   * HUD's idle ring is indistinguishable from "listening and hearing silence",
+   * which is precisely the state this banner exists to contradict.
+   */
+  micOffline: string | null; // sticky banner; the acquisition error
   heal: HealStatus | null;
   /** Red transient banner for heal rejected/blocked/applied (errors only). */
   healAlert: HealAlert | null;
@@ -1597,6 +1607,7 @@ export function initialState(): HudState {
     cloudKeyPresent: null,
     daemonRoot: null,
     inferenceOffline: false,
+    micOffline: null,
     heal: null,
     healAlert: null,
     healDiagnosing: null,
@@ -2014,6 +2025,15 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
   if (s.inferenceOffline && INFERENCE_PROOF_EVENTS.has(env.event)) {
     s = { ...s, inferenceOffline: false };
   }
+  // A single audio frame is proof the capture path is alive again — the only
+  // honest way out of the MIC OFFLINE banner, and the only one available: the
+  // daemon parks its capture thread on an acquisition failure and never retries,
+  // so the recovery is either a daemon restart or the app-mode mic ingest, and
+  // both announce themselves the same way. Guarded on the flag first: audio.level
+  // is the highest-frequency envelope on the bus and must not churn state.
+  if (s.micOffline !== null && env.event === "audio.level") {
+    s = { ...s, micOffline: null };
+  }
 
   switch (env.event) {
     case "audio.level": {
@@ -2192,6 +2212,17 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
         "idle",
         at,
       );
+    }
+
+    /* THE MICROPHONE WAS NEVER ACQUIRED. `audio.rs` acquire_input_device() failed,
+       the capture thread is parked for the life of the process, and no audio frame
+       will ever arrive. Every other surface keeps working, so from the operator's
+       seat the HUD is a fully live appliance sitting at idle — the exact picture it
+       paints while listening to a quiet room. Say so instead. */
+    case "capture.unavailable": {
+      const detail = str(env.data, "error") ?? "";
+      if (s.micOffline === detail) return s; // replayed frame: no churn
+      return setCore({ ...s, micOffline: detail }, "idle", at);
     }
 
     case "inference.unavailable": {

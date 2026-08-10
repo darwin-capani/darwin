@@ -232,6 +232,10 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
             Err(e) => {
                 error!(error = %e, "audio: could not acquire an input device; capture is \
                                     OFF for this run — the rest of the daemon keeps running");
+                // RETAINED (telemetry::sticky_key): this fires once, seconds to
+                // minutes after boot, and the thread parks below — so if the frame
+                // is not replayed on connect the HUD's MIC OFFLINE banner can never
+                // render. Do not drop the sticky arm without deleting the banner.
                 crate::telemetry::emit(
                     "audio",
                     "capture.unavailable",
@@ -431,6 +435,11 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
             // has fired, the reply is already being cut and re-firing is moot.
             if !crate::speech::barge_in_requested() && barge.observe(rms, frames) {
                 info!(rms, "barge-in: user spoke over DARWIN; cutting the reply");
+                // PIXEL-FREE(diagnostic): the barge itself IS already a pixel — the
+                // reply is cut, so the core state leaves "speaking" on the next
+                // audio.level. This frame carries only the triggering rms, for
+                // tuning the detector off a live stream. Do not add a case for it;
+                // a toast per barge-in would fire on ordinary interruption.
                 telemetry::emit("audio", "barge_in", json!({"rms": round4(rms as f64)}));
                 crate::speech::request_barge_in();
                 barge.reset();
@@ -556,15 +565,17 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
 }
 
 /// Build the error that ENDS capture, announcing the total loss on the way out.
-/// The telemetry is a DIAGNOSTIC on the operator's live stream. It is NOT what
-/// the HUD sees — this doc used to say "the HUD sees capture die instead of
-/// watching a waveform that simply never moves again", and the HUD has no
+/// The telemetry is the operator's live stream only. It is NOT what the HUD sees
+/// — this doc used to say "the HUD sees capture die instead of watching a
+/// waveform that simply never moves again", and the HUD has no
 /// `audio.capture_stopped` case, so it does exactly the watching that sentence
 /// promised it would not. What the HUD actually observes is the socket closing
 /// when main winds down for the restart. The returned `Err` is what
 /// `spawn_capture` logs as `"audio capture stopped"` — heal.rs's total-loss
 /// trigger — before the sender drops and main winds down for a restart.
 fn capture_death(reason: &str) -> anyhow::Error {
+    // PIXEL-FREE(diagnostic): see the doc comment — the HUD's real signal for a
+    // dead capture is the socket closing a moment later, as main winds down.
     telemetry::emit("audio", "audio.capture_stopped", json!({ "reason": reason }));
     anyhow!("{reason}")
 }
