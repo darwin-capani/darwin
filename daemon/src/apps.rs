@@ -2788,8 +2788,18 @@ async fn relay_line(
         RelayDecision::ToolResult { id, payload } => {
             // Deliver the correlated answer to its request_op waiter. The
             // payload rides ONLY the oneshot (it is the tool result, returned
-            // to the requester); telemetry gets a secret-free breadcrumb so the
-            // HUD/audit can see THAT a tool answered without echoing WHAT.
+            // to the requester); telemetry gets a secret-free breadcrumb.
+            //
+            // DIAGNOSTIC. That breadcrumb line used to end "so the HUD/audit can
+            // see THAT a tool answered without echoing WHAT", and NEITHER half is
+            // true: `applyEnvelope` is an exact-match switch with no `app.result`
+            // case, so the frame reaches no pixel; and this arm calls
+            // `telemetry::emit` only — nothing on this path writes the audit ring
+            // (audit.rs emits telemetry, it never ingests it). The breadcrumb is
+            // for the operator's live stream. The requester learns the outcome
+            // from the oneshot itself, and a result with no live waiter is
+            // reported by the `warn!` in the `None` arm below. Pinned by
+            // `hud/src/test/silent-drops.test.ts`.
             let waiter = {
                 let apps = registry.apps.lock().await;
                 match apps.get(name) {

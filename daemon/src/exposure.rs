@@ -403,6 +403,15 @@ where
 /// reads the local socket table and sends no packets); nothing is written.
 /// Runtime-only (the live netstat read makes this inspection-verified; its parser
 /// + summary cores are unit-tested).
+///
+/// TELEMETRY REACHES NO PIXEL, ON PURPOSE. The HUD's `applyEnvelope` is an
+/// exact-match switch and has no case for this topic, so this full finding frame
+/// is dropped by its default. What the owner is told is the one-line SUMMARY this
+/// tick also caches, which `posture::scanner_notes` folds onto the
+/// `posture.snapshot` board (and `posture::local_posture` speaks). The detail
+/// frame stays for the operator's live stream and for any other client on the hub
+/// — a per-finding HUD panel is a surface to add deliberately, not by wiring up a
+/// frame that happens to exist.
 async fn sentinel_tick() {
     match scan(run_real_command).await {
         Ok(listeners) => {

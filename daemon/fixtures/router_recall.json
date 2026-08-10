@@ -34,7 +34,7 @@
 
   {"gate": "vault", "expect": "on", "text": "go dark"},
   {"gate": "vault", "expect": "on", "text": "vault mode"},
-  {"gate": "model_tier", "expect": "local", "text": "private mode on"},
+  {"gate": "vault", "expect": "on", "text": "private mode on"},
   {"gate": "vault", "expect": "on", "text": "engage vault mode"},
   {"gate": "vault", "expect": "off", "text": "come out of vault mode"},
   {"gate": "vault", "expect": "off", "text": "turn private mode off"},

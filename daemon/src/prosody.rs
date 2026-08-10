@@ -402,9 +402,107 @@ fn strip_trailing_filler(norm: &str) -> &str {
 /// utterance IS the phrase, or ends with it on a word boundary. This is the anchor:
 /// a phrase buried mid-sentence is a MENTION, not a command.
 fn ends_with_phrase(norm: &str, phrases: &[&str]) -> bool {
-    phrases
-        .iter()
-        .any(|p| norm == *p || norm.strip_suffix(p).is_some_and(|head| head.ends_with(' ')))
+    phrases.iter().any(|p| {
+        norm == *p
+            || norm
+                .strip_suffix(p)
+                .is_some_and(|head| head.ends_with(' ') && head_is_only_an_address(head))
+    })
+}
+
+/// Is everything BEFORE the command phrase nothing but address / politeness /
+/// request framing?
+///
+/// A TAIL ANCHOR ALONE DOES NOT MAKE AN UTTERANCE A COMMAND. Every phrase above
+/// is also the ordinary English for describing what someone ELSE was asked to do,
+/// and reported speech puts the phrase in exactly the same final position.
+/// MEASURED at HEAD, all firing: "i asked them to talk quietly" and "my mother
+/// always said to speak quietly" engaged whisper mode; "tell the kids to stop
+/// whispering" and "i asked the band to speak normally" disengaged it. Ten of the
+/// twenty-two sentences probed in that shape were captured — the owner talking
+/// ABOUT quiet changed how DARWIN speaks.
+///
+/// What separates them is not the tail, it is the HEAD: a real command has nothing
+/// in front of the phrase except the owner addressing DARWIN. So the head must peel
+/// away to nothing, using the same enumerated-wrapper approach as
+/// `model_tier::strip_one_command_lead` (and for the same reason: a token-level
+/// allowlist cannot keep "i need you to speak quietly" while refusing "i asked them
+/// to talk quietly" — both are "<stuff> to <phrase>", and only the whole wrapper
+/// tells them apart).
+///
+/// THIS CAN ONLY NARROW. Before it, EVERY head was accepted; there is no head this
+/// admits that the old code refused, so no sentence can newly reach the toggle. The
+/// cost is the other way: an unenumerated lead-in ("actually, speak quietly") now
+/// falls through, which loses a turn rather than changing a mode.
+fn head_is_only_an_address(head: &str) -> bool {
+    // Longest-first within each family, so a longer wrapper is never cut short by
+    // the prefix of a shorter one.
+    const LEADS: &[&str] = &[
+        // Address.
+        "hey darwin", "ok darwin", "okay darwin", "hi darwin", "hello darwin", "darwin",
+        "hey", "hi", "hello", "ok", "okay",
+        // Politeness.
+        "please", "pls", "kindly",
+        // Request framing addressed to DARWIN. Every entry that carries an
+        // infinitive "to" names DARWIN ("you") as the one being asked — which is
+        // precisely what "i asked THEM to" and "tell THE KIDS to" do not.
+        "i want you to", "i'd like you to", "id like you to", "i would like you to",
+        "i need you to", "i'll need you to",
+        "can you", "could you", "would you", "will you", "can we", "could we",
+        "you can", "you could", "you should", "you may", "try to", "try and",
+        "let's", "lets", "let us", "just",
+        // Imperative framing for a MODE. Each was found by an EXISTING test going
+        // red on this narrowing, not by inspection — "please switch to whisper
+        // mode" (the process-global round-trip test), "ok back to normal voice"
+        // and "say that out loud please" (the conservative-mapping test). None of
+        // them opens the reported-speech family back up: "tell them to switch to
+        // whisper mode" still leaves "tell them" in front and is still refused.
+        "switch to", "switch it to", "put yourself in", "go into", "go back to",
+        "back to", "turn on", "enable", "set yourself to", "say that", "say it",
+        // SUBJECT-LESS DISCOURSE MARKERS, and THE ESCAPE PATH.
+        //
+        // The rule this veto turns on is that a report names WHO was asked — "i
+        // asked THEM to", "tell THE KIDS to". A head carrying no subject at all
+        // therefore cannot be a report, whatever else it carries, and the peel
+        // already enforces that structurally: it must consume the head to
+        // NOTHING, so any leftover subject refuses. That is what makes these safe
+        // to admit, and it is checked rather than claimed — see
+        // `a_discourse_marker_never_fronts_a_report`, which fires the report form
+        // of every marker added here.
+        //
+        // MEASURED dead at the first cut of this narrowing, all real commands:
+        // "alright speak up", "sorry can you speak up", "actually speak quietly",
+        // "maybe keep it down", "how about you speak softly".
+        "actually", "sorry", "alright", "all right", "anyway", "maybe", "well",
+        "so", "then", "and", "but", "also", "how about you", "what about you",
+        // "GO" IS THE ESCAPE, AND THE ESCAPE IS THE HALF THAT MATTERS. Whisper ON
+        // makes DARWIN terse and quiet; a narrowing that keeps the ON phrasings
+        // working while dropping an OFF phrasing leaves the owner holding the
+        // mode with fewer ways out than they had to get in, which is the
+        // asymmetry this campaign refuses. MEASURED dead: "go back to normal",
+        // "let's go back to normal", "can we go back to normal" — all three leave
+        // the bare verb "go" in the head once "back to normal" is taken as the
+        // trailing phrase, and the module's own doc names "back to normal" as how
+        // the owner gets out. Listed LAST so the longer "go into" / "go back to"
+        // are still matched first and keep their exact old behaviour.
+        "go",
+    ];
+    let mut rest = head.trim();
+    'peel: while !rest.is_empty() {
+        for lead in LEADS {
+            let Some(tail) = rest.strip_prefix(lead) else {
+                continue;
+            };
+            // Word boundary: "darwinism" is not the address "darwin".
+            if tail.starts_with(|c: char| c.is_alphanumeric()) {
+                continue;
+            }
+            rest = tail.trim_start_matches([' ', ',']).trim();
+            continue 'peel;
+        }
+        return false;
+    }
+    true
 }
 
 /// PURE command parser: map an operator utterance to a [`WhisperCommand`], or None
@@ -637,6 +735,134 @@ pub fn emit_telemetry(profile: ProsodyProfile, backend: &Backend, shape: &SpeakS
 
 #[cfg(test)]
 mod tests {
+
+    /// TALKING ABOUT QUIET IS NOT ASKING FOR IT. The whisper toggle was purely
+    /// TAIL-anchored, and reported speech puts the command phrase in exactly the
+    /// same final position — so the owner describing what someone ELSE was asked
+    /// to do changed how DARWIN speaks. MEASURED at HEAD: ten of twenty-two
+    /// sentences probed in this shape fired, in BOTH directions.
+    #[test]
+    fn a_tail_phrase_under_a_third_party_head_is_not_a_whisper_command() {
+        for u in [
+            "i asked them to talk quietly",
+            "i told her to speak quietly",
+            "ask the neighbours to keep it down",
+            "the librarian told us to speak softly",
+            "i wish they would talk softly",
+            "my mother always said to speak quietly",
+            "remind the class to talk quieter",
+        ] {
+            assert_eq!(
+                parse_whisper_command(u),
+                None,
+                "{u:?} engaged whisper mode — it is a report about other people"
+            );
+        }
+        for u in [
+            "tell the kids to stop whispering",
+            "tell them to speak up",
+            "i asked the band to speak normally",
+        ] {
+            assert_eq!(
+                parse_whisper_command(u),
+                None,
+                "{u:?} disengaged whisper mode — it is a report about other people"
+            );
+        }
+    }
+
+    /// ...AND EVERY WAY THE OWNER ACTUALLY ASKS MUST STILL WORK. The head is
+    /// allowed to carry address, courtesy, and request framing that names DARWIN
+    /// ("i need you to …") — which is the distinction the veto turns on, since
+    /// both that and "i asked them to …" are "<stuff> to <phrase>".
+    #[test]
+    fn address_and_request_framing_still_reach_the_whisper_toggle() {
+        for u in [
+            "talk quietly",
+            "speak quietly",
+            "whisper mode",
+            "keep your voice down",
+            "can you talk quietly",
+            "darwin please speak softly",
+            "hey darwin, keep your voice down",
+            "i need you to speak quietly",
+            "could you lower your voice",
+            "just speak softly",
+        ] {
+            assert_eq!(parse_whisper_command(u), Some(WhisperCommand::On), "{u:?} stopped working");
+        }
+        for u in [
+            "stop whispering",
+            "you can speak normally again",
+            "normal voice please",
+            "darwin, speak up",
+            "can you speak normally",
+        ] {
+            assert_eq!(
+                parse_whisper_command(u),
+                Some(WhisperCommand::Off),
+                "{u:?} stopped working"
+            );
+        }
+    }
+
+    /// THE ESCAPE PATH, AND THE MARKERS THE HEAD RULE ATE. Every sentence here
+    /// reached the whisper toggle at 7731042 and reached NOTHING once the head
+    /// rule landed. They are not exotic: three of them are the OFF direction, and
+    /// OFF is the direction the owner needs most — whisper mode makes DARWIN
+    /// terse and 0.45x volume, so losing an exit phrasing costs more than losing
+    /// an entry one. `parse_whisper_command`'s own doc names "back to normal" as
+    /// the way out; "go back to normal" is the same sentence with a verb.
+    #[test]
+    fn the_escape_path_and_subject_less_leads_still_reach_the_toggle() {
+        for (u, want) in [
+            ("go back to normal", WhisperCommand::Off),
+            ("let's go back to normal", WhisperCommand::Off),
+            ("can we go back to normal", WhisperCommand::Off),
+            ("alright speak up", WhisperCommand::Off),
+            ("sorry can you speak up", WhisperCommand::Off),
+            ("actually speak quietly", WhisperCommand::On),
+            ("maybe keep it down", WhisperCommand::On),
+            ("how about you speak softly", WhisperCommand::On),
+            ("well, keep your voice down", WhisperCommand::On),
+            ("so speak softly", WhisperCommand::On),
+        ] {
+            assert_eq!(parse_whisper_command(u), Some(want), "{u:?} stopped working");
+        }
+    }
+
+    /// ...AND THE RISK THAT RESTORING THEM OPENS, EXERCISED. A discourse marker
+    /// could in principle front a REPORT ("so i asked them to speak quietly"),
+    /// which would put back the whole family the head rule closed. It cannot,
+    /// because the head must peel to NOTHING and a report always leaves its
+    /// subject behind — but that is a claim about the peel, so it is fired rather
+    /// than asserted. One sentence per marker restored, each the report form of
+    /// that exact marker.
+    #[test]
+    fn a_discourse_marker_never_fronts_a_report() {
+        for u in [
+            "so i asked them to speak quietly",
+            "and tell the kids to stop whispering",
+            "but i told her to speak quietly",
+            "actually tell them to speak quietly",
+            "sorry i asked them to talk quietly",
+            "alright tell them to speak up",
+            "anyway the librarian told us to speak softly",
+            "maybe ask the neighbours to keep it down",
+            "well my mother always said to speak quietly",
+            "then remind the class to talk quieter",
+            "also tell the band to speak normally",
+            "how about you tell them to speak quietly",
+            "what about you asking them to speak softly",
+            "go tell them to speak quietly",
+        ] {
+            assert_eq!(
+                parse_whisper_command(u),
+                None,
+                "{u:?} reached the whisper toggle — a restored lead fronted a report"
+            );
+        }
+    }
 
     /// REGRESSION (router-recall miss list): "talk quietly" (on) and "stop
     /// whispering" (off) both reached NOTHING, so whisper mode could be entered

@@ -1571,18 +1571,43 @@ mod hijack_tests {
     /// FORM is not enough — the first version of this guard accepted park_ctx(true, ..)
     /// from the webhook path, which is precisely the background parker the whole
     /// mechanism exists to stop.
+    ///
+    /// EVERY webhook park site, not the first one. This guard used to read
+    /// `src.find("confirm::park_ctx(")` and check the ~40 bytes after it — the
+    /// first-occurrence-only shape that let a `mission.resumed` SETTLE emit ship
+    /// unguarded in anthropic.rs (a topic with two emit sites whose guard windowed on
+    /// site one and silently vouched for site two). webhooks.rs has exactly ONE park
+    /// site today, so the old form was CORRECT and not a live bug — it was a guard
+    /// that would go quiet the day someone added a second one, which is the day it is
+    /// needed. `every_park_call_site_states_whether_it_reaches_the_user` would not
+    /// have caught that either: it ACCEPTS `true,` as a classified argument, and
+    /// "this file's parks must be `false`" is the rule only stated here. The site
+    /// count is floored so a rotted needle fails instead of passing vacuously.
     #[test]
     fn background_only_parkers_declare_that_no_one_was_prompted() {
         // An inbound webhook fires on its own schedule; nobody was prompted this turn.
         let src = include_str!("webhooks.rs");
-        let i = src
-            .find("confirm::park_ctx(")
-            .expect("webhooks.rs no longer parks; re-point this guard");
-        let call = &src[i..(i + 40).min(src.len())];
+        let mut sites = 0usize;
+        for (n, line) in src.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            let Some(at) = t.find("confirm::park_ctx(") else { continue };
+            sites += 1;
+            let call = &t[at..];
+            assert!(
+                call.contains("park_ctx(false"),
+                "webhooks.rs:{}: the webhook path claims its prompt reached the user, so \
+                 it arms PROMPTED and can steal a confirm the operator spoke for \
+                 something else: {call}",
+                n + 1
+            );
+        }
         assert!(
-            call.contains("park_ctx(false"),
-            "the webhook path claims its prompt reached the user, so it arms PROMPTED \
-             and can steal a confirm the operator spoke for something else: {call}"
+            sites >= 1,
+            "webhooks.rs no longer parks (or the needle rotted); re-point this guard \
+             rather than letting it pass over zero sites"
         );
     }
 

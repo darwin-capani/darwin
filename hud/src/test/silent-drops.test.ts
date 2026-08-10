@@ -209,3 +209,46 @@ describe("a dead daemon stops claiming it is watching the screen", () => {
     expect(twice).toBe(once);
   });
 });
+
+/**
+ * TWO daemon comments still promised a HUD surface for a frame that reaches none.
+ * They are the same defect the `command.routed` deletion pass named and fixed
+ * elsewhere, in the two files that pass did not reach:
+ *
+ *   - daemon/src/anthropic.rs `standing_create_tool` called `standing.created` a
+ *     "HUD card". daemon/src/standing.rs says the opposite in as many words at its
+ *     own emit: applyEnvelope has a case for NEITHER standing.tripwire_armed NOR
+ *     standing.created. One twin was corrected, the other was not.
+ *   - daemon/src/apps.rs's ToolResult arm said the `app.result` breadcrumb lets
+ *     "the HUD/audit see THAT a tool answered". The HUD cannot — no case. Nor does
+ *     audit: that arm calls telemetry::emit only, and audit.rs emits telemetry
+ *     rather than consuming it.
+ *
+ * This pins what those comments now say AT RUNTIME rather than by grep — a grep for
+ * a missing `case` raises a candidate, it never clears one. If either topic is ever
+ * genuinely wired, THIS test fails and the comment must be rewritten with it, which
+ * is the point: the note cannot rot in either direction.
+ */
+describe("frames whose daemon comment promised a HUD surface that does not exist", () => {
+  it("standing.created and app.result leave the reducer untouched", () => {
+    const base = initialState();
+    const cases: [string, Record<string, unknown>][] = [
+      ["standing.created", { id: "m1", goal: "water the plants", schedule: "every day at 9am" }],
+      ["app.result", { name: "jsonpath", id: "7", delivered: true }],
+    ];
+    for (const [event, data] of cases) {
+      // Reference identity, not deep equality: applyEnvelope's default returns the
+      // SAME object, so this also proves no field was rebuilt on the way through.
+      expect(apply(base, event, data)).toBe(base);
+    }
+  });
+
+  it("PRECONDITION: the same helper does move state for a topic that has a case", () => {
+    // Without this, the assertion above would pass just as well if `apply` were
+    // broken and reduced nothing at all.
+    const base = initialState();
+    const moved = apply(base, "config.invalid", { issues: ["unknown key [egres].on"] });
+    expect(moved).not.toBe(base);
+    expect(moved.configIssues).toEqual(["unknown key [egres].on"]);
+  });
+});

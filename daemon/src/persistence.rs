@@ -1264,6 +1264,14 @@ async fn sentinel_tick(store: &PersistenceBaseline, assess_signing: bool, max_as
     let anomalies_redacted: Vec<String> =
         anomalies.iter().map(|a| crate::introspect::redact_home(a)).collect();
 
+    // TELEMETRY REACHES NO PIXEL, ON PURPOSE. The HUD's `applyEnvelope` is an
+    // exact-match switch with no `security.persistence` case, so this full
+    // finding frame is dropped by its default. What the owner is told is the
+    // one-line SUMMARY this scan also caches, which `posture::scanner_notes`
+    // folds onto the `posture.snapshot` board (and `posture::local_posture`
+    // speaks). The detail frame stays for the operator's live stream; a
+    // per-finding HUD panel is a surface to add deliberately, not by wiring up a
+    // frame that happens to exist.
     crate::telemetry::emit(
         "system",
         "security.persistence",

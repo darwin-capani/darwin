@@ -3612,6 +3612,21 @@ export interface PostureSnapshot {
    *  blank for the 30-min scan interval) — the envelope ts is therefore NOT
    *  the data's age; this is. Empty when absent. */
   checkedTs: string;
+  /** The AMBIENT SCANNERS' latest one-line summaries — persistence (autostart
+   *  surfaces), inbound exposure (listening sockets), traffic interception
+   *  (proxy / hosts / root CAs / DNS / profiles). Each of those scanners emits a
+   *  full finding frame of its own that this reducer has NO case for, so the
+   *  frames reach no pixel; the daemon folds these summaries onto the posture
+   *  board (posture.rs::scanner_notes) so the owner is told without having to
+   *  ask for the spoken posture.
+   *
+   *  IMPORTANT — these do NOT share `checkedTs`. They ride their own scanners'
+   *  ~5-minute cadence and are attached at emit time; `checkedTs` belongs to the
+   *  four machine checks alone. The panel must not date them with it.
+   *
+   *  EMPTY means "no scanner has reported yet", never "scanned and all quiet" —
+   *  the daemon omits the key entirely rather than sending []. */
+  scanners: string[];
 }
 
 /** Coerce one protection token; anything unrecognized is "unclear". */
@@ -3633,7 +3648,33 @@ export function parsePostureSnapshot(data: Record<string, unknown>): PostureSnap
       upd === "up_to_date" || upd === "pending" || upd === "unreadable" ? upd : "unclear",
     updatesPending: pending !== null && pending >= 0 ? Math.floor(pending) : 0,
     checkedTs: str(data, "checked_ts") ?? "",
+    scanners: scannerNotes(data),
   };
+}
+
+/** Cap the ambient-scanner lines the board will render. The daemon bounds them
+ *  too (posture.rs NOTES_CAP / NOTE_CHARS); a wire bound enforced only by the
+ *  sender is not a bound on the receiver. */
+export const POSTURE_SCANNER_CAP = 8;
+const POSTURE_SCANNER_CHARS = 400;
+
+/** Parse the OPTIONAL `scanners` array. A missing key, a non-array, or non-string
+ *  entries yield [] — the board then shows no scanner block at all rather than a
+ *  fabricated "all quiet". Never throws. */
+function scannerNotes(data: Record<string, unknown>): string[] {
+  const raw = data["scanners"];
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== "string") continue;
+    const line = item.trim();
+    if (line.length === 0) continue;
+    out.push(
+      line.length > POSTURE_SCANNER_CHARS ? `${line.slice(0, POSTURE_SCANNER_CHARS)}…` : line,
+    );
+    if (out.length === POSTURE_SCANNER_CAP) break;
+  }
+  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -4042,15 +4083,21 @@ export function securityLabel(s: SecurityStatus): string {
  * USER-ONLY unlock. The HUD's job here is the OBSERVABLE face of that: a LOCKED     *
  * DOWN / NORMAL indicator, a prominent PANIC control, and a deliberate UNLOCK.     *
  *                                                                                  *
- * The daemon feeds the HUD three secret-free signals:                              *
- *   1. STARTUP — `system / lockdown.status` { locked, restored_from_marker },      *
- *      emitted once after telemetry::init (shipped default {false,false}). This    *
- *      drives the indicator AND signals a restart that came up still locked.       *
- *   2. ON TRIGGER (voice) — `system / lockdown.panic` {via:"voice"} /              *
- *      `lockdown.unlock` {via:"voice"} from the router; `command.routed`           *
- *      {cmd:"panic"|"unlock"} when the HUD button fires.                           *
- *   3. The panic/unlock COMMAND REPLY carries `locked`, so the indicator flips     *
- *      immediately on a button press (see tauri/command.ts).                       *
+ * The daemon feeds the HUD TWO secret-free signals — this list said THREE and     *
+ * the third was not a signal at all:                                              *
+ *   1. `system / lockdown.status` { locked, restored_from_marker } — the ONLY     *
+ *      topic the indicator listens to. Emitted once at startup (shipped default   *
+ *      {false,false}, which also signals a restart that came up still locked) AND *
+ *      again by `lockdown::panic()` / `lockdown::unlock()` themselves, so a       *
+ *      SPOKEN panic flips the light exactly like a button press.                  *
+ *   2. The panic/unlock COMMAND REPLY carries `locked`, so the indicator flips    *
+ *      immediately on a button press (see tauri/command.ts).                      *
+ *                                                                                 *
+ *   NOT a signal: `lockdown.panic`/`lockdown.unlock` {via:"voice"} are            *
+ *   AUDIT-SHAPED traces with no `applyEnvelope` case (daemon/src/lockdown.rs      *
+ *   says so at `status_payload`), and `command.routed` no longer exists at all —  *
+ *   its 21 emit sites were deleted as pixel-free. Reading either as the thing     *
+ *   that flips the indicator is what this note now prevents.                      *
  *                                                                                  *
  * HONESTY (pinned in the verbatim consts below, echoed by the HUD): panic stops    *
  * ALL FUTURE outward actions + autonomy + the mic immediately, and persists — it   *

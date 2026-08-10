@@ -207,7 +207,8 @@ where
 ///     "firewall":  same,
 ///     "sip":       same,
 ///     "updates":   "up_to_date"|"pending"|"unclear"|"unreadable",
-///     "updates_pending": <count, 0 unless "pending"> }
+///     "updates_pending": <count, 0 unless "pending">,
+///     "scanners": [<one-line ambient-scanner summary>, …]  // OPTIONAL }
 ///
 /// SECRET-FREE BY CONSTRUCTION: only these fixed verdict tokens and a count
 /// ever reach the wire — never a byte of raw command output. Scope is
@@ -215,6 +216,12 @@ where
 /// introspection already ship on their own events (`tcc.snapshot`,
 /// `introspect.snapshot`) — re-emitting them here would double-scan those
 /// stores and split the source of truth.
+///
+/// `scanners` is NOT built here and never touches this cached payload: it is the
+/// three AMBIENT scanners' own cached one-liners, attached at EMIT time by
+/// [`with_scanner_notes`] on their own cadence. That exception exists precisely
+/// because the "ships on its own event" argument above does NOT hold for them —
+/// their events reach no HUD case at all. See [`scanner_notes`].
 async fn build_snapshot<F, Fut>(run: F) -> serde_json::Value
 where
     F: Fn(&'static str, &'static [&'static str], Duration) -> Fut,
@@ -289,7 +296,7 @@ where
 /// a 30s budget for `softwareupdate`, far too heavy for the 15s snapshot pass.
 pub async fn emit_snapshot() {
     let payload = snapshot_and_cache(run_real_command).await;
-    crate::telemetry::emit("system", "posture.snapshot", payload);
+    crate::telemetry::emit("system", "posture.snapshot", with_scanner_notes(payload));
 }
 
 /// Re-broadcast the CACHED snapshot (if any scan has completed). A pure
@@ -300,8 +307,89 @@ pub async fn emit_snapshot() {
 /// (never fabricates a board).
 pub fn re_emit_cached() {
     if let Some(payload) = cache_lock().clone() {
-        crate::telemetry::emit("system", "posture.snapshot", payload);
+        crate::telemetry::emit("system", "posture.snapshot", with_scanner_notes(payload));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Ambient-scanner notes folded onto the wire
+// ---------------------------------------------------------------------------
+
+/// Cap on how many scanner lines ride the frame, and how long each may be. The
+/// three producers are fixed and their lines are already bounded, but a wire
+/// contract that depends on a producer staying short is not a bound.
+const NOTES_CAP: usize = 8;
+const NOTE_CHARS: usize = 400;
+
+/// The three AMBIENT SCANNERS' latest one-line summaries — persistence
+/// (autostart surfaces), exposure (listening sockets), interception (proxy /
+/// hosts / root CAs / DNS / profiles).
+///
+/// WHY THEY ARE HERE. Each scanner emits a full finding frame of its own
+/// (`security.persistence` / `security.exposure` / `security.interception`), and
+/// the HUD has no `applyEnvelope` case for any of the three — so those frames
+/// reach no pixel. Their summaries reached the owner only through
+/// [`local_posture`], i.e. only if the owner ASKED "how's my security". A rogue
+/// trusted root CA silently breaks every TLS connection on the machine; that is
+/// not something to hold until asked. Folding the three CACHED lines onto the
+/// board the owner already has turns a pull into a push without a new panel and
+/// without a second scan.
+///
+/// PURE IN-PROCESS READ — each `posture_line()` clones a cached summary; no
+/// subprocess, no re-scan, so the scanner stays the single producer of its own
+/// data and this is cheap enough for the fast re-broadcast path.
+///
+/// HONEST AGE: these lines carry their OWN scanners' cadences (300s-ish), NOT
+/// the 30-minute `checked_ts` of the four machine checks. They are therefore
+/// attached at EMIT time (here and in [`snapshot_and_cache`]'s caller) rather
+/// than baked into the cached payload, so a re-broadcast never replays a stale
+/// scanner line, and they ride under their own key so nothing reads them as
+/// having been checked at `checked_ts`.
+///
+/// SECRET-FREE: each line is the same text [`local_posture`] already speaks —
+/// counts, service names, and verdict words, home-prefix redacted upstream.
+/// None until a scanner has ticked (the key is then simply absent).
+fn scanner_notes() -> Vec<String> {
+    [
+        crate::persistence::posture_line(),
+        crate::exposure::posture_line(),
+        crate::interception::posture_line(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+/// Attach scanner lines to a snapshot payload under `"scanners"`, capped and
+/// truncated. The key is OMITTED entirely when nothing has ticked yet — an empty
+/// array would read as "scanned, nothing to say", which is a fabricated clean
+/// bill of health. Pure (the live cache read is [`scanner_notes`]) so the wire
+/// bound is tested without touching another module's globals.
+fn attach_notes(mut payload: serde_json::Value, notes: Vec<String>) -> serde_json::Value {
+    let bounded: Vec<String> = notes
+        .into_iter()
+        .filter(|l| !l.trim().is_empty())
+        .take(NOTES_CAP)
+        .map(|l| {
+            if l.chars().count() > NOTE_CHARS {
+                l.chars().take(NOTE_CHARS).collect()
+            } else {
+                l
+            }
+        })
+        .collect();
+    if bounded.is_empty() {
+        return payload;
+    }
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("scanners".to_string(), serde_json::json!(bounded));
+    }
+    payload
+}
+
+/// [`attach_notes`] over the live cached scanner lines.
+fn with_scanner_notes(payload: serde_json::Value) -> serde_json::Value {
+    attach_notes(payload, scanner_notes())
 }
 
 // ---------------------------------------------------------------------------
@@ -706,6 +794,89 @@ mod tests {
         assert_eq!(snap["updates_pending"], 2);
     }
 
+    // -- the ambient-scanner fold (`scanners`) -------------------------------
+
+    /// The persistence / exposure / interception scanners each emit a full
+    /// finding frame the HUD has NO `applyEnvelope` case for, so those frames
+    /// reach no pixel; their summaries reached the owner only if the owner asked
+    /// for the spoken posture. `attach_notes` folds those cached one-liners onto
+    /// the board the owner already has.
+    ///
+    /// NEVER a fabricated clean bill of health: with nothing to say the key is
+    /// ABSENT, not `[]` — an empty array renders as "scanned, all quiet", which
+    /// is exactly the claim a scanner that has not ticked cannot make. Blank
+    /// lines are dropped for the same reason (they would otherwise make the key
+    /// present with nothing in it).
+    #[test]
+    fn scanner_notes_are_absent_rather_than_empty_when_nothing_has_scanned() {
+        let base = serde_json::json!({"filevault": "on"});
+        let none = attach_notes(base.clone(), Vec::new());
+        assert!(
+            none.get("scanners").is_none(),
+            "no scanner has ticked: the key must be ABSENT, got {none}"
+        );
+        let blank = attach_notes(base.clone(), vec!["   ".to_string(), String::new()]);
+        assert!(
+            blank.get("scanners").is_none(),
+            "blank lines are not a scan result: the key must be ABSENT, got {blank}"
+        );
+        // PRECONDITION for the two asserts above: a REAL line does land, so
+        // "absent" is proving omission and not that the key never appears at all.
+        let some = attach_notes(base, vec!["Inbound exposure: 3 listening socket(s)".to_string()]);
+        assert_eq!(
+            some["scanners"],
+            serde_json::json!(["Inbound exposure: 3 listening socket(s)"]),
+            "a real scanner line must reach the wire"
+        );
+        assert_eq!(some["filevault"], "on", "the fold must not disturb the machine checks");
+    }
+
+    /// The wire bound holds even if a producer grows: at most `NOTES_CAP` lines,
+    /// each at most `NOTE_CHARS` chars. A contract that relies on the producer
+    /// staying short is not a bound.
+    #[test]
+    fn scanner_notes_are_capped_and_truncated_on_the_wire() {
+        let many: Vec<String> = (0..NOTES_CAP + 5).map(|i| format!("line-{i}")).collect();
+        let out = attach_notes(serde_json::json!({}), many);
+        let arr = out["scanners"].as_array().expect("an array");
+        assert_eq!(arr.len(), NOTES_CAP, "the line count must be capped at {NOTES_CAP}");
+
+        let long = "é".repeat(NOTE_CHARS + 250);
+        let out = attach_notes(serde_json::json!({}), vec![long]);
+        let line = out["scanners"][0].as_str().expect("a string");
+        assert_eq!(
+            line.chars().count(),
+            NOTE_CHARS,
+            "a long line must be truncated to {NOTE_CHARS} CHARS (not bytes — this line is \
+             multi-byte, and a byte slice would panic or split a codepoint)"
+        );
+    }
+
+    /// STALENESS: the notes ride their OWN scanners' cadence (~5 min), the cached
+    /// payload carries the 30-minute machine checks' `checked_ts`. So the notes
+    /// must NEVER be baked into the cache — `re_emit_cached` re-broadcasts that
+    /// payload every fast tick, and a baked note would be replayed long after its
+    /// scanner moved on, under a timestamp that is not its own.
+    #[tokio::test]
+    async fn the_cached_payload_never_carries_scanner_notes() {
+        let run = canned(
+            "FileVault is On.",
+            "Firewall is enabled. (State = 1)",
+            "System Integrity Protection status: enabled.",
+            "No new software available.",
+        );
+        let cached = snapshot_and_cache(run).await;
+        assert!(
+            cached.get("scanners").is_none(),
+            "the CACHED payload must carry no scanner notes (they are attached at emit time \
+             so a re-broadcast never replays a stale one), got {cached}"
+        );
+        assert!(
+            cached.get("checked_ts").is_some(),
+            "PRECONDITION: this really is the cached payload (it carries checked_ts)"
+        );
+    }
+
     /// An unreadable check degrades to "unreadable" (never a fabricated verdict),
     /// unrecognized output degrades to "unclear" (never coerced to "on"), and —
     /// the secret-free pin — NOT ONE BYTE of raw command output reaches the
@@ -755,7 +926,10 @@ mod tests {
         // checked_ts records WHEN the commands ran; the verdicts ride with it.
         assert!(payload["checked_ts"].as_str().is_some_and(|t| t.contains('T')));
         assert_eq!(payload["filevault"], "on");
-        // The cache holds the exact emitted payload for the fast-pass re-emit.
+        // The cache holds the exact SCANNED payload for the fast-pass re-emit.
+        // (Not byte-identical to what goes on the wire: the ambient-scanner lines
+        // are attached at EMIT time by `with_scanner_notes`, deliberately outside
+        // this cache — see `the_cached_payload_never_carries_scanner_notes`.)
         assert_eq!(super::cache_lock().clone().unwrap(), payload);
     }
 

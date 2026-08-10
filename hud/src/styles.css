@@ -10334,6 +10334,17 @@ body,
 .posture-pill.exposed { color: var(--warn-amber); }
 .posture-pill.unknown { color: var(--fg-dim, rgba(255, 255, 255, 0.4)); }
 .posture-foot { margin-top: 8px; }
+/* Ambient scanners (persistence / inbound exposure / traffic interception).
+   Their own finding frames reach no reducer case, so their one-line summaries
+   ride the posture snapshot. Kept visually SEPARATE from the four machine rows
+   above because they are NOT dated by that block's "Checked HH:MM" — each runs
+   on its own cadence. */
+.posture-scanners { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
+.posture-scanners-head { letter-spacing: 0.06em; font-size: 0.66em; }
+.posture-scanner-line {
+  font-size: 0.82em; line-height: 1.35;
+  overflow-wrap: anywhere; /* a service list must wrap, never widen the panel */
+}
 
 /* Research provenance ledger (research.provenance): per-run grounding split.
    ALL GROUNDED (green) only when nothing was set aside; any unsourced claim

@@ -674,10 +674,56 @@ fn parse_notebook_command(lower: &str) -> Option<(&'static str, String)> {
     }
     for conn in SUBJECT_CONNECTORS {
         if let Some(subject) = rest.strip_prefix(conn) {
-            return Some((head, normalized_topic(subject)));
+            let topic = normalized_topic(subject);
+            if topic_is_a_physical_place(&topic) {
+                return None;
+            }
+            return Some((head, topic));
         }
     }
     None
+}
+
+/// Is the named subject a PLACE the notebook is lying in, rather than the thing
+/// the notebook is ABOUT?
+///
+/// THE SAME LOCATIVE SHAPE the pasteboard wipe was closed on, in a gate that
+/// reaches a HARD DELETE. "notebook" is DARWIN's word for a saved research run
+/// AND the ordinary word for a paper book on a desk, and [`SUBJECT_CONNECTORS`]
+/// is `" on "` — which introduces a research topic ("my notebook on fusion") and
+/// a location ("my notebook on the desk") with the same word. MEASURED at HEAD:
+/// "open my notebook on the desk" revisited a notebook named "the desk", and
+/// "delete my notebook on the shelf" reached [`NotebookIntent::Forget`] — the
+/// branch the doc above calls "destructive, unconfirmed, unjournalled".
+///
+/// The blast radius of that FORGET is one topic key, so what it destroys today is
+/// zero rows; what it does every time is tell the owner a deletion happened. Both
+/// halves are wrong, and the read half is the same sentence with a different verb,
+/// so the veto sits in the shared subject parser rather than on either branch.
+///
+/// EXACT MATCH after one determiner, never `contains`. "my research on desk
+/// ergonomics" and "my notebook on table manners" are real topics that merely
+/// start with a place word; requiring the subject to BE the place and nothing else
+/// is what keeps them. Bounded at both ends on purpose — an unbounded "mentions a
+/// place noun" veto here would eat real research.
+fn topic_is_a_physical_place(topic: &str) -> bool {
+    const DETERMINERS: &[&str] = &["the ", "my ", "a ", "our ", "his ", "her ", "their ", "that ", "this "];
+    let mut t = topic.trim();
+    for d in DETERMINERS {
+        if let Some(rest) = t.strip_prefix(d) {
+            t = rest.trim();
+            break;
+        }
+    }
+    const PLACES: &[&str] = &[
+        "desk", "table", "shelf", "shelves", "bookshelf", "counter", "countertop",
+        "nightstand", "bedside table", "dresser", "drawer", "floor", "wall", "chair",
+        "bed", "couch", "sofa", "windowsill", "mantel", "mantelpiece", "workbench",
+        "bench", "sideboard", "coffee table", "kitchen table", "dining table",
+        "stairs", "piano", "passenger seat", "back seat", "dashboard", "porch",
+        "nightstand drawer", "side table", "night stand",
+    ];
+    PLACES.contains(&t)
 }
 
 /// Detect a notebook management intent. CONSERVATIVE and GRAMMAR-anchored: the
@@ -1023,6 +1069,59 @@ pub async fn dispatch(
 
 #[cfg(test)]
 mod tests {
+
+    /// A NOTEBOOK LYING ON THE FURNITURE IS NOT A RESEARCH NOTEBOOK. The same
+    /// locative shape the pasteboard wipe was closed on, in the gate that reaches
+    /// `memory::forget_notebook` — a hard transactional DELETE the router
+    /// dispatches with no confirmation and no undo entry.
+    ///
+    /// MEASURED at HEAD: "open my notebook on the desk" revisited a notebook named
+    /// "the desk", and "delete my notebook on the shelf" reached FORGET. The
+    /// destructive one is the reason the veto lives in the shared subject parser
+    /// instead of on the read branch: it is the SAME sentence with a different verb.
+    #[test]
+    fn a_notebook_on_the_furniture_is_never_a_research_notebook() {
+        for u in [
+            "open my notebook on the desk",
+            "delete my notebook on the shelf",
+            "forget my notebook on the desk",
+            "show my research notebook on the table",
+            "delete my research notebook on the nightstand",
+            "open my notebook on the kitchen table",
+        ] {
+            assert_eq!(
+                classify_notebook_intent(u),
+                None,
+                "{u:?} reached the notebook store — the FORGET arm of this gate is an \
+                 unconfirmed, unjournalled DELETE"
+            );
+        }
+    }
+
+    /// ...AND A REAL TOPIC THAT MERELY OPENS WITH A PLACE WORD MUST SURVIVE. The
+    /// veto matches the subject EXACTLY (after one determiner), never `contains`,
+    /// which is what keeps "desk ergonomics" and "table manners" researchable.
+    #[test]
+    fn the_place_veto_leaves_every_real_notebook_topic_working() {
+        for (u, want) in [
+            ("open my notebook on fusion", "fusion"),
+            ("show my research on graphene", "graphene"),
+            ("my research notebook on desk ergonomics", "desk ergonomics"),
+            ("open my notebook on table manners", "table manners"),
+            ("show my research on the jwst", "the jwst"),
+        ] {
+            assert_eq!(
+                classify_notebook_intent(u),
+                Some(NotebookIntent::Revisit { topic: want.to_string() }),
+                "{u:?} is a real revisit and stopped working"
+            );
+        }
+        assert_eq!(
+            classify_notebook_intent("forget my notebook on graphene"),
+            Some(NotebookIntent::Forget { topic: "graphene".to_string() }),
+            "a real forget stopped working"
+        );
+    }
 
     /// REGRESSION (router-recall miss list): three notebook phrasings reached
     /// NOTHING — "save that to my notebook" (only the longer "…research notebook"

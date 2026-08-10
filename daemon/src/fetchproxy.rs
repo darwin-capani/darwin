@@ -603,6 +603,10 @@ async fn handle_conn<F: UrlFetcher>(
 /// Emit an `app.proxy_denied` for a security denial and return its reply JSON.
 /// SECRET-FREE: only the app name, the op, and a stable reason — never the URL
 /// or the body.
+///
+/// DIAGNOSTIC — like the OpNotPermitted site below, this frame has no
+/// `applyEnvelope` case and so reaches no pixel. Kept for the operator's live
+/// telemetry stream; the app itself only learns the stable `reason`.
 fn deny(name: &str, reason: &str) -> Option<Value> {
     telemetry::emit(
         "system",
@@ -631,7 +635,12 @@ async fn handle_line<F: UrlFetcher>(
         }
         Decision::OpNotPermitted { name, op } => {
             // Privileged/unknown op: rejected here, never fetched. The op string
-            // is echoed onto telemetry so a probe is visible to the HUD.
+            // is echoed onto telemetry as a DIAGNOSTIC — NOT, as this comment used
+            // to claim, "visible to the HUD": `applyEnvelope` is an exact-match
+            // switch with no `app.proxy_denied` case, so this frame reaches no
+            // pixel. It is kept because a probe belongs in the operator's live
+            // stream (`scripts/doctor.sh`, a `wscat` on the hub) even when nothing
+            // renders it, and the caller only ever learns `op_not_permitted`.
             telemetry::emit("system", "app.proxy_denied", json!({"name": name, "op": op}));
             return Some(json!({"ok": false, "error": "op_not_permitted"}));
         }

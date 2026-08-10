@@ -390,6 +390,64 @@ pub fn all_hits(text: &str) -> Vec<(&'static str, String)> {
 #[cfg(test)]
 mod tests {
 
+    /// HIJACKS THAT ARE STILL OPEN, AS A RATCHET.
+    ///
+    /// These fire TODAY. They are invisible on the shipped config because the
+    /// cloud conversation branch answers first (see [`CLOUD_PREEMPTED`]) — but
+    /// OFFLINE, in VAULT mode, and for a GUEST, `route()` falls through and these
+    /// gates are consulted, so an ordinary sentence renders an image or drives the
+    /// physics engine. That is precisely the population that cannot fall back on
+    /// the cloud answering first.
+    ///
+    /// They are NOT in `router_ordinary.json` because that fixture asserts ZERO
+    /// captures and these are known-bad; burying them there would turn the suite
+    /// red without telling anyone what to fix. Instead this PRINTS them and
+    /// ratchets: the count may shrink, never grow. Closing one means deleting its
+    /// line and moving the sentence into the ordinary corpus.
+    ///
+    /// The untouched branches behind them, from the adversarial pass: markforge
+    /// LAUNCH / STEP+PAUSE / GRAVITY / SPAWN, silicon LAUNCH, and genimage's
+    /// remaining hole — which is grammatical PERSON, not vocabulary, so it needs a
+    /// POS tagger rather than another lexical rule.
+    const KNOWN_OPEN_HIJACKS: &[&str] = &[
+        "we make art with the kids on saturdays",
+        "you cannot paint a picture with only one color",
+        "we draw a picture of the family every christmas",
+        "she took a step into a whole new world after graduation",
+        "hold on, the world is not ending today",
+        "they start the simulation training for new nurses next month",
+        "show me the sandbox where the kids play at the park",
+    ];
+
+    #[test]
+    fn known_open_hijacks_only_ever_shrink() {
+        let still: Vec<&str> = KNOWN_OPEN_HIJACKS
+            .iter()
+            .copied()
+            .filter(|s| !super::all_hits(s).is_empty())
+            .collect();
+        eprintln!("\n=== KNOWN-OPEN HIJACKS still firing: {}/{} ===", still.len(), KNOWN_OPEN_HIJACKS.len());
+        for s in &still {
+            eprintln!("  {:?} -> {:?}", s, super::all_hits(s));
+        }
+        assert!(
+            still.len() <= KNOWN_OPEN_HIJACKS.len(),
+            "the known-open list grew; add the sentence or close the gate"
+        );
+        // ...and the list must not rot into a lie in the other direction: a
+        // sentence that no longer fires belongs in the ordinary corpus, where it
+        // is actually enforced, not sitting here looking unfixed.
+        let fixed: Vec<&&str> = KNOWN_OPEN_HIJACKS
+            .iter()
+            .filter(|s| super::all_hits(s).is_empty())
+            .collect();
+        assert!(
+            fixed.is_empty(),
+            "these no longer hijack — move them to router_ordinary.json so the \
+             corpus enforces it, and delete them here: {fixed:?}"
+        );
+    }
+
     /// CLOUD_PREEMPTED must name real gates, or the caveat printed beside the
     /// headline is measuring nothing. A typo or a renamed gate would silently
     /// drop that gate out of the warning while it stays just as unreachable —
@@ -492,8 +550,13 @@ mod tests {
         eprintln!(
             "    of which CLOUD-PREEMPTED (classifier hits, but route() never \
              consults these gates when the cloud answers): {pre_h}/{pre_t} \
-             probes = {:.1}% of the fixture",
-            pre_t as f64 / total as f64 * 100.0
+             probes = {:.1}% of the fixture — {:?}. A hoist of the four \
+             non-capture gates was measured and REFUSED (see the block above \
+             `needs_deep_reasoning` in router.rs): four of their branches are \
+             not precise enough to be FIRST, and the other four each actuate a \
+             CAPTURE, which is an owner consent decision",
+            pre_t as f64 / total as f64 * 100.0,
+            CLOUD_PREEMPTED,
         );
         for (gate, (h, t)) in &per {
             eprintln!("  {gate:<16} {h}/{t}");
@@ -563,9 +626,59 @@ mod tests {
         // Closing it means adding a phrase to the EMERGENCY STOP's exit path,
         // which is a posture decision — reported here, not taken.
         //
-        // Raise this ONLY with a fresh measurement. Lowering it is the regression
-        // this test exists to catch.
-        const FLOOR_HIT: usize = 192;
+        // A LABEL CORRECTION PUT ONE MISS BACK: 192 -> 191, and the -1 is not a
+        // code regression.
+        //
+        // "private mode on" was labelled `vault`/`on`. The miss-list sweep
+        // relabelled it `model_tier`/`local` and counted it as a hit. NO BEHAVIOUR
+        // CHANGED — the utterance reached exactly what it reached before; the
+        // RIGHT ANSWER was redefined to whatever it already hit, which is the one
+        // move a recall number must never be allowed to make.
+        //
+        // It also settles, silently, what "private mode" MEANS — and the reason
+        // recorded for that must be the code's, not the nearest reassuring
+        // sentence. model_tier's `mod` banner does say it is "swap-only" and
+        // "changes NO safety gate", but that banner is NOT the whole of `Local`
+        // and quoting it alone gets this backwards: the same file calls `Local`
+        // "a PRIVACY control" and warns that a missed "turn on private mode"
+        // "sends the turn to the CLOUD after the user asked it not to", and
+        // `resolve_tier`'s doc says a `Local` override means "NO cloud call is
+        // made (the privacy path)". So model_tier/local DOES keep this turn's
+        // completion off the cloud. It is not nothing.
+        //
+        // What vault adds on top is the part the phrase is worth: `deny_cloud` is
+        // folded into BOTH cloud seams — the ACTUATING tool-loop gate as well as
+        // the turn's `cloud_reachable` — and `boundary::gate_and_trim` forces
+        // CUSTOMS to `TrimSpec::maximal()`, so vault also trims WHAT LEAVES on the
+        // egress that remains, and it is a durable posture rather than a per-turn
+        // model choice.
+        //
+        // THE LABEL IS BACK ON `vault` FOR THE BOOKKEEPING REASON, WHICH STANDS ON
+        // ITS OWN: a recall number may not be raised by redefining the right
+        // answer to whatever the utterance already reached, and the fixture's own
+        // twin entry ("turn private mode off") is still `vault`/`off`. Which of
+        // the two gates SHOULD own the phrase is the owner decision named below;
+        // it is not settled here, and this comment does not pretend the losing
+        // side does nothing.
+        //
+        // The fixture was also INTERNALLY INCONSISTENT, which is what makes the
+        // relabel legible as score-keeping rather than a reading of the code:
+        // "turn private mode off" is STILL labelled `vault`/`off` two entries
+        // later, and is one of the excused misses below. The same two words owned
+        // by two different gates, split exactly where it made ON a hit and left
+        // OFF an excused miss.
+        //
+        // OWNER DECISION, NAMED NOT TAKEN: making "private mode" reach the vault
+        // needs `model_tier` to stop claiming the phrase (it is consulted first
+        // and would have to yield). That redirects a spoken phrase from a model
+        // swap to a control that suppresses cloud egress. It TIGHTENS rather than
+        // widens, but it is still a posture decision about what a word actuates,
+        // so it is reported here rather than made.
+        //
+        // Raise this ONLY with a fresh measurement. Lowering it for any reason
+        // other than a label correction of this kind is the regression this test
+        // exists to catch.
+        const FLOOR_HIT: usize = 191;
         assert!(
             hit >= FLOOR_HIT,
             "router recall regressed: {hit}/{total} < {FLOOR_HIT}"
@@ -654,4 +767,6 @@ mod tests {
         );
     }
 }
+
+
 

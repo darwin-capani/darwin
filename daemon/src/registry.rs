@@ -720,8 +720,14 @@ pub fn ev_status(verify: bool, require_rebuild_match: bool, signer_count: usize)
     )
 }
 
-/// Emit the startup `registry.status` frame ONCE so a HUD that connects after
-/// boot learns the armed/inert posture. LIVE caller (main.rs). SECRET-FREE.
+/// Emit the startup `registry.status` frame ONCE. DIAGNOSTIC — for the operator's
+/// live telemetry stream and the `tracing::info!` line below, which is the surface
+/// an operator actually reads. This doc used to say a HUD "that connects after
+/// boot learns the armed/inert posture"; it does not, twice over: `applyEnvelope`
+/// has no `registry.status` case, and the topic is not in `telemetry::sticky_key`,
+/// so there is no replay for a late client to learn anything FROM. Kept, not
+/// wired: the armed/inert posture is already visible per-install through
+/// `registry.install_gate`'s own path. LIVE caller (main.rs). SECRET-FREE.
 pub fn announce_status(verify: bool, require_rebuild_match: bool, signers: &BTreeMap<String, String>) {
     let allowlist = SignerAllowlist::from_config(signers);
     let (event, payload) = ev_status(verify, require_rebuild_match, allowlist.len());

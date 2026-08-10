@@ -556,8 +556,12 @@ fn capture_loop(root: PathBuf, cfg: Arc<Config>, tx: UnboundedSender<Event>) -> 
 }
 
 /// Build the error that ENDS capture, announcing the total loss on the way out.
-/// The telemetry is the live signal (the HUD sees capture die instead of watching
-/// a waveform that simply never moves again); the returned `Err` is what
+/// The telemetry is a DIAGNOSTIC on the operator's live stream. It is NOT what
+/// the HUD sees — this doc used to say "the HUD sees capture die instead of
+/// watching a waveform that simply never moves again", and the HUD has no
+/// `audio.capture_stopped` case, so it does exactly the watching that sentence
+/// promised it would not. What the HUD actually observes is the socket closing
+/// when main winds down for the restart. The returned `Err` is what
 /// `spawn_capture` logs as `"audio capture stopped"` — heal.rs's total-loss
 /// trigger — before the sender drops and main winds down for a restart.
 fn capture_death(reason: &str) -> anyhow::Error {

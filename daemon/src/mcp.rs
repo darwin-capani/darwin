@@ -687,8 +687,20 @@ impl HttpTransport {
     /// last minted (via [`Self::capture_session_id`]), or `None` before any session
     /// is established. PURE w.r.t. the network (touches only the session mutex), so
     /// the echo-if-present behavior is unit-testable without a wire call.
+    ///
+    /// POISON-TOLERANT, and deliberately so. These two `session_id` critical
+    /// sections were the LAST `.lock().unwrap()` in the daemon's production code —
+    /// every other holder in the tree recovers with `unwrap_or_else(|e|
+    /// e.into_inner())` (or `.ok()`). They were infallible only by circumstance:
+    /// this `Mutex` has no holder outside these two methods and neither section can
+    /// panic while holding it. That is an invariant nobody wrote down and any later
+    /// edit could break in silence — and the failure mode it would buy is a PANIC
+    /// IN A LIVE TRANSPORT, which is a strictly worse outcome than losing one
+    /// echoed session id. Recovering the inner value keeps the two spellings from
+    /// diverging and states the invariant at the site instead of leaving it looking
+    /// like an oversight.
     fn session_id_to_echo(&self) -> Option<String> {
-        self.session_id.lock().unwrap().clone()
+        self.session_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Capture a session id the server handed back in its `Mcp-Session-Id` response
@@ -697,7 +709,8 @@ impl HttpTransport {
     /// session once need not repeat it on every reply. PURE w.r.t. the network.
     fn capture_session_id(&self, header: Option<&str>) {
         if let Some(sid) = header {
-            *self.session_id.lock().unwrap() = Some(sid.to_string());
+            // Poison-tolerant — the invariant is stated on `session_id_to_echo`.
+            *self.session_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(sid.to_string());
         }
     }
 
@@ -3002,6 +3015,73 @@ data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{\"mine\":true}}\n\
         // A new non-empty value REPLACES the old one (server rotated the session).
         t.capture_session_id(Some("sess-2"));
         assert_eq!(t.session_id_to_echo().as_deref(), Some("sess-2"));
+    }
+
+    /// THE SESSION MUTEX STAYS POISON-TOLERANT, LIKE EVERY OTHER LOCK IN THE TREE.
+    ///
+    /// A full enumeration of the daemon (every `.rs` file, `#[cfg(test)]` module
+    /// bodies excluded) found 123 `.lock().unwrap()` occurrences, 121 of them in
+    /// test code and exactly TWO in production — both of them here, against
+    /// `HttpTransport::session_id`. The house convention everywhere else is
+    /// `unwrap_or_else(|e| e.into_inner())` or `.ok()` — MEASURED at this revision:
+    /// 80 `.lock().unwrap_or_else(..)` sites tree-wide (23 of them in this exact
+    /// `|e| e.into_inner()` spelling) and 6 `.lock().ok()`. The two
+    /// were infallible by circumstance, not by design: nothing outside
+    /// `session_id_to_echo` / `capture_session_id` takes that mutex, and neither
+    /// section can panic while holding it. Circumstance is not an invariant, and the
+    /// price of it changing is a panic inside a live network transport.
+    ///
+    /// BOUNDED AT BOTH ENDS: the window is mcp.rs up to its FIRST `#[cfg(test)]`,
+    /// which is ~1100 lines above this test, so the mock transport's own five
+    /// `.lock().unwrap()`s (test scaffolding, where a panic IS the report) are out of
+    /// scope. Both halves are floored so neither a marker at byte 0 nor one at EOF
+    /// can make this vouch for nothing.
+    ///
+    /// COMMENT LINES ARE SKIPPED, and that is not tidiness — the first draft of this
+    /// guard counted raw substrings and FAILED on the doc comment above
+    /// `session_id_to_echo`, which names the spelling in order to explain why it is
+    /// gone. A source-anchored guard that matches prose about the defect is a guard
+    /// that self-matches; scoping it to code lines is what makes the count mean
+    /// something.
+    #[test]
+    fn the_http_session_mutex_is_not_unwrapped() {
+        let src = include_str!("mcp.rs");
+        let cut = src.find("#[cfg(test)]").expect("mcp.rs has a test seam");
+        let prod = &src[..cut];
+        assert!(prod.len() > 30_000, "the production window collapsed: {}", prod.len());
+        assert!(
+            src.len() - cut > 10_000,
+            "the #[cfg(test)] marker matched too late — the window swallowed the tests"
+        );
+        let mut recovering = 0usize;
+        let mut unwrapping: Vec<usize> = Vec::new();
+        for (n, line) in prod.lines().enumerate() {
+            let t = line.trim_start();
+            if t.starts_with("//") {
+                continue;
+            }
+            recovering += t.matches(".lock().unwrap_or_else(|e| e.into_inner())").count();
+            if t.contains(".lock().unwrap()") {
+                unwrapping.push(n + 1);
+            }
+        }
+        // The substantive assertion FIRST, so a reintroduced `.lock().unwrap()` is
+        // reported as itself rather than as a drop in the recovering-site count.
+        assert!(
+            unwrapping.is_empty(),
+            "a production `.lock().unwrap()` is back in mcp.rs at line(s) {unwrapping:?}. \
+             It panics the calling task the moment any other holder of that mutex ever \
+             panics, inside a live HTTP transport, to save one echoed session id — and \
+             these were the last two such sites in the daemon, which is exactly how one \
+             reads as an oversight"
+        );
+        // ANTI-VACUITY: a window that bound to the wrong region, or a file that lost
+        // the two sites entirely, would satisfy the emptiness check above trivially.
+        assert_eq!(
+            recovering, 2,
+            "the two session_id critical sections must both recover a poisoned lock; \
+             found {recovering}, so this guard is no longer looking at them"
+        );
     }
 
     // -- http server through the manager: SAME gate/allowlist/bounds ------

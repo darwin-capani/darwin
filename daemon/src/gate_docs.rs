@@ -100,6 +100,82 @@ fn the_nexus_core_manifest_documents_testing_the_coreaudio_feature_not_checking_
     );
 }
 
+/// `daemon` itself — THE THIRD CRATE WITH THE SAME DEFECT, found by enumerating
+/// every `[features]` block in the tree rather than by guessing which crate to look
+/// at. There are exactly four features in four manifests: `coreaudio`
+/// (apps/nexus/core), `gpu` (apps/silicon-canvas), `endpoint-security` (here), and
+/// none at all in apps/mark-forge, apps/silicon-canvas/fuzz or hud/src-tauri. Two
+/// were fixed above. The third was still prescribing a BUILD.
+///
+/// `daemon/src/main.rs` declares `mod es;` under `#[cfg(feature =
+/// "endpoint-security")]`, so `es::tests::map_event_covers_each_kind_and_rejects_unknown`
+/// — the pure kind→`SecurityEvent` mapping the whole ES path funnels through — does
+/// not exist under the documented gate; naming it there reports "0 filtered out"
+/// rather than failing. MEASURED: 3519 tests without the feature, 3520 with, and
+/// linking `-lEndpointSecurity`/`-lbsm` needs no entitlement (that gate is at
+/// runtime), so the command runs off-device.
+///
+/// Pinned in the `[features]` block, like nexus's: that is the paragraph someone
+/// reads when they turn the feature on.
+///
+/// The nexus/silicon-canvas guards above forbid the string `cargo check --features
+/// X` anywhere in their window, which works only because their retraction prose
+/// lives ABOVE `[features]`. This manifest's retraction ("a build or a check proves
+/// nothing about that test") is INSIDE the block, so a blanket string ban would
+/// either fail on correct text or have to be shaped around the exact sentence I
+/// wrote — a guard fitted to its own author. Instead the block declares its
+/// prescription on ONE line after `VERIFY IT WITH: `, and the command is extracted
+/// from there and judged: the surrounding prose may say whatever it needs to,
+/// including naming the wrong commands in order to retract them.
+#[test]
+fn the_daemon_manifest_documents_testing_the_endpoint_security_feature_not_building_it() {
+    let manifest = include_str!("../Cargo.toml");
+    let feats = section(
+        manifest,
+        "daemon/Cargo.toml",
+        "[features]",
+        "\n[build-dependencies]",
+    );
+    assert!(
+        feats.contains("endpoint-security = []"),
+        "the window missed the key it documents — every assertion below it would be \
+         vacuous:\n{feats}"
+    );
+    // The prescription is exactly the text between `VERIFY IT WITH: ` and the end of
+    // that line — bounded at BOTH ends, so the retraction prose below it is out of
+    // scope and cannot stand in for the real command either way.
+    let lead = "VERIFY IT WITH: ";
+    let at = feats
+        .find(lead)
+        .unwrap_or_else(|| panic!("daemon/Cargo.toml's [features] block no longer declares a \
+             `{lead}` line; the feature is back to having no documented command at all:\n{feats}"));
+    let after = &feats[at + lead.len()..];
+    let cmd = after[..after.find('\n').unwrap_or(after.len())].trim();
+    assert!(
+        cmd.len() > 20,
+        "the prescribed command extracted as {cmd:?} — too short to be a command, so \
+         every check below it would be vacuous"
+    );
+    assert!(
+        cmd.starts_with("cargo test "),
+        "daemon/Cargo.toml prescribes `{cmd}`. Only `cargo test` sets --cfg test; a \
+         build or a check never compiles `#[cfg(test)] mod tests`, which is the exact \
+         defect that left the nexus and silicon-canvas tests reachable by no \
+         documented command"
+    );
+    assert!(
+        cmd.contains("--features endpoint-security"),
+        "the prescribed command `{cmd}` does not name the feature, so it runs the \
+         DEFAULT gate — under which es.rs does not exist and naming its test reports \
+         \"0 filtered out\" rather than failing"
+    );
+    assert!(
+        cmd.contains("--manifest-path daemon/Cargo.toml") || cmd.contains("-p darwin-core"),
+        "the prescribed command `{cmd}` does not say WHICH crate to run it in; the \
+         documented gate set is run from the repo root"
+    );
+}
+
 /// `apps/silicon-canvas` got this right first; pin it so it cannot slide back.
 #[test]
 fn the_silicon_canvas_manifest_keeps_documenting_the_gpu_test_command() {

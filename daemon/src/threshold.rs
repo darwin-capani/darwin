@@ -384,9 +384,15 @@ pub fn guest_telemetry(decision: &GuestDecision) -> serde_json::Value {
     })
 }
 
-/// Emit the `threshold.guest` frame for the HUD. Thin live-side wrapper over
+/// Emit the `threshold.guest` frame. Thin live-side wrapper over
 /// [`guest_telemetry`]; the pure builder is what the tests pin. This is the live
 /// emit seam the router calls once per turn after [`decide`].
+///
+/// DIAGNOSTIC — this said "for the HUD" and there is no `threshold.guest` case in
+/// `applyEnvelope`, so the frame reaches no pixel. Deliberately left that way: the
+/// guest posture is enforced by the gates themselves and stated in the turn's own
+/// reply, and a per-turn banner announcing "a guest is speaking" to whoever is at
+/// the machine is a surface to add on purpose, not by wiring up a stray frame.
 pub fn emit_guest(decision: &GuestDecision) {
     crate::telemetry::emit("threshold", "threshold.guest", guest_telemetry(decision));
 }

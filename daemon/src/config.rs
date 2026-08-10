@@ -5473,6 +5473,71 @@ mod tests {
         }
     }
 
+    /// THIRD COMPANION — and the one that matters most, because it covers the file
+    /// that INSTALLS the flag.
+    ///
+    /// The two guards above hold config.rs honest about `[lumen].narrate`. Both are
+    /// scoped to config.rs, and the flag is documented in a fourth place they cannot
+    /// see: `main.rs`, at the `lumen::install_settings(cfg.lumen.narrate, ..)` call.
+    /// That comment still described the flag the way the corrected ones used to —
+    /// "continuous focus-change narration reads on-screen text aloud, so it is
+    /// EXPLICIT opt-in; OFF is a strict no-op" — every word true, and the reader
+    /// walks away believing ON is not a no-op. A per-file guard is exactly what let
+    /// the previous two survive a correction pass, so this one is scoped to the file
+    /// the earlier ones did not reach rather than to a particular sentence in it.
+    ///
+    /// Bounded at BOTH ends: main.rs up to its FIRST `#[cfg(test)]`, so this test's
+    /// own prose (which necessarily contains the phrase) is in a different file and
+    /// cannot self-match, and both halves are floored so a marker that matched at
+    /// byte 0 or at EOF fails instead of vouching for nothing.
+    #[test]
+    fn the_main_rs_lumen_install_site_says_the_flag_is_inert() {
+        let unwired = include_str!("lumen.rs").contains("NOT WIRED TO ANY CALLER TODAY");
+        let main = include_str!("main.rs");
+        let cut = main.find("#[cfg(test)]").expect("main.rs has a test module");
+        let prod = &main[..cut];
+        assert!(cut > 100_000, "the main.rs production window collapsed: {cut}");
+        assert!(
+            main.len() - cut > 10_000,
+            "the #[cfg(test)] marker matched too late — the window swallowed the tests"
+        );
+        // The install call must still be here; if it moves, this guard is pointing at
+        // nothing and must be re-derived rather than quietly passing.
+        assert!(
+            prod.contains("lumen::install_settings(cfg.lumen.narrate"),
+            "main.rs no longer installs the [lumen].narrate gate; re-point this guard"
+        );
+        let needle = "focus-change narration";
+        let sites: Vec<usize> = prod.match_indices(needle).map(|(i, _)| i).collect();
+        assert!(
+            !sites.is_empty(),
+            "main.rs stopped mentioning {needle:?} at the install site — if the wording \
+             changed, re-derive this guard rather than deleting it"
+        );
+        // NEGATIVE PIN: a phrase that is not there must find nothing, so the window
+        // above cannot be one that matches everything.
+        assert_eq!(prod.matches("focus-change narrationx").count(), 0);
+        if unwired {
+            for i in sites {
+                let mut lo = i.saturating_sub(900);
+                while lo > 0 && !prod.is_char_boundary(lo) {
+                    lo -= 1;
+                }
+                let mut hi = (i + 900).min(prod.len());
+                while hi < prod.len() && !prod.is_char_boundary(hi) {
+                    hi += 1;
+                }
+                let around = &prod[lo..hi];
+                assert!(
+                    around.contains("CHANGES NOTHING"),
+                    "lumen.rs still reports focus-change narration UNWIRED, so the file \
+                     that INSTALLS the flag must say ON changes nothing — a reader here \
+                     should not have to open lumen.rs to learn the switch is dead:\n{around}"
+                );
+            }
+        }
+    }
+
     // --- #37 SPECULATIVE DECODING + #39 QUANTIZATION defaults (OFF/neutral) ----
 
     /// #37 + #39: speculative SHIPS OFF and `draft_model` ships "", because our own

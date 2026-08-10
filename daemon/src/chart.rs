@@ -241,13 +241,51 @@ pub fn classify_chart_intent(utterance: &str) -> Option<ChartIntent> {
     // was not, even though both refer to the same thing in the same position.
     // The verb-must-lead rule above is what keeps this safe: a noun-role "chart"
     // ("my cholesterol chart from the clinic") never opens its own sentence.
-    let whole = |w: &str| crate::utterance::mentions_word(lower, w);
-    let chartable = whole("this")
-        || whole("that")
+    // ...AND THE DEMONSTRATIVE MUST BE A PRONOUN, NOT A DETERMINER.
+    //
+    // The comment directly above says the subject is "the demonstrative standing
+    // in for the live reading" — but the test was `mentions_word`, which cannot
+    // tell the pronoun "chart THAT for me" from the determiner "chart THAT
+    // COURSE". MEASURED at HEAD, all charting the CPU: "chart that course
+    // carefully", "plot that data from the survey", "chart that trip for us",
+    // "plot that point on the map", "graph that paper for class", "chart this
+    // route to the coast", "plot this story out for me", "graph this function for
+    // homework" — seven of the fifteen sentences probed in this shape. The
+    // verb-must-lead rule cannot catch them: "chart" and "plot" ARE the verb in
+    // every one, and the sentence is a genuine imperative about something DARWIN
+    // cannot plot.
+    //
+    // A demonstrative PRONOUN ends the noun phrase; a determiner is followed by
+    // the noun it modifies. So the demonstrative counts only when everything after
+    // it is address or courtesy — which is exactly the shape of the phrasings the
+    // recall fixture pins ("chart that for me", "plot that", "graph that please").
+    // Narrowing only: nothing reaches the gate here that did not before.
+    const AFTER_PRONOUN: &[&str] = &[
+        "for", "me", "us", "please", "now", "again", "darwin", "sir", "thanks", "thank",
+        "you", "instead", "too", "as", "well", "one", "up", "out", "quickly", "then",
+    ];
+    let demonstrative_is_a_pronoun = |d: &str| {
+        let mut toks = lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty());
+        // Scan for the demonstrative, then require the remainder to be filler.
+        // ANY occurrence may qualify it, so "plot this" is judged on its own tail.
+        loop {
+            match toks.next() {
+                Some(w) if w == d => {
+                    if toks.clone().all(|t| AFTER_PRONOUN.contains(&t)) {
+                        return true;
+                    }
+                }
+                Some(_) => continue,
+                None => return false,
+            }
+        }
+    };
+    let chartable = demonstrative_is_a_pronoun("this")
+        || demonstrative_is_a_pronoun("that")
         || lower.contains("system load")
-        || whole("cpu")
-        || whole("memory")
-        || whole("load");
+        || crate::utterance::mentions_word(lower, "cpu")
+        || crate::utterance::mentions_word(lower, "memory")
+        || crate::utterance::mentions_word(lower, "load");
     if !chartable {
         return None;
     }
@@ -293,6 +331,51 @@ pub fn chart_from_snapshot(snapshot: Option<crate::telemetry::SystemSnapshot>) -
 
 #[cfg(test)]
 mod tests {
+
+    /// A DEMONSTRATIVE DETERMINER IS NOT THE LIVE READING. The comment on the
+    /// `chartable` anchor called it "the demonstrative standing in for the live
+    /// reading", but the test was `mentions_word`, which cannot tell "chart THAT
+    /// for me" from "chart THAT COURSE". Every sentence here is a genuine
+    /// imperative whose verb IS chart/plot/graph — so the verb-must-lead rule
+    /// cannot see them — about something this op cannot plot. All charted the
+    /// CPU at HEAD.
+    #[test]
+    fn a_demonstrative_determiner_is_not_the_live_reading() {
+        for u in [
+            "chart that course carefully",
+            "plot that data from the survey",
+            "chart that trip for us",
+            "plot that point on the map",
+            "graph that paper for class",
+            "chart this route to the coast",
+            "plot this story out for me",
+            "graph this function for homework",
+        ] {
+            assert_eq!(
+                classify_chart_intent(u),
+                None,
+                "{u:?} rendered a two-bar CPU/memory chart for a request that is \
+                 not about this machine"
+            );
+        }
+    }
+
+    /// ...AND THE PRONOUN READING MUST SURVIVE, or this trades one defect for the
+    /// recall miss the demonstrative was widened for in the first place.
+    #[test]
+    fn the_pronoun_demonstrative_still_charts() {
+        for u in [
+            "chart that for me",
+            "plot that",
+            "graph that please",
+            "chart this",
+            "chart my cpu usage",
+            "graph the memory usage over time",
+            "chart the system load",
+        ] {
+            assert_eq!(classify_chart_intent(u), Some(ChartIntent), "{u:?} stopped charting");
+        }
+    }
 
     /// REGRESSION (router-recall miss list): "chart that for me" reached NOTHING —
     /// "this" was accepted as the demonstrative standing in for the live reading

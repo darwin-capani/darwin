@@ -12713,9 +12713,21 @@ async fn user_model_forget_tool(memory: &Memory) -> String {
 ///     spoken human yes — so a standing mission is never silently spawned.
 ///   - `confirm == true` (set ONLY by the confirmed replay): actually persist the
 ///     mission via the bounded `standing::create` (which enforces the active cap),
-///     emit the `standing.created` HUD card, and report what was set up — noting
+///     emit the `standing.created` frame, and report what was set up — noting
 ///     honestly that the subsystem is on by default and runs on schedule, but every
 ///     consequential step a run proposes still waits for confirmation.
+///
+/// DIAGNOSTIC — this line called `standing.created` a "HUD card" and it is not one.
+/// `applyEnvelope` (hud/src/core/state.ts) is an exact-match switch with a
+/// state-preserving default and has NO `standing.created` case, so the frame is
+/// built, serialized, written to the socket and dropped. `daemon/src/standing.rs`
+/// says the same at its own tripwire-arm emit — this file is the twin that still
+/// promised a card. What the user actually gets is the confirmation they just gave
+/// and the spoken ack this function returns; the frame is the operator's live-stream
+/// copy. Pinned by the HUD test
+/// `hud/src/test/silent-drops.test.ts::standing.created and app.result leave the
+/// reducer untouched` — wire a case and that test fails, so this note cannot go
+/// stale in the other direction either.
 ///
 /// The schedule phrase is parsed conservatively (ambiguous -> at-most-daily), so
 /// an unclear establish can never become a fast recurring run.

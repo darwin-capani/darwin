@@ -1900,8 +1900,13 @@ async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, soc
             .map(|m| (m, false))
             .chain(condition_due.into_iter().map(|m| (m, true)));
         for (mission, is_tripwire) in to_run {
-            // TRIPWIRE: surface WHY it fired (the condition that tripped) before the
-            // run, so the HUD can distinguish a reactive fire from a scheduled one.
+            // TRIPWIRE: surface WHY it fired (the condition that tripped) before
+            // the run. DIAGNOSTIC — this said "so the HUD can distinguish a reactive
+            // fire from a scheduled one", and it cannot: there is no
+            // `standing.tripwire` case in `applyEnvelope`. What the HUD sees is the
+            // mission's own run frames, identical either way. Kept for the
+            // operator's live stream and the journal, where the WHY is the whole
+            // value of a mission that fired without a clock.
             if is_tripwire {
                 telemetry::emit(
                     "agent.fury",
@@ -2438,11 +2443,23 @@ async fn main() -> Result<()> {
     // silent no-op until init installs the hub, and init runs ~300 lines further down.
     // LUMEN (lumen.rs): install the continuous-narration gate ONCE from
     // [lumen].narrate (mirrors screen_context::install_settings). SHIPS OFF —
-    // continuous focus-change narration reads on-screen text aloud, so it is
+    // continuous focus-change narration would read on-screen text aloud, so it is
     // EXPLICIT opt-in; OFF is a strict no-op (Lumen speaks nothing on its own).
+    //
+    // AND SO IS ON. Turning `[lumen].narrate` on installs the setting and
+    // CHANGES NOTHING: the gate's only consumer, `lumen::narrate_on_focus_change`,
+    // has ZERO call sites outside lumen.rs's own tests, and the daemon has no
+    // focus-change event source to call it from — lumen.rs's header says so in as
+    // many words, and config.rs documents it the same way in three places. This line
+    // is the one that INSTALLS the flag, so it was the last place still reading like
+    // a feature; a reader here must not have to open two other files to learn that
+    // the switch is inert. Wiring it needs a focus-change event source AND a speech
+    // call at the vision relay; neither exists, and adding them is a feature.
+    //
     // The explicit "read me the screen" request path and the voice-navigation
     // path (which selects ONE target and hands it to the UNCHANGED ui_actuate
-    // capstone) are unaffected by this gate. Only the bool is installed/logged.
+    // capstone) are a DIFFERENT path (router.rs) and work either way. Only the bool
+    // is installed/logged.
     lumen::install_settings(cfg.lumen.narrate, cfg.lumen.effective_max_controls());
     // TELEMETRY ORDER: emitted AFTER telemetry::init() — see DEFERRED STARTUP FRAMES.
     // SEMANTIC PASTEBOARD (pasteboard.rs): install the [pasteboard] settings ONCE
@@ -2876,7 +2893,10 @@ async fn main() -> Result<()> {
     // RUNBOOK subsystem status (runbook.rs; secret-free): whether the benign-only,
     // typed automation-DAG subsystem is enabled and its step bound. SHIPS OFF; a
     // runbook carries no authority (every consequential step PARKS fresh, one at a
-    // time), so the frame just reports the master switch + bound for the HUD.
+    // time), so the frame just reports the master switch + bound. DIAGNOSTIC: this
+    // said "for the HUD" and there is no `runbook.status` case in `applyEnvelope`
+    // — the frame reaches no pixel. Kept for the operator's live stream; the
+    // subsystem ships OFF, so the honest surface for "is it on" is darwin.toml.
     telemetry::emit(
         "system",
         "runbook.status",
@@ -2923,11 +2943,18 @@ async fn main() -> Result<()> {
             "cipher": "SQLCipher AES-256 (transparent, whole-file, page-level)"
         }),
     );
-    // ENCLAVE CUSTODY status (enclave.rs; secret-free — NEVER the key). Drives the
-    // HUD's "hardware-bound custody" indicator with the GROUND-TRUTH `active` (the
-    // SE wrap actually engaged this run), the honest availability reason when inert,
-    // and the public SE key label — never any key material. On the shipped
-    // unentitled build this reads "keychain-fallback / inert" honestly.
+    // ENCLAVE CUSTODY status (enclave.rs; secret-free — NEVER the key): the
+    // GROUND-TRUTH `active` (the SE wrap actually engaged this run), the honest
+    // availability reason when inert, and the public SE key label — never any key
+    // material. On the shipped unentitled build this reads "keychain-fallback /
+    // inert" honestly.
+    //
+    // DIAGNOSTIC. This said it "Drives the HUD's hardware-bound custody indicator".
+    // No such indicator exists: `applyEnvelope` has no `enclave.status` case, so
+    // the frame reaches no pixel. The custody posture the HUD DOES render is
+    // `security.status` (emitted a few lines above), whose panel already states
+    // whether the key resolved. Left emitting for the operator's live stream
+    // rather than wired to a second indicator saying the same thing.
     telemetry::emit("system", "enclave.status", enclave::status_frame(&enclave_custody));
     // SKILLS MARKETPLACE status (secret-free): the hand-written in-tree skill
     // catalog the HUD Skills panel browses — every skill's name, category,

@@ -628,9 +628,14 @@ pub async fn create(memory: &Memory, goal: &str, schedule: Schedule) -> Result<S
     save(memory, &mission).await?;
     // TRIPWIRE ARM telemetry: arming a condition trigger is itself a confirmed
     // action (this `create` is only reached from the confirmed `standing_create`
-    // path), so an arm is worth its own HUD frame. Time-based missions keep only the
+    // path), so an arm is worth its own frame. Time-based missions keep only the
     // plain `standing.created` frame (this returns None for them). Fire-and-forget;
-    // a no-op when no HUD hub is initialized (so tests are unaffected).
+    // a no-op when no hub is initialized (so tests are unaffected).
+    //
+    // DIAGNOSTIC, not "its own HUD frame" as this said: `applyEnvelope` has a case
+    // for neither `standing.tripwire_armed` nor `standing.created`, so both reach
+    // no pixel. The user is told at the moment that matters — the confirm they just
+    // gave, and the spoken ack this call returns into.
     if let Some(frame) = tripwire_armed_telemetry(&mission) {
         crate::telemetry::emit("system", "standing.tripwire_armed", frame);
     }

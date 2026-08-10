@@ -25,6 +25,19 @@ path = "src/bin/pdfjail.rs"
 # NOTIFY client, which is DEVICE-GATED at runtime (needs root + the restricted
 # com.apple.developer.endpoint-security.client entitlement + a notarized host).
 # See docs/INTROSPECT.md.
+#
+# VERIFY IT WITH: cargo test --manifest-path daemon/Cargo.toml --bin darwind --features endpoint-security
+#
+# That single line is the whole prescription, and it says `test` on purpose.
+# `mod es;` is #[cfg(feature = "endpoint-security")], so under the documented
+# default gate its `map_event_covers_each_kind_and_rejects_unknown` test DOES NOT
+# EXIST — asking for it by name there reports "0 filtered out" rather than failing,
+# which is precisely how the same defect hid tests in apps/nexus/core and
+# apps/silicon-canvas. A build or a check never sets --cfg test and so never
+# compiles `#[cfg(test)] mod tests` at all: it proves the C shim compiles and links
+# and NOTHING about that test. MEASURED on this box: 3519 tests without the
+# feature, 3520 with — and linking EndpointSecurity + libbsm needs no entitlement
+# (that gate is at runtime), so the command really does run off-device.
 endpoint-security = []
 
 [build-dependencies]

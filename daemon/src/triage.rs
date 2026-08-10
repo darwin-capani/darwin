@@ -690,6 +690,12 @@ pub async fn capture(
 
     // Secret-free telemetry: the bundle path (home-stripped), per-section counts,
     // the manifest digest, and whether the head was anchored. No captured content.
+    //
+    // DIAGNOSTIC — no HUD case for `security.triage`, so it reaches no pixel, and
+    // that is right here: `capture` is USER-INVOKED (the triage tool), and the
+    // TriageSummary it returns is rendered straight back to the caller by
+    // anthropic.rs::render_triage_summary. The owner already has the answer in the
+    // reply; this frame is the operator's copy of where the bundle landed.
     let section_items: BTreeMap<String, usize> =
         sections.iter().map(|s| (s.name.to_string(), s.item_count)).collect();
     crate::telemetry::emit(

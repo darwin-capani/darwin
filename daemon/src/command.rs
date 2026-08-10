@@ -892,6 +892,17 @@ where
 /// swallowed. The cue can NEVER change the command's return value or timing — the
 /// `Value` is already built and returned regardless of the cue. With the flag false
 /// NO cue is spawned, so confirm/deny behave byte-for-byte as today.
+///
+/// NO `command.routed` TELEMETRY. Every arm used to emit a `command.routed`
+/// {cmd: …} frame — 21 sites. The HUD has no `command.routed` case, so all 21
+/// fell through `applyEnvelope`'s exact-match default and changed nothing; the
+/// verb's own reply already goes back to the authenticated caller that sent it,
+/// and each arm's real state change (`lockdown.status`, `vault.status`) is emitted
+/// by the subsystem it calls. The frames were deleted rather than wired: a trace
+/// of "the socket client asked for X" is not something the OWNER needs shown, and
+/// an emit nothing consumes reads to the next reader as if it were. Do not
+/// reintroduce them — `route_command_emits_no_command_routed_frames` fails if you
+/// do.
 async fn route_command<P, D>(
     command: Command,
     pipeline: &Arc<P>,
@@ -904,16 +915,13 @@ where
 {
     match command {
         Command::Ask { text, agent } => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "ask", "agent": agent}));
             let reply = pipeline.ask(&text, agent.as_deref()).await;
             json!({"ok": true, "reply": reply})
         }
         Command::Brief => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "brief"}));
             json!({"ok": true, "reply": pipeline.brief().await})
         }
         Command::Mission { goal } => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "mission"}));
             json!({"ok": true, "reply": pipeline.mission(&goal).await})
         }
         Command::Roster => {
@@ -923,38 +931,30 @@ where
             json!({"ok": true, "reply": pipeline.state().await})
         }
         Command::Distill => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "distill"}));
             json!({"ok": true, "reply": pipeline.distill().await})
         }
         Command::DistillPromote => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "distill_promote"}));
             json!({"ok": true, "reply": pipeline.distill_promote().await})
         }
         Command::DistillRollback => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "distill_rollback"}));
             json!({"ok": true, "reply": pipeline.distill_rollback().await})
         }
         Command::Sync => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "sync"}));
             json!({"ok": true, "reply": pipeline.sync().await})
         }
         Command::Handoff => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "handoff"}));
             json!({"ok": true, "reply": pipeline.handoff().await})
         }
         Command::Resume => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "resume"}));
             json!({"ok": true, "reply": pipeline.resume().await})
         }
         Command::Overnight { task, agent } => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "overnight"}));
             json!({"ok": true, "reply": pipeline.overnight(&task, agent.as_deref()).await})
         }
         Command::Pending => {
             json!({"ok": true, "pending": dispatcher.list_pending().await})
         }
         Command::Confirm { id } => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "confirm"}));
             // The existing handling + reply are UNCHANGED: confirm runs to
             // completion and its reply is built FIRST.
             let reply = json!({"ok": true, "reply": dispatcher.confirm(&id).await});
@@ -967,7 +967,6 @@ where
             reply
         }
         Command::Deny { id } => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "deny"}));
             // Same shape as Confirm: deny's existing handling + reply are UNCHANGED
             // and built FIRST; the opt-in cue is a detached, result-dropped
             // fire-and-forget that can never affect the outcome or timing.
@@ -976,28 +975,27 @@ where
             reply
         }
         Command::DismissForge { ts } => {
-            telemetry::emit("system", "command.routed", json!({"cmd": "dismiss_forge", "ts": ts}));
             json!({"ok": true, "reply": dispatcher.dismiss_forge(ts).await})
         }
         Command::Policy { text } => {
-            // The phrase text is NOT logged (a tool name is not a secret, but we
-            // keep the telemetry shape minimal + uniform with the other verbs).
-            telemetry::emit("system", "command.routed", json!({"cmd": "policy"}));
+            // The phrase text is NOT logged (it never was — the deleted
+            // `command.routed` frame carried the verb name only).
             json!({"ok": true, "reply": dispatcher.policy(&text).await})
         }
         Command::Panic => {
             // The HUD PANIC button: engage the emergency stop directly via the
-            // dispatcher (lockdown::panic) — never the model. Telemetry records the
-            // engage so the HUD status indicator flips to LOCKED DOWN.
-            telemetry::emit("system", "command.routed", json!({"cmd": "panic"}));
+            // dispatcher (lockdown::panic) — never the model. The indicator flips
+            // from `lockdown::panic`'s OWN authoritative `lockdown.status` frame
+            // (the only topic the HUD's LOCKED-DOWN light listens to) plus the
+            // `locked` field on the reply below — never from a frame emitted here.
             let reply = dispatcher.panic().await;
             json!({"ok": true, "reply": reply, "locked": crate::lockdown::is_locked_down()})
         }
         Command::Unlock => {
             // The HUD unlock control: lift the lockdown directly via the dispatcher
             // (lockdown::unlock) — the authenticated-local USER path, never the
-            // model. The HUD status indicator flips back to normal.
-            telemetry::emit("system", "command.routed", json!({"cmd": "unlock"}));
+            // model. As with Panic, the indicator flips from `lockdown::unlock`'s
+            // own `lockdown.status` frame + the `locked` field on the reply.
             let reply = dispatcher.unlock().await;
             json!({"ok": true, "reply": reply, "locked": crate::lockdown::is_locked_down()})
         }
@@ -1011,7 +1009,6 @@ where
             // and surface the honest spoken ack + the new state in the reply.
             let now_on = crate::vault::set(on);
             telemetry::emit("system", "vault.status", crate::vault::status_frame(now_on));
-            telemetry::emit("system", "command.routed", json!({"cmd": "vault", "on": now_on}));
             json!({"ok": true, "reply": crate::vault::ack(now_on), "active": now_on})
         }
         Command::PlayCue { cue } => {
@@ -1019,9 +1016,7 @@ where
             // catalog member (decide). Route into the daemon's `trigger_cue` via
             // the pipeline — its gate (sfx_enabled + offline) makes switch-off /
             // no-key / offline an HONEST silent no-op; we surface whatever it
-            // returns (played/cached/unavailable), never faking a play. The cue
-            // NAME is non-secret, so telemetry records it like the other verbs.
-            telemetry::emit("system", "command.routed", json!({"cmd": "play_cue", "cue": cue}));
+            // returns (played/cached/unavailable), never faking a play.
             json!({"ok": true, "reply": pipeline.play_cue(&cue).await})
         }
         Command::DesignVoice { agent, description, name } => {
@@ -1030,10 +1025,9 @@ where
             // name) by decide. Route into the daemon's trigger_design_voice via the
             // pipeline — its gate (key + cloud tier) makes no-key / offline an
             // HONEST failure; we surface whatever it returns (designed / unavailable
-            // / failed), never faking a voice. Telemetry records the AGENT slot only
-            // — NEVER the (free-text, possibly identifying) description, the el_key,
-            // or the returned voice id.
-            telemetry::emit("system", "command.routed", json!({"cmd": "design_voice", "agent": agent}));
+            // / failed), never faking a voice. The (free-text, possibly identifying)
+            // description, the el_key and the returned voice id stay off telemetry
+            // entirely — this arm emits nothing.
             json!({"ok": true, "reply": pipeline.design_voice(&agent, &description, &name).await})
         }
         Command::CreatePronunciation { word, say, name } => {
@@ -1042,9 +1036,8 @@ where
             // trigger_create_pronunciation via the pipeline — its gate (key + cloud
             // tier) makes no-key / offline an HONEST failure; we surface whatever it
             // returns (created / unavailable / failed), never faking a dictionary
-            // id. Telemetry records the cmd only — NEVER the free-text rule, the
-            // el_key, or the returned ids.
-            telemetry::emit("system", "command.routed", json!({"cmd": "create_pronunciation"}));
+            // id. The free-text rule, the el_key and the returned ids stay off
+            // telemetry entirely — this arm emits nothing.
             json!({"ok": true, "reply": pipeline.create_pronunciation(&word, &say, &name).await})
         }
         Command::ComposeMusic { prompt, length_ms } => {
@@ -1053,9 +1046,8 @@ where
             // trigger_compose_music via the pipeline — its gate (music_enabled +
             // offline) makes switch-off / no-key / offline an HONEST failure; we
             // surface whatever it returns (composed / unavailable / failed), never
-            // faking a track. Telemetry records the cmd only — NEVER the free-text
-            // prompt or the el_key.
-            telemetry::emit("system", "command.routed", json!({"cmd": "compose_music"}));
+            // faking a track. The free-text prompt and the el_key stay off telemetry
+            // entirely — this arm emits nothing.
             json!({"ok": true, "reply": pipeline.compose_music(&prompt, length_ms).await})
         }
     }
@@ -4036,5 +4028,93 @@ mod tests {
         walk(dir, dir, &mut out);
         out.sort();
         out
+    }
+
+    // -- pixel-free telemetry: `command.routed` is gone ----------------------
+
+    /// EVERY `route_command` arm used to emit a `command.routed` frame — 21 emit
+    /// sites, the single largest pixel-free topic in the daemon. The HUD's
+    /// `applyEnvelope` is an exact-match switch with a state-preserving default
+    /// and has no `command.routed` case, so all 21 built a payload, serialized it
+    /// and wrote it to the socket for nothing, while reading at the call site as
+    /// though the owner were being told what their machine just did.
+    ///
+    /// This drives EVERY variant through the real `route_command` with a live
+    /// telemetry subscriber attached and asserts:
+    ///   (a) NO `command.routed` frame is produced by any arm, and
+    ///   (b) the frames that DO carry real state still fire — `Command::Vault`
+    ///       emits `vault.status`, which the HUD's VaultIndicator consumes. That
+    ///       second assertion is the PRECONDITION: without it a subscriber that
+    ///       silently received nothing at all would pass (a).
+    #[tokio::test]
+    async fn route_command_emits_no_command_routed_frames() {
+        let mut rx = crate::telemetry::subscribe_for_test();
+        let pipeline = Arc::new(MockPipeline::default());
+        let dispatcher = Arc::new(ProbeDispatcher::default());
+
+        let commands = vec![
+            Command::Ask { text: "hi".into(), agent: None },
+            Command::Brief,
+            Command::Mission { goal: "g".into() },
+            Command::Roster,
+            Command::State,
+            Command::Distill,
+            Command::DistillPromote,
+            Command::DistillRollback,
+            Command::Sync,
+            Command::Handoff,
+            Command::Resume,
+            Command::Overnight { task: "t".into(), agent: None },
+            Command::Pending,
+            Command::Confirm { id: "c1".into() },
+            Command::Deny { id: "d1".into() },
+            Command::DismissForge { ts: 7 },
+            Command::Policy { text: "always allow the note action".into() },
+            Command::Panic,
+            Command::Unlock,
+            Command::Vault { on: true },
+            Command::PlayCue { cue: "success".into() },
+            Command::DesignVoice {
+                agent: "edith".into(),
+                description: "a calm voice".into(),
+                name: "Edith".into(),
+            },
+            Command::CreatePronunciation {
+                word: "darwin".into(),
+                say: "dar-win".into(),
+                name: "d".into(),
+            },
+            Command::ComposeMusic { prompt: "lo-fi".into(), length_ms: None },
+        ];
+        let arms = commands.len();
+        for c in commands {
+            let _ = route_command(c, &pipeline, &dispatcher, false).await;
+        }
+        // Restore the global the Vault arm flipped BEFORE asserting, so a failing
+        // assertion cannot leave the process in go-dark for the other tests.
+        crate::vault::set(false);
+
+        let mut routed = 0usize;
+        let mut saw_vault_status = false;
+        while let Ok(frame) = rx.try_recv() {
+            let v: Value = serde_json::from_str(&frame).expect("a JSON envelope");
+            match v["event"].as_str() {
+                Some("command.routed") => routed += 1,
+                Some("vault.status") => saw_vault_status = true,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_vault_status,
+            "PRECONDITION: the subscriber must actually receive the frames these {arms} arms \
+             emit — `vault.status` was not seen, so a `command.routed` count of 0 would prove \
+             nothing"
+        );
+        assert_eq!(
+            routed, 0,
+            "route_command emitted {routed} `command.routed` frame(s); the HUD has no case for \
+             that topic, so each one is a build+serialize+socket-write that reaches no pixel. \
+             The verb's reply already goes back to the caller — do not reintroduce them"
+        );
     }
 }

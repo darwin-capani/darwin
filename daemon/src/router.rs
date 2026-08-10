@@ -1419,6 +1419,77 @@ pub async fn route(
         }
     }
 
+    // A HOIST OF THE FOUR NON-CAPTURE APP GATES WAS MEASURED HERE AND REFUSED.
+    //
+    // The four gates that forward a structured op or render on-device (silicon,
+    // nexus, markforge, genimage) sit — like the other four — BELOW the two
+    // cloud early-returns below, so on the shipped
+    // `[router].conversation_route = "cloud_heavy"` an utterance the on-device
+    // classifier labels "conversation" never reaches them and the SAME utterance
+    // offline actuates. `recall_probe::CLOUD_PREEMPTED` measures that as 28.2% of
+    // the recall fixture, and giving those four FIRST REFUSAL instead would make
+    // 13.9% of it reachable.
+    //
+    // IT WAS NOT TAKEN, AND THE REASON IS A MEASUREMENT, NOT A PREFERENCE.
+    // Suppressing the two returns for the turns those gates claim gives them
+    // first refusal on everything that currently reaches cloud conversation —
+    // which is only safe if all four classifiers are precise enough to be FIRST.
+    // Four of them are not. Sentences constructed against the branches' own
+    // trigger vocabulary, each ordinary English, each of which the gates claim
+    // TODAY (they are live on the offline / vault / guest path, and a hoist would
+    // make them live on the shipped path too):
+    //
+    //   markforge LAUNCH   `mentions_mark_forge` still admits the bare nouns "the
+    //                      simulation" / "the sandbox", so with one of four
+    //                      ordinary verbs it opens the engine —
+    //                      "they start the simulation training for new nurses
+    //                      next month", "show me the sandbox where the kids play
+    //                      at the park", "I need to open the sandbox account
+    //                      before the demo tomorrow". `names_mark_forge` (added
+    //                      for the reset branch) is the fix this branch needs.
+    //   markforge STEP     `physics_ctx` accepts the bare whole words "world" /
+    //                      "physics" / "frames", so any sentence carrying one plus
+    //                      step/advance/pause/freeze/hold/halt advances or freezes
+    //                      the world — "she took a step into a whole new world
+    //                      after graduation", "hold on, the world is not ending
+    //                      today", "pause the video during the physics lecture".
+    //   markforge GRAVITY  the ordinary English idiom "the gravity of <X>" plus
+    //                      any of ten set-ish verbs plus an ordinary target word
+    //                      writes the world's gravity vector — "put the gravity of
+    //                      the situation aside, nothing about this is normal",
+    //                      "we should change how gravity is taught in earth
+    //                      science", "turn to the gravity chapter and read about
+    //                      the moon".
+    //   markforge SPAWN    `spawn_context` also takes `mentions_mark_forge`, so a
+    //                      child's sandbox spawns a rigid body — "throw the ball
+    //                      into the sandbox at the playground".
+    //   silicon   LAUNCH   `mentions_silicon_canvas` admits the bare "the
+    //                      schematic" and this branch's verbs are still
+    //                      `contains` — "show the schematic to the electrician
+    //                      when he arrives", "the schematic showed a startling
+    //                      amount of detail".
+    //   genimage           the remaining hole is grammatical PERSON, not
+    //                      vocabulary: a request to DARWIN is an IMPERATIVE, and
+    //                      present-tense narration reuses the base form in the
+    //                      same verb-object shape — "we draw a picture of the
+    //                      family every christmas", "you cannot paint a picture
+    //                      with only one color", "we make art with the kids on
+    //                      saturdays". Verb POSITION (utterance-initial modulo a
+    //                      bounded politeness prefix) is the missing rule; verb
+    //                      FORM alone does not separate them.
+    //
+    // So the ORDER of operations is: harden those six branches, re-prove each
+    // against sentences written for the NEW rule, and only then hoist. Hoisting
+    // first buys 13.9% reachability by re-opening the defect class this campaign
+    // spent the most effort closing — 317 of 1,897 ordinary utterances captured by
+    // app gates, a tornado-watch question that turned the camera on. The gain is
+    // real and it is not worth that.
+    //
+    // The OTHER four (describe / sound / lumen / vision) are a separate question
+    // and a harder one: each actuates a camera, a screen read, a mic clip or a UI
+    // actuation, so hoisting them changes WHEN capture can fire. That is a consent
+    // decision for the owner, named here and not taken.
+
     let needs_deep_reasoning = class.complexity == "heavy";
     // VAULT MODE ("go dark") + THRESHOLD GUEST (guest = local-only) — SEAM 2 of 2. The
     // actuating tool-loop gate does NOT consult `cloud_reachable` (it would otherwise
@@ -2759,7 +2830,11 @@ fn select_agent<'a>(
 /// pre-approves; a parked step produces nothing, so its `${ref}` consumer BLOCKS rather
 /// than run on a fabricated value (the executor in runbook.rs enforces this). The named
 /// runbook is loaded from its CONFINED on-device store; an unsound runbook is refused
-/// whole. Emits the secret-free `runbook.plan` / `runbook.run` HUD frames.
+/// whole. Emits the secret-free `runbook.plan` / `runbook.run` frames — DIAGNOSTIC,
+/// NOT "HUD frames" as this line used to call them: hud/src has no `runbook` handling
+/// at all, so both fall through `applyEnvelope`'s exact-match default (runbook.rs says
+/// the same at its module head). The user learns the outcome from the spoken reply and
+/// from each consequential step's own fresh confirm.
 async fn handle_runbook_command(
     cmd: crate::runbook::RunbookCommand,
     cfg: &Config,
@@ -3198,6 +3273,27 @@ pub fn classify_music_intent(text: &str) -> Option<String> {
     // a bare "play some jazz" (no object noun, no creation verb) must NOT match.
     let play_me = lower.contains("play me");
 
+    // ...AND A CURATION REQUEST IS NOT A COMPOSITION REQUEST.
+    //
+    // THIS BRANCH EGRESSES. With `[voice].cloud_music` shipping true, reaching it
+    // POSTs the owner's sentence to ElevenLabs and spends generation credit; the
+    // request cannot be un-sent. MEASURED at HEAD: "generate a playlist of ambient
+    // music for the drive" composed a piece of music. The owner asked DARWIN to
+    // ASSEMBLE EXISTING TRACKS — which it cannot do, and which the router already
+    // refuses on purpose ("play some lo-fi music" is a recorded NO-GO, not a
+    // phrase gap: the only music capability is COMPOSE). So the utterance was
+    // answered by doing a different thing AND paying a third party to do it.
+    //
+    // A playlist / mixtape / queue names a SET of pre-existing works. Composing
+    // one continuous track and calling it that is the wrong answer whatever the
+    // verb is, so this veto is checked against the WHOLE classifier — including
+    // the `compose` verb, which otherwise anchors on its own: "compose a playlist
+    // for the drive" is the same ask worded differently.
+    const CURATION_PHRASES: &[&str] =
+        &["playlist", "play list", "mixtape", "mix tape", "queue up", "list of"];
+    if CURATION_PHRASES.iter().any(|p| lower.contains(p)) {
+        return None;
+    }
     let is_music = compose_verb || ((broad_verb || play_me) && has_object);
     if !is_music {
         return None;
@@ -5230,9 +5326,66 @@ fn bare_designator_selection(lower: &str) -> Option<String> {
     let digits: Vec<char> = d.chars().skip(letters).collect();
     ((1..=3).contains(&letters)
         && (1..=4).contains(&digits.len())
-        && digits.iter().all(char::is_ascii_digit))
+        && digits.iter().all(char::is_ascii_digit)
+        && REFDES_PREFIXES.contains(&&d[..letters]))
     .then(|| d.to_uppercase())
 }
+
+/// The reference-designator PREFIXES this idiom will accept.
+///
+/// The doc above already calls this rule "CLOSED-VOCABULARY" — it was not. The
+/// shape test was "one to three letters then one to four digits", which is also
+/// the shape of every SPREADSHEET CELL and every CHESS SQUARE. MEASURED at HEAD,
+/// all reaching `select.component`: "select a1", "highlight b2", "select e4",
+/// "highlight g7", "select h8", "highlight aa1", "select b12", "highlight a5" —
+/// eight of the nine cell/square utterances probed. `apps::send_op` forwards the
+/// op fire-and-forget, so the owner working a spreadsheet gets a PCB editor sent
+/// a selection for a part that does not exist, with no result to correlate.
+///
+/// The prefix is the only thing that separates them, and unlike the cell space it
+/// really is closed: these are the standard schematic class letters. Naming them
+/// makes the closed-vocabulary claim TRUE.
+///
+/// TEN LETTERS STAY AMBIGUOUS AND STAY ADMITTED, not one. Every SINGLE-letter
+/// class below is also a spreadsheet column, so `select <letter><digits>` stays
+/// ambiguous for C, D, F, J, K, L, Q, R, U and Y — MEASURED still reaching
+/// `select.component` at this revision: "select c3", "select d4", "highlight f5",
+/// "select j2", "highlight k4", "select l7", "highlight q9", "select u3",
+/// "highlight y2". Three of them (C, D, F) are chess files too, so 24 of the 64
+/// squares are admitted as well.
+///
+/// Saying "the one left open is select c3" would be a HAND-PICKED SUBSET — the
+/// same shape as the "6 of 6 vacuous" figure that became 5 of 79 on full
+/// enumeration. What the prefix list actually closes is the letters that are NOT
+/// designator classes: A, B, E, G, H, M, N, O, P, S, T, V, W, X, Z and every
+/// multi-letter column (AA1, AB2, …). That is a real narrowing and it is what the
+/// test measures; it is not a closed rule over spreadsheet cells, and the
+/// "CLOSED-VOCABULARY" claim above is about the DESIGNATOR vocabulary only.
+///
+/// The overlap is admitted rather than closed because the op is a non-destructive
+/// SELECTION: it costs a mis-sent op rather than anything the owner cannot undo.
+/// Dropping single-letter prefixes wholesale would take R14, U3, C5 and Q2 — the
+/// actual shipped probes — with it.
+const REFDES_PREFIXES: &[&str] = &[
+    "c",  // capacitor
+    "d",  // diode
+    "f",  // fuse
+    "fb", // ferrite bead
+    "j",  // connector
+    "jp", // jumper
+    "k",  // relay
+    "l",  // inductor
+    "ls", // loudspeaker
+    "mh", // mounting hole
+    "q",  // transistor
+    "r",  // resistor
+    "rn", // resistor network
+    "rv", // varistor
+    "sw", // switch
+    "tp", // test point
+    "u",  // integrated circuit
+    "y",  // crystal / oscillator
+];
 
 fn selected_component(lower: &str) -> Option<String> {
     let Some(reference) = extract_component_ref(lower) else {
@@ -6777,6 +6930,110 @@ fn op_read_screen(query: Option<&str>) -> String {
     }
 }
 
+/// Is the screen this utterance names SOMEBODY ELSE'S DEVICE?
+///
+/// ONE IMPLEMENTATION, TWO CALLERS — [`lumen_is_read`] and [`screen_read_op`].
+/// They are two gates onto the SAME consequence (a capture of the owner's screen,
+/// read back aloud) and they overlap by design, so a veto in one alone moves the
+/// hijack instead of closing it. That is not hypothetical here: with only Lumen
+/// narrowed, "read the display on the thermostat" and "read the screen on the
+/// treadmill" still captured the screen — through Vision — and the owner would
+/// have seen no change at all.
+///
+/// MEASURED at HEAD, all capturing: "what buttons are on the display of the
+/// microwave", "what controls are on the display of the oven", "read the display
+/// on the thermostat", "what buttons are on the dashboard display of the car",
+/// "what fields are on the display of the printer", "read the screen on the
+/// treadmill", "what buttons are on the screen of the coffee machine", "list the
+/// controls on the elevator display" — eight of the twelve sentences probed in
+/// this shape, against four real phrasings that must keep working.
+///
+/// `is_screen_read` calls a screen read the thing that "can surface on-screen
+/// passwords/messages", and the readout is SPOKEN — so an owner asking about a
+/// kitchen appliance, out loud, with company in the room, had their screen read
+/// back to them. A disclosure cannot be undone through the channel that caused it.
+///
+/// "display" and "screen" are ordinary words for ANY device's readout, so the noun
+/// cannot be the discriminator. THE POSSESSOR IS: real phrasings leave the screen
+/// unowned ("read the screen") or own it to THIS machine ("my screen", "on this
+/// screen"), while an appliance phrasing always names its owner in an of/on
+/// possessor. So when a possessor is present it must name this machine or one of
+/// its own surfaces.
+///
+/// ALLOWLIST, NOT AN APPLIANCE DENYLIST. Appliances are an open class, and an
+/// open-class denylist is precisely the guard that reads as though it works.
+/// "What a screen may belong to" is short and closed. Being incomplete on this
+/// side can only leave a hijack open — it can never open a new one — and the
+/// failure mode is a wasted sentence rather than a capture.
+fn reads_another_devices_display(lower: &str) -> bool {
+    const POSSESSIVE: &[&str] = &[
+        " of the ", " of a ", " of my ", " of this ", " on the ", " on a ", " on my ",
+        " on this ",
+    ];
+    // Matched on the FIRST token of the possessor, because that is where its owner
+    // sits: "the display OF THE MICROWAVE" and "the ELEVATOR display" both name
+    // their device there, while "the settings page" and "the login screen" name a
+    // qualifier. Matching the possessor's HEAD noun instead would admit "the
+    // elevator display" — its head IS "display" — and lose the fix, so the
+    // qualifiers are enumerated here on the ALLOW side.
+    const OWN_SURFACE: &[&str] = &[
+        // This machine.
+        "mac", "macbook", "computer", "laptop", "machine", "desktop", "monitor", "system",
+        // Its own surfaces.
+        "screen", "display", "window", "page", "dialog", "app", "toolbar", "sidebar",
+        "form", "browser", "tab", "panel", "ui", "interface",
+        // LUMEN'S OWN CONTROL VOCABULARY — the list that makes an utterance a
+        // Lumen read in the first place. `lumen_mentions_control_noun` is
+        // button / link / tab / checkbox / field / menu / control / icon, and
+        // FIVE of those eight were missing here, so the veto was eating the
+        // capability it exists to protect. MEASURED at this revision, all four
+        // reaching a Lumen read at 7731042 and NOTHING after: "read the label on
+        // the button", "read the labels on the checkboxes", "read the labels on
+        // the icons", "read me the labels on the tabs", plus "read the options on
+        // the dropdown menu". A screen read of the owner's own screen is the
+        // capability; refusing it is not a safe default, it is the feature off.
+        //
+        // These cannot admit an appliance, which is why they are safe to restore:
+        // "the button", "the checkbox", "the icon" name PARTS OF A SCREEN, never
+        // something that HAS a screen. Re-proved on the appliance side rather
+        // than asserted — see `a_restored_control_noun_does_not_carry_an_
+        // appliance_past_the_veto`, whose sentences put a restored word in the
+        // FIRST possessor and the device in the SECOND.
+        "button", "checkbox", "check box", "control", "field", "icon", "link",
+        "dropdown", "label",
+        // Qualifiers that still name one of THIS machine's surfaces.
+        "settings", "login", "log", "sign", "lock", "home", "start", "menu", "options",
+        "preferences", "search", "checkout", "payment", "current", "active", "front",
+        // WHICH of this machine's screens. "what's on my second screen" is a
+        // harvested capability-index phrase, and its test went red on the first
+        // draft of this list — a positional qualifier names a monitor, not another
+        // device.
+        "second", "first", "third", "other", "main", "primary", "secondary",
+        "external", "extra", "left", "right", "top", "bottom", "big", "small",
+    ];
+    POSSESSIVE.iter().any(|p| {
+        lower.match_indices(p).any(|(i, _)| {
+            let tail = &lower[i + p.len()..];
+            !OWN_SURFACE.iter().any(|s| {
+                tail.strip_prefix(s).is_some_and(|r| {
+                    // ...IN THE PLURAL TOO. Every control noun above is one the
+                    // owner says in the plural far more often than the singular
+                    // ("read the labels on the ICONS"), and a singular-only match
+                    // refused all of them: "icons" leaves "s" and "checkboxes"
+                    // leaves "es", both alphanumeric, so the word-boundary test
+                    // rejected its own entry. Bounded to those two suffixes, and
+                    // it cannot re-open a capture: no appliance name is an
+                    // own-surface word plus s/es (there is no "screens" or
+                    // "buttones" that is a device), so the only thing this admits
+                    // is the plural of something already allowed.
+                    let r = r.strip_prefix("es").or_else(|| r.strip_prefix('s')).unwrap_or(r);
+                    !r.starts_with(|c: char| c.is_alphanumeric())
+                })
+            })
+        })
+    })
+}
+
 /// Map a lowercased utterance to a `read.screen` op line, or None when it is not
 /// a screen-read request. PURE so the mapping is unit-tested without a socket or
 /// a running app. Recognized intents:
@@ -6787,6 +7044,11 @@ fn op_read_screen(query: Option<&str>) -> String {
 ///     A where-is query carries the control phrase so the app's structuring can
 ///     LOCATE (not click) the best-matching block.
 fn screen_read_op(lower: &str) -> Option<String> {
+    // NOT SOMEBODY ELSE'S DEVICE. Shared with Lumen's read arm so the two gates
+    // onto this capture cannot drift — see [`reads_another_devices_display`].
+    if reads_another_devices_display(lower) {
+        return None;
+    }
     // Where-is a control: "where is/where's the <X> button", "find the <X>
     // button", "locate the <X>". The query is the control phrase; the app
     // locates it READ-ONLY (returns its box/center, never a click).
@@ -6993,6 +7255,11 @@ fn lumen_is_read(lower: &str) -> bool {
         || lower.contains("white board")
         || lower.contains("describe");
     if deferred {
+        return false;
+    }
+    // ...AND NOT WHEN THE THING BEING READ BELONGS TO SOME OTHER DEVICE. Shared
+    // with Vision's `screen_read_op` — see [`reads_another_devices_display`].
+    if reads_another_devices_display(lower) {
         return false;
     }
     let mentions_screen = lower.contains("screen") || lower.contains("display");
@@ -7594,19 +7861,10 @@ pub fn generate_image_command(text: &str) -> Option<GenerateImageRequest> {
         return None;
     }
 
-    // A GENERATE verb must be present — the act of creating a new image.
-    const GEN_VERBS: &[&str] = &[
-        "generate", "make", "draw", "create", "paint", "render", "imagine", "sketch",
-    ];
-    let has_gen_verb = GEN_VERBS.iter().any(|v| lower.contains(v));
-
-    // An IMAGE noun anchors the request to a picture (so "make me a sandwich"
-    // never reads as image generation). The noun is also where the prompt begins.
-    const IMAGE_NOUNS: &[&str] = &[
-        "image", "picture", "photo", "drawing", "painting", "illustration", "artwork", "art ",
-    ];
-    let has_image_noun = IMAGE_NOUNS.iter().any(|n| lower.contains(n));
-    if !has_gen_verb || !has_image_noun {
+    // A GENERATE verb must COMMAND an IMAGE noun — see `image_noun_is_commanded`
+    // for the three things that used to be missing (whole words, base forms, and
+    // an object relation between the two).
+    if !image_noun_is_commanded(&lower) {
         return None;
     }
 
@@ -7614,11 +7872,92 @@ pub fn generate_image_command(text: &str) -> Option<GenerateImageRequest> {
     // phrasing survives. Prefer the explicit "of/showing/depicting <X>" tail; the
     // first such connector AFTER an image noun is where the subject begins.
     if let Some(prompt) = extract_image_prompt(text) {
-        if !prompt.trim().is_empty() {
-            return Some(GenerateImageRequest { prompt: prompt.trim().to_string() });
+        let prompt = prompt.trim();
+        // A CLAUSE IS NOT A DEPICTABLE SUBJECT. "paint a picture of WHAT next
+        // year looks like", "paint me a picture of HOW the meeting went", "draw
+        // me a picture of WHY that matters" are the English idiom for EXPLAIN,
+        // and they satisfy every lexical half of this gate. A real image request
+        // names a thing ("a lighthouse", "a red bicycle", "a fox in the snow");
+        // a wh-word after the connector means the tail is a proposition, and the
+        // diffusion model would be handed a sentence instead of a subject.
+        const CLAUSE_OPENERS: &[&str] = &[
+            "what", "how", "why", "where", "when", "who", "whether",
+        ];
+        let opener = prompt
+            .split(|c: char| !c.is_alphanumeric())
+            .find(|w| !w.is_empty())
+            .unwrap_or_default()
+            .to_lowercase();
+        if CLAUSE_OPENERS.contains(&opener.as_str()) {
+            return None;
+        }
+        if !prompt.is_empty() {
+            return Some(GenerateImageRequest { prompt: prompt.to_string() });
         }
     }
     None
+}
+
+/// Whether a GENERATE verb actually COMMANDS an image noun in `lower` — i.e. the
+/// noun is that verb's OBJECT, not merely another word in the same sentence.
+///
+/// WHAT WENT WRONG: the gate was two independent `contains` scans — "does any
+/// generate verb appear as a SUBSTRING anywhere" AND "does any image noun appear
+/// as a SUBSTRING anywhere". Neither half was a whole word, neither was a base
+/// form, and nothing tied them together, so ordinary speech generated pictures:
+///   "the photosynthesis chapter makes more sense with the diagram of the leaf"
+///        ("photo" inside photosynthesis, "make" inside makes)
+///   "art therapy makes a difference with kids who have trouble talking"
+///        ("art " as a substring, "make" inside makes)
+///   "my daughter created a drawing of a dinosaur with a crayon"   (narration)
+///   "that painting of the harbor is my favourite thing in the house"
+///   "remake that photo album of the wedding with the newer prints"
+///   "the big picture of this quarter is that we make less with more effort"
+///   "make an effort with the picture of professionalism you project"
+///   "I cannot imagine the pressure of taking a photo with a broken lens"
+/// Three rules close all of those and cost none of the shipped phrasings:
+///   1. WHOLE WORDS on both halves — kills photosynthesis/art-therapy/remake.
+///   2. BASE FORMS only for the verb. A request to DARWIN is imperative
+///      ("draw me a picture"), so the inflected forms are narration about
+///      somebody else drawing: makes / created / painted / drew / draws /
+///      rendered / painting-as-a-noun. Dropping them costs no imperative.
+///   3. The noun must be the verb's OBJECT: it follows the verb across at most
+///      two determiner-ish words. That is what separates "make a picture of X"
+///      from "make an effort with the picture of X" and from "the big picture …
+///      we make less".
+///
+/// "imagine" is NOT a generate verb. It was, and it is the one verb on the list
+/// whose ordinary imperative sense ("imagine the artwork of a whole generation
+/// with no galleries left") is the DOMINANT one; no shipped phrasing uses it to
+/// mean render, and it cannot be told apart by position because "imagine the
+/// artwork" is a textbook verb-object pair.
+fn image_noun_is_commanded(lower: &str) -> bool {
+    const GEN_VERBS: &[&str] =
+        &["generate", "make", "draw", "create", "paint", "render", "sketch"];
+    const IMAGE_NOUNS: &[&str] = &[
+        "image", "images", "picture", "pictures", "photo", "photos", "drawing", "drawings",
+        "painting", "paintings", "illustration", "illustrations", "artwork", "art",
+    ];
+    // The words a speaker slips between a generate verb and its object — "draw
+    // ME A picture", "generate AN image", "make MY picture". Deliberately only
+    // determiners and object pronouns: one content word in the gap ("make an
+    // EFFORT with the picture") and the noun is not what is being generated.
+    const GAP: &[&str] = &["me", "us", "a", "an", "the", "my", "your", "one", "some", "another"];
+    let words = speech_words(lower);
+    for (i, w) in words.iter().enumerate() {
+        if !GEN_VERBS.contains(w) {
+            continue;
+        }
+        for w2 in words.iter().skip(i + 1).take(3) {
+            if IMAGE_NOUNS.contains(w2) {
+                return true;
+            }
+            if !GAP.contains(w2) {
+                break;
+            }
+        }
+    }
+    false
 }
 
 /// Extract the image PROMPT (subject) from a generate phrase, in ORIGINAL case.
@@ -9338,26 +9677,51 @@ const MARK_FORGE_BARE_SPAWN_VOCAB: &[&str] = &[
 ];
 
 fn mentions_mark_forge(lower: &str) -> bool {
+    names_mark_forge(lower) || lower.contains("the simulation") || lower.contains("the sandbox")
+}
+
+/// The half of [`mentions_mark_forge`] that actually NAMES this engine.
+///
+/// `mentions_mark_forge` also admits the bare nouns "the simulation" / "the
+/// sandbox", which are ordinary English about anything anyone models or any
+/// walled-off environment ("reset the sandbox account", "the simulation of my
+/// expectations"). That is fine for a branch that has ANOTHER anchor, and not
+/// fine for one where the co-word IS the anchor — see the world-reset branch.
+fn names_mark_forge(lower: &str) -> bool {
     lower.contains("mark forge")
         || lower.contains("mark-forge")
         || lower.contains("markforge")
         || lower.contains("physics sandbox")
         || lower.contains("physics sim")
         || lower.contains("physics engine")
-        || lower.contains("the simulation")
-        || lower.contains("the sandbox")
         || lower.contains("rigid body")
         || lower.contains("rigid-body")
 }
 
+/// The bare world-reset idiom — the WHOLE utterance is nothing but "reset the
+/// world" / "clear the simulation" / "wipe the scene". Same closed-vocabulary
+/// shape the spawn branch and the Nexus bare idioms use, and chosen for the same
+/// reason: it cannot be satisfied by ADDING words, so one content word from
+/// outside this list ("pandemic", "breakup", "police", "account", "expectations")
+/// and it is somebody talking about their life, not wiping a physics scene.
+const MARK_FORGE_BARE_RESET_VOCAB: &[&str] = &[
+    "reset", "resets", "clear", "clears", "wipe", "wipes",
+    "the", "a", "an", "this", "my", "all", "everything", "in", "out",
+    "world", "scene", "bodies", "body", "simulation", "sandbox", "physics", "sim",
+    "please", "darwin", "hey", "ok", "okay", "now", "just", "can", "could", "would", "you",
+    "and", "for", "me", "us",
+];
+
 /// Whether the utterance carries an open-class launch verb.
+///
+/// WHOLE WORDS. Under `contains`, "start" matched "started" and "show" matched
+/// "showed"/"showing", so a past-tense sentence that merely mentioned "the
+/// simulation" was a LAUNCH: "they cleared the simulation results and started
+/// over" opened Mark-Forge. A narration is not an instruction.
 fn mentions_mark_forge_launch_verb(lower: &str) -> bool {
-    lower.contains("open")
-        || lower.contains("launch")
-        || lower.contains("start")
+    crate::utterance::mentions_any_word(lower, &["open", "launch", "start", "show"])
         || lower.contains("bring up")
         || lower.contains("fire up")
-        || lower.contains("show")
 }
 
 /// Map a spoken utterance to a Mark-Forge command, or None when it is not a
@@ -9441,12 +9805,33 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
     // gravity op) — handled by requiring a world/scene noun and excluding the
     // gravity case, which the gravity branch below also catches first if it has
     // a target.
+    //
+    // WHAT WENT WRONG: the co-word WAS the whole gate, and every co-word on that
+    // list is ordinary English. Any sentence carrying one of them plus the word
+    // reset/clear/wipe ANYWHERE wiped the physics world:
+    //   "the world reset itself after the pandemic in a lot of ways"
+    //   "reset the simulation of my expectations for this quarter"
+    //   "clear the scene before the police get here"
+    //   "I need to reset my whole world after that breakup"
+    //   "the bodies of water in this county are all clear now"
+    //   "wipe the scene from your memory it was embarrassing"
+    //   "clear the world of that idea please"  /  "reset the sandbox account"
+    //   "my world reset when the baby arrived"
+    // The SIBLING spawn branch above already carries the answer and this branch
+    // never got it: the utterance must NAME the engine, or be nothing BUT the
+    // bare reset idiom. `mentions_mark_forge`'s loose halves ("the simulation",
+    // "the sandbox") do NOT count as naming it here — they are exactly what
+    // "reset the simulation of my expectations" walked in through, so the
+    // context test uses `names_mark_forge`.
+    let reset_context = names_mark_forge(&lower)
+        || nexus_closed_vocabulary(&lower, MARK_FORGE_BARE_RESET_VOCAB, false);
     if crate::utterance::mentions_any_word(&lower, &["reset", "clear", "wipe"])
         && !lower.contains("gravity")
         && (mentions_mark_forge(&lower)
             || mentions_word(&lower, "world")
             || mentions_word(&lower, "scene")
             || mentions_word(&lower, "bodies"))
+        && reset_context
     {
         return Some(MarkForgeCommand::Op(op_world_reset()));
     }
@@ -9704,6 +10089,195 @@ fn op_spawn_sphere() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// SOMEBODY ELSE'S DISPLAY IS NOT THE OWNER'S SCREEN — asserted on BOTH gates
+    /// that reach the capture, because they overlap and closing one alone only
+    /// moves the hijack. MEASURED: with only Lumen narrowed, "read the display on
+    /// the thermostat" and "read the screen on the treadmill" still captured the
+    /// screen through Vision, so the owner would have seen no change.
+    ///
+    /// A screen read surfaces on-screen passwords/messages (`is_screen_read` says
+    /// so) and is read back ALOUD. Every sentence here is about an appliance.
+    #[test]
+    fn a_read_aimed_at_another_devices_display_never_captures_the_screen() {
+        for u in [
+            "what buttons are on the display of the microwave",
+            "what controls are on the display of the oven",
+            "read the display on the thermostat",
+            "what buttons are on the dashboard display of the car",
+            "what fields are on the display of the printer",
+            "read the screen on the treadmill",
+            "what buttons are on the screen of the coffee machine",
+            "list the controls on the elevator display",
+        ] {
+            assert!(
+                super::lumen_command(u).is_none(),
+                "{u:?} reached a Lumen screen read — the owner asked about an appliance"
+            );
+            assert!(
+                super::screen_read_op(&u.to_lowercase()).is_none(),
+                "{u:?} reached a Vision screen read — the owner asked about an appliance"
+            );
+            assert!(
+                !super::is_screen_read(u),
+                "{u:?} is still classified as a screen read"
+            );
+        }
+    }
+
+    /// ...AND EVERY REAL SCREEN READ MUST SURVIVE ON BOTH GATES. The possessor
+    /// allowlist has to cover this machine AND the surfaces that live on it, or
+    /// the veto eats the capability it is protecting.
+    #[test]
+    fn the_other_device_veto_leaves_every_real_screen_read_working() {
+        for u in [
+            "what buttons are on this screen",
+            "read the controls on this screen",
+            "read my screen",
+            "what's on my screen",
+            "read me the screen",
+            "read the screen",
+            "what is on my screen",
+            "read the buttons on the settings page",
+            "read the controls on the login screen",
+            "read the screen on my mac",
+            // FOUND BY MEASUREMENT, NOT BY INSPECTION. Each of these reached a
+            // Lumen read at 7731042 and reached NOTHING once the veto landed,
+            // because the possessor allowlist omitted five of the eight nouns in
+            // `lumen_mentions_control_noun` — the very list that makes an
+            // utterance a Lumen read. The guard was refusing its own capability.
+            "read the label on the button",
+            "read the labels on the checkboxes",
+            "read the labels on the icons",
+            "read me the labels on the tabs",
+            "read the options on the dropdown menu",
+        ] {
+            assert_eq!(
+                super::lumen_command(u),
+                Some(super::LumenCommand::Read),
+                "{u:?} is a real screen read and stopped working"
+            );
+        }
+    }
+
+    /// RE-PROVING THE APPLIANCE SIDE AFTER THE ALLOWLIST WAS WIDENED. Adding the
+    /// control nouns puts a word on the ALLOW side that an appliance sentence can
+    /// legitimately carry ("read the labels on the BUTTONS of the microwave"), so
+    /// the veto has to be re-proved rather than assumed still sound: widening one
+    /// end of a guard makes a NEW guard.
+    ///
+    /// The veto survives because it fires when ANY possessor names something that
+    /// is not one of this machine's surfaces — so a sentence may satisfy the
+    /// allowlist at its first possessor and still be refused at its second, which
+    /// is exactly the shape an appliance sentence takes. Every sentence here puts
+    /// a NEWLY-restored word in the first possessor and the device in the second;
+    /// without the second-possessor rule they would all capture the screen.
+    ///
+    /// AND EVERY ONE WAS MEASURED FIRING AT 7731042 — a negative probe chosen to
+    /// pass is not a probe. The first draft of this test carried "what buttons are
+    /// on the control panel of the washing machine", which reached NOTHING at HEAD
+    /// (no read verb, no screen word), so asserting it was refused asserted
+    /// nothing; it was replaced with "read the buttons on the control panel of the
+    /// washing machine", which DID reach a Lumen read. The isolating mutation is
+    /// recorded too: adding "washing" to the allowlist above fails THIS test while
+    /// leaving the eight-appliance test green.
+    #[test]
+    fn a_restored_control_noun_does_not_carry_an_appliance_past_the_veto() {
+        for u in [
+            "read the labels on the buttons of the microwave",
+            "read the buttons on the control panel of the washing machine",
+            "read the icons on the display of the oven",
+            "read the labels on the buttons of the thermostat",
+            "read the label on the button of the microwave",
+            "read the links on the page of the treadmill",
+        ] {
+            assert!(
+                super::lumen_command(u).is_none(),
+                "{u:?} reached a Lumen screen read — a restored control noun carried \
+                 an appliance past the veto"
+            );
+            assert!(
+                super::screen_read_op(&u.to_lowercase()).is_none(),
+                "{u:?} reached a Vision screen read — a restored control noun carried \
+                 an appliance past the veto"
+            );
+            assert!(
+                !super::is_screen_read(u),
+                "{u:?} is still classified as a screen read"
+            );
+        }
+    }
+
+    /// A PLAYLIST IS A CURATION REQUEST, AND THIS BRANCH EGRESSES. With
+    /// `[voice].cloud_music` shipping true, reaching the composer POSTs the
+    /// owner's sentence to ElevenLabs and spends generation credit — for a request
+    /// DARWIN cannot satisfy at all (the only music capability is COMPOSE; "play
+    /// some lo-fi music" is a recorded NO-GO). MEASURED at HEAD: six of ten
+    /// sentences probed in this shape composed music.
+    #[test]
+    fn a_curation_request_never_reaches_the_cloud_composer() {
+        for u in [
+            "generate a playlist of ambient music for the drive",
+            "make a playlist of lo-fi music for studying",
+            "produce a playlist of background music for the party",
+            "write a playlist of instrumental music for dinner",
+            "generate a list of ambient music artists",
+            "make me a mixtape of ambient music",
+            "compose a playlist for the drive",
+            "queue up some background music",
+        ] {
+            assert!(
+                super::classify_music_intent(u).is_none(),
+                "{u:?} was sent to the cloud composer — the owner asked for a set of \
+                 existing tracks, which is a recorded NO-GO"
+            );
+        }
+        // ...and composition itself is untouched.
+        for u in [
+            "make me a song about the rain",
+            "generate some background music",
+            "compose something calm for me",
+            "make a jingle for the podcast",
+            "produce some instrumental music",
+        ] {
+            assert!(super::classify_music_intent(u).is_some(), "{u:?} stopped composing");
+        }
+    }
+
+    /// A SPREADSHEET CELL IS NOT A REFERENCE DESIGNATOR. The bare-designator
+    /// idiom's doc calls it "CLOSED-VOCABULARY"; the shape test was "1-3 letters
+    /// then 1-4 digits", which is also every spreadsheet cell and every chess
+    /// square. MEASURED at HEAD: eight of the nine cell/square utterances probed
+    /// reached `select.component`.
+    #[test]
+    fn a_spreadsheet_cell_is_not_a_bare_reference_designator() {
+        for u in [
+            "select a1", "highlight b2", "highlight a5", "select e4", "highlight g7",
+            "select h8", "highlight aa1", "select b12",
+        ] {
+            assert!(
+                super::silicon_canvas_command(u).is_none(),
+                "{u:?} was forwarded to Silicon Canvas as a component selection"
+            );
+        }
+        // The refdes idiom itself is untouched — these are the shipped probes, and
+        // dropping single-letter prefixes wholesale would have taken all of them.
+        for (u, want) in [
+            ("select r14", "R14"),
+            ("highlight u3", "U3"),
+            ("isolate c5", "C5"),
+            ("probe q2", "Q2"),
+        ] {
+            match super::silicon_canvas_command(u) {
+                Some(super::SiliconCanvasCommand::Op(line)) => {
+                    let v: serde_json::Value = serde_json::from_str(&line).expect("wire json");
+                    assert_eq!(v["op"], "select.component", "{u:?}");
+                    assert_eq!(v["name"], want, "{u:?}");
+                }
+                other => panic!("{u:?} stopped selecting: {other:?}"),
+            }
+        }
+    }
 
     /// REGRESSION (router-recall miss list): eight app-command phrasings reached
     /// NOTHING. Each assertion below names the utterance the printed miss list
@@ -11714,6 +12288,137 @@ mod tests {
         );
     }
 
+    /// BOTH CLOUD EARLY-RETURNS ARE UNCONDITIONAL, AND THAT IS LOAD-BEARING.
+    ///
+    /// A hoist of the four non-capture app gates — suppressing these two returns
+    /// for the turns silicon / nexus / markforge / genimage claim — was built,
+    /// measured and REFUSED: it gives those gates FIRST REFUSAL on everything
+    /// that reaches cloud conversation, and six of their branches are not precise
+    /// enough to be first (the block above `needs_deep_reasoning` in `route()`
+    /// names each branch and the ordinary sentence it swallows).
+    ///
+    /// Nothing else can catch a re-land. `route()` is async over a Memory, an
+    /// InferenceClient and an AppRegistry, so no unit test reaches these two
+    /// lines; adding one `&& !hoisted` to either would make 48 measured ordinary
+    /// sentences actuate an app on the shipped config while every other test in
+    /// this file stayed green. So this reads the source, with the two rules that
+    /// class of guard needs:
+    ///   * BOUNDED AT BOTH ENDS — from the refusal block to the local seam's
+    ///     first classifier call, so it cannot reach this test module and
+    ///     SELF-MATCH on the needles written right here;
+    ///   * `expect` on every needle, never `unwrap_or`, so a moved anchor is a
+    ///     loud failure and not a silently-true assertion.
+    ///
+    /// If you are re-landing the hoist: harden the six branches first, re-prove
+    /// each against sentences written for the NEW rule, then change this guard
+    /// deliberately — it is the record that the work was not skipped.
+    #[test]
+    fn both_cloud_returns_are_unconditional() {
+        let src = include_str!("router.rs");
+        let start = src
+            .find("// A HOIST OF THE FOUR NON-CAPTURE APP GATES WAS MEASURED HERE AND REFUSED.")
+            .expect("route()'s hoist-refusal record is gone; re-point this guard");
+        let rest = &src[start..];
+        let end = rest
+            .find("let describe = describe_command(text);")
+            .expect("route()'s local app seam moved; re-point this guard");
+        let window = &rest[..end];
+        assert!(
+            !window.contains("fn both_cloud_returns_are_unconditional"),
+            "the window swallowed this test — it would pass on its own source"
+        );
+        let tool_loop = window
+            .find("let actuating_cloud = to_cloud && !is_uncertain_fallback(class, cfg);")
+            .expect(
+                "the cloud TOOL LOOP gate is no longer exactly \
+                 `to_cloud && !is_uncertain_fallback(class, cfg)` — an app gate has \
+                 been given first refusal over it. Harden the six branches named \
+                 above `needs_deep_reasoning` before allowing that.",
+            );
+        let conversation = window
+            .find("if class.intent == \"conversation\" {")
+            .expect(
+                "the CONVERSATION branch is no longer entered unconditionally for a \
+                 conversation intent — an app gate has been given first refusal \
+                 over it, which is the measured hijack this guard exists to catch",
+            );
+        assert!(
+            tool_loop < conversation,
+            "the two cloud returns are out of order; re-read the seam before \
+             trusting this guard"
+        );
+    }
+
+    /// PRECISION PIN: ordinary speech must never reach the on-device diffusion
+    /// model.
+    ///
+    /// The gate used to be two independent `contains` scans (any generate verb as
+    /// a SUBSTRING anywhere, any image noun as a SUBSTRING anywhere) with nothing
+    /// tying them together. Every sentence below satisfied both halves and
+    /// rendered a picture instead of answering. They were invisible because
+    /// `route()` consults this gate only BELOW its two cloud early-returns, so on
+    /// the shipped cloud config the conversation branch answers them first — the
+    /// precision hole is real the whole time on the offline / vault / guest path,
+    /// and costing it out for a HOIST is what surfaced it. The hoist itself was
+    /// measured and refused (see the block above `needs_deep_reasoning`); these
+    /// sentences are a live defect either way, which is why the fix landed.
+    #[test]
+    fn ordinary_speech_never_generates_an_image() {
+        for u in [
+            // substring verb / substring noun
+            "the photosynthesis chapter makes more sense with the diagram of the leaf",
+            "art therapy makes a difference with kids who have trouble talking",
+            "remake that photo album of the wedding with the newer prints",
+            // narration: an inflected verb is somebody ELSE drawing
+            "my daughter created a drawing of a dinosaur with a crayon",
+            "that painting of the harbor is my favourite thing in the house",
+            "she makes a picture of health with all that hiking",
+            "he drew a picture of what the neighbourhood used to look like",
+            "the painter rendered a portrait of my grandmother with oils",
+            "he painted a picture of a company that was already failing",
+            "the article draws a picture of a city with no water left",
+            "I painted the picture of the room with a roller and it took forever",
+            "the drawing of the boundaries with the neighbours got ugly",
+            // the noun is not the verb's object
+            "the big picture of this quarter is that we make less with more effort",
+            "make an effort with the picture of professionalism you project",
+            // These two specifically exercise the OBJECT relation's near edge: a
+            // content word sits between the verb and the image noun, INSIDE the
+            // two-determiner window. Without the "one content word ends it" rule
+            // they both render a picture.
+            "make sure the picture of the receipt is clear",
+            "draw up the drawing of the extension with the builder",
+            // "paint a picture of <clause>" is the English idiom for EXPLAIN
+            "let us paint a picture of what next year looks like with the new budget",
+            "paint me a picture of how the meeting actually went",
+            "can you draw me a picture of why that matters",
+            "try to create a picture of what the customer actually wants",
+            "make a picture of how bad it got and you will understand",
+            // "imagine" is not a render verb
+            "I cannot imagine the pressure of taking a photo with a broken lens",
+            "imagine the artwork of a whole generation with no galleries left",
+        ] {
+            assert!(
+                generate_image_command(u).is_none(),
+                "{u:?} is ordinary speech and must not generate an image: {:?}",
+                generate_image_command(u)
+            );
+        }
+        // ...and every real request still works, prompt intact.
+        for (u, want) in [
+            ("draw me a picture of a lighthouse", "a lighthouse"),
+            ("generate an image of a red bicycle", "a red bicycle"),
+            ("make me a picture of a mountain at sunset", "a mountain at sunset"),
+            ("create an illustration of a fox in the snow", "a fox in the snow"),
+            ("sketch a drawing of a sailboat", "a sailboat"),
+            ("paint a painting depicting a stormy sea", "a stormy sea"),
+        ] {
+            let req = generate_image_command(u)
+                .unwrap_or_else(|| panic!("{u:?} is a real image request and must still work"));
+            assert_eq!(req.prompt, want, "prompt for {u:?}");
+        }
+    }
+
     /// PANIC PIN (no-regression): extract_image_prompt must never panic on an STT
     /// transcript whose lowercase form is NOT byte-length-preserving. The dotted
     /// capital 'İ' (U+0130, 2 bytes) lowercases to "i̇" (3 bytes), so the old
@@ -13070,6 +13775,24 @@ mod tests {
             "let me step there for a second",
             "the picture frame is crooked",
             "gravity is the weakest of the four forces",
+            // WHAT WENT WRONG (world.reset): the co-word WAS the whole gate, and
+            // "world" / "scene" / "bodies" / "the simulation" / "the sandbox" are
+            // ordinary English. Every one of these WIPED THE PHYSICS WORLD. The
+            // sibling spawn branch had already been given the closed-vocabulary
+            // gate that closes them; this branch had not.
+            "the world reset itself after the pandemic in a lot of ways",
+            "reset the simulation of my expectations for this quarter",
+            "clear the scene before the police get here",
+            "I need to reset my whole world after that breakup",
+            "wipe the scene from your memory it was embarrassing",
+            "the bodies of water in this county are all clear now",
+            "clear the world of that idea please",
+            "reset the sandbox account before the demo",
+            "my world reset when the baby arrived",
+            // ...and the LAUNCH verbs were `contains`, so "started" was "start"
+            // and any past-tense sentence mentioning "the simulation" opened the
+            // engine.
+            "they cleared the simulation results and started over",
         ] {
             assert!(
                 mark_forge_command(u).is_none(),
@@ -13148,14 +13871,41 @@ mod tests {
     /// returns None (no panic) so the turn falls through to normal routing, and a
     /// Mark-Forge phrase buried in a huge string still resolves to a well-formed
     /// op.
+    ///
+    /// THIS TEST ASSERTED THE BUG. Its buried case was `"{huge} reset the
+    /// simulation {huge}"` — 120,000 characters of lorem ipsum with a reset
+    /// phrase in the middle — and it PINNED that as a world.reset. That is not
+    /// robustness, it is the co-word hijack stated as a contract: it is the same
+    /// shape as "reset the simulation of my expectations for this quarter" and
+    /// "the world reset itself after the pandemic", only larger. The robustness
+    /// contract (no panic, a well-formed op, a fall-through on junk) is kept; the
+    /// buried case is re-anchored on the arm that legitimately survives dilution —
+    /// an utterance that NAMES the engine — and the co-word form is now pinned
+    /// the other way.
     #[test]
     fn mark_forge_command_handles_oversize_and_junk_cleanly() {
         let huge = "lorem ipsum ".repeat(5000);
         assert_eq!(mark_forge_command(&huge), None);
         assert_eq!(mark_forge_command(""), None);
         assert_eq!(mark_forge_command("??? --- ..."), None);
-        let buried = format!("{huge} reset the simulation {huge}");
+        // Names the engine -> still resolves, still well-formed, however diluted.
+        let buried = format!("{huge} reset the physics sandbox {huge}");
         assert_mark_forge_op(&buried, r#"{"op":"world.reset"}"#);
+        // A BARE CO-WORD diluted in junk is not a command. "simulation" and
+        // "world" are ordinary English; only the whole-utterance idiom or the
+        // engine's own name carries a reset.
+        for co_word in ["reset the simulation", "clear the world", "wipe the scene"] {
+            assert_eq!(
+                mark_forge_command(&format!("{huge} {co_word} {huge}")),
+                None,
+                "{co_word:?} buried in unrelated text must not wipe the world"
+            );
+            // ...while the same phrase ON ITS OWN still does.
+            assert!(
+                mark_forge_command(co_word).is_some(),
+                "{co_word:?} on its own is still a real command"
+            );
+        }
     }
 
     // ===== CAPABILITY SELECTOR — end-to-end with the SHIPPED scorer ==========
@@ -13949,16 +14699,61 @@ mod budget_and_audit_tests {
 
     /// A DENIAL is a decision and must be recorded. The audit log stopped at "parked",
     /// so a reader could not tell a refused action from one never answered.
+    ///
+    /// AMENDMENT — THE SECOND GUARD WITH `emit_payloads`'s SHAPE, and the worse of
+    /// the two. The residual sweep that hardened `confirm.rs`'s webhook park guard
+    /// reported that exactly ONE other guard in the tree read a first occurrence and
+    /// windowed a fixed number of bytes after it. This is the other one, and unlike
+    /// confirm.rs's it did not merely go quiet on a second site — it FAILED OPEN on
+    /// the very edit it exists to catch.
+    ///
+    /// The old form searched the WHOLE file for `Resolution::Cancelled(ack) =>`.
+    /// That needle occurs TWICE in router.rs: at the arm it guards, and on this
+    /// test's own `.find(..)` line ~13,700 lines below it. The 900-byte window opened
+    /// at the SECOND one contains this test's own
+    /// `arm.contains("audit::Outcome::Denied")`. MEASURED: rename the production
+    /// arm's binding (`Cancelled(ack)` -> `Cancelled(reason)`) and the old form still
+    /// PASSES — `find` slides onto the test's own source, the `expect` never fires,
+    /// and the guard reports green while the audit record it protects is gone. Two
+    /// of this campaign's standing traps at once: a first-occurrence window, and a
+    /// source-anchored guard that self-matches.
+    ///
+    /// Bounded at BOTH ends: the window is router.rs up to its FIRST `#[cfg(test)]`
+    /// (line 9705, ~4,200 lines above this test), so this test's own text is out of
+    /// scope and cannot stand in for the arm; both halves are floored so neither a
+    /// marker at byte 0 nor one at EOF can make this vouch for nothing. And EVERY arm
+    /// in that window is checked, not the first — a second cancel arm that forgot the
+    /// audit record is exactly the site the old form was blind to.
     #[test]
     fn the_cancel_path_records_a_denial() {
         let src = include_str!("router.rs");
-        let i = src
-            .find("Resolution::Cancelled(ack) =>")
-            .expect("the cancel arm moved; re-point this guard");
-        let arm = &src[i..(i + 900).min(src.len())];
+        let cut = src.find("#[cfg(test)]").expect("router.rs has a test seam");
+        let prod = &src[..cut];
         assert!(
-            arm.contains("audit::Outcome::Denied"),
-            "a denied consequential action leaves no audit entry"
+            prod.len() > 100_000,
+            "the router.rs production window collapsed: {}",
+            prod.len()
         );
+        assert!(
+            src.len() - cut > 10_000,
+            "the #[cfg(test)] marker matched too late — the window swallowed the tests"
+        );
+        let sites: Vec<usize> = prod
+            .match_indices("Resolution::Cancelled(ack) =>")
+            .map(|(i, _)| i)
+            .collect();
+        assert!(
+            !sites.is_empty(),
+            "the cancel arm left router.rs's production half; re-point this guard \
+             rather than letting it pass over zero arms"
+        );
+        for i in sites {
+            let arm = &prod[i..(i + 900).min(prod.len())];
+            assert!(
+                arm.contains("audit::Outcome::Denied"),
+                "a denied consequential action leaves no audit entry (router.rs:{})",
+                prod[..i].lines().count()
+            );
+        }
     }
 }
