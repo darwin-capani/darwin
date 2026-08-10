@@ -611,6 +611,43 @@ pub fn classify_pasteboard_intent(utterance: &str) -> Option<PasteboardIntent> {
                     .any(|n| lower.contains(&format!("{v} {det}{n}")))
             })
     });
+    // ...UNLESS THE THING IS SOMEWHERE PHYSICAL.
+    //
+    // THIS BRANCH DESTROYS DATA AND HAS NO UNDO, so it carries the strictest bar
+    // here. "pasteboard" is macOS's word for the clipboard AND an ordinary word
+    // for a noticeboard; "clipboard" is likewise a real object you can hold.
+    // MEASURED at HEAD: "clear the pasteboard in the workshop" wiped the owner's
+    // clipboard ring. The module already refused "i cleared the pasteboard in the
+    // workshop yesterday" — but only because that is PAST TENSE, so the imperative
+    // walked through the same hole.
+    //
+    // The discriminator is NOT the determiner: `wipe_the_clipboard_is_still_a_wipe`
+    // pins "wipe the clipboard", so requiring "my" or "history" would have deleted
+    // a real command — an over-narrowing that test caught. It is the LOCATIVE. No
+    // phrasing for the OS clipboard puts it in a room; every phrasing for a
+    // physical board does.
+    //
+    // A location that names the MACHINE is not physical in that sense, so "clear
+    // the clipboard on my mac" still wipes.
+    // `" on my "` and `" on this "` are here deliberately: without them the
+    // MACHINE carve-out below is UNREACHABLE — no locative ever precedes "mac",
+    // so the branch that protects "clear the clipboard on my mac" would never
+    // run and the test covering it would pass against a mutant that deleted it.
+    // (Measured: dropping the carve-out left the whole suite green.)
+    const LOCATIVES: &[&str] = &[
+        " in the ", " in a ", " on the ", " on a ", " at the ", " at a ",
+        " over the ", " by the ", " in my ", " on my ", " in this ", " on this ",
+        " next to the ",
+    ];
+    const MACHINE: &[&str] = &[
+        "mac", "computer", "laptop", "machine", "system", "device", "desktop", "phone",
+    ];
+    let somewhere_physical = LOCATIVES.iter().any(|loc| {
+        lower.find(loc).is_some_and(|i| {
+            let tail = &lower[i + loc.len()..];
+            !MACHINE.iter().any(|m| tail.starts_with(m))
+        })
+    });
     let read_question = lower.contains("what did i copy")
         || lower.contains("what have i copied")
         || lower.contains("what i copied")
@@ -618,6 +655,7 @@ pub fn classify_pasteboard_intent(utterance: &str) -> Option<PasteboardIntent> {
         || lower.contains("things i copied");
     if mentions_clipboard
         && !read_question
+        && !somewhere_physical
         && crate::utterance::mentions_any_word(&lower, WIPE_VERBS)
         && wipe_aimed_at_the_clipboard
     {
@@ -672,6 +710,54 @@ pub fn reset_for_test() {
 
 #[cfg(test)]
 mod tests {
+
+    /// A PASTEBOARD IN A ROOM IS NOT THE OWNER'S CLIPBOARD, and this branch
+    /// DESTROYS DATA with no undo. The module already refused the past-tense
+    /// "i cleared the pasteboard in the workshop yesterday"; the IMPERATIVE went
+    /// straight through and wiped the ring.
+    #[test]
+    fn a_wipe_aimed_at_a_physical_board_never_erases_the_ring() {
+        for u in [
+            "clear the pasteboard in the workshop",
+            "wipe the pasteboard in the kitchen",
+            "clear the clipboard on the wall",
+            "empty the pasteboard by the door",
+            "clear the pasteboard next to the fridge",
+            "clear the pasteboard on my wall",
+        ] {
+            assert!(
+                !matches!(
+                    super::classify_pasteboard_intent(u),
+                    Some(super::PasteboardIntent::Forget)
+                ),
+                "{u:?} erased the owner's clipboard history — there is no undo"
+            );
+        }
+    }
+
+    /// ...AND THE VETO MUST NOT EAT THE REAL COMMAND. Requiring a possessive or
+    /// the word "history" instead of this locative rule was tried first and
+    /// DELETED "wipe the clipboard" — an existing test caught it. A location that
+    /// names the MACHINE is not a room.
+    #[test]
+    fn the_physical_veto_leaves_every_real_wipe_working() {
+        for u in [
+            "clear my clipboard",
+            "wipe the clipboard",
+            "clear my pasteboard history",
+            "forget the pasteboard history",
+            "clear the clipboard on my mac",
+            "wipe the clipboard on this computer",
+        ] {
+            assert!(
+                matches!(
+                    super::classify_pasteboard_intent(u),
+                    Some(super::PasteboardIntent::Forget)
+                ),
+                "{u:?} is a real wipe and stopped working"
+            );
+        }
+    }
 
     /// REGRESSION (router-recall miss list): "clear my pasteboard history" reached
     /// NOTHING. "pasteboard" is macOS's own word for the clipboard — and the name
