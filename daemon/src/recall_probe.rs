@@ -96,6 +96,26 @@ pub const ORDINARY_FIXTURE: &str = include_str!("../fixtures/router_ordinary.jso
 /// for the last four, `main.rs`) consults them. Used to enumerate cross-gate
 /// capture: a probe that fires a gate it did not name is a capability stealing
 /// another capability's utterance.
+/// GATES THAT `route()` CONSULTS ONLY BELOW ITS TWO CLOUD EARLY-RETURNS.
+///
+/// This measurement calls [`fire`] directly, which is the right way to measure a
+/// CLASSIFIER — but it is not the same question as "can the owner reach this on
+/// the shipped config". On `[router].conversation_route = "cloud_heavy"` (the
+/// default) with a reachable cloud, an utterance the on-device classifier labels
+/// "conversation" is answered by `complete_persona` and RETURNS, and this seam is
+/// never reached; the SAME utterance offline falls through and actuates. The
+/// cloud tool catalogue carries `open_app`/`quit_app` but no describe,
+/// generate-image, identify-sound, Silicon-Canvas, Lumen-read, Vision, Nexus or
+/// Mark-Forge op, so nothing upstream substitutes for it (router.rs documents the
+/// trace).
+///
+/// So the headline number is CLASSIFIER recall. Printing the preempted share
+/// beside it stops that number from being read as shipped reachability — which is
+/// exactly the "right and misleading" shape this campaign keeps finding.
+pub const CLOUD_PREEMPTED: &[&str] = &[
+    "describe", "genimage", "sound", "silicon", "lumen", "vision", "nexus", "markforge",
+];
+
 pub const GATES: &[&str] = &[
     "lockdown.panic",
     "lockdown.unlock",
@@ -369,6 +389,31 @@ pub fn all_hits(text: &str) -> Vec<(&'static str, String)> {
 
 #[cfg(test)]
 mod tests {
+
+    /// CLOUD_PREEMPTED must name real gates, or the caveat printed beside the
+    /// headline is measuring nothing. A typo or a renamed gate would silently
+    /// drop that gate out of the warning while it stays just as unreachable —
+    /// the caveat quietly becoming smaller than the truth.
+    #[test]
+    fn every_cloud_preempted_name_is_a_real_gate() {
+        assert!(!super::CLOUD_PREEMPTED.is_empty(), "the caveat covers nothing");
+        for g in super::CLOUD_PREEMPTED {
+            assert!(
+                super::GATES.contains(g),
+                "CLOUD_PREEMPTED names {g:?}, which is not a gate in GATES — the \
+                 printed caveat is silently smaller than the truth"
+            );
+        }
+        // And every one must actually carry probes, or it is not part of the
+        // percentage it claims to describe.
+        let probes = super::tests::probes();
+        for g in super::CLOUD_PREEMPTED {
+            assert!(
+                probes.iter().any(|p| &p.gate.as_str() == g),
+                "CLOUD_PREEMPTED names {g:?} but no probe targets it"
+            );
+        }
+    }
     use super::*;
     use std::collections::BTreeMap;
 
@@ -432,6 +477,24 @@ mod tests {
         let hit: usize = per.values().map(|(h, _)| *h).sum();
         let total: usize = per.values().map(|(_, t)| *t).sum();
         eprintln!("\n=== ROUTER RECALL: {hit}/{total} ===");
+        // ...and the share of that number the owner cannot actually reach with a
+        // cloud key set. Reported every run so the headline is never quoted alone.
+        let pre_t: usize = per
+            .iter()
+            .filter(|(g, _)| CLOUD_PREEMPTED.contains(g))
+            .map(|(_, (_, t))| *t)
+            .sum();
+        let pre_h: usize = per
+            .iter()
+            .filter(|(g, _)| CLOUD_PREEMPTED.contains(g))
+            .map(|(_, (h, _))| *h)
+            .sum();
+        eprintln!(
+            "    of which CLOUD-PREEMPTED (classifier hits, but route() never \
+             consults these gates when the cloud answers): {pre_h}/{pre_t} \
+             probes = {:.1}% of the fixture",
+            pre_t as f64 / total as f64 * 100.0
+        );
         for (gate, (h, t)) in &per {
             eprintln!("  {gate:<16} {h}/{t}");
         }
