@@ -531,7 +531,57 @@ if [ -f "$DIR/diagnosis.json" ]; then
   # An unrecognized flag makes darwind fall through to ORDINARY DAEMON STARTUP,
   # which would HANG this script on a booted daemon. Never invoke it unguarded
   # (the same hazard --split-heal-diff and apply_forge.sh document).
-  if ! grep -q -- '--heal-responsiveness' "$CRATE/src/main.rs"; then
+  #
+  # THE GUARD MATCHES THE ARGV COMPARISON, NOT THE PROSE — and every flag guard
+  # below it does the same. COUNTED on the real main.rs, not guessed: besides its
+  # argv dispatch each flag is named --heal-responsiveness 3 more times,
+  # --heal-confidence 2, --split-heal-diff 4. Most of those are `//` COMMENTS (the
+  # entrypoint block above each handler); exactly one apiece is the handler's own
+  # eprintln! usage string, which is a CODE line — the comment class below is NOT
+  # what holds that one back, and does not need to be: it carries no argv
+  # comparison at all. So
+  # the plain `grep -q -- '--heal-responsiveness' "$CRATE/src/main.rs"` this used
+  # to be still succeeded on a staged source whose dispatch literal had drifted
+  # or been renamed: the script cleared its own fail-closed guard on a COMMENT
+  # and then invoked a flag the staged daemon does not implement — booting a
+  # daemon instead of getting an answer, with the gate SKIPPED rather than
+  # enforced. PROVED BY EXECUTION on all three guards: with the argv literal
+  # renamed by one letter and the prose untouched, the old grep ACCEPTED and
+  # this one REFUSES.
+  #
+  # Anchoring: the line's first non-blank character must not be `/`, so a `//`
+  # comment quoting the argv form does not clear it either (proved: without that
+  # class, a comment carrying `a == "--heal-responsiveness"` re-opens the hole).
+  # MEASURED across line shapes: the real dispatch ACCEPTS, and so does a
+  # rustfmt-wrapped `.position(|a| a == "--flag")` continuation, so ordinary
+  # reformatting does not break the apply. TWO SHAPE CLASSES diverge from
+  # heal.rs's `!starts_with("//") && contains(...)` code-line rule, and both
+  # REFUSE here where that rule would ACCEPT: a `/*` block comment, and the
+  # comparison standing alone at the start of its line — at column 0 AND AT ANY
+  # INDENT. The indented one is the likely shape, because it is what rustfmt
+  # emits from a block-bodied closure (`.position(|a| {` / `a == "--flag"` /
+  # `})`), and it is pinned by execution rather than by this sentence, in
+  # scripts/test_apply_heal_confinement.sh Part D.
+  #
+  # WHAT A DIVERGENCE COSTS IS NOT THE SAME AT ALL THREE GUARDS — re-derived from
+  # the control flow here, not restated. The --heal-confidence and
+  # --split-heal-diff guards below both refuse the run outright, so for those two
+  # a divergence does mean nothing installs. THIS GUARD IS NOT ONE OF THEM: the
+  # responsiveness probe is ADVISORY and never refuses an apply (see IT NEVER
+  # REFUSES in the block header above; pinned by
+  # heal.rs::the_apply_script_never_refuses_on_responsiveness, which scans this
+  # block). A refusal here only sets RESP_DETAIL, leaves RESP_WORD at UNKNOWN,
+  # prints "older source" about a daemon that is not older, and the run CONTINUES
+  # through the confidence floor, the mutation probe and the live apply. That is
+  # still fail-closed against the hazard this guard exists for — it never invokes
+  # an unimplemented flag, so it can never boot a daemon and hang — but it is NOT
+  # "nothing installs": the operator loses the advisory verdict and is told the
+  # wrong reason for losing it.
+  # daemon/src/heal.rs pins this exact text three ways — the per-flag parity
+  # tests and every_staged_flag_guard_matches_the_argv_comparison_not_the_prose,
+  # which ENUMERATES the guards, so a fourth one written in the old prose form
+  # fails the daemon suite instead of shipping. Script and tests move together.
+  if ! grep -qE '^[[:space:]]*[^/[:space:]].*a == "--heal-responsiveness"' "$CRATE/src/main.rs"; then
     RESP_DETAIL="the staged daemon does not implement --heal-responsiveness (older source)"
   else
     # A probe that always answers the same word is not a probe. Prove it
@@ -597,7 +647,21 @@ fi
 # patched, GREEN tree the gates above built. The mutation probe below
 # reverse-applies the fix and leaves a crate that routinely no longer compiles,
 # and `cargo run --bin darwind` cannot be built from that one.
-if ! grep -q -- '--heal-confidence' "$CRATE/src/main.rs"; then
+# THE ARGV COMPARISON, NOT THE PROSE — see the long note on the responsiveness
+# guard above. COUNTED, not copied: main.rs names `--heal-confidence` TWO more
+# times besides its argv dispatch — once in the entrypoint comment block over the
+# handler, once in that handler's eprintln! usage string. (Four is
+# --split-heal-diff's number; three is --heal-responsiveness's.) Two is already
+# enough: a bare `grep -q -- '--heal-confidence'` clears itself on them and the
+# script then invokes a flag a drifted staged daemon does not implement, and an
+# unknown flag falls through to ORDINARY DAEMON STARTUP rather than erroring.
+# WHAT THAT COSTS, re-derived from the lines just below rather than restated: a
+# booted daemon answers none of the three self-proof probes, so this gate would
+# REFUSE on "does not discriminate" — or, more likely, the command substitution
+# never returns and the apply HANGS on it. So the gate is not "skipped"; what the
+# guard buys is an immediate refusal that names the real reason instead of a hang
+# or a misleading one.
+if ! grep -qE '^[[:space:]]*[^/[:space:]].*a == "--heal-confidence"' "$CRATE/src/main.rs"; then
   fail "the staged daemon does not implement --heal-confidence — live daemon/src NOT modified"
 fi
 # A gate that always answers the same word is not a gate. Prove it discriminates
@@ -654,7 +718,12 @@ rm -rf "$SPLIT_DIR"
 # inside this script — booting a daemon instead of answering, and skipping the
 # gate entirely. apply_forge.sh documents this exact hazard for its own gate flag.
 # Checked against the staged source, so it cannot hang waiting on a daemon.
-if ! grep -q -- '--split-heal-diff' "$CRATE/src/main.rs"; then
+#
+# THE ARGV COMPARISON, NOT THE PROSE — see the long note on the responsiveness
+# guard above. The stage header two paragraphs up and main.rs's own entrypoint
+# comment both spell `--split-heal-diff`, so the bare `grep -q -- '--split-heal-diff'`
+# this replaces cleared itself on a comment while the dispatch literal had drifted.
+if ! grep -qE '^[[:space:]]*[^/[:space:]].*a == "--split-heal-diff"' "$CRATE/src/main.rs"; then
   fail "the staged daemon does not implement the mutation probe — live daemon/src NOT modified"
 fi
 

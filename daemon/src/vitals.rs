@@ -210,7 +210,13 @@ pub struct VolumeReading {
 #[derive(Debug, Clone, PartialEq)]
 pub struct VitalsSnapshot {
     pub battery: BatteryReading,
-    pub thermal: ThermalState,
+    /// The live thermal rung, or `None` when the OS state was UNREADABLE.
+    /// Three-valued for the same reason `battery.percent`/`on_ac` are: the wire
+    /// must be able to say "we could not read it". `crate::power::map_thermal`
+    /// folds an unreadable state to `Nominal` on purpose — that is the THROTTLE
+    /// POLICY refusing to throttle on a guess — but this field is a DISPLAY, and
+    /// reusing that fold rendered a confident "NOMINAL" for a state nobody read.
+    pub thermal: Option<ThermalState>,
     pub mem_used_bytes: u64,
     pub mem_total_bytes: u64,
     /// Per-core CPU utilization percent (one entry per logical core).
@@ -261,7 +267,10 @@ impl VitalsSnapshot {
                 "on_ac": self.battery.on_ac,
                 "charge_state": self.battery.state.as_str(),
             },
-            "thermal": self.thermal.as_str(),
+            // "unknown" for an unreadable state — the HUD's ThermalLevel already
+            // carries that rung and renders it as "—". NEVER a fabricated
+            // "nominal": the gauge would then assert a reading that never happened.
+            "thermal": self.thermal.map(|t| t.as_str()).unwrap_or("unknown"),
             "memory": {
                 "used_bytes": self.mem_used_bytes,
                 "total_bytes": self.mem_total_bytes,
@@ -357,7 +366,9 @@ pub async fn vitals_task(cfg: Arc<Config>) {
         let disks = sysinfo::Disks::new_with_refreshed_list();
         let snapshot = VitalsSnapshot {
             battery: read_battery_live().await,
-            thermal: crate::power::read_thermal_live(),
+            // DISPLAY read (not the policy read): an unreadable state stays None
+            // and goes out as "unknown" rather than a confident "nominal".
+            thermal: crate::power::read_thermal_display(),
             mem_used_bytes: sys.used_memory(),
             mem_total_bytes: sys.total_memory(),
             cpu_per_core,
@@ -440,7 +451,7 @@ mod tests {
                 on_ac: Some(false),
                 state: BatteryState::Discharging,
             },
-            thermal: ThermalState::Serious,
+            thermal: Some(ThermalState::Serious),
             mem_used_bytes: 12,
             mem_total_bytes: 16,
             cpu_per_core: vec![10.04, 200.0, -5.0, f32::NAN],
@@ -514,7 +525,7 @@ mod tests {
             on_ac: Some(true),
             state: BatteryState::Unknown,
         };
-        snap.thermal = ThermalState::Nominal;
+        snap.thermal = Some(ThermalState::Nominal);
         let v = snap.to_json();
         assert!(v["battery"]["percent"].is_null(), "no battery => null, never a fake charge");
         assert_eq!(v["battery"]["on_ac"], json!(true));
@@ -541,5 +552,29 @@ mod tests {
         );
         assert!(v["battery"]["percent"].is_null());
         assert_eq!(v["battery"]["charge_state"], json!("unknown"));
+    }
+
+    #[test]
+    fn to_json_unreadable_thermal_is_unknown_not_a_confident_nominal() {
+        // The thermal shim returning -1 ("unknown/unreadable") is folded to
+        // Nominal by `power::map_thermal` ON PURPOSE — that fold is the THROTTLE
+        // POLICY refusing to throttle on a guess. The GAUGE is a different
+        // consumer: reusing the policy fold showed the owner a confident
+        // "NOMINAL" for a state that was never read. `read_thermal_display`
+        // leaves it None and the wire must say so.
+        let mut snap = sample_snapshot();
+        snap.thermal = None;
+        let v = snap.to_json();
+        assert_eq!(
+            v["thermal"],
+            json!("unknown"),
+            "an unreadable thermal state must NOT serialize as a fabricated \"nominal\""
+        );
+        // The policy fold itself is untouched: -1 still means "do not throttle".
+        assert_eq!(crate::power::map_thermal(-1), ThermalState::Nominal);
+        // And a REAL nominal read is still reported as nominal — the honest
+        // "unknown" must not swallow the genuine bottom rung.
+        snap.thermal = Some(ThermalState::Nominal);
+        assert_eq!(snap.to_json()["thermal"], json!("nominal"));
     }
 }

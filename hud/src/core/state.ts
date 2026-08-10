@@ -248,7 +248,7 @@ import { agentProfile, normalizeHue } from "./agents";
 import { type ChangeqState, changeqReduce, parseChangeqList } from "./changeq";
 import { type HardwareVitals, parseVitals } from "./vitals";
 import { type ProcessesFrame, parseProcesses } from "./procwatch";
-import { rejectionDetail } from "./heal";
+import { parseHealCalibration, rejectionDetail, type HealCalibration } from "./heal";
 
 /* ------------------------------------------------------------------------ */
 
@@ -286,6 +286,10 @@ export interface SystemGauges {
 }
 
 export interface PipelineTimings {
+  /** VAD finish -> event-loop pickup: the wait behind an in-flight turn. NOT
+   *  part of `totalMs` (the daemon's pipeline clock starts at pickup), so it is
+   *  rendered beside the bar, never inside it. */
+  queueMs: number;
   sttMs: number;
   classifyMs: number;
   routeMs: number;
@@ -407,6 +411,11 @@ export interface HealAlert {
   refTs: number | null;
   files: string[];
   detail: string;
+  /** Per-attempt calibration, on the REJECTED kind. This is the half that
+   *  matters most: `stage:"deadline"` means the BUDGET stopped the gate and
+   *  `stage:"confidence"` means the FLOOR did, and neither can be re-tuned from
+   *  a bare token. null when the event carried none (blocked/applied never do).*/
+  calibration: HealCalibration | null;
 }
 
 /** Self-heal v2: the live root-cause diagnosis emitted before drafting
@@ -449,6 +458,13 @@ export interface HealProposal {
    *  UNRELATED patch carries validated=true too — the person clicking ACCEPT
    *  needs both words. "" for an older daemon that does not send it. */
   responsiveness: string;
+  /** Per-attempt calibration: every candidate's review score, every cargo
+   *  stage's real wall time, and how many drafted candidates the attempt could
+   *  not afford to stage. null for an older daemon that does not send it.
+   *  Rendered beside ACCEPT & APPLY — it is the data that says whether
+   *  [self_heal].attempt_budget_secs and .confidence_floor are set right, and
+   *  the panel is where a person is looking at those two numbers' consequences. */
+  calibration: HealCalibration | null;
   ts: string; // envelope ts of the heal.proposal
 }
 
@@ -2152,6 +2168,11 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
 
     case "pipeline.completed": {
       const timings: PipelineTimings = {
+        // The daemon has emitted `queue_ms` since the staleness-gate audit fix;
+        // this reducer used to drop it, so the one number that explains "why did
+        // that answer take so long" — the utterance sat behind another turn —
+        // reached no pixel. It is pickup-RELATIVE-ZERO, i.e. outside total_ms.
+        queueMs: num(env.data, "queue_ms") ?? 0,
         sttMs: num(env.data, "stt_ms") ?? 0,
         classifyMs: num(env.data, "classify_ms") ?? 0,
         routeMs: num(env.data, "route_ms") ?? 0,
@@ -2485,6 +2506,12 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
           subsystem: str(env.data, "subsystem") ?? diag?.subsystem ?? "",
           signature: str(env.data, "signature") ?? diag?.signature ?? "",
           responsiveness: str(env.data, "responsiveness") ?? "",
+          // The calibration payload the daemon ships on every terminal heal
+          // event. It used to stop at the type declaration: the reducer never
+          // read it, so every candidate's score, every cargo stage's real wall
+          // time and `candidates_unaffordable` reached no pixel and the two
+          // self_heal tunables stayed un-tunable from data.
+          calibration: parseHealCalibration(env.data),
           ts: env.ts,
         },
       };
@@ -2503,6 +2530,9 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
           refTs: num(env.data, "ts"),
           files: [],
           detail: rejectionDetail(str(env.data, "stage") ?? "unknown"),
+          // Carried on the REJECTION too — "the budget ran out" and "the floor
+          // was not cleared" are the two rejections whose fix is a NUMBER.
+          calibration: parseHealCalibration(env.data),
         },
       };
     }
@@ -2517,6 +2547,8 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
           refTs: null,
           files: [],
           detail: str(env.data, "reason") ?? "unknown",
+          // blocked = the pipeline never ran, so there is nothing to calibrate.
+          calibration: null,
         },
       };
     }
@@ -2534,6 +2566,9 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
           refTs: num(env.data, "ts"),
           files: [],
           detail: "PATCH APPLIED — DAEMON RESTARTING",
+          // The proposal that carried the calibration is consumed; the apply
+          // notice is about a live mutation, not about tuning the gate.
+          calibration: null,
         },
       };
     }

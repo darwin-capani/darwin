@@ -228,9 +228,17 @@ pub async fn read_power_live() -> PowerReading {
 // ---------------------------------------------------------------------------
 
 /// Map the flat int the thermal shim returns (`darwin_thermal_state`) to a
-/// [`ThermalState`]. PURE — unit-tested on synthetic ints. 0=Nominal, 1=Fair,
-/// 2=Serious, 3=Critical; anything else (incl. the shim's -1 "unknown/
-/// unreadable") degrades to `Nominal`, so the policy NEVER throttles on a guess.
+/// [`ThermalState`], for the THROTTLE POLICY. PURE — unit-tested on synthetic
+/// ints. 0=Nominal, 1=Fair, 2=Serious, 3=Critical; anything else (incl. the
+/// shim's -1 "unknown/unreadable") degrades to `Nominal`, so the policy NEVER
+/// throttles on a guess.
+///
+/// POLICY ONLY — do NOT reuse this for a DISPLAY. The -1 fold is a deliberate
+/// conservative choice about what to *do*; rendering its result tells the owner
+/// "NOMINAL" with full confidence about a state that was never read. The display
+/// path uses [`map_thermal_display`], which keeps "unreadable" distinguishable —
+/// the unknown-vs-zero discipline `read_battery_live` already applies to
+/// `percent`/`on_ac`.
 pub fn map_thermal(raw: i32) -> ThermalState {
     match raw {
         0 => ThermalState::Nominal,
@@ -238,6 +246,18 @@ pub fn map_thermal(raw: i32) -> ThermalState {
         2 => ThermalState::Serious,
         3 => ThermalState::Critical,
         _ => ThermalState::Nominal,
+    }
+}
+
+/// Map the same flat int for a DISPLAY: `Some(level)` only for a rung the OS
+/// actually reported, `None` for the shim's -1 (and any other out-of-ladder
+/// value) — an honest "we could not read it", never a confident `Nominal`.
+/// PURE — unit-tested on synthetic ints alongside [`map_thermal`], which it
+/// agrees with on every VALID rung.
+pub fn map_thermal_display(raw: i32) -> Option<ThermalState> {
+    match raw {
+        0..=3 => Some(map_thermal(raw)),
+        _ => None,
     }
 }
 
@@ -277,6 +297,25 @@ pub fn read_thermal_live() -> ThermalState {
     #[cfg(not(target_os = "macos"))]
     {
         ThermalState::Nominal
+    }
+}
+
+/// Read the LIVE thermal level FOR DISPLAY (`hardware.vitals`). Same one-scalar
+/// shim read as [`read_thermal_live`], but an unreadable state stays `None`
+/// instead of being folded to `Nominal`. DEVICE-GATED: never exercised under
+/// test (the tests drive the PURE [`map_thermal_display`] on synthetic ints).
+/// Off macOS there is no shim to read at all, so it is `None` — unknown, not a
+/// fabricated `Nominal`.
+pub fn read_thermal_display() -> Option<ThermalState> {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: identical contract to `read_thermal_live` — a no-argument
+        // scalar read of one OS signal, linked from the build-script shim.
+        map_thermal_display(unsafe { darwin_thermal_state() })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 
@@ -364,6 +403,35 @@ mod tests {
         assert_eq!(map_thermal(4), ThermalState::Nominal);
         assert_eq!(map_thermal(i32::MIN), ThermalState::Nominal);
         assert_eq!(map_thermal(i32::MAX), ThermalState::Nominal);
+    }
+
+    // THE DISPLAY SEAM. `map_thermal`'s -1 -> Nominal fold is right for the
+    // THROTTLE POLICY ("never throttle on a guess") and wrong for a GAUGE: the
+    // same value used to feed `hardware.vitals`, so the owner was shown a
+    // confident "NOMINAL" for a state nobody read. `map_thermal_display` keeps
+    // the two apart — it agrees with the policy fold on every rung the OS really
+    // reported, and reports None for everything else.
+    #[test]
+    fn map_thermal_display_reports_unknown_where_the_policy_fold_says_nominal() {
+        // Every VALID rung: display and policy agree exactly.
+        for raw in 0..=3 {
+            assert_eq!(
+                map_thermal_display(raw),
+                Some(map_thermal(raw)),
+                "a rung the OS really reported must display as itself"
+            );
+        }
+        // The shim's -1 and every other out-of-ladder int: the POLICY still folds
+        // to Nominal (unchanged, asserted here so the split cannot silently
+        // collapse back into one function), the DISPLAY says unknown.
+        for raw in [-1, 4, i32::MIN, i32::MAX] {
+            assert_eq!(map_thermal(raw), ThermalState::Nominal, "policy fold unchanged");
+            assert_eq!(
+                map_thermal_display(raw),
+                None,
+                "an unreadable thermal state must NOT display as a confident Nominal"
+            );
+        }
     }
 
     // A live-read Serious/Critical (from the thermal shim, modeled here via

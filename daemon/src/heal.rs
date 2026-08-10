@@ -5318,7 +5318,7 @@ mod tests {
 
         // ...AND IT MUST SPLIT THE PATCH BEING APPLIED. The `script.contains(
         // "--split-heal-diff")` assertion above is satisfied by this stage's own prose
-        // header and by the fail-closed `grep -q -- '--split-heal-diff'` that only
+        // header and by the fail-closed argv-comparison grep that only
         // proves the staged BINARY knows the flag — nothing here required the live
         // invocation to name $PATCH_FILE. Re-point it at the self-proof fixture
         // ("$PROBE/sep.diff") and every assertion in this test stays green while the
@@ -5341,10 +5341,18 @@ mod tests {
         // through to ORDINARY DAEMON STARTUP — it would boot a daemon instead of
         // answering, and the gate would be skipped rather than enforced.
         // apply_forge.sh documents this hazard for its own gate flag.
+        // ...ON THE ARGV COMPARISON, not the flag's name. main.rs spells
+        // `--split-heal-diff` in the entrypoint comment above its handler, so the
+        // bare `grep -q -- '--split-heal-diff'` this replaces cleared itself on
+        // PROSE when the dispatch literal had drifted. Same defect, same shape,
+        // as the one already fixed in the test above.
         assert!(
-            probe.contains("grep -q -- '--split-heal-diff' \"$CRATE/src/main.rs\""),
-            "the probe must confirm the staged daemon implements it, or a mismatched \
-             source boots a daemon instead of answering:\n{probe}"
+            probe.contains(
+                "grep -qE '^[[:space:]]*[^/[:space:]].*a == \"--split-heal-diff\"' \
+                 \"$CRATE/src/main.rs\""
+            ),
+            "the probe must confirm the staged daemon implements it BY ITS ARGV \
+             COMPARISON, or a mismatched source boots a daemon instead of answering:\n{probe}"
         );
         assert!(
             probe.contains("does not discriminate"),
@@ -5410,11 +5418,18 @@ mod tests {
         );
         // FAIL-SAFE: an unknown flag boots a daemon instead of answering, and
         // this script would hang on it. The flag must be confirmed present in
-        // the STAGED source first.
+        // the STAGED source first — BY ITS ARGV COMPARISON. main.rs names
+        // `--heal-responsiveness` three more times in prose, so the bare
+        // `grep -q -- '--heal-responsiveness'` this replaces cleared the guard on
+        // a COMMENT; the script would then invoke a flag the staged daemon does
+        // not implement. This literal and the script's must move in LOCKSTEP.
         assert!(
-            block.contains("grep -q -- '--heal-responsiveness' \"$CRATE/src/main.rs\""),
-            "the probe must confirm the staged daemon implements the flag, or a \
-             mismatched source boots a daemon instead of answering:\n{block}"
+            block.contains(
+                "grep -qE '^[[:space:]]*[^/[:space:]].*a == \"--heal-responsiveness\"' \
+                 \"$CRATE/src/main.rs\""
+            ),
+            "the probe must confirm the staged daemon implements the flag BY ITS ARGV \
+             COMPARISON, or a mismatched source boots a daemon instead of answering:\n{block}"
         );
         // A probe that always answers the same word is not a probe.
         assert!(
@@ -5458,11 +5473,15 @@ mod tests {
         // and the usage string), so a whole-file `contains` was satisfied with the
         // handler's own literal renamed. PROVED: changing
         // `|a| a == "--heal-responsiveness"` to `"--heal-responsivenes"` left this
-        // test green. That is not cosmetic: apply_heal.sh's fail-closed
-        // `grep -q -- '--heal-responsiveness' "$CRATE/src/main.rs"` reads the SAME
-        // prose, so the script would clear its own guard and then invoke a flag the
-        // staged daemon does not implement — and an unknown flag falls through to
-        // ORDINARY DAEMON STARTUP rather than erroring.
+        // test green. That was not cosmetic: apply_heal.sh's fail-closed guard used
+        // to be a bare `grep -q -- '--heal-responsiveness' "$CRATE/src/main.rs"`,
+        // which reads the SAME prose — the test was hardened here and THE SCRIPT
+        // WAS NOT, so the script still cleared its own guard and then invoked a flag
+        // the staged daemon does not implement, and an unknown flag falls through to
+        // ORDINARY DAEMON STARTUP rather than erroring. The script now anchors on
+        // this same argv comparison (proved by execution in
+        // scripts/test_apply_heal_confinement.sh, Part D), so the two are in
+        // LOCKSTEP: rename this literal and BOTH sides notice.
         assert!(
             main_rs.lines().map(str::trim_start).any(|l| {
                 !l.starts_with("//") && l.contains("a == \"--heal-responsiveness\"")
@@ -6559,10 +6578,23 @@ mod tests {
              that scores anything but the proposal being installed proves nothing:\n{block}"
         );
         // FAIL CLOSED: an unknown flag makes darwind boot a daemon instead of
-        // answering, so the flag is confirmed in the STAGED source first.
+        // answering, so the flag is confirmed in the STAGED source first — BY ITS
+        // ARGV COMPARISON. COUNTED: main.rs names `--heal-confidence` TWO more
+        // times besides the dispatch — the entrypoint comment above the handler,
+        // and that handler's eprintln! usage string, which is a CODE line. (Four
+        // is --split-heal-diff's number, three is --heal-responsiveness's.) Two
+        // is enough: the bare `grep -q -- '--heal-confidence'` this replaces
+        // cleared the guard on them. Downstream, a booted daemon answers none of
+        // the three self-proof probes, so the gate would refuse on "does not
+        // discriminate" — or the apply would hang waiting for an answer. The
+        // guard buys an immediate, correctly-worded refusal rather than either.
         assert!(
-            block.contains("grep -q -- '--heal-confidence' \"$CRATE/src/main.rs\""),
-            "the gate must confirm the staged daemon implements the flag:\n{block}"
+            block.contains(
+                "grep -qE '^[[:space:]]*[^/[:space:]].*a == \"--heal-confidence\"' \
+                 \"$CRATE/src/main.rs\""
+            ),
+            "the gate must confirm the staged daemon implements the flag BY ITS ARGV \
+             COMPARISON:\n{block}"
         );
         assert!(
             block.contains("does not discriminate"),
@@ -6638,5 +6670,102 @@ mod tests {
              would fail for reasons unrelated to the patch"
         );
         assert!(gate_at < apply_at, "the confidence gate runs after the live apply");
+    }
+
+    /// EVERY staged-flag guard in apply_heal.sh must match the ARGV COMPARISON,
+    /// never the flag's name in prose — ENUMERATED, not named one at a time.
+    ///
+    /// In this codebase an unknown flag is NOT an error: `std::env::args()
+    /// .position(|a| a == "--flag")` simply does not match, and darwind falls
+    /// through to ORDINARY DAEMON STARTUP. So apply_heal.sh confirms every flag it
+    /// is about to invoke against the STAGED source first, or it would boot a
+    /// daemon instead of getting an answer and the gate would be SKIPPED rather
+    /// than enforced. main.rs discusses each of those flags in the comment block
+    /// above its handler, so the guards' original form —
+    /// `grep -q -- '--heal-confidence' "$CRATE/src/main.rs"` — matched that PROSE:
+    /// on a staged source whose dispatch literal had drifted or been renamed, the
+    /// script CLEARED ITS OWN FAIL-CLOSED GUARD and invoked a flag the staged
+    /// daemon does not implement. MEASURED, by execution: with every
+    /// `a == "--flag"` literal in the real main.rs renamed by one letter and the
+    /// prose untouched, all three of those greps still ACCEPTED.
+    ///
+    /// The three per-flag parity tests above pin their own guard's text. A FOURTH
+    /// guard added tomorrow in the prose-matching form would be pinned by nobody,
+    /// which is how this defect got in: the TEST for --heal-responsiveness was
+    /// hardened and the SCRIPT was not. So this enumerates rather than names.
+    #[test]
+    fn every_staged_flag_guard_matches_the_argv_comparison_not_the_prose() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+
+        // Does this line's grep pattern name a long CLI flag? A `--` that OPENS a
+        // quoted token — `'--split-heal-diff'`, `"--heal-confidence"` — does.
+        // grep's own bare `--` end-of-options separator (preceded by a space) does
+        // not, so a future non-flag source guard is not dragged into this rule.
+        fn names_a_cli_flag(line: &str) -> bool {
+            line.as_bytes().windows(4).any(|w| {
+                (w[0] == b'\'' || w[0] == b'"')
+                    && w[1] == b'-'
+                    && w[2] == b'-'
+                    && w[3].is_ascii_lowercase()
+            })
+        }
+
+        let guards: Vec<&str> = script
+            .lines()
+            .map(str::trim_start)
+            .filter(|l| {
+                !l.starts_with('#')
+                    && l.contains("grep")
+                    && l.contains("\"$CRATE/src/")
+                    && names_a_cli_flag(l)
+            })
+            .collect();
+
+        // A FOR-ALL OVER NOTHING IS NOT A CHECK. If the enumeration stops binding —
+        // the guards renamed, $CRATE spelled differently — the loop below would
+        // iterate zero lines and pronounce every guard sound having read none.
+        assert!(
+            guards.len() >= 3,
+            "expected at least the three staged-flag guards (--heal-responsiveness, \
+             --heal-confidence, --split-heal-diff); the enumeration found {}, so it no \
+             longer binds and this test would pass over nothing:\n{guards:#?}",
+            guards.len()
+        );
+
+        for g in &guards {
+            // FAIL-CLOSED SHAPE: a missing flag must refuse, never fall through.
+            assert!(
+                g.starts_with("if ! grep"),
+                "a staged-flag guard that is not `if ! grep ...` does not fail closed:\n{g}"
+            );
+            // ...AND IT MUST READ THE DISPATCH, NOT THE DOCUMENTATION.
+            assert!(
+                g.contains("a == \"--"),
+                "this flag guard matches main.rs's PROSE, not its argv comparison. On a \
+                 staged source whose dispatch literal drifted it clears itself and then \
+                 invokes a flag the daemon does not implement — and an unknown flag boots \
+                 the daemon rather than erroring. Anchor it on `a == \"--<flag>\"`:\n{g}"
+            );
+            // ...and the comment class must be present, or a `//` line quoting the
+            // argv form re-opens the same hole one level down. PROVED by execution:
+            // without it, a comment carrying `a == "--heal-responsiveness"` clears
+            // the guard on a source whose dispatch literal had been renamed.
+            assert!(
+                g.contains("[^/[:space:]]"),
+                "this flag guard would accept the argv form quoted inside a `//` comment; \
+                 it must exclude comment lines:\n{g}"
+            );
+        }
+
+        // ...and each flag the script actually invokes must HAVE one. Enumeration
+        // alone is satisfied by three guards that all name the same flag.
+        for flag in ["--heal-responsiveness", "--heal-confidence", "--split-heal-diff"] {
+            let needle = format!("a == \"{flag}\"");
+            let n = guards.iter().filter(|g| g.contains(needle.as_str())).count();
+            assert_eq!(
+                n, 1,
+                "exactly one staged-flag guard must anchor on `{needle}`; found {n}:\n{guards:#?}"
+            );
+        }
     }
 }

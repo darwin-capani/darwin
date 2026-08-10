@@ -496,5 +496,144 @@ else
 fi
 
 echo
+echo "== staged-flag guards: the ARGV COMPARISON, not the prose =="
+
+# ---------------------------------------------------------------------------
+# Part D: the staged-flag guards (fail-closed, and they must not clear on a
+# COMMENT).
+# ---------------------------------------------------------------------------
+# WHAT WENT WRONG: in this codebase an unknown flag is NOT an error.
+# `std::env::args().position(|a| a == "--flag")` simply does not match and
+# darwind falls through to ORDINARY DAEMON STARTUP — so a script that invokes a
+# flag a staged daemon does not implement BOOTS A DAEMON instead of getting an
+# answer, and its gate is SKIPPED rather than enforced. apply_heal.sh therefore
+# confirms each flag against the staged source first.
+#
+# Those guards used to be `grep -q -- '--heal-confidence' "$CRATE/src/main.rs"`,
+# and main.rs discusses every one of these flags in the comment block above its
+# handler. So on a staged source whose dispatch literal had drifted or been
+# renamed, the grep matched the PROSE, the script cleared its own fail-closed
+# guard, and it invoked the flag anyway. (The daemon-side test that pins these
+# greps had already been hardened against exactly this; the SCRIPT had not.)
+#
+# Still HERMETIC: no cargo, no daemon, no network. We run the script's REAL
+# guard commands — sliced verbatim, so the test cannot drift from what the
+# script runs — against two fake $CRATE trees built from the repo's OWN
+# daemon/src/main.rs:
+#   LEGIT   the real file. A guard that refuses everything is not a fix, so the
+#           accept case is checked against the source the script will really see.
+#   DRIFTED the same file with every `a == "--flag"` argv literal renamed and
+#           ALL PROSE UNTOUCHED. This is the tree that must be refused.
+# Deriving both from the real main.rs (rather than a synthetic stub) means a
+# fourth flag guard is covered the day it lands.
+
+FLAG_GUARDS="$(sed -nE 's/^[[:space:]]*if ! (grep .*"\$CRATE\/src\/main\.rs");[[:space:]]*then$/\1/p' "$SCRIPT")"
+GUARD_N="$(printf '%s\n' "$FLAG_GUARDS" | grep -c 'grep' || true)"
+
+# A FOR-ALL OVER NOTHING IS NOT A CHECK: if the slice stops binding, every case
+# below would "pass" having run no guard at all.
+if [ "${GUARD_N:-0}" -lt 3 ]; then
+  bad "sliced $GUARD_N staged-flag guards out of apply_heal.sh, expected at least 3 — the slice no longer binds and Part D would test nothing"
+else
+  ok "sliced $GUARD_N staged-flag guards verbatim out of apply_heal.sh"
+
+  FAKE="$WORK/flagguard"
+  rm -rf "$FAKE"
+  mkdir -p "$FAKE/legit/src" "$FAKE/drift/src"
+  REAL_MAIN="$REPO_ROOT/daemon/src/main.rs"
+  if [ ! -f "$REAL_MAIN" ]; then
+    bad "no daemon/src/main.rs to build the staged-flag fixtures from"
+  else
+    cp "$REAL_MAIN" "$FAKE/legit/src/main.rs"
+    # Rename every argv literal; touch no prose. The suffix keeps the flag NAME
+    # present everywhere it was, which is the whole point of the fixture.
+    sed -E 's/(a == ")(--[a-z-]+)(")/\1\2-renamed\3/g' "$REAL_MAIN" > "$FAKE/drift/src/main.rs"
+    if cmp -s "$FAKE/legit/src/main.rs" "$FAKE/drift/src/main.rs"; then
+      bad "the drifted fixture is byte-identical to main.rs — the rename matched nothing and the refuse case below would be vacuous"
+    else
+      ok "the drifted fixture renames main.rs's argv literals (prose untouched)"
+    fi
+
+    while IFS= read -r guard; do
+      [ -n "$guard" ] || continue
+      # Read the flag out of the guard's QUOTED FLAG TOKEN, not out of `a == "..."`.
+      # Keying on the hardened form would make a guard REGRESSED to the prose form
+      # unparseable, and Part D would report a parse failure instead of running it
+      # — the regression would be caught, but for the wrong reason and without
+      # ever demonstrating that the old form ACCEPTS a drifted tree. This way the
+      # regressed guard is executed and fails on what it actually does.
+      flag="$(printf '%s\n' "$guard" | sed -E "s/.*[\"'](--[a-z][a-z-]*)[\"'].*/\1/")"
+      case "$flag" in --*) ;; *) bad "could not read a flag name out of the guard: $guard"; continue ;; esac
+
+      # PRECONDITION. The drifted tree must still SAY the flag everywhere main.rs
+      # said it in prose — otherwise a refusal below proves only that the name
+      # vanished, not that the guard reads the dispatch.
+      if grep -q -- "$flag" "$FAKE/drift/src/main.rs"; then
+        ok "$flag: the drifted fixture still names the flag in prose (the refusal below is not vacuous)"
+      else
+        bad "$flag: the drifted fixture lost the flag name entirely — this case cannot show prose-matching"
+      fi
+
+      if CRATE="$FAKE/legit" bash -c "$guard" 2>/dev/null; then
+        ok "$flag: the guard ACCEPTS the real main.rs (a guard that refuses everything is not a fix)"
+      else
+        bad "$flag: the guard REFUSES the repo's own main.rs — every apply would fail forever"
+      fi
+
+      if CRATE="$FAKE/drift" bash -c "$guard" 2>/dev/null; then
+        bad "$flag: the guard ACCEPTS a staged source that mentions the flag only in PROSE — it clears itself on a comment and would then invoke a flag the daemon does not implement (unknown flags boot the daemon, they do not error)"
+      else
+        ok "$flag: the guard REFUSES a staged source that names the flag only in PROSE"
+      fi
+
+      # ...AND ONE LEVEL DOWN. Anchoring on `a == "--flag"` without excluding
+      # comment lines just moves the hole: a `//` line QUOTING the argv form
+      # clears the guard on a source whose dispatch literal has drifted. Same
+      # drifted tree, plus a comment that spells the comparison.
+      mkdir -p "$FAKE/cmt/src"
+      { printf '// the dispatch reads `a == "%s"`; see apply_heal.sh\n' "$flag"
+        cat "$FAKE/drift/src/main.rs"; } > "$FAKE/cmt/src/main.rs"
+      if CRATE="$FAKE/cmt" bash -c "$guard" 2>/dev/null; then
+        bad "$flag: the guard ACCEPTS a drifted source whose only argv-form match is inside a // COMMENT — it must exclude comment lines"
+      else
+        ok "$flag: the guard REFUSES an argv-form match that lives in a // COMMENT"
+      fi
+
+      # ...AND THE DIVERGENCE THE GUARD IS DOCUMENTED TO HAVE, MADE EXECUTABLE.
+      # The regex spends one character on [^/[:space:]] before `.*`, so a line
+      # whose ONLY `a == "--flag"` starts at the line's first non-blank column
+      # never matches — at column 0 and, the realistic case, INDENTED. rustfmt
+      # emits exactly that from a block-bodied closure. heal.rs's
+      # `!starts_with("//") && contains(...)` rule ACCEPTS such a line, so the
+      # two gates disagree there; the disagreement is fail-closed (this refuses)
+      # and is written up above the responsiveness guard in apply_heal.sh, where
+      # the COST of a refusal differs per guard. Pin it, so widening the regex to
+      # reach parity forces whoever does it back through that note.
+      mkdir -p "$FAKE/bare/src"
+      { printf '    if let Some(pos) = std::env::args().position(|a| {\n'
+        printf '        a == "%s"\n' "$flag"
+        printf '    }) {\n'
+        cat "$FAKE/drift/src/main.rs"; } > "$FAKE/bare/src/main.rs"
+      # PRECONDITION: the fixture really carries the bare INDENTED comparison —
+      # the exact shape heal.rs's code-line rule accepts. Without this the pin
+      # below would also "pass" on a fixture that has no argv form at all.
+      if grep -qE '^[[:space:]]+a == "'"$flag"'"$' "$FAKE/bare/src/main.rs"; then
+        ok "$flag: the bare-comparison fixture carries an indented, comment-free argv comparison (the shape heal.rs accepts)"
+      else
+        bad "$flag: the bare-comparison fixture does not carry that line — the divergence pin below would be vacuous"
+      fi
+      if CRATE="$FAKE/bare" bash -c "$guard" 2>/dev/null; then
+        bad "$flag: the guard ACCEPTS a bare indented argv comparison. That is PARITY with heal.rs rather than a hole, but apply_heal.sh documents this shape as REFUSED and spells out what a refusal costs at each guard — move the note and this pin together"
+      else
+        ok "$flag: the guard REFUSES a bare indented argv comparison (documented fail-closed divergence from heal.rs's code-line rule)"
+      fi
+    done <<EOF
+$FLAG_GUARDS
+EOF
+  fi
+  rm -rf "$FAKE"
+fi
+
+echo
 echo "apply_heal confinement: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

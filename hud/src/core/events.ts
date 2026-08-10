@@ -49,7 +49,12 @@ export interface HardwareVitalsData {
     on_ac: boolean;
     charge_state: "discharging" | "charging" | "charged" | "unknown";
   };
-  thermal: "nominal" | "fair" | "serious" | "critical"; // ProcessInfo.thermalState
+  /** ProcessInfo.thermalState. "unknown" is a REAL wire value: the shim returns
+   *  -1 when the state could not be read, and the daemon sends that through
+   *  honestly rather than folding it to "nominal". (The THROTTLE POLICY does
+   *  fold it — power::map_thermal — so it never throttles on a guess; that fold
+   *  is deliberately NOT on this display path.) */
+  thermal: "nominal" | "fair" | "serious" | "critical" | "unknown";
   memory: {
     used_bytes: number;
     total_bytes: number;
@@ -165,12 +170,56 @@ export interface ResponseSpeakingData {
 
 /** system / pipeline.completed — main.rs (PipelineTiming struct). */
 export interface PipelineCompletedData {
+  /** VAD finish (the utterance WAV's mtime) -> event-loop pickup: the time the
+   *  utterance spent QUEUED behind an in-flight turn. It is measured BEFORE the
+   *  pipeline clock starts, so it is NOT part of `total_ms` and must never be
+   *  added into the stt/classify/route/speak bar — those are all pickup-relative.
+   *  The daemon added it precisely so a long wait is visible (main.rs: "the clock
+   *  used to start at dequeue, hiding it"); it was then dropped by the reducer,
+   *  so the wait stayed hidden anyway. */
+  queue_ms: number;
   stt_ms: number;
   classify_ms: number;
   route_ms: number;
   first_audio_ms: number | null; // Option<u64>
   speak_ms: number;
   total_ms: number;
+}
+
+/** How the latency strip talks about the pre-pickup queue wait. PURE, so the
+ *  threshold is tested rather than buried in JSX.
+ *
+ *  ARITHMETIC: `queueMs` is NOT inside `total_ms` — the daemon's pipeline clock
+ *  starts at pickup — so `wallMs` (what the person actually waited from the
+ *  moment they stopped speaking) is queue + total, and that sum is the only
+ *  number that answers "why was that slow?" when the queue dominated. */
+export interface QueueWaitNote {
+  text: string;
+  /** True when the wait is a real part of what the owner experienced: at least
+   *  a quarter of the end-to-end wall time AND at least 250 ms of it. Both
+   *  conditions matter — 200 ms of queue on a 400 ms turn is a big fraction of
+   *  nothing, and 300 ms behind a 60 s turn is noise. */
+  notable: boolean;
+  /** queue + total: the honest end-to-end wall time from VAD finish. */
+  wallMs: number;
+}
+
+/** Minimum absolute queue wait before the strip calls it notable (ms). */
+export const QUEUE_NOTABLE_MIN_MS = 250;
+/** Minimum share of end-to-end wall time before the strip calls it notable. */
+export const QUEUE_NOTABLE_SHARE = 0.25;
+
+export function queueWaitNote(queueMs: number, totalMs: number): QueueWaitNote {
+  const q = Number.isFinite(queueMs) && queueMs > 0 ? Math.round(queueMs) : 0;
+  const t = Number.isFinite(totalMs) && totalMs > 0 ? Math.round(totalMs) : 0;
+  const wallMs = q + t;
+  const notable =
+    q >= QUEUE_NOTABLE_MIN_MS && wallMs > 0 && q / wallMs >= QUEUE_NOTABLE_SHARE;
+  return {
+    text: notable ? `${q} ms QUEUED before pickup` : `${q} ms queued`,
+    notable,
+    wallMs,
+  };
 }
 
 /** system / inference.unavailable — ops seen in daemon/src:
@@ -240,9 +289,14 @@ export interface HealDiagnosingData {
  *  every cargo stage's real wall time, so after N attempts the right floor and
  *  the right budget are arithmetic rather than argument.
  *
- *  NOT RENDERED TODAY — declared so the wire contract is written down once, on
- *  the side that has to keep reading it. Optional everywhere: an older daemon
- *  sends none of it. */
+ *  RENDERED: core/heal.ts `parseHealCalibration` folds it into state and
+ *  `calibrationRows` derives the readout; SelfHealPanel shows it beside ACCEPT &
+ *  APPLY and AlertPanel shows it on a REJECTED banner. (It was declared here and
+ *  rendered nowhere for its whole first life — the measurements were paid for
+ *  and unreadable. Do not let it lapse back: hud/src/test/heal-calibration.test.ts
+ *  fails if either surface stops rendering it.) Optional everywhere: an older
+ *  daemon sends none of it, and both surfaces then render nothing at all rather
+ *  than a shell of zeros. */
 export interface HealCalibrationData {
   /** Per candidate: `reviewed:false` is a review call that never returned,
    *  recorded as 0.0 — that is NO REVIEW, not a zero verdict, and averaging the

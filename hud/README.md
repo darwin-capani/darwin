@@ -30,9 +30,21 @@ npm run tauri build   # bundles DARWIN.app (macOS only)
 ```sh
 npx vitest run                  # headless suite: state core, event parsers,
                                 # and SSR panel renders (whole HUD surface)
+npx tsc --noEmit                # typecheck (no bundle)
 npm run build                   # tsc + vite production build
-(cd src-tauri && cargo check)   # Rust shell
+(cd src-tauri && cargo test --locked)   # Rust shell — 158 tests, RUN THEM
 ```
+
+`cargo check` used to be the only Rust command named here, and `cargo check` does
+not set `--cfg test`: it never compiles `#[cfg(test)] mod tests` at all. The 158
+tests under `src-tauri/` are not decorative — they are the gate on the config
+whitelist, control-character rejection, path-absoluteness and duplicate rejection,
+i.e. **what may be written into `config/darwin.toml`** — and CI runs them only on a
+pushed `v*` tag (`.github/workflows/release.yml`), which is long after the moment
+they would have caught something. Cost, measured on an M1 Pro: **2m 08s cold**
+(first build of the Tauri dependency graph) and **8.6s warm** — so the recurring
+price of keeping this in the local gate is under nine seconds, and the cold number
+is paid once per clean checkout. Run it before every merge, not before every tag.
 
 The telemetry reducer, envelope parsing, visual state signatures, and the adaptive
 performance governor live in plain TypeScript modules (`src/core/*`) with no

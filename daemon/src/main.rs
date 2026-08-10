@@ -5749,6 +5749,31 @@ async fn trigger_create_pronunciation(
 #[cfg(test)]
 mod recall_probe;
 
+// MISS BEHAVIOUR (miss_offer.rs) — the follow-on question to recall_probe's number:
+// the utterances that reach NO gate land in a generic conversational answer about a
+// thing DARWIN could have DONE, so could a cheap on-device "did you mean" name the
+// real capability instead? MEASURED NO: no similarity threshold is both honest (zero
+// suggestions on the 172 ordinary utterances) and useful (>= 5 correct offers on the
+// 55 misses). TEST-ONLY, no production caller — it exists so the NO-GO carries its
+// numbers and goes RED if a later change overturns it. Declared here for the same
+// reason recall_probe is: a `#[cfg(test)]` above the last production item truncates
+// the `encryption_migration_tests` source scrape of this file.
+#[cfg(test)]
+mod miss_offer;
+
+// GATE DOCUMENTATION (gate_docs.rs) — the commands that name the LOCAL gate set are
+// themselves a contract. CI runs only on a pushed `v*` tag, so a wrong command in
+// hud/README.md or an app manifest is the whole reason a test suite ends up run by
+// nothing; `cargo check`, in particular, never sets `--cfg test` and so never
+// compiles `#[cfg(test)] mod tests` at all. TEST-ONLY, no production caller.
+//
+// DECLARED HERE for the reason spelled out above `mod recall_probe`: an attribute
+// that opens a test module, placed anywhere above the first test module, truncates
+// the keyed-open guard's production scrape to nothing. Test-only modules go below
+// the last production item — right here.
+#[cfg(test)]
+mod gate_docs;
+
 #[cfg(test)]
 mod tests {
     use super::{

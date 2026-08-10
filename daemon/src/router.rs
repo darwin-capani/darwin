@@ -1853,11 +1853,40 @@ pub async fn route(
     // Silicon Canvas voice control (SPEC §6): a precise control phrase ("show
     // me the 3V3 net", "trace this net", "run ERC", "open silicon canvas") maps
     // to a LAUNCH or a STRUCTURED op forwarded to the running app. Checked
-    // before the generic local handlers so an op phrase that would otherwise
-    // classify as conversation/app.launch is handled deterministically and the
-    // app never sees natural language — the daemon forwards structured ops
-    // ONLY. The action's verified outcome is converse data, phrased in persona
-    // on the streamed path below (llm_voice), exactly like the app-launch path.
+    // before the generic local handlers, so an op phrase that REACHES HERE is
+    // handled deterministically and the app never sees natural language — the
+    // daemon forwards structured ops ONLY. The action's verified outcome is
+    // converse data, phrased in persona on the streamed path below (llm_voice),
+    // exactly like the app-launch path.
+    //
+    // WHAT "REACHES HERE" COSTS — re-derived from the call graph, because the
+    // sentence this replaced ("an op phrase that would otherwise classify as
+    // conversation/app.launch is handled deterministically") claimed more than
+    // the code does. This whole seam sits BELOW two early returns, so an op
+    // phrase does NOT reach it on every turn:
+    //   * the cloud TOOL LOOP (`if actuating_cloud` above) returns on Ok, and it
+    //     is entered whenever the turn is heavy or below the confidence
+    //     threshold (`wants_cloud`);
+    //   * the CONVERSATION branch (`if class.intent == "conversation"`) resolves
+    //     its tier through `conversation_brain`, and on the SHIPPED default
+    //     ([router].conversation_route = "cloud_heavy") a reachable cloud makes
+    //     that tier Heavy or Fast — both cloud — so `complete_persona` answers
+    //     and returns.
+    // Neither cloud path substitutes for this seam: `anthropic`'s tool catalogue
+    // carries open_app/quit_app but NO describe / generate-image /
+    // identify-sound / Silicon-Canvas / Lumen-read / Vision / Nexus /
+    // Mark-Forge op. The nearest thing the catalogue does carry is
+    // `screen_recall`, and it is NOT a substitute: it RANKS a bounded, in-RAM,
+    // TRANSIENT ring of PAST redacted OCR text (owner-gated on Screen-Recording
+    // consent) and reads nothing NOW — no VLM description, no camera, no audio
+    // clip, no app op. So on the shipped cloud-enabled config an utterance the
+    // on-device intent classifier labels "conversation" — and its taxonomy
+    // (inference/prompts/intent_classifier.txt) is ELEVEN intents, none of them
+    // these apps — is answered conversationally and these gates are never
+    // consulted, while the SAME utterance offline falls through and actuates.
+    // Hoisting this seam above those returns would change WHEN camera capture
+    // and screen reads can actuate, which is a posture decision — recorded here
+    // (and in daemon/src/miss_offer.rs) rather than taken.
     // Vision voice control (mirrors Silicon Canvas): "what do you see", "who is
     // there", "watch the door|screen", "analyze this video" map to a LAUNCH or a
     // STRUCTURED op forwarded to the running Vision app. Checked alongside the

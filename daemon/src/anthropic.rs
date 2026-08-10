@@ -13215,7 +13215,15 @@ async fn mission_resume_tool(memory: &Memory, id: &str) -> String {
         None
     };
     if let Some(m) = settled {
-        let status = if outcome.is_ok() {
+        // NAME THE TYPE. The wire-token guard reads this payload's SOURCE TEXT, and
+        // a bare `status.as_str()` told it nothing — `.as_str()` exists on a dozen
+        // types, and the single fact that keeps this token inside the HUD's closed
+        // union is that it comes from `MissionStatus`, whose every variant is pinned
+        // by `every_mission_status_token_is_one_the_hud_accepts`. Spelling the
+        // producing type into the payload (UFCS) is what makes THIS emit checkable;
+        // until it was, the guard could not see this site at all — it stopped at the
+        // FIRST `"mission.resumed"` in the file, which is the ACTIVE emit above.
+        let status: crate::durable_missions::MissionStatus = if outcome.is_ok() {
             m.status
         } else {
             crate::durable_missions::MissionStatus::Paused
@@ -13226,7 +13234,7 @@ async fn mission_resume_tool(memory: &Memory, id: &str) -> String {
             json!({
                 "id": m.id,
                 "goal": m.goal,
-                "status": status.as_str(),
+                "status": crate::durable_missions::MissionStatus::as_str(&status),
                 "done": m.steps.iter().filter(|s| matches!(s.status, crate::durable_missions::StepStatus::Done)).count(),
                 "total": m.steps.len(),
             }),
@@ -23698,33 +23706,74 @@ mod hud_frame_field_tests {
     /// Asserted at the source because the emit sites are inside async tool handlers
     /// that need a live memory + model to reach; what matters is that the payload
     /// literal carries the keys the other side reads.
-    fn emit_payload(event: &str) -> String {
+    /// EVERY emit payload for `event`, in source order — never just the first.
+    ///
+    /// This returned ONE payload (the first match) and that is exactly how the
+    /// `mission.resumed` SETTLE emit went unguarded: the topic has TWO production
+    /// emit sites — the ACTIVE emit before `durable_missions::resume()`, and the
+    /// SETTLE emit after it that reports Done/Paused — and the guard only ever saw
+    /// the first, so a dropped field in the second was invisible. A guard that
+    /// windows on the first occurrence of a multi-site topic pins one site and
+    /// silently vouches for the rest.
+    fn emit_payloads(event: &str) -> Vec<String> {
         let src = include_str!("anthropic.rs");
         // Anchor on the emit's own argument list — not the first mention of the name
-        // anywhere in the file, which is a doc comment or a match arm.
+        // anywhere in the file, which is a doc comment or a match arm. (This module's
+        // own calls pass the topic as `emit_payloads("x")` / `..("x", &p)`, neither of
+        // which is followed by a comma-newline, so the needle cannot self-match.)
         let needle = format!("\"{event}\",\n");
-        let i = src
-            .find(&needle)
-            .unwrap_or_else(|| panic!("{event} is no longer emitted"));
-        let rest = &src[i..];
-        // ...and bound it to the json! LITERAL. A generous fixed window reaches into
-        // the code after the emit and finds unrelated keys there: a 1200-char window
-        // made the mission.resumed guard pass against a mutant that removed "status"
-        // from its payload, because the resume() call below happens to mention one.
-        let j = rest.find("json!(").expect("emit payload is not a json! literal");
-        let k = rest[j..].find("}),").map(|e| j + e + 2).unwrap_or(rest.len());
-        rest[j..k].to_string()
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while let Some(rel) = src[at..].find(&needle) {
+            let start = at + rel + needle.len();
+            at = start;
+            let rest = &src[start..];
+            // The payload must be the VERY NEXT thing — bounded at BOTH ends, and
+            // adjacency is what makes multi-site scanning safe. A scan that hunted
+            // forward for "the next json! anywhere below" would happily pair a site
+            // whose literal had been refactored away with some LATER emit's payload
+            // and report it green. Anything that is not an adjacent json! literal
+            // FAILS LOUDLY here rather than being skipped: a guard that quietly
+            // drops a site it cannot read is the defect this function exists to end.
+            //
+            // Whitespace and `//` lines are stepped over and NOTHING else —
+            // mission.saved and draft.composed each explain their payload in a
+            // comment sitting between the topic and the literal, and refusing that
+            // would have been a guard that fails on correct code.
+            let mut probe = rest.trim_start();
+            while let Some(after) = probe.strip_prefix("//") {
+                let nl = after.find('\n').map(|x| x + 1).unwrap_or(after.len());
+                probe = after[nl..].trim_start();
+            }
+            assert!(
+                probe.starts_with("json!("),
+                "{event}: an emit site does not pass a json! literal directly; this \
+                 guard reads payload literals and must not silently skip a site"
+            );
+            let j = rest.len() - probe.len();
+            // ...and bound it to the json! LITERAL. A generous fixed window reaches into
+            // the code after the emit and finds unrelated keys there: a 1200-char window
+            // made the mission.resumed guard pass against a mutant that removed "status"
+            // from its payload, because the resume() call below happens to mention one.
+            let k = rest[j..].find("}),").map(|e| j + e + 2).unwrap_or(rest.len());
+            out.push(rest[j..k].to_string());
+        }
+        assert!(!out.is_empty(), "{event} is no longer emitted");
+        out
     }
 
     #[test]
     fn mission_saved_carries_what_the_panel_renders() {
-        let p = emit_payload("mission.saved");
-        for key in ["\"goal\"", "\"status\"", "\"done\"", "\"total\""] {
-            assert!(
-                p.contains(key),
-                "mission.saved omits {key}; the DURABLE MISSIONS panel reads it and \
-                 renders an id with nothing else"
-            );
+        let payloads = emit_payloads("mission.saved");
+        assert_eq!(payloads.len(), 1, "mission.saved gained an emit site");
+        for p in &payloads {
+            for key in ["\"goal\"", "\"status\"", "\"done\"", "\"total\""] {
+                assert!(
+                    p.contains(key),
+                    "mission.saved omits {key}; the DURABLE MISSIONS panel reads it and \
+                     renders an id with nothing else"
+                );
+            }
         }
     }
 
@@ -23744,6 +23793,35 @@ mod hud_frame_field_tests {
         rest[..end].trim().to_string()
     }
 
+    /// Whether `expr` is EXACTLY a `MissionStatus::as_str(..)` call — the closing
+    /// paren that balances its argument list is the LAST character of the
+    /// expression. `MissionStatus::as_str(&s)` is accepted;
+    /// `MissionStatus::as_str(&s).to_uppercase()` is not, and neither is
+    /// `&MissionStatus::as_str(&s)[..1]`. Both of those still END in a paren or a
+    /// bracket, which is why a `contains(..)` / `ends_with(')')` test cannot tell
+    /// them apart and this one walks the parens.
+    fn is_bare_ufcs_as_str(expr: &str) -> bool {
+        const CALL: &str = "MissionStatus::as_str(";
+        let Some(open) = expr.find(CALL) else {
+            return false;
+        };
+        let start = open + CALL.len();
+        let mut depth = 1usize;
+        for (i, c) in expr[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return start + i + 1 == expr.len();
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
     /// A status VALUE the HUD folds without silently rewriting it: either a literal
     /// from the closed union, or a token produced by `MissionStatus::as_str()` —
     /// the one function that can emit those four and nothing else.
@@ -23756,10 +23834,28 @@ mod hud_frame_field_tests {
                  coerces it to the SAFE default and the row reads PAUSED"
             );
         } else {
+            // Both spellings of the same fact are accepted — the METHOD form
+            // `MissionStatus::X.as_str()` and the UFCS form `MissionStatus::as_str(&x)`.
+            // What is load-bearing is that the WHOLE expression is that call and nothing
+            // wrapped around it, so each form is pinned at BOTH ends.
+            //
+            // RELAXING THIS TO `contains("as_str(")` REOPENED A HOLE THAT WAS CLOSED.
+            // `MissionStatus::Cancelled.as_str().to_uppercase()` contains both
+            // "MissionStatus::" and "as_str(" — and puts "CANCELLED" on the wire, which
+            // is in NO MissionStatus, so `coerceMissionStatus` rewrites it to the SAFE
+            // default and the row reads PAUSED. That is the exact class of bug this
+            // guard was written for, and the earlier `ends_with(".as_str()")` rule
+            // caught it. So: keep that rule for the method form, and admit the UFCS
+            // form only when the close paren of `MissionStatus::as_str(` IS the end of
+            // the expression. (`status.as_str()` on an untyped local names no type at
+            // all and is still refused: `.as_str()` lives on a dozen types.)
+            let method_form = expr.contains("MissionStatus::") && expr.ends_with(".as_str()");
             assert!(
-                expr.contains("MissionStatus::") && expr.ends_with(".as_str()"),
-                "{event} builds its status from {expr:?}; it must come from \
-                 MissionStatus::as_str(), the only producer of the four wire tokens"
+                method_form || is_bare_ufcs_as_str(&expr),
+                "{event} builds its status from {expr:?}; it must be EXACTLY \
+                 MissionStatus::as_str(..) — the only producer of the four wire tokens — \
+                 with nothing wrapped around it, or the token can leave the HUD's \
+                 closed union"
             );
         }
     }
@@ -23771,29 +23867,54 @@ mod hud_frame_field_tests {
     /// always there, the VALUE was the bug. It also omitted goal/done/total, and the
     /// panel REPLACES the row from this payload, so resuming blanked the goal to
     /// "(no goal)" and the progress readout to 0/0.
+    ///
+    /// AND IT HAS TWO EMIT SITES. `mission_resume_tool` emits once BEFORE
+    /// `durable_missions::resume()` (the ACTIVE row) and once AFTER it (the SETTLE
+    /// row that reports Done, or Paused when the resume errored). The guard used to
+    /// window on the FIRST `"mission.resumed",` in the file, so the settle emit —
+    /// the one that ends up on screen — was never checked at all: dropping `goal`
+    /// there would blank the row to "(no goal)" the instant a mission finished, and
+    /// this test would still have been green. Every site is checked below, and the
+    /// COUNT is pinned so a third site cannot be added into the blind spot either.
     #[test]
     fn a_resumed_mission_reports_a_status_the_hud_accepts() {
-        let p = emit_payload("mission.resumed");
-        for key in ["\"goal\"", "\"status\"", "\"done\"", "\"total\""] {
-            assert!(
-                p.contains(key),
-                "mission.resumed omits {key}; the HUD replaces the row from this \
-                 payload, so resuming a mission blanks what it already showed"
-            );
+        let payloads = emit_payloads("mission.resumed");
+        assert_eq!(
+            payloads.len(),
+            2,
+            "mission.resumed has TWO emit sites IN anthropic.rs (ACTIVE before the \
+             resume, SETTLE after it). Found {} — if a site was added, check it here \
+             too; if one vanished, the panel now keeps a stale row. NOTE THE SCOPE: \
+             emit_payloads reads THIS FILE ONLY, so a site added in another module is \
+             not counted here and is not guarded by anything.",
+            payloads.len()
+        );
+        for (n, p) in payloads.iter().enumerate() {
+            for key in ["\"goal\"", "\"status\"", "\"done\"", "\"total\""] {
+                assert!(
+                    p.contains(key),
+                    "mission.resumed emit site #{n} omits {key}; the HUD replaces the \
+                     row from this payload, so resuming a mission blanks what it \
+                     already showed"
+                );
+            }
+            assert_hud_foldable_status("mission.resumed", p);
         }
-        assert_hud_foldable_status("mission.resumed", &p);
     }
 
     /// The same wholesale-replace applies to a cancellation: without `goal` the
     /// cancelled row renders "(no goal)" for a mission the user just named.
     #[test]
     fn a_cancelled_mission_keeps_the_goal_on_its_row() {
-        let p = emit_payload("mission.cancelled");
-        assert!(
-            p.contains("\"goal\""),
-            "mission.cancelled omits the goal; the row it replaces renders \"(no goal)\""
-        );
-        assert_hud_foldable_status("mission.cancelled", &p);
+        let payloads = emit_payloads("mission.cancelled");
+        assert_eq!(payloads.len(), 1, "mission.cancelled gained an emit site");
+        for p in &payloads {
+            assert!(
+                p.contains("\"goal\""),
+                "mission.cancelled omits the goal; the row it replaces renders \"(no goal)\""
+            );
+            assert_hud_foldable_status("mission.cancelled", p);
+        }
     }
 
     /// The daemon-side half of the contract the guards above lean on: every token
@@ -23817,13 +23938,16 @@ mod hud_frame_field_tests {
 
     #[test]
     fn draft_composed_carries_its_subject_and_preview() {
-        let p = emit_payload("draft.composed");
-        for key in ["\"subject\"", "\"preview\""] {
-            assert!(
-                p.contains(key),
-                "draft.composed omits {key}; every PENDING DRAFTS row renders \
-                 \"(no subject)\" with no body preview"
-            );
+        let payloads = emit_payloads("draft.composed");
+        assert_eq!(payloads.len(), 1, "draft.composed gained an emit site");
+        for p in &payloads {
+            for key in ["\"subject\"", "\"preview\""] {
+                assert!(
+                    p.contains(key),
+                    "draft.composed omits {key}; every PENDING DRAFTS row renders \
+                     \"(no subject)\" with no body preview"
+                );
+            }
         }
     }
 }

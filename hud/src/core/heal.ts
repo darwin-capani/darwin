@@ -117,6 +117,233 @@ export function rejectionDetail(stage: string): string {
 }
 
 /* ------------------------------------------------------------------------ *
+ * PER-ATTEMPT CALIBRATION (heal.proposal / heal.rejected `calibration`).
+ *
+ * The daemon has shipped this payload on BOTH terminal heal events since the
+ * two self-heal tunables — [self_heal].attempt_budget_secs and
+ * .confidence_floor — became settable. It exists so those two numbers can be
+ * set from measurement instead of from argument: every candidate's review
+ * score (not just the winner's), every cargo stage's real wall time on THIS
+ * machine, and how many drafted candidates the attempt could not afford to
+ * stage at all. The HUD declared the type and rendered none of it, so the
+ * numbers stayed unreadable — which is the same as not having them.
+ *
+ * Everything below is PURE and lives here (not in the component) so the
+ * arithmetic is tested headlessly under vitest.
+ * ------------------------------------------------------------------------ */
+
+/** One candidate's adversarial-review score. */
+export interface HealReviewScore {
+  candidate: number;
+  confidence: number;
+  /** false = the review CALL never returned and was recorded as 0.0. That is NO
+   *  REVIEW, not a zero verdict — averaging the two together calibrates the
+   *  floor against an outage, so the two are kept apart everywhere. */
+  reviewed: boolean;
+}
+
+/** One cargo stage that actually ran, with its real wall time. */
+export interface HealStageTiming {
+  candidate: number;
+  stage: string;
+  secs: number;
+  /** ok:false with cutOff:false is a MERIT failure (usually much faster);
+   *  cutOff:true is the budget biting. A mean over both is meaningless. */
+  ok: boolean;
+  cutOff: boolean;
+}
+
+export interface HealCalibration {
+  reviews: HealReviewScore[];
+  stages: HealStageTiming[];
+  attemptSpentSecs: number | null;
+  attemptBudgetSecs: number | null;
+  candidateBudgetSecs: number | null;
+  confidenceFloor: number | null;
+  candidatesDrafted: number | null;
+  candidatesUnaffordable: number | null;
+}
+
+/** Bound on rendered per-candidate / per-stage rows, so a hostile or runaway
+ *  frame cannot flood the panel. A real attempt drafts a handful. */
+export const CALIBRATION_MAX_ROWS = 32;
+
+function isObj(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function fin(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** Parse the `calibration` object off a heal.proposal / heal.rejected payload.
+ *  Returns null when the daemon sent none (an older daemon) or when it carries
+ *  nothing usable — the panel then renders nothing rather than an empty shell
+ *  of zeros, which would read as measurements. Every field is optional and
+ *  independently defensive; a malformed row is dropped, never fabricated. */
+export function parseHealCalibration(data: unknown): HealCalibration | null {
+  if (!isObj(data)) return null;
+  const raw = data.calibration;
+  if (!isObj(raw)) return null;
+
+  const reviews: HealReviewScore[] = Array.isArray(raw.confidences)
+    ? raw.confidences
+        .filter(isObj)
+        .map((r) => ({
+          candidate: fin(r.candidate) ?? 0,
+          confidence: fin(r.confidence) ?? 0,
+          // Absent => treat as NOT reviewed: claiming a review happened is the
+          // failure mode this flag exists to prevent.
+          reviewed: r.reviewed === true,
+        }))
+        .slice(0, CALIBRATION_MAX_ROWS)
+    : [];
+
+  const stages: HealStageTiming[] = Array.isArray(raw.stages)
+    ? raw.stages
+        .filter(isObj)
+        .map((r) => ({
+          candidate: fin(r.candidate) ?? 0,
+          stage: typeof r.stage === "string" ? r.stage : "?",
+          secs: Math.max(0, fin(r.secs) ?? 0),
+          ok: r.ok === true,
+          cutOff: r.cut_off === true,
+        }))
+        .slice(0, CALIBRATION_MAX_ROWS)
+    : [];
+
+  const out: HealCalibration = {
+    reviews,
+    stages,
+    attemptSpentSecs: fin(raw.attempt_spent_secs),
+    attemptBudgetSecs: fin(raw.attempt_budget_secs),
+    candidateBudgetSecs: fin(raw.candidate_budget_secs),
+    confidenceFloor: fin(raw.confidence_floor),
+    candidatesDrafted: fin(raw.candidates_drafted),
+    candidatesUnaffordable: fin(raw.candidates_unaffordable),
+  };
+  const empty =
+    out.reviews.length === 0 &&
+    out.stages.length === 0 &&
+    out.attemptSpentSecs === null &&
+    out.attemptBudgetSecs === null &&
+    out.candidateBudgetSecs === null &&
+    out.confidenceFloor === null &&
+    out.candidatesDrafted === null &&
+    out.candidatesUnaffordable === null;
+  return empty ? null : out;
+}
+
+/** One rendered line of the calibration readout. */
+export interface CalibrationRow {
+  key: string;
+  label: string;
+  text: string;
+  /** Render as a warning: this line is telling the operator a tunable is wrong. */
+  warn: boolean;
+}
+
+/** Turn a calibration payload into the lines that answer the only two questions
+ *  it exists to answer: is `attempt_budget_secs` big enough for THIS machine,
+ *  and is `confidence_floor` in the right place?
+ *
+ *  ARITHMETIC IS DONE HERE, not left to the reader: the budget line states the
+ *  remaining margin as a number (and says "over by" rather than showing a
+ *  negative), and the review line counts how many candidates actually cleared
+ *  the floor versus how many were never reviewed at all. */
+export function calibrationRows(c: HealCalibration): CalibrationRow[] {
+  const rows: CalibrationRow[] = [];
+
+  if (c.attemptBudgetSecs !== null) {
+    const budget = Math.round(c.attemptBudgetSecs);
+    if (c.attemptSpentSecs === null) {
+      rows.push({
+        key: "budget",
+        label: "ATTEMPT BUDGET",
+        text: `${budget}s (spend not reported)`,
+        warn: false,
+      });
+    } else {
+      const spent = Math.round(c.attemptSpentSecs);
+      const left = budget - spent;
+      rows.push({
+        key: "budget",
+        label: "ATTEMPT BUDGET",
+        text:
+          left >= 0
+            ? `spent ${spent}s of ${budget}s — ${left}s left`
+            : `spent ${spent}s of ${budget}s — OVER by ${-left}s`,
+        warn: left <= 0,
+      });
+    }
+  }
+
+  if (c.candidateBudgetSecs !== null) {
+    rows.push({
+      key: "candidate-budget",
+      label: "PER CANDIDATE",
+      text: `${Math.round(c.candidateBudgetSecs)}s ceiling`,
+      warn: false,
+    });
+  }
+
+  const unaffordable = c.candidatesUnaffordable ?? 0;
+  if (unaffordable > 0) {
+    const drafted = c.candidatesDrafted;
+    rows.push({
+      key: "unaffordable",
+      label: "NEVER STAGED",
+      text:
+        (drafted === null
+          ? `${unaffordable} drafted candidate${unaffordable === 1 ? "" : "s"}`
+          : `${unaffordable} of ${Math.round(drafted)} drafted candidates`) +
+        " — the attempt could not afford to validate them. Raise [self_heal].attempt_budget_secs.",
+      warn: true,
+    });
+  } else if (c.candidatesDrafted !== null) {
+    rows.push({
+      key: "drafted",
+      label: "CANDIDATES",
+      text: `${Math.round(c.candidatesDrafted)} drafted, all staged`,
+      warn: false,
+    });
+  }
+
+  if (c.reviews.length > 0) {
+    const n = c.reviews.length;
+    const unreviewed = c.reviews.filter((r) => !r.reviewed).length;
+    const floor = c.confidenceFloor;
+    let text: string;
+    let warn = unreviewed > 0;
+    if (floor === null) {
+      text = `${n} scored (floor not reported)`;
+    } else {
+      const cleared = c.reviews.filter((r) => r.reviewed && r.confidence >= floor).length;
+      text = `${cleared} of ${n} at or above the ${confidencePct(floor)}% floor`;
+      warn = warn || cleared === 0;
+    }
+    if (unreviewed > 0) {
+      text += ` · ${unreviewed} review call${unreviewed === 1 ? "" : "s"} never returned (recorded 0.0 — NO REVIEW, not a zero verdict)`;
+    }
+    rows.push({ key: "reviews", label: "REVIEW SCORES", text, warn });
+  }
+
+  if (c.stages.length > 0) {
+    const total = c.stages.reduce((a, s) => a + s.secs, 0);
+    const slowest = c.stages.reduce((a, s) => (s.secs > a.secs ? s : a), c.stages[0]);
+    const cut = c.stages.filter((s) => s.cutOff);
+    let text = `${c.stages.length} ran, ${total}s total — slowest ${slowest.stage} ${slowest.secs}s (candidate ${slowest.candidate})`;
+    if (cut.length > 0) {
+      text += ` · ${cut.length} CUT OFF by the budget (${cut
+        .map((s) => `${s.stage}/c${s.candidate}`)
+        .join(", ")})`;
+    }
+    rows.push({ key: "stages", label: "CARGO STAGES", text, warn: cut.length > 0 });
+  }
+
+  return rows;
+}
+
+/* ------------------------------------------------------------------------ *
  * Accept-and-apply lifecycle — a PURE state machine, separated from the React
  * component so the two-step-confirm guard and the apply lifecycle are testable
  * headlessly under vitest (node env), exactly like the reducer in state.ts.

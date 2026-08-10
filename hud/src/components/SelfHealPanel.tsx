@@ -1,14 +1,17 @@
 import { useEffect, useReducer, useRef, useState } from "react";
 import {
   applyReduce,
+  calibrationRows,
   CONFIDENCE_SEGMENTS,
   confidenceNote,
+  confidencePct,
   confirmReady,
   initialApplyState,
   litSegments,
   REARM_MS,
   reviewVerdict,
   stageLabel,
+  type HealCalibration,
 } from "../core/heal";
 import type { HealDiagnosing, HealProposal } from "../core/state";
 import { healApply, healProposalDetail } from "../tauri/bridge";
@@ -85,6 +88,71 @@ function ConfidenceGauge({
       <span className={note.belowFloor ? "sh-conf-pct sh-warn" : "sh-conf-pct"}>
         {note.text}
       </span>
+    </div>
+  );
+}
+
+/**
+ * PER-ATTEMPT CALIBRATION — rendered where the decision is made.
+ *
+ * The daemon ships this on heal.proposal AND heal.rejected so the two self-heal
+ * tunables can be set from measurement: `[self_heal].attempt_budget_secs` and
+ * `.confidence_floor`. The HUD declared the type and rendered none of it, so the
+ * owner paid for every one of these measurements and could read none of them.
+ *
+ * It sits beside ACCEPT & APPLY because that is the moment the numbers are
+ * actionable: "2 of 3 candidates were never staged" says the budget is too small
+ * for THIS machine, and "0 of 3 cleared the floor" says the floor (or the
+ * drafter) is the thing to change — neither is visible in the winner's score.
+ *
+ * ADVISORY ONLY: nothing here gates anything. It changes no button state, and
+ * the daemon has already enforced both tunables by the time this frame exists.
+ */
+function CalibrationReadout({ calibration }: { calibration: HealCalibration }) {
+  const rows = calibrationRows(calibration);
+  if (rows.length === 0) return null;
+  return (
+    <div className="sh-calib">
+      <div className="sh-calib-label">
+        ATTEMPT CALIBRATION
+        <span className="dim-note"> — what this attempt cost and what it judged</span>
+      </div>
+      {rows.map((r) => (
+        <div className="sh-row" key={r.key}>
+          <span className="sh-k">{r.label}</span>
+          <span className={r.warn ? "sh-v sh-warn" : "sh-v"}>{r.text}</span>
+        </div>
+      ))}
+      {calibration.reviews.length > 0 && (
+        <ul className="sh-calib-list">
+          {calibration.reviews.map((r) => (
+            <li key={`c${r.candidate}`}>
+              candidate {r.candidate}:{" "}
+              {r.reviewed ? (
+                `${confidencePct(r.confidence)}%`
+              ) : (
+                <span className="sh-warn">no review returned</span>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {calibration.stages.length > 0 && (
+        <ul className="sh-calib-list">
+          {calibration.stages.map((st, i) => (
+            <li key={`s${i}-${st.candidate}-${st.stage}`}>
+              c{st.candidate} {st.stage} {st.secs}s{" "}
+              {st.cutOff ? (
+                <span className="sh-warn">cut off</span>
+              ) : st.ok ? (
+                "ok"
+              ) : (
+                "failed"
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }
@@ -359,6 +427,10 @@ function Proposal({
         confidence={proposal.confidence}
         floor={proposal.confidenceFloor}
       />
+
+      {proposal.calibration !== null ? (
+        <CalibrationReadout calibration={proposal.calibration} />
+      ) : null}
 
       {/* The actual code change, for HUMAN REVIEW. */}
       {ts !== null ? (

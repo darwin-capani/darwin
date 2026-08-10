@@ -40,6 +40,38 @@
 //!
 //! Both are CHECKED IN so the numbers are reproducible and a regression is a red
 //! test rather than an anecdote.
+//!
+//! ## WHAT A MISS DOES TODAY, and what it cannot be turned into
+//!
+//! A miss is not a soft degrade. `route()` hands the turn to the on-device intent
+//! classifier, whose ELEVEN intents contain nothing for these capabilities, so the
+//! turn is answered as CONVERSATION: on the shipped default a cloud persona
+//! completion returned to `main` and spoken there, or — offline / on a cloud error
+//! — generated AND spoken inside `route()` by the streamed `converse_speak`. Either
+//! way the owner hears a generic answer ABOUT the thing DARWIN could have done.
+//!
+//! `miss_offer.rs` measured whether a cheap on-device "did you mean" could name the
+//! real capability instead, using an index of 534 phrases harvested from this
+//! repo's own production source and verified to fire their gate. MEASURED NO-GO: no
+//! similarity threshold is both honest (zero suggestions across all 172 ordinary
+//! utterances) and useful (>= 5 correct offers on the 55 misses); the BEST
+//! zero-false threshold (T=0.94) yields ONE correct offer out of 55 beside one
+//! wrong-capability offer, and above T=0.96 only the wrong one is left. The
+//! reason is structural and is recorded there.
+//!
+//! TWO OWNER DECISIONS came out of that work and are NAMED, NOT TAKEN:
+//!   * the "did you mean" that WOULD work is the gate classifiers reporting their
+//!     own near-miss ("you named a macro operation but no macro"), not a second
+//!     weaker classifier beside them — a change to 35 classifier signatures;
+//!   * eight of the gates below (`describe`, `genimage`, `sound`, `silicon`,
+//!     `lumen`, `vision`, `nexus`, `markforge`) are consulted in `route()` BELOW
+//!     the cloud tool loop and the conversation branch, both of which return on
+//!     success. This harness fires them in ISOLATION and so cannot see it: on the
+//!     shipped cloud-enabled config an utterance the intent classifier labels
+//!     "conversation" never reaches them, while the same utterance offline
+//!     actuates. Hoisting them would change when camera capture and screen reads
+//!     can fire, which is a posture decision (see the comment at that seam in
+//!     `router.rs`).
 
 use serde::Deserialize;
 

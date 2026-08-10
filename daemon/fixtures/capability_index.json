@@ -1,0 +1,2672 @@
+[
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "agent roster"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "how many agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "list agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "list my agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "list my team"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "list of agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "list the agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "my agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "my constellation"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "name my agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "name my team"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "name the agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "show me the agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "the constellation"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "the roster"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "what agents do"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "what's the constellation"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "which agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "who are my agents"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "who are my team"
+ },
+ {
+  "gate": "agentquery",
+  "expect": "agentquery",
+  "text": "who are the agents"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "activity history"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "activity log"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "activity timeline"
+ },
+ {
+  "gate": "aperture",
+  "expect": "forget",
+  "text": "forget my activity timeline"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "my activity"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "my timeline"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "recall my activity"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "show me my activity"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "show my activity"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "what did i do this morning"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "what did i do today"
+ },
+ {
+  "gate": "aperture",
+  "expect": "recall",
+  "text": "what was i working on around 3pm"
+ },
+ {
+  "gate": "aperture",
+  "expect": "forget",
+  "text": "wipe my timeline"
+ },
+ {
+  "gate": "chart",
+  "expect": "chart",
+  "text": "chart the system load"
+ },
+ {
+  "gate": "chart",
+  "expect": "chart",
+  "text": "chart this"
+ },
+ {
+  "gate": "chart",
+  "expect": "chart",
+  "text": "graph the cpu"
+ },
+ {
+  "gate": "chart",
+  "expect": "chart",
+  "text": "plot the system load"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "ask about my display"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "ask about my screen"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "ask about the display"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "ask about the screen"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "ask my display"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "ask my screen"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "ask my screen which button rebuilds"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "ask the display"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "ask the screen"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "describe my screen"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "describe what's on my screen"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "what am i looking at"
+ },
+ {
+  "gate": "describe",
+  "expect": "screen",
+  "text": "what do you make of my screen"
+ },
+ {
+  "gate": "explain",
+  "expect": "last",
+  "text": "why did you do that"
+ },
+ {
+  "gate": "genimage",
+  "expect": "genimage",
+  "text": "draw a picture of a red bicycle"
+ },
+ {
+  "gate": "genimage",
+  "expect": "genimage",
+  "text": "generate an image of x"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "day",
+  "text": "how was my day"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "week",
+  "text": "life log"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "week",
+  "text": "life-log"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "week",
+  "text": "lifelog"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "week",
+  "text": "my life log"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "day",
+  "text": "my life log today"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "week",
+  "text": "what did i do"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "week",
+  "text": "what did i do this week"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "day",
+  "text": "what did my day look like"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "week",
+  "text": "what have i been up to"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "week",
+  "text": "what have i done"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "week",
+  "text": "what i did"
+ },
+ {
+  "gate": "lifelog",
+  "expect": "week",
+  "text": "what i've been doing"
+ },
+ {
+  "gate": "lockdown.panic",
+  "expect": "panic",
+  "text": "kill switch"
+ },
+ {
+  "gate": "lockdown.panic",
+  "expect": "panic",
+  "text": "lockdown"
+ },
+ {
+  "gate": "lockdown.panic",
+  "expect": "panic",
+  "text": "panic"
+ },
+ {
+  "gate": "lockdown.panic",
+  "expect": "panic",
+  "text": "shut it all down"
+ },
+ {
+  "gate": "lockdown.panic",
+  "expect": "panic",
+  "text": "stop everything"
+ },
+ {
+  "gate": "lockdown.unlock",
+  "expect": "unlock",
+  "text": "end lockdown"
+ },
+ {
+  "gate": "lockdown.unlock",
+  "expect": "unlock",
+  "text": "resume normal"
+ },
+ {
+  "gate": "lockdown.unlock",
+  "expect": "unlock",
+  "text": "unlock"
+ },
+ {
+  "gate": "lockdown.unlock",
+  "expect": "unlock",
+  "text": "unlock my account"
+ },
+ {
+  "gate": "lumen",
+  "expect": "read",
+  "text": "can you read my screen"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "click"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "click sign in"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "click submit"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "click the third"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "click the third button"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "double click"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "double-click"
+ },
+ {
+  "gate": "lumen",
+  "expect": "read",
+  "text": "read me the screen"
+ },
+ {
+  "gate": "lumen",
+  "expect": "read",
+  "text": "read my screen"
+ },
+ {
+  "gate": "lumen",
+  "expect": "read",
+  "text": "read the screen"
+ },
+ {
+  "gate": "lumen",
+  "expect": "read",
+  "text": "read the screen first"
+ },
+ {
+  "gate": "lumen",
+  "expect": "read",
+  "text": "read what's on screen"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "tap"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "tap out"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "tap submit"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "tap the third"
+ },
+ {
+  "gate": "lumen",
+  "expect": "act",
+  "text": "tap water"
+ },
+ {
+  "gate": "lumen",
+  "expect": "read",
+  "text": "what is on screen"
+ },
+ {
+  "gate": "lumen",
+  "expect": "read",
+  "text": "what's on my screen"
+ },
+ {
+  "gate": "lumen",
+  "expect": "read",
+  "text": "what's on my second screen"
+ },
+ {
+  "gate": "lumen",
+  "expect": "read",
+  "text": "what's on the display"
+ },
+ {
+  "gate": "macros",
+  "expect": "forget",
+  "text": "delete macro x"
+ },
+ {
+  "gate": "macros",
+  "expect": "stop",
+  "text": "end recording"
+ },
+ {
+  "gate": "macros",
+  "expect": "stop",
+  "text": "end the recording"
+ },
+ {
+  "gate": "macros",
+  "expect": "stop",
+  "text": "finish recording"
+ },
+ {
+  "gate": "macros",
+  "expect": "stop",
+  "text": "finish the recording"
+ },
+ {
+  "gate": "macros",
+  "expect": "forget",
+  "text": "forget macro x"
+ },
+ {
+  "gate": "macros",
+  "expect": "forget",
+  "text": "forget the deploy macro"
+ },
+ {
+  "gate": "macros",
+  "expect": "list",
+  "text": "list macros"
+ },
+ {
+  "gate": "macros",
+  "expect": "list",
+  "text": "list my macros"
+ },
+ {
+  "gate": "macros",
+  "expect": "replay",
+  "text": "play back the standup macro"
+ },
+ {
+  "gate": "macros",
+  "expect": "replay",
+  "text": "play macro x"
+ },
+ {
+  "gate": "macros",
+  "expect": "record",
+  "text": "record a macro called x"
+ },
+ {
+  "gate": "macros",
+  "expect": "record",
+  "text": "record macro x"
+ },
+ {
+  "gate": "macros",
+  "expect": "record",
+  "text": "record the standup macro"
+ },
+ {
+  "gate": "macros",
+  "expect": "forget",
+  "text": "remove macro x"
+ },
+ {
+  "gate": "macros",
+  "expect": "replay",
+  "text": "replay macro x"
+ },
+ {
+  "gate": "macros",
+  "expect": "replay",
+  "text": "replay the macro morning setup"
+ },
+ {
+  "gate": "macros",
+  "expect": "replay",
+  "text": "replay the macro x"
+ },
+ {
+  "gate": "macros",
+  "expect": "replay",
+  "text": "replay the morning setup macro"
+ },
+ {
+  "gate": "macros",
+  "expect": "replay",
+  "text": "run macro x"
+ },
+ {
+  "gate": "macros",
+  "expect": "replay",
+  "text": "run my deploy macro"
+ },
+ {
+  "gate": "macros",
+  "expect": "replay",
+  "text": "run the macro x"
+ },
+ {
+  "gate": "macros",
+  "expect": "stop",
+  "text": "save macro"
+ },
+ {
+  "gate": "macros",
+  "expect": "stop",
+  "text": "save the macro"
+ },
+ {
+  "gate": "macros",
+  "expect": "list",
+  "text": "show macros"
+ },
+ {
+  "gate": "macros",
+  "expect": "list",
+  "text": "show my macros"
+ },
+ {
+  "gate": "macros",
+  "expect": "record",
+  "text": "start a macro called x"
+ },
+ {
+  "gate": "macros",
+  "expect": "record",
+  "text": "start recording a macro called x"
+ },
+ {
+  "gate": "macros",
+  "expect": "record",
+  "text": "start recording macro x"
+ },
+ {
+  "gate": "macros",
+  "expect": "stop",
+  "text": "stop recording"
+ },
+ {
+  "gate": "macros",
+  "expect": "stop",
+  "text": "stop recording macro"
+ },
+ {
+  "gate": "macros",
+  "expect": "stop",
+  "text": "stop recording the macro"
+ },
+ {
+  "gate": "macros",
+  "expect": "stop",
+  "text": "stop the recording"
+ },
+ {
+  "gate": "macros",
+  "expect": "list",
+  "text": "what macros do i have"
+ },
+ {
+  "gate": "markforge",
+  "expect": "body.spawn",
+  "text": "add a crate"
+ },
+ {
+  "gate": "markforge",
+  "expect": "world.step",
+  "text": "advance 5 frames"
+ },
+ {
+  "gate": "markforge",
+  "expect": "body.spawn",
+  "text": "drop a box"
+ },
+ {
+  "gate": "markforge",
+  "expect": "body.spawn",
+  "text": "drop a box in the sandbox"
+ },
+ {
+  "gate": "markforge",
+  "expect": "body.spawn",
+  "text": "drop two boxes"
+ },
+ {
+  "gate": "markforge",
+  "expect": "launch",
+  "text": "mark-forge launch failed"
+ },
+ {
+  "gate": "markforge",
+  "expect": "launch",
+  "text": "mark-forge launch requested"
+ },
+ {
+  "gate": "markforge",
+  "expect": "set.gravity",
+  "text": "moon gravity"
+ },
+ {
+  "gate": "markforge",
+  "expect": "set.gravity",
+  "text": "no gravity"
+ },
+ {
+  "gate": "markforge",
+  "expect": "launch",
+  "text": "open the physics sandbox"
+ },
+ {
+  "gate": "markforge",
+  "expect": "world.reset",
+  "text": "reset the simulation"
+ },
+ {
+  "gate": "markforge",
+  "expect": "set.gravity",
+  "text": "set gravity to earth"
+ },
+ {
+  "gate": "markforge",
+  "expect": "set.gravity",
+  "text": "set gravity to mars"
+ },
+ {
+  "gate": "markforge",
+  "expect": "set.gravity",
+  "text": "set gravity to the moon"
+ },
+ {
+  "gate": "markforge",
+  "expect": "set.gravity",
+  "text": "set gravity to zero"
+ },
+ {
+  "gate": "markforge",
+  "expect": "body.spawn",
+  "text": "spawn a marble"
+ },
+ {
+  "gate": "markforge",
+  "expect": "body.spawn",
+  "text": "throw a ball"
+ },
+ {
+  "gate": "markforge",
+  "expect": "set.gravity",
+  "text": "turn off gravity"
+ },
+ {
+  "gate": "markforge",
+  "expect": "set.gravity",
+  "text": "zero gravity"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "actually you were right about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "clear the suppression"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "clear the suppression on"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "forget that i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "how do you know i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "how do you know that i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "i do not actually"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "i don't actually"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "i never said i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "let yourself learn about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "reconsider my"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "reconsider what you think about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "stop assuming i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "stop believing i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "stop suppressing"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "stop thinking i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "that is not true about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "that is wrong"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "that is wrong about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "that's not true about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "that's wrong"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "that's wrong about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "that's wrong about x"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "thats wrong about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "un-suppress"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "unsuppress"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "what makes you think i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "what makes you think that i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "why do you assume i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "why do you believe i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "why do you believe that i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "why do you say i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "why do you say that i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "why do you think i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "why do you think i am"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "why do you think i prefer x"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "why do you think i'm"
+ },
+ {
+  "gate": "mirror",
+  "expect": "explain",
+  "text": "why do you think that i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "you are mistaken"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "you are wrong about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "you can learn about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "you were right about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "you were right about x"
+ },
+ {
+  "gate": "mirror",
+  "expect": "clear",
+  "text": "you were right that i"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "you're mistaken"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "you're wrong about"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "you're wrong about c"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "you're wrong about my interest in rust"
+ },
+ {
+  "gate": "mirror",
+  "expect": "contest",
+  "text": "you're wrong that i"
+ },
+ {
+  "gate": "model_tier",
+  "expect": "auto",
+  "text": "back to normal"
+ },
+ {
+  "gate": "model_tier",
+  "expect": "fast",
+  "text": "fast mode"
+ },
+ {
+  "gate": "model_tier",
+  "expect": "local",
+  "text": "go offline"
+ },
+ {
+  "gate": "model_tier",
+  "expect": "heavy",
+  "text": "use the powerful model"
+ },
+ {
+  "gate": "model_tier",
+  "expect": "local",
+  "text": "work offline"
+ },
+ {
+  "gate": "music",
+  "expect": "music",
+  "text": "compose"
+ },
+ {
+  "gate": "music",
+  "expect": "music",
+  "text": "compose a song"
+ },
+ {
+  "gate": "music",
+  "expect": "music",
+  "text": "compose an 8-bit happy birthday"
+ },
+ {
+  "gate": "music",
+  "expect": "music",
+  "text": "play me a beat"
+ },
+ {
+  "gate": "music",
+  "expect": "music",
+  "text": "play me a tune"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "are the levels clipping"
+ },
+ {
+  "gate": "nexus",
+  "expect": "launch",
+  "text": "bring up the routing matrix"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "disable the monitor"
+ },
+ {
+  "gate": "nexus",
+  "expect": "preset.load",
+  "text": "download the vocal preset"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "drop the gain to -12 db"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "i've stopped monitoring my mic levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "kill the monitor"
+ },
+ {
+  "gate": "nexus",
+  "expect": "preset.load",
+  "text": "load preset podcast"
+ },
+ {
+  "gate": "nexus",
+  "expect": "preset.load",
+  "text": "load preset vocal"
+ },
+ {
+  "gate": "nexus",
+  "expect": "preset.load",
+  "text": "load the podcast preset darwin"
+ },
+ {
+  "gate": "nexus",
+  "expect": "preset.load",
+  "text": "load the vocal preset"
+ },
+ {
+  "gate": "nexus",
+  "expect": "preset.load",
+  "text": "load the vocal preset now"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "look at the levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "lower the gain to -12 db"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "lower the input gain to -12"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "monitor input 1"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "mute"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "mute channel 3"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "mute input 2"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "mute me"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "mute the mic"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "mute the microphone"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "mute the speakers"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "my input levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "launch",
+  "text": "nexus launch failed"
+ },
+ {
+  "gate": "nexus",
+  "expect": "launch",
+  "text": "nexus launch requested"
+ },
+ {
+  "gate": "nexus",
+  "expect": "launch",
+  "text": "open nexus"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "output 1 gain"
+ },
+ {
+  "gate": "nexus",
+  "expect": "route.set",
+  "text": "patch the mic into output 2"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "pause monitoring"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "quit monitoring"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "read out the matrix"
+ },
+ {
+  "gate": "nexus",
+  "expect": "preset.load",
+  "text": "reload the preset"
+ },
+ {
+  "gate": "nexus",
+  "expect": "route.set",
+  "text": "route input 1 to the monitor"
+ },
+ {
+  "gate": "nexus",
+  "expect": "route.set",
+  "text": "route input 2 to output 3"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "route state"
+ },
+ {
+  "gate": "nexus",
+  "expect": "route.set",
+  "text": "route the mic to the monitor"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "routing matrix"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "routing state"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "set input gain to -18"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "set the gain on input 1 to -12"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "set the gain to -6"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "set the gain to -6 right now"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "set the headphone gain to -6"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "show me the current levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "show me the levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "show me the meters"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "show me the peak levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "stop monitoring"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "switch off the monitor"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the audio levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the audio matrix"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the current meters"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the level of the mic"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the master levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the meters"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the mic level"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the output meters"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the peak levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "the routing matrix"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "the trim on input 1"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "trim input 1 to -6 db"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "trim the input to -6 db"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "trim the mic to -6"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "turn off the monitor"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "turn the gain down to -12"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "turn the monitor back on"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "turn the monitor off"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "turn the monitor off please"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "un-mute"
+ },
+ {
+  "gate": "nexus",
+  "expect": "monitor.set",
+  "text": "unmonitor"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "unmute"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "unmute channel 3"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "unmute everything"
+ },
+ {
+  "gate": "nexus",
+  "expect": "gain.set",
+  "text": "unmute input 2"
+ },
+ {
+  "gate": "nexus",
+  "expect": "route.set",
+  "text": "unpatch the mic from the monitor"
+ },
+ {
+  "gate": "nexus",
+  "expect": "route.set",
+  "text": "unpatch the studio mic from the monitor"
+ },
+ {
+  "gate": "nexus",
+  "expect": "route.set",
+  "text": "unroute the mic from the monitor"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "what are the audio levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "what are the levels"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "what are the meters showing"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "what do the meters say"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "what's the level on input 1"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "what's the routing state"
+ },
+ {
+  "gate": "nexus",
+  "expect": "state.get",
+  "text": "whats routed to output 1"
+ },
+ {
+  "gate": "notebook",
+  "expect": "list",
+  "text": "forget my research"
+ },
+ {
+  "gate": "notebook",
+  "expect": "revisit",
+  "text": "my research notebook on the jwst"
+ },
+ {
+  "gate": "notebook",
+  "expect": "save",
+  "text": "save this research"
+ },
+ {
+  "gate": "notebook",
+  "expect": "list",
+  "text": "what have i researched"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "forget",
+  "text": "clear clipboard"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "forget",
+  "text": "clear my clipboard"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "clipboard history"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "forget",
+  "text": "forget my clipboard"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "i forget what i copied to my clipboard"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "recall my clipboard"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "recall the thing i copied about x"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "the thing i copied about the lease"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "thing i copied"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "things i copied"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "what did i copy"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "what did i copy about the lease"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "what have i copied"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "recall",
+  "text": "what i copied"
+ },
+ {
+  "gate": "pasteboard",
+  "expect": "forget",
+  "text": "wipe clipboard"
+ },
+ {
+  "gate": "peek",
+  "expect": "peek",
+  "text": "let me peek"
+ },
+ {
+  "gate": "peek",
+  "expect": "peek",
+  "text": "peek"
+ },
+ {
+  "gate": "peek",
+  "expect": "peek",
+  "text": "quick look"
+ },
+ {
+  "gate": "peek",
+  "expect": "peek",
+  "text": "quicklook"
+ },
+ {
+  "gate": "peek",
+  "expect": "peek",
+  "text": "show me what you just produced"
+ },
+ {
+  "gate": "peek",
+  "expect": "peek",
+  "text": "what did you just do"
+ },
+ {
+  "gate": "precog",
+  "expect": "hypothetical",
+  "text": "what would you do if i said x"
+ },
+ {
+  "gate": "report",
+  "expect": "report",
+  "text": "generate a report on x"
+ },
+ {
+  "gate": "rewind",
+  "expect": "rewind",
+  "text": "rewind the last hour"
+ },
+ {
+  "gate": "rewind",
+  "expect": "rewind",
+  "text": "walk me through this morning"
+ },
+ {
+  "gate": "rewind",
+  "expect": "rewind",
+  "text": "what happened at 2pm"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "assemble"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "assemble the team"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "assemble the team for x"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "introduce the team"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "introduce yourself"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "introduce yourselves"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "meet the team"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "roll call"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "rollcall"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "team roll call"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "who is on the team"
+ },
+ {
+  "gate": "rollcall",
+  "expect": "rollcall",
+  "text": "who's on the team"
+ },
+ {
+  "gate": "runbook",
+  "expect": "run",
+  "text": "execute the runbook x"
+ },
+ {
+  "gate": "runbook",
+  "expect": "plan",
+  "text": "plan the release runbook"
+ },
+ {
+  "gate": "runbook",
+  "expect": "plan",
+  "text": "plan the runbook x"
+ },
+ {
+  "gate": "runbook",
+  "expect": "plan",
+  "text": "preview the runbook x"
+ },
+ {
+  "gate": "runbook",
+  "expect": "run",
+  "text": "run the release runbook"
+ },
+ {
+  "gate": "runbook",
+  "expect": "run",
+  "text": "run the runbook release"
+ },
+ {
+  "gate": "runbook",
+  "expect": "run",
+  "text": "run the runbook x"
+ },
+ {
+  "gate": "screen_context",
+  "expect": "forget",
+  "text": "forget my screen context"
+ },
+ {
+  "gate": "screen_context",
+  "expect": "recall",
+  "text": "recall my screen context"
+ },
+ {
+  "gate": "screen_context",
+  "expect": "recall",
+  "text": "what was i doing"
+ },
+ {
+  "gate": "screen_context",
+  "expect": "recall",
+  "text": "what was i working on"
+ },
+ {
+  "gate": "screen_context",
+  "expect": "recall",
+  "text": "what were i doing"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.step",
+  "text": "advance the trace"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.step",
+  "text": "advance the trace one step"
+ },
+ {
+  "gate": "silicon",
+  "expect": "erc.run",
+  "text": "any erc errors"
+ },
+ {
+  "gate": "silicon",
+  "expect": "launch",
+  "text": "bring up the schematic"
+ },
+ {
+  "gate": "silicon",
+  "expect": "erc.run",
+  "text": "check the electrical rules"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.component",
+  "text": "component r12"
+ },
+ {
+  "gate": "silicon",
+  "expect": "erc.run",
+  "text": "erc"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.stop",
+  "text": "exit trace mode"
+ },
+ {
+  "gate": "silicon",
+  "expect": "view.set",
+  "text": "fit all"
+ },
+ {
+  "gate": "silicon",
+  "expect": "view.set",
+  "text": "fit everything on the board"
+ },
+ {
+  "gate": "silicon",
+  "expect": "view.set",
+  "text": "fit the board"
+ },
+ {
+  "gate": "silicon",
+  "expect": "view.set",
+  "text": "fit the board on my screen"
+ },
+ {
+  "gate": "silicon",
+  "expect": "view.set",
+  "text": "fit the board view"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.net",
+  "text": "go to the batt net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.net",
+  "text": "highlight the batt net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.net",
+  "text": "highlight the gnd net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.step",
+  "text": "next step in the trace"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.step",
+  "text": "next trace step"
+ },
+ {
+  "gate": "silicon",
+  "expect": "launch",
+  "text": "open silicon canvas"
+ },
+ {
+  "gate": "silicon",
+  "expect": "erc.run",
+  "text": "run erc"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.component",
+  "text": "select component u3"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.net",
+  "text": "select the vbus net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.component",
+  "text": "show component r12"
+ },
+ {
+  "gate": "silicon",
+  "expect": "launch",
+  "text": "show me silicon canvas"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.net",
+  "text": "show me the 3v3 net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "erc.run",
+  "text": "show me the erc"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.net",
+  "text": "show me the in net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "view.set",
+  "text": "show the whole board"
+ },
+ {
+  "gate": "silicon",
+  "expect": "launch",
+  "text": "silicon canvas launch failed"
+ },
+ {
+  "gate": "silicon",
+  "expect": "launch",
+  "text": "silicon canvas launch requested"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "start tracing"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.stop",
+  "text": "stop the trace"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.net",
+  "text": "the 3v3 net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "select.net",
+  "text": "the gnd net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "trace"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "trace along this net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "trace from this pad"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "trace it"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "trace mode"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "trace that"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "trace the gnd net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "trace this"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "trace this connection"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "trace this net"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "traces"
+ },
+ {
+  "gate": "silicon",
+  "expect": "trace.start",
+  "text": "tracing"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "identify that noise"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "identify that sound"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "identify this sound"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "name that sound"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "what am i hearing"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "what are you hearing"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "what do you hear"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "what was that noise"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "what was that sound"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "what's that i hear"
+ },
+ {
+  "gate": "sound",
+  "expect": "sound",
+  "text": "what's that sound"
+ },
+ {
+  "gate": "undo",
+  "expect": "undo",
+  "text": "revert that"
+ },
+ {
+  "gate": "undo",
+  "expect": "undo",
+  "text": "undo"
+ },
+ {
+  "gate": "undo",
+  "expect": "undo",
+  "text": "undo that"
+ },
+ {
+  "gate": "undo",
+  "expect": "status",
+  "text": "what can you undo"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "come back online"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "come out of the dark"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "disable vault"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "disable vault mode"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "enable vault"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "enable vault mode"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "end vault mode"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "engage vault"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "engage vault mode"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "enter vault"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "enter vault mode"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "exit vault"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "exit vault mode"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "go back online"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "go dark"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "go dark for this one"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "go dark now"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "leave vault"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "leave vault mode"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "turn off vault"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "turn off vault mode"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "turn on vault"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "turn on vault mode"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "vault mode off"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "vault mode on"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "vault mode on please"
+ },
+ {
+  "gate": "vault",
+  "expect": "off",
+  "text": "vault off"
+ },
+ {
+  "gate": "vault",
+  "expect": "on",
+  "text": "vault on"
+ },
+ {
+  "gate": "vision",
+  "expect": "analyze.file",
+  "text": "analyze the video clip"
+ },
+ {
+  "gate": "vision",
+  "expect": "analyze.file",
+  "text": "analyze this video"
+ },
+ {
+  "gate": "vision",
+  "expect": "status",
+  "text": "anybody there"
+ },
+ {
+  "gate": "vision",
+  "expect": "status",
+  "text": "anyone there"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.stop",
+  "text": "end the watch"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "find the sign in button"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "go back to watching the driveway"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.stop",
+  "text": "halt the watch"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "locate the settings icon"
+ },
+ {
+  "gate": "vision",
+  "expect": "scan.document",
+  "text": "maybe scan the receipt"
+ },
+ {
+  "gate": "vision",
+  "expect": "launch",
+  "text": "open vision"
+ },
+ {
+  "gate": "vision",
+  "expect": "scan.document",
+  "text": "quickly scan this receipt"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "read that"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "read that out"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.handwriting",
+  "text": "read the whiteboard"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "read this"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.handwriting",
+  "text": "read this handwriting"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "read this to me"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "resume watching the front door"
+ },
+ {
+  "gate": "vision",
+  "expect": "scan.document",
+  "text": "scan that receipt"
+ },
+ {
+  "gate": "vision",
+  "expect": "scan.document",
+  "text": "scan the page"
+ },
+ {
+  "gate": "vision",
+  "expect": "scan.document",
+  "text": "scan this document"
+ },
+ {
+  "gate": "vision",
+  "expect": "scan.document",
+  "text": "scan this receipt"
+ },
+ {
+  "gate": "vision",
+  "expect": "set.sensitivity",
+  "text": "set sensitivity high please"
+ },
+ {
+  "gate": "vision",
+  "expect": "status",
+  "text": "somebody there"
+ },
+ {
+  "gate": "vision",
+  "expect": "status",
+  "text": "someone there"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.stop",
+  "text": "stop the camera watch"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.stop",
+  "text": "stop the watch"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.stop",
+  "text": "stop watching"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.stop",
+  "text": "stop watching now"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.stop",
+  "text": "stop watching the door"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.stop",
+  "text": "stop watching the front door"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "tell me whats on the screen"
+ },
+ {
+  "gate": "vision",
+  "expect": "launch",
+  "text": "vision launch failed"
+ },
+ {
+  "gate": "vision",
+  "expect": "launch",
+  "text": "vision launch requested"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch all of the doors"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch my external monitor"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch my son's room"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch that door"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the baby's room"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the bedroom door"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the camera feed"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the door"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the doorbell cam"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the french doors"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the front door"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the kitchen door"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the neighbor's driveway"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the nursery camera"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the screen"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch the third monitor"
+ },
+ {
+  "gate": "vision",
+  "expect": "watch.start",
+  "text": "watch what's on the screen"
+ },
+ {
+  "gate": "vision",
+  "expect": "status",
+  "text": "what are you seeing"
+ },
+ {
+  "gate": "vision",
+  "expect": "status",
+  "text": "what can you see"
+ },
+ {
+  "gate": "vision",
+  "expect": "status",
+  "text": "what do you see"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.handwriting",
+  "text": "what does this handwriting say"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "what was on my screen about x"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "whats on my screen"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "where is the submit button"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "where's the checkbox for terms"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "where's the submit button"
+ },
+ {
+  "gate": "vision",
+  "expect": "read.screen",
+  "text": "where's the submit button on my screen"
+ },
+ {
+  "gate": "vision",
+  "expect": "status",
+  "text": "who is there"
+ },
+ {
+  "gate": "vision",
+  "expect": "status",
+  "text": "who's there"
+ },
+ {
+  "gate": "voiceclone",
+  "expect": "clone",
+  "text": "clone my voice"
+ },
+ {
+  "gate": "voiceclone",
+  "expect": "forget",
+  "text": "delete my cloned voice"
+ },
+ {
+  "gate": "voiceclone",
+  "expect": "forget",
+  "text": "delete the cloned voice"
+ },
+ {
+  "gate": "voiceclone",
+  "expect": "forget",
+  "text": "forget my cloned voice"
+ },
+ {
+  "gate": "voiceclone",
+  "expect": "clone",
+  "text": "make a voice clone"
+ },
+ {
+  "gate": "voiceclone",
+  "expect": "clone",
+  "text": "voice clone"
+ },
+ {
+  "gate": "voiceid",
+  "expect": "enroll",
+  "text": "enroll my voice"
+ },
+ {
+  "gate": "voiceid",
+  "expect": "forget",
+  "text": "forget my voice"
+ },
+ {
+  "gate": "voiceid",
+  "expect": "forget",
+  "text": "forget my voice clone"
+ },
+ {
+  "gate": "voiceid",
+  "expect": "enroll",
+  "text": "register my voice"
+ },
+ {
+  "gate": "voiceid",
+  "expect": "enroll",
+  "text": "register my voice with elevenlabs"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "be discreet"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "can you speak quietly please"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "discreet"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "discreet mode"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "keep it down"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "keep your voice down"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "lower your voice"
+ },
+ {
+  "gate": "whisper",
+  "expect": "off",
+  "text": "normal voice"
+ },
+ {
+  "gate": "whisper",
+  "expect": "off",
+  "text": "out loud"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "please switch to whisper mode"
+ },
+ {
+  "gate": "whisper",
+  "expect": "off",
+  "text": "speak normally"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "speak quietly"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "speak softly"
+ },
+ {
+  "gate": "whisper",
+  "expect": "off",
+  "text": "speak up"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "start whispering"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "whisper"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "whisper it"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "whisper mode"
+ },
+ {
+  "gate": "whisper",
+  "expect": "on",
+  "text": "whisper to me"
+ },
+ {
+  "gate": "whisper",
+  "expect": "off",
+  "text": "you can speak normally now"
+ }
+]

@@ -260,6 +260,7 @@ describe("core state transitions", () => {
     s = tel(
       s,
       env("pipeline.completed", {
+        queue_ms: 120,
         stt_ms: 640,
         classify_ms: 210,
         route_ms: 980,
@@ -269,7 +270,10 @@ describe("core state transitions", () => {
       }),
     );
     expect(s.coreState).toBe("idle");
+    // NOTE: this exact-shape assertion used to omit queueMs, which meant it
+    // ASSERTED the drop — the daemon has always sent queue_ms.
     expect(s.lastTimings).toEqual({
+      queueMs: 120,
       sttMs: 640,
       classifyMs: 210,
       routeMs: 980,

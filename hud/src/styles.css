@@ -900,6 +900,27 @@ svg.tri circle {
   word-break: break-word;
 }
 
+/* Per-attempt calibration on a REJECTED banner: the numbers that say WHICH
+   tunable stopped the gate. Advisory — it changes no control. */
+.alert-calib {
+  margin: 5px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 9.5px;
+  line-height: 1.5;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.alert-calib li.warn {
+  color: var(--warn-amber);
+}
+
+.alert-calib-k {
+  color: var(--cyan-dim);
+  letter-spacing: 0.12em;
+}
+
 .alert-ack {
   background: transparent;
   border: 1px solid currentColor;
@@ -1121,6 +1142,34 @@ svg.tri circle {
 .sh-note {
   font-size: 9.5px;
   line-height: 1.5;
+}
+
+/* ATTEMPT CALIBRATION — advisory measurement block beside ACCEPT & APPLY.
+   Deliberately quiet chrome: it gates nothing, it is what the two [self_heal]
+   tunables should be set from. */
+.sh-calib {
+  margin-top: 7px;
+  padding-top: 6px;
+  border-top: 1px dashed rgba(26, 214, 255, 0.18);
+}
+
+.sh-calib-label {
+  font-size: 9.5px;
+  color: var(--cyan-dim);
+  letter-spacing: 0.12em;
+  margin-bottom: 3px;
+}
+
+.sh-calib-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  margin: 3px 0 0;
+  padding: 0;
+  list-style: none;
+  font-size: 9.5px;
+  color: var(--ice-dim);
+  font-variant-numeric: tabular-nums;
 }
 
 .dim-note {
@@ -4119,6 +4168,13 @@ svg.tri circle {
   color: var(--ice-faint);
   letter-spacing: 0.15em;
 }
+
+/* Pre-pickup queue wait. Deliberately NOT a bar segment (it is outside
+   total_ms — see LatencyStrip.tsx); dim by default, amber only when it is a
+   real share of what the owner waited. */
+.latency .queue-wait { color: var(--ice-faint); }
+.latency .queue-wait.slow,
+.latency .queue-wait.slow .num { color: var(--warn-amber); }
 
 /* ------------------------------------------------------------- waveform */
 

@@ -14,9 +14,27 @@
 # declared HERE so no downstream module agent edits this file. The CoreAudio
 # device stack is behind an OPTIONAL `coreaudio` feature so `cargo test` /
 # `cargo build` work WITHOUT a real audio device (this headless dev box), and
-# `cargo check --features coreaudio` compiles the device-gated IOProc/aggregate
-# code. The whole DSP/metering/matrix core builds and tests headlessly with
-# SYNTHESIZED in-memory buffers only — it NEVER opens a CoreAudio device.
+# `cargo test --features coreaudio` compiles AND EXERCISES the device-gated
+# IOProc/aggregate code's device-free half. The whole DSP/metering/matrix core
+# builds and tests headlessly with SYNTHESIZED in-memory buffers only — it NEVER
+# opens a CoreAudio device.
+#
+# RUN BOTH. This file used to document only `cargo check --features coreaudio`,
+# and `cargo check` does not set `--cfg test`, so it never even COMPILES
+# `#[cfg(test)] mod tests` — while `cargo test` (no features) does not compile
+# coreaudio.rs's gated code at all. Between the two documented commands, the
+# `io_proc_mix` tests inside `coreaudio.rs` (which drive `nexus_io_proc` with
+# SYNTHESIZED `AudioBufferList`s and touch no HAL symbol — every device call
+# lives in install/teardown, which they never reach) ran under NOTHING.
+# MEASURED on an M1 Pro: `cargo test` = 102 tests, `cargo test --features
+# coreaudio` = 106 — the 4 that were invisible. Same defect silicon-canvas's
+# manifest already records for its `gpu` feature; same remedy.
+#
+# COST, and the honest catch: warm, either command finishes in ~1s of test time.
+# But the two feature sets do NOT share a build fingerprint, so ALTERNATING
+# between them rebuilds the crate each time (measured cold here: 15.1s default,
+# then 26.0s for the first `--features coreaudio`). Budget the switch, not the
+# run.
 
 [package]
 name = "nexus_core"
@@ -49,15 +67,18 @@ toml = "0.8"
 # --- CoreAudio device stack (optional; behind `coreaudio` feature) ---------
 # DEVICE-GATED, NEVER built or run on this headless box. These bind the real
 # AudioDeviceIOProc, aggregate-device create/destroy, and the HAL property
-# plumbing (SPEC §1/§2). `cargo check --features coreaudio` compiles the seam;
-# it is NEVER enabled by `cargo build`/`cargo test` here. The honest boundary:
-# this code is written CORRECT but is DEVICE-GATED and never claim-measured.
+# plumbing (SPEC §1/§2). `cargo test --features coreaudio` compiles the seam and
+# runs its 4 device-free tests; the feature is NEVER enabled by a plain
+# `cargo build`/`cargo test` here. The honest boundary: this code is written
+# CORRECT but the DEVICE path is device-gated and never claim-measured.
 coreaudio-sys = { version = "0.2", optional = true }
 
 [features]
 # Default OFF so the headless DSP/metering/matrix core builds and tests on a
 # device-less box with only synthesized buffers. Turn on with
-# `cargo check --features coreaudio` to compile the CoreAudio IOProc seam.
+# `cargo test --features coreaudio` to compile the CoreAudio IOProc seam AND run
+# its device-free unit tests — see the note at the top of this file for why
+# `cargo check` was the wrong command to document.
 default = []
 coreaudio = ["dep:coreaudio-sys"]
 
