@@ -75,6 +75,61 @@ pub fn normalize_name(name: &str) -> String {
     bound(&n, MAX_NAME_LEN)
 }
 
+/// Is `name` a plausible macro LABEL rather than the tail of a sentence?
+///
+/// A macro name is a short identifier — "deploy", "morning setup", "standup".
+/// [`named_before_noun`] accepts the phrasing where the name comes BEFORE the
+/// noun, and without this bound it would swallow any sentence that merely ENDS
+/// in the word "macro": "run the numbers on the macro" would strip to a macro
+/// named "numbers on the" and REPLAY it. Requiring a short, function-word-free
+/// label is what keeps the recall widening from being a hijack widening.
+fn is_plausible_label(name: &str) -> bool {
+    /// Determiners, prepositions and copulas — the words that mean the captured
+    /// span is a clause, not a label. No macro is called "on the".
+    const CLAUSE_WORDS: &[&str] = &[
+        "the", "a", "an", "my", "your", "our", "their", "this", "that", "these",
+        "those", "on", "of", "in", "for", "to", "with", "about", "at", "from",
+        "by", "into", "over", "and", "or", "but", "is", "are", "was", "were",
+        "it", "them", "me", "you",
+    ];
+    let words: Vec<&str> = name.split_whitespace().collect();
+    !words.is_empty()
+        && words.len() <= 3
+        && !words.iter().any(|w| CLAUSE_WORDS.contains(w))
+}
+
+/// The OTHER word order: `<verb> [the|my] <name> macro`, with the NAME BEFORE
+/// the noun.
+///
+/// WHAT WENT WRONG: every lead in [`classify_macro_command`] put the name AFTER
+/// the noun ("replay the macro morning setup"). Out loud, people say the
+/// opposite — "replay the morning setup macro", "run my deploy macro", "delete
+/// the morning setup macro" — and every one of those returned None. A None here
+/// is not a soft degrade: the turn falls through to the on-device intent
+/// classifier, whose entire taxonomy is eleven intents
+/// (`inference/prompts/intent_classifier.txt`) and contains no macro intent at
+/// all, so the macro was UNREACHABLE by the phrasing people actually use.
+/// Measured on the checked-in probe set (`daemon/fixtures/router_recall.json`):
+/// 7 of 12 macro probes missed, five of them this exact shape.
+///
+/// It cannot widen the gate to ordinary speech: the utterance must still END in
+/// the literal word "macro", still OPEN with one of the same enumerated verbs,
+/// and the span between them must pass [`is_plausible_label`].
+fn named_before_noun(t: &str, leads: &[&str]) -> Option<String> {
+    // The LEADING space makes "macro" a whole word: "the promacro" is not a macro.
+    let body = t.strip_suffix(" macro")?.trim_end();
+    for lead in leads {
+        let Some(rest) = body.strip_prefix(lead) else {
+            continue;
+        };
+        let name = normalize_name(rest);
+        if !name.is_empty() && is_plausible_label(&name) {
+            return Some(name);
+        }
+    }
+    None
+}
+
 /// Trim + length-bound a string. Pure.
 fn bound(s: &str, max: usize) -> String {
     let s = s.trim();
@@ -138,6 +193,13 @@ pub fn classify_macro_command(text: &str) -> Option<MacroCommand> {
         || t == "save macro"
         || t == "finish recording"
         || t == "end recording"
+        // RECALL (measured): the four ways a person actually ends a recording
+        // out loud, none of which the six above accept. These are WHOLE-UTTERANCE
+        // equalities, so they can capture nothing but themselves.
+        || t == "stop recording the macro"
+        || t == "stop recording macro"
+        || t == "end the recording"
+        || t == "finish the recording"
     {
         return Some(MacroCommand::StopRecording);
     }
@@ -161,6 +223,12 @@ pub fn classify_macro_command(text: &str) -> Option<MacroCommand> {
         "record a macro named ",
         "start recording macro ",
         "record macro ",
+        // RECALL (measured): "start a macro called X" is how people open one when
+        // they do not say the word "recording" — it missed entirely.
+        "start a macro called ",
+        "start a macro named ",
+        "start recording the macro ",
+        "record the macro ",
     ] {
         if let Some(rest) = t.strip_prefix(lead) {
             let name = normalize_name(rest);
@@ -168,6 +236,13 @@ pub fn classify_macro_command(text: &str) -> Option<MacroCommand> {
                 return Some(MacroCommand::StartRecording { name });
             }
         }
+    }
+    // ...and the same order reversed: "record the standup macro".
+    if let Some(name) = named_before_noun(
+        t,
+        &["start recording the ", "start recording ", "record the ", "record my ", "record "],
+    ) {
+        return Some(MacroCommand::StartRecording { name });
     }
 
     // REPLAY: "replay macro X" / "run the macro X" / "run macro X" / "play macro X".
@@ -186,6 +261,19 @@ pub fn classify_macro_command(text: &str) -> Option<MacroCommand> {
             }
         }
     }
+    // ...and the name BEFORE the noun: "replay the morning setup macro",
+    // "run my deploy macro", "play back the standup macro".
+    if let Some(name) = named_before_noun(
+        t,
+        &[
+            "replay the ", "replay my ", "replay ",
+            "run the ", "run my ", "run ",
+            "play back the ", "play back my ", "play back ",
+            "play the ", "play my ", "play ",
+        ],
+    ) {
+        return Some(MacroCommand::Replay { name });
+    }
 
     // FORGET: "forget macro X" / "delete macro X" / "remove macro X".
     for lead in [
@@ -202,6 +290,19 @@ pub fn classify_macro_command(text: &str) -> Option<MacroCommand> {
                 return Some(MacroCommand::Forget { name });
             }
         }
+    }
+    // ...and the name BEFORE the noun: "forget the deploy macro", "delete the
+    // morning setup macro". Checked LAST, exactly like the prefix form, so a
+    // replay phrasing is never read as a delete.
+    if let Some(name) = named_before_noun(
+        t,
+        &[
+            "forget the ", "forget my ", "forget ",
+            "delete the ", "delete my ", "delete ",
+            "remove the ", "remove my ", "remove ",
+        ],
+    ) {
+        return Some(MacroCommand::Forget { name });
     }
 
     None
@@ -627,6 +728,97 @@ mod tests {
         assert_eq!(classify_macro_command("open safari"), None);
         // A start with no name is not a valid command.
         assert_eq!(classify_macro_command("record a macro called "), None);
+    }
+
+    /// RECALL — THE NAME BEFORE THE NOUN.
+    ///
+    /// Every lead the classifier shipped with put the macro's name AFTER the
+    /// noun ("replay the macro morning"). Out loud people say the reverse, and
+    /// the measured probe set (`daemon/fixtures/router_recall.json`) scored
+    /// macros 5/12 because of it. A miss is terminal: the on-device intent
+    /// classifier's eleven-intent taxonomy has no macro intent, so the macro was
+    /// unreachable by the phrasing people use.
+    #[test]
+    fn a_macro_named_before_the_noun_still_reaches_its_command() {
+        assert_eq!(
+            classify_macro_command("replay the morning setup macro"),
+            Some(MacroCommand::Replay { name: "morning setup".to_string() })
+        );
+        assert_eq!(
+            classify_macro_command("run my deploy macro"),
+            Some(MacroCommand::Replay { name: "deploy".to_string() })
+        );
+        assert_eq!(
+            classify_macro_command("play back the standup macro"),
+            Some(MacroCommand::Replay { name: "standup".to_string() })
+        );
+        assert_eq!(
+            classify_macro_command("forget the deploy macro"),
+            Some(MacroCommand::Forget { name: "deploy".to_string() })
+        );
+        assert_eq!(
+            classify_macro_command("Delete the morning setup macro."),
+            Some(MacroCommand::Forget { name: "morning setup".to_string() })
+        );
+        assert_eq!(
+            classify_macro_command("record the standup macro"),
+            Some(MacroCommand::StartRecording { name: "standup".to_string() })
+        );
+        // ...and the openers/closers that the exact-match lists lacked.
+        assert_eq!(
+            classify_macro_command("start a macro called standup"),
+            Some(MacroCommand::StartRecording { name: "standup".to_string() })
+        );
+        assert_eq!(
+            classify_macro_command("stop recording the macro"),
+            Some(MacroCommand::StopRecording)
+        );
+    }
+
+    /// ...AND THE WIDENING DOES NOT BECOME A HIJACK.
+    ///
+    /// The trailing-noun form accepts any span between an enumerated verb and
+    /// the word "macro", which is exactly how a recall fix turns into the
+    /// capture the campaign spent 317 utterances closing. [`is_plausible_label`]
+    /// is the bound: a macro name is a SHORT, function-word-free label, so a
+    /// sentence that merely ends in "macro" keeps falling through to
+    /// conversation. Without that bound "run the numbers on the macro" REPLAYS a
+    /// macro called "numbers on the".
+    #[test]
+    fn a_sentence_that_merely_ends_in_macro_is_not_a_macro_command() {
+        for text in [
+            "run the numbers on the macro",
+            "explain the macro",
+            "what's your read on the macro",
+            "the meeting was a bit of a macro",
+            "i don't follow the macro",
+            "run the risk of overfitting the macro",
+            "delete the reference to the macro",
+            // A bare determiner is not a name.
+            "run my macro",
+            "forget the macro",
+            "replay that macro",
+            // The noun has to be a WHOLE word.
+            "run the deploy promacro",
+        ] {
+            assert_eq!(
+                classify_macro_command(text),
+                None,
+                "ordinary speech must not become a macro command: {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn is_plausible_label_admits_names_and_refuses_clauses() {
+        assert!(is_plausible_label("deploy"));
+        assert!(is_plausible_label("morning setup"));
+        assert!(is_plausible_label("standup notes daily"));
+        assert!(!is_plausible_label(""));
+        assert!(!is_plausible_label("numbers on the"));
+        assert!(!is_plausible_label("my"));
+        // Four words is a clause, not a label.
+        assert!(!is_plausible_label("one two three four"));
     }
 
     // ---- the recording buffer captures only, never changes a gate ----------

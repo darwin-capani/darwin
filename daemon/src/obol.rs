@@ -560,12 +560,18 @@ fn round_usd(v: f64) -> f64 {
 /// recent rows' NON-SECRET fields (model + counts + cost + agent + ts). PURE —
 /// a function of its inputs, so it is unit-tested directly. The dollar figures are
 /// always LABELLED an estimate (published rates × measured counts, not billed).
+///
+/// `measured` is CARRIED, never assumed: it says whether the ledger reads behind
+/// these numbers actually succeeded (see [`spend_report`]). Every figure below is
+/// 0 both for a day with no cloud spend AND for a ledger that could not be read,
+/// so without this flag those two states are indistinguishable on the wire.
 pub fn build_spend_report(
     day_spend_usd: f64,
     daily_cap_usd: f64,
     calls_today: u64,
     recent: &[SpendRow],
     now: u64,
+    measured: bool,
 ) -> Value {
     let pressure = budget_pressure(day_spend_usd, daily_cap_usd);
     let cap_configured = daily_cap_usd > 0.0;
@@ -608,21 +614,50 @@ pub fn build_spend_report(
         "recent": rows,
         // The dollars are a transparent estimate (rates × measured counts).
         "cost_is_estimate": true,
+        // MEASURED vs UNKNOWN. Every number above is 0 both when the ledger
+        // genuinely holds no spend today AND when the ledger could not be READ
+        // (`spend_report` degrades each failed read so the meter loop never
+        // wedges). Those two states used to reach the HUD identically —
+        // "~$0.00 · CALLS TODAY 0" — on a panel whose own header says MEASURED,
+        // NEVER FABRICATED. This flag is the only thing that separates them, so
+        // the gauge can show an explicit "—" instead of a zero it cannot stand
+        // behind.
+        "measured": measured,
     })
 }
 
 /// Assemble + return the read-only spend report from the DURABLE ledger (the
 /// `spend_report` op's core + the meter task's payload). Uses `[obol].daily_usd_cap`
 /// for the cap and the ledger's own daily-sum for "today", so the report and the
-/// live budget agree on the same UTC-day window. Read failures degrade to an
-/// honest zero report (never wedges, never fabricates spend).
+/// live budget agree on the same UTC-day window.
+///
+/// WHAT WENT WRONG: a failed read fell to `unwrap_or(0.0)` / `unwrap_or(0)` and
+/// this doc called the result "an honest zero report". It is not honest. The only
+/// consumer is `spend_meter_task` -> `obol.spend` -> the HUD's SPEND // CLOUD
+/// METER, a panel headed "MEASURED, NEVER FABRICATED" that renders the payload as
+/// "~$0.00 · CALLS TODAY 0" — so a ledger the daemon could not read reached the
+/// owner byte-identically to a day with no cloud spend. The reads still degrade
+/// (this must never wedge the meter loop and must never invent spend), but the
+/// report now CARRIES whether it was measured, which is what makes the unknown
+/// visibly distinct from a real zero.
 pub async fn spend_report(cfg: &Config, ledger: &SpendLedger) -> Value {
     let now = now_secs();
     let start = day_start(now);
-    let today = ledger.spend_since(start).await.unwrap_or(0.0);
-    let calls = ledger.count_since(start).await.unwrap_or(0);
-    let recent = ledger.recent(REPORT_RECENT).await.unwrap_or_default();
-    build_spend_report(today, cfg.obol.daily_usd_cap, calls, &recent, now)
+    let today = ledger.spend_since(start).await;
+    let calls = ledger.count_since(start).await;
+    let recent = ledger.recent(REPORT_RECENT).await;
+    // EVERY read that feeds a rendered figure has to succeed for the report to
+    // call itself measured — `recent` included, since an unreadable ledger and an
+    // empty one both produce an empty RECENT CALLS list.
+    let measured = today.is_ok() && calls.is_ok() && recent.is_ok();
+    build_spend_report(
+        today.unwrap_or(0.0),
+        cfg.obol.daily_usd_cap,
+        calls.unwrap_or(0),
+        &recent.unwrap_or_default(),
+        now,
+        measured,
+    )
 }
 
 /// Interval between `obol.spend` meter emits.
@@ -633,7 +668,9 @@ const METER_STARTUP_DELAY: Duration = Duration::from_secs(20);
 /// The periodic SPEND // CLOUD METER feed: emit the read-only `obol.spend` report
 /// so the HUD gauge can render the current day spend vs cap + the reduce-only
 /// budget posture. Fire-and-forget through the existing telemetry hub; a read
-/// failure inside `spend_report` degrades to an honest zero report, never wedges.
+/// failure inside `spend_report` never wedges the loop — it emits a report whose
+/// `measured` flag is FALSE, so the gauge shows an explicit "—" rather than a
+/// dollar zero it cannot stand behind.
 pub async fn spend_meter_task(cfg: Arc<Config>, ledger: Arc<SpendLedger>) {
     tokio::time::sleep(METER_STARTUP_DELAY).await;
     loop {
@@ -903,7 +940,7 @@ mod tests {
         assert!(!s.contains("UTTERANCE"));
 
         // The read-only report is likewise secret-free.
-        let report = build_spend_report(cost, 0.0, 1, &recent, 100).to_string();
+        let report = build_spend_report(cost, 0.0, 1, &recent, 100, true).to_string();
         assert!(!report.contains("CANARY"), "spend report leaked utterance content");
         assert!(!report.contains("do-not-leak"));
     }
@@ -916,8 +953,9 @@ mod tests {
     fn report_states_cap_pressure_and_headroom() {
         let rows = vec![row(10, "claude-haiku-4-5", 0.25, "gecko")];
         // Cap $10, spent $9 -> EASE (>=80%), headroom $1.
-        let v = build_spend_report(9.0, 10.0, 3, &rows, 500);
+        let v = build_spend_report(9.0, 10.0, 3, &rows, 500, true);
         assert_eq!(v["cap_configured"], true);
+        assert_eq!(v["measured"], true, "a report built from real reads says so");
         assert_eq!(v["pressure"], "ease");
         assert_eq!(v["will_step_down"], true);
         assert!((v["headroom_usd"].as_f64().unwrap() - 1.0).abs() < 1e-9);
@@ -932,7 +970,7 @@ mod tests {
     #[test]
     fn report_no_cap_is_pure_accounting_no_pressure() {
         // No cap configured (the default) -> accounting only, never a step-down.
-        let v = build_spend_report(123.45, 0.0, 7, &[], 1);
+        let v = build_spend_report(123.45, 0.0, 7, &[], 1, true);
         assert_eq!(v["cap_configured"], false);
         assert_eq!(v["pressure"], "none");
         assert_eq!(v["will_step_down"], false);
@@ -942,9 +980,70 @@ mod tests {
 
     #[test]
     fn report_over_cap_floors() {
-        let v = build_spend_report(12.0, 10.0, 40, &[], 1);
+        let v = build_spend_report(12.0, 10.0, 40, &[], 1, true);
         assert_eq!(v["pressure"], "floor");
         assert_eq!(v["will_step_down"], true);
         assert_eq!(v["headroom_usd"], 0.0, "over cap -> no headroom (clamped >=0)");
+    }
+
+    // -----------------------------------------------------------------------
+    // MEASURED vs UNKNOWN — a zero that means "could not read" must not render
+    // as a zero that means "read it, there was none"
+    // -----------------------------------------------------------------------
+
+    /// REGRESSION: a report whose ledger could not be READ must not be reported as
+    /// a day with no spend.
+    ///
+    /// `spend_report` degrades every failed read (it must never wedge the meter
+    /// loop and must never invent spend), so an unreadable ledger yields
+    /// day_spend 0.0 / calls 0 / no recent rows — identical to a genuinely quiet
+    /// day. Its one consumer, the HUD's SPEND // CLOUD METER, renders that as
+    /// "~$0.00 · CALLS TODAY 0" under a header that says MEASURED, NEVER
+    /// FABRICATED. `measured` is the only field that tells the two apart.
+    #[tokio::test]
+    async fn an_unreadable_ledger_is_not_reported_as_a_day_with_no_spend() {
+        let led = SpendLedger::open_in_memory().unwrap();
+        let cfg = Config::default();
+        led.record(&row(now_secs(), "claude-opus-4-8", 1.25, "darwin")).await.unwrap();
+
+        // PRECONDITION: a READABLE ledger reports measured, with the real numbers.
+        let ok = spend_report(&cfg, &led).await;
+        assert_eq!(ok["measured"], true, "a readable ledger must say so: {ok}");
+        assert!(
+            ok["day_spend_usd"].as_f64().unwrap() > 0.0,
+            "the precondition needs a real recorded call: {ok}"
+        );
+
+        // Break the ledger under the report's feet — every read now errors.
+        led.conn.lock().await.execute("DROP TABLE spend", params![]).unwrap();
+        let broken = spend_report(&cfg, &led).await;
+        assert_eq!(broken["day_spend_usd"], 0.0, "the read still degrades, by design");
+        assert_eq!(broken["calls_today"], 0);
+        assert_eq!(
+            broken["measured"], false,
+            "a ledger that could not be read must NOT be reported as measured: {broken}"
+        );
+        assert_ne!(
+            ok["measured"], broken["measured"],
+            "an unknown and a real zero must be distinguishable on the wire"
+        );
+    }
+
+    /// The flag is CARRIED, not inferred: `build_spend_report` emits exactly what
+    /// it was told, so no caller can launder an unknown into a measured zero —
+    /// and the two payloads differ ONLY in that field, which is the point.
+    #[test]
+    fn the_report_carries_the_measured_flag_it_was_given() {
+        let measured = build_spend_report(0.0, 0.0, 0, &[], 1, true);
+        let unknown = build_spend_report(0.0, 0.0, 0, &[], 1, false);
+        assert_eq!(measured["measured"], true);
+        assert_eq!(unknown["measured"], false);
+        assert_eq!(measured["day_spend_usd"], unknown["day_spend_usd"]);
+        assert_eq!(measured["calls_today"], unknown["calls_today"]);
+        assert_ne!(
+            measured.to_string(),
+            unknown.to_string(),
+            "the two zero-valued reports must not serialize identically"
+        );
     }
 }

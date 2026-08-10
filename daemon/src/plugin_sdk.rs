@@ -563,7 +563,9 @@ mod tests {
     /// `net_hosts` was "over-privileged" (implying: add hosts), and a non-empty
     /// one was accepted. Following that advice produced a profile `sandbox-exec`
     /// rejects with exit 65, so the app never launched -- which is how fab-link
-    /// and algo-core came to be shipped-but-unlaunchable.
+    /// and algo-core came to be shipped-but-unlaunchable. (Both apps are since
+    /// DELETED -- docs/BLOCKED_APPS.md -- but this test never depended on them:
+    /// it pins the RULE against the synthetic `netty` manifest below.)
     ///
     /// Both spellings must now be refused, with a diagnostic that names the
     /// fetch proxy rather than telling the author to declare hosts.

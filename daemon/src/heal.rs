@@ -37,7 +37,7 @@
 //!      its own stage, `deadline`, and never as a rejection on the merits.
 //!      THE BUDGET IS AN ATTEMPT-WIDE CEILING, NOT A PER-CANDIDATE ALLOWANCE:
 //!      each candidate may take up to VALIDATE_TIMEOUT, but only out of the one
-//!      ATTEMPT_BUDGET all CANDIDATE_COUNT of them share, and each stage is
+//!      attempt budget all CANDIDATE_COUNT of them share, and each stage is
 //!      capped so a slow one cannot starve the stages behind it. A candidate the
 //!      attempt cannot afford is reported as `deadline` WITHOUT being staged.
 //!      ONLY TIME SPENT INSIDE stage_and_validate IS CHARGED TO IT — the draft
@@ -51,7 +51,7 @@
 //!      what the MACHINE compiles, and a slow review API must not spend it.
 //!   7. SELECT — prefer the MINIMAL patch with the HIGHEST review confidence
 //!      among those that PASSED validation, and PROPOSE NOTHING when even the
-//!      best of them is below CONFIDENCE_FLOOR: the four staged gates are blind
+//!      best of them is below the review-confidence floor: the staged gates are blind
 //!      to whether the patch is a good idea, the reviewer is the only stage that
 //!      judges that, and "best of three the reviewer disbelieved" is not a
 //!      proposal. Rejected-at-the-floor attempts still write every candidate,
@@ -91,7 +91,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::process::Stdio;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
@@ -156,7 +156,7 @@ const REVIEW_SYSTEM: &str = "You are DARWIN's adversarial self-repair reviewer: 
 /// judged AT ALL, and the attempt reports "NO CANDIDATE WAS EVER JUDGED".
 ///
 /// This is NOT a licence to spend more wall clock. The whole attempt is capped
-/// at [`ATTEMPT_BUDGET`] across all [`CANDIDATE_COUNT`] candidates, so the
+/// at [`attempt_budget()`] across all [`CANDIDATE_COUNT`] candidates, so the
 /// worst case is UNCHANGED from the 3 x 600s it replaces — the time is simply
 /// allowed to go where it is needed instead of being handed out in three equal
 /// slices that each fall just short.
@@ -186,7 +186,42 @@ const VALIDATE_TIMEOUT: Duration = Duration::from_secs(900);
 /// healthy machine, with the message "the earlier candidates used the machine
 /// up". A third of every attempt's drafted (and paid-for) candidates was being
 /// discarded because an API was slow, and the operator was told their box was.
-const ATTEMPT_BUDGET: Duration = Duration::from_secs(1800);
+/// THE DEFAULT, and what `config/darwin.toml` ships. The EFFECTIVE value is
+/// [`attempt_budget()`], set once from `[self_heal].attempt_budget_secs`.
+const ATTEMPT_BUDGET_DEFAULT: Duration = Duration::from_secs(1800);
+
+/// Clamp ends for `[self_heal].attempt_budget_secs`. **DERIVED, NOT PICKED.**
+///
+/// * The LOW end is [`minimum_viable_budget`] (750s): below it,
+///   `stage_and_validate` refuses to stage even the FIRST candidate, so the
+///   whole gate could never reach a verdict on anything — a configured "0" would
+///   not be a small budget, it would be a silently disabled self-heal that still
+///   pays for three heavy-model drafts every attempt. It is read from the same
+///   function the staging path uses, so raising a stage floor moves this end too.
+/// * The HIGH end is 4h. Self-heal only runs on a machine that is ALREADY
+///   MISBEHAVING; there is no operator intent behind "occupy every core for a
+///   day", and an unbounded ceiling makes the one knob that bounds the machine
+///   not bound it.
+const ATTEMPT_BUDGET_MAX_SECS: u64 = 4 * 60 * 60;
+
+/// The process-wide effective attempt budget, seeded once from config by
+/// [`configure`]. Unset (every unit test, and any path that never loaded a
+/// config) reads [`ATTEMPT_BUDGET_DEFAULT`] — so the default is the behavior,
+/// not a fallback that differs from it.
+static ATTEMPT_BUDGET_CELL: OnceLock<Duration> = OnceLock::new();
+
+/// The attempt-wide cargo budget in force. See [`ATTEMPT_BUDGET_DEFAULT`].
+fn attempt_budget() -> Duration {
+    *ATTEMPT_BUDGET_CELL.get().unwrap_or(&ATTEMPT_BUDGET_DEFAULT)
+}
+
+/// The configured attempt budget, clamped. PURE — the clamp is unit-tested
+/// without touching the process-wide cell, so no test can race another by
+/// changing a global out from under it.
+pub fn effective_attempt_budget(sh: &crate::config::SelfHealConfig) -> Duration {
+    let lo = minimum_viable_budget().as_secs();
+    Duration::from_secs(sh.attempt_budget_secs.clamp(lo, ATTEMPT_BUDGET_MAX_SECS))
+}
 
 /// Floor for the `check` stage — the cheapest gate, and the one whose failure
 /// is the plain "this does not compile" message an operator needs first.
@@ -222,7 +257,84 @@ const MUTATION_STAGE_FLOOR: Duration = Duration::from_secs(60);
 /// SAME constant through `darwind --heal-confidence` (one implementation, two
 /// callers, like `--split-heal-diff`), so a proposal written by an older daemon
 /// cannot be applied under a weaker bar either.
-const CONFIDENCE_FLOOR: f64 = 0.25;
+/// (continued) THE DEFAULT, and what `config/darwin.toml` ships. The EFFECTIVE
+/// value is [`confidence_floor()`], set once from `[self_heal].confidence_floor`.
+///
+/// MAKING IT CONFIGURABLE IS NOT THE SAME AS KNOWING WHAT IT SHOULD BE.
+/// Replacing 0.25 with a different judged number would have been a guess in a
+/// decision's clothes, so the default is unchanged and every attempt instead
+/// emits the reviewer's confidence (and the per-stage timings) into telemetry
+/// under `calibration`, so the right floor becomes readable from N real
+/// attempts rather than argued.
+const CONFIDENCE_FLOOR_DEFAULT: f64 = 0.25;
+
+/// Clamp ends for `[self_heal].confidence_floor`. **DERIVED, NOT PICKED.**
+///
+/// * The LOW end must be strictly above the score a FAILED review call is
+///   recorded as (0.0) — at 0.0 the floor is not a floor, it admits "no review
+///   happened" as if it were a verdict, which is the exact defect this gate was
+///   added to close (`the_confidence_floor_is_inclusive_at_the_bar` pins it).
+///   It must ALSO stay strictly above the BELOW_FLOOR probe
+///   `scripts/apply_heal.sh` proves its own gate with (0.01), or that
+///   self-proof stops discriminating and the apply gate fails closed on every
+///   proposal.
+/// * The HIGH end must stay at or below that script's ABOVE_FLOOR probe (0.95),
+///   for the same reason from the other side.
+///
+/// `the_confidence_clamp_brackets_the_apply_scripts_own_self_proof` reads both
+/// probe values back out of `scripts/apply_heal.sh` and asserts this bracket, so
+/// the derivation cannot rot if either file is edited alone.
+const CONFIDENCE_FLOOR_MIN: f64 = 0.05;
+const CONFIDENCE_FLOOR_MAX: f64 = 0.95;
+
+/// The process-wide effective floor, seeded once from config by [`configure`].
+/// Unset reads [`CONFIDENCE_FLOOR_DEFAULT`].
+static CONFIDENCE_FLOOR_CELL: OnceLock<f64> = OnceLock::new();
+
+/// The review-confidence floor in force. `pub` for the `--heal-confidence` CLI
+/// and the HUD wire payload. See [`CONFIDENCE_FLOOR_DEFAULT`].
+pub fn confidence_floor() -> f64 {
+    *CONFIDENCE_FLOOR_CELL.get().unwrap_or(&CONFIDENCE_FLOOR_DEFAULT)
+}
+
+/// The configured floor, clamped. PURE (see [`effective_attempt_budget`]).
+/// A NaN — which no comparison would reject and which would make
+/// `meets_confidence_floor` answer `false` for every score, walling off the
+/// gate — falls back to the default rather than propagating.
+pub fn effective_confidence_floor(sh: &crate::config::SelfHealConfig) -> f64 {
+    if !sh.confidence_floor.is_finite() {
+        return CONFIDENCE_FLOOR_DEFAULT;
+    }
+    sh.confidence_floor.clamp(CONFIDENCE_FLOOR_MIN, CONFIDENCE_FLOOR_MAX)
+}
+
+/// Seed BOTH effective values from `[self_heal]`. Idempotent and first-wins
+/// (`OnceLock::set`), so the daemon and the `--heal-confidence` CLI reach the
+/// same numbers from the same file and a later call cannot move the bar
+/// mid-attempt. Logs when a configured value was clamped — an operator who
+/// wrote `attempt_budget_secs = 60` must not be silently given 750.
+pub fn configure(sh: &crate::config::SelfHealConfig) {
+    let floor = effective_confidence_floor(sh);
+    if (floor - sh.confidence_floor).abs() > f64::EPSILON {
+        warn!(
+            configured = sh.confidence_floor,
+            effective = floor,
+            "self_heal.confidence_floor is outside [{CONFIDENCE_FLOOR_MIN}, {CONFIDENCE_FLOOR_MAX}] and was clamped"
+        );
+    }
+    let budget = effective_attempt_budget(sh);
+    if budget.as_secs() != sh.attempt_budget_secs {
+        warn!(
+            configured = sh.attempt_budget_secs,
+            effective = budget.as_secs(),
+            "self_heal.attempt_budget_secs is outside [{}, {ATTEMPT_BUDGET_MAX_SECS}] and was clamped",
+            minimum_viable_budget().as_secs(),
+        );
+    }
+    let _ = CONFIDENCE_FLOOR_CELL.set(floor);
+    let _ = ATTEMPT_BUDGET_CELL.set(budget);
+}
+
 const PATCH_BIN: &str = "/usr/bin/patch";
 /// Validation output tail kept in report.md / candidates.md.
 const REPORT_TAIL_CHARS: usize = 4000;
@@ -1207,14 +1319,14 @@ fn parse_confidence(s: &str) -> f64 {
     num.parse::<f64>().unwrap_or(0.0)
 }
 
-/// Does a review confidence clear [`CONFIDENCE_FLOOR`]?
+/// Does a review confidence clear [`confidence_floor()`]?
 ///
 /// THE ONE COMPARISON. The daemon's own selection and
 /// `darwind --heal-confidence` — which `scripts/apply_heal.sh` shells out to,
 /// exactly like `--split-heal-diff` — both call this, so the two gates cannot
 /// drift into two different bars. `pub` for that CLI caller.
 pub fn meets_confidence_floor(confidence: f64) -> bool {
-    confidence >= CONFIDENCE_FLOOR
+    confidence >= confidence_floor()
 }
 
 /// What the shared confidence gate says about one proposal. Printed as its word
@@ -1276,14 +1388,15 @@ pub fn confidence_gate(report: &str) -> (ConfidenceGate, String) {
         ),
         Some(c) if meets_confidence_floor(c) => (
             ConfidenceGate::Above,
-            format!("review confidence {c:.2} clears the {CONFIDENCE_FLOOR:.2} floor"),
+            format!("review confidence {c:.2} clears the {:.2} floor", confidence_floor()),
         ),
         Some(c) => (
             ConfidenceGate::Below,
             format!(
-                "review confidence {c:.2} is BELOW the {CONFIDENCE_FLOOR:.2} floor — the \
+                "review confidence {c:.2} is BELOW the {:.2} floor — the \
                  adversarial reviewer did not back this patch, so it is not installed by a \
-                 one-click apply"
+                 one-click apply",
+                confidence_floor()
             ),
         ),
     }
@@ -1358,7 +1471,7 @@ fn render_report(ts: u64, model: &str, d: &Diagnosis, winner: &Survivor) -> Stri
         responsiveness = responsiveness(d, &winner.diff).1,
         index = winner.index,
         confidence = winner.confidence,
-        floor = CONFIDENCE_FLOOR,
+        floor = confidence_floor(),
         // THE HEADER, NOT ONLY THE SECTION 60 LINES DOWN. A reader skimming the
         // top of report.md (and the HUD, which shows its first lines) got a bare
         // number with no bar beside it and no word from the only stage that
@@ -1423,7 +1536,7 @@ fn render_review_md(winner: &Survivor) -> String {
          - reviewed: {reviewed}\n\n## Verdict\n\n{verdict}\n",
         index = winner.index,
         confidence = winner.confidence,
-        floor = CONFIDENCE_FLOOR,
+        floor = confidence_floor(),
         stance = if meets_confidence_floor(winner.confidence) { "cleared" } else { "BELOW" },
         reviewed = if winner.reviewed {
             "yes"
@@ -1473,6 +1586,11 @@ async fn run_pipeline(
     scan: &LogScan,
 ) {
     let ts = now_secs();
+    // SEED THE TWO TUNABLES FROM CONFIG, once, before anything reads them.
+    // `configure` is first-wins, so the numbers cannot move mid-attempt, and the
+    // `--heal-confidence` CLI seeds them from the SAME file — the daemon's
+    // propose-side bar and apply_heal.sh's install-side bar stay one number.
+    configure(&cfg.self_heal);
     // LOCKDOWN OVERLAY (task #12): self-heal is autonomy, so it is FORCED off
     // while the emergency stop is engaged — the enabled bit is ANDed with
     // `!is_locked_down()`, so the pure `heal_action` returns Disabled and the
@@ -1522,7 +1640,7 @@ async fn run_pipeline(
     let daemon_dir = root.join("daemon");
     let heal_root = root.join("state").join("heal");
     match run_attempt(&daemon_dir, &heal_root, ts, &cfg.cloud.heavy_model, brain, scan).await {
-        AttemptResult::Proposed { diff, report, files, confidence, responsiveness, extra } => match action {
+        AttemptResult::Proposed { diff, report, files, confidence, calibration, responsiveness, extra } => match action {
             HealAction::Propose => {
                 // Pass `extra` THROUGH. It used to be swallowed by the `..` in this
                 // destructuring pattern and the no-extra `propose` wrapper hard-coded
@@ -1544,6 +1662,7 @@ async fn run_pipeline(
                     &files,
                     confidence,
                     responsiveness,
+                    &calibration,
                     &extra,
                 )
                 .await;
@@ -1584,17 +1703,33 @@ async fn run_pipeline(
             }
             HealAction::Disabled => unreachable!("gated above"),
         },
-        AttemptResult::Rejected { stage, diff, report } => {
+        AttemptResult::Rejected { stage, diff, report, calibration } => {
             warn!(stage, "heal: all candidates rejected");
             // record a best-effort patch.diff (last attempted) + report for audit.
             let dir = heal_root.join("rejected");
             record_artifact(&dir, ts, "patch.diff", &diff);
             record_artifact(&dir, ts, "report.md", &report);
-            telemetry::emit("system", "heal.rejected", json!({"ts": ts, "stage": stage}));
+            telemetry::emit(
+                "system",
+                "heal.rejected",
+                json!({"ts": ts, "stage": stage, "calibration": calibration.to_json()}),
+            );
         }
         AttemptResult::Aborted { stage } => {
             warn!(stage, "heal: attempt aborted (no verdict on any patch)");
-            telemetry::emit("system", "heal.rejected", json!({"ts": ts, "stage": stage}));
+            // An abort has no per-candidate data (nothing was staged or reviewed),
+            // but it STILL reports the settings in force -- otherwise the one
+            // event class that means "the pipeline could not even start" is also
+            // the one that hides which configuration it could not start under.
+            telemetry::emit(
+                "system",
+                "heal.rejected",
+                json!({
+                    "ts": ts,
+                    "stage": stage,
+                    "calibration": Calibration::default().to_json(),
+                }),
+            );
         }
     }
 }
@@ -1653,6 +1788,7 @@ async fn run_attempt(
             stage: "draft",
             diff: tail_chars(&raw, REPORT_TAIL_CHARS),
             report,
+            calibration: Calibration::default(),
         };
     }
 
@@ -1668,14 +1804,32 @@ async fn run_attempt(
     // budget, so an attempt could occupy every core for CANDIDATE_COUNT times
     // that — on a machine that is misbehaving, which is the only time this code
     // runs at all. One clock for the whole attempt: a candidate may take up to
-    // VALIDATE_TIMEOUT, but only out of what is left of ATTEMPT_BUDGET.
+    // VALIDATE_TIMEOUT, but only out of what is left of attempt_budget().
     let mut attempt_spent = Duration::ZERO;
+    // CALIBRATION: what this attempt cost and what it judged. Accumulated across
+    // every candidate (including the rejected ones -- those are the informative
+    // ones for the budget) and shipped on whichever terminal event fires.
+    let mut calib = Calibration { drafted: candidate_diffs.len(), ..Calibration::default() };
     for (i, diff) in candidate_diffs.iter().enumerate() {
         let files = extract_source_files(diff);
-        let budget = candidate_budget(ATTEMPT_BUDGET.saturating_sub(attempt_spent), VALIDATE_TIMEOUT);
+        let budget = candidate_budget(attempt_budget().saturating_sub(attempt_spent), VALIDATE_TIMEOUT);
+        if budget < minimum_viable_budget() {
+            // Counted, not just refused: a nonzero `candidates_unaffordable` is
+            // the one number that says "your attempt_budget_secs is too small for
+            // this machine" without anyone having to read a rejection report.
+            calib.unaffordable += 1;
+        }
         let started = tokio::time::Instant::now();
-        let staged =
-            stage_and_validate(daemon_dir, heal_root, ts, i, diff, &diagnosis, budget).await;
+        let staged = stage_and_validate(
+            daemon_dir,
+            heal_root,
+            CandidateRef { ts, index: i },
+            diff,
+            &diagnosis,
+            budget,
+            &mut calib.stages,
+        )
+        .await;
         // CHARGE THE MACHINE, NOT THE NETWORK.
         //
         // This accumulates only what the STAGED VALIDATION used. A wall-clock
@@ -1688,6 +1842,7 @@ async fn run_attempt(
         // spent by the earlier candidates" — a statement about the machine, for
         // something the machine did not do.
         attempt_spent = attempt_spent.saturating_add(started.elapsed());
+        calib.spent_secs = attempt_spent.as_secs();
         match staged {
             Ok(StageResult::Validated { validation_tail }) => {
                 // (6) Adversarial review of this survivor.
@@ -1706,6 +1861,11 @@ async fn run_attempt(
                             ("review call failed".to_string(), 0.0, false)
                         }
                     };
+                calib.reviews.push(json!({
+                    "candidate": i + 1,
+                    "confidence": confidence,
+                    "reviewed": reviewed,
+                }));
                 outcomes.push(CandidateOutcome {
                     index: i + 1,
                     diff: diff.clone(),
@@ -1779,6 +1939,7 @@ async fn run_attempt(
                 .cloned()
                 .unwrap_or_default(),
             report,
+            calibration: calib,
         };
     };
     let winner = survivors[win_idx].clone();
@@ -1794,7 +1955,7 @@ async fn run_attempt(
     if !meets_confidence_floor(winner.confidence) {
         warn!(
             confidence = winner.confidence,
-            floor = CONFIDENCE_FLOOR,
+            floor = confidence_floor(),
             reviewed = winner.reviewed,
             "heal: the best candidate is below the review-confidence floor; proposing nothing"
         );
@@ -1808,6 +1969,7 @@ async fn run_attempt(
             stage: "confidence",
             diff: winner.diff.clone(),
             report,
+            calibration: calib,
         };
     }
 
@@ -1821,6 +1983,7 @@ async fn run_attempt(
         report,
         files: winner.files.clone(),
         confidence: winner.confidence,
+        calibration: calib,
         responsiveness: responsiveness_word,
         extra: ProposalArtifacts {
             diagnosis_json,
@@ -1838,6 +2001,10 @@ enum AttemptResult {
         report: String,
         files: Vec<String>,
         confidence: f64,
+        /// Per-attempt CALIBRATION (see [`Calibration`]) -- every candidate's
+        /// review score and every stage's real wall time, so the two tunables
+        /// can be set from measurement instead of judgement.
+        calibration: Calibration,
         /// Whether the chosen patch actually answers the diagnosis
         /// (`Responsiveness::word()`). Carried out so the propose path can put
         /// it on the wire — the gate chain itself is blind to it.
@@ -1850,6 +2017,11 @@ enum AttemptResult {
         stage: &'static str,
         diff: String,
         report: String,
+        /// Carried on rejections TOO, and that is the important half: a
+        /// `deadline` rejection is the machine telling you the budget is wrong,
+        /// and a `confidence` rejection is the reviewer telling you the floor
+        /// may be. Both are invisible without the numbers.
+        calibration: Calibration,
     },
     /// Infrastructure trouble before any verdict (draft call failed). No
     /// statement about any patch.
@@ -1893,6 +2065,7 @@ async fn propose(
     files: &[String],
     confidence: f64,
     responsiveness: &str,
+    calibration: &Calibration,
     extra: &ProposalArtifacts,
 ) {
     let dir = heal_root.join("proposals");
@@ -1915,11 +2088,16 @@ async fn propose(
             // HUD had to hard-code a second copy of the floor to render "is this
             // a good number?", and two copies of a threshold drift. The daemon
             // owns the number; the HUD renders what it is told.
-            "confidence_floor": CONFIDENCE_FLOOR,
+            "confidence_floor": confidence_floor(),
             // VALIDATED IS NOT RESPONSIVE. Four gates prove the patch compiles,
             // lints, passes and that its test bites; none of them prove it
             // addresses the burst. The HUD's Accept button needs both words.
             "responsiveness": responsiveness,
+            // CALIBRATION -- see `Calibration`. `confidence` above is the
+            // WINNER's score (what the gauge renders); this carries EVERY
+            // candidate's, including the losers, plus what each stage actually
+            // cost. The floor and the budget are set from this, not from taste.
+            "calibration": calibration.to_json(),
         }),
     );
 }
@@ -2034,9 +2212,24 @@ struct CmdOutput {
 /// target/) into the staging dir, apply the diff with patch -p1 --batch
 /// (reject on any hunk failure), then check + clippy + test + mutation under the
 /// `budget` the caller hands down: at most VALIDATE_TIMEOUT, and only out of the
-/// single ATTEMPT_BUDGET every candidate of the attempt shares. (This read "one
+/// single attempt budget every candidate of the attempt shares. (This read "one
 /// 10-minute deadline" for as long as the constant was 600s and per-candidate.
 /// Neither of those is true any more.)
+/// WHICH candidate of WHICH attempt is being staged.
+///
+/// Bundled rather than passed as two positional scalars for two reasons: it
+/// keeps the staging entry points under clippy's argument ceiling (which the
+/// calibration sink pushed them over), and these two values name the staging
+/// directory together (`staging-<ts>-c<i>`) -- a pair that must always travel
+/// together is a struct, not an argument-order convention.
+#[derive(Clone, Copy)]
+struct CandidateRef {
+    ts: u64,
+    /// ZERO-BASED. The operator-facing candidate number is `index + 1`
+    /// everywhere it is reported; only the staging path uses the raw index.
+    index: usize,
+}
+
 /// Wrapper that guarantees the staging tree is REMOVED on every exit.
 ///
 /// stage_and_validate creates state/heal/staging-<ts>-c<i>/ per candidate and copies
@@ -2050,11 +2243,11 @@ struct CmdOutput {
 async fn stage_and_validate(
     source_dir: &Path,
     heal_root: &Path,
-    ts: u64,
-    candidate: usize,
+    cand: CandidateRef,
     diff: &str,
     diagnosis: &Diagnosis,
     budget: Duration,
+    timings: &mut Vec<serde_json::Value>,
 ) -> anyhow::Result<StageResult> {
     // NOT ENOUGH TIME LEFT IN THE ATTEMPT TO REACH A VERDICT. Say so before
     // copying a crate tree and applying a patch: staging costs disk and IO on a
@@ -2064,9 +2257,9 @@ async fn stage_and_validate(
     if budget < minimum_viable_budget() {
         return Ok(budget_exhausted("check", "", None, budget, BudgetStop::Attempt));
     }
-    let staging = heal_root.join(staging_dir_name(ts, candidate));
+    let staging = heal_root.join(staging_dir_name(cand.ts, cand.index));
     let out =
-        stage_and_validate_inner(source_dir, heal_root, ts, candidate, diff, diagnosis, budget)
+        stage_and_validate_inner(source_dir, heal_root, cand, diff, diagnosis, budget, timings)
             .await;
     // Best-effort: a tree we could not remove is wasted disk, never a broken heal.
     if let Err(e) = tokio::fs::remove_dir_all(&staging).await {
@@ -2086,13 +2279,20 @@ const UNRUNNABLE_IN_STAGE: &[&str] = &[
 async fn stage_and_validate_inner(
     source_dir: &Path,
     heal_root: &Path,
-    ts: u64,
-    candidate: usize,
+    cand: CandidateRef,
     diff: &str,
     diagnosis: &Diagnosis,
     budget: Duration,
+    // CALIBRATION SINK. Every cargo stage that actually RUNS appends its real
+    // wall time here (see `record_stage_timing`). This is the whole point of the
+    // exercise: `attempt_budget_secs` was picked by judgement, and the only way
+    // to replace judgement with measurement is for each attempt to report what
+    // the cycle cost ON THIS MACHINE. Passed by &mut rather than returned in
+    // StageResult so the timings survive a candidate that is REJECTED -- the
+    // rejected runs are the ones that tell you the budget is too small.
+    timings: &mut Vec<serde_json::Value>,
 ) -> anyhow::Result<StageResult> {
-    let staging = heal_root.join(staging_dir_name(ts, candidate));
+    let staging = heal_root.join(staging_dir_name(cand.ts, cand.index));
     // `staging` is a miniature REPO ROOT; the crate itself lands one level down.
     // Both `patch -p1` (whose headers are `a/src/...`) and cargo run against the
     // CRATE dir, not the staging root.
@@ -2185,7 +2385,10 @@ async fn stage_and_validate_inner(
         if cap.is_zero() {
             return Ok(budget_exhausted(stage, &combined, None, budget, BudgetStop::StageShare));
         }
-        match run_cargo(&crate_dir, args, cap).await {
+        let stage_started = tokio::time::Instant::now();
+        let stage_out = run_cargo(&crate_dir, args, cap).await;
+        record_stage_timing(timings, cand.index, stage, stage_started.elapsed(), &stage_out);
+        match stage_out {
             Ok(out) => {
                 combined.push_str(&format!("\n$ cargo {}\n", args.join(" ")));
                 combined.push_str(&out.output);
@@ -2270,7 +2473,10 @@ async fn stage_and_validate_inner(
                         validation_tail: tail_chars(&combined, REPORT_TAIL_CHARS),
                     });
                 }
-                match run_cargo(&crate_dir, &test_args, remaining).await {
+                let mut_started = tokio::time::Instant::now();
+                let mut_out = run_cargo(&crate_dir, &test_args, remaining).await;
+                record_stage_timing(timings, cand.index, "mutation", mut_started.elapsed(), &mut_out);
+                match mut_out {
                     Ok(o) if !o.ok => "PROVEN: the patch's test FAILS once its fix is taken away.",
                     Ok(o) => {
                         return Ok(StageResult::Rejected {
@@ -2311,13 +2517,99 @@ async fn stage_and_validate_inner(
 /// classifier cannot drift away from the message it classifies.
 const CARGO_DEADLINE_MARKER: &str = "exceeded the staged-validation budget";
 
+/// Append ONE cargo stage's real wall time to the attempt's calibration sink.
+///
+/// WHY THIS EXISTS. `[self_heal].attempt_budget_secs` and `.confidence_floor`
+/// ship at numbers a human picked. Making them settable does not make them
+/// RIGHT; it just moves the guess. What makes them right is data, and the only
+/// place that data exists is here: the seconds a check / clippy / test /
+/// mutation re-run actually took, on the operator's machine, on the run that
+/// mattered. After N attempts `calibration.stages` answers "what is my cycle?"
+/// arithmetically, and the budget follows from it instead of from an argument.
+///
+/// SECRET-FREE by construction: a candidate index, a fixed stage name from a
+/// literal table, an integer, and a bool. No paths, no diff text, no cargo
+/// output — the compiler's stdout can carry source lines, and this is a HUD
+/// wire payload.
+///
+/// `ok` distinguishes the three outcomes that take very different times: the
+/// stage passed, the stage FAILED on merit (usually much faster — one error
+/// aborts the build), or the stage was cut off by its cap. A mean taken across
+/// all three is meaningless, so the flag is recorded rather than inferred.
+fn record_stage_timing(
+    sink: &mut Vec<serde_json::Value>,
+    candidate: usize,
+    stage: &str,
+    elapsed: Duration,
+    out: &anyhow::Result<CmdOutput>,
+) {
+    let (ok, cut_off) = match out {
+        Ok(o) => (o.ok, false),
+        Err(e) => (false, is_deadline_error(e)),
+    };
+    sink.push(json!({
+        "candidate": candidate + 1,
+        "stage": stage,
+        "secs": elapsed.as_secs(),
+        "ok": ok,
+        "cut_off": cut_off,
+    }));
+}
+
+/// Everything one attempt learned about ITS OWN COST AND ITS OWN JUDGEMENTS,
+/// carried out to telemetry so the two tunables can be set from measurement.
+///
+/// EXTENDS the existing `heal.proposal` / `heal.rejected` events rather than
+/// adding a parallel topic: those are the two events an attempt already ends on,
+/// the HUD already subscribes to both, and a third topic would have to be
+/// joined back to them by timestamp to be useful. `heal.proposal` keeps its
+/// top-level `confidence` (the WINNER's, which the HUD gauge renders) and
+/// `confidence_floor`; this adds what neither carried — EVERY candidate's score
+/// including the ones that lost, and what the machine actually spent.
+/// `confidence_floor` is repeated inside here on purpose: `heal.rejected` has no
+/// top-level copy, and a below-floor rejection is precisely the event an
+/// analysis needs the floor for.
+#[derive(Default, Clone)]
+struct Calibration {
+    /// One per candidate that reached the adversarial reviewer:
+    /// `{candidate, confidence, reviewed}`. `reviewed:false` is a review call
+    /// that never came back, recorded as 0.0 — that is NOT the reviewer scoring
+    /// the patch zero, and averaging the two together is how a floor gets
+    /// calibrated against an outage instead of against opinions.
+    reviews: Vec<serde_json::Value>,
+    /// One per cargo stage that actually ran (see [`record_stage_timing`]).
+    stages: Vec<serde_json::Value>,
+    /// Seconds of the attempt-wide budget actually consumed by staged validation.
+    spent_secs: u64,
+    /// How many candidates were drafted, and how many were never staged at all
+    /// because the attempt could not afford them. A nonzero `unaffordable` is
+    /// the signal that `attempt_budget_secs` is too small for THIS machine.
+    drafted: usize,
+    unaffordable: usize,
+}
+
+impl Calibration {
+    fn to_json(&self) -> serde_json::Value {
+        json!({
+            "confidences": self.reviews,
+            "stages": self.stages,
+            "attempt_spent_secs": self.spent_secs,
+            "attempt_budget_secs": attempt_budget().as_secs(),
+            "candidate_budget_secs": VALIDATE_TIMEOUT.as_secs(),
+            "confidence_floor": confidence_floor(),
+            "candidates_drafted": self.drafted,
+            "candidates_unaffordable": self.unaffordable,
+        })
+    }
+}
+
 /// True when a `run_cargo` error is the deadline running out rather than the
 /// toolchain being missing or unspawnable.
 fn is_deadline_error(e: &anyhow::Error) -> bool {
     e.to_string().contains(CARGO_DEADLINE_MARKER)
 }
 
-/// How much of [`ATTEMPT_BUDGET`] one candidate may take: its own ceiling,
+/// How much of [`attempt_budget()`] one candidate may take: its own ceiling,
 /// clamped by whatever the earlier candidates left of the attempt-wide one.
 /// PURE, so the rule is unit-tested without a clock.
 fn candidate_budget(attempt_remaining: Duration, per_candidate: Duration) -> Duration {
@@ -2393,7 +2685,7 @@ fn budget_exhausted(
             "the {}s attempt-wide budget was already spent by the earlier candidates, so \
              this one was never started (it would have had {secs}s, below the {}s a \
              candidate needs to reach any verdict)",
-            ATTEMPT_BUDGET.as_secs(),
+            attempt_budget().as_secs(),
             minimum_viable_budget().as_secs()
         ),
     };
@@ -2435,7 +2727,7 @@ fn rejection_summary(deadline_hits: usize, merit_rejects: usize) -> String {
              check + clippy + test + mutation-rerun cycle on this machine inside {}s per \
              candidate / {}s per attempt.",
             VALIDATE_TIMEOUT.as_secs(),
-            ATTEMPT_BUDGET.as_secs()
+            attempt_budget().as_secs()
         );
     }
     let mut out =
@@ -2445,7 +2737,7 @@ fn rejection_summary(deadline_hits: usize, merit_rejects: usize) -> String {
             " ({deadline_hits} of them never finished: the {}s per-candidate / {}s per-attempt \
              validation budget ran out, so those were not judged on their merits.)",
             VALIDATE_TIMEOUT.as_secs(),
-            ATTEMPT_BUDGET.as_secs()
+            attempt_budget().as_secs()
         ));
     }
     out
@@ -2467,8 +2759,9 @@ fn drill_rejection_sentence(stage: &str) -> String {
             .to_string(),
         "confidence" => format!(
             "candidates passed every staged gate, but the adversarial reviewer backed none of \
-             them (below the {CONFIDENCE_FLOOR:.2} confidence floor), so nothing was proposed. \
-             That is the reviewer's verdict, not a gate failure"
+             them (below the {:.2} confidence floor), so nothing was proposed. \
+             That is the reviewer's verdict, not a gate failure",
+            confidence_floor()
         ),
         other => format!("every candidate was rejected at stage `{other}`"),
     }
@@ -2491,9 +2784,10 @@ fn below_floor_summary(best: &Survivor, survivors: usize) -> String {
     format!(
         "NOTHING WAS PROPOSED, AND NOT BECAUSE THE PATCHES FAILED A GATE. {survivors} \
          candidate(s) passed staged check + clippy -D warnings + test + the mutation probe, but \
-         {scored}, below the {CONFIDENCE_FLOOR:.2} review-confidence floor. A patch nobody \
+         {scored}, below the {:.2} review-confidence floor. A patch nobody \
          vouched for does not get a one-click APPLY button next to it. Every candidate, its \
-         diff and its review are in this directory — apply one by hand if you disagree."
+         diff and its review are in this directory — apply one by hand if you disagree.",
+        confidence_floor()
     )
 }
 
@@ -2583,6 +2877,20 @@ fn copy_crate_tree(from: &Path, to: &Path) -> std::io::Result<()> {
 const RUNTIME_TEST_INPUTS: &[&str] = &[
     "config",  // agents.toml, darwin.toml — read by agents:: and config:: tests
     "scripts", // apply_forge.sh and friends — forge:: tests execute these
+    // docs/ — MEASURED, not guessed. `apps::tests::the_sandbox_doc_worked_
+    // example_names_an_app_whose_manifest_validates` reads
+    // <CARGO_MANIFEST_DIR>/../docs/SANDBOX.md and `.expect("docs/SANDBOX.md is
+    // present")`. It was added AFTER this list, so it panicked in every staged
+    // tree with `Os { code: 2, kind: NotFound }` — one test failing for a
+    // HARNESS reason, which fails the whole `test` stage, which discards EVERY
+    // candidate at stage `test`, which the operator reads as "the model drafted
+    // three bad patches". The gate could not pass, ever. Staging a tree by hand
+    // exactly as `stage_sources` builds one and running the suite in it is what
+    // found this; the whole directory is 296K. THE THREE ENTRIES HERE ARE NOW
+    // THE THREE `join("../<dir>")` ROOTS THE SUITE READS — `../config`,
+    // `../docs`, `../apps` (apps is handled separately below) — and
+    // `the_staged_mirror_carries_the_repo_dirs_the_suite_reads` pins that.
+    "docs",
 ];
 
 /// Mirror the repo inputs the staged suite reads at runtime: whole directories
@@ -3079,7 +3387,7 @@ pub async fn run_heal_drill(model: &str) -> anyhow::Result<PathBuf> {
     }
 
     match result {
-        AttemptResult::Proposed { diff, report, files, confidence, responsiveness, extra } => {
+        AttemptResult::Proposed { diff, report, files, confidence, calibration, responsiveness, extra } => {
             // Write the proposal artifacts exactly as the propose path does,
             // WITHOUT touching meta or emitting heal.proposal into a live HUD
             // (no Memory here): the drill proves the loop, it is not a live heal.
@@ -3093,7 +3401,7 @@ pub async fn run_heal_drill(model: &str) -> anyhow::Result<PathBuf> {
             telemetry::emit(
                 "system",
                 "heal.proposal",
-                json!({"ts": ts, "files": files, "validated": true, "confidence": confidence, "confidence_floor": CONFIDENCE_FLOOR, "responsiveness": responsiveness, "drill": true}),
+                json!({"ts": ts, "files": files, "validated": true, "confidence": confidence, "confidence_floor": confidence_floor(), "responsiveness": responsiveness, "calibration": calibration.to_json(), "drill": true}),
             );
             info!(
                 proposal = %dir.display(),
@@ -3713,10 +4021,44 @@ mod tests {
              }}\n"
         );
 
+        // CALIBRATION SINK, exercised for real. This test is the only one that
+        // drives all four stages against a live cargo, so it is the only place
+        // the per-stage timing capture can be shown to actually fire. Without
+        // this the whole "set the budget from measurement" story would be an
+        // untested branch -- a knob that emits nothing is the same defect as a
+        // knob nothing reads.
+        let mut timings: Vec<serde_json::Value> = Vec::new();
         let result =
-            stage_and_validate(&crate_dir, &heal_root, 1_770_000_001, 0, &vacuous, &diag_for(&["src/lib.rs"], "router"), VALIDATE_TIMEOUT)
+            stage_and_validate(&crate_dir, &heal_root, CandidateRef { ts: 1_770_000_001, index: 0 }, &vacuous, &diag_for(&["src/lib.rs"], "router"), VALIDATE_TIMEOUT, &mut timings)
                 .await
                 .unwrap();
+        let staged: Vec<&str> = timings
+            .iter()
+            .filter_map(|t| t.get("stage").and_then(|v| v.as_str()))
+            .collect();
+        for want in ["check", "clippy", "test", "mutation"] {
+            assert!(
+                staged.contains(&want),
+                "stage `{want}` recorded no timing -- the calibration payload that \
+                 attempt_budget_secs is supposed to be set FROM is incomplete: {staged:?}"
+            );
+        }
+        assert!(
+            timings.iter().all(|t| t.get("secs").and_then(|v| v.as_u64()).is_some()),
+            "a recorded stage carries no `secs`: {timings:?}"
+        );
+        // SECRET-FREE: only the five declared keys, nothing carrying compiler
+        // output or a path (this rides the HUD wire).
+        for t in &timings {
+            let obj = t.as_object().expect("each timing is an object");
+            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+            keys.sort_unstable();
+            assert_eq!(
+                keys,
+                ["candidate", "cut_off", "ok", "secs", "stage"],
+                "an unexpected field entered the calibration payload: {t:?}"
+            );
+        }
         match result {
             StageResult::Rejected { stage, detail } => {
                 assert_eq!(stage, "mutation", "wrong stage rejected:\n{detail}");
@@ -3759,7 +4101,7 @@ mod tests {
         );
 
         let result =
-            stage_and_validate(&crate_dir, &heal_root, 1_770_000_002, 0, &biting, &diag_for(&["src/lib.rs"], "router"), VALIDATE_TIMEOUT)
+            stage_and_validate(&crate_dir, &heal_root, CandidateRef { ts: 1_770_000_002, index: 0 }, &biting, &diag_for(&["src/lib.rs"], "router"), VALIDATE_TIMEOUT, &mut Vec::new())
                 .await
                 .unwrap();
         match result {
@@ -3884,7 +4226,7 @@ mod tests {
         };
 
         let result =
-            stage_and_validate(&crate_dir, &heal_root, 1_780_000_001, 0, elsewhere, &diagnosis, VALIDATE_TIMEOUT)
+            stage_and_validate(&crate_dir, &heal_root, CandidateRef { ts: 1_780_000_001, index: 0 }, elsewhere, &diagnosis, VALIDATE_TIMEOUT, &mut Vec::new())
                 .await
                 .unwrap();
 
@@ -3944,11 +4286,11 @@ mod tests {
         let result = stage_and_validate(
             &crate_dir,
             &heal_root,
-            1_780_000_002,
-            0,
+            CandidateRef { ts: 1_780_000_002, index: 0 },
             &biting,
             &diag_for(&["src/lib.rs"], "router"),
             VALIDATE_TIMEOUT,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -4382,11 +4724,11 @@ mod tests {
         let result = stage_and_validate(
             &crate_dir,
             &heal_root,
-            1_760_000_002,
-            0,
+            CandidateRef { ts: 1_760_000_002, index: 0 },
             wrong_context_diff,
             &diag_for(&["src/lib.rs"], "router"),
             VALIDATE_TIMEOUT,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -4415,11 +4757,11 @@ mod tests {
         let result = stage_and_validate(
             &crate_dir,
             &heal_root,
-            1_760_000_003,
-            0,
+            CandidateRef { ts: 1_760_000_003, index: 0 },
             useless_diff,
             &diag_for(&["src/lib.rs"], "router"),
             VALIDATE_TIMEOUT,
+            &mut Vec::new(),
         )
         .await
         .unwrap();
@@ -4444,11 +4786,11 @@ mod tests {
         let result = stage_and_validate(
             &crate_dir,
             &heal_root,
-            1_760_000_001,
-            0,
+            CandidateRef { ts: 1_760_000_001, index: 0 },
             fixing,
             &diag_for(&["src/lib.rs"], "router"),
             VALIDATE_TIMEOUT,
+            &mut Vec::new(),
         )
         .await
         .expect("staging infrastructure must work");
@@ -5271,7 +5613,10 @@ mod tests {
     fn the_mutation_probes_second_test_run_is_guarded_against_a_spent_budget() {
         let src = include_str!("heal.rs");
         let arm = concat!("            Ok(r) if ", "r.ok => {");
-        let rerun = concat!("match run_cargo(&crate_dir, ", "&test_args, remaining).await {");
+        // The re-run is now TIMED (its wall clock feeds `calibration.stages`), so
+        // the call is bound to a local before the match. The anchor follows the
+        // CALL, which is the thing this guard is about.
+        let rerun = concat!("let mut_out = run_cargo(&crate_dir, ", "&test_args, remaining).await;");
         let start = src
             .find(arm)
             .expect("the mutation probe no longer has a reverse-patch success arm");
@@ -5355,14 +5700,31 @@ mod tests {
             VALIDATE_TIMEOUT.as_secs()
         );
         assert!(
-            VALIDATE_TIMEOUT <= ATTEMPT_BUDGET,
+            VALIDATE_TIMEOUT <= ATTEMPT_BUDGET_DEFAULT,
             "a candidate may not be allowed more than the whole attempt"
         );
         assert!(
-            ATTEMPT_BUDGET <= Duration::from_secs(1800),
+            ATTEMPT_BUDGET_DEFAULT <= Duration::from_secs(1800),
             "the attempt-wide ceiling ({}s) is above the 3 x 600s worst case it replaced — \
              this change must not buy headroom with the operator's machine",
-            ATTEMPT_BUDGET.as_secs()
+            ATTEMPT_BUDGET_DEFAULT.as_secs()
+        );
+        // THE BUDGET IS NOW OPERATOR-SETTABLE, so the constants fitting is no
+        // longer enough: the CLAMP'S OWN LOW END has to fit a candidate too, or
+        // an operator writing `attempt_budget_secs = 1` would get a self-heal
+        // that pays for CANDIDATE_COUNT heavy-model drafts every attempt and
+        // then refuses all of them at `deadline` without staging one.
+        let floored = effective_attempt_budget(&crate::config::SelfHealConfig {
+            attempt_budget_secs: 1,
+            ..Default::default()
+        });
+        assert!(
+            floored >= minimum_viable_budget(),
+            "the configured-budget clamp bottoms out at {}s, below the {}s a candidate needs to \
+             be staged at all — a misconfiguration would silently disable the gate while still \
+             paying for the drafts",
+            floored.as_secs(),
+            minimum_viable_budget().as_secs()
         );
         // ...and the budget must actually be bigger than the measured cycle it
         // has to fit (523s cold on an M1 Pro), or nothing was fixed.
@@ -5380,7 +5742,7 @@ mod tests {
     /// least `minimum_viable_budget()`. "On a healthy machine all of them still
     /// get a real verdict" is therefore not a hope — it is this inequality, and
     /// nothing else in the file enforces it. Raise a stage floor, or the measured
-    /// cycle, without raising ATTEMPT_BUDGET and the last candidate is drafted,
+    /// cycle, without raising the attempt budget and the last candidate is drafted,
     /// paid for, and then SILENTLY never judged: refused as `deadline` and billed
     /// to the operator's machine.
     #[test]
@@ -5391,15 +5753,24 @@ mod tests {
         let predecessors = MEASURED_CYCLE * (CANDIDATE_COUNT as u32 - 1);
         let needed = predecessors + minimum_viable_budget();
         assert!(
-            ATTEMPT_BUDGET >= needed,
-            "the {}s attempt budget cannot afford {CANDIDATE_COUNT} candidates: the first {} \
-             at the measured {}s cycle leave {}s, below the {}s the last one needs before it \
-             is staged at all",
-            ATTEMPT_BUDGET.as_secs(),
+            ATTEMPT_BUDGET_DEFAULT >= needed,
+            "the {}s default attempt budget cannot afford {CANDIDATE_COUNT} candidates: the \
+             first {} at the measured {}s cycle leave {}s, below the {}s the last one needs \
+             before it is staged at all",
+            ATTEMPT_BUDGET_DEFAULT.as_secs(),
             CANDIDATE_COUNT - 1,
             MEASURED_CYCLE.as_secs(),
-            ATTEMPT_BUDGET.saturating_sub(predecessors).as_secs(),
+            ATTEMPT_BUDGET_DEFAULT.saturating_sub(predecessors).as_secs(),
             minimum_viable_budget().as_secs()
+        );
+        // STATE THE MARGIN IN NUMBERS, and fail if it is gone. The last change
+        // here shipped with 4s of slack and nobody did the subtraction; this
+        // does it, in the test, every run.
+        let slack = ATTEMPT_BUDGET_DEFAULT.saturating_sub(needed);
+        assert!(
+            slack.as_secs() < 3600,
+            "slack of {}s is implausible — MEASURED_CYCLE is probably stale, not generous",
+            slack.as_secs()
         );
         // The slack this passes with is 1800 - 2 x 523 - 750 = 4s. It is REAL,
         // not comfortable, and that is exactly why it is pinned: any nudge to a
@@ -5436,7 +5807,7 @@ mod tests {
             window.len()
         );
         assert!(
-            window.contains(concat!("ATTEMPT_BUDGET.saturating_sub(", "attempt_spent)")),
+            window.contains(concat!("attempt_budget().saturating_sub(", "attempt_spent)")),
             "the candidate budget is not taken from the ACCUMULATED staged time:\n{window}"
         );
         assert!(
@@ -5587,11 +5958,11 @@ mod tests {
         let out = stage_and_validate(
             &crate_dir,
             &heal_root,
-            ts,
-            0,
+            CandidateRef { ts, index: 0 },
             diff,
             &diag_for(&["src/lib.rs"], "router"),
             Duration::from_secs(5),
+            &mut Vec::new(),
         )
         .await
         .expect("staging must not error");
@@ -5647,21 +6018,362 @@ mod tests {
         );
     }
 
+    /// THE STAGED TREE MUST CARRY EVERY REPO DIRECTORY THE SUITE READS AT RUNTIME.
+    ///
+    /// MEASURED, not reasoned: a tree staged exactly as `stage_sources` builds
+    /// one, with the suite run inside it, failed
+    /// `apps::tests::the_sandbox_doc_worked_example_names_an_app_whose_manifest_validates`
+    /// with `docs/SANDBOX.md is present: Os { code: 2, kind: NotFound }`. One
+    /// test failing for a HARNESS reason fails the whole `test` stage, which
+    /// discards EVERY candidate at stage `test` -- reported to the operator as
+    /// "no candidate passed the staged gates", i.e. as a verdict on three
+    /// patches that were never actually judged. The gate could not pass at all.
+    ///
+    /// This pins the mirror against the ONLY thing that makes it correct: the
+    /// set of repo roots the crate's own tests reach for. Those are spelled
+    /// `join("../<dir>")` off `CARGO_MANIFEST_DIR`, so they are enumerable from
+    /// the sources rather than remembered -- `apps` is mirrored by the
+    /// per-app arm below the list and is exempted here by name.
+    #[test]
+    fn the_staged_mirror_carries_the_repo_dirs_the_suite_reads() {
+        // Enumerate `join("../<dir>")` across the crate's sources.
+        let mut wanted: Vec<String> = Vec::new();
+        for src in [
+            include_str!("apps.rs"),
+            include_str!("config.rs"),
+            include_str!("heal.rs"),
+            include_str!("agents.rs"),
+            include_str!("forge.rs"),
+        ] {
+            let needle = concat!("join(\"..", "/");
+            let mut from = 0usize;
+            while let Some(i) = src[from..].find(needle) {
+                let start = from + i + needle.len();
+                let dir: String = src[start..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if !dir.is_empty() && !wanted.contains(&dir) {
+                    wanted.push(dir);
+                }
+                from = start;
+            }
+        }
+        assert!(
+            wanted.len() >= 3,
+            "the enumeration found almost nothing ({wanted:?}) -- it is not scanning what it claims"
+        );
+        for dir in &wanted {
+            // `apps` is mirrored by the per-app arm (manifests + entry files),
+            // not as a whole directory: staging every app's vendored deps and
+            // fixtures would be hundreds of megabytes.
+            if dir == "apps" {
+                continue;
+            }
+            assert!(
+                RUNTIME_TEST_INPUTS.contains(&dir.as_str()),
+                "the staged suite reads `../{dir}` at runtime but RUNTIME_TEST_INPUTS does not \
+                 mirror it ({RUNTIME_TEST_INPUTS:?}) -- that test will fail in EVERY staging tree \
+                 for a harness reason, failing the whole `test` stage and discarding every \
+                 candidate at stage `test`"
+            );
+        }
+    }
+
+    /// THE TWO STAGING MIRRORS MUST MIRROR THE SAME DIRECTORIES.
+    ///
+    /// There are TWO implementations of "stage a tree the suite can run in":
+    /// `RUNTIME_TEST_INPUTS` here (the daemon's PROPOSE-side gate) and
+    /// `mirror_runtime_test_inputs` in `scripts/apply_heal.sh` (the APPLY-side
+    /// gate). `apply_heal.sh` says so itself -- "the two MUST agree, or a patch
+    /// the daemon proved will fail here for a reason that is not the patch".
+    ///
+    /// MEASURED, not reasoned. `docs` was added to the list above after
+    /// `apps::tests::the_sandbox_doc_worked_example_names_an_app_whose_manifest_validates`
+    /// began reading `<crate>/../docs/SANDBOX.md` with an `.expect`. It was NOT
+    /// added to the script, and nothing noticed: the existing guard checks only
+    /// that the script CALLS its mirror function, not WHAT that function
+    /// mirrors. With `docs` absent the staged suite panics, `cargo test` fails,
+    /// and `apply_heal.sh` refuses every apply with "cargo test failed in
+    /// staging" -- no self-heal patch installable by any path, and the operator
+    /// told the patch failed a gate it never reached. Fixing one side of a
+    /// two-implementation gate and not the other is how that defect recurs, so
+    /// this pins the SET, not the call.
+    ///
+    /// Bounded at BOTH ends on the script's own function body, and the
+    /// extraction is proven non-empty before it is trusted.
+    #[test]
+    fn the_apply_script_mirrors_the_same_runtime_inputs_as_the_daemon_gate() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        // Window: the body of mirror_runtime_test_inputs, from its definition to
+        // the `apps` arm that closes the whole-directory loop.
+        let start_anchor = concat!("mirror_runtime_test_inputs", "() {");
+        let end_anchor = concat!("if [ -d \"$repo_root", "/apps\" ]; then");
+        let start = script
+            .find(start_anchor)
+            .expect("apply_heal.sh no longer defines mirror_runtime_test_inputs");
+        let rest = &script[start..];
+        let end = rest
+            .find(end_anchor)
+            .expect("mirror_runtime_test_inputs no longer ends at its apps arm");
+        let body = &rest[..end];
+        assert!(
+            body.len() > 100 && body.len() < 6_000,
+            "the mirror-function window did not bind ({} bytes)",
+            body.len()
+        );
+        // The whole-directory list is the `for d in <words>; do` line.
+        let needle = concat!("for d in", " ");
+        let list_start = body
+            .find(needle)
+            .expect("mirror_runtime_test_inputs no longer loops over a directory list");
+        let after = &body[list_start + needle.len()..];
+        let list_end = after.find(';').expect("the `for d in ...` line has no `;`");
+        let mirrored: Vec<&str> = after[..list_end].split_whitespace().collect();
+        assert!(
+            !mirrored.is_empty(),
+            "the script's directory list extracted EMPTY -- the guard would pass vacuously"
+        );
+        for want in RUNTIME_TEST_INPUTS {
+            assert!(
+                mirrored.contains(want),
+                "daemon-side RUNTIME_TEST_INPUTS mirrors `{want}` but apply_heal.sh's \
+                 mirror_runtime_test_inputs does not ({mirrored:?}). The apply gate would stage a \
+                 tree the suite cannot run in, `cargo test` would fail for a HARNESS reason, and \
+                 EVERY apply -- interactive, --yes and the HUD Accept button -- would be refused \
+                 with the patch blamed for it"
+            );
+        }
+    }
+
     // -- (10) THE REVIEW-CONFIDENCE FLOOR -----------------------------------
+
+    /// THE CONFIGURED FLOOR IS ACTUALLY SEEDED BY BOTH GATES THAT ENFORCE IT.
+    ///
+    /// `effective_confidence_floor` being correct proves nothing on its own: if
+    /// nobody CALLS `configure`, both cells stay unset, `confidence_floor()`
+    /// returns the compiled default forever, and `[self_heal].confidence_floor`
+    /// is a documented knob that does nothing -- this repo's built-but-inert
+    /// defect class, in the one place it also means two gates silently disagree.
+    ///
+    /// MEASURED: with all three seeding call sites deleted, the entire suite
+    /// still passed 3467/0. Nothing else in the tree pins the wiring, because
+    /// the cells are process-global `OnceLock`s and a runtime test that seeded
+    /// them would move a global out from under every other test in the binary.
+    /// So the wiring is pinned at the SOURCE, at both callers, ordered:
+    ///
+    ///   * `run_pipeline` (daemon, PROPOSE side) must seed before it reads a
+    ///     floor or a budget;
+    ///   * `--heal-confidence` (main.rs, the INSTALL side `apply_heal.sh` shells
+    ///     out to) must seed before it calls `confidence_gate`.
+    ///
+    /// Both windows are bounded at both ends and proven non-empty first, and
+    /// every needle is `concat!`-split so this test cannot match on its own text.
+    #[test]
+    fn both_confidence_gates_seed_the_floor_from_config_before_reading_it() {
+        let seed = concat!("configure(&cfg", ".self_heal);");
+
+        // (a) DAEMON / PROPOSE SIDE.
+        let src = include_str!("heal.rs");
+        let fn_anchor = concat!("async fn run_pipeline", "(");
+        let start = src.find(fn_anchor).expect("run_pipeline is gone");
+        let rest = &src[start..];
+        let end = rest
+            .find(concat!("let enabled = cfg.self_heal.enabled", " &&"))
+            .expect("run_pipeline no longer computes `enabled` where it did");
+        let head = &rest[..end];
+        assert!(
+            head.len() > 200 && head.len() < 3_000,
+            "the run_pipeline window did not bind ({} bytes)",
+            head.len()
+        );
+        assert!(
+            head.contains(seed),
+            "run_pipeline does not seed the self-heal tunables from config before the \
+             attempt runs -- [self_heal].confidence_floor / .attempt_budget_secs would be \
+             parsed, clamped and then IGNORED, and the daemon would propose against the \
+             compiled default while apply_heal.sh judged against the operator's value:\n{head}"
+        );
+
+        // (b) CLI / INSTALL SIDE, and BEFORE the gate reads the floor.
+        let main_src = include_str!("main.rs");
+        let arm = concat!("usage: darwind --heal", "-confidence <report.md>");
+        let astart = main_src.find(arm).expect("the --heal-confidence arm is gone");
+        let arest = &main_src[astart..];
+        let aend = arest
+            .find(concat!("return Ok(", "());"))
+            .expect("the --heal-confidence arm no longer returns where it did");
+        let window = &arest[..aend];
+        assert!(
+            window.len() > 200 && window.len() < 3_000,
+            "the --heal-confidence window did not bind ({} bytes)",
+            window.len()
+        );
+        let seed_at = window.find(concat!("heal::configure(&cfg", ".self_heal);")).expect(
+            "the --heal-confidence gate does not seed the floor from config -- apply_heal.sh \
+             would refuse (or admit) proposals against the COMPILED default while the daemon \
+             proposed against the configured one, which is the two-gates-disagree defect this \
+             one-implementation-two-callers shape exists to prevent",
+        );
+        let gate_at = window
+            .find(concat!("heal::confidence", "_gate(&report)"))
+            .expect("the --heal-confidence arm no longer calls confidence_gate");
+        assert!(
+            seed_at < gate_at,
+            "the floor is seeded AFTER the gate reads it, so the gate judges against the \
+             compiled default"
+        );
+    }
+
+    /// BOTH NUMBERS ARE OPERATOR-SETTABLE, AND A SETTING ACTUALLY TAKES.
+    ///
+    /// The point of making them configurable is defeated by a knob that parses
+    /// and is then ignored — this repo's "built-but-inert" defect class. These
+    /// are the PURE resolvers the daemon and the `--heal-confidence` CLI both go
+    /// through, exercised without touching the process-wide cells, so this test
+    /// can never race another by moving a global out from under it.
+    #[test]
+    fn the_configured_floor_and_budget_resolve_to_the_configured_values() {
+        use crate::config::SelfHealConfig;
+        let d = SelfHealConfig::default();
+        // The shipped defaults ARE the compiled defaults (config lockstep pins
+        // the file side; this pins that the resolver does not transform them).
+        assert_eq!(effective_confidence_floor(&d), CONFIDENCE_FLOOR_DEFAULT);
+        assert_eq!(effective_attempt_budget(&d), ATTEMPT_BUDGET_DEFAULT);
+
+        // ...and a value INSIDE the range is honored exactly, not snapped.
+        let tuned = SelfHealConfig {
+            confidence_floor: 0.60,
+            attempt_budget_secs: 2400,
+            ..SelfHealConfig::default()
+        };
+        assert_eq!(effective_confidence_floor(&tuned), 0.60);
+        assert_eq!(effective_attempt_budget(&tuned), Duration::from_secs(2400));
+        assert_ne!(
+            effective_confidence_floor(&tuned),
+            CONFIDENCE_FLOOR_DEFAULT,
+            "the resolver returned the default for a configured value — the knob is inert"
+        );
+    }
+
+    /// THE CLAMPS HOLD AT BOTH ENDS, AND A NaN CANNOT WALL OFF THE GATE.
+    ///
+    /// A NaN floor is the nasty one: every `>=` against it is false, so
+    /// `meets_confidence_floor` would answer NO for a perfect 1.00 and the
+    /// daemon would propose nothing, forever, with no error anywhere.
+    #[test]
+    fn out_of_range_and_nonfinite_settings_are_clamped_not_honored() {
+        use crate::config::SelfHealConfig;
+        let mk = |f: f64, b: u64| SelfHealConfig {
+            confidence_floor: f,
+            attempt_budget_secs: b,
+            ..SelfHealConfig::default()
+        };
+        assert_eq!(effective_confidence_floor(&mk(0.0, 1800)), CONFIDENCE_FLOOR_MIN);
+        assert_eq!(effective_confidence_floor(&mk(-5.0, 1800)), CONFIDENCE_FLOOR_MIN);
+        assert_eq!(effective_confidence_floor(&mk(1.0, 1800)), CONFIDENCE_FLOOR_MAX);
+        assert_eq!(effective_confidence_floor(&mk(99.0, 1800)), CONFIDENCE_FLOOR_MAX);
+        assert_eq!(effective_confidence_floor(&mk(f64::NAN, 1800)), CONFIDENCE_FLOOR_DEFAULT);
+        assert_eq!(
+            effective_confidence_floor(&mk(f64::INFINITY, 1800)),
+            CONFIDENCE_FLOOR_DEFAULT
+        );
+        // A clamped floor is still a REAL floor: it must reject the 0.0 a failed
+        // review call is recorded as.
+        assert!(effective_confidence_floor(&mk(0.0, 1800)) > 0.0);
+
+        assert_eq!(effective_attempt_budget(&mk(0.25, 0)), minimum_viable_budget());
+        assert_eq!(effective_attempt_budget(&mk(0.25, 1)), minimum_viable_budget());
+        assert_eq!(
+            effective_attempt_budget(&mk(0.25, u64::MAX)),
+            Duration::from_secs(ATTEMPT_BUDGET_MAX_SECS)
+        );
+    }
+
+    /// THE FLOOR'S CLAMP RANGE IS DERIVED FROM `scripts/apply_heal.sh`, SO IT
+    /// MUST STILL BRACKET THAT SCRIPT'S OWN SELF-PROOF.
+    ///
+    /// Before installing anything, `apply_heal.sh` proves its confidence gate
+    /// discriminates by feeding `darwind --heal-confidence` a HIGH report and a
+    /// LOW one and requiring ABOVE_FLOOR / BELOW_FLOOR. Those two probe scores
+    /// are literals in the script. Making the floor configurable put a NEW way
+    /// to break that proof into the operator's hands: a floor at or above the
+    /// high probe, or at or below the low probe, makes the self-proof fail and
+    /// the apply gate refuse EVERY proposal (fail-closed, but for a reason no
+    /// operator could diagnose from the message).
+    ///
+    /// So the clamp ends are not taste — they are `low_probe < MIN` and
+    /// `MAX <= high_probe`. This reads the two literals back out of the script
+    /// (bounded at both ends on the self-proof block, and the extraction is
+    /// proven non-empty first) so editing either file alone fails here.
+    #[test]
+    fn the_confidence_clamp_brackets_the_apply_scripts_own_self_proof() {
+        let script = include_str!("../../scripts/apply_heal.sh");
+        // Bound the window: the self-proof block starts where the script builds
+        // its probe reports and ends where it judges their verdicts.
+        let start_anchor = concat!("CP=\"$STAGING/confidence", "-selfproof\"");
+        let end_anchor = concat!("the confidence gate does not ", "discriminate");
+        let start = script
+            .find(start_anchor)
+            .expect("apply_heal.sh no longer builds a confidence self-proof");
+        let rest = &script[start..];
+        let end = rest.find(end_anchor).expect("the self-proof block no longer ends where it did");
+        let window = &rest[..end];
+        assert!(
+            window.len() > 200 && window.len() < 4_000,
+            "the self-proof window did not bind ({} bytes)",
+            window.len()
+        );
+        // Every `review confidence: <float>` literal inside the window.
+        let mut probes: Vec<f64> = Vec::new();
+        for piece in window.split("review confidence:").skip(1) {
+            let num: String = piece
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == '.')
+                .collect();
+            if let Ok(v) = num.parse::<f64>() {
+                probes.push(v);
+            }
+        }
+        assert_eq!(
+            probes.len(),
+            2,
+            "expected exactly the HIGH and LOW probe scores in the self-proof, got {probes:?}"
+        );
+        let high = probes.iter().cloned().fold(f64::MIN, f64::max);
+        let low = probes.iter().cloned().fold(f64::MAX, f64::min);
+        assert!(high > low, "the two probes are not distinguishable: {probes:?}");
+        assert!(
+            CONFIDENCE_FLOOR_MAX <= high,
+            "a configurable floor may reach {CONFIDENCE_FLOOR_MAX}, at or above apply_heal.sh's \
+             ABOVE_FLOOR probe of {high} — at that setting the script's own self-proof fails and \
+             it refuses EVERY proposal for a reason the operator cannot read"
+        );
+        assert!(
+            low < CONFIDENCE_FLOOR_MIN,
+            "a configurable floor may drop to {CONFIDENCE_FLOOR_MIN}, at or below \
+             apply_heal.sh's BELOW_FLOOR probe of {low} — the low probe would then read \
+             ABOVE_FLOOR and the self-proof stops discriminating"
+        );
+        // ...and the DEFAULT must sit inside the same bracket, or the shipped
+        // configuration breaks the shipped script.
+        assert!(low < CONFIDENCE_FLOOR_DEFAULT && CONFIDENCE_FLOOR_DEFAULT <= high);
+    }
 
     /// The bar is INCLUSIVE. An exclusive comparison would reject the one score
     /// the floor is documented to allow, and the HUD (which renders the same
     /// boundary) would disagree with the daemon about it.
     #[test]
     fn the_confidence_floor_is_inclusive_at_the_bar() {
-        assert!(meets_confidence_floor(CONFIDENCE_FLOOR));
+        assert!(meets_confidence_floor(confidence_floor()));
         assert!(meets_confidence_floor(1.0));
-        assert!(!meets_confidence_floor(CONFIDENCE_FLOOR - 0.01));
+        assert!(!meets_confidence_floor(confidence_floor() - 0.01));
         assert!(!meets_confidence_floor(0.0));
         // A FLOOR OF 0.0 WOULD NOT BE A FLOOR — it would let a failed review
         // call (recorded as 0.0) through as a proposal. That is exactly what the
         // `!meets_confidence_floor(0.0)` assertion above pins, so setting
-        // CONFIDENCE_FLOOR = 0.0 fails this test rather than silently disarming
+        // a floor of 0.0 fails this test rather than silently disarming
         // the gate. (Asserting on the constant directly is a clippy
         // `assertions_on_constants` error, and the indirect assertion is the
         // stronger one anyway: it goes through the comparison both gates use.)

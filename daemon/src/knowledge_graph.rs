@@ -1811,6 +1811,19 @@ mod tests {
         );
         assert_eq!(e.len(), 1);
         assert_eq!(r.len(), 1);
+        // A COUNT is not a parse. `len() == 1` is equally happy when the one row
+        // carries the WRONG fields: reading `type` into `name`, or reading the
+        // endpoints in the reverse order, both yield exactly one entity and one
+        // relationship. The entity mapping is caught downstream (a swapped
+        // kind/name stops grounding), but NOTHING in the suite pins the
+        // relationship ENDPOINT ORDER — a reversed reader writes "Beta -> Ann"
+        // into the world model and every test stays green. Pin the identity.
+        assert_eq!((e[0].kind.as_str(), e[0].name.as_str()), ("person", "Ann"));
+        assert_eq!(
+            (r[0].from.as_str(), r[0].to.as_str()),
+            ("Ann", "Beta"),
+            "the endpoints keep their DIRECTION: `from` is the JSON's from"
+        );
         // Garbage / no JSON -> empty, never a throw.
         for junk in ["not json at all", "", "{ broken", "{}", "{\"entities\":\"nope\"}"] {
             let (e, r) = parse_llm_extraction(junk);

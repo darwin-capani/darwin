@@ -1782,7 +1782,12 @@ const CANONICAL_ROSTER: &[(&str, &str, &str, u16, &[&str])] = &[
     ),
     (
         "gecko",
-        "Markets + Capital: market watch, trading research (future Algo-Core)",
+        // LOCKSTEP with config/agents.toml. It used to promise a "(future
+        // Algo-Core)" feed; that app was never built, could never load (its
+        // net scope is not grantable) and is now DELETED -- docs/BLOCKED_APPS.md.
+        // A role line naming a feed that does not and will not exist is the
+        // same defect class as a persona claiming live quotes.
+        "Markets + Capital: market watch, trading research (no live market feed)",
         "bm_daniel",
         120,
         // gecko, the other ads agent (Markets + Capital), holds the same ads read +

@@ -116,11 +116,28 @@ describe("AttributionHealthPanel (review-only)", () => {
     expect(html).toContain("FAILING");
     expect(html).toContain("NEEDS ATTENTION");
     expect(html).toContain("karen");
-    expect(html).toContain("17% success");
+    expect(html).toContain("17% uncorrected");
     // The promote section names the eval-verified, live-proven skill.
     expect(html).toContain("READY TO PROMOTE");
     expect(html).toContain("base64_encode");
-    expect(html).toContain("95% success");
+    expect(html).toContain("95% uncorrected");
+  });
+
+  /* REGRESSION: the rendered rate must not call itself "success".
+   *
+   * This assertion previously read `toContain("17% success")` — the test was
+   * pinning the defect. The daemon computes this number as
+   * successes/graded where every turn is recorded provisionally successful and
+   * only ever demoted when the NEXT turn looks like a correction (nothing in
+   * production writes Failed/Unknown). daemon/src/attribution.rs renders it as
+   * "% uncorrected" and guards that with `the_rendered_rate_does_not_claim_success`;
+   * that guard never reached the HUD, which is the surface the owner reads. */
+  it("never calls the uncorrected rate a success rate", () => {
+    const html = render(parseAttributionHealth(payload));
+    expect(html).toContain("% uncorrected");
+    expect(html).not.toMatch(/%\s*success/);
+    // ...on the promote row too, not just the failing one.
+    expect(html.match(/% uncorrected/g) ?? []).toHaveLength(2);
   });
 
   it("shows an all-healthy note when nothing is failing, and no promote section when empty", () => {

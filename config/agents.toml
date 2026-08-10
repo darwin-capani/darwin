@@ -116,7 +116,7 @@ namespace = "agent.oracle"
 
 [[agent]]
 name = "gecko"
-role = "Markets + Capital: market watch, trading research (future Algo-Core)"
+role = "Markets + Capital: market watch, trading research (no live market feed)"
 voice = "bm_daniel"
 hue = 120
 persona_file = "inference/personas/gecko.txt"

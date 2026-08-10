@@ -331,8 +331,8 @@ mod tests {
         assert_eq!(sticky_key("app.registry", &serde_json::json!({})).as_deref(), Some("app.registry"));
         assert_eq!(sticky_key("lockdown.status", &serde_json::json!({})).as_deref(), Some("lockdown.status"));
         assert_eq!(
-            sticky_key("app.manifest_invalid", &serde_json::json!({"name": "fab-link"})).as_deref(),
-            Some("app.manifest_invalid:fab-link"),
+            sticky_key("app.manifest_invalid", &serde_json::json!({"name": "broken-app"})).as_deref(),
+            Some("app.manifest_invalid:broken-app"),
         );
         // SAFETY SNAPSHOT: the anchored restore point is rare, event-driven state a
         // later-connecting client must still learn, so it retains. NOTE — matching

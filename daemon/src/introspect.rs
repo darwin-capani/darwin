@@ -1378,12 +1378,12 @@ mod tests {
     fn format_status_lists_recent_findings() {
         let recent = vec![
             "module: vision loaded unexpected /tmp/x.dylib".to_string(),
-            "cpu_spike: algo-core — cpu 99% > 95% threshold".to_string(),
+            "cpu_spike: busy-app — cpu 99% > 95% threshold".to_string(),
         ];
         let s = format_status(Some((2, 0, 1)), 1, &recent);
         assert!(s.contains("Recent findings:"));
         assert!(s.contains("/tmp/x.dylib"));
-        assert!(s.contains("cpu_spike: algo-core"));
+        assert!(s.contains("cpu_spike: busy-app"));
     }
 
     #[test]
@@ -1422,8 +1422,8 @@ mod tests {
     #[test]
     fn exec_mapping_by_a_jit_declared_app_is_expected_no_finding() {
         // An app that declared jit=true is EXPECTED to make executable memory.
-        assert!(classify_security_event("algo-core", true, &SecurityEvent::MprotectExec).is_none());
-        assert!(classify_security_event("algo-core", true, &SecurityEvent::MapJit).is_none());
+        assert!(classify_security_event("jit-declared-app", true, &SecurityEvent::MprotectExec).is_none());
+        assert!(classify_security_event("jit-declared-app", true, &SecurityEvent::MapJit).is_none());
     }
 
     #[test]

@@ -1833,6 +1833,27 @@ roots = []                     # EXPLICIT codebase-root allowlist, SHIPS EMPTY.
                 value: SettingValue::StrList(vec![bad.into()]),
             }]);
             assert!(r.is_err(), "control char in {bad:?} must be rejected");
+            // `is_err()` alone does NOT prove the CONTROL-CHAR rule refused. Every
+            // input here is also absolute, short and non-empty, so today only that
+            // rule can fire — but the moment another validator joins the chain (or
+            // this one is deleted and a broader one starts catching the same
+            // strings) the test would keep passing over a hole. Pin the REASON and
+            // the exact offending code point.
+            let why = r.unwrap_err();
+            let cp = bad
+                .chars()
+                .find(|c| (*c as u32) < 0x20 || (*c as u32) == 0x7F)
+                .expect("the fixture carries a control char");
+            assert!(
+                why.contains("control character"),
+                "{bad:?} must be refused BY THE CONTROL-CHAR RULE, not for some other \
+                 reason; got: {why}"
+            );
+            assert!(
+                why.contains(&format!("U+{:04X}", cp as u32)),
+                "the refusal must name the offending code point U+{:04X}; got: {why}",
+                cp as u32
+            );
         }
     }
 
@@ -1883,6 +1904,17 @@ roots = []                     # EXPLICIT codebase-root allowlist, SHIPS EMPTY.
             value: SettingValue::StrList(vec!["/a".into(), "/a".into()]),
         }]);
         assert!(r.is_err(), "a duplicate path must be rejected");
+        // Same trap: "/a" is absolute, short, non-empty and control-free, so a bare
+        // `is_err()` cannot tell the DUPLICATE rule from any other refusal. If the
+        // dedup were deleted and the batch failed for an unrelated reason, this
+        // test would stay green while config/darwin.toml gained a TOML-illegal
+        // duplicate array entry. Pin the reason and the offending value.
+        let why = r.unwrap_err();
+        assert!(
+            why.contains("duplicate entry"),
+            "the DUPLICATE rule must be the one that refuses; got: {why}"
+        );
+        assert!(why.contains("/a"), "the refusal must name the repeated value; got: {why}");
     }
 
     #[test]

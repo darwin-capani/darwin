@@ -898,7 +898,12 @@ pub fn generate_sbpl(
             // /usr/bin/python3 or any non-framework build performs no second exec
             // and works fine. Homebrew python@3.x and the python.org installers
             // are framework builds — and both this dev tree and the deployed
-            // install resolve to one, where all 36 runtime="python" apps are dead.
+            // install resolve to one, where all 34 runtime="python" apps are dead.
+            // (34, counted from apps/*/manifest.toml. It read 36 while `fab-link`
+            // and `algo-core` were still in the tree -- and was already wrong
+            // then, since both were refused at validation and never registered.
+            // Deleting them is what makes a count of shipped apps a count of apps
+            // that can run; a stale count here would have kept that untrue.)
             //
             // EXEC ONLY, and a LITERAL. `interpreter_install_prefix` already emits
             // a read subpath covering this file; what was missing is permission to
@@ -3151,7 +3156,8 @@ mod tests {
     /// express a host filter at all, so a non-empty list only ever produced an
     /// uncompilable profile. Note the second case below: `octoprint.local` is a
     /// perfectly bare hostname that the OLD ceiling ACCEPTED, and it is exactly
-    /// what made fab-link unlaunchable. It must now be refused.
+    /// what made the deleted `fab-link` app unlaunchable (docs/BLOCKED_APPS.md).
+    /// It must now be refused.
     #[test]
     fn ceiling_refuses_any_net_hosts_declaration_however_well_formed() {
         for host in [
@@ -3853,7 +3859,7 @@ mod tests {
         // Stale nonce (a leaked token after a restart rotated the nonce).
         assert!(!verify_token_with_key(TEST_KEY, "global-scan", &p, "nonce-B", &t));
         // Cross-app: another app presenting global-scan's token.
-        assert!(!verify_token_with_key(TEST_KEY, "algo-core", &p, "nonce-A", &t));
+        assert!(!verify_token_with_key(TEST_KEY, "other-app", &p, "nonce-A", &t));
         // Tampered permission set (a manifest that widened net_hosts after the
         // token was minted).
         let widened = perms(&["feeds.npr.org", "evil.com"]);
@@ -3927,12 +3933,12 @@ mod tests {
         // discipline as camera/screen/net_hosts. This is what makes auto-promoting
         // an app to jit=true detectable rather than silent.
         let base = perms(&["feeds.npr.org"]);
-        let t = compute_token(TEST_KEY, "algo-core", &base, "nonce-A");
-        assert!(verify_token_with_key(TEST_KEY, "algo-core", &base, "nonce-A", &t));
+        let t = compute_token(TEST_KEY, "jit-probe-app", &base, "nonce-A");
+        assert!(verify_token_with_key(TEST_KEY, "jit-probe-app", &base, "nonce-A", &t));
         let mut jit = base.clone();
         jit.jit = true;
         assert!(
-            !verify_token_with_key(TEST_KEY, "algo-core", &jit, "nonce-A", &t),
+            !verify_token_with_key(TEST_KEY, "jit-probe-app", &jit, "nonce-A", &t),
             "flipping jit on must invalidate a token minted without it"
         );
     }
@@ -4513,6 +4519,9 @@ mod tests {
         assert!(apps_root.is_dir(), "repo apps/ tree present");
         let mut tool_decls = 0usize;
         let mut checked_apps = 0usize;
+        // (dir_name, manifest text) of one REAL shipped app that validates, used
+        // after the loop to build the synthetic net-scope probe.
+        let mut net_scope_probe: Option<(String, String)> = None;
         for entry in std::fs::read_dir(&apps_root).unwrap() {
             let dir = entry.unwrap().path();
             let manifest_path = dir.join("manifest.toml");
@@ -4522,77 +4531,42 @@ mod tests {
             let dir_name = dir.file_name().unwrap().to_str().unwrap().to_string();
             let raw = std::fs::read_to_string(&manifest_path).unwrap();
 
-            // KNOWN-REFUSED: these two declare a direct-egress `net_hosts`, which
-            // is not grantable on this OS and is refused at validation (see
-            // `NET_SCOPE_REFUSAL`). They are spec-only (SPEC.md + manifest, no
-            // main.py) and were ALREADY unlaunchable before the refusal landed --
-            // their profile failed to compile, so they crash-looped instead. They
-            // are deliberately NOT migrated to the fetch proxy because neither
-            // can use it: fab-link needs `ws://voron.local:7125` (wrong scheme,
-            // wrong port, and a private LAN address the SSRF guard refuses), and
-            // algo-core needs persistent WebSocket market-data streams the
-            // one-shot proxy cannot carry. Granting either one egress needs a new
-            // mechanism and is an OWNER DECISION -- see docs/SANDBOX.md.
+            // NO EXEMPTIONS. There used to be an arm here for `fab-link` and
+            // `algo-core`: two spec-only apps whose manifests declared a
+            // direct-egress `net_hosts` (not grantable on this OS -- see
+            // `NET_SCOPE_REFUSAL`), asserted POSITIVELY to be refused so their
+            // state could not rot into silence. The owner has since DELETED both
+            // apps (docs/BLOCKED_APPS.md carries what they were for, the exact
+            // endpoints each needed, why neither can use the fetch proxy, the
+            // mechanism each would need, and the git SHA the full source is
+            // recoverable from), so the exemption is gone with them and EVERY
+            // manifest under apps/ must now validate.
             //
-            // Asserted POSITIVELY (not skipped) so this cannot rot into silence:
-            // if one is ever migrated or removed, this arm fails and must be
-            // updated deliberately.
-            if matches!(dir_name.as_str(), "fab-link" | "algo-core") {
-                let err = crate::plugin_sdk::validate_manifest(&raw, &dir_name).expect_err(
-                    &format!("apps/{dir_name}: still declares a net scope, so it MUST be refused"),
-                );
-                assert!(
-                    err.contains("not grantable"),
-                    "apps/{dir_name}: refused for the wrong reason: {err}"
-                );
-                assert!(
-                    err.contains("fetch_hosts"),
-                    "apps/{dir_name}: the refusal must name the supported route: {err}"
-                );
-                // AND THE STATE MUST BE VISIBLE WHERE A HUMAN MEETS IT. A
-                // refusal the daemon knows about is worthless if the tree still
-                // reads like a live design: an author opening SPEC.md would
-                // implement against it, and the manifest is what they would copy.
-                // Both files must carry the loud marker, name the owner decision,
-                // and say the app does not run. (Retention is deliberate -- see
-                // docs/SANDBOX.md; if the owner instead decides to DELETE these
-                // apps, this whole arm goes with them.)
-                for (label, path) in [("SPEC.md", dir.join("SPEC.md")), ("manifest.toml", manifest_path.clone())] {
-                    let text = std::fs::read_to_string(&path)
-                        .unwrap_or_else(|e| panic!("apps/{dir_name}/{label} must exist: {e}"));
-                    let head: String = text.chars().take(2500).collect();
-                    assert!(
-                        head.contains("BLOCKED"),
-                        "apps/{dir_name}/{label}: must open with the BLOCKED marker -- a refused app that reads as a live design is how someone implements against it"
-                    );
-                    assert!(
-                        head.contains("REFUSED"),
-                        "apps/{dir_name}/{label}: must say the manifest is REFUSED, not merely unbuilt"
-                    );
-                    assert!(
-                        head.contains("OWNER DECISION") || head.contains("owner's decision") || head.contains("owner decides"),
-                        "apps/{dir_name}/{label}: must name whose decision unblocks it"
-                    );
-                }
-                // ...and neither may sprout an implementation while refused: a
-                // main.py here would be dead code the loader can never start.
-                assert!(
-                    !dir.join("main.py").exists(),
-                    "apps/{dir_name}: has an implementation but its manifest is refused -- it can never launch"
-                );
-                continue;
-            }
+            // The GUARD those two carried is NOT deleted with them -- it is
+            // re-pinned below against a SYNTHETIC manifest, so the rule ("a net
+            // scope is not grantable") outlives the two examples that happened
+            // to trip it.
 
             // The REAL loader contract (deny_unknown_fields) + the SDK contract.
             let manifest = crate::plugin_sdk::validate_manifest(&raw, &dir_name)
                 .unwrap_or_else(|e| panic!("apps/{dir_name}/manifest.toml invalid: {e}"));
-            // EVERY other shipped manifest must be free of a net scope -- a
-            // validator that refuses too much would brick the app deck, and a
-            // manifest that still carried one would be silently undeployable.
+            // TAUTOLOGY, KEPT DELIBERATELY AND LABELLED AS ONE. `validate_manifest`
+            // refuses a non-empty `net_hosts` outright, so a manifest that reached
+            // this line CANNOT carry one and this assertion cannot fail today. It
+            // is a structural pin, not evidence: if the refusal is ever narrowed
+            // this line becomes load-bearing again. It PROVES NOTHING about the
+            // refusal on its own -- `net_scope_probe` below is what proves that.
             assert!(
                 manifest.permissions.net_hosts.is_empty(),
                 "apps/{dir_name}: a validated manifest can never carry net_hosts"
             );
+            // Keep ONE real shipped manifest's text to build the synthetic probe
+            // from, after the loop. Built from a manifest that DOES validate, so
+            // the only difference between the accepted and the refused form is the
+            // net scope itself.
+            if net_scope_probe.is_none() {
+                net_scope_probe = Some((dir_name.clone(), raw.clone()));
+            }
             checked_apps += 1;
 
             // HARNESS GRANT — checked for EVERY python app that imports the shared
@@ -4659,6 +4633,69 @@ mod tests {
         }
         assert!(checked_apps >= 30, "the fleet registered ({checked_apps} apps)");
         assert!(tool_decls >= 30, "the agent-tool surface is live ({tool_decls} tools)");
+
+        // THE RULE, PINNED AGAINST A SYNTHETIC MANIFEST -- the guard the two
+        // deleted apps used to carry, rewritten so it no longer depends on them
+        // existing.
+        //
+        // "Every shipped manifest validates" and "the validator refuses a net
+        // scope" are DIFFERENT CLAIMS, and only the first survives deleting the
+        // examples: a validator that had quietly stopped refusing `net_hosts`
+        // would pass every assertion above, because no shipped app declares one.
+        // So take a manifest that DID validate a moment ago, inject a net scope
+        // into it, and require the refusal -- the accepted and the refused text
+        // differ by exactly that one permission.
+        let (probe_name, probe_raw) = net_scope_probe
+            .expect("no shipped manifest was available to build the net-scope probe from");
+        assert!(
+            crate::plugin_sdk::validate_manifest(&probe_raw, &probe_name).is_ok(),
+            "the probe base must be a manifest that VALIDATES, or the refusal below proves nothing"
+        );
+        // Drop any existing (necessarily EMPTY -- it validated) `net_hosts` line
+        // and put a POPULATED one right after `[permissions]`. Line-wise rather
+        // than a substring replace: nearly every shipped manifest carries
+        // `net_hosts = []` plus a comment mentioning it, and a naive replace
+        // would edit the comment and leave the real declaration alone -- a
+        // no-op mutation, which is indistinguishable from a surviving one.
+        let mut injected = String::new();
+        let mut inserted = false;
+        for line in probe_raw.lines() {
+            if line.trim_start().starts_with("net_hosts") {
+                continue;
+            }
+            injected.push_str(line);
+            injected.push('\n');
+            if line.trim() == "[permissions]" {
+                injected.push_str("net_hosts = [\"voron.local\", \"stream.binance.com\"]\n");
+                inserted = true;
+            }
+        }
+        assert!(
+            inserted,
+            "the injection was a no-op (apps/{probe_name}/manifest.toml has no [permissions] \
+             table), so the refusal below would be asserted against an unmodified manifest"
+        );
+        assert_ne!(
+            injected, probe_raw,
+            "the injected text is byte-identical to the original -- nothing was mutated"
+        );
+        assert!(
+            injected.contains("net_hosts = [\"voron.local\""),
+            "the populated net scope is not in the injected text: {injected}"
+        );
+        let err = crate::plugin_sdk::validate_manifest(&injected, &probe_name).expect_err(
+            "a net scope is NOT GRANTABLE on this OS (macOS SBPL has no host filter): a manifest \
+             declaring net_hosts must be refused at validation, whatever hosts it names",
+        );
+        assert!(
+            err.contains("not grantable"),
+            "the refusal must name the reason -- an author told the scope is `malformed` will try \
+             to reshape it, and there is no shape that works: {err}"
+        );
+        assert!(
+            err.contains("fetch_hosts"),
+            "the refusal must name the route that DOES work, or it is a dead end: {err}"
+        );
     }
 
     /// THE SCHEMA DOC'S WORKED EXAMPLE MUST BE AN APP THAT ACTUALLY VALIDATES.
@@ -4668,14 +4705,17 @@ mod tests {
     /// daemon REFUSES -- complete with a five-step "at launch, darwind ..."
     /// sequence that never happened on any machine. It was moved to a shipped,
     /// running app; NOTHING made that stick, so nothing stopped the next edit
-    /// putting a blocked app back in the one block authors copy.
+    /// putting a blocked app back in the one block authors copy. (fab-link and
+    /// algo-core are since DELETED -- docs/BLOCKED_APPS.md -- but "the example
+    /// names an app whose manifest validates" is the rule, and it is not about
+    /// those two.)
     ///
     /// This does. It reads `[app].name` out of the fenced block that follows the
     /// "## Worked example" heading -- bounded at BOTH ends (heading -> opening
     /// fence -> closing fence), so it can neither self-match on the heading nor
     /// run past the block into the rest of the document -- and requires that
     /// app's REAL manifest to pass the SAME validator the loader runs. Point the
-    /// doc at fab-link or algo-core again and this test fails.
+    /// doc at any app whose manifest the daemon refuses and this test fails.
     #[test]
     fn the_sandbox_doc_worked_example_names_an_app_whose_manifest_validates() {
         let doc = Path::new(env!("CARGO_MANIFEST_DIR")).join("../docs/SANDBOX.md");
@@ -5305,7 +5345,8 @@ mod tests {
     /// `(remote tcp (host-name ...))`, which macOS refuses to compile
     /// ("host must be * or localhost"). `sandbox-exec` exited 65, the profile was
     /// rejected, and the app never launched. It failed CLOSED, so there was no
-    /// security exposure -- but two shipped apps (fab-link, algo-core) were
+    /// security exposure -- but two shipped apps (fab-link, algo-core, both since
+    /// DELETED: docs/BLOCKED_APPS.md) were
     /// unlaunchable and docs/SANDBOX.md described an allow-list this OS never
     /// accepted. The two string-matching tests over those rules passed the whole
     /// time, because they asserted the literals the generator emitted -- the

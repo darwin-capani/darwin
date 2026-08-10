@@ -1985,6 +1985,11 @@ async fn main() -> Result<()> {
             .with_writer(std::io::stderr)
             .init();
         let (cfg, _issues) = Config::load(&resolve_root().join("config").join("darwin.toml"));
+        // The drill runs the REAL pipeline, so it must run it under the REAL
+        // configured floor/budget. Without this it would exercise the compiled
+        // defaults and report them on heal.proposal, and a verifier's "the loop
+        // works" would be a statement about a configuration nobody is running.
+        heal::configure(&cfg.self_heal);
         anthropic::resolve_api_key().await; // resolve once (logs nothing)
         let dir = heal::run_heal_drill(&cfg.cloud.heavy_model).await?;
         println!("heal drill PASSED — proposal written to {}", dir.display());
@@ -2135,13 +2140,23 @@ async fn main() -> Result<()> {
     //   darwind --heal-confidence <report.md>
     //
     // The daemon refuses to PROPOSE a patch the adversarial reviewer scored
-    // below heal::CONFIDENCE_FLOOR. scripts/apply_heal.sh has to refuse to
+    // below the review-confidence floor. scripts/apply_heal.sh has to refuse to
     // INSTALL one for the same reason — otherwise a proposal written by an older
     // daemon, or one edited by hand, would be applied under a weaker bar than
     // the one that would have blocked it being written. It calls this rather
     // than grepping report.md in bash: a second parser and a second copy of the
     // threshold is the two-gates-disagree defect this file has produced most,
     // which is exactly why --split-heal-diff and --heal-responsiveness exist.
+    //
+    // THE FLOOR IS NOW CONFIGURABLE ([self_heal].confidence_floor), which makes
+    // loading the config here MANDATORY rather than tidy: without it this gate
+    // would judge against the compiled default while the daemon proposed against
+    // the operator's value, and the two-gates-disagree defect would be back —
+    // this time invisible, because both sides would be "the same function".
+    // `heal::configure` is the one seeder, and it clamps identically for both
+    // callers. apply_heal.sh runs this from the STAGED crate under
+    // state/heal/staging-<ts>/, whose exe ancestors reach the real repo root, so
+    // `resolve_root()` finds the same config/darwin.toml the daemon read.
     //
     // Line 1 is the verdict word (ABOVE_FLOOR | BELOW_FLOOR | NO_SCORE), line 2
     // the sentence for a human. Exit 0 on any verdict; exit 2 is reserved for
@@ -2160,6 +2175,9 @@ async fn main() -> Result<()> {
                 std::process::exit(2);
             }
         };
+        let (cfg, _issues) =
+            Config::load(&resolve_root().join("config").join("darwin.toml"));
+        heal::configure(&cfg.self_heal);
         let (verdict, detail) = heal::confidence_gate(&report);
         println!("{}", verdict.word());
         println!("{detail}");
@@ -5710,6 +5728,27 @@ async fn trigger_create_pronunciation(
     }
 }
 
+// ROUTER RECALL (recall_probe.rs) — the standing measurement of the OTHER half of
+// the routing boundary. Precision ("does an ordinary sentence get hijacked into an
+// app") was measured and fixed: 317 of 1,897 ordinary utterances used to be
+// captured, 1 survives. RECALL ("does an utterance that SHOULD reach a capability
+// actually reach it") had never been measured, and every precision fix moved the
+// boundary in the direction that costs it. TEST-ONLY: two checked-in fixtures
+// (daemon/fixtures/router_recall.json + router_ordinary.json) and the pure gate
+// dispatcher that scores them. No production caller — it exists so recall is a
+// number that regresses loudly.
+//
+// DECLARED HERE, not up with the other `mod`s, ON PURPOSE:
+// `encryption_migration_tests::every_keyed_open_is_covered_by_the_migration_list`
+// scrapes this file's PRODUCTION half as `src.split("#[cfg(test)]").next()`. A
+// `#[cfg(test)]` anywhere above the first test module truncates that scrape to
+// nothing and the keyed-open guard silently reads zero openers. It fails LOUDLY
+// (`sites >= 7`) rather than passing vacuously — which is how this placement was
+// found — but the constraint is real: a test-only module must be declared below
+// the last production item, i.e. right here.
+#[cfg(test)]
+mod recall_probe;
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -5964,6 +6003,42 @@ mod tests {
             "a startup telemetry::emit( sits above telemetry::init() in main; emit() is \
              a silent no-op until the hub exists, so that frame is discarded and no HUD \
              can ever see it (move it to the DEFERRED STARTUP FRAMES block after init)"
+        );
+    }
+
+    /// STARTUP-ORDER pin: `telemetry::init()` must run BEFORE the
+    /// `tokio::spawn(telemetry::serve(` that starts the websocket server.
+    ///
+    /// DISTINCT from both neighbouring pins, which cover `emit`-before-`init` and
+    /// `init`-before-`discover`; NEITHER constrains where the serve spawn sits.
+    /// `telemetry::serve`'s accept loop does
+    /// `HUB.get().expect("telemetry::init called first")` once per accepted
+    /// connection, so an init moved below the spawn would panic that task. The
+    /// blast radius is the WHOLE telemetry websocket server (the accept loop
+    /// itself), not one connection — and it dies inside a `tokio::spawn` whose
+    /// JoinHandle is dropped, so it dies SILENTLY.
+    ///
+    /// The window is BOUNDED to main's body (`async fn main` onward) and both live
+    /// call sites precede this test module, so `find` reads the real statements and
+    /// never self-matches the string literals below.
+    #[test]
+    fn telemetry_init_precedes_the_serve_spawn() {
+        let src = include_str!("main.rs");
+        let main_at = src
+            .find("\nasync fn main(")
+            .expect("main.rs defines `async fn main`");
+        let body = &src[main_at..];
+        let init_at = body
+            .find("telemetry::init();")
+            .expect("main calls telemetry::init()");
+        let serve_at = body
+            .find("tokio::spawn(telemetry::serve(")
+            .expect("main spawns telemetry::serve");
+        assert!(
+            init_at < serve_at,
+            "telemetry::init() must precede tokio::spawn(telemetry::serve(...)) in main: \
+             serve()'s accept loop resolves the hub with expect(), so spawning it above \
+             init would kill the entire telemetry websocket server on first connect"
         );
     }
 

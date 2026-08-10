@@ -147,7 +147,7 @@ Per `docs/SANDBOX.md`, micro-apps never open windows; the HUD composites their s
 | Class | Composition |
 |---|---|
 | `panel` | Floating glass panel in the right-side panel rail; user-arrangeable; max 3 visible, the rest collapse to tabs |
-| `overlay` | Translucent layer over the main scene; no fill, strokes only; never occludes the status bar. (No shipped app uses this class yet — the design that did, Fab-Link, is BLOCKED and unbuilt; see `docs/ROADMAP.md`.) |
+| `overlay` | Translucent layer over the main scene; no fill, strokes only; never occludes the status bar. (No shipped app uses this class — the only design that did, Fab-Link, was never built and has been DELETED; see `docs/BLOCKED_APPS.md`.) |
 | `fullscreen` | Takes the whole stage; core shrinks to a 48 px status orb top-right; exit via the same chord that opened it |
 
 Two transport tiers, matching the roadmap honestly:

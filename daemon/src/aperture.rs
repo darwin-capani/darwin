@@ -1194,6 +1194,26 @@ mod tests {
         t.record("Safari", "Google", 1040); // title changed -> new span
         t.record("Xcode", "main.rs", 1060); // app changed -> new span
         assert_eq!(t.len(), 3, "a changed app OR title starts a new span");
+        // A COUNT does not say WHICH spans. Three spans carrying the wrong app or
+        // the wrong title — a stale carry-over of the previous sample's name, say
+        // — still counts three, and the recall would then attribute the owner's
+        // time to the wrong application. Pin the identity and the boundaries.
+        let snap = t.snapshot(); // newest-first
+        let ident: Vec<(&str, &str)> = snap
+            .iter()
+            .map(|a| (a.app.as_str(), a.title.as_str()))
+            .collect();
+        assert_eq!(
+            ident,
+            vec![("Xcode", "main.rs"), ("Safari", "Google"), ("Safari", "GitHub")],
+            "each span keeps its OWN app+title, newest-first"
+        );
+        // The merged first span spans both of its samples; the two new ones start
+        // at the sample that split them (they are not silently back-dated).
+        assert_eq!(snap[2].start_ts, 1000, "the merged Safari/GitHub span starts at its first sample");
+        assert_eq!(snap[2].end_ts, 1020, "…and ends at the merged sample");
+        assert_eq!(snap[1].start_ts, 1040, "the title change starts a span at its own ts");
+        assert_eq!(snap[0].start_ts, 1060, "the app change starts a span at its own ts");
     }
 
     #[test]

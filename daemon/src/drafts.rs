@@ -359,7 +359,20 @@ mod tests {
             .unwrap();
         }
         let listed = list(&m).await.unwrap();
-        assert!(listed.len() <= 3, "retention must bound the store: {}", listed.len());
+        // The cap is EXACT, not merely an upper bound: `len() <= 3` also passes
+        // when retention wrongly wipes the store down to 2, 1 or 0.
+        assert_eq!(listed.len(), 3, "retention keeps exactly the cap: {listed:?}");
+        // …and it must be the OLDEST that go. A bare count proves nothing about
+        // WHICH three survived: an INVERTED eviction (delete the newest, keep the
+        // oldest) leaves `len()` identical at 3 while silently destroying the
+        // drafts the owner just composed. `list` is newest-first, so subjects 4,
+        // 3, 2 survive and 1, 0 are evicted.
+        let kept: Vec<&str> = listed.iter().map(|d| d.subject.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["subject 4", "subject 3", "subject 2"],
+            "the three NEWEST survive (newest-first); the two oldest are evicted"
+        );
     }
 
     #[test]

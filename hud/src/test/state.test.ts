@@ -1156,11 +1156,11 @@ describe("micro-app: app.data feed relay", () => {
 
   it("multiple apps keep independent feed slices (keyed by name)", () => {
     let s = tel(connected(), appData(GS, { items: [gsItem({ title: "gs" })] }));
-    s = tel(s, appData("algo-core", { items: [gsItem({ title: "ac" })] }));
+    s = tel(s, appData("cronwise", { items: [gsItem({ title: "cw" })] }));
     expect(s.appFeeds[GS].items[0].title).toBe("gs");
-    expect(s.appFeeds["algo-core"].items[0].title).toBe("ac");
+    expect(s.appFeeds["cronwise"].items[0].title).toBe("cw");
     expect(s.runningApps.has(GS)).toBe(true);
-    expect(s.runningApps.has("algo-core")).toBe(true);
+    expect(s.runningApps.has("cronwise")).toBe(true);
   });
 
   it("app.log / app.auth_failed are not panel-state-bearing (same reference)", () => {

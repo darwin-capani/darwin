@@ -15,6 +15,17 @@ import Frame from "./Frame";
  *   - HONEST. Only WELL-SAMPLED capabilities are judged (the daemon excludes
  *     low-sample ones), and parseAttributionHealth never returns null — a
  *     malformed/empty payload reads as an honest all-zero snapshot, not a stale one.
+ *   - THE RATE IS "UNCORRECTED", NOT "SUCCESS". This panel used to render the
+ *     `rate` field as "N% success". It is not a success rate: the daemon records
+ *     every turn as provisionally successful and only ever re-labels it
+ *     CorrectedNextTurn when the FOLLOWING turn looks like a correction, so a
+ *     turn where the user gave up, rephrased in a later session, or accepted a
+ *     wrong answer counts on the GOOD side. daemon/src/attribution.rs renders the
+ *     identical number as "% uncorrected" and has a named regression test
+ *     (`the_rendered_rate_does_not_claim_success`) forbidding the word — the
+ *     guard covered only the Rust text report, while the HUD, the surface the
+ *     owner actually looks at, re-labelled the same number with the exact claim
+ *     the system never makes. Both callers now say the same true word.
  *   - SECRET-FREE. The wire carries capability names + counts only.
  */
 export default function AttributionHealthPanel({
@@ -51,8 +62,11 @@ export default function AttributionHealthPanel({
                 <div className="attr-flag" key={`${f.kind}:${f.name}`}>
                   <span className="attr-flag-name">{f.name}</span>
                   <span className="attr-flag-kind">{f.kind}</span>
-                  <span className="attr-flag-stat">
-                    {f.turns} turns · {f.rate}% success
+                  <span
+                    className="attr-flag-stat"
+                    title="Share of graded turns the user did not visibly correct on the following turn — not a judgement that the answer was right."
+                  >
+                    {f.turns} turns · {f.rate}% uncorrected
                   </span>
                 </div>
               ))}
@@ -70,8 +84,11 @@ export default function AttributionHealthPanel({
                 <div className="attr-flag" key={`promote:${f.name}`}>
                   <span className="attr-promote-name">{f.name}</span>
                   <span className="attr-flag-kind">skill</span>
-                  <span className="attr-flag-stat">
-                    {f.turns} turns · {f.rate}% success
+                  <span
+                    className="attr-flag-stat"
+                    title="Share of graded turns the user did not visibly correct on the following turn — not a judgement that the answer was right."
+                  >
+                    {f.turns} turns · {f.rate}% uncorrected
                   </span>
                 </div>
               ))}

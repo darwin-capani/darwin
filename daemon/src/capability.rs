@@ -419,11 +419,28 @@ mod tests {
         let m = capability_map(&Config::default(), &deps(false, true));
         let arr = m["capabilities"].as_array().expect("capabilities is an array");
         assert!(arr.len() >= 12, "covers the notable subsystems");
+        // Every row carries the full honest shape. `get(f).is_some()` alone is
+        // NOT that check: in serde_json a JSON `null` is `Some(Value::Null)`, and
+        // an empty string is Some too — a row of `{"key":"","armed":null,…}` would
+        // sail through while being unusable by the HUD that renders it. Assert the
+        // TYPE and the non-emptiness of each field, and that the keys are unique.
+        let mut keys: Vec<&str> = Vec::new();
         for c in arr {
-            // Every row carries the full honest shape.
             for f in ["key", "label", "armed", "status", "dependency", "verified"] {
-                assert!(c.get(f).is_some(), "row missing {f}: {c}");
+                let v = c.get(f).unwrap_or_else(|| panic!("row missing {f}: {c}"));
+                assert!(!v.is_null(), "{f} is null, not an honest value: {c}");
             }
+            let key = c["key"].as_str().expect("key is a string");
+            let label = c["label"].as_str().expect("label is a string");
+            let status = c["status"].as_str().expect("status is a string");
+            assert!(!key.trim().is_empty(), "an empty key is unaddressable: {c}");
+            assert!(!label.trim().is_empty(), "an empty label renders blank: {c}");
+            assert!(!status.trim().is_empty(), "an empty status reads as nothing: {c}");
+            assert!(c["armed"].is_boolean(), "armed must be a bool, not {c}");
+            assert!(c["verified"].is_boolean(), "verified must be a bool, not {c}");
+            assert!(c["dependency"].is_string(), "dependency must be a string: {c}");
+            assert!(!keys.contains(&key), "duplicate capability key {key:?}");
+            keys.push(key);
         }
     }
 }

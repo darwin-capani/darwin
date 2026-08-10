@@ -1308,6 +1308,13 @@ pub fn classify_runbook_command(text: &str) -> Option<RunbookCommand> {
             }
         }
     }
+    // ...and the same command with the NAME BEFORE the noun.
+    if let Some(name) = named_before_noun(
+        t,
+        &["plan the ", "plan my ", "plan ", "preview the ", "preview my ", "preview "],
+    ) {
+        return Some(RunbookCommand::Plan { name });
+    }
 
     // RUN (execute — each consequential step PARKS fresh).
     for lead in [
@@ -1323,7 +1330,53 @@ pub fn classify_runbook_command(text: &str) -> Option<RunbookCommand> {
             }
         }
     }
+    // ...and the same command with the NAME BEFORE the noun. Checked AFTER the
+    // plan form above, so "plan the release runbook" is never read as a run.
+    if let Some(name) =
+        named_before_noun(t, &["run the ", "run my ", "run ", "execute the ", "execute my ", "execute "])
+    {
+        return Some(RunbookCommand::Run { name });
+    }
 
+    None
+}
+
+/// The OTHER word order: `<verb> [the|my] <name> runbook`, with the NAME BEFORE
+/// the noun.
+///
+/// WHAT WENT WRONG: every lead in [`classify_runbook_command`] put the name
+/// AFTER the noun ("run the runbook release"). Nobody says that. Out loud it is
+/// "run the release runbook" / "plan the release runbook" / "execute the backup
+/// runbook", and all four runbook probes in the checked-in probe set
+/// (`daemon/fixtures/router_recall.json`) missed — runbooks scored 0/4, the
+/// worst recall of any capability measured. A None here is terminal: the turn
+/// falls through to the on-device intent classifier, whose eleven-intent
+/// taxonomy (`inference/prompts/intent_classifier.txt`) has no runbook intent,
+/// so the whole automation surface was unreachable by its natural phrasing.
+///
+/// It cannot widen the gate to ordinary speech. The utterance must END in the
+/// literal word "runbook" AND open with one of the same enumerated verbs, and
+/// the span between them still goes through [`normalize_runbook_name`], which
+/// admits only a bare `[a-z0-9._-]` stem — so a clause tail like "the numbers on
+/// the" (spaces) is rejected there, and no path escape can ride in either.
+fn named_before_noun(t: &str, leads: &[&str]) -> Option<String> {
+    /// A bare determiner left over after a shorter lead peels is NOT a name.
+    /// "run the runbook" strips to "run the", the `"run "` lead exposes `"the"`,
+    /// and `normalize_runbook_name("the")` happily returns a valid stem — so
+    /// without this the no-name form (which the shipped tests pin as None) would
+    /// execute a runbook called "the".
+    const DETERMINERS: &[&str] = &["the", "a", "an", "my", "our", "your", "this", "that", "it"];
+    // The LEADING space makes "runbook" a whole word.
+    let body = t.strip_suffix(" runbook")?.trim_end();
+    for lead in leads {
+        let Some(rest) = body.strip_prefix(lead) else {
+            continue;
+        };
+        let name = normalize_runbook_name(rest);
+        if !name.is_empty() && !DETERMINERS.contains(&name.as_str()) {
+            return Some(name);
+        }
+    }
     None
 }
 
@@ -2105,6 +2158,62 @@ mod tests {
             "runbook", // bare word, no verb + name
             "run the runbook", // verb but no name
             "plan the runbook ", // name is empty after the lead
+        ] {
+            assert_eq!(classify_runbook_command(utter), None, "{utter:?} must NOT trigger");
+        }
+    }
+
+    /// RECALL — THE NAME BEFORE THE NOUN.
+    ///
+    /// The shipped leads all put the name AFTER the noun ("run the runbook
+    /// release"). Nobody says that; people say "run the release runbook". The
+    /// checked-in probe set (`daemon/fixtures/router_recall.json`) scored
+    /// runbooks 0/4 — the worst recall of any capability measured — and a miss
+    /// is terminal, because the on-device intent classifier's eleven-intent
+    /// taxonomy has no runbook intent to fall back to.
+    #[test]
+    fn a_runbook_named_before_the_noun_still_reaches_its_command() {
+        assert_eq!(
+            classify_runbook_command("run the release runbook"),
+            Some(RunbookCommand::Run { name: "release".to_string() })
+        );
+        assert_eq!(
+            classify_runbook_command("Execute the backup runbook."),
+            Some(RunbookCommand::Run { name: "backup".to_string() })
+        );
+        assert_eq!(
+            classify_runbook_command("run my nightly runbook"),
+            Some(RunbookCommand::Run { name: "nightly".to_string() })
+        );
+        // PLAN is still checked first, so a plan phrasing never executes.
+        assert_eq!(
+            classify_runbook_command("plan the release runbook"),
+            Some(RunbookCommand::Plan { name: "release".to_string() })
+        );
+        assert_eq!(
+            classify_runbook_command("preview the backup runbook"),
+            Some(RunbookCommand::Plan { name: "backup".to_string() })
+        );
+    }
+
+    /// ...AND THE WIDENING DOES NOT BECOME A HIJACK. The span between the verb
+    /// and the noun still goes through [`normalize_runbook_name`], which admits
+    /// only a bare `[a-z0-9._-]` stem — so a multi-word clause tail (spaces) and
+    /// every path escape are refused there, and a bare determiner yields nothing.
+    #[test]
+    fn a_sentence_that_merely_ends_in_runbook_is_not_a_runbook_command() {
+        for utter in [
+            "run the numbers on the runbook",
+            "run the tests before the runbook",
+            "plan the rest of the runbook",
+            "run the runbook",
+            "run my runbook",
+            "plan the runbook",
+            // Whole-word noun.
+            "run the release prerunbook",
+            // Confinement rides the same normalizer.
+            "run the ../secrets runbook",
+            "run the /etc/passwd runbook",
         ] {
             assert_eq!(classify_runbook_command(utter), None, "{utter:?} must NOT trigger");
         }

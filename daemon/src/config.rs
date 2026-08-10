@@ -559,7 +559,13 @@ const KNOWN_KEYS: &[(&str, &[&str])] = &[
     // server gates whether to WARM the cross-encoder at preload. HONEST FALLBACK to
     // the dense order when the reranker is off / unbuildable (fell_back on the wire).
     ("inference", &["preload", "speculative", "draft_model", "quant", "embedder", "reranker"]),
-    ("self_heal", &["enabled", "mode"]),
+    // [self_heal] — `confidence_floor` and `attempt_budget_secs` were hard-coded
+    // constants in heal.rs (0.25 / 1800s) chosen by judgement. They are now
+    // operator-tunable, clamped in heal.rs to ranges whose ends are derived (not
+    // picked), and CALIBRATABLE: every attempt emits the reviewer's confidence
+    // and its real per-stage timings on heal.proposal/heal.rejected, so the right
+    // values are readable from data instead of argued. See SelfHealConfig.
+    ("self_heal", &["enabled", "mode", "confidence_floor", "attempt_budget_secs"]),
     // [forge] — Self-Forge (forge.rs). Same shape and contract as [self_heal]:
     // "mode" is "propose"|"auto" and is listed so it never reads as a typo. Note
     // "auto" NEVER deploys a forged app into apps/ — deploy is ALWAYS a separate
@@ -2441,6 +2447,55 @@ pub struct SelfHealConfig {
     /// KeepAlive that is a restart, under `cargo run` it is a stop.
     /// Unknown values fall back to "propose" (the safe behavior).
     pub mode: String,
+    /// THE ADVERSARIAL REVIEWER'S FLOOR (default **0.25**). Below this review
+    /// confidence the daemon proposes NOTHING, and `scripts/apply_heal.sh`
+    /// refuses to install a proposal scored under it (`darwind
+    /// --heal-confidence` — one implementation, two callers).
+    ///
+    /// **THIS IS NOT A QUALITY BAR.** It is a "the reviewer did not believe
+    /// this" bar. Every staged gate (check / clippy / test / mutation probe) is
+    /// mechanical and blind to whether the patch is a good *idea*; the reviewer
+    /// is the only stage that judges that, and a failed review call is recorded
+    /// as 0.0 — which is *no review*, not a bad one. Raising this trades away
+    /// correct patches scored low by a miscalibrated reviewer; lowering it
+    /// trades toward one-click-applying patches nobody vouched for.
+    ///
+    /// NOTHING IS LOST EITHER WAY: a below-floor attempt still writes every
+    /// candidate, its review and the diagnosis under
+    /// `state/heal/rejected/<ts>/`. The floor only decides whether there is a
+    /// one-click APPLY button, never whether the work is kept.
+    ///
+    /// **Pick this from data, not judgement.** Every attempt emits the
+    /// reviewer's confidence on `heal.proposal` / `heal.rejected`
+    /// (`calibration.confidences`), so after N real attempts the right floor is
+    /// readable rather than argued.
+    ///
+    /// Clamped to `[0.05, 0.95]` (`heal::CONFIDENCE_FLOOR_MIN` / `_MAX`) —
+    /// see `heal::effective_confidence_floor` for why each end is where it is.
+    pub confidence_floor: f64,
+    /// THE ATTEMPT-WIDE CARGO BUDGET IN SECONDS (default **1800**). The total
+    /// time one self-heal attempt may spend inside staged validation, shared by
+    /// all of its candidates. It is a CARGO budget, not a wall clock: cloud
+    /// review latency is not charged to it.
+    ///
+    /// Self-heal only ever runs on a machine that is, by definition of the
+    /// trigger, already misbehaving — so this is the knob that decides how much
+    /// of that machine one heal may occupy. Lower it and the later candidates
+    /// are drafted, paid for at the heavy model, and then refused at stage
+    /// `deadline` without ever being judged; raise it and a struggling box
+    /// compiles for longer.
+    ///
+    /// **Do the arithmetic before changing it.** At the cycle measured on this
+    /// hardware, affording all `heal::CANDIDATE_COUNT` candidates needs
+    /// `(CANDIDATE_COUNT - 1) * cycle + heal::minimum_viable_budget()`. Every
+    /// attempt emits its real per-stage timings on `heal.proposal` /
+    /// `heal.rejected` (`calibration.stages`), so the cycle on YOUR machine is
+    /// measured, not assumed.
+    ///
+    /// Clamped to `[750, 14400]` (`heal::ATTEMPT_BUDGET_MIN_SECS` /
+    /// `_MAX_SECS`): below the low end not even ONE candidate can be staged, so
+    /// the gate could never reach a verdict at all.
+    pub attempt_budget_secs: u64,
 }
 
 impl Default for SelfHealConfig {
@@ -2455,6 +2510,15 @@ impl Default for SelfHealConfig {
             // gate. "auto" is DANGEROUS (the daemon applies a patch to itself and
             // restarts); NEVER ship "auto" as the default.
             mode: "propose".to_string(),
+            // THE DOCUMENTED DEFAULTS, and the values config/darwin.toml ships.
+            // They were originally hard-coded constants in heal.rs picked by
+            // JUDGEMENT; they are still judged numbers, and that is exactly why
+            // they are now (a) configurable and (b) accompanied by per-attempt
+            // telemetry that makes the right values readable from real runs.
+            // Replacing one judged number with a different judged number would
+            // have been a guess wearing a decision's clothes.
+            confidence_floor: 0.25,
+            attempt_budget_secs: 1800,
         }
     }
 }
@@ -5717,6 +5781,8 @@ mod tests {
         let defaults = Config::default();
         assert_eq!(cfg.self_heal.enabled, defaults.self_heal.enabled);
         assert_eq!(cfg.self_heal.mode, defaults.self_heal.mode);
+        assert_eq!(cfg.self_heal.confidence_floor, defaults.self_heal.confidence_floor);
+        assert_eq!(cfg.self_heal.attempt_budget_secs, defaults.self_heal.attempt_budget_secs);
         assert!(cfg.self_heal.enabled, "self-heal SHIPS ON (full-power default; inert without a cloud key)");
         assert_eq!(cfg.self_heal.mode, "propose", "self-heal stays PROPOSE (the gate; never auto)");
         assert_eq!(cfg.forge.enabled, defaults.forge.enabled);
@@ -6178,16 +6244,40 @@ mod tests {
         assert!(issues.is_empty());
         assert!(cfg.self_heal.enabled, "self-heal SHIPS ON (full-power default; inert without a cloud key)");
         assert_eq!(cfg.self_heal.mode, "propose", "self-heal stays PROPOSE (the gate; never auto)");
+        // THE TWO TUNABLES SHIP AT THE NUMBERS THEY ALWAYS HAD. Making them
+        // settable must not change what an operator who sets nothing gets:
+        // swapping one judged number for another judged number would have been a
+        // guess dressed as a decision. heal.rs pins the same two as its
+        // *_DEFAULT constants and the whole-struct lockstep pins the file side.
+        assert_eq!(
+            cfg.self_heal.confidence_floor, 0.25,
+            "the review-confidence floor default must not drift when it becomes configurable"
+        );
+        assert_eq!(
+            cfg.self_heal.attempt_budget_secs, 1800,
+            "the attempt-wide cargo budget default must not drift when it becomes configurable"
+        );
 
         let raw = r#"
             [self_heal]
             enabled = true
             mode = "auto"
+            confidence_floor = 0.4
+            attempt_budget_secs = 2400
         "#;
         let (cfg, issues) = Config::parse(raw);
-        assert!(issues.is_empty(), "mode must be a known key: {issues:?}");
+        assert!(issues.is_empty(), "all four must be known keys: {issues:?}");
         assert!(cfg.self_heal.enabled);
         assert_eq!(cfg.self_heal.mode, "auto");
+        assert_eq!(cfg.self_heal.confidence_floor, 0.4);
+        assert_eq!(cfg.self_heal.attempt_budget_secs, 2400);
+        // ...and a typo under [self_heal] is still DIAGNOSED, so the two new keys
+        // did not arrive by widening the section into an anything-goes table.
+        let (_, issues) = Config::parse("[self_heal]\nconfidence_flor = 0.4\n");
+        assert!(
+            issues.iter().any(|i| i.contains("confidence_flor")),
+            "a typo'd [self_heal] key must be reported: {issues:?}"
+        );
     }
 
     /// Contract lockstep: [optimize] ships enabled=TRUE (full-power default),

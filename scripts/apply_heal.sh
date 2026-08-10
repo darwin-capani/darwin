@@ -33,7 +33,7 @@
 #     screamed,
 #   - enforce the REVIEW-CONFIDENCE FLOOR (`darwind --heal-confidence`, the
 #     daemon's own function a third time). The daemon refuses to PROPOSE a patch
-#     the adversarial reviewer scored below heal::CONFIDENCE_FLOOR; this refuses
+#     the adversarial reviewer scored below the review-confidence floor; this refuses
 #     to INSTALL one, so an older or hand-edited proposal cannot be applied under
 #     a weaker bar than the one that would have blocked it. This one DOES refuse
 #     — it is the reviewer's explicit verdict on this patch, not a heuristic
@@ -179,7 +179,20 @@ confined_patch() {
 mirror_runtime_test_inputs() {
   local daemon_dir="$1" staging="$2" repo_root d
   repo_root="$(cd "$daemon_dir/.." && pwd -P)"
-  for d in config scripts; do
+  # `docs` IS NOT OPTIONAL, and leaving it out is not a cosmetic gap: the suite
+  # reads <crate>/../docs/SANDBOX.md with `.expect("docs/SANDBOX.md is present")`
+  # (apps.rs, the_sandbox_doc_worked_example_names_an_app_whose_manifest_validates).
+  # Absent, that test PANICS, the whole `cargo test` gate below fails, and this
+  # script ends `RESULT: failed  cargo test failed in staging` — i.e. NO self-heal
+  # patch is installable by ANY path (interactive, --yes, or the HUD Accept
+  # button), and the operator is told the PATCH failed the test gate when the
+  # harness could not run the suite at all. That is the exact defect this
+  # function was written to close, recurring on the apply side after the daemon
+  # side was fixed alone. THIS LIST AND heal.rs RUNTIME_TEST_INPUTS ARE PINNED
+  # IN LOCKSTEP by heal::tests::the_apply_script_mirrors_the_same_runtime_inputs
+  # _as_the_daemon_gate — add a directory to one and that test fails until it is
+  # added here too.
+  for d in config scripts docs; do
     [ -d "$repo_root/$d" ] || continue
     mkdir -p "$staging/$d"
     cp -R "$repo_root/$d/." "$staging/$d/"
@@ -559,7 +572,9 @@ fi
 
 # ------------------------------------- REVIEW-CONFIDENCE FLOOR (REFUSES)
 # The daemon will not PROPOSE a patch the adversarial reviewer scored below
-# heal::CONFIDENCE_FLOOR — the four staged gates are all mechanical and blind to
+# the review-confidence floor ([self_heal].confidence_floor; the NUMBER lives in
+# Rust and is deliberately not repeated here) — the
+# four staged gates are all mechanical and blind to
 # whether the patch is a good IDEA, and the reviewer is the only stage that
 # judges that. This refuses to INSTALL one for the same reason, so a proposal
 # written by an OLDER daemon (or edited by hand) cannot be applied under a

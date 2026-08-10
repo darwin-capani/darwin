@@ -61,7 +61,19 @@ pub fn classify_intent(utterance: &str) -> Option<CloneIntent> {
     let lower = utterance.to_lowercase();
 
     // Must be about the speaker's own voice and a CLONE/REGISTER-with-the-cloud act.
-    let mentions_voice = lower.contains("my voice") || lower.contains("voice clone");
+    //
+    // THE DELETE DIRECTION IS DELIBERATELY EASIER TO REACH THAN THE CREATE ONE.
+    // `mentions_voice` used to match only the NOUN forms ("my voice", "voice
+    // clone"), so "delete my cloned voice" and "forget my cloned voice" — the
+    // adjectival form, and the two most natural ways to ask — both returned
+    // None. MEASURED by the router-recall fixture: voiceclone scored 1/4, and
+    // the owner could not remove a voiceprint HELD BY A THIRD PARTY by saying
+    // the obvious sentence. Widening a DELETE can only reduce what is held
+    // off-device, so it is safe to widen. Widening the CLONE side would ship a
+    // voice sample to ElevenLabs, so it stays exactly as narrow as it was:
+    // "cloned voice" reaches Forget and never Clone.
+    let clone_noun = lower.contains("my voice") || lower.contains("voice clone");
+    let mentions_voice = clone_noun || lower.contains("cloned voice");
     let clone_word = lower.contains("clone")
         || lower.contains("register my voice")
         || lower.contains("voice clone");
@@ -73,6 +85,11 @@ pub fn classify_intent(utterance: &str) -> Option<CloneIntent> {
     const FORGET: &[&str] = &["forget", "delete", "remove", "clear", "unclone", "erase"];
     if FORGET.iter().any(|v| lower.contains(v)) {
         return Some(CloneIntent::Forget);
+    }
+    // CLONE keeps the ORIGINAL narrow match. The adjectival phrasing added above
+    // is a deletion affordance only; it must not open a new path to an upload.
+    if !clone_noun {
+        return None;
     }
     // Otherwise an explicit clone proposal (still consent-gated downstream).
     Some(CloneIntent::Clone)
@@ -393,6 +410,43 @@ pub fn clone_display_name(agent: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The owner must be able to DELETE a voiceprint held by a third party using
+    /// the sentence they would actually say. Both of these returned None before:
+    /// `mentions_voice` matched the noun forms only, never "cloned voice".
+    #[test]
+    fn the_natural_ways_to_delete_a_voice_clone_reach_forget() {
+        for u in [
+            "delete my cloned voice",
+            "forget my cloned voice",
+            "remove my cloned voice",
+            "delete my voice clone",
+        ] {
+            assert_eq!(
+                classify_intent(u),
+                Some(CloneIntent::Forget),
+                "the owner cannot delete their voiceprint by saying {u:?}"
+            );
+        }
+    }
+
+    /// ...AND THE WIDENING IS DELETION-ONLY. The adjectival phrasing must never
+    /// reach Clone: that path ships a voice sample to ElevenLabs, and making a
+    /// removal affordance easier to say must not make an upload easier to say.
+    /// Without this, a later "simplify" that folds the two matches back together
+    /// silently opens an upload path.
+    #[test]
+    fn the_deletion_phrasing_never_reaches_the_upload_path() {
+        for u in ["i want a cloned voice", "give me a cloned voice", "a cloned voice please"] {
+            assert_ne!(
+                classify_intent(u),
+                Some(CloneIntent::Clone),
+                "{u:?} reached the CLONE path — the deletion widening opened an upload"
+            );
+        }
+        // The original noun phrasings still reach Clone; nothing was taken away.
+        assert_eq!(classify_intent("clone my voice"), Some(CloneIntent::Clone));
+    }
     use super::*;
 
     #[test]

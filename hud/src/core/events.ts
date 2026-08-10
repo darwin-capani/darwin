@@ -231,6 +231,43 @@ export interface HealDiagnosingData {
   subsystem: string; // module-path subsystem (audio/inference/router/...)
 }
 
+/** CALIBRATION payload carried on BOTH heal.proposal and heal.rejected.
+ *
+ *  The daemon's two self-heal tunables — `[self_heal].confidence_floor` and
+ *  `[self_heal].attempt_budget_secs` — were hard-coded numbers a human picked.
+ *  They are now settable, and this is what makes them SETTABLE FROM DATA: every
+ *  attempt reports every candidate's review score (not just the winner's) and
+ *  every cargo stage's real wall time, so after N attempts the right floor and
+ *  the right budget are arithmetic rather than argument.
+ *
+ *  NOT RENDERED TODAY — declared so the wire contract is written down once, on
+ *  the side that has to keep reading it. Optional everywhere: an older daemon
+ *  sends none of it. */
+export interface HealCalibrationData {
+  /** Per candidate: `reviewed:false` is a review call that never returned,
+   *  recorded as 0.0 — that is NO REVIEW, not a zero verdict, and averaging the
+   *  two together calibrates the floor against an outage. */
+  confidences?: { candidate: number; confidence: number; reviewed: boolean }[];
+  /** Per cargo stage that actually ran. `ok:false` with `cut_off:false` is a
+   *  merit failure (usually much faster); `cut_off:true` is the budget biting. */
+  stages?: {
+    candidate: number;
+    stage: string;
+    secs: number;
+    ok: boolean;
+    cut_off: boolean;
+  }[];
+  attempt_spent_secs?: number;
+  attempt_budget_secs?: number;
+  candidate_budget_secs?: number;
+  confidence_floor?: number;
+  candidates_drafted?: number;
+  /** Drafted (and paid for at the heavy model) but never staged, because the
+   *  attempt could not afford them. Nonzero means the budget is too small for
+   *  this machine — the one number that says so without reading a report. */
+  candidates_unaffordable?: number;
+}
+
 /** system / heal.proposal — heal.rs pipeline, mode=propose (self-heal contract).
  *  v2 adds the adversarial-review `confidence` (0..1) of the chosen candidate;
  *  `subsystem`/`signature` may be echoed from the diagnosis for the panel. */
@@ -247,12 +284,20 @@ export interface HealProposalData {
    *  blind to the diagnosis, so an UNRELATED patch is VALIDATED too. Optional —
    *  an older daemon does not send it. */
   responsiveness?: string;
+  /** Per-attempt calibration for the two self-heal tunables. Optional — an
+   *  older daemon does not send it. */
+  calibration?: HealCalibrationData;
 }
 
 /** system / heal.rejected — validation failed at some stage. */
 export interface HealRejectedData {
   ts: number;
   stage: string; // "patch" | "cargo_check" | "cargo_test" | ...
+  /** Per-attempt calibration. Carried on rejections TOO, and that is the half
+   *  that matters most: `stage:"deadline"` means the BUDGET stopped the gate and
+   *  `stage:"confidence"` means the FLOOR did, and neither can be tuned from a
+   *  bare token. Optional — an older daemon does not send it. */
+  calibration?: HealCalibrationData;
 }
 
 /** system / heal.blocked — pipeline could not start (e.g. no cloud key). */
@@ -3550,7 +3595,16 @@ export interface AttributionFlag {
   kind: string;
   name: string;
   turns: number;
-  /** Success rate as a whole-number percent. */
+  /** UNCORRECTED rate as a whole-number percent — NOT a success rate.
+   *
+   *  The daemon records every turn as provisionally successful and only ever
+   *  re-labels it CorrectedNextTurn when the FOLLOWING turn looks like a
+   *  correction; nothing in production writes Failed/Unknown. So this ratio is
+   *  "turns the user did not visibly correct" — a turn where they gave up,
+   *  rephrased later, or accepted a wrong answer lands on the GOOD side of it.
+   *  daemon/src/attribution.rs renders the identical number as "% uncorrected"
+   *  and pins that with `the_rendered_rate_does_not_claim_success`; anything
+   *  rendering this field must use the same word. */
   rate: number;
 }
 
@@ -3578,7 +3632,7 @@ function coerceAttributionFlag(o: Record<string, unknown>): AttributionFlag | nu
     kind: str(o, "kind") ?? "capability",
     name,
     // turns + rate are whole-number counts/percents — truncate a float or
-    // negative payload rather than render "6.7 turns · 45.7% success".
+    // negative payload rather than render "6.7 turns · 45.7% uncorrected".
     turns: nonNegIntOr0(o, "turns"),
     rate: nonNegIntOr0(o, "rate"),
   };
@@ -6291,6 +6345,18 @@ export interface ObolSpend {
   callsToday: number;
   recent: ObolSpendRow[];
   costIsEstimate: boolean;
+  /** Did every ledger read behind this report SUCCEED?
+   *
+   *  daemon/src/obol.rs::spend_report degrades a failed read to 0.0 / 0 / no rows,
+   *  so an unreadable ledger arrives byte-identical to a day with no cloud spend.
+   *  The gauge must NOT render that as "~$0.00 · CALLS TODAY 0" — a zero it
+   *  cannot stand behind, on a panel headed MEASURED, NEVER FABRICATED. False =>
+   *  show an explicit unknown.
+   *
+   *  Defaults TRUE when the field is ABSENT: only a daemon predating the flag
+   *  omits it, and everything such a daemon sends really was read. The unknown
+   *  state is only ever announced EXPLICITLY (`measured: false`). */
+  measured: boolean;
 }
 
 /** A non-negative float (a dollar figure), or 0 when absent/negative/NaN. */
@@ -6342,6 +6408,8 @@ export function parseObolSpend(data: Record<string, unknown>): ObolSpend {
     recent: rawRecent.map(parseObolRow),
     // Fail-safe TRUE: a dollar figure is ALWAYS shown as an estimate, never billed.
     costIsEstimate: bool(data, "cost_is_estimate") ?? true,
+    // Only an EXPLICIT false marks the figures unknown (see the field's doc).
+    measured: bool(data, "measured") ?? true,
   };
 }
 

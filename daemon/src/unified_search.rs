@@ -1324,6 +1324,21 @@ mod tests {
         };
         let res = fold(&inputs, 3);
         assert_eq!(res.hits.len(), 3, "result capped at k");
+        // A COUNT is not a cap: `len() == 3` passes just as happily when the cap
+        // keeps the three WORST candidates (or an arbitrary three). The cap must
+        // be applied AFTER the score sort, so the survivors are the top three in
+        // descending score order — /f0 (5.0), /f1 (4.9), /f2 (4.8).
+        let kept: Vec<&str> = res.hits.iter().map(|h| h.title.as_str()).collect();
+        assert_eq!(
+            kept,
+            vec!["/f0.md", "/f1.md", "/f2.md"],
+            "k keeps the TOP three by score, in rank order"
+        );
+        assert!(
+            res.hits[0].score >= res.hits[1].score && res.hits[1].score >= res.hits[2].score,
+            "the capped list is still ranked: {:?}",
+            res.hits.iter().map(|h| h.score).collect::<Vec<_>>()
+        );
     }
 
     #[test]

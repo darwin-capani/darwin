@@ -11,6 +11,11 @@ import Frame from "./Frame";
  *   - MEASURED, NEVER FABRICATED — today's spend is summed from real recorded
  *     cloud calls (the SAME token counts the eval cost window uses). Before the
  *     first call the gauge reads $0.00, never an invented number.
+ *   - AN UNREADABLE LEDGER IS NOT $0.00. obol.rs::spend_report degrades a failed
+ *     ledger read to 0.0 / 0 / no rows, which used to render here identically to a
+ *     quiet day — a zero meaning "could not measure", under a header that says
+ *     MEASURED. The wire now carries `measured`; when it is false every figure
+ *     that came from the ledger renders as "—" and the panel says why.
  *   - $ IS AN ESTIMATE — every dollar figure is a published $/1M-token rate over
  *     the measured token counts, NOT a billed number. Always labelled EST.
  *   - REDUCE-ONLY BUDGET — when a daily cap is set, the budget can only step a
@@ -38,6 +43,7 @@ export default function SpendMeter({ spend }: { spend: ObolSpend | null }) {
     pressure,
     callsToday,
     recent,
+    measured,
   } = spend;
 
   // The gauge fill is the share of the cap spent, clamped to [0, 1] for the bar
@@ -46,7 +52,10 @@ export default function SpendMeter({ spend }: { spend: ObolSpend | null }) {
 
   return (
     <div className="spend-meter">
-      <Frame title="SPEND // CLOUD METER" tag="MEASURED · REDUCE-ONLY">
+      <Frame
+        title="SPEND // CLOUD METER"
+        tag={measured ? "MEASURED · REDUCE-ONLY" : "LEDGER UNREADABLE · REDUCE-ONLY"}
+      >
         <div className="spend-body">
           <section className="spend-section">
             <div className="spend-section-head">
@@ -62,9 +71,13 @@ export default function SpendMeter({ spend }: { spend: ObolSpend | null }) {
             <div className="spend-metrics">
               <Stat
                 label="DAY SPEND"
-                value={`~$${fmtUsd(daySpendUsd)}`}
+                value={measured ? `~$${fmtUsd(daySpendUsd)}` : "—"}
                 prominent
-                title="ESTIMATE — published $/1M-token rate over the measured token counts, not a billed figure"
+                title={
+                  measured
+                    ? "ESTIMATE — published $/1M-token rate over the measured token counts, not a billed figure"
+                    : "NOT READ — the spend ledger could not be read this tick, so today's figure is unknown. It is not $0.00."
+                }
               />
               {capConfigured ? (
                 <>
@@ -78,7 +91,7 @@ export default function SpendMeter({ spend }: { spend: ObolSpend | null }) {
                   title="[obol].daily_usd_cap ships 0.0 — the budget is INERT (pure accounting). Set a cap to arm the reduce-only budget-floor."
                 />
               )}
-              <Stat label="CALLS TODAY" value={String(callsToday)} />
+              <Stat label="CALLS TODAY" value={measured ? String(callsToday) : "—"} />
               <PressurePill pressure={pressure} capConfigured={capConfigured} />
             </div>
 
@@ -115,6 +128,13 @@ export default function SpendMeter({ spend }: { spend: ObolSpend | null }) {
                 ))}
               </ul>
             </section>
+          )}
+
+          {!measured && (
+            <div className="spend-unmeasured dim-note" role="note">
+              The spend ledger could not be read this tick, so today's figures are
+              UNKNOWN, not zero.
+            </div>
           )}
 
           <div className="spend-foot dim-note">

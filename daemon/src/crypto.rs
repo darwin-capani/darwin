@@ -404,6 +404,28 @@ mod tests {
         let k = SecretKey::generate().unwrap();
         let again = SecretKey::from_hex(&k.keychain_value()).unwrap();
         assert_eq!(k, again, "keychain hex must round-trip back to the same key");
+        // A round trip runs the SAME codec on BOTH ends, so it stays green even
+        // if that codec changed wholesale — uppercase, byte-reversed, a different
+        // alphabet all round-trip perfectly. But the keychain string is an
+        // ON-DISK contract: the entry a PREVIOUS build wrote must still decode to
+        // the SAME key, or every at-rest DB (memory / audit / docsearch /
+        // optimize) stops opening. Pin the codec to a KNOWN VECTOR, both ways.
+        let mut bytes = [0u8; KEY_BYTES];
+        for (i, b) in bytes.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let pinned = SecretKey::from_bytes(bytes);
+        let expect = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+        assert_eq!(
+            pinned.keychain_value(),
+            expect,
+            "the keychain value is LOWERCASE hex of the 32 key bytes, in order"
+        );
+        assert_eq!(
+            SecretKey::from_hex(expect).unwrap().raw_bytes(),
+            &bytes,
+            "…and that exact stored string decodes back to those bytes, in order"
+        );
     }
 
     #[test]

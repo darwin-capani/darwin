@@ -492,6 +492,24 @@ pub fn classify_undo_command(text: &str) -> Option<UndoCommand> {
         "revert it",
         "revert the last action",
         "take that back",
+        // RECALL (measured): the phrasings a person actually reaches for that
+        // none of the above accept. This list is matched by WHOLE-UTTERANCE
+        // equality, so each entry can capture nothing but itself.
+        //
+        // THAT IS NOT THE SAME AS "a widening here cannot re-open a hijack",
+        // which is what this comment claimed. Equality bounds the BLAST RADIUS to
+        // one sentence; it says NOTHING about whether that sentence is ordinary
+        // English. "is that reversible", added to the STATUS list below on exactly
+        // this reasoning, captured precisely itself — and itself was an ordinary
+        // question about anything reversible. It has been removed; see the note
+        // there. The real bar for an entry here is that the SENTENCE ITSELF carry
+        // an undo anchor, which every entry below does ("undo" / "revert" /
+        // "take ... back").
+        "undo the last thing you did",
+        "undo the last thing",
+        "undo what you just did",
+        "revert what you just did",
+        "take it back",
     ];
     if UNDO_PHRASES.contains(&t) {
         return Some(UndoCommand::UndoLast);
@@ -504,6 +522,19 @@ pub fn classify_undo_command(text: &str) -> Option<UndoCommand> {
         "can you undo",
         "is that undoable",
         "can that be undone",
+        // Same measured gap, same whole-utterance equality.
+        "undo status",
+        "what can be undone",
+        // NOT "is that reversible". It was added with the two above and then
+        // MEASURED to capture ordinary speech: unlike every other entry here it
+        // carries no undo/revert anchor at all, so a bare "is that reversible?" —
+        // about a vasectomy, a chemical reaction, a policy change, a decision —
+        // stopped being a question and became the undo status line. It is the one
+        // added phrase no probe in `daemon/fixtures/router_recall.json` exercises,
+        // so dropping it costs EXACTLY ZERO recall (measured: 142/200 before and
+        // after) and closes the one ordinary-speech capture the recall widening
+        // opened. Both fixtures now pin it: the sentence is in the ordinary corpus
+        // and the negative case is asserted below.
     ];
     if STATUS_PHRASES.contains(&t) {
         return Some(UndoCommand::Status);
@@ -656,6 +687,20 @@ fn short_desc(preview: &str, tool: &str) -> String {
 /// Build the secret-free `journal.snapshot` payload: the newest entries
 /// (preview text only — NEVER the raw input), each with its honest undo verdict.
 /// PURE over the store contents.
+///
+/// `count` is the SESSION TOTAL of consequential executions, derived from the
+/// monotonic `next_seq` — NOT the size of the retained ring.
+///
+/// WHAT WENT WRONG: this emitted `entries.len()`, and the HUD's JournalPanel
+/// renders that field verbatim as "N executed this session". The ring is capped
+/// at [`JOURNAL_CAP`] with evict-oldest ([`record_at`]), so from the 65th
+/// consequential action onward the field PINNED at 64 and stayed there for the
+/// rest of the session: the number was right about the ring and wrong about its
+/// own label, and it was wrong in the flattering direction (fewer consequential
+/// actions taken on the user's behalf than actually ran). `next_seq` is the only
+/// value that still means "this session" once the cap bites. `retained`/`cap` are
+/// emitted alongside so a TRUNCATED ledger is visibly distinct from a short one
+/// instead of silently identical to it.
 pub fn snapshot_payload() -> Value {
     let g = lock();
     let entries: Vec<Value> = g
@@ -680,7 +725,16 @@ pub fn snapshot_payload() -> Value {
             })
         })
         .collect();
-    json!({ "count": g.entries.len(), "entries": entries })
+    // next_seq is 1-based and only ever increments (clear_for_test resets it with
+    // the ring), so next_seq - 1 IS the number of consequential actions recorded
+    // this session — the thing the panel's label claims to be showing.
+    let executed = g.next_seq.saturating_sub(1);
+    json!({
+        "count": executed,
+        "retained": g.entries.len(),
+        "cap": JOURNAL_CAP,
+        "entries": entries,
+    })
 }
 
 /// Emit the `journal.snapshot` telemetry for the HUD panel. READ-ONLY — called
@@ -727,6 +781,46 @@ mod tests {
         assert_eq!(classify_undo_command("undo the volume change and then send it"), None);
         assert_eq!(classify_undo_command("what does undo mean"), None);
         assert_eq!(classify_undo_command(""), None);
+    }
+
+    /// RECALL — the phrasings a person reaches for that the shipped lists did
+    /// not hold. Measured on the checked-in probe set
+    /// (`daemon/fixtures/router_recall.json`): undo scored 3/6, and a miss is
+    /// terminal because the on-device intent classifier has no undo intent.
+    ///
+    /// This list is matched by WHOLE-UTTERANCE equality, so each added entry can
+    /// capture nothing but itself — the negative cases below still hold, which
+    /// is the point: this widening cannot re-open a hijack.
+    #[test]
+    fn the_natural_ways_to_ask_for_an_undo_reach_it() {
+        for u in [
+            "undo the last thing you did",
+            "Undo the last thing.",
+            "undo what you just did",
+            "revert what you just did",
+            "take it back",
+        ] {
+            assert_eq!(classify_undo_command(u), Some(UndoCommand::UndoLast), "{u:?}");
+        }
+        for u in ["undo status", "what can be undone"] {
+            assert_eq!(classify_undo_command(u), Some(UndoCommand::Status), "{u:?}");
+        }
+        // ...and the one phrasing that was added here and then MEASURED to capture
+        // ordinary speech. "is that reversible" carries no undo anchor, so it is a
+        // question about anything reversible, not a request for the undo status.
+        // It is exercised by no probe, so refusing it costs no recall. See the
+        // note on STATUS_PHRASES.
+        for u in ["is that reversible", "is that reversible?", "Is that reversible"] {
+            assert_eq!(classify_undo_command(u), None, "{u:?} must NOT trigger");
+        }
+        // ...and the sentences that merely CONTAIN one of them still fall through.
+        for u in [
+            "i'll take it back to the store tomorrow",
+            "undo the last thing you did to the config file by hand",
+            "is that reversible in the chemical sense",
+        ] {
+            assert_eq!(classify_undo_command(u), None, "{u:?} must NOT trigger");
+        }
     }
 
     // -- derive_inverse ------------------------------------------------------
@@ -903,6 +997,50 @@ mod tests {
         assert_eq!(g.entries.len(), JOURNAL_CAP);
         assert_eq!(g.entries.last().unwrap().seq, (JOURNAL_CAP + 6) as u64);
         assert_eq!(g.entries.first().unwrap().seq, 7);
+    }
+
+    /// REGRESSION: the snapshot's `count` is the SESSION TOTAL, not the ring size.
+    ///
+    /// The HUD's JournalPanel renders this field as "N executed this session". It
+    /// used to be `entries.len()`, which the evict-oldest cap PINS at JOURNAL_CAP
+    /// — so past the 65th consequential action the owner was told 64 forever, a
+    /// number that is right about the ring and false about its own label (and
+    /// wrong in the flattering direction). `retained`/`cap` make a TRUNCATED
+    /// ledger visibly distinct from a short one.
+    #[test]
+    fn snapshot_count_is_the_session_total_not_the_capped_ring_size() {
+        let _g = store_guard();
+        // Precondition: an empty session is an honest zero on every field.
+        let empty = snapshot_payload();
+        assert_eq!(empty["count"], 0);
+        assert_eq!(empty["retained"], 0);
+
+        // Under the cap the two agree — a short ledger is unchanged.
+        for i in 0..5 {
+            record("agent.a", "gads_pause_campaign", json!({"i": i}), &format!("preview {i}"));
+        }
+        let under = snapshot_payload();
+        assert_eq!(under["count"], 5);
+        assert_eq!(under["retained"], 5);
+
+        // Past the cap they DIVERGE: `retained` pins at the cap, `count` keeps
+        // counting the actions that actually executed.
+        let extra = 6usize;
+        for i in 0..(JOURNAL_CAP + extra - 5) {
+            record("agent.a", "gads_pause_campaign", json!({"j": i}), &format!("later {i}"));
+        }
+        let over = snapshot_payload();
+        assert_eq!(
+            over["count"],
+            (JOURNAL_CAP + extra) as u64,
+            "count must be every action executed this session, not the ring size"
+        );
+        assert_eq!(over["retained"], JOURNAL_CAP, "the ring itself is still capped");
+        assert_eq!(over["cap"], JOURNAL_CAP);
+        assert_ne!(
+            over["count"], over["retained"],
+            "past the cap a truncated ledger must be visibly distinct from a short one"
+        );
     }
 
     #[test]

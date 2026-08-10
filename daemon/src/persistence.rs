@@ -1155,6 +1155,11 @@ struct LastSnapshot {
     total: usize,
     self_n: usize,
     unsigned: usize,
+    /// How many autostart SURFACES this tick could not read. Carried so the
+    /// posture line can say the counts below are partial — an unreadable surface
+    /// contributes NO items, so without this the tally reads as a complete
+    /// inventory (see [`posture_line`]).
+    skipped: usize,
     gatekeeper: Gatekeeper,
 }
 
@@ -1168,11 +1173,32 @@ fn set_last_snapshot(snap: LastSnapshot) {
 
 /// A one-line persistence summary for `posture.rs`'s read-only report, or `None`
 /// if the sentinel has not ticked yet (so posture shows nothing stale).
-/// SECRET-FREE — counts + the Gatekeeper token only.
+/// SECRET-FREE — counts + the Gatekeeper token only, plus an honest note when a
+/// surface could not be read.
+///
+/// WHAT WENT WRONG: this stated the tally with no qualifier. Every collector
+/// degrades an unreadable surface to `(Vec::new(), Some(skip))` — login items
+/// without Automation consent, a busy `kmutil`, a `launchctl`/`crontab` timeout —
+/// so those surfaces contribute NO items and the counts silently describe a
+/// PARTIAL scan. The module already knew this everywhere else: `baseline_diff`
+/// takes `skipped` precisely because "a surface we could not READ tells us
+/// NOTHING", and the `security.persistence` frame carries `skips`. But
+/// `posture_line` is the one that gets SPOKEN, inside a readout the user asked
+/// for as a security check — and "0 unsigned/untrusted" from a scan that never
+/// opened the login-items surface reads as a clean bill of health. Mirrors
+/// `interception::posture_line`, which already appends exactly this note.
 pub fn posture_line() -> Option<String> {
     let s = (*LAST_SNAPSHOT.lock().ok()?)?;
+    let skip_note = if s.skipped == 0 {
+        String::new()
+    } else {
+        format!(
+            " ({} autostart surface(s) could not be read this scan — these counts cover only what was, not a clean bill of health)",
+            s.skipped
+        )
+    };
     Some(format!(
-        "Persistence sentinel: {} autostart item(s) ({} DARWIN self, {} unsigned/untrusted) · Gatekeeper {} — read-only",
+        "Persistence sentinel: {} autostart item(s) ({} DARWIN self, {} unsigned/untrusted) · Gatekeeper {} — read-only{skip_note}",
         s.total, s.self_n, s.unsigned, s.gatekeeper.wire()
     ))
 }
@@ -1202,7 +1228,14 @@ fn now_secs() -> i64 {
 async fn sentinel_tick(store: &PersistenceBaseline, assess_signing: bool, max_assess: usize) {
     let inv = build_inventory(assess_signing, max_assess).await;
     let (total, self_n, unsigned) = summarize(&inv.items);
-    set_last_snapshot(LastSnapshot { total, self_n, unsigned, gatekeeper: inv.gatekeeper });
+    set_last_snapshot(LastSnapshot {
+        total,
+        self_n,
+        unsigned,
+        // The counts above are over the surfaces this tick actually READ.
+        skipped: inv.skips.len(),
+        gatekeeper: inv.gatekeeper,
+    });
 
     let now = now_secs();
     // The surfaces this tick could NOT read. Both the diff and the store write need
@@ -1617,6 +1650,54 @@ mod tests {
             item("kext", "com.c.adhoc", Signedness::Adhoc, false),
         ];
         assert_eq!(summarize(&items), (4, 1, 2), "4 total, 1 self, 2 unsigned/untrusted");
+    }
+
+    /// REGRESSION: the SPOKEN posture line must not present a PARTIAL scan as a
+    /// complete inventory.
+    ///
+    /// A collector that cannot read its surface returns no items and an explicit
+    /// skip, so "0 unsigned/untrusted" can mean "looked, found none" or "never
+    /// looked" — and this line lands inside the security readout the user asked
+    /// for. `baseline_diff` already refuses to treat a skip as evidence and the
+    /// telemetry frame already carries `skips`; the readout is the surface that
+    /// still had to say it. Mirrors `interception::posture_line`'s skip note.
+    #[test]
+    fn the_posture_line_never_presents_a_partial_scan_as_a_clean_bill_of_health() {
+        // A scan that read everything states the tally plainly — no qualifier.
+        set_last_snapshot(LastSnapshot {
+            total: 12,
+            self_n: 3,
+            unsigned: 0,
+            skipped: 0,
+            gatekeeper: Gatekeeper::Enabled,
+        });
+        let clean = posture_line().expect("a cached summary");
+        assert!(clean.contains("12 autostart item(s)"), "got: {clean}");
+        assert!(clean.contains("0 unsigned/untrusted"), "got: {clean}");
+        assert!(
+            !clean.contains("could not be read"),
+            "a complete scan must not invent a skip note: {clean}"
+        );
+
+        // The SAME counts with surfaces skipped must say so — the zero is now
+        // "not measured", and the line must not read as a clean bill of health.
+        set_last_snapshot(LastSnapshot {
+            total: 12,
+            self_n: 3,
+            unsigned: 0,
+            skipped: 2,
+            gatekeeper: Gatekeeper::Enabled,
+        });
+        let partial = posture_line().expect("a cached summary");
+        assert!(
+            partial.contains("2 autostart surface(s) could not be read"),
+            "a partial scan must name how many surfaces it missed: {partial}"
+        );
+        assert!(
+            partial.contains("not a clean bill of health"),
+            "the note must say the counts are partial: {partial}"
+        );
+        assert_ne!(clean, partial, "a skipped surface must change what is said");
     }
 
     // -- durable store round-trip incl. set-replacement (removed) ------------

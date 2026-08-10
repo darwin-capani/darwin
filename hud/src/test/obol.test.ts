@@ -250,4 +250,40 @@ describe("SpendMeter gauge", () => {
     // No gauge bar is rendered without a cap (nothing to meter against).
     expect(html).not.toContain("spend-gauge-fill");
   });
+
+  /* REGRESSION: an UNREADABLE ledger must not render as a day with no spend.
+   *
+   * daemon/src/obol.rs::spend_report degrades every failed ledger read to
+   * 0.0 / 0 / no rows, so the unknown reaches this panel byte-identical to a quiet
+   * day — and this panel's own header says MEASURED, NEVER FABRICATED. The
+   * daemon-side guard is `an_unreadable_ledger_is_not_reported_as_a_day_with_no_spend`;
+   * this is its HUD half, because the render is what the owner actually reads. */
+  it("shows an explicit unknown, not $0.00, when the ledger could not be read", () => {
+    const base = {
+      day_spend_usd: 0,
+      daily_cap_usd: 0,
+      cap_configured: false,
+      pressure: "none",
+      will_step_down: false,
+      calls_today: 0,
+    };
+    const quiet = renderToStaticMarkup(
+      createElement(SpendMeter, { spend: parseObolSpend({ ...base, measured: true }) }),
+    );
+    const unknown = renderToStaticMarkup(
+      createElement(SpendMeter, { spend: parseObolSpend({ ...base, measured: false }) }),
+    );
+    // A genuinely quiet day still shows the MEASURED zero.
+    expect(quiet).toContain("~$0.00");
+    expect(quiet).toContain("MEASURED · REDUCE-ONLY");
+    // A ledger that could not be read renders an em dash where each ledger-derived
+    // figure was — never a dollar zero it cannot stand behind. ("$0.00" still
+    // occurs inside the explanatory tooltip; the point is that the VALUE is not one.)
+    expect(unknown).not.toContain("~$0.00");
+    expect(unknown).toContain(">—<");
+    expect(unknown).toContain("LEDGER UNREADABLE");
+    expect(unknown).toContain("spend-unmeasured");
+    expect(unknown).toContain("UNKNOWN, not zero");
+    expect(unknown).not.toBe(quiet);
+  });
 });
