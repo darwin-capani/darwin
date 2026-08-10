@@ -513,6 +513,26 @@ fn parse_time_window(lower: &str, now: &DateTime<Local>) -> Option<TimeWindow> {
             label: "the last hour".to_string(),
         });
     }
+    // MEASURED RECALL MISS: "what was i doing at lunch" reached NOTHING here (the
+    // recall cue matched, but the gate below also demands a WINDOW and no clause
+    // recognized "lunch"), and fell through to the recent screen-context ring —
+    // which holds minutes, not a named hour of the day. Lunch is a named period
+    // exactly like "this morning"/"this afternoon", so it is parsed as one:
+    // 11:30-13:30 local. Note this ONLY supplies a window; the gate still needs an
+    // independent recall cue, so no sentence becomes an aperture query by
+    // mentioning lunch.
+    if lower.contains("at lunch")
+        || lower.contains("over lunch")
+        || lower.contains("during lunch")
+        || lower.contains("lunchtime")
+        || lower.contains("lunch time")
+    {
+        return Some(TimeWindow {
+            start: local_unix_at(now, 11, 30),
+            end: local_unix_at(now, 13, 30),
+            label: "at lunch".to_string(),
+        });
+    }
     if lower.contains("earlier today") || lower.contains("so far today") || lower.contains("today") {
         return Some(TimeWindow {
             start: local_unix_at(now, 0, 0),
@@ -1064,6 +1084,27 @@ pub fn reset_for_test() {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): "what was i doing at lunch" reached
+    /// NOTHING here — the recall cue matched but the gate also demands a WINDOW and
+    /// nothing parsed "lunch" — so it fell through to the screen-context ring,
+    /// which holds minutes rather than a named hour of the day.
+    #[test]
+    fn lunch_is_a_named_time_window_and_alone_it_starts_no_recall() {
+        let q = build_query("what was i doing at lunch", &fixed_now());
+        let w = q.window.expect("a lunch window");
+        assert_eq!((w.start, w.end), (at(11, 30), at(13, 30)));
+        assert_eq!(w.label, "at lunch");
+        assert!(
+            classify_aperture_intent("what was i doing at lunch", &fixed_now()).is_some(),
+            "the recall must now reach aperture"
+        );
+        // A lunch MENTION with no recall cue is not an aperture query: the window
+        // clause only supplies a window, it never opens the gate.
+        for u in ["i had a sandwich at lunch and regretted it", "what's for lunch tomorrow"] {
+            assert!(classify_aperture_intent(u, &fixed_now()).is_none(), "{u:?}");
+        }
+    }
     /// A RECALL MUST NEVER BE HEARD AS A WIPE.
     ///
     /// The forget verbs were matched with `contains` over the whole utterance, so

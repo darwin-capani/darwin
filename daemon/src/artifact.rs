@@ -660,8 +660,22 @@ pub fn classify_peek_intent(utterance: &str) -> bool {
     // A peek at the artifact either names NOTHING (the object is understood) or
     // names a DEMONSTRATIVE / DARWIN's own output. An oven, an answer key and the
     // front pages are none of those.
-    const ARTIFACT_OBJECT: &[&str] =
-        &["that", "it", "this", "those", "them", "the output", "the result", "the draft"];
+    // MEASURED RECALL MISS: "peek at the last thing you made". The object IS
+    // DARWIN's own output, named the long way round instead of with a pronoun —
+    // exactly the case this list exists to admit. The possessive "you" is kept in
+    // the entry ON PURPOSE: "peek at the last thing in the fridge" names an
+    // object that is not DARWIN's and must stay refused.
+    // MEASURED HIJACK (adversary pass): "the last thing you" is a possessive,
+    // not a production claim — "let me peek at the last thing you ordered" was
+    // CLEAN at HEAD and captured. DARWIN's output is named by the VERB, so the
+    // verb is part of the entry.
+    const ARTIFACT_OBJECT: &[&str] = &[
+        "that", "it", "this", "those", "them", "the output", "the result", "the draft",
+        "the last thing you made", "the last thing you built",
+        "the last thing you wrote", "the last thing you generated",
+        "the last thing you produced", "the last one you made",
+        "the last one you built", "what you made", "what you built",
+    ];
     let peek_object_is_the_artifact = |after: &str| {
         let a = after.trim_start_matches(|c: char| !c.is_alphanumeric()).trim();
         a.is_empty()
@@ -672,6 +686,31 @@ pub fn classify_peek_intent(utterance: &str) -> bool {
             })
     };
     if lower == "peek" || lower.contains("quick look") || lower.contains("quicklook") {
+        return true;
+    }
+    // MEASURED RECALL MISS: "what was that last artifact" reached nothing — the
+    // recall stem below only models "what did/have YOU …", and this names the
+    // thing itself instead of the producer.
+    //
+    // ANCHORED ON THE DEMONSTRATIVE, not on the bare noun. "artifact" is an
+    // ordinary English word ("what was the last artifact they dug up in Giza"),
+    // and the difference between that sentence and this one is THAT: a
+    // demonstrative refers back to something in the conversation, which is
+    // precisely when the registry has the answer. "the last artifact" is
+    // deliberately NOT here.
+    // ...and the doc directly above says "ANCHORED ON THE DEMONSTRATIVE": two of
+    // the four entries carried no demonstrative and no back-reference at all.
+    // MEASURED HIJACK (adversary pass): "show me the most recent artifact they
+    // found at the dig" and "the latest artifact in the museum is a bronze
+    // mirror" were both CLEAN at HEAD and both captured. The superlatives keep
+    // their place only with the possessive that makes the artifact DARWIN's.
+    const ARTIFACT_NOUN_CUES: &[&str] = &[
+        "that last artifact",
+        "that artifact you",
+        "the latest artifact you",
+        "the most recent artifact you",
+    ];
+    if ARTIFACT_NOUN_CUES.iter().any(|c| lower.contains(c)) {
         return true;
     }
     if let Some(rest) = lower.split_once("peek").map(|(_, r)| r) {
@@ -725,6 +764,34 @@ pub fn classify_peek_intent(utterance: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): "peek at the last thing you made" and
+    /// "what was that last artifact" both reached NOTHING — the first names
+    /// DARWIN's output the long way round instead of with a pronoun, the second
+    /// names the artifact itself instead of its producer.
+    #[test]
+    fn the_long_way_of_naming_darwins_own_output_is_still_a_peek() {
+        for u in [
+            "peek at the last thing you made",
+            "let me peek at the last thing you built",
+            "what was that last artifact",
+            "show me the latest artifact you made",
+        ] {
+            assert!(classify_peek_intent(u), "{u:?}");
+        }
+        // The object must still be DARWIN's: an oven and a dig site are not.
+        for u in [
+            "let me peek at the last thing in the oven",
+            "what was the last artifact they dug up in giza",
+            // ADVERSARY NEGATIVES, both CLEAN at HEAD: a superlative is not a
+            // back-reference, and a possessive "you" is not a production verb.
+            "show me the most recent artifact they found at the dig",
+            "the latest artifact in the museum is a bronze mirror",
+            "let me peek at the last thing you ordered",
+        ] {
+            assert!(!classify_peek_intent(u), "{u:?}");
+        }
+    }
     use super::*;
 
     fn cite(title: &str, url: &str) -> Citation {

@@ -1290,6 +1290,31 @@ pub fn normalize_runbook_name(raw: &str) -> String {
 /// mentions "runbook" (or a path-shaped name) never triggers. PLAN is checked before
 /// RUN so a "plan" phrasing is never misread as a "run". Mirrors
 /// [`crate::macros::classify_macro_command`].
+/// "show me what the backup runbook would do" / "what would the release runbook
+/// do" — the PLAN (dry-run) request asked as a question. Returns the runbook name.
+///
+/// BOUNDED AT BOTH ENDS, and both bounds are load-bearing: the utterance must
+/// OPEN with a show/ask frame and the name must be immediately followed by the
+/// literal noun "runbook" plus a would-do tail. Dropping either end would make
+/// this the widest gate in the file — "show me what the neighbours would do" has
+/// the frame, and "the backup runbook" alone is a noun phrase, not a request.
+/// Pure. Resolves to PLAN (read-only), never RUN.
+fn plan_dry_run_name(t: &str) -> Option<String> {
+    const FRAMES: &[&str] = &[
+        "show me what the ", "show me what my ", "show what the ", "show what my ",
+        "tell me what the ", "tell me what my ",
+        "what would the ", "what would my ", "what does the ", "what does my ",
+    ];
+    const TAILS: &[&str] = &["would do", "would run", "will do", "does", "do"];
+    let rest = FRAMES.iter().find_map(|f| t.strip_prefix(f))?;
+    let (name, tail) = rest.split_once(" runbook ")?;
+    if !TAILS.contains(&tail.trim()) {
+        return None;
+    }
+    let name = normalize_runbook_name(name);
+    (!name.is_empty()).then_some(name)
+}
+
 pub fn classify_runbook_command(text: &str) -> Option<RunbookCommand> {
     let t = text.trim().to_lowercase();
     let t = t.trim_end_matches(['.', '!', '?']).trim();
@@ -1313,6 +1338,13 @@ pub fn classify_runbook_command(text: &str) -> Option<RunbookCommand> {
         t,
         &["plan the ", "plan my ", "plan ", "preview the ", "preview my ", "preview "],
     ) {
+        return Some(RunbookCommand::Plan { name });
+    }
+    // ...and the DRY-RUN QUESTION, which is the same read-only request asked as a
+    // question instead of an order. MEASURED RECALL MISS: "show me what the backup
+    // runbook would do" reached nothing — the safest thing a person can ask about
+    // a runbook, and the one phrasing that had no route.
+    if let Some(name) = plan_dry_run_name(t) {
         return Some(RunbookCommand::Plan { name });
     }
 
@@ -1428,6 +1460,30 @@ pub fn classify_step_outcome(consequential: bool, out: String, is_error: bool) -
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): "show me what the backup runbook would
+    /// do" reached NOTHING — the safest thing anyone can ask about a runbook, and
+    /// the one phrasing with no route. It resolves to PLAN (read-only), never RUN.
+    #[test]
+    fn the_dry_run_question_resolves_to_plan_and_never_to_run() {
+        for u in [
+            "show me what the backup runbook would do",
+            "what would the release runbook do",
+            "tell me what my backup runbook would do",
+        ] {
+            match classify_runbook_command(u) {
+                Some(RunbookCommand::Plan { name }) => assert!(!name.is_empty(), "{u:?}"),
+                other => panic!("expected Plan for {u:?}, got {other:?}"),
+            }
+        }
+        // BOTH ends are required: the frame alone is not a runbook request.
+        for u in [
+            "show me what the neighbours would do in that situation",
+            "what would the coach do with a lineup like that",
+        ] {
+            assert!(classify_runbook_command(u).is_none(), "{u:?}");
+        }
+    }
     use super::*;
 
     // A compact registry for the parser/checker tests: one benign read tool, one pure

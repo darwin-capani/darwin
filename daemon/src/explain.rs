@@ -377,6 +377,26 @@ pub fn classify_explain_intent(text: &str) -> Option<ExplainQuery> {
 /// `<name>` is always a single alphabetic token that is NOT a pronoun/filler.
 fn agent_query(t: &str) -> Option<String> {
     let words: Vec<&str> = t.split_whitespace().collect();
+    // 1a. "explain <name>'s decision|reasoning|call|choice".
+    //
+    // MEASURED RECALL MISS: "explain gecko's decision" reached nothing. Every
+    // branch below demanded that the utterance OPEN with "why", so the imperative
+    // form of the same question — which the LAST_PHRASES table already models for
+    // DARWIN itself ("explain your last decision") — had no per-agent analogue.
+    //
+    // BOUNDED AT BOTH ENDS: the utterance must open with "explain", the token
+    // after it must be a possessive agent NAME, and the noun it possesses must be
+    // a DECISION noun. "explain gecko's habitat" and "explain the decision" are
+    // both refused — the first has no decision noun, the second no name.
+    if words.first() == Some(&"explain") && words.len() >= 3 {
+        if let Some(stem) = words[1].strip_suffix("'s").or_else(|| words[1].strip_suffix("s'")) {
+            const DECISION_NOUNS: &[&str] =
+                &["decision", "decisions", "reasoning", "call", "choice", "answer", "rationale"];
+            if is_name_token(stem) && DECISION_NOUNS.contains(&words[2]) {
+                return Some(stem.to_string());
+            }
+        }
+    }
     if words.first() != Some(&"why") {
         return None;
     }
@@ -523,6 +543,33 @@ pub fn payload(query: &ExplainQuery, trace: Option<&DecisionTrace>) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): "explain gecko's decision" reached
+    /// NOTHING — every agent branch demanded the utterance OPEN with "why", so the
+    /// imperative form that LAST_PHRASES already models for DARWIN itself had no
+    /// per-agent analogue.
+    #[test]
+    fn explain_a_named_agents_decision_is_an_agent_query() {
+        for (u, want) in [
+            ("explain gecko's decision", "gecko"),
+            ("explain friday's reasoning", "friday"),
+            ("Explain Gecko's call.", "gecko"),
+        ] {
+            assert_eq!(classify_explain_intent(u), Some(ExplainQuery::Agent(want.to_string())), "{u:?}");
+        }
+        // BOTH ends are required: a name with no decision noun, and a decision
+        // noun with no name, are each refused.
+        for u in [
+            "explain darwin's theory of evolution to me",
+            "explain gecko's habitat in simple terms",
+            "explain the decision",
+        ] {
+            assert!(
+                !matches!(classify_explain_intent(u), Some(ExplainQuery::Agent(_))),
+                "{u:?}"
+            );
+        }
+    }
     use super::*;
 
     fn signals() -> TurnSignals {

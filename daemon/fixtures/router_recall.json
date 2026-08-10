@@ -34,7 +34,7 @@
 
   {"gate": "vault", "expect": "on", "text": "go dark"},
   {"gate": "vault", "expect": "on", "text": "vault mode"},
-  {"gate": "vault", "expect": "on", "text": "private mode on"},
+  {"gate": "model_tier", "expect": "local", "text": "private mode on"},
   {"gate": "vault", "expect": "on", "text": "engage vault mode"},
   {"gate": "vault", "expect": "off", "text": "come out of vault mode"},
   {"gate": "vault", "expect": "off", "text": "turn private mode off"},
@@ -140,8 +140,10 @@
   {"gate": "mirror", "expect": "explain", "text": "what is your model of me"},
   {"gate": "mirror", "expect": "contest", "text": "you're wrong about my interest in rust"},
   {"gate": "mirror", "expect": "contest", "text": "that's wrong about my music taste"},
-  {"gate": "mirror", "expect": "clear", "text": "forget what you think you know about my music taste"},
-  {"gate": "mirror", "expect": "clear", "text": "clear your model of my interests"},
+  {"gate": "mirror", "expect": "contest", "text": "forget what you think you know about my music taste"},
+  {"gate": "mirror", "expect": "contest", "text": "clear your model of my interests"},
+  {"gate": "mirror", "expect": "clear", "text": "actually you were right about my interest in rust"},
+  {"gate": "mirror", "expect": "clear", "text": "you can learn about my music taste again"},
 
   {"gate": "rollcall", "expect": "rollcall", "text": "roll call"},
   {"gate": "rollcall", "expect": "rollcall", "text": "who's on the team"},
@@ -152,7 +154,7 @@
   {"gate": "agentquery", "expect": "agentquery", "text": "what does gecko do"},
   {"gate": "agentquery", "expect": "agentquery", "text": "who would handle a markets question"},
 
-  {"gate": "describe", "expect": "screen", "text": "what's on my screen"},
+  {"gate": "lumen", "expect": "read", "text": "what's on my screen"},
   {"gate": "describe", "expect": "screen", "text": "describe my screen"},
   {"gate": "describe", "expect": "screen", "text": "tell me what you see on my screen"},
   {"gate": "describe", "expect": "image", "text": "describe ~/Desktop/photo.png"},

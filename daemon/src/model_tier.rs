@@ -1163,6 +1163,26 @@ fn match_control_phrase(text: &str) -> Option<ModelSwapIntent> {
         "automatic model",
         "automatically pick",
         "automatically choose",
+        // MEASURED RECALL MISSES. Both are head-anchored like every entry here,
+        // so they command and never report:
+        //   "go back to automatic model selection" — "back to auto" does not
+        //     match ("automatic" != "auto" at the word boundary) and "automatic
+        //     model" is not at the head, so the whole phrasing fell through.
+        //   "pick the model yourself" — the mirror of "pick the model for me",
+        //     which was already here.
+        // NOTE the word "model". MEASURED HIJACK (adversary pass): a bare "back
+        // to automatic" captured "back to automatic pilot then" — CLEAN at HEAD
+        // — and flipped the model override on an ordinary sentence. "automatic"
+        // qualifies dozens of nouns; only the one this module owns is admitted.
+        "go back to automatic model",
+        "back to automatic model",
+        "go back to automatic selection",
+        "back to automatic selection",
+        "automatic model selection",
+        "pick the model yourself",
+        "choose the model yourself",
+        "you pick the model",
+        "you choose the model",
     ];
     if AUTO_PHRASES.iter().any(|p| opens_with_phrase(text, p)) {
         return Some(ModelSwapIntent::Auto);
@@ -1190,6 +1210,20 @@ fn match_control_phrase(text: &str) -> Option<ModelSwapIntent> {
         "off the grid",
         "local model only",
         "local only",
+        // MEASURED RECALL MISS: "don't use the cloud" reached nothing. This is a
+        // NEGATED form, and the doc above rightly refuses to peel "don't" as a
+        // wrapper (that is what turned "don't go offline" INTO a go-offline). The
+        // safe way to hold it is as a WHOLE literal phrase whose negation is part
+        // of the phrase: the head must literally be "don't use the cloud", so
+        // "don't go offline" still peels to nothing and still returns None.
+        "don't use the cloud",
+        "dont use the cloud",
+        "do not use the cloud",
+        // A bare "no cloud" is NOT here, and the reason is a measured negative:
+        // `opens_with_phrase` would accept "no cloud cover means it'll be cold
+        // tonight" — an ordinary weather sentence — and take the turn offline.
+        "stay off the cloud",
+        "keep it off the cloud",
     ];
     if LOCAL_PHRASES.iter().any(|p| opens_with_phrase(text, p)) {
         return Some(ModelSwapIntent::Local);
@@ -1219,6 +1253,22 @@ fn match_control_phrase(text: &str) -> Option<ModelSwapIntent> {
         "power mode",
         "heavy mode",
         "go heavy",
+        // MEASURED RECALL MISS: "think harder about this one" — the way people
+        // actually ask for the capable model — reached nothing. Head-anchored, so
+        // it is an IMPERATIVE: "i wish you would think harder" reports and does
+        // not open the utterance, and "think harder" is not a phrase an ordinary
+        // declarative sentence begins with.
+        // NOTE the trailing preposition. MEASURED HIJACK (adversary pass): a
+        // bare "think harder" is head-anchored but head-anchoring only proves
+        // the utterance OPENS with it — "think harder, that's what my dad always
+        // said" was CLEAN at HEAD and captured, and Heavy is the CLOUD tier
+        // (`Tier::Heavy` -> `[cloud].heavy_model`), so an ordinary sentence sent
+        // the turn off the device. The imperative that means it takes an object.
+        "think harder about",
+        "think harder on",
+        "think harder please",
+        "think about this harder",
+        "think this through harder",
     ];
     if HEAVY_PHRASES.iter().any(|p| opens_with_phrase(text, p)) {
         return Some(ModelSwapIntent::Heavy);
@@ -1253,6 +1303,44 @@ fn match_control_phrase(text: &str) -> Option<ModelSwapIntent> {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): four model-control phrasings reached
+    /// NOTHING — "think harder about this one" (heavy), "don't use the cloud"
+    /// (local), "go back to automatic model selection" and "pick the model
+    /// yourself" (auto). Each negative below is a sentence the added phrase could
+    /// otherwise have swallowed, and "no cloud cover means it'll be cold tonight"
+    /// is why the bare phrase "no cloud" is NOT in LOCAL_PHRASES.
+    #[test]
+    fn recall_miss_phrasings_classify_and_their_ordinary_neighbours_do_not() {
+        use ModelSwapIntent::*;
+        for (u, want) in [
+            ("think harder about this one", Heavy),
+            ("don't use the cloud", Local),
+            ("stay off the cloud", Local),
+            ("go back to automatic model selection", Auto),
+            ("pick the model yourself", Auto),
+            ("choose the model yourself", Auto),
+        ] {
+            assert_eq!(classify_model_swap(u), Some(want), "{u:?}");
+        }
+        for u in [
+            // ADVERSARY NEGATIVES, both CLEAN at HEAD: head-anchoring alone does
+            // not make a phrase an imperative, and Heavy is the CLOUD tier.
+            "think harder, that's what my dad always said",
+            "back to automatic pilot then",
+            "i should think harder about where this is going",
+            "you always make me think harder than i want to",
+            "my coach told me to think harder about my next move",
+            "i don't use the cloud for my photos anymore",
+            "no cloud cover means it'll be cold tonight",
+            "there's no cloud in the sky today",
+            "the car went back to automatic transmission after the repair",
+            "the sprinklers went back to automatic last week",
+            "the agency lets clients pick the model themselves",
+        ] {
+            assert_eq!(classify_model_swap(u), None, "ordinary speech must not swap the model: {u:?}");
+        }
+    }
     use super::*;
     use crate::obol::Pressure;
 

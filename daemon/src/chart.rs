@@ -236,8 +236,14 @@ pub fn classify_chart_intent(utterance: &str) -> Option<ChartIntent> {
     // snapshot — CPU % and memory % — so the subject is that or the demonstrative
     // standing in for it. "load" is matched WHOLE: as a substring it is inside
     // downLOAD, upLOAD and workLOAD.
+    // MEASURED RECALL MISS: "chart that for me" reached nothing — "this" was
+    // accepted as the demonstrative standing in for the live reading and "that"
+    // was not, even though both refer to the same thing in the same position.
+    // The verb-must-lead rule above is what keeps this safe: a noun-role "chart"
+    // ("my cholesterol chart from the clinic") never opens its own sentence.
     let whole = |w: &str| crate::utterance::mentions_word(lower, w);
     let chartable = whole("this")
+        || whole("that")
         || lower.contains("system load")
         || whole("cpu")
         || whole("memory")
@@ -287,6 +293,24 @@ pub fn chart_from_snapshot(snapshot: Option<crate::telemetry::SystemSnapshot>) -
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): "chart that for me" reached NOTHING —
+    /// "this" was accepted as the demonstrative standing in for the live reading
+    /// and "that" was not, though both refer to the same thing in the same slot.
+    #[test]
+    fn that_is_a_chartable_demonstrative_when_the_verb_leads() {
+        for u in ["chart that for me", "plot that", "graph that please"] {
+            assert_eq!(classify_chart_intent(u), Some(ChartIntent), "{u:?}");
+        }
+        // The verb-must-lead rule is what keeps the noun role out.
+        for u in [
+            "the chart that shows the decline is misleading",
+            "that graph in the newspaper was wrong",
+            "my cholesterol chart from the clinic looked fine",
+        ] {
+            assert_eq!(classify_chart_intent(u), None, "{u:?}");
+        }
+    }
     use super::*;
 
     fn line_spec() -> ChartSpec {

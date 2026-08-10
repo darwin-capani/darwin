@@ -444,16 +444,53 @@ mod tests {
         // MEASURED FLOOR. At HEAD 39c8101 this was 129/200 (64.5%) — the first
         // time router recall had a number at all. Three fixes (macros + runbooks
         // accepting the name BEFORE the noun, and the undo phrase lists holding
-        // the phrasings people use) took it to 142/200 (71.0%) with the
-        // ordinary-speech corpus still at 0 captures. The remaining 58 misses are
-        // documented, not forgotten: several are deliberate refusals (the camera
-        // watch is not widened on purpose — turning capture ON is a posture
-        // decision, not a recall fix), and several are cross-gate precedence
-        // rather than a dead end.
+        // the phrasings people use) took it to 142/200, then 145/200 (72.5%).
         //
-        // NAMED, NOT FIXED — one entry in the miss list above is worse than a
-        // miss and is an OWNER DECISION rather than a recall fix. "disengage
-        // lockdown" does not merely fail to unlock: it fires
+        // THE MISS-LIST SWEEP took it to 192/202 (95.0%). Every one of the 55
+        // misses the harness printed was read against the code that produced it.
+        // 45 of them are now hits — 43 closed by a classifier fix, and 2 by a
+        // LABEL correction alone (the utterance already reached the capability
+        // that is the right answer; see `no_recall_hit_is_shadowed_by_an_earlier
+        // _gate` for all four label corrections). The remaining 10 are named here
+        // rather than left to be rediscovered.
+        //
+        // The ordinary-speech corpus grew 172 -> 244 in the same change: every
+        // widening contributed the ordinary sentences it could newly swallow, and
+        // `ordinary_speech_reaches_no_gate` is still at 0 captures. Two probes
+        // were ADDED for `MirrorIntent::Clear`, whose only two probes turned out
+        // to be mislabelled contests — the variant would otherwise have been left
+        // with no coverage at all.
+        //
+        // MEASURED, not inferred: HEAD (39c8101 + ff17b40) run against THIS
+        // 202-probe fixture scores 149/202. So the code fixes are worth +43 and
+        // the fixture changes account for the other +4 of the 145 -> 192 move.
+        //
+        // THE 10 THAT REMAIN, and why:
+        //   * POSTURE, DELIBERATELY REFUSED (7). "turn on the camera" / "keep an
+        //     eye on the camera" (arming a lens is a consent decision);
+        //     "stand down" / "disengage lockdown" (loosening the emergency stop);
+        //     "come out of vault mode" / "turn private mode off" (re-enabling
+        //     cloud egress); "make a voice that sounds like me" (ships a sample
+        //     to a third party). Each is a decision for the owner, not a recall
+        //     fix. NOTE the SHIPPED direction of each pair IS closed: "turn the
+        //     camera off" now stops the watch, because turning capture off
+        //     removes a capability rather than granting one.
+        //   * CAPABILITY DOES NOT COVER IT (2). "plot the last week of battery
+        //     life" — `chart_from_snapshot` reads ONE telemetry snapshot (cpu %
+        //     and memory %); there is no battery series and no history, so firing
+        //     the gate would answer a battery question with a two-bar "System
+        //     load" chart. "play some lo-fi music" — the only music capability is
+        //     COMPOSE (`classify_music_intent` + an ElevenLabs generation);
+        //     nothing plays a library, and the router's own doc refuses play
+        //     requests on purpose. Both are honest NO-GOs, not phrase gaps.
+        //   * ANCHORLESS (1). "who would handle a markets question" carries
+        //     neither the word "agent" nor an agent's name, and "who handles X"
+        //     is ordinary English ("who handles the payroll at your company").
+        //     Admitting it would answer a question about the owner's colleagues
+        //     out of DARWIN's roster.
+        //
+        // NAMED, NOT FIXED — "disengage lockdown" is worse than a miss and is an
+        // OWNER DECISION. It does not merely fail to unlock: it fires
         // `lockdown::is_panic_intent` and ENGAGES the panic lockdown. The token
         // "lockdown" is a PANIC phrase, and the unlock veto inside
         // `is_panic_intent` only spares the spellings listed in `UNLOCK_PHRASES`
@@ -465,7 +502,7 @@ mod tests {
         //
         // Raise this ONLY with a fresh measurement. Lowering it is the regression
         // this test exists to catch.
-        const FLOOR_HIT: usize = 142;
+        const FLOOR_HIT: usize = 192;
         assert!(
             hit >= FLOOR_HIT,
             "router recall regressed: {hit}/{total} < {FLOOR_HIT}"
@@ -487,6 +524,24 @@ mod tests {
     /// Vision deliberately ("a control read/act is Lumen's"). The LABEL was
     /// corrected, not the router; the total is unchanged because the probe still
     /// hits under its true owner.
+    ///
+    /// THE MISS-LIST SWEEP corrected three more labels the same way, each because
+    /// the utterance already reached a capability that IS the right answer:
+    ///   * "what's on my screen" was labelled `describe`/`screen` (the VLM
+    ///     caption). It is an OCR read — `vision_command`'s own doc says so
+    ///     ("Checked before the presence status so 'what's on my screen' is an
+    ///     OCR read") — and Lumen takes it first, for the same control-read
+    ///     reason as "read my screen". Relabelled `lumen`/`read`.
+    ///   * "private mode on" was labelled `vault`/`on`. `model_tier` owns
+    ///     "private mode" deliberately and resolves it to `Local` ("Work offline
+    ///     / on-device / privately — NO cloud call"), and `model_tier` is
+    ///     consulted first. Relabelled `model_tier`/`local`.
+    ///   * "forget what you think you know about my music taste" and "clear your
+    ///     model of my interests" were labelled `mirror`/`clear`. `Clear` is the
+    ///     UN-contest (it LIFTS a suppression so a belief may be re-derived);
+    ///     both utterances ask for the belief to be DROPPED, which is `Contest`.
+    ///     Relabelled, and two real `clear` probes added so the variant keeps
+    ///     coverage.
     ///
     /// CAVEAT, so this is not read as more than it is: `voiceid`, `voiceclone` and
     /// `guest` are consulted in `main.rs` BEFORE `route()` yet sit at the END of
@@ -536,3 +591,4 @@ mod tests {
         );
     }
 }
+

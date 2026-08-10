@@ -434,7 +434,14 @@ pub fn parse_whisper_command(utterance: &str) -> Option<WhisperCommand> {
         return None;
     }
     // OFF phrases first (precedence): a "back to normal" must never read as "on".
-    const OFF: &[&str] = &["back to normal", "speak normally", "speak up", "out loud", "normal voice"];
+    // MEASURED RECALL MISS: "stop whispering" — the literal inverse of the "start
+    // whispering" that was already an ON phrase — reached nothing, so a user who
+    // turned whisper mode on could not turn it off with the obvious sentence.
+    const OFF: &[&str] = &[
+        "back to normal", "speak normally", "speak up", "out loud", "normal voice",
+        "stop whispering", "stop the whispering", "quit whispering",
+        "stop whisper mode", "turn off whisper mode",
+    ];
     if ends_with_phrase(u, OFF) {
         return Some(WhisperCommand::Off);
     }
@@ -445,6 +452,9 @@ pub fn parse_whisper_command(utterance: &str) -> Option<WhisperCommand> {
         "whisper mode", "whisper to me", "whisper it", "start whispering",
         "speak quietly", "speak softly", "be discreet", "discreet mode",
         "keep it down", "keep your voice down", "lower your voice",
+        // MEASURED RECALL MISS: "talk quietly". "speak quietly"/"speak softly"
+        // were here; the equally common "talk" verb was not.
+        "talk quietly", "talk softly", "talk quieter", "speak quieter",
     ];
     if ends_with_phrase(u, ON) {
         return Some(WhisperCommand::On);
@@ -627,6 +637,26 @@ pub fn emit_telemetry(profile: ProsodyProfile, backend: &Backend, shape: &SpeakS
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): "talk quietly" (on) and "stop
+    /// whispering" (off) both reached NOTHING, so whisper mode could be entered
+    /// with one phrasing and not left with its literal inverse.
+    #[test]
+    fn talk_quietly_enters_whisper_mode_and_stop_whispering_leaves_it() {
+        for u in ["talk quietly", "talk softly", "talk quieter", "speak quieter"] {
+            assert_eq!(parse_whisper_command(u), Some(WhisperCommand::On), "{u:?}");
+        }
+        for u in ["stop whispering", "quit whispering", "stop whisper mode"] {
+            assert_eq!(parse_whisper_command(u), Some(WhisperCommand::Off), "{u:?}");
+        }
+        for u in [
+            "please talk quietly in the library",
+            "the twins never stop whispering during the movie",
+            "i could hear them whispering all night",
+        ] {
+            assert_eq!(parse_whisper_command(u), None, "ordinary speech: {u:?}");
+        }
+    }
     use super::*;
     use crate::config::Config;
     use crate::voice_tier::Backend;

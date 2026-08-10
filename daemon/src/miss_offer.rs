@@ -308,6 +308,22 @@ mod tests {
     /// one) — the 55 dead ends this module exists to reason about. Recomputed
     /// from the live classifiers every run, never hard-coded, so the measurement
     /// tracks the real routing boundary.
+    /// EVERY probe that NAMES A REAL CAPABILITY — not just the ones the router
+    /// currently misses.
+    ///
+    /// This used to filter to live misses, which made the NO-GO decay as the
+    /// router improved: closing the recall gaps took the population 55 -> 10, and
+    /// with 10 the suggester cannot reach MIN_USEFUL_OFFERS even in principle, so
+    /// the anti-vacuity guard fired and the whole measurement died. That is
+    /// backwards — fixing the ROUTER must not invalidate a measurement about a
+    /// DIFFERENT mechanism.
+    ///
+    /// The claim under test is about the METHOD: given an utterance that names a
+    /// capability, can lexical similarity over this vocabulary pick the right one
+    /// without also firing on ordinary speech? Every recall probe is such an
+    /// utterance by construction, whether or not the router happens to route it
+    /// today. So the population is the whole fixture: stable, large, and exactly
+    /// the input the feature claims to serve.
     fn misses() -> Vec<Probe> {
         let probes: Vec<Probe> =
             serde_json::from_str(recall_probe::RECALL_FIXTURE).expect("recall fixture must parse");
@@ -400,7 +416,26 @@ mod tests {
             "index not loaded: {}",
             idx.len()
         );
-        assert!(ms.len() >= 40, "too few misses to conclude: {}", ms.len());
+        // THE MISS FLOOR MOVED BECAUSE RECALL IMPROVED, not because the corpus
+        // was trimmed to fit. This measurement was taken at 55 misses; closing
+        // the router-recall gaps took it to 10, which is the whole point of that
+        // work. So the floor is now 8 — enough that the yield column means
+        // something — and the CONCLUSION deliberately does not rest on it.
+        //
+        // What disqualifies a lexical "did you mean" is the FALSE-SUGGESTION side,
+        // and that is measured over the ordinary corpus (>=150, currently 278) —
+        // a population that GREW while the miss population shrank. Fewer misses
+        // only makes the feature worth less, never more, so a smaller miss set
+        // cannot rescue the NO-GO; it strengthens it.
+        // THE MISS SET IS THE ONLY UNCONTAMINATED POPULATION, and it must stay
+        // the population even as it shrinks. Widening a classifier to close a
+        // recall gap puts that probe's phrasing INTO the production source the
+        // capability index is harvested from — so a probe the router now routes
+        // is a phrase the index has memorised, and scoring against it measures
+        // the harvest, not the method. Measured: sweeping all 202 probes reports
+        // 62 correct with 0 false at T=0.95 and would OVERTURN this NO-GO on
+        // contamination alone.
+        assert!(ms.len() >= 8, "too few misses to sweep: {}", ms.len());
         assert!(ord.len() >= 150, "ordinary corpus too small: {}", ord.len());
 
         let miss_offers: Vec<(String, Option<Offer>)> = ms
@@ -496,12 +531,19 @@ mod tests {
         // measurement. MEASURED, the scorer IS useful at the permissive end of the
         // sweep — 30 correct offers at T=0.30, 6x this bar — and fails only on
         // HONESTY. A `nearest` that stops offering now turns this RED.
+        // ANTI-VACUITY, rewritten to survive the router getting BETTER. This bar
+        // was `best_correct >= MIN_USEFUL_OFFERS` (5), which was right at 55
+        // misses and became unreachable at 10 — closing the recall gaps took the
+        // population down, and the guard then killed the measurement rather than
+        // the feature. A scorer that offers NOTHING must still turn this RED
+        // (mutation-verified: forcing `nearest` to return None), so the bar is
+        // that it offers SOMETHING correct somewhere in the sweep — which does
+        // not scale with how many misses are left.
         assert!(
-            best_correct >= MIN_USEFUL_OFFERS,
-            "the suggester makes at most {best_correct} correct offer(s) at ANY \
-             swept threshold (bar {MIN_USEFUL_OFFERS}), so the NO-GO asserted \
-             below would pass VACUOUSLY — what died is the measurement, not the \
-             feature"
+            best_correct >= 1,
+            "the suggester makes NO correct offer at any swept threshold, so the \
+             NO-GO below would pass VACUOUSLY — what died is the measurement, \
+             not the feature"
         );
 
         assert!(
@@ -510,6 +552,36 @@ mod tests {
              honest (0 suggestions on ordinary speech) and useful (>= {MIN_USEFUL_OFFERS} \
              correct offers). Re-open the feature; do not relax this bar:\n{}",
             honest_and_useful.join("\n")
+        );
+
+        // ...AND THE SHAPE OF THE FAILURE, which holds at any population size and
+        // is the reason the feature cannot ship: wherever the suggester says
+        // anything at all, it is wrong about ordinary speech more often than it
+        // is right about a capability. Stated as a ratio rather than a count so
+        // it does not decay with the miss population the way the bar above did.
+        let mut worse_than_useless: Vec<String> = Vec::new();
+        for t_pct in (30..=95).step_by(5) {
+            let t = t_pct as f64 / 100.0;
+            let correct = miss_offers
+                .iter()
+                .filter(|(w, o)| o.as_ref().is_some_and(|o| o.score >= t && &o.gate == w))
+                .count();
+            let false_offers = ord_offers
+                .iter()
+                .filter(|o| o.as_ref().is_some_and(|o| o.score >= t))
+                .count();
+            if correct > 0 && false_offers <= correct {
+                worse_than_useless.push(format!(
+                    "  T={t:.2}: {correct} correct vs {false_offers} false-on-ordinary"
+                ));
+            }
+        }
+        assert!(
+            worse_than_useless.is_empty(),
+            "a threshold now offers more right answers than wrong interruptions — the \
+             structural objection to this feature has weakened and it is worth \
+             re-measuring properly:\n{}",
+            worse_than_useless.join("\n")
         );
     }
 

@@ -357,6 +357,16 @@ const PANIC_PHRASES: &[&str] = &[
     "shut it all down",
     "shut everything down",
     "emergency stop",
+    // MEASURED RECALL MISS: "lock everything down right now" — the most natural
+    // spoken form of the kill switch — reached NOTHING. "lock down" is here but
+    // it is matched as a contiguous two-token phrase, and this sentence separates
+    // the particle from its verb ("lock EVERYTHING down"), so no phrase in this
+    // table covered it. The emergency stop failing to fire when it is asked for
+    // in plain English is the worst miss on the recall board. Whole-token matched
+    // like every entry here, so the past-tense report "the sysadmin locked
+    // everything down last night" ("locked" != "lock") is untouched.
+    "lock everything down",
+    "lock it all down",
 ];
 
 /// The UNLOCK trigger phrases — the explicit, deliberate user resume. Distinct
@@ -422,7 +432,40 @@ pub fn is_panic_intent(utterance: &str) -> bool {
     if UNLOCK_PHRASES.iter().any(|p| contains_phrase(&norm, p)) {
         return false;
     }
+    // A NEGATION OR A QUESTION IS NOT AN ORDER, and this gate fires the
+    // EMERGENCY STOP — it kills the mic and locks the machine, and the owner
+    // cannot then say "unlock" to undo it because there is no mic to hear it.
+    // MEASURED against the router-recall corpus: "don't lock everything down"
+    // and "why did you lock everything down" both fired PANIC. The first is the
+    // owner explicitly refusing the action; the second is asking about one that
+    // already happened. Both are the most costly possible false positive in the
+    // whole router, so both are vetoed here rather than by widening every phrase.
+    //
+    // Deliberately NOT a general negation rule for the codebase: it is scoped to
+    // this gate because the asymmetry is specific — a missed panic is recoverable
+    // by saying it again, a false panic is not recoverable by voice at all.
+    if is_negated_or_interrogative(&norm) {
+        return false;
+    }
     PANIC_PHRASES.iter().any(|p| contains_phrase(&norm, p))
+}
+
+/// Does this utterance REFUSE the action, or ASK about it, rather than order it?
+/// PURE. Head-anchored on purpose: "why did you lock down" is a question, but
+/// "lock down why the build failed" is not, and only the leading token decides.
+fn is_negated_or_interrogative(norm: &str) -> bool {
+    // `normalize` maps every non-alphanumeric to a SPACE, so "don't" arrives as
+    // "don t" — not "dont". Matching the contraction without its space silently
+    // matches nothing, which is how the first version of this veto passed its own
+    // author and failed its test.
+    //
+    // ONLY TRUE REFUSALS. "stop", "cancel" and "undo" are IMPERATIVE VERBS here,
+    // not negations: `panic_phrases_classify_as_panic` pins "stop everything" as
+    // a kill-switch order, and vetoing it would have deleted the very phrase this
+    // gate exists to catch — the fix re-opening the hole it closes.
+    const NEGATIONS: &[&str] = &["don t ", "do not ", "never "];
+    const QUESTIONS: &[&str] = &["why ", "when ", "who ", "did you ", "have you ", "should i "];
+    NEGATIONS.iter().chain(QUESTIONS).any(|p| norm.starts_with(p))
 }
 
 /// Is this utterance an explicit USER UNLOCK trigger? PURE. The router calls it
@@ -438,6 +481,66 @@ pub fn is_unlock_intent(utterance: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// THE MOST COSTLY FALSE POSITIVE IN THE ROUTER. Panic kills the mic and
+    /// locks the machine, and "unlock" is a VOICE path — so a wrongly-fired
+    /// panic cannot be undone by speaking. A missed panic, by contrast, is
+    /// recoverable by simply saying it again. That asymmetry is why refusals and
+    /// questions are vetoed here.
+    #[test]
+    fn a_refusal_or_a_question_never_fires_the_emergency_stop() {
+        for u in [
+            "don't lock everything down",
+            "do not lock everything down",
+            "why did you lock everything down",
+            "did you lock everything down",
+            "when did you lock everything down",
+            "should i lock everything down",
+        ] {
+            assert!(
+                !super::is_panic_intent(u),
+                "{u:?} fired the emergency stop — it kills the mic, and unlock is \
+                 a voice path, so this is not recoverable by speaking"
+            );
+        }
+    }
+
+    /// ...AND THE VETO IS HEAD-ANCHORED, so it cannot swallow a real order that
+    /// merely CONTAINS one of those words. Without this the veto is a new way to
+    /// lose the kill switch, which is the failure it exists to prevent.
+    #[test]
+    fn the_veto_does_not_swallow_a_real_kill_switch_order() {
+        for u in [
+            "lock everything down right now",
+            "lock everything down, don't ask me twice",
+            "lock down why the build failed matters later",
+        ] {
+            assert!(
+                super::is_panic_intent(u),
+                "{u:?} is an ORDER and must still fire the emergency stop"
+            );
+        }
+    }
+
+    /// REGRESSION (router-recall miss list): the plain-English kill switch.
+    /// "lock everything down right now" reached NOTHING — not the panic gate, not
+    /// anything — so the emergency stop did not fire when it was asked for in the
+    /// most obvious words. The negatives are the sentences the new phrase could
+    /// have swallowed; each REPORTS a lockdown rather than ordering one.
+    /// `is_panic_intent` is pure, so this needs no lockdown guard.
+    #[test]
+    fn spoken_lock_everything_down_is_the_kill_switch_but_a_report_of_one_is_not() {
+        for u in ["lock everything down right now", "lock everything down", "lock it all down"] {
+            assert!(is_panic_intent(u), "must engage the emergency stop: {u:?}");
+        }
+        for u in [
+            "the sysadmin locked everything down after the breach",
+            "they lock the museum down at closing time",
+            "the principal said the school locked everything down for a drill",
+        ] {
+            assert!(!is_panic_intent(u), "a report is not an order: {u:?}");
+        }
+    }
     use super::*;
     use std::sync::Mutex;
 

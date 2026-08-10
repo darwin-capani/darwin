@@ -133,6 +133,16 @@ const ROLL_CALL_CUES: &[&str] = &[
     "roll call", "rollcall", "introduce the team", "introduce yourselves",
     "introduce yourself", "assemble", "assemble the team", "meet the team",
     "who is on the team", "who's on the team", "team roll call",
+    // MEASURED RECALL MISS: "everyone sound off" — the military form of a roll
+    // call, and the one people reach for when they want the team to speak in
+    // turn.
+    //
+    // The BARE phrase "sound off" is deliberately NOT here. It is also the idiom
+    // for giving an opinion ("sound off on the proposal", "he sounded off about
+    // the parking"), and a bare word-boundary phrase match would take those —
+    // the identical trap "assemble" carries two entries above. So it is admitted
+    // ONLY with the team as its subject, spelled out.
+    "sound off",
 ];
 
 /// Whether `text` asks for the constellation roll-call (item 3, the reel
@@ -162,9 +172,54 @@ pub fn is_roll_call(text: &str) -> bool {
             .filter(|w| !w.is_empty())
             .all(|w| FRAME.contains(&w))
     };
+    // "sound off" is a roll call when its SUBJECT is the team ("everyone sound
+    // off", "team, sound off") — and an opinion idiom otherwise ("sound off on
+    // the proposal", "he sounded off about the parking"). Same shape as
+    // `assemble_is_the_call`, and same reason.
+    let sound_off_is_the_call = |l: &str| -> bool {
+        if !contains_phrase(l, "sound off") {
+            return false;
+        }
+        // MEASURED HIJACK (adversary pass, all three CLEAN at HEAD): the team
+        // word was looked for ANYWHERE in the sentence, so "everyone should
+        // sound off on the new policy", "let everybody sound off about the
+        // parking" and "the team will sound off on it tomorrow" each read as a
+        // roll call. A roll call is an IMPERATIVE and the phrase CLOSES it; the
+        // opinion idiom always carries its object after the phrase ("sound off
+        // ON the proposal"). Requiring the phrase to end the utterance — after
+        // nothing but address/politeness — is what separates the two, and it is
+        // the same tail anchor `prosody::ends_with_phrase` uses for whisper.
+        {
+            const TRAILING: &[&str] =
+                &["please", "now", "darwin", "ok", "okay", "everyone", "everybody", "all"];
+            let mut toks: Vec<&str> =
+                l.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
+            while toks.last().is_some_and(|w| TRAILING.contains(w)) {
+                toks.pop();
+            }
+            if toks.len() < 2 || toks[toks.len() - 2] != "sound" || toks[toks.len() - 1] != "off" {
+                return false;
+            }
+        }
+        if crate::utterance::mentions_any_word(
+            l,
+            &["team", "crew", "roster", "constellation", "agents", "everyone", "everybody", "specialists"],
+        ) {
+            return true;
+        }
+        // Bare imperative: nothing but address/politeness around the phrase.
+        const FRAME: &[&str] =
+            &["sound", "off", "darwin", "hey", "ok", "okay", "please", "now", "all"];
+        l.split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .all(|w| FRAME.contains(&w))
+    };
     ROLL_CALL_CUES.iter().any(|cue| {
         if cue == &"assemble" {
             return assemble_is_the_call(&lower);
+        }
+        if cue == &"sound off" {
+            return sound_off_is_the_call(&lower);
         }
         if cue.contains(' ') {
             // A contained space does NOT make a phrase safe as a bare substring:
@@ -188,7 +243,54 @@ const AGENT_QUERY_CUES: &[&str] = &[
     "show me the agents", "who are the agents", "what agents do",
     "the constellation", "my constellation", "agent roster", "the roster",
     "list my team", "name my team", "who are my team",
+    // MEASURED RECALL MISS: "which agent handles security" reached nothing. The
+    // table held "which agents" (plural) but not the singular routing question,
+    // which is how the owner actually asks who owns a domain.
+    //
+    // THE ROLE VERB IS PART OF THE CUE, and that is not decoration. A bare
+    // "which agent" also matches "which agent did you use to sell the house" —
+    // a real-estate agent, and a real sentence — so the cue carries the verb
+    // that makes it a question about a ROLE. For the same reason a bare "which
+    // specialist" ("which specialist should i see for my knee") and "who on the
+    // team" ("who on the team is bringing snacks") are NOT here at all.
+    // The SINGULAR routing question moved to `asks_which_agent_covers_a_domain`
+    // — as bare `contains` cues it captured insurance sentences. Only the plural
+    // POSSESSIVE forms, which name DARWIN's own roster outright, stay here.
+    "which of your agents", "which of my agents",
 ];
+
+/// The SINGULAR routing question — "which agent handles security".
+///
+/// MEASURED HIJACK (adversary pass): held as bare `contains` cues this family
+/// captured "which agent handles claims in this area" and "which agent handles
+/// my policy" — insurance sentences, both CLEAN at HEAD. Unlike "which of YOUR
+/// agents", "which agent handles X" names nobody's roster: it is ordinary
+/// English whenever X is not something DARWIN does. So the DOMAIN is the second
+/// anchor, and it is read from [`CUE_VOCAB`] — the shipped routing vocabulary,
+/// not a list invented here — or from an agent's name.
+///
+/// The stop list is small and every entry is a measured artefact of the vocab
+/// being stored as prose: fury's line is "… end to end multi-step", so "to",
+/// "end" and "up" (edith's "heads up") tokenize as keywords and would re-admit
+/// any sentence containing them. They anchor nothing and are refused.
+fn asks_which_agent_covers_a_domain(lower: &str) -> bool {
+    const CUES: &[&str] = &[
+        "which agent handles", "which agent handle", "which agent covers",
+        "which agent owns", "which agent is", "which agent should", "which agent would",
+        "what agent handles", "what agent covers", "what agent owns",
+    ];
+    const STOP: &[&str] = &["to", "end", "up"];
+    let Some(tail) = CUES.iter().find_map(|c| lower.split_once(c).map(|(_, t)| t)) else {
+        return false;
+    };
+    tail.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty() && !STOP.contains(w))
+        .any(|w| {
+            CUE_VOCAB
+                .iter()
+                .any(|(agent, vocab)| *agent == w || vocab.split(' ').any(|k| k == w))
+        })
+}
 
 /// Whether `text` asks DARWIN to LIST/NAME its agents (the roster), as opposed
 /// to running the spoken roll-call ([`is_roll_call`], checked first). Routed
@@ -197,7 +299,77 @@ const AGENT_QUERY_CUES: &[&str] = &[
 /// hallucinates agents that do not exist.
 pub fn is_agent_query(text: &str) -> bool {
     let lower = text.to_lowercase();
-    AGENT_QUERY_CUES.iter().any(|cue| lower.contains(cue))
+    if AGENT_QUERY_CUES.iter().any(|cue| lower.contains(cue)) {
+        return true;
+    }
+    asks_which_agent_covers_a_domain(&lower) || asks_what_a_named_agent_does(&lower)
+}
+
+/// "what does gecko do" / "who is cassandra" — a question about ONE agent BY
+/// NAME, answered from the live registry.
+///
+/// MEASURED RECALL MISS: "what does gecko do" reached nothing, so the owner
+/// asking what a member of their own constellation is for got a model guess
+/// instead of the roster's real role line — the exact hallucination
+/// [`is_agent_query`] exists to prevent.
+///
+/// THE NAME IS THE ANCHOR, and it is checked against the SHIPPED roster
+/// ([`CUE_VOCAB`], the same vocabulary the fallback router ranks on) rather than
+/// against a name-shaped pattern. That is what keeps "what does this button do"
+/// and "who is the new tenant" out: the second token has to BE one of DARWIN's
+/// agents. Both anchors are required — the question frame at the head and the
+/// roster name in it — so neither alone can trip this.
+///
+/// NOT WIDENED to the bare "who handles X" / "who would handle X" family. Those
+/// carry no agent word and no agent name ("who handles the payroll at your
+/// company" is ordinary English), and admitting them would answer a question
+/// about the owner's colleagues with DARWIN's roster. That miss is left open on
+/// purpose.
+fn asks_what_a_named_agent_does(lower: &str) -> bool {
+    const FRAMES: &[&str] = &[
+        "what does ", "what's ", "what is ", "who is ", "who's ", "what do ",
+    ];
+    let trimmed = lower.trim().trim_end_matches(['?', '.', '!']).trim();
+    let Some(rest) = FRAMES.iter().find_map(|f| trimmed.strip_prefix(f)) else {
+        return false;
+    };
+    let mut words = rest.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty());
+    let Some(name) = words.next() else {
+        return false;
+    };
+    if !CUE_VOCAB.iter().any(|(agent, _)| *agent == name) {
+        return false;
+    }
+    // MEASURED HIJACK (adversary pass): the roster name is NOT an anchor on its
+    // own, because most of the roster is spelled with ordinary English words and
+    // common given names. Every one of these was CLEAN at HEAD and captured by
+    // the unfiltered form — "what does steve do for work", "what does karen do",
+    // "what is sage good for", "what is pepper good for", "what is vision for",
+    // "what does oracle do", "what does friday cover in the news". Answering any
+    // of them out of DARWIN's roster is precisely the hijack this campaign
+    // closed, so the recall those names would have bought is GIVEN UP: a name
+    // that is also an ordinary word anchors nothing.
+    //
+    // The names that remain are the coined ones, and they are what the probe
+    // rides on ("what does gecko do"). Note the frame requires the name to
+    // follow the question word IMMEDIATELY, so the animal reading needs an
+    // article ("what does A gecko do") and does not match.
+    const NAME_IS_ORDINARY_ENGLISH: &[&str] = &[
+        "steve", "friday", "vision", "oracle", "sage", "pepper", "karen", "herald",
+        "stark", "fury", "midas", "voyager", "hercules", "athena", "babel", "jerome",
+        "veronica", "edith", "cassandra",
+    ];
+    if NAME_IS_ORDINARY_ENGLISH.contains(&name) {
+        return false;
+    }
+    // A ROLE question, not a passing mention. The tail is REQUIRED, and a bare
+    // "<frame> <name>" is refused ON PURPOSE: several roster names are ordinary
+    // English words ("friday", "vision", "sage", "oracle", "steve"), so "what is
+    // friday" is a question about the weekday far more often than about the
+    // agent. The role verb is what makes it a question about a ROLE.
+    const ROLE_TAILS: &[&str] =
+        &["do", "does", "handle", "handles", "cover", "covers", "work", "for", "good"];
+    words.next().is_some_and(|w| ROLE_TAILS.contains(&w))
 }
 
 /// EDITH (Proactive Sentinel) delegation cues: phrases that ask DARWIN to
@@ -2493,6 +2665,62 @@ impl AgentScorer for LexicalAgentScorer {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): "everyone sound off" (roll call),
+    /// "which agent handles security" and "what does gecko do" (roster queries)
+    /// all reached NOTHING. Each widening carries its own subject anchor, and the
+    /// negatives are the ordinary sentences the un-anchored form would have taken.
+    #[test]
+    fn sound_off_and_named_agent_questions_reach_the_roster_not_ordinary_speech() {
+        for u in ["everyone sound off", "sound off", "team, sound off"] {
+            assert!(super::is_roll_call(u), "roll call: {u:?}");
+        }
+        for u in [
+            "sound off on the proposal when you've read it",
+            "he sounded off about the parking again",
+            // ADVERSARY NEGATIVES, all CLEAN at HEAD: the team word may not be
+            // looked for anywhere in the sentence — the phrase must CLOSE it.
+            "everyone should sound off on the new policy",
+            "let everybody sound off about the parking",
+            "the team will sound off on it tomorrow",
+        ] {
+            assert!(!super::is_roll_call(u), "the opinion idiom is not a roll call: {u:?}");
+        }
+        for u in [
+            "which agent handles security",
+            "what does gecko do",
+            "what does mnemosyne cover",
+            "which of your agents handles markets",
+        ] {
+            assert!(super::is_agent_query(u), "roster query: {u:?}");
+        }
+        for u in [
+            "which agent did you use to sell the house",
+            "which specialist should i see for my knee",
+            "who on the team is bringing snacks",
+            "who handles the payroll at your company",
+            "what is friday looking like for you",
+            "who is steve bringing to the wedding",
+        ] {
+            assert!(!super::is_agent_query(u), "ordinary speech must not read the roster: {u:?}");
+        }
+        // ADVERSARY NEGATIVES. Each was CLEAN at HEAD and captured by the
+        // widening as first written; the two anchors added above are what refuse
+        // them. The roster-name family goes first, then the routing frame.
+        for u in [
+            "what does steve do for work",
+            "what does karen do",
+            "what is sage good for",
+            "what is pepper good for",
+            "what is vision for",
+            "what does oracle do",
+            "what does friday cover in the news",
+            "which agent handles claims in this area",
+            "which agent handles my policy",
+        ] {
+            assert!(!super::is_agent_query(u), "adversary negative read the roster: {u:?}");
+        }
+    }
     use super::{AgentRegistry, CANONICAL_ROSTER};
 
     /// The canonical roster must satisfy every registry invariant — this is

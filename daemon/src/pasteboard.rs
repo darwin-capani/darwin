@@ -572,7 +572,16 @@ pub fn classify_pasteboard_intent(utterance: &str) -> Option<PasteboardIntent> {
         return None;
     }
     // A pasteboard command must reference the clipboard OR a past copy.
-    let mentions_clipboard = lower.contains("clipboard");
+    //
+    // MEASURED RECALL MISS: "clear my pasteboard history" reached nothing. This
+    // module is NAMED pasteboard.rs — "pasteboard" is macOS's own word for the
+    // clipboard and the one the platform's UI uses — yet the classifier only ever
+    // matched "clipboard", so the owner's own vocabulary for the surface did not
+    // reach it. Treated as an exact synonym everywhere "clipboard" is tested
+    // below (including the destructive branch's aiming test), which is why the
+    // determiner loop templates over both words rather than only the first.
+    const CLIPBOARD_NOUNS: &[&str] = &["clipboard", "pasteboard"];
+    let mentions_clipboard = CLIPBOARD_NOUNS.iter().any(|n| lower.contains(n));
     let mentions_copied = lower.contains("copied") || lower.contains("i copy");
 
     // FORGET: an explicit wipe of the clipboard history.
@@ -596,7 +605,11 @@ pub fn classify_pasteboard_intent(utterance: &str) -> Option<PasteboardIntent> {
     let wipe_aimed_at_the_clipboard = WIPE_VERBS.iter().any(|v| {
         ["my ", "the ", "", "my whole ", "the whole ", "all my "]
             .iter()
-            .any(|det| lower.contains(&format!("{v} {det}clipboard")))
+            .any(|det| {
+                CLIPBOARD_NOUNS
+                    .iter()
+                    .any(|n| lower.contains(&format!("{v} {det}{n}")))
+            })
     });
     let read_question = lower.contains("what did i copy")
         || lower.contains("what have i copied")
@@ -616,6 +629,7 @@ pub fn classify_pasteboard_intent(utterance: &str) -> Option<PasteboardIntent> {
     // nor a recall verb, so it is excluded here.
     let recall_cue = read_question
         || lower.contains("clipboard history")
+        || lower.contains("pasteboard history")
         || lower.contains("recall")
         || lower.contains("find")
         || lower.contains("search");
@@ -658,6 +672,33 @@ pub fn reset_for_test() {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): "clear my pasteboard history" reached
+    /// NOTHING. "pasteboard" is macOS's own word for the clipboard — and the name
+    /// of this module — yet only "clipboard" was matched, so the platform's own
+    /// vocabulary for the surface did not reach it.
+    #[test]
+    fn pasteboard_is_a_synonym_for_clipboard_on_both_branches() {
+        assert_eq!(
+            classify_pasteboard_intent("clear my pasteboard history"),
+            Some(PasteboardIntent::Forget)
+        );
+        assert_eq!(
+            classify_pasteboard_intent("forget the pasteboard history"),
+            Some(PasteboardIntent::Forget)
+        );
+        assert!(matches!(
+            classify_pasteboard_intent("search my pasteboard history for the address"),
+            Some(PasteboardIntent::Recall { .. })
+        ));
+        // A pasteboard MENTION is not a command, exactly as for "clipboard".
+        for u in [
+            "the pasteboard on the wall has the shift schedule",
+            "i cleared the pasteboard in the workshop yesterday",
+        ] {
+            assert!(classify_pasteboard_intent(u).is_none(), "{u:?}");
+        }
+    }
     /// A CLIPBOARD RECALL MUST NEVER BE HEARD AS A WIPE — same substring trap as
     /// the timeline: "clear" hides inside "nuclear"/"clearance", and the wipe
     /// branch ran first, so asking what you had copied ERASED the ring.

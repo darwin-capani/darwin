@@ -847,6 +847,17 @@ pub fn classify_screen_context_intent(utterance: &str) -> Option<ScreenContextIn
         && (lower.contains("working on")
             || lower.contains("doing")
             || lower.contains("looking at"));
+    // MEASURED RECALL MISS: "what have i been looking at" reached nothing — the
+    // present-perfect is at least as natural as the past tense above, and it is
+    // the phrasing the ring's own doc describes.
+    //
+    // NARROWER THAN THE PAST-TENSE CLAUSE ON PURPOSE: "doing" is NOT accepted
+    // here. "what have i been doing with my life" / "what have i been doing
+    // wrong" are ordinary rhetorical English and would have been answered with a
+    // list of app windows. "looking at" and "working on" name the ring's actual
+    // contents (frontmost app + window title), so they stay.
+    let perfect_recall = lower.contains("what have i been")
+        && (lower.contains("looking at") || lower.contains("working on"));
     // "what was on my screen earlier" — the phrasing the Recall variant's own doc
     // lists as supported, and which classified as None. It reaches neither gate
     // above ("what was on" is not "what was i", and there is no "screen context"
@@ -864,7 +875,7 @@ pub fn classify_screen_context_intent(utterance: &str) -> Option<ScreenContextIn
             || lower.contains("a moment ago")
             || lower.contains("just now")
             || lower.contains("recently"));
-    if working_recall || past_screen_recall {
+    if working_recall || perfect_recall || past_screen_recall {
         return Some(ScreenContextIntent::Recall {
             subject: extract_recall_subject(&lower),
         });
@@ -887,6 +898,25 @@ pub fn is_screen_context_recall(utterance: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): "what have i been looking at" reached
+    /// NOTHING — only the past tense ("what WAS i …") was modelled. The negatives
+    /// are why "doing" is deliberately NOT accepted in the present-perfect clause.
+    #[test]
+    fn present_perfect_recall_reaches_the_ring_without_taking_rhetorical_questions() {
+        for u in ["what have i been looking at", "what have i been working on"] {
+            assert!(
+                matches!(classify_screen_context_intent(u), Some(ScreenContextIntent::Recall { .. })),
+                "{u:?}"
+            );
+        }
+        for u in [
+            "what have i been doing wrong with this recipe",
+            "what have i been paying for all these years",
+        ] {
+            assert!(classify_screen_context_intent(u).is_none(), "rhetorical: {u:?}");
+        }
+    }
     /// A SCREEN-CONTEXT RECALL MUST NEVER BE HEARD AS A WIPE — the third copy of
     /// the same substring trap.
     #[test]

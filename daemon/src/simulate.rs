@@ -540,9 +540,72 @@ const PRECOG_CUES: &[&str] = &[
     "what would you do if i wanted to ",
     "what would you do if you were told to ",
     "what would happen if i asked you to ",
+    "what would happen if i told you to ",
+    "what would happen if i wanted to ",
+    // A bare "what would happen if i asked …" is NOT here. MEASURED HIJACK
+    // (adversary pass): it captured "what would happen if i asked for a raise",
+    // which is a question about the owner's job, not about DARWIN. The
+    // "…asked YOU to …" form two lines up is the one that addresses DARWIN, and
+    // it was already shipped.
     "what would happen if i said ",
     "what would happen if you ",
 ];
+
+/// The INVERTED conditional: the hypothetical comes FIRST and the question
+/// follows it ("if I asked you to email my boss, WHAT WOULD HAPPEN", "suppose I
+/// said open safari, WHAT WOULD YOU DO"). [`PRECOG_CUES`] only models the
+/// question-first order, so this whole word order — which is at least as common
+/// in speech — reached nothing.
+///
+/// TWO anchors are required, one at each end, and that is what keeps it precise:
+/// the utterance must OPEN with a hypothetical lead-in AND CLOSE with the precog
+/// question. An ordinary conditional ("if i asked you to help i would owe you
+/// one") satisfies only the first and is refused; a bare question satisfies only
+/// the second. Bounding at both ends is deliberate — a one-ended window here
+/// would swallow every "if …" sentence the owner speaks.
+///
+/// MEASURED HIJACK (adversary pass): the bare "if i said …" / "if i asked …"
+/// lead-ins are NOT addressed to DARWIN, and with a precog tail they captured
+/// "if i said no what happens" and "if i asked for a raise what would happen" —
+/// both CLEAN at HEAD, both ordinary conditionals about the owner's own life.
+/// Bounding at both ends is not enough when the OPENING end is not second
+/// person: what makes a hypothetical DARWIN's is the word "you". Every lead-in
+/// kept either addresses DARWIN ("…you to …") or is an explicit supposition
+/// frame ("suppose i said …"), and no shipped probe used the bare forms.
+const PRECOG_LEAD_INS: &[&str] = &[
+    "if i asked you to ",
+    "if i told you to ",
+    "suppose i asked you to ",
+    "suppose i told you to ",
+    "suppose i said ",
+    "say i asked you to ",
+    "say i told you to ",
+];
+
+/// The trailing question that must CLOSE an inverted hypothetical.
+const PRECOG_TAILS: &[&str] = &[
+    "what would you do",
+    "what would happen",
+    "what do you do",
+    "what happens",
+    "would you do it",
+];
+
+/// Extract the hypothetical from the INVERTED order, or `None`. Pure.
+/// The returned utterance is the span BETWEEN the two anchors, with the comma
+/// that joins the clauses trimmed off.
+fn extract_inverted_hypothetical(lower: &str) -> Option<String> {
+    let body = lower.trim().trim_end_matches(['?', '!', '.']).trim();
+    let rest = PRECOG_LEAD_INS.iter().find_map(|c| body.strip_prefix(c))?;
+    // The tail must END the utterance — a mid-sentence "what would happen" is
+    // part of the hypothetical, not the question about it.
+    let middle = PRECOG_TAILS.iter().find_map(|t| {
+        rest.strip_suffix(t)
+            .map(|m| m.trim().trim_end_matches([',', ';', '-']).trim())
+    })?;
+    let cleaned = clean_hypothetical(middle);
+    (!cleaned.is_empty()).then_some(cleaned)
+}
 
 /// Extract the HYPOTHETICAL utterance from a "what would you do if I said X"
 /// query, or `None` when the text is not a PRECOG query. PURE. Conservatively
@@ -571,7 +634,7 @@ pub fn extract_hypothetical(text: &str) -> Option<String> {
             }
         }
     }
-    None
+    extract_inverted_hypothetical(&lower)
 }
 
 /// Trim a hypothetical tail: drop surrounding quotes (straight + curly) and a
@@ -601,6 +664,41 @@ fn unquote(s: &str) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): three PRECOG phrasings reached
+    /// NOTHING. One needed a cue the table simply lacked ("what would happen if i
+    /// TOLD you to …"); the other two put the hypothetical FIRST and the question
+    /// last, a word order the cue table did not model at all.
+    #[test]
+    fn inverted_and_told_you_to_hypotheticals_extract_their_utterance() {
+        assert_eq!(
+            extract_hypothetical("what would happen if i told you to wipe my memory").as_deref(),
+            Some("wipe my memory")
+        );
+        assert_eq!(
+            extract_hypothetical("if i asked you to email my boss, what would happen").as_deref(),
+            Some("email my boss")
+        );
+        assert_eq!(
+            extract_hypothetical("suppose i said open safari, what would you do").as_deref(),
+            Some("open safari")
+        );
+        // BOTH ends are required: a conditional with no trailing question, and a
+        // trailing question that is not one of the precog forms, are both refused.
+        // ...and the OPENING end must address DARWIN — the last three were CLEAN
+        // at HEAD and captured until the bare "if i said"/"if i asked" lead-ins
+        // came out.
+        for u in [
+            "if i said that i would be lying to you",
+            "suppose i said yes, we would still need the permit",
+            "if i asked you to help me move would you say yes",
+            "if i said no what happens",
+            "if i asked for a raise what would happen",
+            "what would happen if i asked for a raise",
+        ] {
+            assert_eq!(extract_hypothetical(u), None, "{u:?}");
+        }
+    }
     use super::*;
     use crate::agents::{AgentRegistry, LexicalAgentScorer};
     use crate::config::Config;

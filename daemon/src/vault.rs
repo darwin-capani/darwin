@@ -261,6 +261,19 @@ const ON_PHRASES: &[&str] = &[
     "engage vault mode",
 ];
 
+/// The WHOLE-UTTERANCE ON forms. Mirrors the whisper parser's `ON_EXACT`.
+///
+/// MEASURED RECALL MISS: the bare utterance "vault mode" reached nothing. The
+/// NOTE in [`ON_PHRASES`] explains why it is not there — [`matches_phrase`] also
+/// admits a phrase as a LEADING IMPERATIVE, so "vault mode what does it do" (the
+/// comma-free shape STT emits) would engage the vault on a QUESTION. That reason
+/// only applies to the leading-imperative form. An utterance that is NOTHING BUT
+/// "vault mode" cannot be a question about it, so it is admitted here, by exact
+/// match only — strictly narrower than adding it to [`ON_PHRASES`].
+/// A BARE "vault" is deliberately absent: one word with no mode noun is as often
+/// a question ("vault?") as a command, and unlike "vault mode" it names no state.
+const ON_EXACT: &[&str] = &["vault mode"];
+
 /// Whether the normalized utterance IS one of `phrases` — either the whole thing or
 /// its leading imperative (so "go dark now" / "vault mode on please" match, but a
 /// sentence that merely mentions vault does not). Conservative by construction:
@@ -290,11 +303,31 @@ pub fn classify_vault_command(text: &str) -> Option<VaultCommand> {
     if matches_phrase(&norm, ON_PHRASES) {
         return Some(VaultCommand::On);
     }
+    if ON_EXACT.contains(&norm.as_str()) {
+        return Some(VaultCommand::On);
+    }
     None
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): the bare utterance "vault mode"
+    /// reached NOTHING. It is admitted by EXACT match only — the leading-imperative
+    /// form is still refused, which is what keeps the question "vault mode what
+    /// does it do again" from engaging the vault.
+    #[test]
+    fn a_bare_vault_mode_utterance_engages_but_a_question_about_it_does_not() {
+        assert_eq!(classify_vault_command("vault mode"), Some(VaultCommand::On));
+        assert_eq!(classify_vault_command("Vault Mode."), Some(VaultCommand::On));
+        for u in [
+            "vault mode, what does it do again",
+            "is vault mode on right now",
+            "vault mode is something i read about",
+        ] {
+            assert_eq!(classify_vault_command(u), None, "a question is not a command: {u:?}");
+        }
+    }
     use super::*;
 
     /// SERIALIZE the tests that mutate the process-global mode (`VAULT_ON` /

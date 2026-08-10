@@ -522,9 +522,26 @@ const COMMAND_HEADS: &[&str] = &[
     "save that to my research notebook",
     "save this research notebook",
     "save my research notebook",
+    // MEASURED RECALL MISS: "save that to my notebook". The "…to my RESEARCH
+    // notebook" spellings were all here; the shorter, far more common "…to my
+    // notebook" was not, so the most natural save phrasing reached nothing.
+    // Listed BEFORE the shorter "save this research"/"save my research" is
+    // irrelevant (longest-head-wins does the ordering), but they must all be
+    // present or the subject is cut at the wrong place.
+    "save it to my notebook",
+    "save this to my notebook",
+    "save that to my notebook",
     "save this research",
     "save my research",
     // REVISIT / LIST — read back what was saved.
+    // MEASURED RECALL MISS: "open my notebook on fusion". "show"/"list" were
+    // admitted openers and "open" — the verb people actually use on a notebook —
+    // was not. READ-ONLY, and it still has to be followed by " on "/" about " or
+    // by nothing but filler, so "open my notebook and pass me a pen" is refused.
+    "open my research notebooks",
+    "open my research notebook",
+    "open my notebooks",
+    "open my notebook",
     "show me my research notebooks",
     "show my research notebooks",
     "show me my research notebook",
@@ -701,6 +718,38 @@ pub fn classify_notebook_intent(utterance: &str) -> Option<NotebookIntent> {
         || saves_research;
     if !about_notebook {
         return None;
+    }
+
+    // THE LIST QUESTION. MEASURED RECALL MISS: "what research notebooks do i
+    // have" reached nothing. [`COMMAND_HEADS`] only models IMPERATIVES ("list my
+    // research notebooks"), and a head of "what research notebooks" leaves the
+    // tail "do i have", which is neither filler nor a subject connector — so the
+    // interrogative form of the same request was refused.
+    //
+    // Held as a CLOSED SET of whole utterances (bare trailing filler allowed),
+    // not as a pattern: "notebook" plus a question word is ordinary English ("what
+    // notebooks does the library stock"), and the thing that makes these safe is
+    // that the utterance IS the question and nothing else. Each names the shelf
+    // and asks to enumerate it; the answer is a READ.
+    const LIST_QUESTIONS: &[&str] = &[
+        "what research notebooks do i have",
+        "what research notebooks have i got",
+        "which research notebooks do i have",
+        "what notebooks do i have",
+        "what notebooks have i got",
+        "which notebooks do i have",
+        "do i have any research notebooks",
+        "do i have any notebooks",
+        "what research notebooks are there",
+    ];
+    {
+        let body = strip_address_prefix(lower);
+        if LIST_QUESTIONS
+            .iter()
+            .any(|q| body.strip_prefix(q).is_some_and(is_filler_only))
+        {
+            return Some(NotebookIntent::List);
+        }
     }
 
     // FORGET vs SAVE — read from the COMMAND region only, as WHOLE WORDS.
@@ -974,6 +1023,43 @@ pub async fn dispatch(
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): three notebook phrasings reached
+    /// NOTHING — "save that to my notebook" (only the longer "…research notebook"
+    /// spellings were heads), "open my notebook on fusion" ("open" was not an
+    /// admitted opener) and "what research notebooks do i have" (COMMAND_HEADS
+    /// models only imperatives, so the question form had no route).
+    #[test]
+    fn the_short_notebook_phrasings_and_the_list_question_reach_the_shelf() {
+        assert_eq!(
+            classify_notebook_intent("save that to my notebook"),
+            Some(NotebookIntent::Save { topic: None })
+        );
+        assert_eq!(
+            classify_notebook_intent("save this to my notebook"),
+            Some(NotebookIntent::Save { topic: None })
+        );
+        assert_eq!(
+            classify_notebook_intent("open my notebook on fusion"),
+            Some(NotebookIntent::Revisit { topic: "fusion".to_string() })
+        );
+        for u in [
+            "what research notebooks do i have",
+            "what notebooks do i have",
+            "do i have any research notebooks",
+        ] {
+            assert_eq!(classify_notebook_intent(u), Some(NotebookIntent::List), "{u:?}");
+        }
+        // A head with a trailing SENTENCE (not a subject) is still refused, and a
+        // question about somebody else's notebooks is not the list question.
+        for u in [
+            "open my notebook and take this down for me",
+            "what notebooks does the library stock these days",
+            "save that to my notebook app when you get a chance",
+        ] {
+            assert_eq!(classify_notebook_intent(u), None, "{u:?}");
+        }
+    }
     use super::*;
     use crate::research::{Claim, Source};
     use std::path::PathBuf;

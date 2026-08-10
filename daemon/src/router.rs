@@ -3146,7 +3146,39 @@ pub fn classify_music_intent(text: &str) -> Option<String> {
             scan = scan.replace(c, " ");
         }
     }
-    let has_object = crate::utterance::mentions_any_word(&scan, OBJECTS);
+    // MEASURED RECALL MISS: "generate some background music" reached nothing —
+    // the object list held every word for a PIECE of music (song/track/tune/…)
+    // and not the word "music" itself.
+    //
+    // THE BARE WORD "music" IS NOT ADDED, and that is the whole design of this
+    // fix. "music" is an ordinary modifier ("the music festival", "my music
+    // teacher", "some music recommendations"), and the broad verbs here are
+    // make/write/generate/produce — so a bare "music" object would put "write
+    // down some music recommendations" and "make a note about the music
+    // festival" straight back into the composer, which is the note-losing class
+    // the OBJECT_COMPOUNDS comment above is about. Only phrases in which "music"
+    // is the HEAD NOUN of a thing to be composed are admitted, as whole phrases.
+    const OBJECT_PHRASES: &[&str] = &[
+        "background music",
+        "instrumental music",
+        "ambient music",
+        "lo-fi music",
+        "lofi music",
+        "music track",
+        "piece of music",
+        "bit of music",
+    ];
+    // ...and a MEMO request is never a composition request. "make a note about
+    // the background music in that film" carries a broad verb AND an object
+    // phrase; without this veto it would be composed instead of written down —
+    // the exact note-losing failure the OBJECT_COMPOUNDS comment above records.
+    // The veto applies ONLY to the new phrase path, so the proven OBJECTS path
+    // behaves exactly as it did.
+    const MEMO_PHRASES: &[&str] =
+        &["make a note", "take a note", "write down", "jot down", "note about", "remind me"];
+    let is_memo = MEMO_PHRASES.iter().any(|p| lower.contains(p));
+    let has_object = crate::utterance::mentions_any_word(&scan, OBJECTS)
+        || (!is_memo && OBJECT_PHRASES.iter().any(|p| scan.contains(p)));
 
     // The creation verb must appear as a leading/standalone word, not buried in a
     // longer token. `compose` anchors on its own (inherently musical); the broader
@@ -5163,8 +5195,49 @@ fn looks_like_designator(reference: &str) -> bool {
 /// present AND the phrase settles on it, because a select verb alone still let
 /// "show me component 4 of the essay" and "find component 7 of the rubric"
 /// through.
+/// "select r14" / "highlight u3" — a bare KiCad reference designator with no
+/// "component" noun anywhere.
+///
+/// MEASURED RECALL MISS: "select r14" reached nothing. [`extract_component_ref`]
+/// keys on the literal word "component", and nobody working a schematic says it —
+/// they say the refdes. So the single most common Silicon Canvas utterance was
+/// unroutable.
+///
+/// CLOSED-VOCABULARY, like the Nexus/Mark-Forge bare idioms: the WHOLE utterance
+/// must be a select verb, at most two frame words, and ONE token shaped like a
+/// designator (1-3 letters then 1-4 digits). One content word from outside that
+/// list and it is a sentence, not a command — which is what keeps "select all the
+/// rows in column b2" and "highlight the r14 paragraph" out. Pure.
+fn bare_designator_selection(lower: &str) -> Option<String> {
+    const VERBS: &[&str] = &["select", "highlight", "isolate", "probe"];
+    const FRAME: &[&str] = &["the", "darwin", "please", "now", "ok", "okay", "hey", "component"];
+    let words = speech_words(lower);
+    if !(2..=4).contains(&words.len()) || !VERBS.contains(&words[0]) {
+        return None;
+    }
+    let mut designator: Option<&str> = None;
+    for w in &words[1..] {
+        if FRAME.contains(w) {
+            continue;
+        }
+        if designator.is_some() {
+            return None; // two content words: a sentence, not a refdes command
+        }
+        designator = Some(w);
+    }
+    let d = designator?;
+    let letters = d.chars().take_while(|c| c.is_ascii_alphabetic()).count();
+    let digits: Vec<char> = d.chars().skip(letters).collect();
+    ((1..=3).contains(&letters)
+        && (1..=4).contains(&digits.len())
+        && digits.iter().all(char::is_ascii_digit))
+    .then(|| d.to_uppercase())
+}
+
 fn selected_component(lower: &str) -> Option<String> {
-    let reference = extract_component_ref(lower)?;
+    let Some(reference) = extract_component_ref(lower) else {
+        return bare_designator_selection(lower);
+    };
     if looks_like_designator(&reference) || mentions_board_noun(lower) {
         return Some(reference);
     }
@@ -5880,6 +5953,37 @@ fn watch_start_source(lower: &str) -> Option<&'static str> {
 /// stop verb ("stop watching the door"), while a wristwatch sentence puts the
 /// watch FIRST ("watch stopped"). Only determiners and Vision's own nouns may sit
 /// between the two, and at most three of them.
+/// "turn the camera off" / "turn off the camera" / "shut the webcam off".
+///
+/// MEASURED RECALL MISS: "turn the camera off" reached nothing.
+/// [`watch_stop_targets_the_watch`] only models the stop/end/quit/cancel/kill/halt
+/// verbs taking "watch"/"watching" as their object, and nobody phrases it that way
+/// about a lens — they say turn it off.
+///
+/// THIS ONLY EVER STOPS. It is the one direction of the camera control that is not
+/// a posture decision: turning capture OFF removes a capability, it never grants
+/// one, and the corresponding "turn ON the camera" stays refused (arming a lens is
+/// a consent decision, made deliberately elsewhere and NOT here). Both anchors are
+/// required — a camera noun AND an off particle bound to a turn/shut/kill verb —
+/// so "the camera off the coast" is not a command. Pure.
+fn camera_off_command(lower: &str) -> bool {
+    const NOUNS: &[&str] = &["camera", "cameras", "webcam", "webcams"];
+    if !crate::utterance::mentions_any_word(lower, NOUNS) {
+        return false;
+    }
+    const FORMS: &[&str] = &[
+        "turn off the camera", "turn off camera", "turn the camera off",
+        "turn off the cameras", "turn the cameras off",
+        "turn off the webcam", "turn the webcam off",
+        "shut off the camera", "shut the camera off", "shut the camera down",
+        "kill the camera",
+        // A BARE "camera off" is NOT here: "the camera off the coast picked up
+        // the storm" is the sentence it would take. Every form kept carries the
+        // verb that makes it an order.
+    ];
+    FORMS.iter().any(|f| crate::agents::contains_phrase(lower, f))
+}
+
 fn watch_stop_targets_the_watch(lower: &str) -> bool {
     // "kill"/"halt" are the two other things people say to a running watch. They
     // are worth listing because of what the OLD code did with them: "kill the
@@ -6255,6 +6359,7 @@ pub fn vision_command(text: &str) -> Option<VisionCommand> {
     // --- watch lifecycle (specific before the broad launch) ----------------
     // STOP first so "stop watching the door" is unambiguous.
     if watch_stop_targets_the_watch(&lower)
+        || camera_off_command(&lower)
         || (mentions_vision(&lower)
             && crate::utterance::mentions_any_word(&lower, &["watch", "watching"])
             && vision_verb_in_command_position(&lower, &["stop", "end", "quit", "cancel"]))
@@ -6359,6 +6464,20 @@ pub fn vision_command(text: &str) -> Option<VisionCommand> {
         || lower.contains("someone there")
         || lower.contains("somebody there")
         || lower.contains("what are you seeing")
+        // MEASURED RECALL MISS: "what is the vision app doing" reached nothing.
+        // The status snapshot IS the answer to that question, and the utterance
+        // NAMES the app — the strongest anchor in this whole classifier.
+        //
+        // EVERY form here says "vision APP", and the word app is load-bearing.
+        // MEASURED HIJACK (adversary pass): a bare "vision doing" / "status of
+        // vision" captured "how is my vision doing since the surgery", "is my
+        // vision doing any better" and "what's the status of vision therapy" —
+        // three sentences about EYESIGHT, all CLEAN at HEAD, each answered with
+        // a camera-app status snapshot. No probe ever needed the bare forms.
+        || lower.contains("vision app doing")
+        || lower.contains("vision app status")
+        || lower.contains("status of the vision app")
+        || lower.contains("status of vision app")
     {
         return Some(VisionCommand::Op(op_status()));
     }
@@ -6884,7 +7003,23 @@ fn lumen_is_read(lower: &str) -> bool {
         || lower.contains("what's on")
         || lower.contains("what is on")
         || lower.contains("what are");
-    reads && (mentions_screen || mentions_controls)
+    // MEASURED RECALL MISS: "what buttons are on this screen" reached nothing.
+    // "what are" was in `reads` but this word order interposes the noun ("what
+    // BUTTONS are"), so the most natural way to ask Lumen what it can see fell
+    // through to Vision's OCR.
+    //
+    // THE SCREEN IS REQUIRED, not merely a control noun. `reads` above is ORed
+    // with `mentions_controls`, and every one of these cues CONTAINS a control
+    // noun — so folding them into `reads` would have made "what buttons should i
+    // sew on this coat" a Lumen read (button + question). Anchoring the new cues
+    // on the screen instead is what keeps the coat out.
+    let control_inventory = mentions_screen
+        && (lower.contains("what buttons")
+            || lower.contains("what controls")
+            || lower.contains("what fields")
+            || lower.contains("what links")
+            || lower.contains("what menus"));
+    control_inventory || (reads && (mentions_screen || mentions_controls))
 }
 
 /// Whether `lower` names an on-screen CONTROL kind (button/link/tab/…). Used to
@@ -6997,7 +7132,17 @@ pub fn describe_command(text: &str) -> Option<DescribeRequest> {
     // An image-FILE describe ("describe this image ~/pics/cat.png", "what's in
     // photo.jpg"): a describe/what-is verb PLUS a token carrying an image
     // extension. Checked before the screen describe so a named file wins.
+    // MEASURED RECALL MISS: "look at ~/Desktop/diagram.png and tell me what it
+    // shows" reached nothing. Widening this list is SAFE IN A WAY THE SCREEN
+    // BRANCH BELOW IS NOT: `names_describe` gates only the IMAGE branch, and that
+    // branch additionally requires `extract_image_path` to find a real
+    // image-extension token in the utterance. A sentence that names a .png and
+    // asks to look at it is a describe request; a sentence that merely says "look
+    // at that" still reaches nothing here.
     let names_describe = lower.contains("describe")
+        || lower.contains("look at")
+        || lower.contains("tell me what it shows")
+        || lower.contains("tell me what this shows")
         || lower.contains("what's in")
         || lower.contains("whats in")
         || lower.contains("what is in")
@@ -7034,7 +7179,15 @@ pub fn describe_command(text: &str) -> Option<DescribeRequest> {
         lower.contains("screen") || lower.contains("display") || lower.contains("looking at");
     let describe_screen = (lower.contains("describe") && mentions_screen)
         || lower.contains("what am i looking at")
-        || (lower.contains("what do you make of") && mentions_screen);
+        || (lower.contains("what do you make of") && mentions_screen)
+        // MEASURED RECALL MISS: "tell me what you see on my screen" reached the
+        // OCR path instead (Vision's `screen_read_op`), which reads the screen's
+        // TEXT back. "what you see" asks for the SCENE, which is what the VLM
+        // describe produces — so it is claimed here, ahead of the OCR read.
+        // Both anchors required: the see-phrase AND the screen noun, so a bare
+        // "what do you see" stays Vision's presence status.
+        || (lower.contains("what you see") && mentions_screen)
+        || (lower.contains("what you can see") && mentions_screen);
     if describe_screen {
         let question = vqa_question(text, None);
         return Some(DescribeRequest::Screen { question });
@@ -8139,6 +8292,27 @@ pub fn nexus_command(text: &str) -> Option<NexusCommand> {
         }
     }
 
+    // --- gain set on a bare NUMBERED CHANNEL -------------------------------
+    // "set channel 1 to -6 db". MEASURED RECALL MISS: reached nothing, because
+    // the gain branch above keys on one of NEXUS_GAIN_WORDS and this phrasing
+    // names the CHANNEL instead of the parameter — which is how the utterance
+    // comes out when the person is looking at a mixer strip.
+    //
+    // THREE anchors, all required: a NUMBERED "channel", a set verb, and an
+    // explicit DECIBEL unit. The route branch above measured that 0 of the 1,897
+    // everyday utterances contain even a bare "input"/"output"; a sentence that
+    // additionally states a dB figure after a set verb is about audio.
+    if let Some(channel) = extract_channel(&lower, "channel") {
+        if crate::utterance::mentions_any_word(&lower, &["set", "trim", "turn", "put", "bring"])
+            && (lower.contains("db") || lower.contains("decibel"))
+        {
+            if let Some(gain_db) = extract_db(&lower) {
+                let stage = if mentions_output(&lower) { "output" } else { "input" };
+                return Some(NexusCommand::Op(op_gain_set(channel, gain_db, stage)));
+            }
+        }
+    }
+
     // --- route / unroute ---------------------------------------------------
     // "route input 1 to the monitor", "route input 2 to output 3", "unroute
     // input 1 from the monitor". A "route … to the monitor" without an explicit
@@ -8337,6 +8511,14 @@ pub fn nexus_command(text: &str) -> Option<NexusCommand> {
         || matrix_state_query
         || lower.contains("routing state")
         || lower.contains("route state")
+        // MEASURED RECALL MISS: "what's the mixer state" reached nothing. The
+        // read-only snapshot was reachable through "matrix"/"levels"/"routed" but
+        // not through the name of the thing itself. Each phrase binds the state
+        // noun to the MIXER, so a bare "state" is never enough.
+        || lower.contains("mixer state")
+        || lower.contains("state of the mixer")
+        || lower.contains("nexus state")
+        || lower.contains("state of nexus")
         || (crate::utterance::mentions_any_word(&lower, &["what", "whats"])
             && mentions_word(&lower, "routed"))
     {
@@ -9346,6 +9528,33 @@ pub fn mark_forge_command(text: &str) -> Option<MarkForgeCommand> {
         return Some(MarkForgeCommand::Op(op_world_step(0)));
     }
 
+    // --- state read (READ-ONLY snapshot) -----------------------------------
+    // "what's the physics state" / "what's the state of the sandbox".
+    //
+    // MEASURED RECALL MISS: the Mark-Forge app has implemented `state.get`
+    // (apps/mark-forge/src/ipc.rs `Op::StateGet`) since it shipped, and NO router
+    // branch ever emitted it — the op was unreachable from voice entirely, which
+    // is the strongest form of a recall gap. Read-only: it returns a snapshot and
+    // mutates nothing.
+    //
+    // Each phrase BINDS the state noun to the physics sandbox, so a bare "what's
+    // the state" (of anything at all) is not taken.
+    // MEASURED HIJACK (adversary pass): "state of the simulation" / "simulation
+    // state" are NOT bound to this sandbox — a simulation is anything anyone
+    // models. They captured "the state of the simulation in that paper was
+    // unclear" and "what's the state of the simulation they ran", both CLEAN at
+    // HEAD, and the shipped probe ("what's the physics state") never needed
+    // them. Only the phrases that name THIS app or its physics remain.
+    if lower.contains("physics state")
+        || lower.contains("state of the physics")
+        || lower.contains("sandbox state")
+        || lower.contains("state of the sandbox")
+        || lower.contains("mark forge state")
+        || lower.contains("mark-forge state")
+    {
+        return Some(MarkForgeCommand::Op(op_mark_forge_state_get()));
+    }
+
     // --- launch ------------------------------------------------------------
     // Only when the utterance actually names Mark-Forge / the sandbox AND carries
     // an open-class verb. Last so a control phrase that also says "open" was
@@ -9392,6 +9601,44 @@ fn gravity_target(lower: &str) -> Option<f64> {
     {
         return Some(MARK_FORGE_EARTH_GRAVITY);
     }
+    // An explicit NUMERIC target: "set gravity to -9.8". MEASURED RECALL MISS —
+    // every named body was here and the one form a physics user actually speaks,
+    // the number itself, was not.
+    //
+    // Read ONLY from after an explicit "to"/"at", so a number elsewhere in the
+    // sentence ("the 3 boxes fell") can never become a gravity vector, and
+    // clamped to a sane magnitude so a misheard figure cannot launch the world.
+    numeric_gravity(lower)
+}
+
+/// Parse an explicit numeric gravity from "gravity to|at <number>". Pure. `None`
+/// unless the target word sits IMMEDIATELY AFTER the noun "gravity". Clamped to
+/// +-100 m/s^2.
+///
+/// The anchor is "gravity to"/"gravity at" and NOT a free-floating "to"/"at",
+/// which was the first cut of this function and was measurably wrong: "the
+/// gravity of the situation set in at about 3" has the word gravity, a setting
+/// verb, and a number after "at" — and would have written a 3.0 gravity vector
+/// into the world. Binding the preposition to the noun is what refuses it.
+fn numeric_gravity(lower: &str) -> Option<f64> {
+    const MAX_ABS_GRAVITY: f64 = 100.0;
+    let normalized = lower.replace("minus ", "-").replace("negative ", "-");
+    // "gravity is <n>" is deliberately absent: it is a DECLARATIVE, not an order.
+    let after = ["gravity to ", "gravity at "]
+        .iter()
+        .find_map(|a| normalized.split_once(a).map(|(_, r)| r))?;
+    let toks: Vec<&str> = after.split_whitespace().collect();
+    for tok in &toks {
+        let t = tok.trim_matches(|c: char| !(c.is_ascii_digit() || c == '-' || c == '.' || c == '+'));
+        if t.is_empty() || t == "-" || t == "+" || t == "." {
+            continue;
+        }
+        if let Ok(n) = t.parse::<f64>() {
+            if n.is_finite() {
+                return Some(n.clamp(-MAX_ABS_GRAVITY, MAX_ABS_GRAVITY));
+            }
+        }
+    }
     None
 }
 
@@ -9417,6 +9664,11 @@ fn extract_step_count(lower: &str) -> Option<u32> {
 
 fn op_world_reset() -> String {
     json!({"op": "world.reset"}).to_string()
+}
+/// The EXACT wire form apps/mark-forge/src/ipc.rs deserializes as `Op::StateGet`
+/// (`#[serde(rename = "state.get")]`, no fields).
+fn op_mark_forge_state_get() -> String {
+    json!({"op": "state.get"}).to_string()
 }
 fn op_world_step(n: u32) -> String {
     json!({"op": "world.step", "n": n}).to_string()
@@ -9452,6 +9704,127 @@ fn op_spawn_sphere() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): eight app-command phrasings reached
+    /// NOTHING. Each assertion below names the utterance the printed miss list
+    /// carried; each negative is a sentence the widening could otherwise have
+    /// swallowed. Grouped because they all live in router.rs's classifiers.
+    #[test]
+    fn recall_miss_app_phrasings_reach_their_op_and_ordinary_speech_does_not() {
+        // MUSIC — "generate some background music": OBJECTS held every word for a
+        // PIECE of music and not "music" itself. The bare word is still refused;
+        // a MEMO request is vetoed outright (that is how notes used to be lost).
+        assert!(super::classify_music_intent("generate some background music").is_some());
+        assert!(super::classify_music_intent("produce some instrumental music").is_some());
+        for u in [
+            "make a note about the background music in that film",
+            "write down some music recommendations for the drive",
+            "what's the background music in this show",
+            "play some jazz",
+        ] {
+            assert!(super::classify_music_intent(u).is_none(), "not a composition: {u:?}");
+        }
+
+        // DESCRIBE — "tell me what you see on my screen" went to the OCR path, and
+        // "look at <file>.png and tell me what it shows" reached nothing at all.
+        assert!(matches!(
+            super::describe_command("tell me what you see on my screen"),
+            Some(super::DescribeRequest::Screen { .. })
+        ));
+        assert!(matches!(
+            super::describe_command("look at ~/Desktop/diagram.png and tell me what it shows"),
+            Some(super::DescribeRequest::Image { .. })
+        ));
+        // The bare "look at <file>" form too — without this assertion the "look
+        // at" cue is unproven (the sentence above also carries "tell me what it
+        // shows", so it passes on that cue alone; a mutation that deleted "look
+        // at" SURVIVED until this line existed).
+        assert!(matches!(
+            super::describe_command("look at ~/Desktop/diagram.png"),
+            Some(super::DescribeRequest::Image { .. })
+        ));
+        // Without an image FILE, "look at" is not a describe request.
+        assert!(super::describe_command("look at the sunset over the bay").is_none());
+
+        // LUMEN — "what buttons are on this screen": the control-kind question.
+        // The SCREEN is required, so a sewing question is not a control read.
+        assert!(matches!(
+            super::lumen_command("what buttons are on this screen"),
+            Some(super::LumenCommand::Read)
+        ));
+        for u in ["what buttons should i sew on this coat", "what fields did they plant this year"] {
+            assert!(super::lumen_command(u).is_none(), "{u:?}");
+        }
+
+        // SILICON CANVAS — "select r14": a bare reference designator, with no
+        // "component" noun anywhere.
+        // Asserted on the PARSED wire fields, not on a string the same builder
+        // produced — a byte comparison against `op_select_component` would only
+        // prove the builder equals itself.
+        match super::silicon_canvas_command("select r14") {
+            Some(super::SiliconCanvasCommand::Op(line)) => {
+                let v: serde_json::Value = serde_json::from_str(&line).expect("wire json");
+                assert_eq!(v["op"], "select.component");
+                assert_eq!(v["name"], "R14");
+            }
+            other => panic!("expected a select.component op, got {other:?}"),
+        }
+        for u in ["select all the rows in that spreadsheet", "highlight the important parts for me"] {
+            assert!(super::silicon_canvas_command(u).is_none(), "{u:?}");
+        }
+
+        // VISION — "turn the camera off" (stop, never start) and "what is the
+        // vision app doing" (status).
+        assert_eq!(
+            super::vision_command("turn the camera off"),
+            Some(super::VisionCommand::Op(super::op_watch_stop()))
+        );
+        assert_eq!(
+            super::vision_command("what is the vision app doing"),
+            Some(super::VisionCommand::Op(super::op_status()))
+        );
+        // The OFF path must never become an ON path, and a past-tense report is
+        // not an order.
+        assert!(!super::camera_off_command("turn on the camera"));
+        for u in [
+            "i turned the camera off after the show",
+            "the camera off the coast picked up the storm",
+        ] {
+            assert!(!super::camera_off_command(u), "{u:?}");
+        }
+        assert!(super::vision_command("my vision has been blurry since the surgery").is_none());
+
+        // NEXUS — "set channel 1 to -6 db" (gain on a bare numbered channel) and
+        // "what's the mixer state" (the read-only snapshot).
+        assert_eq!(
+            super::nexus_command("set channel 1 to -6 db"),
+            Some(super::NexusCommand::Op(super::op_gain_set(1, -6.0, "input")))
+        );
+        assert_eq!(
+            super::nexus_command("what's the mixer state"),
+            Some(super::NexusCommand::Op(super::op_state_get()))
+        );
+        // The DECIBEL UNIT is the gate: without it a channel number is a TV channel.
+        for u in ["set channel 1 to the news at six", "we set channel 3 to record the game"] {
+            assert!(super::nexus_command(u).is_none(), "{u:?}");
+        }
+
+        // MARK-FORGE — "set gravity to -9.8" (a numeric target) and "what's the
+        // physics state" (state.get, which NO router branch ever emitted).
+        assert_eq!(
+            super::mark_forge_command("set gravity to -9.8"),
+            Some(super::MarkForgeCommand::Op(super::op_set_gravity(-9.8)))
+        );
+        assert_eq!(
+            super::mark_forge_command("what's the physics state"),
+            Some(super::MarkForgeCommand::Op(super::op_mark_forge_state_get()))
+        );
+        // The preposition must bind to the NOUN: a sentence about the gravity of a
+        // situation, with a number after "at", must not write a gravity vector.
+        for u in ["the gravity of the situation set in at about 3", "set the alarm to 7 in the morning"] {
+            assert!(super::mark_forge_command(u).is_none(), "{u:?}");
+        }
+    }
     use super::{
         ambient_monitor_should_start, arg_str, classify_app_request, clear_roll_call_interrupt,
         cloud_model, conversation_brain, describe_command, describe_confined_path, enforce_tool,

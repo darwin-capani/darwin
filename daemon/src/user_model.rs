@@ -1364,6 +1364,34 @@ const MIRROR_EXPLAIN_CUES: &[&str] = &[
     "how do you know i",
     "what makes you think that i",
     "what makes you think i",
+    // MEASURED RECALL MISSES: "what do you think you know about me" and "what is
+    // your model of me" both reached nothing. Every cue above asks why ONE belief
+    // is held; neither of these names a belief — they ask for the MODEL ITSELF,
+    // which is exactly what `explain_belief`/`snapshot` render, and which the HUD
+    // already has a surface for. The subject these leave behind ("me", or nothing)
+    // resolves to the whole profile, which is the honest answer to the question.
+    //
+    // Each keeps the same word-boundary discipline as the rest of the table (see
+    // `cue_match_end`): they end on a full word, not the bare pronoun "i", so the
+    // "it/is/if/i'll" substring class that hijacked this surface cannot recur.
+    // The SELF-REFERENTIAL anchor ("me"/"my") is part of every cue on purpose.
+    // A bare "what do you think you know about" also opens "what do you think you
+    // know about quantum physics" — an ordinary challenge, which this surface
+    // would answer with "I have no recorded belief about quantum physics" instead
+    // of letting the model answer it. The MIRROR is the model OF THE USER, so the
+    // cue says so.
+    "what do you think you know about me",
+    "what do you think you know about my",
+    "what do you think you've learned about me",
+    "what do you think you've learned about my",
+    "what have you learned about me",
+    "what have you learned about my",
+    "what is your model of me",
+    "what's your model of me",
+    "whats your model of me",
+    "what is your model of my",
+    "what's your model of my",
+    "whats your model of my",
 ];
 
 /// CONTEST cues — telling the model a stored belief is WRONG. Any match DROPS the
@@ -1390,6 +1418,33 @@ const MIRROR_CONTEST_CUES: &[&str] = &[
     "that is wrong",
     "you're mistaken",
     "you are mistaken",
+    // MEASURED RECALL MISSES: "forget what you think you know about my music
+    // taste" and "clear your model of my interests" reached nothing.
+    //
+    // THEY BELONG HERE, NOT UNDER CLEAR. `Clear` is the UN-CONTEST — it LIFTS a
+    // suppression tombstone so the model may re-derive a belief. These two ask for
+    // the opposite: DROP what is held. That is `Contest` (drop + tombstone), and
+    // the recall fixture's original `clear` label for them was wrong; it is
+    // corrected alongside this.
+    //
+    // Each is an ORDER aimed at the model ("forget WHAT YOU THINK YOU KNOW",
+    // "clear YOUR MODEL OF"), never a bare wipe verb: the same discipline
+    // `notebook.rs` and `pasteboard.rs` both had to learn, since a match here
+    // deletes a belief and writes a permanent tombstone.
+    // Same self-referential anchor as the EXPLAIN table, and here it matters
+    // more: a match on this table DELETES a belief and writes a permanent
+    // tombstone, so the cue must name the user's own model and nothing else.
+    "forget what you think you know about me",
+    "forget what you think you know about my",
+    "forget what you've learned about my",
+    "forget what you know about my",
+    "clear your model of me",
+    "clear your model of my",
+    "clear what you think you know about my",
+    "wipe your model of me",
+    "wipe your model of my",
+    "forget your model of me",
+    "forget your model of my",
 ];
 
 /// CLEAR cues — the user lifts a prior contest so the model MAY re-derive the belief
@@ -1507,6 +1562,42 @@ fn now_secs() -> u64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): four MIRROR phrasings reached NOTHING
+    /// — "what do you think you know about me" / "what is your model of me" (both
+    /// ask for the MODEL rather than for one belief) and "forget what you think you
+    /// know about my music taste" / "clear your model of my interests" (both order
+    /// the belief DROPPED, which is Contest, not the un-contest Clear the fixture
+    /// used to label them).
+    #[test]
+    fn whole_model_questions_explain_and_whole_model_wipes_contest() {
+        assert!(matches!(
+            classify_mirror_intent("what do you think you know about me"),
+            Some(MirrorIntent::Explain(_))
+        ));
+        assert!(matches!(
+            classify_mirror_intent("what is your model of me"),
+            Some(MirrorIntent::Explain(_))
+        ));
+        match classify_mirror_intent("forget what you think you know about my music taste") {
+            Some(MirrorIntent::Contest(s)) => assert_eq!(s, "music taste"),
+            other => panic!("expected Contest(music taste), got {other:?}"),
+        }
+        match classify_mirror_intent("clear your model of my interests") {
+            Some(MirrorIntent::Contest(s)) => assert_eq!(s, "interests"),
+            other => panic!("expected Contest(interests), got {other:?}"),
+        }
+        // THE SELF-REFERENTIAL ANCHOR: without "me"/"my" these are ordinary
+        // sentences, and the destructive one would delete a belief on a subject the
+        // user never named.
+        for u in [
+            "what do you think you know about quantum physics",
+            "forget what you think you know about parenting advice",
+            "clear your model of the airplane off the table",
+        ] {
+            assert!(classify_mirror_intent(u).is_none(), "{u:?}");
+        }
+    }
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;

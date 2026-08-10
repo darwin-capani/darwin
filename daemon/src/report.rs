@@ -411,7 +411,45 @@ pub fn classify_report_intent(utterance: &str) -> Option<ReportIntent> {
     // Must carry an explicit build verb so a mere mention of "report" (a question
     // about an existing report) does not trip it.
     const VERBS: &[&str] = &["generate", "write", "build", "make", "create", "produce", "draft", "compile"];
-    if !crate::utterance::mentions_any_word(lower, VERBS) {
+    // ...or an explicit REQUEST FRAME for one. MEASURED RECALL MISSES: "put
+    // together a report on fusion research" and "i need a report on what you found
+    // about graphene" both reached NOTHING. Neither carries a single-token build
+    // verb — the verb is a two-word phrase ("put together") or the request is
+    // framed as a need — yet both are unambiguous orders to build a report.
+    //
+    // These are PHRASES, not words, and each already contains the noun "report",
+    // so they are not a second unanchored keyword: the topic anchor below
+    // ("report on"/"report about") still has to hold, which is what refuses "i
+    // need a report from the mechanic before tuesday".
+    const REQUEST_FRAMES: &[&str] = &[
+        "put together a report",
+        "put together the report",
+        "pull together a report",
+        "prepare a report",
+        "prepare the report",
+        "i need a report",
+        "i want a report",
+        "i'd like a report",
+        "id like a report",
+        "give me a report",
+        "get me a report",
+    ];
+    let framed = REQUEST_FRAMES.iter().any(|f| lower.contains(f));
+    if !framed && !crate::utterance::mentions_any_word(lower, VERBS) {
+        return None;
+    }
+    // A REPORT EXPECTED *FROM* SOMEONE IS NOT A REPORT ORDERED FROM DARWIN, and
+    // getting this wrong costs EGRESS: this intent runs a web research pass, so
+    // a misread turns an ordinary sentence about a family member into a search
+    // carrying their description off the machine.
+    //
+    // MEASURED: the REQUEST_FRAMES widening above closed two real recall misses
+    // and opened "i need a report on my son from his teacher" — grammatically a
+    // perfect match for the frame, and semantically the owner saying a THIRD
+    // PARTY owes them a document. The source attribution is the discriminator,
+    // and it is the same signal the topic anchor already relies on to refuse
+    // "i need a report from the mechanic before tuesday".
+    if framed && lower.contains(" from ") {
         return None;
     }
     // Pull the topic after the LAST " on " / " about " that follows "report".
@@ -599,6 +637,51 @@ pub async fn dispatch(
 
 #[cfg(test)]
 mod tests {
+
+    /// This intent runs a WEB RESEARCH PASS, so a false positive is egress. The
+    /// request-frame widening made "i need a report on X" an order, which is
+    /// right — but it also matched the owner saying a THIRD PARTY owes them a
+    /// document about someone in their family, and searched the web for it.
+    #[test]
+    fn a_report_expected_from_a_person_is_not_a_report_ordered_from_darwin() {
+        for u in [
+            "i need a report on my son from his teacher",
+            "i need a report on the roof from the surveyor",
+            "give me a report on the car from the mechanic",
+        ] {
+            assert!(
+                super::classify_report_intent(u).is_none(),
+                "{u:?} ordered a web research run — that sentence describes a \
+                 document another PERSON owes the owner"
+            );
+        }
+        // ...and the real orders the widening was added for still land.
+        assert!(super::classify_report_intent("i need a report on what you found about graphene").is_some());
+        assert!(super::classify_report_intent("put together a report on fusion research").is_some());
+    }
+
+    /// REGRESSION (router-recall miss list): "put together a report on fusion
+    /// research" and "i need a report on what you found about graphene" both
+    /// reached NOTHING — neither carries a single-token build verb, though both
+    /// are unambiguous orders to build a report.
+    #[test]
+    fn request_framed_report_orders_classify_without_a_single_token_verb() {
+        assert_eq!(
+            classify_report_intent("put together a report on fusion research"),
+            Some(ReportIntent { topic: "fusion research".to_string() })
+        );
+        assert_eq!(
+            classify_report_intent("i need a report on what you found about graphene"),
+            Some(ReportIntent { topic: "what you found about graphene".to_string() })
+        );
+        // The TOPIC ANCHOR still has to hold: a request frame alone is not enough.
+        for u in [
+            "i need a report from the mechanic before tuesday",
+            "give me a report card summary at the end of term",
+        ] {
+            assert_eq!(classify_report_intent(u), None, "{u:?}");
+        }
+    }
     use super::*;
 
     fn cfg() -> ReportConfig {

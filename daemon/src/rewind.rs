@@ -73,9 +73,21 @@ pub fn classify_rewind_intent(text: &str, now: DateTime<FixedOffset>) -> Option<
     let t = text.trim().to_lowercase();
     let t = t.trim_end_matches(['.', '!', '?']).trim();
 
-    let gated = ["what happened", "rewind", "walk me through", "replay"]
-        .iter()
-        .any(|g| t.contains(g));
+    // MEASURED RECALL MISS: "take me back through the last half hour" reached
+    // nothing — it is the same request as "walk me through this morning" in
+    // different words. Safe to add because the cue is only half the gate: an
+    // utterance still has to resolve a TIME WINDOW below, so "take me back to my
+    // childhood" and "take me back through the process again" both fall through.
+    let gated = [
+        "what happened",
+        "rewind",
+        "walk me through",
+        "replay",
+        "take me back through",
+        "take me back over",
+    ]
+    .iter()
+    .any(|g| t.contains(g));
     if !gated {
         return None;
     }
@@ -107,6 +119,13 @@ fn parse_last_window(t: &str, now: DateTime<FixedOffset>) -> Option<Window> {
         .map(|(_, r)| r)?;
     let minutes = if rest.starts_with("hour") {
         60
+    } else if rest.starts_with("half hour") || rest.starts_with("half an hour") {
+        // "the last half hour" — spoken far more often than "the last 30
+        // minutes", and it parsed as neither (the numeric branch below tries to
+        // `parse::<i64>()` the token "half" and gives up).
+        30
+    } else if rest.starts_with("half day") || rest.starts_with("half a day") {
+        12 * 60
     } else {
         let mut parts = rest.splitn(2, ' ');
         let n: i64 = parts.next()?.parse().ok()?;
@@ -436,6 +455,30 @@ pub fn payload(r: &Rewind) -> Value {
 
 #[cfg(test)]
 mod tests {
+
+    /// REGRESSION (router-recall miss list): "take me back through the last half
+    /// hour" reached NOTHING — twice over. The phrasing was not a gated cue, and
+    /// "half hour" parsed as no window at all (the numeric branch tries to parse
+    /// the token "half").
+    #[test]
+    fn take_me_back_through_a_half_hour_resolves_a_window() {
+        let now = now();
+        let w = classify_rewind_intent("take me back through the last half hour", now)
+            .expect("a half-hour window");
+        assert_eq!(w.label, "the last 30 minutes");
+        assert_eq!(
+            w.from_utc,
+            (now - Duration::minutes(30)).with_timezone(&Utc).to_rfc3339()
+        );
+        assert!(classify_rewind_intent("rewind the last half hour", now).is_some());
+        // The cue alone is not the gate — a window is still required.
+        for u in [
+            "take me back through the process one more time",
+            "the last half hour of the movie was the best part",
+        ] {
+            assert!(classify_rewind_intent(u, now).is_none(), "{u:?}");
+        }
+    }
     use super::*;
 
     /// 2026-07-13 15:00:00 -05:00 — a fixed afternoon, machine-TZ-independent.
