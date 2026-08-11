@@ -217,13 +217,20 @@ reachability/telemetry-port bindability/cloud-key) and exits non-zero on a hard 
 > `./install.sh` does **not** run `scripts/init_memory.py`; the three runtime state subdirs
 > are created by the daemon itself at startup (`daemon/src/main.rs`, which also chmods
 > `state/ipc` to 0700). So on a freshly installed machine where the daemon has **never
-> started**, `darwind --selftest` reports **FAIL** on `state/ipc`, `state/logs` and
-> `state/tmp` — each with the message "*missing (the daemon creates it at startup)*", a
-> verdict that contradicts its own explanation — plus an honest `SKIP` on `ipc_perms`
-> ("could not stat state/ipc"). Nothing is wrong: that is "not started yet", not an error.
-> Start the agents (§7) or `scripts/bringup.sh` — which reports the same condition as
-> `SKIP`, not `FAIL` — and re-run it. If they are still missing *after* a start, the
-> failure is real.
+> started**, `darwind --selftest` reports `SKIP` on `state/ipc`, `state/logs` and
+> `state/tmp` (plus the `SKIP` on `ipc_perms`, "could not stat state/ipc") — nothing is
+> wrong, that is "not started yet", not an error. It used to report **FAIL** on those
+> three, with the message "*missing (the daemon creates it at startup)*": a verdict that
+> contradicted its own explanation. Start the agents (§7) or `scripts/bringup.sh` —
+> which reported the condition as `SKIP` all along — and re-run it.
+>
+> The `SKIP` is **witnessed, not blanket**, so a deployed system still fails loudly.
+> `selfcheck::ever_started` looks for `state/darwin.db` or `state/audit.db` — both
+> opened unconditionally at startup, directly under `state/` rather than inside the
+> three subdirs, and created by neither `install.sh` nor anything else on the install
+> path. If either exists, or if some of the three exist and others do not (nothing
+> creates a partial set — `prepare_state_dirs` makes all three or errors), a missing
+> subdir is a `FAIL`. Only "no witness AND none of the three" reads as never-started.
 
 The daemon now also runs a **background inference-liveness probe** (publishing
 `inference.health` + a one-shot `inference.degraded`/`inference.recovered` edge to the HUD)
@@ -245,25 +252,38 @@ reachable from the script each tests, as is the new `test_uninstall_footprint.sh
 `test_doc_claims.sh` has no installer of its own to hang off, so what keeps IT reachable is
 this command block plus the `gate_docs.rs` guard that pins it — delete the line below and the
 guard fails. The fourth, `scripts/test_shell_sandbox.sh`, belongs to the shell-sandbox
-surface and is still outstanding:
+surface rather than to an installer, so it is wired the same way one section down
+("Surface gate — the shell sandbox"):
 
 ```sh
 ./install.sh --selftest                # -> scripts/test_install_config_preserved.sh  (30 checks)
 ./uninstall.sh --selftest              # -> scripts/test_uninstall_footprint.sh      (23 checks)
 scripts/install_boot.sh --selftest     # -> scripts/test_install_boot.sh              (6 checks)
-bash scripts/test_doc_claims.sh        # the doc-claims harness                      (25 checks)
+bash scripts/test_doc_claims.sh        # the doc-claims harness                      (28 checks)
 ```
 
 **Cost, measured on an M1 Pro (best of three warm runs of the commands above, not of the
 bare harnesses — the wrapper scripts source `scripts/ui.sh` first): 0.96s + 0.81s + 0.28s
-+ 0.66s = 2.7s for all four** — stated here so the price is known rather than discovered.
++ 0.85s = 2.90s -> 2.9s for all four** — stated here so the price is known rather than
+discovered. Only the doc-claims component has moved: 0.62s -> 0.72s when the two
+`DARWIN_ALLOW_FOREIGN_HOME` probes were added, then **+0.13s** for the four-value
+hatch-VALUE sweep. That last figure is a DELTA, not a re-measurement: an interleaved A/B,
+best of twelve runs each, same interpreter (0.78s amended vs 0.65s control) on a FASTER
+M-series box than the one the other three numbers came from — so on that slower box the
+component is at least 0.85s. The other three commands are untouched and keep their
+numbers.
 The first three harnesses on their own are 0.45s / 0.54s / 0.40s; the number that matters
-is the one you pay. `test_doc_claims.sh` is in this list because 11 of its 25 checks have `install.sh`, `uninstall.sh` or `install_boot.sh` as their
+is the one you pay. `test_doc_claims.sh` is in this list because 14 of its 28 checks have `install.sh`, `uninstall.sh` or `install_boot.sh` as their
 subject, and are
 installer/uninstaller checks — including the one that DRIVES `uninstall.sh`'s `guard_home`
 against an empty / `/` / foreign / relative `$HOME` (and against your real one, so it is
-not a blanket refusal), which is the coverage `test_uninstall_footprint.sh` deliberately
-does not duplicate. It too was reachable by no documented command.
+not a blanket refusal, and against `DARWIN_ALLOW_FOREIGN_HOME` on both sides of BOTH of
+its boundaries — the `$HOME` it rescues (the foreign one, and never an empty / `/` /
+relative one), and its own VALUE: exactly `1` opens the hatch, while a word-truthy
+(`true`), arithmetic (`01`), whitespace-padded (`" 1"`) or arbitrary (`xyz`) value stays
+REFUSED, so the guard in front of the `rm -rf` cannot be disarmed by a variable set for
+some unrelated purpose), which
+is the coverage `test_uninstall_footprint.sh` deliberately does not duplicate. It too was reachable by no documented command.
 
 All four are hermetic: no daemon, no network, no build, no model, and they WRITE nothing
 outside their own `mktemp -d` sandboxes. In
@@ -289,6 +309,39 @@ product calls `tccutil`, so re-installing inherits your existing consent decisio
 ("the user pointing at a bigger disk"), a split `scripts/doctor.sh` has a check for. On such
 an install those gigabytes stay; deleting a possibly-shared HF cache would be worse than
 leaving it, so `uninstall.sh`'s `--help` names the exception instead.
+
+---
+
+## Surface gate — the shell sandbox (#43)
+
+`scripts/test_shell_sandbox.sh` was the FOURTH harness this repo found reachable by no
+runnable command and by no `daemon/src/gate_docs.rs` guard. It has no installer to be
+reached FROM — the surface it covers is the sandboxed shell/terminal, the highest-risk
+capability in the product — so, exactly like `test_doc_claims.sh`, what keeps it
+reachable is this command block plus the `gate_docs.rs` guard that pins it: delete the
+line below and the guard fails.
+
+```sh
+bash scripts/test_shell_sandbox.sh     # the shell-sandbox safety selftest   (4 checks / 14 tests)
+```
+
+(Four `PASS:` lines, one per filter, covering 14 tests — the count in the other block above
+is `ok` lines, so both units are given here rather than silently mixed.)
+
+It runs four hermetic `cargo test` filters over the layers a shell command must clear
+before a byte of it runs: the classifier denylist plus obfuscation attempts and the
+deny-default/no-network/scratch-only SBPL profile TEXT (`shell::tests`, 11 tests),
+`shell_run`'s membership in `CONSEQUENTIAL_TOOLS` so it parks for a spoken yes,
+`[shell].enabled` shipping true (armed by default, gated per action), and the
+owned/voice-id gate routing (1 test each). It refuses a vacuous pass: a filter matching
+ZERO tests is a FAIL, not cargo's "ok. 0 passed" — it had already hidden two renamed
+tests once. And it never execs a command, sandboxed or not; the four exec-ing drain
+tests live in `shell::drain_tests`, which none of these filters match.
+
+**Cost, measured on an M1 Pro, best of three: 0.87s warm**, against a `daemon/target`
+the daemon gate has already built. **Cold in a fresh tree it is 217s**, because the
+first `cargo test` pays the whole debug build — so run it after
+`cargo test --manifest-path daemon/Cargo.toml --bin darwind`, not before it.
 
 ---
 

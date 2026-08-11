@@ -5990,24 +5990,49 @@ const VISION_REQUEST_MODALS: &[&str] = &[
 /// Bare subject pronouns. English spells the PAST tense of "read" and "set"
 /// exactly like the imperative, so "we read the whiteboard notes" and "i set the
 /// sensitivity myself last week" are indistinguishable from a command by the
-/// verb alone — but a subject sitting directly in front of the verb, with no
-/// modal ahead of it, is the tell. "can YOU read my screen" keeps working
-/// because the modal came first; "WE read the whiteboard" does not.
+/// verb alone — but a subject ANYWHERE in front of the verb, with no modal
+/// ahead of it, is the tell. "can YOU read my screen" keeps working because the
+/// modal came first; "WE read the whiteboard" does not.
+///
+/// ANYWHERE, NOT ADJACENT, AND THE DIFFERENCE WAS MEASURED. This said "directly
+/// in front of" and the code matched it: only the token IMMEDIATELY before the
+/// verb was checked, so ONE frame adverb between the subject and the verb
+/// cleared the tell. Every one of these captured the owner's screen and SPOKE it
+/// — each is one word from a sentence `router_ordinary.json` already enforces as
+/// inert: "we just read my screen and drink cocoa" (cf. "on sundays we read my
+/// screen and drink cocoa"), "i just read the screen before you got here" (cf.
+/// "i already read …", where "already" is not in the frame and so was caught),
+/// "we now read my screen every day", "i also read my screen", "we simply read
+/// my screen and move on", "we quickly read my screen then leave", "i actually
+/// read my screen already", "we maybe read my screen later", "we first read my
+/// screen then eat", "we go and read the screen together", "you just read my
+/// screen over my shoulder", "i just narrate my screen while i cook", "we just
+/// list the buttons on my screen for fun", "we just describe my screen out
+/// loud", "we also describe my screen" — and, on the CAMERA gates that share
+/// this helper, "we just watch the front door on sundays" (watch.start) and "we
+/// just read the whiteboard together" (read.handwriting).
 const VISION_BARE_SUBJECTS: &[&str] = &["i", "we", "you"];
 
 /// Whether the FIRST content token of `lower` is one of `verbs` — i.e. the verb
 /// is in COMMAND position, preceded by nothing but [`VISION_COMMAND_FRAME`], and
-/// not sitting behind a bare subject (see [`VISION_BARE_SUBJECTS`]). Whole-word
+/// with NO bare subject anywhere ahead of it unless a request modal came first
+/// (see [`VISION_BARE_SUBJECTS`] for why anywhere, not adjacent). Whole-word
 /// by construction (the split is the same alnum-boundary rule
 /// `crate::utterance::mentions_word` uses), so "proofread this" is not a "read"
 /// and "already read …" is not a command. Single pass, no allocation — an
 /// oversize junk utterance must stay cheap.
 fn vision_verb_in_command_position(lower: &str, verbs: &[&str]) -> bool {
     let mut modal_seen = false;
-    let mut prev_was_subject = false;
+    // STICKY, not adjacent: once a bare subject has been seen, it stays seen for
+    // the rest of the prefix. `prev_was_subject` was overwritten by every token,
+    // so one frame adverb after the subject ("we JUST read my screen") erased it
+    // — see [`VISION_BARE_SUBJECTS`] for the 17 measured sentences that got
+    // through that way. A later modal still forgives ("i just need YOU to read
+    // my screen" fires), because `modal_seen` is checked at the verb, not here.
+    let mut subject_seen = false;
     for w in lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
         if verbs.contains(&w) {
-            return !prev_was_subject || modal_seen;
+            return !subject_seen || modal_seen;
         }
         if !VISION_COMMAND_FRAME.contains(&w) {
             return false;
@@ -6015,7 +6040,9 @@ fn vision_verb_in_command_position(lower: &str, verbs: &[&str]) -> bool {
         if VISION_REQUEST_MODALS.contains(&w) {
             modal_seen = true;
         }
-        prev_was_subject = VISION_BARE_SUBJECTS.contains(&w);
+        if VISION_BARE_SUBJECTS.contains(&w) {
+            subject_seen = true;
+        }
     }
     false
 }
@@ -7441,12 +7468,60 @@ fn lumen_is_read(lower: &str) -> bool {
     }
     let mentions_screen = lower.contains("screen") || lower.contains("display");
     let mentions_controls = lumen_mentions_control_noun(lower);
-    let reads = lower.contains("read")
-        || lower.contains("narrate")
-        || lower.contains("list")
-        || lower.contains("what's on")
+    // THE READ VERB MUST BE IN COMMAND POSITION.
+    //
+    // WHAT WENT WRONG: these were bare `contains` tests, so an owner NARRATING
+    // captured their own screen and had it read back ALOUD. MEASURED at
+    // 668bcb3, all reaching a Lumen read: "on sundays we read my screen and
+    // drink cocoa", "our routine is that we read my screen and then drink
+    // cocoa", "after coffee we read my screen together", "my sister read my
+    // screen over my shoulder last night", "the kids list the buttons on my
+    // screen for fun", "we sat down and read the screen together", "she narrates
+    // my screen while i cook", "i already read the screen before you got here"
+    // — and, because these were SUBSTRING tests, three sentences that contain no
+    // read verb at all: "the spreadsheet is open on my screen" and "the reading
+    // on my display was wrong" (spREADsheet / READing) and "is the screen ready
+    // for the presentation" (READy).
+    //
+    // `vision_verb_in_command_position` is the SAME rule the watch/stop/scan/
+    // analyze gates in this file already use, and it fixes both halves at once:
+    // it is whole-word by construction (so "spreadsheet" is not a "read"), and
+    // it admits the verb only behind VISION_COMMAND_FRAME with no bare subject
+    // in front of it (so "we read …" is a report while "can you read …" is a
+    // request). The third-person "narrates" / "lists" / "reads" is deliberately
+    // NOT listed: it is narration by definition and no command uses one.
+    //
+    // THE PROGRESSIVE FORMS ARE, AND THEY HAVE TO BE. "Only the base forms"
+    // silently deleted the whole ASPECT construction, which is what the
+    // "keep"/"keeps"/"keeping"/"start"/"starts"/"continue"/"resume"/"begin"
+    // tokens in VISION_COMMAND_FRAME exist for — the frame admits the aspect
+    // verb, so the verb list has to have a progressive for it to reach. MEASURED
+    // lost at the fix and restored here, all 8 working before it: "keep reading
+    // my screen", "keep reading the screen to me", "keep reading the buttons out
+    // loud", "start reading my screen", "continue reading my screen", "resume
+    // reading the screen", "begin reading my screen", "keep listing the buttons
+    // on my screen". This is the sibling's own construction, not a new one:
+    // WATCH_VERBS is `["watch", "watching"]` and the handwriting read passes
+    // `["read", "reread", "transcribe", "transcribing"]` for exactly this reason,
+    // and "watching the front door" / "transcribing the whiteboard" both fire
+    // today. "narrating"/"describing" are NOT added: they never reached at HEAD
+    // either (the old substring test could not see them), so adding them would be
+    // a new capability rather than a restoration.
+    let reads_verb =
+        vision_verb_in_command_position(
+            lower,
+            &["read", "reread", "reading", "rereading", "narrate", "list", "listing"],
+        );
+    // THE QUESTION CUES ARE LEFT AS THEY WERE, and deliberately so: they carry no
+    // verb that could sit in command position ("what's on my screen" has none at
+    // all), so the sibling's rule does not apply to them and imposing it would
+    // delete the capability. They remain matchable anywhere — see the
+    // question-form entries in `recall_probe`'s KNOWN_OPEN_HIJACKS, where the
+    // residue is stated rather than quietly dropped.
+    let asks = lower.contains("what's on")
         || lower.contains("what is on")
         || lower.contains("what are");
+    let reads = reads_verb || asks;
     // MEASURED RECALL MISS: "what buttons are on this screen" reached nothing.
     // "what are" was in `reads` but this word order interposes the noun ("what
     // BUTTONS are"), so the most natural way to ask Lumen what it can see fell
@@ -7621,7 +7696,26 @@ pub fn describe_command(text: &str) -> Option<DescribeRequest> {
     // to the VLM (VQA); a bare "describe my screen" stays a generic caption.
     let mentions_screen =
         lower.contains("screen") || lower.contains("display") || lower.contains("looking at");
-    let describe_screen = (lower.contains("describe") && mentions_screen)
+    // THE DESCRIBE VERB MUST BE IN COMMAND POSITION — the same rule the
+    // watch/stop/scan/analyze gates in this file already use, and the same fix
+    // the Lumen read arm just took.
+    //
+    // WHAT WENT WRONG: `contains("describe")` captured the owner's screen off
+    // ordinary NARRATION, and this branch runs FIRST in `route()` (ahead of
+    // Lumen and Vision), so it was the earliest of the three ways a weekend
+    // anecdote could put the screen on the speaker. MEASURED at 668bcb3, all
+    // reaching a screen describe: "we get out the laptop and describe my screen
+    // and take notes", "on mondays we describe my screen to the group", "our
+    // habit is that we describe my screen out loud", and — because this was a
+    // SUBSTRING test — the inflected reports "she described my screen to the
+    // support agent", "the manual describes the screen in detail" and "he
+    // described the display at the museum to me".
+    //
+    // ONLY THIS CONJUNCT CHANGES. The three question forms below carry no verb
+    // in command position and are untouched; the IMAGE branch above is untouched
+    // too (it is anchored on `extract_image_path` finding a real
+    // image-extension token, which narration does not carry).
+    let describe_screen = (vision_verb_in_command_position(&lower, &["describe"]) && mentions_screen)
         || lower.contains("what am i looking at")
         || (lower.contains("what do you make of") && mentions_screen)
         // MEASURED RECALL MISS: "tell me what you see on my screen" reached the
@@ -12320,6 +12414,168 @@ mod tests {
         }
     }
 
+    /// TALKING ABOUT READING A SCREEN IS NOT ASKING FOR ONE — and the readout is
+    /// SPOKEN, so an owner narrating their weekend with company in the room had
+    /// their screen read back to the room. A disclosure cannot be undone through
+    /// the channel that caused it.
+    ///
+    /// EVERY SENTENCE HERE WAS MEASURED REACHING A LUMEN READ AT 668bcb3 — a
+    /// negative probe chosen to pass is not a probe. The list covers the five
+    /// narration shapes that defeat a bare `contains`, plus the three SUBSTRING
+    /// false positives (spREADsheet / READing / READy) that carry no read verb at
+    /// all:
+    ///   * fronted adjunct        "on sundays we read my screen …"
+    ///   * nominal/possessive subject  "our routine is that we read my screen …"
+    ///   * bare subject           "we sat down and read the screen together"
+    ///   * third-person report    "she narrates my screen while i cook"
+    ///   * past-tense report      "i already read the screen before you got here"
+    ///
+    /// The fix is `vision_verb_in_command_position`, the SAME helper the
+    /// watch/stop/scan/analyze gates in this file use. It is clean for two
+    /// independent reasons, and both are load-bearing here: it splits on
+    /// alnum boundaries so the verb is WHOLE-WORD (killing the three substrings),
+    /// and it admits the verb only behind VISION_COMMAND_FRAME with no bare
+    /// subject directly in front of it unless a modal came first (killing the
+    /// reports while keeping "can YOU read my screen").
+    #[test]
+    fn lumen_narration_about_reading_the_screen_never_captures_it() {
+        for text in [
+            "on sundays we read my screen and drink cocoa",
+            "our routine is that we read my screen and then drink cocoa",
+            "after coffee we read my screen together",
+            "my sister read my screen over my shoulder last night",
+            "the kids list the buttons on my screen for fun",
+            "we sat down and read the screen together",
+            "she narrates my screen while i cook",
+            "i already read the screen before you got here",
+            // NO READ VERB AT ALL — the old test was a substring.
+            "the spreadsheet is open on my screen",
+            "is the screen ready for the presentation",
+            "the reading on my display was wrong",
+        ] {
+            assert_eq!(
+                lumen_command(text),
+                None,
+                "{text:?} is narration and captured the owner's screen"
+            );
+            assert!(
+                !is_screen_read(text),
+                "{text:?} is still classified as a screen read"
+            );
+        }
+    }
+
+    /// ...AND BOTH SIDES OF THE BOUNDARY. The command-position rule can only pay
+    /// for itself if the real request survives every way an owner opens one, so
+    /// each admitted shape is probed: bare imperative, vocative prefix,
+    /// politeness prefix, the modal question form (which is where the bare
+    /// subject "you" has to be FORGIVEN), a discourse-marker prefix, and the
+    /// question forms that carry no verb in command position at all and are
+    /// therefore NOT subject to this rule.
+    #[test]
+    fn every_real_lumen_read_survives_the_command_position_rule() {
+        for text in [
+            "read my screen",                       // bare imperative
+            "darwin, read my screen",               // vocative
+            "please read my screen",                // politeness
+            "can you read my screen",               // modal question, bare subject
+            "hey darwin can you read the screen to me",
+            "just read the buttons out loud",       // discourse marker
+            "now list the controls on my screen",
+            "narrate my screen",
+            "read me the buttons",
+            "read me the screen",
+            "read the controls on this screen",
+            "read the label on the button",
+            // THE ASPECT CONSTRUCTION, which the frame carries "keep"/"start"/
+            // "continue"/"resume"/"begin" specifically to admit. Every one of
+            // these worked at HEAD and was measured reaching NOTHING after the
+            // base-forms-only verb list — this row is what makes that a test
+            // failure instead of a silent capability loss.
+            "keep reading my screen",
+            "keep reading the screen to me",
+            "keep reading the buttons out loud",
+            "start reading my screen",
+            "continue reading my screen",
+            "resume reading the screen",
+            "begin reading my screen",
+            "keep listing the buttons on my screen",
+            // NOT verb-in-command-position: the question forms, untouched.
+            "what's on my screen",
+            "what is on my screen",
+            "what are the controls",
+            "what buttons are on this screen",
+        ] {
+            assert_eq!(
+                lumen_command(text),
+                Some(LumenCommand::Read),
+                "{text:?} is a real screen read and stopped working"
+            );
+        }
+    }
+
+    /// ONE WORD IS NOT A BOUNDARY. The command-position rule checked only the
+    /// token IMMEDIATELY before the verb, so a single frame adverb between the
+    /// bare subject and the verb put the capture back: "on sundays we read my
+    /// screen and drink cocoa" was inert while "we JUST read my screen and drink
+    /// cocoa" read the owner's screen ALOUD, and "i already read the screen
+    /// before you got here" was inert while "i JUST read the screen before you
+    /// got here" was not. Every sentence here was MEASURED capturing (lumen
+    /// read, and most of them vision `read.screen` as well) AFTER that fix and
+    /// inert only once [`VISION_BARE_SUBJECTS`] became sticky.
+    ///
+    /// ONE DIMENSION AT A TIME: the subject is held fixed and the adverb between
+    /// it and the verb is varied over the frame ("just", "also", "now", "then",
+    /// "simply", "quickly", "actually", "maybe", "first", "go", "go back"), then
+    /// the subject is varied over i/we/you with the adverb held fixed.
+    #[test]
+    fn a_frame_adverb_between_the_subject_and_the_verb_is_still_narration() {
+        for text in [
+            "we just read my screen and drink cocoa",
+            "i just read the screen before you got here",
+            "you just read my screen over my shoulder",
+            "we also read my screen on sundays",
+            "we now read my screen every day",
+            "we then read my screen and drink cocoa",
+            "we simply read my screen and move on",
+            "we quickly read my screen then leave",
+            "i actually read my screen already",
+            "we maybe read my screen later",
+            "we first read my screen then eat",
+            "i first read my screen then i eat breakfast",
+            "we go and read the screen together",
+            "we go back and read my screen every hour",
+            "i just narrate my screen while i cook",
+            "we just list the buttons on my screen for fun",
+        ] {
+            assert_eq!(
+                lumen_command(text),
+                None,
+                "{text:?} is narration and captured the owner's screen"
+            );
+            assert!(
+                !is_screen_read(text),
+                "{text:?} is still classified as a screen read"
+            );
+        }
+        // ...AND THE MODAL MUST STILL FORGIVE THE ADDRESSEE, at a distance too:
+        // the subject is no longer required to be adjacent, so the check that a
+        // request survives it cannot be adjacency-only either.
+        for text in [
+            "can you read my screen",
+            "i need you to read my screen",
+            "i just need you to read my screen",
+            "i'd like you to read my screen",
+            "im going to need you to read my screen",
+        ] {
+            assert_eq!(
+                lumen_command(text),
+                Some(LumenCommand::Read),
+                "{text:?} is a request and the sticky subject ate it"
+            );
+        }
+    }
+
     /// A Lumen READ is a screen read (surfaces on-screen control labels), so it is
     /// unioned into `is_screen_read` for TRANSIENCE; a Lumen ACT is NOT a read.
     #[test]
@@ -12898,6 +13154,76 @@ mod tests {
                 "{text:?} must be a generic VLM screen describe (no specific question)"
             );
         }
+    }
+
+    /// TALKING ABOUT DESCRIBING A SCREEN IS NOT ASKING FOR ONE. This branch is
+    /// consulted FIRST in `route()` — ahead of Lumen and Vision — so it was the
+    /// EARLIEST of the three ways an ordinary anecdote could capture the owner's
+    /// screen and put it on the speaker.
+    ///
+    /// EVERY SENTENCE WAS MEASURED REACHING `DescribeRequest::Screen` AT 668bcb3.
+    /// Three are narration shapes a bare `contains` cannot see past (mid-sentence
+    /// coordination, fronted adjunct, possessive subject); three are INFLECTIONS
+    /// the substring test swallowed whole ("described", "describes"), which only
+    /// a whole-word rule can reject.
+    #[test]
+    fn describe_narration_about_the_screen_never_captures_it() {
+        for text in [
+            "we get out the laptop and describe my screen and take notes",
+            "on mondays we describe my screen to the group",
+            "our habit is that we describe my screen out loud",
+            "she described my screen to the support agent",
+            "the manual describes the screen in detail",
+            "he described the display at the museum to me",
+        ] {
+            assert_eq!(
+                describe_command(text),
+                None,
+                "{text:?} is narration and captured the owner's screen"
+            );
+            assert!(
+                !is_describe_request(text),
+                "{text:?} is still classified as a describe request"
+            );
+        }
+    }
+
+    /// ...AND BOTH SIDES. Every way an owner actually opens a describe request
+    /// must survive: bare imperative, vocative, politeness, modal question, and a
+    /// discourse-marker prefix — plus the three question forms and the IMAGE
+    /// branch, neither of which carries a verb in command position and neither of
+    /// which this rule touches.
+    #[test]
+    fn every_real_screen_describe_survives_the_command_position_rule() {
+        for text in [
+            "describe my screen",
+            "darwin, describe my screen",
+            "please describe my screen",
+            "can you describe my screen",
+            "could you describe the display for me",
+            "now describe my screen",
+            "describe what's on my screen",
+            "describe the display",
+            // NOT verb-in-command-position — untouched by this rule.
+            "what am i looking at",
+            "what do you make of my screen",
+            "tell me what you see on my screen",
+        ] {
+            assert!(
+                matches!(describe_command(text), Some(DescribeRequest::Screen { .. })),
+                "{text:?} is a real screen describe and stopped working"
+            );
+        }
+        // The IMAGE branch is anchored on a real image-extension token, not on
+        // command position, and keeps working with the verb anywhere.
+        assert!(matches!(
+            describe_command("look at ~/Desktop/diagram.png and tell me what it shows"),
+            Some(DescribeRequest::Image { .. })
+        ));
+        assert!(matches!(
+            describe_command("describe ~/Desktop/photo.png"),
+            Some(DescribeRequest::Image { .. })
+        ));
     }
 
     /// VQA (task #2, build 2/2): a SPECIFIC visual question about the screen is

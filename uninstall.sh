@@ -147,12 +147,37 @@ guard_home() {
     local rh
     if rh="$(real_home)"; then
         if [ "${HOME%/}" != "${rh%/}" ]; then
+            # KEEP THIS COMPARE EXACT. "This hatch cannot be tripped by accident"
+            # is true only because it takes the literal string "1": a
+            # DARWIN_ALLOW_FOREIGN_HOME that a wrapper, a CI runner or an operator
+            # set to `true`, `yes`, `01` or anything else must NOT disarm the guard
+            # standing in front of remove_home's rm -rf. Loosening this to != "0"
+            # once passed every gate in the repo, so it is now probed on both
+            # sides: scripts/test_doc_claims.sh drives guard_home with "1" (opens)
+            # and with true / 01 / " 1" / xyz (all still refused).
             if [ "${DARWIN_ALLOW_FOREIGN_HOME:-0}" = "1" ]; then
                 ui_warn "\$HOME ($HOME) is not $(id -un)'s home ($rh) — proceeding because DARWIN_ALLOW_FOREIGN_HOME=1."
+                # STATE THE BREADTH OF THE HATCH, because it is not symmetric: only the
+                # $HOME-DERIVED targets move with $HOME. Four do not, and they hit the
+                # REAL login session no matter what $HOME says — so a hatch used with a
+                # $HOME that is NOT where DARWIN is installed produces exactly the
+                # half-uninstall-and-report-success this guard exists to prevent (see
+                # WHAT WENT WRONG above), and one of the four is irreversible. Saying so
+                # costs four lines; the user still has the two-step typed confirm after
+                # this. NOTE: interpolate nothing here — scripts/test_doc_claims.sh
+                # drives this function sliced out of the file, under `set -u`, with the
+                # ui_* helpers stubbed and no globals defined.
+                ui_note "Only \$HOME-derived targets follow \$HOME: the install home, ~/Library/LaunchAgents,"
+                ui_note "~/Applications/DARWIN.app and the HUD's ~/Library WebKit/cache/saved-state dirs."
+                ui_note "These do NOT, and hit your REAL login session regardless of \$HOME: launchctl"
+                ui_note "bootout of the three agents, pkill of a running darwind / server.py / HUD, the"
+                ui_note "com.darwin.daemon Keychain deletion (IRREVERSIBLE), and /Applications/DARWIN.app."
             else
                 ui_err "Refusing to run: \$HOME (\"$HOME\") is not $(id -un)'s home directory (\"$rh\")."
-                ui_note "Everything this script removes except /Applications/DARWIN.app is derived from"
-                ui_note "\$HOME, so running like this would half-uninstall and report success."
+                ui_note "Most of what this script removes is derived from \$HOME, but four things are"
+                ui_note "not — launchctl bootout, the pkill of a running darwind/server.py/HUD, the"
+                ui_note "com.darwin.daemon Keychain deletion and /Applications/DARWIN.app — so running"
+                ui_note "like this would half-uninstall and report success."
                 ui_note "Re-run without overriding \$HOME (e.g. not under sudo/su with always_set_home),"
                 ui_note "or set DARWIN_ALLOW_FOREIGN_HOME=1 if you really installed under this \$HOME."
                 exit 1

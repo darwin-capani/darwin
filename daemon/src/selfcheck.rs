@@ -92,6 +92,26 @@ pub fn tally(checks: &[Check]) -> (usize, usize, usize) {
     (pass, skip, fail)
 }
 
+/// "Has darwind ever started in THIS root?" — the witness that lets a fresh
+/// install report honestly without weakening a deployed one.
+///
+/// `main()` calls [`prepare_state_dirs`] FIRST — before `init_tracing`, before any
+/// store is opened — so ANY startup artifact that lives OUTSIDE `state/ipc|logs|tmp`
+/// proves those three existed at least once. Two such artifacts sit directly under
+/// `state/` and are opened UNCONDITIONALLY on the run path, each with `?`
+/// (`main.rs`: `open_memory(state/darwin.db)`, then `open_audit(state/audit.db)`),
+/// and NEITHER is an install artifact: `./install.sh` creates `state/` only in order
+/// to write `state/env.sh`, and it never runs `scripts/init_memory.py` — the other
+/// thing that would create `darwin.db`, and which creates the three subdirs too, so
+/// the witness and the dirs cannot disagree in that direction either.
+///
+/// Absent on a freshly installed, never-started tree; present on any tree where
+/// darwind got past its own startup gate once.
+fn ever_started(root: &Path) -> bool {
+    let state = root.join("state");
+    state.join("darwin.db").is_file() || state.join("audit.db").is_file()
+}
+
 /// The structural FILESYSTEM checks: root resolution, the daemon binary, the
 /// venv python, config readability, the three state subdirs, and the 0700 perms
 /// on `state/ipc`. PURE w.r.t. the clock/network — it only stats the tree — so
@@ -175,24 +195,53 @@ pub fn filesystem_checks(root: &Path) -> Vec<Check> {
     // This said "four", which implied a fourth directory was validated at startup
     // — scripts/init_memory.py does list a fourth (state/ipc/apps), and that is
     // precisely the thing a reader would then assume is gated here. It is not.
-    for sub in ["ipc", "logs", "tmp"] {
+    //
+    // THE FRESH-INSTALL WRINKLE. These three are created by a START
+    // (`prepare_state_dirs`), and `./install.sh` does not create them — so before
+    // the first start a FAIL here declared a freshly installed tree BROKEN in a
+    // message that then explained the condition was normal ("missing (the daemon
+    // creates it at startup)"): a verdict contradicting its own explanation.
+    //
+    // Turning that into a blanket SKIP would weaken a real gate on a deployed
+    // system, so the SKIP is witnessed, and every other case still FAILs loudly:
+    //   * a start witness present (`ever_started`) -> FAIL. The daemon HAS run
+    //     here, so a missing subdir is a real fault.
+    //   * SOME of the three present and others missing -> FAIL. Nothing creates a
+    //     partial set: `prepare_state_dirs` makes all three or returns Err, so a
+    //     partial set means one was removed.
+    //   * ONLY "no witness AND none of the three" is "not started yet" -> SKIP.
+    // `scripts/bringup.sh` already reports this condition as SKIP; the two now
+    // agree, and `ipc_perms` below was already an honest SKIP here.
+    let subs = ["ipc", "logs", "tmp"];
+    let present = subs
+        .iter()
+        .filter(|s| root.join("state").join(s).is_dir())
+        .count();
+    let never_started = present == 0 && !ever_started(root);
+    for sub in subs {
+        let name = match sub {
+            "ipc" => "state/ipc",
+            "logs" => "state/logs",
+            _ => "state/tmp",
+        };
         let d = root.join("state").join(sub);
         if d.is_dir() {
-            checks.push(Check::pass(
-                match sub {
-                    "ipc" => "state/ipc",
-                    "logs" => "state/logs",
-                    _ => "state/tmp",
-                },
-                format!("{} present", d.display()),
+            checks.push(Check::pass(name, format!("{} present", d.display())));
+        } else if never_started {
+            checks.push(Check::skip(
+                name,
+                format!(
+                    "{} missing, and darwind has never started here (no state/darwin.db, \
+                     no state/audit.db, and none of state/ipc|logs|tmp) — that is \"not \
+                     started yet\", not a fault. Start it (scripts/bringup.sh or the \
+                     LaunchAgents) and re-run; if it is still missing AFTER a start, this \
+                     leg FAILs",
+                    d.display()
+                ),
             ));
         } else {
             checks.push(Check::fail(
-                match sub {
-                    "ipc" => "state/ipc",
-                    "logs" => "state/logs",
-                    _ => "state/tmp",
-                },
+                name,
                 format!("{} missing (the daemon creates it at startup)", d.display()),
             ));
         }
@@ -473,6 +522,22 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         let checks = startup_blocking_checks(&root);
         assert!(any_failed(&checks), "missing config + state dirs must hard-FAIL the startup gate");
+        // EXACT, so this cannot go on resting on a leg whose meaning changed: on a
+        // tree that has NEVER started, the three state subdirs SKIP (see
+        // `a_never_started_tree_skips_the_state_subdirs_and_a_started_one_still_fails`)
+        // and `ipc_perms` cannot stat, so the FAILs here are root + config. Counting
+        // failures instead of naming them would let this pass while proving nothing
+        // about the legs in its own name.
+        let failed: Vec<&str> = checks
+            .iter()
+            .filter(|c| c.status == Status::Fail)
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(
+            failed,
+            vec!["root", "config"],
+            "the missing-dep FAILs must be exactly root + config: {checks:?}"
+        );
         // The inference + cloud-key legs are NOT in the blocking set.
         assert!(
             !checks.iter().any(|c| c.name == "inference" || c.name == "cloud_key"),
@@ -558,6 +623,84 @@ mod tests {
         let v2 = ready_frame(&root, Some(true), true, true, true);
         assert_eq!(v2["inference_reachable"], true);
     }
+    /// THE FRESH-INSTALL WRINKLE, probed on BOTH sides of BOTH boundaries.
+    ///
+    /// `./install.sh` does not create `state/ipc|logs|tmp` and does not run
+    /// `scripts/init_memory.py` — the daemon makes them at startup — so before the
+    /// first start these three legs reported FAIL with the message "missing (the
+    /// daemon creates it at startup)", a verdict that contradicted its own
+    /// explanation. They now SKIP, but ONLY on a tree with no start witness AND
+    /// none of the three present. Every step below is a boundary this SKIP must NOT
+    /// cross, so each is asserted rather than argued.
+    #[test]
+    fn a_never_started_tree_skips_the_state_subdirs_and_a_started_one_still_fails() {
+        use std::fs;
+        let root = tmp_root("neverstarted");
+        fs::create_dir_all(root.join("config")).unwrap();
+        fs::write(root.join("config").join("darwin.toml"), "x=1\n").unwrap();
+        // EXACTLY install.sh's shape: `state/` exists because the installer writes
+        // `state/env.sh` into it, and nothing else is there.
+        fs::create_dir_all(root.join("state")).unwrap();
+        fs::write(root.join("state").join("env.sh"), "# env\n").unwrap();
+
+        let legs = |root: &Path| -> Vec<(String, Status)> {
+            filesystem_checks(root)
+                .into_iter()
+                .filter(|c| matches!(c.name, "state/ipc" | "state/logs" | "state/tmp"))
+                .map(|c| (c.name.to_string(), c.status))
+                .collect()
+        };
+
+        // (1) NEVER STARTED -> all three SKIP, and the startup gate does not hard-fail.
+        let l = legs(&root);
+        assert_eq!(l.len(), 3, "all three legs must still be reported: {l:?}");
+        assert!(
+            l.iter().all(|(_, s)| *s == Status::Skip),
+            "a never-started install must SKIP — not FAIL — the dirs only a START \
+             creates: {l:?}"
+        );
+
+        // (2) THE WITNESS BOUNDARY, other side: darwin.db proves darwind ran here,
+        // so the same three missing dirs are a REAL fault. The SKIP must not
+        // generalize to a deployed system.
+        fs::write(root.join("state").join("darwin.db"), b"").unwrap();
+        let l = legs(&root);
+        assert!(
+            l.iter().all(|(_, s)| *s == Status::Fail),
+            "state/darwin.db proves a start happened here, so a missing subdir is a \
+             real FAIL, never \"not started yet\": {l:?}"
+        );
+        assert!(any_failed(&startup_blocking_checks(&root)), "and it must still block startup");
+        fs::remove_file(root.join("state").join("darwin.db")).unwrap();
+        // audit.db is the second witness (open_audit, same run path) and must count.
+        fs::write(root.join("state").join("audit.db"), b"").unwrap();
+        assert!(
+            legs(&root).iter().all(|(_, s)| *s == Status::Fail),
+            "state/audit.db is opened at startup too, so it is a witness as well"
+        );
+        fs::remove_file(root.join("state").join("audit.db")).unwrap();
+
+        // (3) THE PARTIAL-SET BOUNDARY, other side: no witness at all, but ONE of the
+        // three exists. `prepare_state_dirs` makes all three or errors, so a partial
+        // set means one was REMOVED — the two missing ones stay FAIL.
+        fs::create_dir_all(root.join("state").join("ipc")).unwrap();
+        let l = legs(&root);
+        for (name, status) in &l {
+            let want = if name == "state/ipc" { Status::Pass } else { Status::Fail };
+            assert_eq!(*status, want, "partial set: {name} must be {want:?}; got {l:?}");
+        }
+
+        // (4) DEGENERATE: all three present -> PASS, with or without a witness.
+        for sub in ["logs", "tmp"] {
+            fs::create_dir_all(root.join("state").join(sub)).unwrap();
+        }
+        assert!(
+            legs(&root).iter().all(|(_, s)| *s == Status::Pass),
+            "all three present must PASS"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A FRESH TREE MUST BOOT.
     ///
     /// `main.rs` creates `state/ipc` with a plain `create_dir_all` (0777 & ~umask,

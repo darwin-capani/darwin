@@ -352,8 +352,18 @@ esac
 # real install home / LaunchAgents / Keychain items in place, and still reported
 # "completely removed". So DRIVE the guard rather than reading it.
 guard_src="$(awk '/^real_home\(\) \{/{c=1} c{print} c && /^\}$/{n++} c && n==2{exit}' "$ROOT/uninstall.sh")"
-guard_probe() {   # $1 = the $HOME to run the guard under
-    HOME="$1" GUARD_SRC="$guard_src" bash -c '
+# $2 = the value DARWIN_ALLOW_FOREIGN_HOME takes inside the probe; "" means the
+# escape hatch is OFF (guard_home reads `${DARWIN_ALLOW_FOREIGN_HOME:-0}`, so empty
+# and unset are the same to it).
+#
+# IT USED TO BE INHERITED from the ambient environment, which is not hermetic: with
+# DARWIN_ALLOW_FOREIGN_HOME=1 exported, the HOME=/tmp and HOME=/System probes below
+# flip from REFUSED to PASSED and this harness reports a defect in uninstall.sh that
+# is really a defect in the harness. MEASURED before the fix:
+# `DARWIN_ALLOW_FOREIGN_HOME=1 bash scripts/test_doc_claims.sh` -> "1 FAILURE(S)".
+# The hatch is now an INPUT to the probe, set on both sides, never leaked in.
+guard_probe() {   # $1 = the $HOME to run the guard under; $2 = the hatch value or ""
+    HOME="$1" GUARD_SRC="$guard_src" DARWIN_ALLOW_FOREIGN_HOME="${2-}" bash -c '
         set -uo pipefail
         ui_err() { :; }; ui_note() { :; }; ui_warn() { :; }
         DARWIN_HOME="$HOME/Library/Application Support/DARWIN"
@@ -365,17 +375,69 @@ case "$guard_src" in
     *"real_home() {"*"guard_home() {"*)
         guard_bad=""
         for _h in "" "/" "/tmp" "/System" "relative/path"; do
-            [ "$(guard_probe "$_h")" = "REFUSED" ] || guard_bad="$guard_bad [HOME='$_h']"
+            [ "$(guard_probe "$_h" "")" = "REFUSED" ] || guard_bad="$guard_bad [HOME='$_h']"
         done
         if [ -n "$guard_bad" ]; then
             fail "uninstall.sh's guard_home ACCEPTS a malformed \$HOME:$guard_bad — it would half-uninstall and report success"
         else
             ok "uninstall.sh's guard_home refuses an empty / root / foreign / relative \$HOME"
         fi
-        if [ "$(guard_probe "$HOME")" = "PASSED" ]; then
+        if [ "$(guard_probe "$HOME" "")" = "PASSED" ]; then
             ok "...and still accepts this user's real \$HOME (the guard is not a blanket refusal)"
         else
             fail "uninstall.sh's guard_home REFUSES this user's real \$HOME ($HOME) — a legitimate uninstall cannot run"
+        fi
+        # THE ESCAPE HATCH, probed on BOTH sides. DARWIN_ALLOW_FOREIGN_HOME=1 turns
+        # the foreign-home REFUSAL into a warning on a script whose next act is an
+        # `rm -rf` of a $HOME-derived tree, so what it permits must be stated by a
+        # test and not only by a comment. What it permits, exactly: the $HOME-derived
+        # targets move to the foreign home, while `launchctl bootout gui/$(id -u)`,
+        # the `com.darwin.daemon` Keychain deletion and /Applications/DARWIN.app
+        # still hit the REAL user — i.e. it is the half-uninstall the guard exists to
+        # prevent, entered deliberately. Two things must hold.
+        if [ "$(guard_probe "/tmp" "1")" = "PASSED" ]; then
+            ok "DARWIN_ALLOW_FOREIGN_HOME=1 is what lets a foreign \$HOME through (the hatch uninstall.sh's header and guard_home's own error text both advertise)"
+        else
+            fail "DARWIN_ALLOW_FOREIGN_HOME=1 no longer lets a foreign \$HOME through, yet uninstall.sh's header and guard_home's error text both tell the user to set it"
+        fi
+        hatch_bad=""
+        for _h in "" "/" "relative/path"; do
+            [ "$(guard_probe "$_h" "1")" = "REFUSED" ] || hatch_bad="$hatch_bad [HOME='$_h']"
+        done
+        if [ -n "$hatch_bad" ]; then
+            fail "DARWIN_ALLOW_FOREIGN_HOME=1 now ALSO rescues a \$HOME that is never legitimate:$hatch_bad — the hatch must widen ONLY the foreign-home leg, never step 1 (an empty \$HOME makes remove_home's \`cd \"\$HOME\"\` a silent no-op)"
+        else
+            ok "DARWIN_ALLOW_FOREIGN_HOME=1 does NOT rescue an empty / \"/\" / relative \$HOME — the hatch is scoped to the foreign-home leg"
+        fi
+        # THE HATCH'S VALUE IS THE OTHER BOUNDARY, and it had been probed on one
+        # side only: "1" (opens) and "" (identical to unset, since guard_home reads
+        # ${DARWIN_ALLOW_FOREIGN_HOME:-0}). Neither probe can tell an EXACT compare
+        # from a truthy one — yet "the compare is exact, so true/yes/0 cannot trip
+        # it" is the load-bearing half of the argument that this hatch cannot be
+        # reached by accident, and therefore the reason it is safe to leave as wide
+        # as it is. MEASURED: loosening the compare from = "1" to != "0" left
+        # test_doc_claims.sh at 27/27 ALL PASS, test_uninstall_footprint.sh at exit
+        # 0 and gate_docs.rs at 6/6 green — while `true` and even `xyz` opened a
+        # guard that stands in front of an rm -rf.
+        #
+        # FOUR values, one per loosening SHAPE, so this is a boundary sweep and not
+        # a list. Each was confirmed to be the one that catches its shape: "true"
+        # catches != "0" and any word-truthy test; "xyz" catches a bare -n; "01"
+        # catches an arithmetic test, which "true"/"xyz" do NOT trip; " 1" catches a
+        # whitespace-tolerant regex, which none of the other three trip. With "1"
+        # above and "" already probed as the unset-equivalent, both sides of the
+        # equality are covered.
+        loose_bad=""; loose_n=0
+        for _v in "true" "01" " 1" "xyz"; do
+            loose_n=$((loose_n + 1))
+            [ "$(guard_probe "/tmp" "$_v")" = "REFUSED" ] || loose_bad="$loose_bad [DARWIN_ALLOW_FOREIGN_HOME='$_v']"
+        done
+        if [ "$loose_n" -eq 0 ]; then
+            fail "the hatch-VALUE sweep probed NOTHING — an emptied value list reports a clean pass and proves nothing, the same vacuous shape scripts/test_shell_sandbox.sh refuses when a cargo filter matches zero tests"
+        elif [ -n "$loose_bad" ]; then
+            fail "uninstall.sh's foreign-\$HOME hatch opens on a value that is not exactly \"1\":$loose_bad — keep the literal = \"1\" compare, or a DARWIN_ALLOW_FOREIGN_HOME set to a truthy word for some unrelated purpose silently disarms the guard in front of an rm -rf"
+        else
+            ok "the hatch opens on EXACTLY \"1\" — a word-truthy (true), arithmetic (01), whitespace-padded (\" 1\") and arbitrary (xyz) value are all still REFUSED, so it cannot be tripped by a truthy value set for another purpose"
         fi
         ;;
     *)

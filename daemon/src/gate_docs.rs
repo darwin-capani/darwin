@@ -176,6 +176,50 @@ fn the_daemon_manifest_documents_testing_the_endpoint_security_feature_not_build
     );
 }
 
+/// THE FOURTH UNREACHABLE SHELL HARNESS — the same defect a SIXTH time.
+/// `scripts/test_shell_sandbox.sh` covers the sandboxed-shell surface (#43): the
+/// classifier denylist plus obfuscation, the deny-default / no-network /
+/// scratch-only SBPL profile text, `shell_run`'s `CONSEQUENTIAL_TOOLS` membership,
+/// and `[shell].enabled` shipping true. It RUNS and PASSES today — MEASURED: 14
+/// tests across four cargo filters, 0.87s warm (best of three, M1 Pro) against an
+/// already-built `daemon/target`, 217s cold because the first run pays the debug
+/// build — and it was named by no runnable command and by no guard.
+///
+/// It has no installer to be reached FROM, so it is wired like `test_doc_claims.sh`:
+/// a documented command block plus this guard.
+///
+/// Scoped to the FENCED BLOCK, not the section: the prose around it names the script
+/// in order to explain what it covers, and `docs/BRINGUP.md` ALREADY named it before
+/// this — as "still outstanding". A guard that looked for the string anywhere in the
+/// section would therefore have passed on the exact broken state being fixed.
+#[test]
+fn the_bringup_doc_documents_running_the_shell_sandbox_selftest() {
+    let doc = include_str!("../../docs/BRINGUP.md");
+    let sect = section(
+        doc,
+        "docs/BRINGUP.md",
+        "## Surface gate — the shell sandbox (#43)",
+        "\n## ",
+    );
+    let cmds = section(sect, "docs/BRINGUP.md Surface gate", "```sh", "```");
+    assert!(
+        cmds.contains("scripts/test_shell_sandbox.sh"),
+        "docs/BRINGUP.md's Surface gate command block does not name \
+         `scripts/test_shell_sandbox.sh`. CI runs on a pushed v* tag only, so the \
+         commands a contributor is told to run ARE the merge gate — and this harness, \
+         unlike the three installer ones, has no script of its own to be reached \
+         from.\nblock was:\n{cmds}"
+    );
+    // Both measured costs must stay stated, not rediscovered. The cold one is the
+    // number that surprises whoever runs this first.
+    assert!(
+        sect.contains("0.87s") && sect.contains("217s"),
+        "docs/BRINGUP.md's Surface gate section no longer states the MEASURED warm \
+         (0.87s) and cold (217s) cost of scripts/test_shell_sandbox.sh, so its price \
+         is something the next contributor discovers instead of reads"
+    );
+}
+
 /// `apps/silicon-canvas` got this right first; pin it so it cannot slide back.
 #[test]
 fn the_silicon_canvas_manifest_keeps_documenting_the_gpu_test_command() {
@@ -218,9 +262,9 @@ fn the_silicon_canvas_manifest_keeps_documenting_the_gpu_test_command() {
 /// --selftest` already use. This guard pins the DOCUMENTED half: the section of
 /// `docs/BRINGUP.md` a contributor reads before touching an installer must name all
 /// three commands. MEASURED on an M1 Pro, best of three warm runs of THOSE COMMANDS (not of
-/// the bare harnesses): 0.96s + 0.81s + 0.28s + 0.66s = 2.7s total, and
-/// the check counts are 30 / 23 / 6 / 25. `test_doc_claims.sh` is in the list
-/// because 11 of its 25 checks have install.sh, uninstall.sh or install_boot.sh as their
+/// the bare harnesses): 0.96s + 0.81s + 0.28s + 0.85s = 2.90s -> 2.9s total, and
+/// the check counts are 30 / 23 / 6 / 28. `test_doc_claims.sh` is in the list
+/// because 14 of its 28 checks have install.sh, uninstall.sh or install_boot.sh as their
 /// subject — among them the
 /// only one that DRIVES uninstall.sh's guard_home — and it was reachable by no
 /// documented command either.
@@ -257,7 +301,7 @@ fn the_bringup_doc_documents_running_the_installer_lifecycle_selftests() {
     // The measured cost must stay stated, not rediscovered. The three runtimes are
     // the reason this is cheap enough to be a per-merge gate at all.
     assert!(
-        sect.contains("2.7s"),
+        sect.contains("2.9s"),
         "docs/BRINGUP.md's Lifecycle gates section no longer states the MEASURED total \
          runtime of the three harnesses, so their cost is something the next contributor \
          discovers instead of reads"
