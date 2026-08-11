@@ -19,11 +19,21 @@
 #     ~/Library/Saved Application State (plus com.darwin.hud.savedState there)
 # DARWIN's logs are NOT a separate footprint item: they live in the install home at
 # state/logs/ (see boot/*.plist StandardOutPath), so removing the home removes them.
+# NOT removed, and worth knowing before you answer yes: (1) macOS TCC grants (Microphone /
+#   Screen Recording / Accessibility) — nothing in this product calls tccutil; (2) model
+#   weights that live OUTSIDE the install home. install.sh only DEFAULTS HF_HOME to
+#   $DARWIN_HOME/models: if state/env.sh already carries an `export HF_HOME=` install.sh
+#   honors it (explicitly, for "the user pointing at a bigger disk"), and scripts/doctor.sh
+#   treats that split as a supported state — so those gigabytes are not under the install
+#   home and this script leaves them, deliberately, because such a cache may be shared with
+#   other tools. Check yours with:
+#     grep HF_HOME "$HOME/Library/Application Support/DARWIN/state/env.sh"
 # It removes the INSTALLED OS. A source clone you may have elsewhere is left untouched.
 #
 # Usage:
 #   ~/Library/Application\ Support/DARWIN/uninstall.sh   # interactive, two-step confirm
 #   ./uninstall.sh --dry-run                             # show what WOULD be removed; delete nothing
+#   ./uninstall.sh --selftest                            # hermetic teardown selftest; deletes nothing
 #   ./uninstall.sh --help
 #
 # $HOME must be the invoking user's real home (the guard below verifies it against
@@ -74,13 +84,23 @@ APP_PATHS=("/Applications/DARWIN.app" "$HOME/Applications/DARWIN.app")
 DRY_RUN=0
 case "${1:-}" in
     --dry-run|--check) DRY_RUN=1 ;;
+    # This script's own hermetic teardown selftest, reachable FROM the script it
+    # tests — the same shape as `scripts/apply_heal.sh --selftest` and
+    # `scripts/apply_code_diff.sh --selftest`. A test that exists but is named by no
+    # runnable command is the defect this repo has now hit four times (the 158
+    # src-tauri tests, the three feature-gated suites, and these installer
+    # harnesses). It runs BEFORE guard_home and deletes nothing outside its own
+    # mktemp sandbox.
+    # `exec bash <file>` rather than exec'ing the file: it runs the same harness
+    # whether or not the copy in this tree carries its exec bit.
+    --selftest) exec bash "$SCRIPT_DIR/scripts/test_uninstall_footprint.sh" ;;
     # --help IS the header block above. DERIVE its end (the first non-comment
     # line) instead of hard-coding a range: this was `sed -n '2,22p'`, so every
     # line the footprint list grows would silently fall off the only in-band
     # documentation of what this destructive script deletes.
     -h|--help) awk 'NR > 1 { if (substr($0, 1, 1) != "#") exit; print }' "${BASH_SOURCE[0]}"; exit 0 ;;
     "") : ;;
-    *) printf 'uninstall.sh: unknown argument %q (use --dry-run or --help)\n' "$1" >&2; exit 2 ;;
+    *) printf 'uninstall.sh: unknown argument %q (use --dry-run, --selftest or --help)\n' "$1" >&2; exit 2 ;;
 esac
 
 # --- SAFETY GUARD: refuse to act unless $HOME really is this user's home. ---------
@@ -184,7 +204,7 @@ present_targets() {
     if [ -d "$DARWIN_HOME" ]; then
         local size; size="$(du -sh "$DARWIN_HOME" 2>/dev/null | cut -f1 || true)"
         ui_note "$DARWIN_HOME"
-        ui_note "    └ the OS, code, .venv, all models, and all state${size:+  (~$size)}"
+        ui_note "    └ the OS, code, .venv, all state, and the models in its own models/ cache${size:+  (~$size)}"
     else
         ui_note "$DARWIN_HOME  (not installed — nothing to remove there)"
     fi
@@ -218,8 +238,26 @@ stop_and_remove_agents() {
         done
     fi
     # Best-effort: reap any still-running processes (never fatal).
+    #
+    # THE HUD NEEDS ITS OWN REAP HERE. The daemon and the inference server were
+    # reaped unconditionally; the HUD was not — its only `pkill` lived inside
+    # remove_hud_app's loop body, which runs ONLY for an /Applications (or
+    # ~/Applications) DARWIN.app that EXISTS and VERIFIES. But boot/run_hud.sh
+    # prefers the bundle built UNDER THE INSTALL HOME
+    # ($DARWIN_ROOT/hud/src-tauri/target/release/bundle/.../DARWIN.app), and
+    # install.sh's place_hud_app is explicitly "never fatal" — it warns and leaves
+    # INSTALLED_APP_PATH at the build path when neither Applications dir is
+    # writable. In that (or any hand-moved) install, remove_hud_app finds nothing,
+    # so nothing reaped the HUD, and remove_home then deleted the running HUD's own
+    # executable and Resources out from under it — a live agent pointed at deleted
+    # files, while the script printed "completely removed from this machine".
+    # launchctl bootout cannot be relied on to have finished either: install_boot.sh
+    # --uninstall deliberately does NOT wait_for_bootout (only --install polls), and
+    # that unfinished-teardown race is the whole reason the two reaps below exist.
+    # Scoped to the install home's own bundle path, exactly like the two above.
     pkill -f "DARWIN/daemon/target/release/darwind" 2>/dev/null || true
     pkill -f "DARWIN/inference/server.py" 2>/dev/null || true
+    pkill -f "DARWIN/hud/src-tauri/target/release/bundle/" 2>/dev/null || true
     ui_ok "Autostart unloaded and LaunchAgents removed."
 }
 

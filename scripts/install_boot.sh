@@ -11,6 +11,7 @@
 #   scripts/install_boot.sh              # DRY RUN: print the plan, change nothing
 #   scripts/install_boot.sh --install    # preflight, build daemon, render, lint, bootstrap
 #   scripts/install_boot.sh --uninstall  # bootout all three agents and remove rendered plists
+#   scripts/install_boot.sh --selftest   # hermetic render/load/unload selftest; touches nothing
 set -euo pipefail
 
 DARWIN_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -43,6 +44,12 @@ case "${1:-}" in
     "")            MODE="dry-run" ;;
     --install)     MODE="install" ;;
     --uninstall)   MODE="uninstall" ;;
+    # scripts/test_install_boot.sh appeared in no runnable command and no
+    # gate_docs.rs guard — it existed and ran nowhere, the same defect as the 158
+    # src-tauri tests before #240. Reached from the script it tests, exactly like
+    # `scripts/apply_heal.sh --selftest`. It never calls launchctl and never writes
+    # to ~/Library/LaunchAgents.
+    --selftest)    exec "$(dirname "${BASH_SOURCE[0]}")/test_install_boot.sh" ;;
     -h|--help)
         # DERIVE the end (the first non-comment line); never hard-code a range.
         # This was `sed -n '2,11p'` while the usage list runs to line 13, so
@@ -53,7 +60,7 @@ case "${1:-}" in
         exit 0
         ;;
     *)
-        echo "error: unknown argument '${1}' (expected --install, --uninstall, or no args for dry run)" >&2
+        echo "error: unknown argument '${1}' (expected --install, --uninstall, --selftest, or no args for dry run)" >&2
         exit 1
         ;;
 esac

@@ -381,6 +381,7 @@ impl SpendLedger {
             );
             CREATE INDEX IF NOT EXISTS idx_spend_ts ON spend(ts);",
         )?;
+        crate::schema::ensure(&conn, "obol.db")?;
         Ok(Self {
             conn: AsyncMutex::new(conn),
         })

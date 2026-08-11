@@ -190,6 +190,7 @@ mod lumen;
 mod macros;
 mod mcp;
 mod memory;
+mod schema;
 mod mission;
 // MODEL TIER + RUNTIME OVERRIDE: the swap-only "which brain answers" layer
 // (Local / Fast / Heavy) + the process-global voice override + the conservative

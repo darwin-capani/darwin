@@ -1048,6 +1048,7 @@ impl PersistenceBaseline {
                 PRIMARY KEY(surface, key)
             );",
         )?;
+        crate::schema::ensure(&conn, "persistence_baseline.db")?;
         Ok(Self { conn: Mutex::new(conn) })
     }
 

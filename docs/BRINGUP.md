@@ -213,11 +213,82 @@ Also: `darwind --selftest` (alias `--health`) validates the installed environmen
 starting the daemon (root/config/venv/binary/state dirs/0700 ipc perms/inference
 reachability/telemetry-port bindability/cloud-key) and exits non-zero on a hard failure.
 
+> **First-run ordering wrinkle — read this before believing a fresh install is broken.**
+> `./install.sh` does **not** run `scripts/init_memory.py`; the three runtime state subdirs
+> are created by the daemon itself at startup (`daemon/src/main.rs`, which also chmods
+> `state/ipc` to 0700). So on a freshly installed machine where the daemon has **never
+> started**, `darwind --selftest` reports **FAIL** on `state/ipc`, `state/logs` and
+> `state/tmp` — each with the message "*missing (the daemon creates it at startup)*", a
+> verdict that contradicts its own explanation — plus an honest `SKIP` on `ipc_perms`
+> ("could not stat state/ipc"). Nothing is wrong: that is "not started yet", not an error.
+> Start the agents (§7) or `scripts/bringup.sh` — which reports the same condition as
+> `SKIP`, not `FAIL` — and re-run it. If they are still missing *after* a start, the
+> failure is real.
+
 The daemon now also runs a **background inference-liveness probe** (publishing
 `inference.health` + a one-shot `inference.degraded`/`inference.recovered` edge to the HUD)
 and emits a single aggregated `daemon.ready` frame at startup — so a down inference server is
 visible *before* a turn is lost, and the inference IPC client reconnects with bounded
 exponential backoff + jitter instead of failing the first op after a server restart.
+
+---
+
+## Lifecycle gates — run these before merging a change to the installers
+
+`.github/workflows/release.yml` triggers only on a pushed `v*` tag, so the commands a
+contributor is TOLD to run **are** the merge gate. FOUR of this repo's six
+`scripts/test_*.sh` harnesses appeared in no runnable command and in no
+`daemon/src/gate_docs.rs` guard — they ran nowhere, the same defect as the 158
+`hud/src-tauri` tests before #240. (The other two were already reachable, via
+`scripts/apply_heal.sh --selftest` and `scripts/apply_code_diff.sh --selftest`.) Two of them — `test_install_boot.sh` and `test_install_config_preserved.sh` — are now
+reachable from the script each tests, as is the new `test_uninstall_footprint.sh`.
+`test_doc_claims.sh` has no installer of its own to hang off, so what keeps IT reachable is
+this command block plus the `gate_docs.rs` guard that pins it — delete the line below and the
+guard fails. The fourth, `scripts/test_shell_sandbox.sh`, belongs to the shell-sandbox
+surface and is still outstanding:
+
+```sh
+./install.sh --selftest                # -> scripts/test_install_config_preserved.sh  (30 checks)
+./uninstall.sh --selftest              # -> scripts/test_uninstall_footprint.sh      (23 checks)
+scripts/install_boot.sh --selftest     # -> scripts/test_install_boot.sh              (6 checks)
+bash scripts/test_doc_claims.sh        # the doc-claims harness                      (25 checks)
+```
+
+**Cost, measured on an M1 Pro (best of three warm runs of the commands above, not of the
+bare harnesses — the wrapper scripts source `scripts/ui.sh` first): 0.96s + 0.81s + 0.28s
++ 0.66s = 2.7s for all four** — stated here so the price is known rather than discovered.
+The first three harnesses on their own are 0.45s / 0.54s / 0.40s; the number that matters
+is the one you pay. `test_doc_claims.sh` is in this list because 11 of its 25 checks have `install.sh`, `uninstall.sh` or `install_boot.sh` as their
+subject, and are
+installer/uninstaller checks — including the one that DRIVES `uninstall.sh`'s `guard_home`
+against an empty / `/` / foreign / relative `$HOME` (and against your real one, so it is
+not a blanket refusal), which is the coverage `test_uninstall_footprint.sh` deliberately
+does not duplicate. It too was reachable by no documented command.
+
+All four are hermetic: no daemon, no network, no build, no model, and they WRITE nothing
+outside their own `mktemp -d` sandboxes. In
+particular none of them runs `launchctl`, `security`, `pkill` or `defaults` for real, none
+writes to `~/Library/LaunchAgents`, `/Applications` or `~/Library/Application
+Support/DARWIN`, and `test_uninstall_footprint.sh` **proves** that confinement twice
+before it deletes anything — statically (`uninstall.sh` must call those commands as bare
+words, since a shell function cannot shadow `/bin/rm`) and dynamically (`type -t` inside
+the shell that runs the sliced teardown code).
+
+What `--uninstall`'s harness pins, i.e. the answer to *what is left behind*: all three
+agents are booted out (not merely plist-deleted) and the daemon, inference server **and**
+HUD are reaped **before** the install home is removed; the install home goes whole
+(`state/`, both SQLite DBs, `config/`) with `guard_home` re-asserted immediately before
+the `rm -rf`; Keychain deletion is scoped to service `com.darwin.daemon`; a decoy
+`DARWIN.app` whose `Info.plist` carries a different bundle id is **left in place**; and
+the HUD's five out-of-home WebKit/cache/HTTPStorages/saved-state directories go without
+widening into `~/Library/Caches` itself. **Not** removed, by design and worth knowing:
+macOS **TCC grants** (Microphone / Screen Recording / Accessibility) — nothing in the
+product calls `tccutil`, so re-installing inherits your existing consent decisions — and
+**model weights outside the install home**: `install.sh` only *defaults* `HF_HOME` to
+`$DARWIN_HOME/models` and explicitly honors an `export HF_HOME=` already in `state/env.sh`
+("the user pointing at a bigger disk"), a split `scripts/doctor.sh` has a check for. On such
+an install those gigabytes stay; deleting a possibly-shared HF cache would be worse than
+leaving it, so `uninstall.sh`'s `--help` names the exception instead.
 
 ---
 

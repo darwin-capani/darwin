@@ -509,6 +509,8 @@ fn open_vault(path: &Path, key: &crate::crypto::SecretKey) -> std::io::Result<ru
         "CREATE TABLE IF NOT EXISTS owner(id INTEGER PRIMARY KEY CHECK(id=1), profile_json TEXT NOT NULL);",
     )
     .map_err(std::io::Error::other)?;
+    crate::schema::ensure(&conn, "owner.enc.db")
+        .map_err(std::io::Error::other)?;
     Ok(conn)
 }
 
@@ -522,11 +524,48 @@ pub fn load_profile_encrypted(root: &Path, key: &crate::crypto::SecretKey) -> Op
     if !path.exists() {
         return None;
     }
-    let conn = open_vault(&path, key).ok()?;
-    let json: String = conn
-        .query_row("SELECT profile_json FROM owner WHERE id=1", [], |r| r.get(0))
-        .ok()?;
-    serde_json::from_str::<OwnerProfile>(&json).ok()
+    // A VAULT THAT EXISTS AND CANNOT BE READ IS NOT "NOBODY IS ENROLLED".
+    //
+    // `path.exists()` above already returned None for a genuinely absent vault,
+    // which is the legitimate unenrolled state. Past that point every error means
+    // the enrollment IS there and we failed to read it — and because
+    // threshold.rs documents voice-id as NOT ENFORCING when no profile is
+    // enrolled (main.rs gates on `if enrolled && !is_verified_owner`), a
+    // swallowed error here silently DISARMS the voice gate for an owner who is
+    // enrolled. That is the worst direction for this particular `.ok()`.
+    //
+    // These three stay `Option`-returning — turning this into a hard refusal is a
+    // posture decision about what happens to a corrupted vault, and it is the
+    // owner's to make. What is NOT a decision is doing it QUIETLY: each failure
+    // now names itself at error! level with the remedy, so an unenrolled-looking
+    // system whose vault is really unreadable is visible in the log instead of
+    // being indistinguishable from a fresh install.
+    let conn = match open_vault(&path, key) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(error = %e, path = %path.display(),
+                "voiceid: the enrolled vault EXISTS but could not be opened — voice-id will \
+                 read as NOT ENROLLED and therefore NOT ENFORCE. Re-enroll, or restore the \
+                 vault; this is not the same as having no enrollment");
+            return None;
+        }
+    };
+    let json: String = match conn.query_row("SELECT profile_json FROM owner WHERE id=1", [], |r| r.get(0)) {
+        Ok(j) => j,
+        Err(e) => {
+            tracing::error!(error = %e, "voiceid: the vault opened but the owner row could not \
+                 be read — voice-id will read as NOT ENROLLED and therefore NOT ENFORCE");
+            return None;
+        }
+    };
+    match serde_json::from_str::<OwnerProfile>(&json) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            tracing::error!(error = %e, "voiceid: the owner profile in the vault did not parse \
+                 — voice-id will read as NOT ENROLLED and therefore NOT ENFORCE");
+            None
+        }
+    }
 }
 
 /// Persist the owner profile into the ENCRYPTED vault (vector only, as JSON inside
@@ -907,6 +946,50 @@ pub fn unrecognized_refusal() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// AN UNREADABLE VAULT MUST NOT BE INDISTINGUISHABLE FROM A FRESH INSTALL.
+    /// threshold.rs documents voice-id as NOT ENFORCING when no profile is
+    /// enrolled, and main.rs gates on `if enrolled && !is_verified_owner` — so a
+    /// swallowed read error silently DISARMS the gate for an enrolled owner. This
+    /// pins the distinction the code must keep making: absent vault -> None with
+    /// no complaint (legitimately unenrolled); PRESENT but unreadable -> None
+    /// only after saying so, never quietly.
+    #[test]
+    fn an_unreadable_vault_is_not_silently_read_as_unenrolled() {
+        let src = include_str!("voiceid.rs");
+        let start = src
+            .find("pub fn load_profile_encrypted")
+            .expect("load_profile_encrypted moved");
+        // Bound at BOTH ends: the next `pub fn` after it, so this cannot drift
+        // into an unrelated function below (trap g).
+        let end = src[start + 10..]
+            .find("\npub fn ")
+            .map(|o| start + 10 + o)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        // The three fallible steps past the exists() check must each be named.
+        let loud = body.matches("tracing::error!").count();
+        assert!(
+            loud >= 3,
+            "load_profile_encrypted has {loud} error! sites; each of the three \
+             fallible reads past the exists() check must say so, or an unreadable \
+             enrollment reads as no enrollment and voice-id stops enforcing"
+        );
+        // ...and every one must state the consequence, not just the error.
+        assert!(
+            body.matches("NOT ENFORCE").count() >= 3,
+            "a log line that does not say voice-id will stop ENFORCING does not \
+             tell the owner what the failure costs them"
+        );
+        // The absent-vault path stays quiet — a fresh install must not log an error.
+        let exists_guard = body
+            .find("if !path.exists()")
+            .expect("the absent-vault early return is what keeps a fresh install quiet");
+        assert!(
+            !body[exists_guard..exists_guard + 120].contains("tracing::error!"),
+            "a fresh install with no vault must not log an error"
+        );
+    }
     use super::*;
 
     /// A deterministic synthetic "voice": a sum of sinusoids at the given

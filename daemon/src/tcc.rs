@@ -341,6 +341,7 @@ impl TccBaseline {
                 PRIMARY KEY(client, service)
             );",
         )?;
+        crate::schema::ensure(&conn, "tcc_baseline.db")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

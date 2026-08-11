@@ -619,6 +619,7 @@ impl TraceStore {
                 latency_ms INTEGER NOT NULL
             );",
         )?;
+        crate::schema::ensure(&conn, "optimize.db")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

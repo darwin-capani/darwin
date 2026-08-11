@@ -468,7 +468,7 @@ CREATE TABLE IF NOT EXISTS transcripts (
 );
 ```
 
-The `response` column arrived after first ship: `memory.rs` runs an idempotent migration at open (`ALTER TABLE transcripts ADD COLUMN response TEXT`, ignoring the duplicate-column error on already-migrated DBs), and `scripts/init_memory.py` includes the column for fresh installs.
+The `response` column arrived after first ship, and it is why `daemon/src/schema.rs` exists: `CREATE TABLE IF NOT EXISTS` is a no-op on a table that already exists, so an upgrade that preserves `state/` leaves a newly declared column absent and every query naming it fails at runtime. Each store's opener now calls `schema::ensure`, which diffs `PRAGMA table_info` against that module's INVENTORY and adds what is missing with `ALTER TABLE ... ADD COLUMN` — additive only, never a table rebuild, stamped into `PRAGMA user_version`. It subsumes the hand-written `ALTER TABLE transcripts ADD COLUMN response TEXT` that used to run in `memory.rs`. `scripts/init_memory.py` includes the column for fresh installs.
 
 `events` mirrors the telemetry stream for offline analysis; `facts` is the durable key-value memory written by the learning loop (and readable with `sqlite3 state/darwin.db 'SELECT key,value FROM facts ORDER BY id DESC;'`); `transcripts` is the exchange log feeding context windows and evaluation.
 

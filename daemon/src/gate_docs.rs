@@ -201,3 +201,65 @@ fn the_silicon_canvas_manifest_keeps_documenting_the_gpu_test_command() {
          as the one that proved nothing"
     );
 }
+
+/// THE INSTALLER / UNINSTALLER LIFECYCLE HARNESSES — the same defect a FIFTH time,
+/// in shell rather than in Rust. `scripts/test_install_boot.sh` and
+/// `scripts/test_install_config_preserved.sh` both existed, both passed, and a grep
+/// over `docs/*.md` plus this module found NEITHER: no documented command ran them
+/// and no guard required one to. `uninstall.sh` — 393 lines of `rm -rf`,
+/// `launchctl bootout`, `pkill` and `security delete-generic-password` — had no
+/// teardown harness at all (`scripts/test_doc_claims.sh` drives its `guard_home`
+/// and pins its `--help` text; nothing exercised the teardown), so
+/// `scripts/test_uninstall_footprint.sh` was written for it.
+///
+/// All three are now reached FROM the script each one tests (`./install.sh
+/// --selftest`, `./uninstall.sh --selftest`, `scripts/install_boot.sh --selftest`)
+/// — the shape `scripts/apply_heal.sh --selftest` and `scripts/apply_code_diff.sh
+/// --selftest` already use. This guard pins the DOCUMENTED half: the section of
+/// `docs/BRINGUP.md` a contributor reads before touching an installer must name all
+/// three commands. MEASURED on an M1 Pro, best of three warm runs of THOSE COMMANDS (not of
+/// the bare harnesses): 0.96s + 0.81s + 0.28s + 0.66s = 2.7s total, and
+/// the check counts are 30 / 23 / 6 / 25. `test_doc_claims.sh` is in the list
+/// because 11 of its 25 checks have install.sh, uninstall.sh or install_boot.sh as their
+/// subject — among them the
+/// only one that DRIVES uninstall.sh's guard_home — and it was reachable by no
+/// documented command either.
+///
+/// Scoped to the fenced command block, not the section: the prose below the fence
+/// explains what the uninstall harness pins and legitimately mentions the scripts by
+/// name, so a guard that only looked for the strings anywhere in the section would
+/// pass on prose that named no runnable command at all.
+#[test]
+fn the_bringup_doc_documents_running_the_installer_lifecycle_selftests() {
+    let doc = include_str!("../../docs/BRINGUP.md");
+    let sect = section(
+        doc,
+        "docs/BRINGUP.md",
+        "## Lifecycle gates — run these before merging a change to the installers",
+        "\n## ",
+    );
+    let cmds = section(sect, "docs/BRINGUP.md Lifecycle gates", "```sh", "```");
+    for cmd in [
+        "./install.sh --selftest",
+        "./uninstall.sh --selftest",
+        "scripts/install_boot.sh --selftest",
+        "scripts/test_doc_claims.sh",
+    ] {
+        assert!(
+            cmds.contains(cmd),
+            "docs/BRINGUP.md's Lifecycle gates command block does not name `{cmd}`. \
+             CI runs on a pushed v* tag only, so the commands a contributor is told to \
+             run ARE the merge gate — a lifecycle harness named by no command is a test \
+             that exists and runs nowhere, which is how the 158 src-tauri tests and \
+             three feature-gated suites were lost.\nblock was:\n{cmds}"
+        );
+    }
+    // The measured cost must stay stated, not rediscovered. The three runtimes are
+    // the reason this is cheap enough to be a per-merge gate at all.
+    assert!(
+        sect.contains("2.7s"),
+        "docs/BRINGUP.md's Lifecycle gates section no longer states the MEASURED total \
+         runtime of the three harnesses, so their cost is something the next contributor \
+         discovers instead of reads"
+    );
+}

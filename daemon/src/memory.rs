@@ -215,14 +215,13 @@ impl Memory {
             CREATE INDEX IF NOT EXISTS idx_notebook_cit_entry
                 ON notebook_citations(entry_id);",
         )?;
-        // Idempotent migration for databases created before the learning
-        // loop: add transcripts.response, ignoring "duplicate column name"
-        // (the CREATE TABLE above already includes it on fresh installs).
-        if let Err(e) = conn.execute("ALTER TABLE transcripts ADD COLUMN response TEXT", []) {
-            if !e.to_string().contains("duplicate column name") {
-                return Err(e.into());
-            }
-        }
+        // SCHEMA EVOLUTION. `CREATE TABLE IF NOT EXISTS` is a NO-OP on a table that
+        // already exists, so an upgrade that preserves `state/` (which install.sh
+        // deliberately does) leaves any newly declared column ABSENT. schema::ensure
+        // adds what is missing, additively, and never drops the owner's rows. This
+        // SUBSUMES the hand-written `ALTER TABLE transcripts ADD COLUMN response`
+        // that used to live here — see schema::MEMORY.
+        crate::schema::ensure(&conn, "darwin.db")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

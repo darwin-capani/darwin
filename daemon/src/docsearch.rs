@@ -1459,6 +1459,9 @@ impl DocIndex {
                 value TEXT NOT NULL
             );",
         )?;
+        // SCHEMA EVOLUTION — before the stamp read below, which NAMES a column and
+        // would otherwise be the statement that fails on a pre-upgrade file.
+        crate::schema::ensure(&conn, "docsearch.db")?;
         // ONE-TIME MIGRATION — pre-stamp store => UNKNOWN sentinel. A store that
         // carries vectors but NO `doc_meta` stamp was built before stamping
         // existed, and its embedder is UNVERIFIABLE: op=embed ids are opaque and

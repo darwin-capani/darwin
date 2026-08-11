@@ -472,6 +472,7 @@ impl EgressBaselineDb {
                 PRIMARY KEY(process, host, port)
             );",
         )?;
+        crate::schema::ensure(&conn, "egress_baseline.db")?;
         Ok(Self {
             conn: Mutex::new(conn),
         })

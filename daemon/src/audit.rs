@@ -279,6 +279,10 @@ impl AuditLog {
                 entry_hash TEXT NOT NULL
             );",
         )?;
+        // An upgrade preserves state/, so IF NOT EXISTS is a no-op on an existing
+        // audit.db and a newly declared column would be silently absent. The chain
+        // columns refuse backfill (a forged hash is worse than a hard error).
+        crate::schema::ensure(&conn, "audit.db")?;
         Ok(Self {
             conn: Mutex::new(conn),
             max_entries: MAX_ENTRIES,

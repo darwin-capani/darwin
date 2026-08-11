@@ -48,6 +48,10 @@
 #                         default, see --no-provision.
 #   --no-provision        DO NOT auto-install build prereqs. Revert to detect +
 #                         instruct + fatal-if-missing (Rust/Python3.11/Node).
+#   --selftest            run scripts/test_install_config_preserved.sh (the
+#                         redeploy-must-not-destroy-config harness) and exit. It
+#                         builds nothing, installs nothing and touches only its own
+#                         mktemp dirs.
 #                         Provisioning is ON by default; use this to opt out.
 #   --no-models           skip the model pre-download stage (build everything else)
 #   --help / -h           this help
@@ -195,6 +199,15 @@ while [ "$#" -gt 0 ]; do
         -y|--yes)          ASSUME_YES=1 ;;
         --no-provision)    DO_PROVISION=0 ;;
         --no-models)       DO_MODELS=0 ;;
+        # scripts/test_install_config_preserved.sh — the harness that proves a
+        # redeploy does not revert the operator's config/darwin.toml — was named by
+        # no runnable command and no gate_docs.rs guard, so it ran nowhere. Reached
+        # from the script it tests, like `scripts/apply_heal.sh --selftest`. Exits
+        # here (the --help arm below already establishes that leaving at this point
+        # is side-effect free: nothing but ui.sh has been sourced).
+        --selftest)
+            exec "$SRC_ROOT/scripts/test_install_config_preserved.sh"
+            ;;
         -h|--help)
             # Print the header comment block (the doc lines above `set -euo
             # pipefail`) as the help text, stripping the leading "# ".

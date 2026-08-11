@@ -14,8 +14,10 @@ SCHEMA — keep in sync with the Rust daemon:
               text TEXT NOT NULL, intent TEXT, routed_to TEXT,
               response TEXT)
     — response is what DARWIN replied; recent_exchanges(n) selects rows
-      WHERE response IS NOT NULL. The daemon applies the same column as an
-      idempotent ALTER TABLE migration for databases created before it.
+      WHERE response IS NOT NULL. For a database created before the column
+      existed, the daemon adds it in daemon/src/schema.rs (PRAGMA user_version
+      + an additive ALTER TABLE ADD COLUMN), which replaced the hand-written
+      migration memory.rs used to carry.
 """
 
 import argparse
