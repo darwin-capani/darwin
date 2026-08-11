@@ -698,6 +698,10 @@ pub async fn capture(
     // reply; this frame is the operator's copy of where the bundle landed.
     let section_items: BTreeMap<String, usize> =
         sections.iter().map(|s| (s.name.to_string(), s.item_count)).collect();
+    // PIXEL-FREE(diagnostic): `capture` is USER-INVOKED and its TriageSummary is
+    // rendered straight back to the caller by `anthropic::render_triage_summary` —
+    // the owner asked, and already has the answer in the reply. A second copy in
+    // the HUD would be an echo of a question they just asked.
     crate::telemetry::emit(
         "system",
         "security.triage",
@@ -772,18 +776,46 @@ mod tests {
 
     // -- redaction at source -------------------------------------------------
 
+    /// THIS TEST USED TO WRITE `$HOME` AND IT BROKE A DIFFERENT MODULE'S TEST.
+    ///
+    /// It did `std::env::set_var("HOME", "/Users/darwincapani")` to give
+    /// `redact_home` something to strip. `std::env::set_var` is a PROCESS-GLOBAL
+    /// write and the suite runs tests in parallel, so it reached across into
+    /// `introspect::tests::redact_home_replaces_the_home_prefix_only`, which reads
+    /// `$HOME`, builds a path from it, and then calls `redact_home` — which reads
+    /// `$HOME` AGAIN. Land the write between those two reads and the redactor
+    /// strips a home that is no longer the one in the string.
+    ///
+    /// INVISIBLE ON THE AUTHOR'S MACHINE, WHERE `$HOME` HAPPENS TO BE THE LITERAL
+    /// ABOVE — so the write changed nothing and nothing ever went red. MEASURED
+    /// with `$HOME` set to anything else, running only these two tests on two
+    /// threads: 14 of 40 runs FAILED, at `introspect.rs:1209`, with neither
+    /// module's code touched. That is a gate failing for a reason that is not the
+    /// code, and it would have hit any second machine or CI runner.
+    ///
+    /// The fix needs no global write at all: build the path from the AMBIENT
+    /// `$HOME`, which is what a real triage section contains anyway.
     #[test]
     fn redact_section_scrubs_secrets_pii_and_home_and_bounds_size() {
-        let raw = "user AKIAIOSFODNN7EXAMPLE1 logged in from bob@example.com\n\
-                   token ghp_0123456789abcdefghijklmnopqrstuvwxyz used\n\
-                   path /Users/darwincapani/Downloads/evidence";
-        // Fake a $HOME so redact_home has something to strip deterministically.
-        std::env::set_var("HOME", "/Users/darwincapani");
-        let out = redact_section(raw, 4096);
+        // PRECONDITION rather than a silent skip: with no `$HOME`, `redact_home`
+        // is a pass-through and the home half of this test would assert nothing.
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert!(
+            !home.is_empty(),
+            "$HOME must be set for the home-redaction half of this test to mean \
+             anything (it is set by every login session and by launchd)"
+        );
+        let raw = format!(
+            "user AKIAIOSFODNN7EXAMPLE1 logged in from bob@example.com\n\
+             token ghp_0123456789abcdefghijklmnopqrstuvwxyz used\n\
+             path {home}/Downloads/evidence"
+        );
+        let out = redact_section(&raw, 4096);
         assert!(!out.contains("AKIAIOSFODNN7EXAMPLE1"), "AWS key must be redacted: {out}");
         assert!(!out.contains("ghp_0123456789abcdefghijklmnopqrstuvwxyz"), "GH token redacted");
         assert!(!out.contains("bob@example.com"), "email redacted");
-        assert!(!out.contains("/Users/darwincapani"), "home path stripped: {out}");
+        assert!(!out.contains(&home), "home path stripped: {out}");
+        assert!(out.contains("~/Downloads/evidence"), "and stripped to a ~ path: {out}");
     }
 
     #[test]

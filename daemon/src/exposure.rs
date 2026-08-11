@@ -416,11 +416,21 @@ async fn sentinel_tick() {
     match scan(run_real_command).await {
         Ok(listeners) => {
             set_last_summary(summarize(&listeners));
+            // PIXEL-FREE(diagnostic): the OWNER'S half of this finding is the
+            // one-line summary cached on the line above, which
+            // `posture::scanner_notes` folds onto `posture.snapshot` and the
+            // PostureDashboardPanel draws under AMBIENT SCANNERS. What is dropped
+            // here is the per-socket TABLE — an inventory, not a decision, and a
+            // panel for it is a surface to add deliberately.
             crate::telemetry::emit("system", "security.exposure", build_frame(&listeners));
         }
         Err(why) => {
             // The read couldn't run — report honestly (with the generic reason),
             // don't fabricate a table and don't clobber the last good summary.
+            // PIXEL-FREE(diagnostic): a failed netstat read is an operator fact
+            // about this machine's tooling, not a security finding about it. The
+            // cached summary is deliberately NOT clobbered, so the posture board
+            // keeps showing the last honest reading rather than blinking.
             crate::telemetry::emit(
                 "system",
                 "security.exposure",

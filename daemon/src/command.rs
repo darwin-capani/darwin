@@ -836,6 +836,13 @@ where
     let (token, command) = match decide(raw) {
         Decision::Ok { token, command } => (token, command),
         Decision::UnknownCommand { cmd } => {
+            // PIXEL-FREE(diagnostic), AND DELIBERATELY SO: `cmd` is the caller's raw
+            // JSON `cmd` field, bounded only by MAX_LINE_BYTES (8 KiB), and this arm
+            // runs BEFORE the token check — so any local client that can reach the
+            // socket can put ~8 KiB of text of its choosing into this frame without
+            // authenticating. Rendering that would hand an unauthenticated caller a
+            // writable line in the owner's HUD. The structural allowlist already
+            // refused the command; the log is the right place to notice.
             telemetry::emit("system", "command.denied", json!({"reason": "unknown_command", "cmd": cmd}));
             return json!({"ok": false, "error": "unknown_command"});
         }
@@ -843,6 +850,10 @@ where
             return json!({"ok": false, "error": "bad_request", "detail": reason});
         }
         Decision::Oversized => {
+            // PIXEL-FREE(diagnostic): pre-auth like the arm above, and it carries no
+            // detail at all — "someone sent a line over 8 KiB" is a fact about a
+            // broken or probing client, with nothing the owner decides. The bound
+            // held, which is the whole event.
             telemetry::emit("system", "command.denied", json!({"reason": "oversized"}));
             return json!({"ok": false, "error": "oversized"});
         }
@@ -856,6 +867,17 @@ where
     // token value is ever logged.
     if !apps::verify_command_token(&token) {
         warn!("command line failed token verification");
+        // This looks like the loudest frame in the file and is not, because of WHO
+        // can produce it. The socket is `0600` inside a `0700` dir, and
+        // `command_token_path` puts the token in a `0600` file in that SAME dir — so
+        // any principal that can reach the socket to fail this check could equally
+        // have read the token and passed it. An auth failure is not a boundary being
+        // crossed; it is a stale or broken client (and not the HUD's Tauri backend,
+        // which re-reads the token file on every round-trip, so a restart's fresh
+        // per-boot nonce is transparent to it). If the socket's confinement ever
+        // loosens, this reasoning is the first thing that has to be revisited.
+        // PIXEL-FREE(diagnostic): telling the owner "unauthorized access attempt"
+        // would overstate what the filesystem already prevents.
         telemetry::emit("system", "command.auth_failed", json!({"via": "command"}));
         return json!({"ok": false, "error": "unauthorized"});
     }
@@ -869,6 +891,11 @@ where
     };
     if !allowed {
         warn!("command channel rate limit tripped");
+        // PIXEL-FREE(diagnostic): unlike its two siblings this arm is POST-auth, so
+        // the flooder is a client holding a valid token — in practice the HUD
+        // itself. The caller already learns it was throttled (the `rate_limited`
+        // reply below) and retries; there is no owner decision in a spam guard
+        // doing exactly what it says on the tin.
         telemetry::emit("system", "command.denied", json!({"reason": "rate_limited"}));
         return json!({"ok": false, "error": "rate_limited"});
     }

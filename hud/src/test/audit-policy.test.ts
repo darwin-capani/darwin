@@ -433,6 +433,144 @@ describe("AuditPanel (review-only, honest)", () => {
     expect(html.toLowerCase()).toContain("never always wins");
   });
 
+  /* ====================================================================== *
+   * THE EXTERNAL ANCHOR ROW                                                *
+   *                                                                        *
+   * The defect this covers: `verify_chain` re-derives the chain from the   *
+   * very bytes an attacker rewrote, so a CONSISTENT whole-chain rewrite —  *
+   * the one tamper the panel's own footer admits it cannot catch — showed  *
+   * the owner a green CHAIN OK. The daemon HAS the detector (a Keychain    *
+   * witness in a separate OS protection domain, checked at every start)    *
+   * and its verdict reached nothing but a warn! line in daemon.log,        *
+   * because applyEnvelope has no `audit.anchor` case and never will: that  *
+   * frame fires once at boot, before any HUD connects. The verdict now     *
+   * rides audit.snapshot.                                                  *
+   * ====================================================================== */
+
+  it("draws the DIVERGED witness even while the local chain verifies clean", () => {
+    // This exact combination — chain.ok true, anchor mismatched — IS the
+    // whole-chain-rewrite signature. If the panel only ever showed one of the
+    // two verdicts, this is the case it would get wrong.
+    const html = render(
+      parseAuditSnapshot({
+        enabled: true,
+        chain: { ok: true, count: 412 },
+        anchor: {
+          ok: false,
+          state: "mismatch",
+          anchored_seq: 300,
+          anchored_head: "wit-abc",
+          live_seq: 412,
+          live_head: "live-def",
+          checked_ts: "2026-08-10T09:12:00Z",
+        },
+        entries: [],
+      }),
+    );
+    expect(html).toContain("CHAIN OK"); // the local verdict is still reported honestly
+    expect(html).toContain("EXTERNAL ANCHOR DIVERGED");
+    expect(html).toContain("#300");
+    expect(html).toContain("#412");
+    // The owner is told what it means and what to do — a red pill they cannot
+    // act on is the same silence with a colour.
+    expect(html.toLowerCase()).toContain("triage bundle");
+    expect(html.toLowerCase()).toContain("will not re-witness on its own");
+    // …and no button re-witnesses for them: one click to bless a rewritten
+    // chain is precisely what the daemon refuses to do automatically.
+    expect(html).not.toContain("<button");
+
+    // THE OTHER MISMATCH SHAPE, and the one a naive `#${liveSeq}` renders as
+    // "#null": the daemon reports `live: None` when an anchor exists and the
+    // chain is EMPTY — the whole log gone from under the witness, which is what
+    // a wiped state dir looks like. It has to read as words, not a null.
+    const gone = render(
+      parseAuditSnapshot({
+        enabled: true,
+        chain: { ok: true, count: 0 },
+        anchor: { ok: false, state: "mismatch", anchored_seq: 300, live_seq: null },
+        entries: [],
+      }),
+    );
+    expect(gone).toContain("EXTERNAL ANCHOR DIVERGED");
+    expect(gone).toContain("GONE");
+    expect(gone).not.toContain("#null");
+  });
+
+  it("says CORROBORATED for a benign verdict, and dates the reading not the frame", () => {
+    // A row that can only ever go red is a row nobody believes when it does.
+    const html = render(
+      parseAuditSnapshot({
+        enabled: true,
+        chain: { ok: true, count: 5 },
+        anchor: { ok: true, state: "extended", anchored_seq: 3, live_seq: 5, checked_ts: "2026-08-10T09:12:00Z" },
+        entries: [],
+      }),
+    );
+    expect(html).toContain("EXTERNAL ANCHOR OK");
+    expect(html).toContain("corroborates");
+    expect(html).toContain("checked "); // the reading's own age, not the 15s tick's
+    expect(html).not.toContain("DIVERGED");
+  });
+
+  it("claims NOTHING when the daemon sent no anchor, and never a false green", () => {
+    // An older daemon, an audit-off daemon, and a check that never ran all look
+    // identical on the wire. None of them is evidence of anything.
+    const silent = parseAuditSnapshot({ enabled: true, chain: { ok: true, count: 2 }, entries: [] });
+    expect(silent.anchor).toBeNull();
+    const html = render(silent);
+    expect(html).not.toContain("EXTERNAL ANCHOR");
+
+    // NOT-YET-WITNESSED must not tell the owner to wait for a restart. `no_anchor`
+    // is benign, so `verify_and_reanchor_on_start` witnesses the head in the SAME
+    // start — a few lines after the reading this row is showing — whenever the
+    // chain is non-empty. That is every existing install the first time the anchor
+    // shipped. Only an EMPTY chain really waits for a later start.
+    const unwitnessed = render(
+      parseAuditSnapshot({
+        enabled: true,
+        chain: { ok: true, count: 4 },
+        anchor: { ok: true, state: "no_anchor" },
+        entries: [],
+      }),
+    );
+    expect(unwitnessed).toContain("NOT YET WITNESSED");
+    expect(unwitnessed).toContain("once there is a chain to witness");
+    expect(unwitnessed).not.toContain("the next start establishes one");
+
+    // Junk is silent in the ALARM direction…
+    expect(parseAuditSnapshot({ anchor: "nope" }).anchor).toBeNull();
+    expect(parseAuditSnapshot({ anchor: {} }).anchor).toBeNull();
+    // …and fails CLOSED in the reassurance direction: a future/garbled state
+    // token can never be read as a corroborating witness.
+    const weird = parseAuditSnapshot({ anchor: { ok: true, state: "banana" } }).anchor;
+    expect(weird!.ok).toBe(false);
+    expect(render(parseAuditSnapshot({ enabled: true, chain: { ok: true, count: 1 }, anchor: { ok: true, state: "banana" }, entries: [] })))
+      .toContain("EXTERNAL ANCHOR — UNCLEAR");
+  });
+
+  it("carries the anchor through the reducer on the audit.snapshot frame", () => {
+    // The daemon folds it onto audit.snapshot rather than emitting a topic of
+    // its own; if the reducer dropped it, everything above would be untested UI.
+    const s = reduce(initialState(), {
+      type: "telemetry",
+      envelope: {
+        ts: "2026-08-10T09:12:05Z",
+        source: "system",
+        event: "audit.snapshot",
+        data: {
+          enabled: true,
+          total: 412,
+          chain: { ok: true, count: 412 },
+          anchor: { ok: false, state: "mismatch", anchored_seq: 300, live_seq: 412 },
+          entries: [],
+        },
+      } as TelemetryEnvelope,
+      at: 1,
+    });
+    expect(s.audit!.anchor!.state).toBe("mismatch");
+    expect(s.audit!.anchor!.ok).toBe(false);
+  });
+
   it("has NO action button — it is review-only", () => {
     const html = render(parseAuditSnapshot(mockAudit));
     expect(html).not.toContain("<button");

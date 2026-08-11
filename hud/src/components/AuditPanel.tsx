@@ -1,4 +1,5 @@
 import type {
+  AuditAnchor,
   AuditEntry,
   AuditSnapshot,
   LiveGateEvent,
@@ -86,6 +87,11 @@ export default function AuditPanel({
                 </span>
               </div>
 
+              {/* The EXTERNAL WITNESS, directly under the chain verdict it
+                  qualifies — the two rows are allowed to disagree, and when they
+                  do that disagreement IS the finding. */}
+              <AnchorRow anchor={audit?.anchor ?? null} />
+
               {truncated && (
                 <div className="audit-truncated dim-note">
                   The log was pruned at its retention cap — the oldest entries were
@@ -139,6 +145,92 @@ export default function AuditPanel({
       </Frame>
     </div>
   );
+}
+
+/**
+ * EXTERNAL ANCHOR — the Keychain witness row.
+ *
+ * WHY THIS ROW EXISTS. The footer of this panel has always admitted the hole: "a
+ * root attacker who rewrites the WHOLE on-disk chain could make it verify again."
+ * The daemon has had the detector for precisely that since the anchor landed — it
+ * witnesses the chain head into the macOS Keychain, a protection domain the
+ * SQLite-file attacker cannot silently rewrite, and re-checks it at every start.
+ * On a divergence it warns, emits `audit.anchor`, and DELIBERATELY leaves the
+ * witness alone so the finding keeps resurfacing. But `applyEnvelope` had no case
+ * for that topic, so what a rewritten audit log looked like, from this seat, was a
+ * green CHAIN OK and a line in daemon.log. The verdict now rides `audit.snapshot`.
+ *
+ * HONESTY CONTRACT:
+ *   - It is a BOOT-TIME reading re-broadcast on the snapshot cadence, so it is
+ *     dated by its own `checkedTs` and never by the 15s tick that carried it.
+ *   - CORROBORATED (green) only for a verdict the daemon actually reached; an
+ *     unrecognized state reads UNCLEAR, and a daemon that sent no anchor at all
+ *     renders NOTHING rather than either a green shield or a false alarm.
+ *   - REVIEW-ONLY, like the rest of this panel. The row states the remedy in
+ *     words; there is no button here that re-witnesses, and there must not be —
+ *     a one-click "re-anchor" is a one-click way to bless a rewritten chain.
+ */
+function AnchorRow({ anchor }: { anchor: AuditAnchor | null }) {
+  // No verdict on the wire: an older daemon, or one that never got to check.
+  // Claim nothing — this row must not invent either colour.
+  if (anchor === null) return null;
+
+  const diverged = anchor.state === "mismatch";
+  const cls = anchor.ok ? "ok" : diverged ? "broken" : "awaiting";
+  const label = anchor.ok
+    ? "EXTERNAL ANCHOR OK"
+    : diverged
+      ? "EXTERNAL ANCHOR DIVERGED"
+      : anchor.state === "no_anchor"
+        ? "EXTERNAL ANCHOR — NOT YET WITNESSED"
+        : "EXTERNAL ANCHOR — UNCLEAR";
+
+  return (
+    <>
+      <div className={`audit-anchor ${cls}`}>
+        <span className="audit-chain-led" aria-hidden="true" />
+        <span className="audit-chain-label">{label}</span>
+        <span className="audit-chain-detail dim-note">
+          {anchor.ok
+            ? `Keychain witness corroborates the chain${seqNote(anchor)}`
+            : diverged
+              ? `witnessed #${anchor.anchoredSeq ?? "?"}, live head ${
+                  anchor.liveSeq === null ? "GONE — the chain is empty" : `#${anchor.liveSeq}`
+                }`
+              : anchor.state === "no_anchor"
+                ? "no witness was stored when this daemon started — one is written at startup once there is a chain to witness"
+                : `the stored witness could not be read (${anchor.state})`}
+          {checkedNote(anchor.checkedTs)}
+        </span>
+      </div>
+      {diverged && (
+        <div className="audit-anchor-note">
+          The audit log&apos;s head no longer matches the witness held in your
+          Keychain. Ordinary growth and ordinary pruning both corroborate — a
+          divergence is what a REWRITTEN log looks like, and the local chain can
+          verify clean while this disagrees. Treat the recent timeline as
+          unproven, capture a security triage bundle to preserve the evidence
+          (that also re-witnesses the current head), and check what had access to{" "}
+          <code>state/audit.db</code>. DARWIN will not re-witness on its own: doing
+          so silently would bless the rewrite.
+        </div>
+      )}
+    </>
+  );
+}
+
+/** " at #412" when the daemon named a seq, otherwise nothing — never "#?" on the
+ *  reassuring path, where a fabricated detail would read as corroboration. */
+function seqNote(anchor: AuditAnchor): string {
+  return anchor.anchoredSeq === null ? "" : ` at #${anchor.anchoredSeq}`;
+}
+
+/** " · checked HH:MM" — the age of the READING, not of the frame that carried it.
+ *  Omitted entirely when the daemon sent no stamp. */
+function checkedNote(ts: string | null): string {
+  if (ts === null) return "";
+  const at = clock(ts);
+  return at === "" ? "" : ` · checked ${at}`;
 }
 
 /** One authoritative audit entry row (from a snapshot). Shows the secret-free

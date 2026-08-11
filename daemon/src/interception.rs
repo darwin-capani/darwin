@@ -886,6 +886,11 @@ async fn run_real_command(
 async fn sentinel_tick() {
     let findings = scan(run_real_command, Path::new(HOSTS_PATH)).await;
     set_last_summary(summarize(&findings));
+    // PIXEL-FREE(diagnostic): the OWNER'S half is the one-line summary cached on
+    // the line above — `posture::scanner_notes` folds it onto `posture.snapshot`
+    // and the PostureDashboardPanel draws it under AMBIENT SCANNERS, which is how
+    // "a rogue trusted root CA" reaches a person without being asked for. This
+    // frame is the full per-surface finding table for the operator's stream.
     crate::telemetry::emit("system", "security.interception", build_frame(&findings));
 }
 

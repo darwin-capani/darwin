@@ -531,9 +531,17 @@ impl AuditLog {
             }
             // An entry EXISTS at the witnessed seq but its hash CHANGED: the chain was
             // rewritten under the witness — the exact offline full-rewrite tamper the
-            // external anchor catches (and that verify_chain alone cannot). A rare
-            // local prune of a still-present witnessed entry also lands here
-            // (documented residual — a prune is uncommon at the generous retention cap).
+            // external anchor catches (and that verify_chain alone cannot).
+            //
+            // A PRUNE DOES NOT LAND HERE. This caveat used to claim "a rare local prune
+            // of a still-present witnessed entry also lands here (documented residual)"
+            // — a leftover from the RE-ROOTING prune that [`Self::prune_oldest`] replaced.
+            // The prune is now DELETE-ONLY and a survivor's stored hash is immutable for
+            // the entry's whole lifetime, so a pruned-but-untampered log corroborates as
+            // `Extended`; `a_prune_does_not_poison_the_external_anchor` holds that. The
+            // stale sentence mattered because it is exactly the one that teaches a reader
+            // — or an operator staring at the alarm — to wave off a real divergence as
+            // routine housekeeping.
             Some(_) => Ok(AnchorStatus::Mismatch {
                 anchored_seq: a_seq,
                 anchored_head: a_head,
@@ -830,6 +838,103 @@ pub fn anchor_status_json(status: &AnchorStatus) -> serde_json::Value {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The cached anchor verdict — what carries the tamper evidence to a PIXEL
+// ---------------------------------------------------------------------------
+
+/// The LAST external-anchor verdict measured, as the `anchor_status_json` object
+/// plus a `checked_ts`. Written once by [`verify_and_reanchor_on_start`]; read on
+/// every `audit.snapshot` tick by [`emit_snapshot`].
+///
+/// WHY A CACHE AND NOT A SECOND CHECK. The verdict is the whole point of the
+/// external anchor — a root attacker who rewrites the ENTIRE on-disk chain still
+/// passes [`AuditLog::verify_chain`], so the panel's "CHAIN OK" is a FALSE GREEN in
+/// the one case that matters, and the only contradicting evidence was a `warn!`
+/// line in daemon.log. But re-reading the Keychain on the 15s snapshot cadence
+/// would put a blocking security-framework call on a hot loop for an answer that
+/// cannot change while the process runs (nothing rewrites the log under us and
+/// `anchor_to` only ever advances the witness to the live head). So the boot
+/// reading is cached and RE-BROADCAST, and it rides its own `checked_ts` so the
+/// panel dates it honestly instead of implying a fresh measurement.
+static LAST_ANCHOR: std::sync::RwLock<Option<serde_json::Value>> = std::sync::RwLock::new(None);
+
+/// Cache the verdict, stamped with the moment it was actually taken. A poisoned
+/// lock is swallowed: a missed cache costs the panel its anchor row, and must
+/// never take the daemon down over a telemetry nicety.
+fn set_last_anchor(mut verdict: serde_json::Value) {
+    if let Some(obj) = verdict.as_object_mut() {
+        obj.insert("checked_ts".to_string(), serde_json::json!(Utc::now().to_rfc3339()));
+    }
+    if let Ok(mut guard) = LAST_ANCHOR.write() {
+        *guard = Some(verdict);
+    }
+}
+
+/// The cached verdict, or `None` when no check has run (audit off, or a Keychain
+/// read error that skipped the check). `None` is NOT "all clear" — see
+/// [`attach_anchor`], which omits the key entirely rather than sending a verdict
+/// nobody measured.
+fn last_anchor() -> Option<serde_json::Value> {
+    LAST_ANCHOR.read().ok().and_then(|g| g.clone())
+}
+
+/// The ONLY verdict fields allowed onto `audit.snapshot`. An ALLOW-LIST, not a
+/// denylist, because the failure it exists to prevent is a field arriving later
+/// and riding out by default.
+///
+/// WHAT IT KEEPS OUT, AND WHY THAT IS NOT PEDANTRY. `anchor_status_json` carries
+/// `head` / `anchored_head` / `live_head`, and those are `entry_hash` values read
+/// straight out of the chain by [`AuditLog::head`] / [`AuditLog::hash_at_seq`].
+/// [`snapshot_json`] states — and
+/// `snapshot_json_surfaces_only_the_secret_free_subset_newest_first` pins — that
+/// the internal chain bytes never reach this wire, so "even the wire shape cannot
+/// smuggle a chain byte". That guard is taken on `snapshot_json`; what the daemon
+/// EMITS is `with_anchor(snapshot_json(..))`, one layer above it. Folding the
+/// verdict unprojected would move the live and witnessed heads from a frame that
+/// reaches no subscriber (`audit.anchor` fires before `telemetry::init`) onto one
+/// re-broadcast to every hub client every 15s — the one value an EXTERNAL witness
+/// exists to hold outside the file-attacker's reach — for a row that renders only
+/// the seqs. `Malformed`'s redacted `raw` anchor value is dropped for the same
+/// reason: nothing draws it.
+const ANCHOR_WIRE_KEYS: [&str; 6] = ["ok", "state", "checked_ts", "seq", "anchored_seq", "live_seq"];
+
+/// PURE: project a verdict down to [`ANCHOR_WIRE_KEYS`]. A non-object (impossible
+/// from `anchor_status_json`, but this is a wire bound) collapses to `{}`, which
+/// the HUD's `coerceAuditAnchor` reads as "no state" and renders as NOTHING — the
+/// silent direction, never a false green and never a false alarm.
+fn anchor_for_snapshot(anchor: &serde_json::Value) -> serde_json::Value {
+    let mut out = serde_json::Map::new();
+    if let Some(obj) = anchor.as_object() {
+        for k in ANCHOR_WIRE_KEYS {
+            if let Some(v) = obj.get(k) {
+                out.insert(k.to_string(), v.clone());
+            }
+        }
+    }
+    serde_json::Value::Object(out)
+}
+
+/// PURE: fold the cached anchor verdict onto a snapshot payload under `"anchor"`.
+///
+/// The key is OMITTED when nothing was measured. An absent key is the honest "this
+/// daemon has not verified its witness"; a fabricated `{"ok": true}` would be a
+/// green shield for a check that never ran, which is the failure this whole
+/// surface exists to prevent. Mirrors `posture::attach_notes` — same shape, same
+/// reason, so the wire bound is tested without touching a global. What rides is
+/// the [`anchor_for_snapshot`] projection, never the raw verdict.
+fn attach_anchor(mut payload: serde_json::Value, anchor: Option<serde_json::Value>) -> serde_json::Value {
+    let Some(anchor) = anchor else { return payload };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("anchor".to_string(), anchor_for_snapshot(&anchor));
+    }
+    payload
+}
+
+/// [`attach_anchor`] over the live cache.
+fn with_anchor(payload: serde_json::Value) -> serde_json::Value {
+    attach_anchor(payload, last_anchor())
+}
+
 /// One-shot: verify the installed log's live head against the macOS-Keychain
 /// external anchor, emit a secret-free `audit.anchor` frame, and then (re)witness
 /// the CURRENT head — but ONLY when the prior state was benign (Match / NoAnchor /
@@ -857,7 +962,17 @@ pub async fn verify_and_reanchor_on_start() {
         }
         _ => {}
     }
-    crate::telemetry::emit("system", "audit.anchor", anchor_status_json(&status));
+    // CACHE FIRST, so the verdict rides the very next `audit.snapshot` tick.
+    let verdict = anchor_status_json(&status);
+    set_last_anchor(verdict.clone());
+    // PIXEL-FREE(diagnostic), and be exact about why: `main` runs this at startup
+    // (before `telemetry::init()`, and in any case before a client subscribes), so
+    // the frame reaches no hub receiver, not merely no reducer case — a
+    // `case "audit.anchor"` would draw nothing in the deployed configuration. The
+    // OPERATOR's surface is the `warn!` above; the OWNER's is the verdict cached
+    // two lines up, which `emit_snapshot` folds onto `audit.snapshot` under
+    // "anchor" for the AuditPanel's EXTERNAL ANCHOR row. Retention, not a case.
+    crate::telemetry::emit("system", "audit.anchor", verdict);
     // Do NOT silently overwrite a real mismatch — leave it for the operator.
     if matches!(status, AnchorStatus::Mismatch { .. }) {
         return;
@@ -1024,10 +1139,19 @@ pub async fn emit_snapshot() {
             return;
         }
     };
+    // FOLD THE EXTERNAL-ANCHOR VERDICT ONTO THE BOARD THE PANEL ALREADY READS.
+    // `verify_chain` above cannot see a whole-chain rewrite (it re-derives the
+    // chain from the very bytes that were rewritten), so on its own it renders a
+    // green CHAIN OK for the worst case the log has. The Keychain witness is what
+    // catches that, and its verdict used to stop at a `warn!`. Only the ENABLED
+    // path carries it: `verify_and_reanchor_on_start` self-gates on the SAME
+    // installed-and-enabled flag, so the two OFF returns above can never have a
+    // cached verdict to attach — the key is simply absent there, which is the
+    // honest "not checked", not a green.
     crate::telemetry::emit(
         "system",
         "audit.snapshot",
-        snapshot_json(true, total, &entries, &chain),
+        with_anchor(snapshot_json(true, total, &entries, &chain)),
     );
 }
 
@@ -1459,6 +1583,143 @@ mod tests {
         let chain = log.verify_chain().await.unwrap();
         let snap = snapshot_json(true, 1, &entries, &chain);
         assert!(!snap.to_string().contains(secret), "the raw secret must never reach the wire");
+    }
+
+    /// THE ANCHOR VERDICT REACHES THE SNAPSHOT, AND AN UNMEASURED ONE DOES NOT.
+    ///
+    /// The whole point of the external witness is the case `verify_chain` CANNOT
+    /// see: a consistent whole-chain rewrite re-derives clean, so `chain.ok` is a
+    /// green shield over the worst tamper the log has. `attach_anchor` is what
+    /// carries the contradicting verdict onto the frame the AuditPanel reads.
+    ///
+    /// Both directions are asserted because only one of them is the safe failure:
+    /// an ABSENT verdict must leave the key off entirely (an older/unchecked daemon
+    /// claims nothing) rather than synthesising an `ok` nobody measured.
+    #[test]
+    fn attach_anchor_carries_a_measured_verdict_and_omits_an_unmeasured_one() {
+        let base = || snapshot_json(true, 3, &[], &ChainStatus::Ok { count: 3 });
+
+        // Nothing measured: the key is absent, NOT a fabricated all-clear.
+        let unmeasured = attach_anchor(base(), None);
+        assert!(
+            unmeasured.get("anchor").is_none(),
+            "an unverified daemon must claim nothing about its witness, got {unmeasured}"
+        );
+
+        // A real MISMATCH rides the same frame that reports a clean local chain —
+        // which is exactly the whole-chain-rewrite signature the owner must see.
+        let mismatch = anchor_status_json(&AnchorStatus::Mismatch {
+            anchored_seq: 300,
+            anchored_head: "wit-abc".into(),
+            live: Some((412, "live-def".into())),
+        });
+        let framed = attach_anchor(base(), Some(mismatch));
+        assert_eq!(framed["chain"]["ok"], serde_json::json!(true), "the local chain still verifies");
+        assert_eq!(framed["anchor"]["state"], serde_json::json!("mismatch"));
+        assert_eq!(framed["anchor"]["ok"], serde_json::json!(false));
+        assert_eq!(framed["anchor"]["anchored_seq"], serde_json::json!(300));
+        assert_eq!(framed["anchor"]["live_seq"], serde_json::json!(412));
+        // SECRET-FREE, like everything else on this wire: only public digests and
+        // integers, and no chain byte beyond the single witnessed head.
+        assert!(framed["entries"].as_array().expect("entries array").is_empty());
+
+        // A benign EXTENDED verdict rides too — the row must be able to say
+        // "corroborated", or the only anchor state the owner ever sees is red.
+        let extended = anchor_status_json(&AnchorStatus::Extended {
+            anchored_seq: 300,
+            anchored_head: "wit-abc".into(),
+            live: (412, "live-def".into()),
+        });
+        let ok_framed = attach_anchor(base(), Some(extended));
+        assert_eq!(ok_framed["anchor"]["ok"], serde_json::json!(true));
+        assert_eq!(ok_framed["anchor"]["state"], serde_json::json!("extended"));
+    }
+
+    /// THE FOLD MUST NOT SMUGGLE A CHAIN BYTE ONTO THE WIRE.
+    ///
+    /// `snapshot_json_surfaces_only_the_secret_free_subset_newest_first` asserts
+    /// "no chain bytes on the wire" — but it asserts it about `snapshot_json`,
+    /// and what the daemon emits is `with_anchor(snapshot_json(..))`. The anchor
+    /// verdict carries `head` / `anchored_head` / `live_head`, which ARE
+    /// `entry_hash` values out of the chain, so the guard sat one layer below the
+    /// thing it guards. This one is taken at the EMITTED boundary.
+    ///
+    /// BOUNDED AT BOTH ENDS, deliberately: it also asserts what SURVIVES the
+    /// projection, so an allow-list tightened until it drops `state` — which
+    /// deletes the anchor row outright, since `coerceAuditAnchor` returns null
+    /// without one — fails here rather than in a HUD nobody ran.
+    #[tokio::test]
+    async fn the_anchor_fold_carries_the_verdict_and_never_a_chain_byte() {
+        let log = AuditLog::in_memory().unwrap();
+        log_some(&log).await;
+        let (seq, head) = log.head().await.unwrap().expect("a head to witness");
+        assert!(head.len() >= 32, "a real entry_hash, not a stub: {head}");
+
+        let framed = attach_anchor(
+            snapshot_json(true, 3, &[], &ChainStatus::Ok { count: 3 }),
+            Some(anchor_status_json(&AnchorStatus::Match { seq, head: head.clone() })),
+        );
+        let whole = framed.to_string();
+        assert!(!whole.contains(&head), "the live chain head reached the wire: {whole}");
+        assert!(!whole.contains("\"head\""), "no head key on the wire: {whole}");
+
+        // The MISMATCH shape carries TWO of them — the witnessed head and the live
+        // one — and it is the shape the owner is most likely to be looking at.
+        let diverged = attach_anchor(
+            snapshot_json(true, 3, &[], &ChainStatus::Ok { count: 3 }),
+            Some(anchor_status_json(&AnchorStatus::Mismatch {
+                anchored_seq: 300,
+                anchored_head: "witnessed-hash-abc".into(),
+                live: Some((412, "live-hash-def".into())),
+            })),
+        );
+        let whole = diverged.to_string();
+        assert!(!whole.contains("witnessed-hash-abc"), "the witnessed head reached the wire: {whole}");
+        assert!(!whole.contains("live-hash-def"), "the live head reached the wire: {whole}");
+
+        // …and Malformed's redacted raw anchor value is not on the allow-list.
+        let malformed = attach_anchor(
+            snapshot_json(true, 0, &[], &ChainStatus::Ok { count: 0 }),
+            Some(anchor_status_json(&AnchorStatus::Malformed {
+                raw_redacted: "unparseable-anchor-value".into(),
+            })),
+        );
+        assert!(
+            !malformed.to_string().contains("unparseable-anchor-value"),
+            "the stored anchor value reached the wire: {malformed}"
+        );
+
+        // WHAT MUST SURVIVE — every field the row actually renders.
+        assert_eq!(diverged["anchor"]["state"], serde_json::json!("mismatch"));
+        assert_eq!(diverged["anchor"]["ok"], serde_json::json!(false));
+        assert_eq!(diverged["anchor"]["anchored_seq"], serde_json::json!(300));
+        assert_eq!(diverged["anchor"]["live_seq"], serde_json::json!(412));
+        assert_eq!(framed["anchor"]["seq"], serde_json::json!(seq));
+        assert_eq!(framed["anchor"]["ok"], serde_json::json!(true));
+        assert_eq!(malformed["anchor"]["state"], serde_json::json!("malformed"));
+    }
+
+    /// The cache is what turns a ONCE-AT-BOOT frame into a surface: `audit.anchor`
+    /// fires before any HUD has connected and is not sticky, so the verdict only
+    /// reaches a pixel by being stored and re-broadcast on the snapshot cadence.
+    /// The `checked_ts` stamp is part of that contract — a re-broadcast reading
+    /// dated as if freshly measured would be the dishonest version of this fix.
+    #[test]
+    fn the_cached_verdict_is_stamped_with_when_it_was_actually_taken() {
+        set_last_anchor(anchor_status_json(&AnchorStatus::Match {
+            seq: 7,
+            head: "head-7".into(),
+        }));
+        let cached = last_anchor().expect("the verdict must survive the cache");
+        assert_eq!(cached["state"], serde_json::json!("match"));
+        let ts = cached["checked_ts"].as_str().expect("a checked_ts stamp");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(ts).is_ok(),
+            "checked_ts must be a real RFC3339 instant, got {ts:?}"
+        );
+        // …and it lands on the live snapshot path through `with_anchor`.
+        let framed = with_anchor(snapshot_json(true, 1, &[], &ChainStatus::Ok { count: 1 }));
+        assert_eq!(framed["anchor"]["state"], serde_json::json!("match"));
     }
 
     /// HONEST EMPTY/OFF: a disabled (or empty) snapshot carries enabled:false, zero

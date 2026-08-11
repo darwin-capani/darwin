@@ -172,10 +172,10 @@ fn op_of(line: &str) -> String {
 /// gate id itself for the boolean gates that carry no variant.
 ///
 /// PURE: every arm is a side-effect-free classifier, exactly as
-/// `guest_denied_fast_path` relies on. Clock-taking classifiers are given the
-/// real local clock (the same one `route()` hands them).
+/// `guest_denied_fast_path` relies on. Clock-taking classifiers are given
+/// [`probe_clock`] — a PINNED local clock, for the reason spelled out there.
 pub fn fire(gate: &str, text: &str) -> Option<String> {
-    let now = chrono::Local::now();
+    let now = probe_clock();
     match gate {
         "lockdown.panic" => crate::lockdown::is_panic_intent(text).then(|| "panic".to_string()),
         "lockdown.unlock" => crate::lockdown::is_unlock_intent(text).then(|| "unlock".to_string()),
@@ -379,6 +379,45 @@ pub fn fire(gate: &str, text: &str) -> Option<String> {
     }
 }
 
+/// THE CLOCK THE PROBES MEASURE AT. PINNED, and it used to be `Local::now()`.
+///
+/// THIS TURNED THE WHOLE DAEMON SUITE RED FOR FIVE HOURS OF EVERY DAY, on any
+/// machine, with no code change — the worst shape of flaky gate there is, because
+/// it is a clean red on a byte-identical tree and the natural response is to
+/// re-run it in the morning.
+///
+/// MEASURED, by sweeping `TZ` across all 26 whole-hour offsets and reading the
+/// recall number at each: 191/202 at local hours 05..=23, **190/202 at local hours
+/// 00..=04**. THREE gates go red in that window, not one:
+///   * `router_recall_does_not_regress` — 190 < 191, the ratchet.
+///   * `miss_offer::capability_index_entries_still_fire_their_gate` — the index
+///     phrase "walk me through this morning" stops firing `rewind`.
+///   * `miss_offer::a_lexical_did_you_mean_cannot_be_honest_on_device` — the extra
+///     miss shifts the frontier until a threshold shows 1 correct against 0 false
+///     offers, and the test announces that the NO-GO has been OVERTURNED. At 1am
+///     the suite tells the next reader a measured product decision has changed.
+///
+/// THE MECHANISM, so this is a diagnosis and not a shrug: `rewind`'s day-part
+/// windows are half-open hour ranges (morning = 05..12, `rewind.rs`), and a window
+/// lying entirely in the FUTURE is correctly refused — "this evening" asked in the
+/// morning is not a rewind. Before 05:00 local, "this morning" is that future
+/// window. The classifier is RIGHT; measuring the language at whatever hour the
+/// suite happened to run is what is wrong.
+///
+/// So the harness pins its clock and says which one. This is a measurement of
+/// LANGUAGE — does an utterance reach a capability — and it must answer the same
+/// at 2am as at 2pm. 14:00 is chosen because it is past every day-part boundary
+/// `rewind` knows, so no probe is refused for being in the future; the date is
+/// fixed too, so a weekday-sensitive classifier cannot move the number either.
+/// The offset is still the machine's real one, so this is a local clock, not UTC.
+fn probe_clock() -> chrono::DateTime<chrono::Local> {
+    use chrono::TimeZone;
+    chrono::Local
+        .with_ymd_and_hms(2026, 1, 15, 14, 0, 0)
+        .earliest()
+        .expect("14:00 on 2026-01-15 exists in the machine's local zone")
+}
+
 /// Every gate that fires on `text`, as `(gate, token)` pairs in [`GATES`] order.
 pub fn all_hits(text: &str) -> Vec<(&'static str, String)> {
     GATES
@@ -474,6 +513,64 @@ mod tests {
         // own breadth or it is not a ratchet.
         "the kids draw a picture of the dog every week",
     ];
+
+    /// THE HARNESS CLOCK IS PINNED, AND IT HAS TO BE.
+    ///
+    /// The measurement this module publishes is about LANGUAGE, so it must not
+    /// depend on when it is run. It did: at local hours 00..=04 the recall number
+    /// read 190/202 instead of 191/202 and three gates went red on a byte-identical
+    /// tree (see [`probe_clock`] for the full sweep and the mechanism).
+    ///
+    /// The second assertion is the ANTI-VACUITY one and it is the point of the
+    /// test: it demonstrates, in-process and with no dependence on the wall clock,
+    /// that this probe really is clock-sensitive — the same utterance the fixture
+    /// requires to fire reaches NOTHING when the clock says midnight. Without it a
+    /// pinned clock would look like a decoration.
+    #[test]
+    fn the_probe_harness_clock_is_pinned_off_the_hours_that_moved_the_number() {
+        use chrono::{FixedOffset, TimeZone, Timelike};
+        assert_eq!(
+            super::probe_clock().hour(),
+            14,
+            "the harness clock must be pinned past every rewind day-part boundary; \
+             at 00..=04 local this suite goes red for a reason that is not the code"
+        );
+        assert_eq!(
+            super::fire("rewind", "walk me through this morning").as_deref(),
+            Some("rewind"),
+            "the capability index's own phrase must fire at the pinned clock"
+        );
+        // AND `fire` MUST BE WIRED TO IT, which the two assertions above cannot
+        // show on their own — `probe_clock` could be pinned and ignored. At 14:00
+        // "this afternoon" (12..18) is half past and "this evening" (18..23) is
+        // entirely ahead, so this PAIR holds at the pin and at no local hour
+        // outside 12..=17: a `fire` that went back to `Local::now()` is caught for
+        // 18 of every 24 hours. Stated rather than implied, because a pin that
+        // nothing reads is the vacuous version of this fix.
+        assert_eq!(
+            super::fire("rewind", "walk me through this afternoon").as_deref(),
+            Some("rewind"),
+            "at the pinned 14:00 the afternoon is half over"
+        );
+        assert_eq!(
+            super::fire("rewind", "walk me through this evening").as_deref(),
+            None,
+            "at the pinned 14:00 the evening has not happened — if this fires, \
+             `fire` is reading the real clock again"
+        );
+        // PRECONDITION: this probe IS clock-sensitive. Midnight, stated directly
+        // rather than waited for.
+        let midnight = FixedOffset::east_opt(0)
+            .unwrap()
+            .with_ymd_and_hms(2026, 1, 15, 0, 0, 0)
+            .unwrap();
+        assert!(
+            crate::rewind::classify_rewind_intent("walk me through this morning", midnight)
+                .is_none(),
+            "precondition: at 00:00 this utterance reaches NOTHING — if it fired \
+             here, the pin above would be defending nothing"
+        );
+    }
 
     #[test]
     fn known_open_hijacks_only_ever_shrink() {

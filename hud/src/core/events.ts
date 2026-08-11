@@ -8793,7 +8793,39 @@ export interface AuditSnapshot {
   total: number;
   truncated: boolean;
   chain: ChainStatus;
+  anchor: AuditAnchor | null;
   entries: AuditEntry[];
+}
+
+/** The EXTERNAL TAMPER-ANCHOR verdict (audit.snapshot `anchor`), measured once at
+ *  daemon startup by `audit::verify_and_reanchor_on_start` against a witness held
+ *  in the macOS Keychain — a SEPARATE OS protection domain from the SQLite file.
+ *
+ *  WHY IT RIDES THIS FRAME, AND WHY IT MATTERS. `chain` above is re-derived from
+ *  the on-disk bytes, so an attacker who rewrites the WHOLE chain consistently
+ *  still gets `chain.ok === true`: the panel's green shield is at its most
+ *  reassuring in the worst case the log has. The Keychain witness is the only
+ *  thing that catches that, and its verdict reached nothing but daemon.log. It is
+ *  folded onto the snapshot rather than given a topic of its own because the
+ *  `audit.anchor` frame fires ONCE at boot, before any HUD has connected.
+ *
+ *  `state` is the daemon's verdict token, carried opaquely (forward-tolerant):
+ *  "match"/"extended" = corroborated, "mismatch" = DIVERGED, "no_anchor" = never
+ *  witnessed, "malformed" = the stored value was not `<seq>:<hash>`.
+ *
+ *  `checkedTs` is when the check RAN. This is a boot-time reading re-broadcast on
+ *  the 15s snapshot cadence, NOT a fresh measurement, and the panel dates it so.
+ *
+ *  A PRUNE DOES NOT PRODUCE "mismatch". Retention is delete-only and a survivor's
+ *  stored hash is immutable, so an ordinary prune corroborates as "extended"
+ *  (daemon test `a_prune_does_not_poison_the_external_anchor`). That is what makes
+ *  a divergence worth drawing rather than an alarm the owner learns to wave off. */
+export interface AuditAnchor {
+  ok: boolean;
+  state: string;
+  checkedTs: string | null;
+  anchoredSeq: number | null;
+  liveSeq: number | null;
 }
 
 /** One user-set policy rule as surfaced to the HUD — mirrors the daemon's
@@ -8860,6 +8892,33 @@ function coerceChainStatus(v: unknown): ChainStatus {
   };
 }
 
+/** Coerce the `anchor` sub-object of audit.snapshot, or null when it is absent or
+ *  unusable.
+ *
+ *  THE TWO FAILURE DIRECTIONS ARE NOT SYMMETRIC, so this does not fail one way.
+ *  Toward REASSURANCE it fails closed: `ok` is true only when the daemon said so
+ *  AND named a state that actually corroborates, so `{ok:true, state:"banana"}`
+ *  from a future/garbled daemon reads as unclear, never as a green witness.
+ *  Toward ALARM it fails SILENT: an absent or structureless payload yields null
+ *  and the panel says nothing, because an older daemon, an audit-off daemon, and
+ *  a check that never ran all look like this — turning any of them into a
+ *  "DIVERGED" banner would be crying wolf, which is the one thing tamper evidence
+ *  cannot afford. Never throws. */
+function coerceAuditAnchor(v: unknown): AuditAnchor | null {
+  if (!isPlainObject(v)) return null;
+  const state = str(v, "state");
+  if (state === null || state.length === 0) return null;
+  const corroborated = state === "match" || state === "extended";
+  return {
+    ok: (bool(v, "ok") ?? false) && corroborated,
+    state,
+    checkedTs: str(v, "checked_ts"),
+    // `match` carries `seq`; `extended`/`mismatch` carry `anchored_seq`.
+    anchoredSeq: num(v, "anchored_seq") ?? num(v, "seq"),
+    liveSeq: num(v, "live_seq"),
+  };
+}
+
 /** Parse an audit.snapshot payload. NEVER returns null — an audit frame always
  *  yields a (possibly empty) snapshot so the panel renders the honest current
  *  state (off / empty / a verified or broken chain) rather than a stale one.
@@ -8879,6 +8938,7 @@ export function parseAuditSnapshot(data: Record<string, unknown>): AuditSnapshot
     total: num(data, "total") ?? entries.length,
     truncated: bool(data, "truncated") ?? false,
     chain: coerceChainStatus(data["chain"]),
+    anchor: coerceAuditAnchor(data["anchor"]),
     entries,
   };
 }

@@ -5476,19 +5476,78 @@ fn selected_component(lower: &str) -> Option<String> {
     let Some(reference) = extract_component_ref(lower) else {
         return bare_designator_selection(lower);
     };
-    if looks_like_designator(&reference) || mentions_board_noun(lower) {
-        return Some(reference);
-    }
-    if !mentions_select_verb(lower) {
-        return None;
-    }
     let words = speech_words(lower);
     let pos = words.iter().position(|w| *w == "component")?;
-    if phrase_settles_at(&words, pos + 1) {
-        Some(reference)
-    } else {
-        None
+    // The board named outright still carries the utterance on its own, exactly as
+    // it does for a net.
+    if mentions_board_noun(lower) {
+        return Some(reference);
     }
+    // A REFDES-SHAPED reference is a strong enough signal to stand with no select
+    // verb — "component r12" with the board open is a selection. It is NOT strong
+    // enough to skip the POSITION test, which is what it used to do.
+    //
+    // MEASURED HIJACK: `looks_like_designator` short-circuited before every
+    // position and verb test, so "the emotional component R2 of the study was
+    // dropped" selected R2 in a PCB editor, and it was not one sentence but a
+    // class — "the ui component D3 of the design system was deprecated", "the
+    // second component K4 of that argument never landed", "component J1 is where
+    // the ribbon cable goes", "we removed component C5 from the bill of
+    // materials", all captured at the previous revision. English puts a
+    // designator-shaped token after "component" whenever the sentence is ABOUT a
+    // labelled part, and a sentence about a part is not a command to select it.
+    //
+    // Requiring the phrase to SETTLE on the designator is the same test the
+    // numeric branch below already applied, so the two now agree instead of one
+    // being a hole in the other. What it costs is the compound form ("select
+    // component r14 AND zoom in"), which was never a probe and is the same thing
+    // "select component 5 and zoom in" already cost.
+    //
+    // SETTLING ALONE IS ONLY HALF THE CLASS, MEASURED. A settle test looks at
+    // what comes AFTER the designator, so it closes exactly the sentences that
+    // keep going ("... of the study was dropped") and closes NOTHING that ENDS on
+    // the part — which is the commoner English shape. All twelve of these reached
+    // `select.component` with the settle test in place: "the failure was traced to
+    // component u7", "i replaced the broken component r5", "we ordered a
+    // replacement for component c12", "he blamed the whole outage on component
+    // q3", "the invoice lists one spare component c9", "the vendor discontinued
+    // component l4", "my thesis chapter covers the thermal component t2", "nobody
+    // could explain the failure of component d8", "the recall notice named
+    // component k2", "the essay is missing its strongest component a1", and the
+    // same with a politeness tail ("... component l4 NOW", "... component r9
+    // AGAIN"), because a trailer settles.
+    //
+    // So the verb waiver is scoped the way `bare_designator_selection` scopes its
+    // own: the no-verb form is admitted ONLY when the utterance is the BARE one —
+    // nothing but determiners and politeness before the noun. That is the whole
+    // reason the waiver exists ("component r12", "the component r12", "component
+    // u3 on the schematic"); a designator sitting mid-sentence never was.
+    //
+    // STRICTLY A NARROWING: the admitted set is `(designator AND bare frame) OR
+    // select verb`, a SUBSET of the `designator OR select verb` above it, so this
+    // cannot let anything through that did not already come through. Both silicon
+    // recall probes for this op keep working — "select component u3" has its verb,
+    // and "select r14" never reaches this branch at all (it is
+    // `bare_designator_selection`).
+    let bare_form = looks_like_designator(&reference) && only_frame_before(&words, pos);
+    if !bare_form && !mentions_select_verb(lower) {
+        return None;
+    }
+    phrase_settles_at(&words, pos + 1).then_some(reference)
+}
+
+/// Is everything BEFORE `idx` mere frame — a determiner or a politeness word —
+/// rather than the sentence the noun is embedded in?
+///
+/// The mirror of [`settles_from`], which asks the same question of the tail. A
+/// gate that waives its verb needs BOTH: "component r12" is a command, "the
+/// failure was traced to component u7" is a sentence, and only the prefix tells
+/// them apart. Deliberately a CLOSED list — the two frame lists this module
+/// already ships — because a content word admitted here re-opens the hijack.
+fn only_frame_before(words: &[&str], idx: usize) -> bool {
+    words[..idx.min(words.len())]
+        .iter()
+        .all(|w| SPEECH_DETERMINERS.contains(w) || SPEECH_TRAILERS.contains(w) || *w == "hey")
 }
 
 /// The object of a fit phrase may be followed by the redundant "view" /
@@ -11133,15 +11192,124 @@ mod tests {
     /// proven to fire by `fixtures/router_recall.json` never reached it.
     ///
     /// So: every intent in the "MUST be one of" list needs a definition line or
-    /// a worked example. `KNOWN_UNDOCUMENTED` is the residue this wave did not
-    /// measure and therefore did not touch; adding a NEW intent without writing
-    /// it up, or deleting an existing write-up, fails here.
+    /// a worked example. `KNOWN_UNDOCUMENTED` is the residue not yet measured;
+    /// adding a NEW intent without writing it up, or deleting an existing
+    /// write-up, fails here.
+    ///
+    /// THE RESIDUE IS NOW EMPTY. `system.query` and `memory.recall` were the last
+    /// two, and both are written up. MEASURED on the real on-device classifier
+    /// (a private inference server built from this tree, cross-validated against
+    /// the live `com.darwin.inference` socket at 84/85 intent agreement on the
+    /// UNMODIFIED prompt — one borderline utterance differs between two processes
+    /// of the same model, which is the noise floor these numbers sit on):
+    ///
+    ///   * system.query recall, over 25 utterances derived from what
+    ///     `actions::system_status_data` actually returns: 18/25 -> 25/25. The
+    ///     seven misses did not merely go unanswered — two ("am i running out of
+    ///     memory", "when did this machine last reboot") were classified
+    ///     memory.recall, i.e. a question about the MACHINE read the OWNER'S
+    ///     stored facts out loud.
+    ///   * memory.recall recall, over 20 such utterances: 20/20 -> 20/20. It
+    ///     needed no help; the write-up is a NARROWING, and that is the whole
+    ///     value. `handle_local`'s memory.recall arm takes NO search term — it
+    ///     dumps up to 50 stored rows as the verified data the reply is spoken
+    ///     from (`memory_recall_speaks_the_whole_store_unfiltered` pins that)
+    ///     — so every false positive discloses the WHOLE store, not one item.
+    ///
+    ///     ADVERSARY CORRECTION, TWICE. This paragraph said "up to `FACTS_LIMIT`",
+    ///     and both halves of that were wrong in the direction that makes the
+    ///     disclosure look smaller than it is — in the paragraph whose entire job
+    ///     is to size that disclosure.
+    ///       1. THE BOUND IS 50, NOT 12. The arm passes a LITERAL 50; `FACTS_LIMIT`
+    ///          is 12 (router.rs:30) and belongs to a different caller, the
+    ///          grounded-facts feed at router.rs:3454. A reader who greps the
+    ///          symbol concludes a stray recall speaks at most twelve rows. It
+    ///          speaks up to fifty — 4.2x. MEASURED: rewriting the arm to
+    ///          `FACTS_LIMIT` left the WHOLE suite green (3554 passed / 0 failed),
+    ///          so nothing pinned the number the prose was quoting. The seeding
+    ///          below now pins it.
+    ///       2. IT IS NOT ONLY WHAT THE OWNER ASKED DARWIN TO REMEMBER.
+    ///          `agent_scoped_facts` (memory.rs:426) returns own-namespace rows OR
+    ///          any key NOT LIKE 'agent.%', and two auto-harvested SHARED tiers sit
+    ///          under exactly that: `user.world.*` (world_model.rs WORLD_PREFIX —
+    ///          entities and relationships the world model extracts on its own) and
+    ///          `user.model.*` (the personalization/user-model tier). Neither was
+    ///          ever dictated to memory.store. So a stray recall reads back
+    ///          inferences ABOUT the owner beside the notes FROM them, and the
+    ///          prompt's "the notes the owner earlier asked DARWIN to remember"
+    ///          describes the narrower half. The narrowing is MORE justified than
+    ///          the write-up argued, not less — which is why this is a correction
+    ///          and not an objection.
+    ///   * false positives, over 574 sentences that ask for neither (the 470 of
+    ///     `fixtures/router_ordinary.json` plus 104 adversarial): 33 -> 3
+    ///     (5.75% -> 0.52%). Eight of the thirty were in the ordinary corpus
+    ///     itself: "I muted that group chat weeks ago", "did you lock everything
+    ///     down" and "forget what you think you know about parenting advice" each
+    ///     reached the memory.recall arm and read the owner's whole fact store
+    ///     back — the last of those while being asked to FORGET something.
+    ///   * the other nine intents, over 40 sentences chosen to exercise each:
+    ///     40/40 unchanged. Ordinary-corpus utterances landing on ANY action
+    ///     intent: 44 -> 25.
+    ///
+    /// TWO COSTS, both measured and both kept:
+    ///   * the five worked examples added with the prose are all "light", and
+    ///     that biases the SEPARATE complexity axis: heavy on the ordinary corpus
+    ///     goes 249 -> 110 of 470. A prose-only variant was measured as the
+    ///     control (heavy 200, i.e. most of the shift is the examples) and
+    ///     REJECTED: it holds the same 25/25 and 20/20 but leaves 11 false
+    ///     positives instead of 3, including "send me the runbook" and "what do
+    ///     you recall from the meeting yesterday" still dumping the fact store.
+    ///     The cost inside the cloud config is that a general-knowledge
+    ///     conversation turn is now phrased by the fast cloud model rather than
+    ///     the heavy one.
+    ///
+    ///     THIS PARAGRAPH USED TO ADD "fewer heavy turns is the direction #245
+    ///     already moved deliberately (a heavy turn preempts the app gates via the
+    ///     cloud tool loop)". THE SECOND CLAUSE IS TRUE AND THE INFERENCE FROM IT
+    ///     IS BACKWARDS. Re-derived from the call graph rather than from #245's
+    ///     sentence: `actuating_cloud` is `heavy OR low-confidence`, and that block
+    ///     RETURNS on both arms — Ok from `complete_with_tools`, and Err via
+    ///     `generate_in_persona`. So "heavy" does not merely preempt the app gates
+    ///     on a reachable cloud; it preempts them OFFLINE too, which is precisely
+    ///     why #245 could call it terminal. Preemption is a BUG for an utterance
+    ///     that wants an app gate and a SHIELD for one that does not, and the
+    ///     ordinary corpus is entirely the second kind. Downgrading it therefore
+    ///     cuts both ways:
+    ///       * ONLINE it is a real gain, and that half of the old sentence stands:
+    ///         a light conversation turn takes `complete_persona`, which has NO
+    ///         tool catalogue, instead of the actuating tool loop.
+    ///       * OFFLINE / IN VAULT it is a loss. A heavy turn returned from the Err
+    ///         arm above; a light one reaches the conversation branch, resolves
+    ///         Local, and on `tools_used == 0` FALLS THROUGH to the describe /
+    ///         genimage / sound / silicon / lumen / vision / nexus / markforge
+    ///         stack — the eight gates `recall_probe::CLOUD_PREEMPTED` documents as
+    ///         reachable by "OFFLINE, in VAULT mode, and for a GUEST ... precisely
+    ///         the population that cannot fall back on the cloud answering first".
+    ///
+    ///     MEASURED, and the measurement is why this is a rewritten rationale and
+    ///     not a veto: of the 137 ordinary-corpus sentences that go heavy -> light,
+    ///     ZERO fire any lexical gate (`recall_probe::all_hits` over all 137), so
+    ///     no corpus sentence realizes the exposure. It is realizable outside the
+    ///     corpus: "in art school the kids draw a picture of the dog every week and
+    ///     i never understood why" fires genimage, is heavy at HEAD and light here,
+    ///     and `[image]` ships enabled with a pre-downloaded checkpoint. Its bare
+    ///     form is already `KNOWN_OPEN_HIJACKS[3]` and already fires at HEAD, so
+    ///     this widens a documented hole by one phrasing rather than opening a new
+    ///     one — but the hole is genimage's grammatical-person gap, and the
+    ///     honest statement is that this edit removes some of the cover it was
+    ///     sitting behind, not that it is safe in that direction.
+    ///   * two ordinary sentences newly reach an action intent: "do i need a visa
+    ///     to visit japan" -> web.search and "make a note about the background
+    ///     music in that film" -> memory.store (both stable over three runs).
+    ///     Against that, "what are the levels of lead in the water supply" stops
+    ///     being a web.search, so ordinary-corpus web.search goes 3 -> 2.
     #[test]
     fn every_intent_in_the_classifier_taxonomy_is_defined_or_exemplified() {
         const PROMPT: &str = include_str!("../../inference/prompts/intent_classifier.txt");
-        /// Listed, but neither defined nor exemplified. Both predate this test and
-        /// are OPEN — the same defect class `app.control` had, unmeasured here.
-        const KNOWN_UNDOCUMENTED: &[&str] = &["system.query", "memory.recall"];
+        /// Listed, but neither defined nor exemplified. EMPTY — the residue is
+        /// closed. A name may only be added here with the measurement that says
+        /// why writing it up was not done.
+        const KNOWN_UNDOCUMENTED: &[&str] = &[];
 
         let must_line = PROMPT
             .lines()
@@ -11752,6 +11920,120 @@ mod tests {
         assert_op("fit everything on the board", fit);
         assert_op("fit the board view", fit);
         assert_op("show the entire board", fit);
+    }
+
+    /// A REFDES AFTER "component" IS NOT A COMMAND ON ITS OWN.
+    ///
+    /// `looks_like_designator` used to short-circuit `selected_component` before
+    /// every position and verb test, on the reasoning that "component R12" is
+    /// unambiguous. It is not: English puts a designator-shaped token straight
+    /// after "component" whenever the sentence is ABOUT a labelled part, and a
+    /// sentence about a part is not an instruction to select it. All six below
+    /// reached `select.component` at the previous revision — and `apps::send_op`
+    /// forwards fire-and-forget, so the owner discussing a study, a design system
+    /// or a BOM had a PCB editor jump to a part.
+    ///
+    /// The second half is the point of the test: the short-circuit existed for the
+    /// BARE form "component r12", which has no select verb at all, and that form
+    /// still works. So does "select r14", which never came through this branch —
+    /// it is `bare_designator_selection`, and a fix that quietly took it would be
+    /// a recall loss, not a precision win.
+    #[test]
+    fn a_refdes_after_component_still_has_to_settle_the_phrase() {
+        for s in [
+            "the emotional component r2 of the study was dropped",
+            "the component r2 of the study was dropped by the reviewers",
+            "the ui component d3 of the design system was deprecated",
+            "the second component k4 of that argument never landed",
+            "component j1 is where the ribbon cable goes",
+            "we removed component c5 from the bill of materials",
+        ] {
+            assert!(
+                silicon_canvas_command(s).is_none(),
+                "{s:?} is a sentence about a part, not a command: it still reaches \
+                 silicon canvas"
+            );
+        }
+        assert_op("component r12", r#"{"op":"select.component","name":"R12"}"#);
+        assert_op("select component u3", r#"{"op":"select.component","name":"U3"}"#);
+        assert_op(
+            "isolate component u12 please",
+            r#"{"op":"select.component","name":"U12"}"#,
+        );
+        assert_op(
+            "probe component tp4 now",
+            r#"{"op":"select.component","name":"TP4"}"#,
+        );
+        assert_op(
+            "component u3 on the schematic",
+            r#"{"op":"select.component","name":"U3"}"#,
+        );
+        assert_op(
+            "can you select component r7 for me",
+            r#"{"op":"select.component","name":"R7"}"#,
+        );
+        assert_op("select r14", r#"{"op":"select.component","name":"R14"}"#);
+    }
+
+    /// ...AND SETTLING THE TAIL IS ONLY HALF OF IT.
+    ///
+    /// The sibling test above proves a designator followed by more sentence is
+    /// not a command. It cannot prove anything about a designator that ENDS the
+    /// sentence, because a settle test only looks FORWARD — and ending on the
+    /// part is the commoner English shape. MEASURED: with the settle test in
+    /// place and the verb still waived, all twelve below reached
+    /// `select.component`, so the class was half open with the fix in it.
+    ///
+    /// The prefix test is what closes them, and it is scoped so it cannot cost a
+    /// command: the no-verb waiver now admits only the BARE utterance, which is
+    /// the only thing it ever existed for. Every positive in the sibling test
+    /// still passes, both silicon recall probes for this op still fire, and the
+    /// three capability-index entries ("component r12", "select component u3",
+    /// "show component r12") are re-asserted at the bottom of this one.
+    ///
+    /// THE RISK THIS PREFIX RULE OPENS, stated rather than hidden: determiners and
+    /// politeness words ARE admitted, so "that component d4" is still a selection.
+    /// That is deliberate — it is the deictic form a person at a board actually
+    /// says — and it is a two-word utterance, not a sentence a designator is
+    /// buried in. A CONTENT word before the noun is what re-opens the hijack, and
+    /// that is exactly what is refused.
+    #[test]
+    fn a_refdes_mid_sentence_is_not_a_bare_selection() {
+        for s in [
+            "the failure was traced to component u7",
+            "i replaced the broken component r5",
+            "we ordered a replacement for component c12",
+            "he blamed the whole outage on component q3",
+            "the invoice lists one spare component c9",
+            "the vendor discontinued component l4",
+            "my thesis chapter covers the thermal component t2",
+            "nobody could explain the failure of component d8",
+            "the recall notice named component k2",
+            "the essay is missing its strongest component a1",
+            // A politeness trailer SETTLES, so these two got through the tail test
+            // on their own — the prefix is the only thing that refuses them.
+            "the vendor discontinued component l4 now",
+            "the report blames component r9 again",
+        ] {
+            assert!(
+                silicon_canvas_command(s).is_none(),
+                "{s:?} ends on a part it is ABOUT, not a part to select: it still \
+                 reaches silicon canvas"
+            );
+        }
+        // PRECONDITION against a prefix rule that tightened into matching nothing:
+        // the bare forms the waiver exists for, including the two determiner and
+        // politeness shapes the rule deliberately admits.
+        assert_op("component r12", r#"{"op":"select.component","name":"R12"}"#);
+        assert_op("the component r12", r#"{"op":"select.component","name":"R12"}"#);
+        assert_op("hey component r12", r#"{"op":"select.component","name":"R12"}"#);
+        assert_op(
+            "component u3 on the schematic",
+            r#"{"op":"select.component","name":"U3"}"#,
+        );
+        assert_op("select component u3", r#"{"op":"select.component","name":"U3"}"#);
+        assert_op("show component r12", r#"{"op":"select.component","name":"R12"}"#);
+        assert_op("select r14", r#"{"op":"select.component","name":"R14"}"#);
     }
 
     /// The three real commands this gate DOES cost, pinned so the trade is
@@ -14879,6 +15161,249 @@ mod tests {
         assert!(!out.data.contains("guest mode"), "conversation is allowed for a guest: {}", out.data);
         let out = super::handle_local("system.query", &serde_json::Value::Null, "how are you running", &mem, &apps, agent).await;
         assert!(!out.data.contains("guest mode"), "non-personal system status is allowed for a guest: {}", out.data);
+    }
+
+    /// THE CLAIM THE `memory.recall` WRITE-UP RESTS ON, PINNED TO THE HANDLER.
+    ///
+    /// `inference/prompts/intent_classifier.txt` now tells the model that
+    /// memory.recall "takes NO search term: it speaks the WHOLE stored set, so
+    /// use it ONLY when the utterance asks for what DARWIN has SAVED, never as a
+    /// lookup for one item." That is the sentence doing the narrowing work, and
+    /// it is a claim about THIS code: the arm ignores both `args` and `text` and
+    /// hands every row `agent_scoped_facts` returns to the reply.
+    ///
+    /// So the prompt is only honest while the handler is an unfiltered dump. If
+    /// someone later makes the arm filter by the utterance, the prompt's reason
+    /// for being narrow silently becomes false — and the utterances it pushed to
+    /// `conversation` (a single-topic question like "what do you know about my
+    /// sourdough starter") would then have been the right ones to route here.
+    /// This test fails at that moment, naming the prompt.
+    ///
+    /// It also states the disclosure plainly: a memory.recall false positive
+    /// speaks the WHOLE store, not the part the sentence was about. That is why
+    /// the eight ordinary-corpus sentences that reached this arm at HEAD mattered.
+    #[tokio::test]
+    async fn memory_recall_speaks_the_whole_store_unfiltered() {
+        let db = TempDb::new("memory-recall-dump");
+        let mem = Memory::open(&db.0).unwrap();
+        let reg = AgentRegistry::canonical();
+        let agent = reg.orchestrator();
+        let apps =
+            std::sync::Arc::new(crate::apps::AppRegistry::discover(std::path::Path::new("/nonexistent")));
+        let _o = crate::threshold::ScopeOverride::owner();
+
+        // SEEDED OLDEST-FIRST ON PURPOSE. `agent_scoped_facts` orders `ts DESC,
+        // id DESC` and truncates at its `limit`, so the OLDEST rows are the ones a
+        // narrower bound would drop. These three are therefore the witnesses for
+        // the row bound as well as for the absence of filtering.
+        mem.upsert_fact("user.sourdough", "starter lives in the back of the fridge").await.unwrap();
+        mem.upsert_fact("user.alarm_code", "the gate code is 8814").await.unwrap();
+        mem.upsert_fact("user.cardiologist", "appointment moved to the 14th").await.unwrap();
+
+        // TWO ROWS THE OWNER NEVER DICTATED. `agent_scoped_facts` admits own-namespace
+        // rows OR any key NOT LIKE 'agent.%', and both auto-harvested SHARED tiers sit
+        // under that clause: `user.world.*` (world_model.rs `WORLD_PREFIX` — entities
+        // and relationships the world model extracts by itself) and `user.model.*`
+        // (the personalization/user-model tier). Neither ever went through
+        // memory.store, so the prompt's "the notes the owner earlier asked DARWIN to
+        // remember" is the NARROWER half of what this arm actually speaks. Seeded
+        // here so that stays true by test rather than by reading.
+        mem.upsert_fact("user.world.entity.person.hannah.role", "hannah handles the custody filing").await.unwrap();
+        mem.upsert_fact("user.model.style.money", "gets defensive when asked about the overdraft").await.unwrap();
+
+        // PAD PAST `FACTS_LIMIT` (12). The arm passes a LITERAL 50, not that
+        // constant, and before this padding existed the two were indistinguishable:
+        // rewriting the arm to `FACTS_LIMIT` left the whole suite GREEN. With
+        // thirteen newer rows in front of them, the three witnesses above survive
+        // only while the bound is genuinely larger than twelve.
+        for i in 0..13 {
+            mem.upsert_fact(&format!("user.filler_{i}"), &format!("filler row {i}")).await.unwrap();
+        }
+
+        // An utterance about ONE of the three. The handler still speaks all three:
+        // it never reads `text` or `args`.
+        let out = super::handle_local(
+            "memory.recall",
+            &serde_json::json!({"key": "sourdough"}),
+            "what do you know about my sourdough starter",
+            &mem,
+            &apps,
+            agent,
+        )
+        .await;
+        for probe in ["back of the fridge", "gate code is 8814", "moved to the 14th"] {
+            assert!(
+                out.data.contains(probe),
+                "memory.recall is an UNFILTERED dump — every stored fact must be in its \
+                 output, but {probe:?} was not: {}\nIf this arm now filters, the \
+                 memory.recall write-up in inference/prompts/intent_classifier.txt says \
+                 something false and must be rewritten.",
+                out.data
+            );
+        }
+        // ...AND THE TWO AUTO-HARVESTED TIERS COME WITH THEM. Neither row was ever
+        // dictated to memory.store; both are admitted by the same
+        // `key NOT LIKE 'agent.%'` clause. If a later change scopes this arm to the
+        // owner's DICTATED notes, the disclosure genuinely shrinks and the
+        // correction in `every_intent_in_the_classifier_taxonomy_is_defined_or_
+        // exemplified` must be rewritten with it — which is what this fails for.
+        for (tier, probe) in [
+            ("user.world.* (world model)", "custody filing"),
+            ("user.model.* (personalization)", "defensive when asked about the overdraft"),
+        ] {
+            assert!(
+                out.data.contains(probe),
+                "memory.recall no longer speaks the {tier} tier. That tier is \
+                 AUTO-HARVESTED — the owner never dictated it through memory.store — \
+                 and the write-up in router.rs describes the dump as spanning it. \
+                 Missing {probe:?} in: {}",
+                out.data
+            );
+        }
+
+        // PRECONDITION, asserted so the checks above cannot pass vacuously on an
+        // empty store or an error string.
+        assert!(
+            out.data.starts_with("Stored facts:"),
+            "expected the fact-dump shape, got: {}",
+            out.data
+        );
+        // ...and that the padding really did push the witnesses past `FACTS_LIMIT`,
+        // so "the bound is bigger than 12" is a fact about THIS run and not an
+        // assumption about how many rows the seeding produced.
+        let rows = out.data.lines().count() - 1;
+        assert!(
+            rows > super::FACTS_LIMIT,
+            "this test only pins the row bound while it seeds more than FACTS_LIMIT \
+             ({}) rows; it dumped {rows}",
+            super::FACTS_LIMIT
+        );
+
+        // AND THE PROMPT MUST STILL SAY SO. The dump above is the behaviour; the
+        // sentence below is what makes the classifier narrow enough to be safe
+        // with it, and the taxonomy guard alone will NOT notice its removal —
+        // memory.recall also has a worked example, and "defined OR exemplified"
+        // is satisfied by the example on its own. (MEASURED: deleting the whole
+        // definition line leaves `every_intent_in_the_classifier_taxonomy_is_
+        // defined_or_exemplified` green.) So the narrowing clause is pinned here,
+        // beside the behaviour it describes.
+        const PROMPT: &str = include_str!("../../inference/prompts/intent_classifier.txt");
+        let def = PROMPT
+            .lines()
+            .find(|l| l.starts_with("memory.recall "))
+            .expect(
+                "memory.recall lost its definition line in the classifier prompt — without it \
+                 the model is left to guess at an intent that reads the owner's whole fact \
+                 store aloud",
+            );
+        assert!(
+            def.contains("NO search term") && def.contains("WHOLE stored set"),
+            "the memory.recall definition no longer states that this arm takes no search \
+             term and speaks the whole store — that clause is what keeps single-topic \
+             questions out of a handler that would answer them by reading everything: {def}"
+        );
+    }
+
+    /// THE CLAIM THE `system.query` WRITE-UP RESTS ON, PINNED TO THE HANDLER.
+    ///
+    /// The prompt now says system.query reports "exactly four" numbers — CPU
+    /// percent, RAM used out of total, free disk space, uptime — and that "every
+    /// other measurement is conversation", naming battery, temperature, volume,
+    /// network usage and other machines. That list is not a style choice: it is
+    /// the exact set `actions::system_status_data` can produce, and the reason
+    /// "how much battery do i have left" must NOT come here is that this handler
+    /// has no battery to report and would answer with the CPU instead.
+    ///
+    /// Widening the handler without widening the prompt makes the taxonomy too
+    /// narrow; widening the prompt without the handler makes DARWIN promise a
+    /// number it will answer with a different one. Either way this fails.
+    #[test]
+    fn system_query_prompt_names_exactly_the_status_fields_the_handler_emits() {
+        const PROMPT: &str = include_str!("../../inference/prompts/intent_classifier.txt");
+        let def = PROMPT
+            .lines()
+            .find(|l| l.starts_with("system.query "))
+            .expect("system.query has no definition line in the classifier prompt");
+
+        let rendered = crate::actions::format_system_status(&crate::telemetry::SystemSnapshot {
+            cpu_percent: 12.5,
+            mem_used_bytes: 8 * 1024 * 1024 * 1024,
+            mem_total_bytes: 16 * 1024 * 1024 * 1024,
+            disk_free_bytes: Some(200 * 1024 * 1024 * 1024),
+            disk_total_bytes: Some(500 * 1024 * 1024 * 1024),
+            uptime_secs: 90_000,
+        });
+
+        // Every field the handler EMITS must be named in the definition's own
+        // ENUMERATION of what system.query reports — the clause between "which are
+        // exactly four:" and the dash that introduces its example phrases.
+        //
+        // BOUNDED THAT TIGHTLY BECAUSE THE OBVIOUS SCOPE DOES NOT WORK: checking
+        // the whole line was MEASURED to survive its own mutation. Deleting "free
+        // disk space" from the enumeration left the line still containing "disk"
+        // twice — once in the example "how much disk is left" and once in the
+        // exclusion "free up disk space" — so the guard matched its own
+        // neighbours and reported a promise that was no longer made.
+        let enumeration = def
+            .split_once("which are exactly four:")
+            .map(|(_, tail)| tail.split(" — ").next().unwrap_or(tail))
+            .unwrap_or_else(|| {
+                panic!("system.query definition lost its four-field enumeration: {def}")
+            });
+        assert!(
+            (40..200).contains(&enumeration.len()),
+            "the four-field enumeration parse looks wrong ({} chars): {enumeration:?}",
+            enumeration.len()
+        );
+        for (emitted, promised) in
+            [("CPU at", "CPU"), ("memory", "RAM"), ("disk", "disk"), ("uptime", "been up")]
+        {
+            assert!(
+                rendered.contains(emitted),
+                "system_status_data no longer emits {emitted:?}: {rendered}"
+            );
+            assert!(
+                enumeration.contains(promised),
+                "the handler reports {emitted:?} but the system.query definition does not \
+                 list {promised:?} among the numbers it reports — \
+                 inference/prompts/intent_classifier.txt is now narrower than the handler, \
+                 so an utterance asking for it is taught to go somewhere else. \
+                 Enumeration: {enumeration:?}"
+            );
+        }
+        // ...and nothing the handler CANNOT emit may be promised. These are the
+        // measurements that were landing here at HEAD and answering with the CPU.
+        for absent in ["battery", "temperature", "volume", "process"] {
+            assert!(
+                !rendered.contains(absent),
+                "system_status_data now emits {absent:?}; the definition line excludes it \
+                 and must be rewritten: {rendered}"
+            );
+            // The definition may NAME them, but only where it is EXCLUDING them.
+            // The boundary is "It only READS those four": everything before it is
+            // what system.query PROMISES, everything after is what it refuses.
+            // (Bounded at both ends after the first attempt split at the later
+            // "Every other measurement is conversation" and failed on the word
+            // "volume", which the prompt uses correctly in the earlier "a request
+            // to CHANGE ... is NOT system.query" clause — the guard was too wide,
+            // not the prompt. The split's length is asserted below so a reworded
+            // prompt cannot silently make this check vacuous.)
+            let promises = def
+                .split_once("It only READS those four")
+                .map(|(head, _)| head)
+                .unwrap_or_else(|| panic!("system.query definition lost its READS-only clause: {def}"));
+            assert!(
+                promises.len() > 80 && promises.len() < def.len(),
+                "the promise/exclusion split looks wrong ({} of {} chars): {def}",
+                promises.len(),
+                def.len()
+            );
+            assert!(
+                !promises.contains(absent),
+                "the system.query definition promises {absent:?} before its exclusion \
+                 clause, but the handler cannot report it: {def}"
+            );
+        }
     }
 
     #[tokio::test]

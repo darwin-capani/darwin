@@ -1272,6 +1272,11 @@ async fn sentinel_tick(store: &PersistenceBaseline, assess_signing: bool, max_as
     // speaks). The detail frame stays for the operator's live stream; a
     // per-finding HUD panel is a surface to add deliberately, not by wiring up a
     // frame that happens to exist.
+    //
+    // PIXEL-FREE(diagnostic): the one-line summary this scan caches rides
+    // `posture.snapshot` into the PostureDashboardPanel's AMBIENT SCANNERS block,
+    // so a new/unsigned autostart item reaches the owner unasked. This frame is
+    // the full per-surface inventory + skip list for the operator's stream.
     crate::telemetry::emit(
         "system",
         "security.persistence",

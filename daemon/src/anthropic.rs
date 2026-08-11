@@ -7216,6 +7216,10 @@ async fn execute_mcp_tool(
     // A user-originated call (call 0) is unaffected.
     if !user_originated && !consequential && manager.server_reaches_network(&server) {
         warn!(tool = flat, agent = namespace, "egress guard: refusing an outward MCP call in a tool continuation");
+        // PIXEL-FREE(diagnostic): the refusal is RETURNED as the tool result a few
+        // lines below and the model relays it, so the owner is told in the answer —
+        // in their own language, in the turn it happened, with the connector named.
+        // A HUD row would be a second, worse copy of a sentence they just read.
         crate::telemetry::emit(
             "system",
             "egress.refused",
@@ -7651,6 +7655,9 @@ async fn execute_tool_bound(
     {
         if let Some(refusal) = outward_get_egress_refusal(name, input) {
             warn!(tool = name, "egress guard: refusing an outward GET in a tool continuation");
+            // PIXEL-FREE(diagnostic): `refusal` is returned two lines below as an
+            // is_error tool_result the model relays, so the owner hears WHY in the
+            // reply. This frame is the operator's structured copy of the same event.
             crate::telemetry::emit(
                 "system",
                 "egress.refused",
@@ -7685,6 +7692,9 @@ async fn execute_tool_bound(
         let (customs_on, trim) = boundary::gate_and_trim();
         if customs_withholds_recall(customs_on, trim, name, cloud_bound) {
             warn!(tool = name, trim = trim.as_str(), "CUSTOMS: refusing a recall that a trim withholds");
+            // PIXEL-FREE(diagnostic): the "withheld by the CUSTOMS egress policy"
+            // sentence returned below is the surface — the owner set this trim, and
+            // the answer tells them which category it withheld this turn.
             crate::telemetry::emit(
                 "system",
                 "egress.refused",
@@ -14144,6 +14154,13 @@ async fn sage_read_capped(resp: reqwest::Response) -> Result<String> {
 /// the honest degrade. The URL is not logged (it can carry a path); the reason is.
 fn sage_fetch_refusal(reason: &'static str) -> anyhow::Error {
     warn!(reason, "sage: refusing to fetch a research source");
+    // PIXEL-FREE(diagnostic), AND UNLIKE ITS THREE SIBLINGS THIS ONE IS NOT
+    // RELAYED: `research.rs`'s fetch loop skips a failed source (`Err(_) =>
+    // continue`), so the owner sees a report that simply does not cite it. That is
+    // still the right silence — the refused source is one the SEARCH ENGINE
+    // returned, not one the owner named, and the guard declining to fetch a
+    // LAN/loopback/plaintext page is the SSRF boundary doing its job on a URL the
+    // owner never saw. There is no decision here for them to make.
     crate::telemetry::emit("system", "egress.refused", json!({"tool": "sage_research", "reason": reason}));
     anyhow!("refused to fetch this source: {reason}")
 }

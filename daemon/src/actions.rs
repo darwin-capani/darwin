@@ -904,8 +904,10 @@ async fn direct_system_snapshot() -> telemetry::SystemSnapshot {
     }
 }
 
-/// Phrase a snapshot as the verified data string handed to the LLM.
-fn format_system_status(s: &telemetry::SystemSnapshot) -> String {
+/// Phrase a snapshot as the verified data string handed to the LLM. `pub(crate)`
+/// so the classifier-taxonomy test in `router` can hold the system.query
+/// write-up to the fields this actually emits, without a live sysinfo read.
+pub(crate) fn format_system_status(s: &telemetry::SystemSnapshot) -> String {
     const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
     let cpu = s.cpu_percent;
     let mem_used = s.mem_used_bytes as f64 / GIB;

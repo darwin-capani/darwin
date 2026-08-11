@@ -265,23 +265,47 @@ impl Index {
     /// model, no I/O. Applies NO threshold — the caller chooses one, which is
     /// what the measurement below sweeps.
     pub fn nearest(&self, text: &str) -> Option<Offer> {
+        self.nearest_counted(text).0
+    }
+
+    /// [`Index::nearest`], plus the WORK the scan actually did, so the cost test
+    /// can state a budget with no clock in it. One unit per INDEX-TOKEN PROBE: a
+    /// `contains` against the utterance's token set, or a `spread` weight lookup.
+    /// The units are incremented inside the loops, off their real trip counts,
+    /// never from a formula about them — a scan that grew a second pass over the
+    /// cues, or an index that doubled in size, doubles this number.
+    ///
+    /// The accumulations below are written as explicit loops rather than
+    /// `.filter().map().sum()` only so the probes can be counted where they
+    /// happen. `Iterator::sum` for `f64` folds left-to-right from `0.0` over the
+    /// same `BTreeSet` order, so every score is bit-identical to the chain it
+    /// replaced — which matters, because the NO-GO frontier above is asserted on
+    /// those scores.
+    fn nearest_counted(&self, text: &str) -> (Option<Offer>, usize) {
         let ut = tokens(text);
         if ut.is_empty() {
-            return None;
+            return (None, 0);
         }
+        let mut work = ut.len();
         let ut_mass: f64 = ut.iter().map(|t| self.weight(t)).sum();
         let mut best: Option<Offer> = None;
         for c in &self.cues {
-            let inter: f64 = c
-                .toks
-                .iter()
-                .filter(|t| ut.contains(*t))
-                .map(|t| self.weight(t))
-                .sum();
+            let mut inter: f64 = 0.0;
+            for t in &c.toks {
+                work += 1;
+                if ut.contains(t) {
+                    work += 1;
+                    inter += self.weight(t);
+                }
+            }
             if inter <= 0.0 {
                 continue;
             }
-            let cue_mass: f64 = c.toks.iter().map(|t| self.weight(t)).sum();
+            let mut cue_mass: f64 = 0.0;
+            for t in &c.toks {
+                work += 1;
+                cue_mass += self.weight(t);
+            }
             let denom = cue_mass + ut_mass;
             if denom <= 0.0 {
                 continue;
@@ -295,7 +319,7 @@ impl Index {
                 });
             }
         }
-        best
+        (best, work)
     }
 }
 
@@ -586,35 +610,137 @@ mod tests {
     }
 
     /// COST, so "cheap and on-device" is a number rather than a claim. The whole
-    /// 534-phrase scan is pure string work; this bounds it well under a single
-    /// audio frame so the NO-GO above is about ACCURACY, never about speed.
+    /// 534-phrase scan is pure string work; this bounds it so the NO-GO above is
+    /// about ACCURACY, never about speed.
+    ///
+    /// THIS USED TO BE A WALL-CLOCK ASSERTION AND IT WAS A BAD GATE. It timed the
+    /// scan and required `per < 5000µs`. On an idle machine the scan costs 645µs,
+    /// so it looked like 7.8x of headroom — and it still went RED at 5770µs, on a
+    /// file byte-identical to HEAD, because several agents were building at once.
+    /// RE-MEASURED HERE rather than taken on faith: the same scan on the same
+    /// binary costs 645µs idle, 1444µs under 16 spinners and 4662µs under 48
+    /// spinners on a 10-core machine — a 7.2x swing driven entirely by who else
+    /// is running. No fixed µs budget both survives that and still means anything,
+    /// and a gate that goes red for a reason that is not the code teaches everyone
+    /// to re-run it until it is green.
+    ///
+    /// So the budget is two numbers that do not move with the machine's load:
+    ///
+    /// 1. WORK, with no clock in it at all — index-token probes per utterance,
+    ///    counted inside [`Index::nearest_counted`]'s own loops. Deterministic
+    ///    given the fixture: identical on an idle laptop and a thrashing one.
+    /// 2. A RATIO against a baseline THIS TEST MEASURES IN THE SAME RUN — the
+    ///    routing pass (`recall_probe::all_hits`) that already runs on every
+    ///    utterance anyway. Contention inflates both phases together, so the
+    ///    ratio holds where the absolute number does not: MEASURED over six runs
+    ///    at three load levels it stays in 1.62..1.91 while the absolute cost it
+    ///    is computed from moves 645µs -> 4662µs, a 7.2x swing. The bound is 3.0,
+    ///    57% above the worst ratio any of those runs produced.
     #[test]
     fn the_did_you_mean_scan_is_cheap_enough_to_ship() {
         let idx = Index::build();
         let corpus = ordinary();
-        assert!(corpus.len() >= 150, "corpus too small to time");
-        // Warm the allocator/branch predictors so the measured pass is steady.
+        assert!(corpus.len() >= 150, "corpus too small to measure");
+
+        // ---- 1. WORK PER UTTERANCE. No clock, no load sensitivity. ----
+        let mut total_work = 0usize;
+        let mut worst: (usize, &str) = (0, "");
+        for t in &corpus {
+            let (_, w) = idx.nearest_counted(t);
+            total_work += w;
+            if w > worst.0 {
+                worst = (w, t.as_str());
+            }
+        }
+        let work_per = total_work / corpus.len();
+        eprintln!(
+            "\n=== MISS-OFFER SCAN WORK: {work_per} index-token probes per utterance \
+             over {} indexed phrases (worst {} on {:?}) ===",
+            idx.len(),
+            worst.0,
+            worst.1
+        );
+        // PRECONDITION, or the budget below passes vacuously on a counter stuck at
+        // zero: the intersection pass probes every token of every cue, so the work
+        // can never be less than one probe per indexed phrase.
+        assert!(
+            work_per >= idx.len(),
+            "the work counter reports {work_per} probes for {} indexed phrases — it \
+             is not counting the scan it claims to count",
+            idx.len()
+        );
+        // MEASURED at this revision: 2_726 probes per utterance on average, worst
+        // single utterance 3_439. The budget is 4_000 — 1.47x the mean, so the
+        // index may grow by nearly half before anyone has to think about it, and
+        // far below the ~5_452 that a second pass over the cues, or an index of
+        // twice the size, would cost. Unlike the µs budget it replaces, this
+        // number is IDENTICAL on an idle machine and a thrashing one; the only
+        // thing that moves it is the fixture, which is a reviewable change.
+        //
+        // IT TRACKS THE ORDINARY CORPUS TOO, which is easy to miss because the
+        // budget is stated per utterance: `work_per` is a MEAN over
+        // `router_ordinary.json`, so adding sentences moves it. It read 2_723 at
+        // 476 sentences and 2_726 at 488 — re-derive it, do not nudge it.
+        assert!(
+            work_per <= 4_000,
+            "the capability scan now costs {work_per} index-token probes per \
+             utterance over {} phrases (budget 4_000, was 2_726 when measured) — \
+             it has grown a pass or the index has grown by half; re-derive the \
+             cost before shipping it on every turn",
+            idx.len()
+        );
+
+        // ---- 2. TIME, AS A RATIO AGAINST A SAME-RUN BASELINE. ----
+        // The baseline is production work that already runs on EVERY utterance, so
+        // "the suggester costs N routing passes" is the honest statement of what it
+        // would add. Both phases are min-of-3 and interleaved, so a load ramp
+        // during the test hits them alike.
         for t in &corpus {
             let _ = idx.nearest(t);
+            let _ = recall_probe::all_hits(t);
         }
-        let start = Instant::now();
-        let rounds = 5u32;
-        for _ in 0..rounds {
+        let mut scan = f64::MAX;
+        let mut route = f64::MAX;
+        for _ in 0..3 {
+            let t0 = Instant::now();
             for t in &corpus {
                 let _ = idx.nearest(t);
             }
+            scan = scan.min(t0.elapsed().as_secs_f64());
+            let t1 = Instant::now();
+            for t in &corpus {
+                let _ = recall_probe::all_hits(t);
+            }
+            route = route.min(t1.elapsed().as_secs_f64());
         }
-        let total = start.elapsed();
-        let per = total / (rounds * corpus.len() as u32);
+        let ratio = scan / route;
         eprintln!(
-            "\n=== MISS-OFFER SCAN COST: {:?} per utterance over {} indexed phrases ===",
-            per,
-            idx.len()
+            "=== MISS-OFFER SCAN COST: {:.0}µs per utterance = {ratio:.2}x the \
+             routing pass ({:.0}µs) measured in the same run ===",
+            scan * 1e6 / corpus.len() as f64,
+            route * 1e6 / corpus.len() as f64
         );
+        // PRECONDITION: a baseline that measured nothing would make any ratio pass.
         assert!(
-            per.as_micros() < 5_000,
-            "the capability scan costs {per:?} per utterance — no longer negligible \
-             beside the ~1-2s STT+route+converse turn it would ride"
+            route > 0.0 && scan > 0.0,
+            "one of the two phases took no measurable time — the ratio below means \
+             nothing (scan {scan:?}s, route {route:?}s)"
+        );
+        // 3.0 against a worst observed 1.91 is 57% headroom on the noisiest run
+        // measured, and still refuses a scan that got 1.6x slower — TIGHTER than
+        // the 7.8x the deleted wall-clock budget allowed.
+        //
+        // THE ONE WAY THIS CAN FAIL WITHOUT THE SCAN CHANGING: the baseline gets
+        // FASTER. That is a router optimisation, not machine noise — a visible,
+        // deliberate event, and the message says to check it.
+        assert!(
+            ratio <= 3.0,
+            "the capability scan costs {ratio:.2}x the routing pass it would ride \
+             beside — either the scan got slower, or `recall_probe::all_hits` got \
+             much faster and this ratio needs re-deriving. Absolute cost this run: \
+             {:.0}µs scan, {:.0}µs route, per utterance.",
+            scan * 1e6 / corpus.len() as f64,
+            route * 1e6 / corpus.len() as f64
         );
     }
 }

@@ -15,8 +15,8 @@
  *               or the next person reading audio.rs cannot know the silence was
  *               chosen. The test enforces both directions of that.
  *   untriaged   Enumerated, not yet decided. NO `why`: an entry here is an
- *               inventory line, and inventing a rationale for 103 of them is
- *               exactly how the previous list rotted. `UNTRIAGED` below is the
+ *               inventory line, and inventing a rationale for a hundred of them
+ *               in one sitting is exactly how the previous list rotted. `UNTRIAGED` below is the
  *               scoreboard and the test pins it to the measured count, so this
  *               number can only be moved deliberately — and it should only ever
  *               go DOWN.
@@ -40,7 +40,7 @@ export interface LedgerEntry {
  * It is pinned to the measured count, so a new pixel-free emit cannot be parked
  * in the backlog without editing it — which is a visible, arguable act in review.
  */
-export const UNTRIAGED = 103;
+export const UNTRIAGED = 94;
 
 /**
  * THE OTHER SILENCE — topics that DO have an `applyEnvelope` case, whose case is
@@ -105,7 +105,12 @@ export const PIXEL_FREE: Record<string, LedgerEntry> = {
       "Capture DIED mid-run, which deliberately drops the sender and ends main for a launchd restart. The HUD's real signal is the socket closing a moment later; this frame is the reason, on the live stream.",
   },
   "audio.sound": { bucket: "untriaged", sites: "router.rs:8470" },
-  "audit.anchor": { bucket: "untriaged", sites: "audit.rs:860" },
+  "audit.anchor": {
+    bucket: "diagnostic",
+    sites: "audit.rs:860",
+    why:
+      "Fires ONCE at startup, before any HUD has connected, and is not a sticky announce - a reducer case for it would render nothing in the deployed configuration. The verdict is cached and folded onto audit.snapshot under `anchor`, which the AuditPanel draws as its EXTERNAL ANCHOR row; that is the pixel. This frame is the operator's full copy.",
+  },
   "babel.interpret": { bucket: "untriaged", sites: "anthropic.rs:9588" },
   "barge_in": {
     bucket: "diagnostic",
@@ -114,17 +119,37 @@ export const PIXEL_FREE: Record<string, LedgerEntry> = {
       "The barge itself is already a pixel - the reply is cut and the core state leaves speaking. This frame carries only the triggering rms, for tuning the detector. A toast per barge-in would fire on ordinary interruption.",
   },
   "calibrate.report": { bucket: "untriaged", sites: "calibrate.rs:526" },
-  "command.auth_failed": { bucket: "untriaged", sites: "command.rs:859" },
+  "command.auth_failed": {
+    bucket: "diagnostic",
+    sites: "command.rs:859",
+    why:
+      "The command socket is 0600 inside a 0700 dir and the token sits in a 0600 file in that same dir, so any principal that can reach the socket could have read the token and passed. A failure is a stale/broken client, not a crossed boundary - and not the HUD, which re-reads the token per round-trip.",
+  },
   "command.channel_up": { bucket: "untriaged", sites: "main.rs:3150" },
-  "command.denied": { bucket: "untriaged", sites: "command.rs:839 command.rs:846 command.rs:872" },
+  "command.denied": {
+    bucket: "diagnostic",
+    sites: "command.rs:839 command.rs:846 command.rs:872",
+    why:
+      "unknown_command and oversized fire PRE-AUTH, and the first carries the caller's raw `cmd` string bounded only by the 8 KiB line cap - rendering it would give an unauthenticated local client a writable line in the owner's HUD. rate_limited is post-auth and the caller is already told. Every arm refused something and there is no owner decision in it.",
+  },
   "daemon.ready": { bucket: "untriaged", sites: "main.rs:3450" },
   "design_voice.created": { bucket: "untriaged", sites: "main.rs:5692" },
   "design_voice.failed": { bucket: "untriaged", sites: "main.rs:5697" },
   "design_voice.no_key": { bucket: "untriaged", sites: "main.rs:5675" },
   "dls.status": { bucket: "untriaged", sites: "main.rs:3006" },
   "egress.beacon": { bucket: "untriaged", sites: "egress_beacon.rs:675" },
-  "egress.newhost": { bucket: "untriaged", sites: "egress_beacon.rs:649" },
-  "egress.refused": { bucket: "untriaged", sites: "anthropic.rs:7219 anthropic.rs:7654 anthropic.rs:7688 anthropic.rs:14147" },
+  "egress.newhost": {
+    bucket: "diagnostic",
+    sites: "egress_beacon.rs:649",
+    why:
+      "MARKED, NOT ENDORSED. run_task's baseline is in-memory and never loaded from disk, so the first tick after every restart calls the owner's ordinary traffic first-seen and the global debounce lets exactly one arbitrary talker through. Per boot, this alert is a false positive by construction. Drawing it would train the owner to dismiss the row. Wire it when the baseline survives a restart.",
+  },
+  "egress.refused": {
+    bucket: "diagnostic",
+    sites: "anthropic.rs:7219 anthropic.rs:7654 anthropic.rs:7688 anthropic.rs:14147",
+    why:
+      "Three of the four sites RETURN the refusal as the tool result the model relays, so the owner is told in the answer, in the turn it happened. The fourth (sage_research) is not relayed - research.rs skips a failed source - and that silence is still right: the refused URL came from a search engine, not from the owner, and the SSRF guard declining it is not their decision.",
+  },
   "enclave.status": { bucket: "untriaged", sites: "main.rs:2958" },
   "envlock.build_refused": { bucket: "untriaged", sites: "envlock.rs:641" },
   "envlock.built": { bucket: "untriaged", sites: "envlock.rs:673" },
@@ -200,10 +225,30 @@ export const PIXEL_FREE: Record<string, LedgerEntry> = {
   "runbook.status": { bucket: "untriaged", sites: "main.rs:2900" },
   "screen_context.loop_armed": { bucket: "untriaged", sites: "main.rs:3582" },
   "screen_context.loop_started": { bucket: "untriaged", sites: "main.rs:3567" },
-  "security.exposure": { bucket: "untriaged", sites: "exposure.rs:419 exposure.rs:424" },
-  "security.interception": { bucket: "untriaged", sites: "interception.rs:889" },
-  "security.persistence": { bucket: "untriaged", sites: "persistence.rs:1275" },
-  "security.triage": { bucket: "untriaged", sites: "triage.rs:701" },
+  "security.exposure": {
+    bucket: "diagnostic",
+    sites: "exposure.rs:419 exposure.rs:424",
+    why:
+      "The owner's half is the one-line summary the same tick caches, which posture::scanner_notes folds onto posture.snapshot and the PostureDashboardPanel draws under AMBIENT SCANNERS. What stays here is the per-socket table - an inventory, not a decision. The error arm reports a failed netstat read without clobbering the last honest summary.",
+  },
+  "security.interception": {
+    bucket: "diagnostic",
+    sites: "interception.rs:889",
+    why:
+      "Same fold as its two scanner siblings: the cached one-liner rides posture.snapshot into the PostureDashboardPanel's AMBIENT SCANNERS block, which is how a rogue trusted root CA reaches a person without being asked for. This frame is the full per-surface finding table for the operator's stream.",
+  },
+  "security.persistence": {
+    bucket: "diagnostic",
+    sites: "persistence.rs:1275",
+    why:
+      "Same fold as its two scanner siblings: the cached one-liner rides posture.snapshot into the AMBIENT SCANNERS block, so a new or unsigned autostart item reaches the owner unasked. This frame is the full per-surface inventory plus the skip list, for the operator's stream.",
+  },
+  "security.triage": {
+    bucket: "diagnostic",
+    sites: "triage.rs:701",
+    why:
+      "capture is USER-INVOKED and its TriageSummary is rendered straight back to the caller by anthropic::render_triage_summary - the owner asked and already has the answer in the reply. A HUD copy would echo a question they just asked. This frame records where the bundle landed.",
+  },
   "selector.clarify": { bucket: "untriaged", sites: "router.rs:1397" },
   "selector.mode": { bucket: "untriaged", sites: "router.rs:1409" },
   "selector.standing_proposed": { bucket: "untriaged", sites: "router.rs:2744" },

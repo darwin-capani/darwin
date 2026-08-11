@@ -545,8 +545,23 @@ mod tests {
 
         // An absolute path OUTSIDE the root is REJECTED (authorization-bound: never
         // an arbitrary recording elsewhere on the disk).
-        let outside = std::env::temp_dir().join("someone-elses-voice.wav");
+        //
+        // PID-SCOPED, and it was not: this was the one temp path in the daemon
+        // suite with a FIXED name. `confine_sample` rejects a path that does not
+        // EXIST as well as one outside the root (the last case below is exactly
+        // that), so two suite runs at once — the normal state of this repo — could
+        // have the other run's cleanup delete this file between the write and the
+        // call, and the assertion would then pass for the wrong reason and prove
+        // nothing about confinement. Never a red, which is why it could sit here.
+        // The precondition makes the vacuous pass impossible either way.
+        let outside = std::env::temp_dir()
+            .join(format!("someone-elses-voice-{}.wav", std::process::id()));
         std::fs::write(&outside, b"RIFFstub").unwrap();
+        assert!(
+            outside.exists(),
+            "precondition: the outside file must EXIST, or `confine_sample` would \
+             reject it for being absent and say nothing about the root boundary"
+        );
         assert!(
             confine_sample(&root, &outside).is_none(),
             "a path outside the root must be rejected"

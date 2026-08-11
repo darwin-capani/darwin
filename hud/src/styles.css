@@ -5746,6 +5746,30 @@ svg.tri circle {
 .audit-chain-label { font-weight: 600; letter-spacing: 0.06em; font-size: 0.8em; }
 .audit-chain-detail { font-size: 0.74em; }
 
+/* EXTERNAL ANCHOR — the Keychain-witness row, deliberately identical in form to
+   .audit-chain above it. The two verdicts answer different questions (the local
+   chain re-derived from disk vs. an out-of-band witness) and are allowed to
+   disagree; giving the second one a lesser weight would bury the only signal that
+   survives a whole-chain rewrite. */
+.audit-anchor {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 5px 8px;
+  border: 1px solid currentColor;
+  border-radius: 4px;
+}
+.audit-anchor.ok { color: var(--learn-green); }
+.audit-anchor.broken { color: var(--alert-red); }
+.audit-anchor.awaiting { color: var(--ice-dim); }
+.audit-anchor-note {
+  color: var(--alert-red);
+  font-size: 0.74em;
+  line-height: 1.4;
+  padding: 0 8px;
+}
+
 .audit-timeline { display: flex; flex-direction: column; gap: 4px; }
 .audit-empty { padding: 4px 2px; line-height: 1.4; }
 .audit-row {

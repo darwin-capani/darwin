@@ -646,6 +646,18 @@ pub async fn run_task(cfg: std::sync::Arc<crate::config::Config>) {
                     let proposal =
                         render_block_proposal(&o.process, &o.host, o.port, "first-seen outbound talker");
                     info!(process = %o.process, host = %o.host, "egress: new outbound talker");
+                    // THE REASON THIS IS SILENT IS A DEFECT, NOT A PREFERENCE. The
+                    // baseline this diff is taken against is `BaselineStore::new(..)`
+                    // a few lines up in THIS function — in-memory, never loaded from
+                    // disk — so the first tick after every daemon start sees an EMPTY
+                    // `known` set and calls the owner's entirely ordinary traffic
+                    // first-seen (test: a_cold_baseline_calls_every_ordinary_talker_
+                    // first_seen). The global debounce then lets exactly ONE of that
+                    // cohort through and swallows the rest, which are baselined by
+                    // the next tick. Per boot, this alert is one arbitrary ordinary
+                    // talker. PIXEL-FREE(diagnostic): drawing that would teach the
+                    // owner to dismiss the row before the day a real one appears.
+                    // Wire it when the baseline survives a restart, not before.
                     crate::telemetry::emit("egress", "egress.newhost", newhost_frame(o, &proposal));
                     ledger.record(&key, now);
                 }
@@ -726,6 +738,53 @@ mod tests {
     }
 
     // ---- Classifier 1: new-host baseline diff ----
+
+    /// THE COLD-START PROPERTY, MEASURED — the reason `egress.newhost` is marked
+    /// diagnostic at its emit site rather than drawn.
+    ///
+    /// `run_task` builds its baseline with `BaselineStore::new(...)` and never
+    /// loads one from disk, so the store a fresh daemon diffs against is EMPTY.
+    /// Against an empty baseline every ordinary talker on the machine — the
+    /// browser, the mail client, the update daemon — is "a first-seen outbound
+    /// talker", each one carrying a rendered pfctl block proposal. That is not a
+    /// finding; it is an inventory wearing a finding's clothes, and it recurs at
+    /// every restart. If persistence ever lands, this test is where to come back:
+    /// a baseline that survives a boot is what makes the alert worth a pixel.
+    #[test]
+    fn a_cold_baseline_calls_every_ordinary_talker_first_seen() {
+        let cold = BaselineStore::new(RetentionPolicy {
+            max_talkers: 2048,
+            max_samples_per_talker: 64,
+            retention_secs: 24 * 60 * 60,
+        });
+        assert!(
+            cold.known_host_pairs().is_empty(),
+            "a freshly constructed store must have no baseline — that IS the defect"
+        );
+
+        // A perfectly ordinary desktop sample: nothing here is suspicious.
+        let ordinary = vec![
+            obs("Google Chrome", "142.250.72.14", 443, 100),
+            obs("Mail", "17.42.251.7", 993, 100),
+            obs("softwareupdated", "17.253.55.202", 443, 100),
+        ];
+        let flagged = diff_new_hosts(&ordinary, &cold.known_host_pairs());
+        assert_eq!(
+            flagged.len(),
+            ordinary.len(),
+            "every ordinary talker is 'first-seen' against a cold baseline: {flagged:?}"
+        );
+
+        // …and once the same sample has been ingested, the very same traffic is
+        // silent. The alert is therefore a function of daemon uptime, not of the
+        // network — which is exactly what an owner-facing alarm must not be.
+        let mut warm = cold;
+        warm.ingest_sample(&ordinary, 100);
+        assert!(
+            diff_new_hosts(&ordinary, &warm.known_host_pairs()).is_empty(),
+            "identical traffic must be silent once baselined"
+        );
+    }
 
     #[test]
     fn new_host_diff_flags_only_unknown_pairs_once() {
