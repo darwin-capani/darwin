@@ -483,35 +483,67 @@ mod tests {
     /// that WRITES A GRAVITY VECTOR or SPAWNS A BODY is an owner judgement, not an
     /// agent's, so it is recorded here rather than taken.
     ///
-    /// WHAT REMAINS IS GENIMAGE, AND IT IS NOT A VOCABULARY PROBLEM.
+    /// THE GENIMAGE PERSON CLASS IS NOW CLOSED, AND NOT BY A SUBJECT LIST.
     /// A request to DARWIN is an IMPERATIVE; present-tense narration reuses the
     /// SAME base verb form in the SAME verb-object shape, so "draw a picture of X"
     /// and "we draw a picture of X every christmas" are lexically identical up to
     /// the subject. Rule 2 in `image_noun_is_commanded` already drops the inflected
     /// forms (drew / draws / painted / created), which is why only 1st/2nd-person
-    /// and plural narration survives — exactly these.
+    /// and plural narration survived — the four sentences that used to sit here.
     ///
-    /// A subject-pronoun rule ("we"/"you"/"they"/"I" immediately before the verb,
-    /// absent subject-auxiliary inversion) would close all three. IT WAS MEASURED
-    /// AND NOT TAKEN: it closes the PRONOUN class and leaves the equally ordinary
-    /// PLURAL-NOUN class wide open — "the kids draw a picture of the dog every
-    /// week" and "they make art with recycled bottles at the co-op" still fire, as
-    /// does "i paint a picture of the coast every summer" if the pronoun list is
-    /// bounded any tighter. Closing three named sentences while an identical
-    /// sentence one noun away still renders an image would make this ratchet read
-    /// CLOSED while the hole stays open — the "right and misleading" shape this
-    /// campaign keeps finding. Separating them needs a POS tagger (or the
-    /// classifier reporting its own near-miss), not another list. Left visible on
-    /// purpose.
+    /// A subject-pronoun rule was measured first AND NOT TAKEN: it closes the
+    /// PRONOUN class and leaves the equally ordinary PLURAL-NOUN class wide open
+    /// ("the kids draw a picture of the dog every week" still fired) — closing
+    /// named sentences while an identical sentence one noun away still renders
+    /// would have made this ratchet read CLOSED while the hole stayed open.
+    /// Subjects are an OPEN class, so no subject list can close them. What IS
+    /// closed is the complement: everything a request legitimately puts in front
+    /// of its verb. Rule 4 (`image_verb_in_command_position`) requires the verb to
+    /// open its clause modulo a closed set of non-referential lead-ins (politeness
+    /// / discourse / the vocative "darwin") plus one optional request frame
+    /// ("can/could/would/will you", "i want/need you to", "i'd like you to",
+    /// "let's", "help me", "go ahead"), with sentence punctuation resetting the
+    /// clause so "instead of a photo, make a drawing of the house" keeps working.
+    /// DENY BY DEFAULT, so it fails toward a missed request (rephraseable) and
+    /// never toward rendering on narration. MEASURED on 17 narration shapes
+    /// (pronoun subjects, plural-noun subjects, bare-plural subjects, fronted
+    /// adverbials, vocative-then-subject, subject-first auxiliaries, negated
+    /// imperatives): 17/17 fire at the pre-fix HEAD, 0/17 after — all are now in
+    /// `router_ordinary.json`. 16 request shapes with pre-verb material (vocative,
+    /// politeness chains, aux inversion, embedded requests, hortatives) all still
+    /// fire and are now `router_recall.json` genimage probes.
+    ///
+    /// THE MEASURED COST, so it is not rediscovered as a bug: of 17 constructed
+    /// request phrasings whose pre-verb material falls OUTSIDE the closed set,
+    /// 14 no longer fire — fronted adjuncts and clauses without a comma ("when
+    /// you get a chance draw me a picture of the harbour", "after lunch make me
+    /// a picture of a robot", "tomorrow draw me a picture of the sunrise"),
+    /// imperatives conjoined to another command ("open the canvas and draw a
+    /// picture of a fox"), negative-question requests ("why don't you draw me a
+    /// picture of the garden", "won't you paint a picture of the old house") and
+    /// suggestions ("you should draw a picture of the harbour"). The comma'd
+    /// spellings of the first class still fire ("when you get a chance, draw
+    /// ..."), so the loss is confined to punctuation-free transcripts of fringe
+    /// shapes. Naming the noun imperatively always works. A POS tagger would buy
+    /// exactly these 14 back — that is what remains of the tagger requirement,
+    /// down from the whole person class.
     const KNOWN_OPEN_HIJACKS: &[&str] = &[
-        "we make art with the kids on saturdays",
-        "you cannot paint a picture with only one color",
-        "we draw a picture of the family every christmas",
-        // NOT one of the original seven — measured by the same enumeration and
-        // added here rather than left unstated, because it is the class the
-        // pronoun rule above would NOT have closed. The list is honest about its
-        // own breadth or it is not a ratchet.
-        "the kids draw a picture of the dog every week",
+        // WHAT REMAINS OPEN after rule 4, stated so the list keeps its breadth:
+        // clause punctuation resets command position (that is what keeps the
+        // fronted-adjunct request "instead of a photo, make a drawing of the
+        // house" alive), so narration whose comma lands DIRECTLY before a
+        // coordinated base-form verb still renders — a comma-fronted VP list.
+        // The comma is one SPELLING of the residual, not its extent: any clause
+        // punctuation fronts the VP the same way ("here's our sunday routine:
+        // draw pictures of the dog, drink cocoa" renders via the colon —
+        // measured at this revision). One representative sits below; read the
+        // class as punctuation-fronted, not comma-fronted.
+        // Distinguishing "..., draw pictures of the dog and drink cocoa" (a
+        // narrated list) from "..., draw me a picture of a fox" (a request after
+        // a vocative or an adjunct) needs a POS tagger or the classifier
+        // reporting its own near-miss; every cheaper cut was measured to break
+        // one side or the other. MEASURED still firing at this revision.
+        "on sundays we sit down, draw pictures of the dog and drink cocoa",
     ];
 
     /// THE HARNESS CLOCK IS PINNED, AND IT HAS TO BE.
@@ -705,10 +737,11 @@ mod tests {
              consults these gates when the cloud answers): {pre_h}/{pre_t} \
              probes = {:.1}% of the fixture — {:?}. A hoist of the four \
              non-capture gates was measured and REFUSED (see the block above \
-             `needs_deep_reasoning` in router.rs): five of the six branches that \
-             blocked it are now closed, ONE (genimage's grammatical-person hole) \
-             is not, and the other four gates each actuate a CAPTURE, which is an \
-             owner consent decision",
+             `needs_deep_reasoning` in router.rs): all six branches that blocked \
+             it are now closed (genimage's grammatical-person hole was the last, \
+             via the command-position rule), but taking the hoist is a routing \
+             POSTURE change and stays an owner decision — as do the other four \
+             gates, which each actuate a CAPTURE",
             pre_t as f64 / total as f64 * 100.0,
             CLOUD_PREEMPTED,
         );
@@ -832,7 +865,15 @@ mod tests {
         // Raise this ONLY with a fresh measurement. Lowering it for any reason
         // other than a label correction of this kind is the regression this test
         // exists to catch.
-        const FLOOR_HIT: usize = 191;
+        //
+        // 191 -> 206 (2026-08-11): the genimage person-class close added 15
+        // genimage probes with pre-verb material (vocatives, politeness chains,
+        // aux-inversion, embedded requests, hortatives) — the request side of the
+        // command-position rule's boundary, so a later "simplification" of that
+        // rule that eats them goes red here. All 15 measured as hits when added;
+        // every prior probe's outcome is unchanged (202 -> 217 total, misses
+        // stayed the same 11).
+        const FLOOR_HIT: usize = 206;
         assert!(
             hit >= FLOOR_HIT,
             "router recall regressed: {hit}/{total} < {FLOOR_HIT}"

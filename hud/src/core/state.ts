@@ -181,6 +181,9 @@ import {
   parseTccSnapshot,
   parseTccAnomalies,
   TCC_ANOMALY_CAP,
+  parseEgressBeacon,
+  EGRESS_BEACON_CAP,
+  type EgressBeaconAlert,
   parseIntrospectSnapshot,
   parsePasteboardStatus,
   parseApertureStatus,
@@ -798,6 +801,11 @@ export interface HudState {
   /** Accumulated TCC anomaly alerts (tcc.anomaly): new grants / denied→allowed
    *  escalations, newest-first, deduped + capped. REVIEW-ONLY. */
   tccAnomalies: string[];
+  /** Accumulated suspected-beacon alerts (egress.beacon): a process contacting
+   *  one host on a metronome-regular interval, newest-first, one row per talker
+   *  (a re-alert refreshes its row), capped. PROPOSE-ONLY: each row carries the
+   *  rendered pf rule as TEXT — DARWIN never applies it. */
+  egressBeacons: EgressBeaconAlert[];
   /** The micro-app introspection tally (introspect.snapshot): sandboxed apps
    *  observed + profile-drift + resource-anomaly counts. Null until the sentinel
    *  emits its first tick. REVIEW-ONLY and SECRET-FREE. */
@@ -1622,6 +1630,7 @@ export function initialState(): HudState {
     capabilityAtlas: null,
     tccSentinel: null,
     tccAnomalies: [],
+    egressBeacons: [],
     introspect: null,
     introspectAlerts: [],
     introspectCapabilities: [],
@@ -2859,6 +2868,22 @@ function applyEnvelope(state: HudState, env: TelemetryEnvelope, at: number): Hud
         .filter((x, i, a) => a.indexOf(x) === i)
         .slice(0, TCC_ANOMALY_CAP);
       return { ...s, tccAnomalies: merged };
+    }
+
+    case "egress.beacon": {
+      // A suspected C2-style beacon from the longitudinal egress sentinel
+      // (egress_beacon.rs): >= 6 rising edges on a tight (CV <= 0.15) regular
+      // interval — real signal, not a cold-start artifact (the newhost topic
+      // stays diagnostic for exactly that churn reason; see pixelFreeLedger).
+      // ONE ROW PER TALKER: the daemon re-alerts the same key after its 6h
+      // cooldown with fresh period/samples, so refresh that row in place
+      // instead of stacking near-duplicates. Newest-first, capped. PROPOSE-
+      // ONLY: the pf rule rides the row as TEXT for the owner to apply
+      // themselves; nothing here (or anywhere) applies it.
+      const alert = parseEgressBeacon(env.data);
+      if (alert === null) return s;
+      const rest = s.egressBeacons.filter((b) => b.key !== alert.key);
+      return { ...s, egressBeacons: [alert, ...rest].slice(0, EGRESS_BEACON_CAP) };
     }
 
     case "introspect.snapshot": {

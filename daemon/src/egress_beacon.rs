@@ -43,11 +43,15 @@
 //!     instant. It is an advisory signal, not a packet-level IDS.
 
 use std::collections::{HashSet, VecDeque};
+use std::path::Path;
 use std::time::Duration;
 
+use anyhow::Result;
 use chrono::Timelike;
+use rusqlite::Connection;
 use serde_json::{json, Value};
-use tracing::{debug, info};
+use tokio::sync::Mutex;
+use tracing::{debug, info, warn};
 
 /// Rides every alert frame: the standing honesty note about UID-scoped
 /// attribution. Stated, not hidden.
@@ -63,6 +67,25 @@ pub const UID_CAVEAT: &str =
 /// beacon when it has at least `min_samples` timestamps, a mean inter-arrival
 /// within `[min_interval_secs, max_interval_secs]`, and a coefficient of
 /// variation (stddev/mean of the deltas) at or below `max_jitter_ratio`.
+///
+/// HONEST FLOOR (audited, not just configured): a rising edge needs an
+/// absent->present transition, so consecutive edges are at least TWO sample
+/// intervals apart — at the shipped 60s cadence nothing below a ~120s period is
+/// observable, whatever `min_interval_secs` says. And because edges are
+/// quantized to the sample grid, an off-grid period P records deltas on the two
+/// neighbouring grid multiples (the larger with fraction f = frac(P/60)), so the
+/// quantization CV is 60*sqrt(f*(1-f))/P — at most 30/P. Recomputed against the
+/// 0.15 ceiling (evasion needs f*(1-f) > 0.0225*(P/60)^2, cross-checked by a
+/// phase-swept simulation over 6/12/64-edge windows): only mid-grid periods in
+/// roughly 121–169s can evade; EVERY period from 180s — three sample intervals —
+/// up fires at any phase (the m=3 worst case is P=210s, CV=0.143), as do
+/// grid-aligned and near-grid periods below that. The detector's LIVE band at
+/// shipped config is therefore ~180s..max_interval_secs plus aligned shorter
+/// periods, with a quantization blind spot only in that ~121–169s mid-grid band.
+/// (An earlier pass wrote "~240s" for this bound; the arithmetic gives 180s.)
+/// Stated here because a threshold that reads "30s" and never fires below ~120s
+/// is exactly the kind of dead-looking band an audit should not have to
+/// rediscover.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BeaconThresholds {
     /// Minimum number of timestamps (→ `min_samples - 1` intervals) required
@@ -181,6 +204,13 @@ pub struct BaselineStore {
     talkers: Vec<TalkerRecord>,
     present: HashSet<TalkerKey>,
     retention: RetentionPolicy,
+    /// Latched TRUE the first time a NON-EMPTY sample is ingested (or when the
+    /// store is loaded from a non-empty persisted baseline). While false the
+    /// store is COLD: it has never observed anything, so a diff against it is
+    /// an inventory of everything currently talking, not a finding set — see
+    /// [`fold_and_diff`]'s silent seed. A latch (not `talkers.is_empty()`) so a
+    /// mid-run full prune does not quietly re-arm seeding semantics.
+    seeded: bool,
 }
 
 impl BaselineStore {
@@ -189,7 +219,15 @@ impl BaselineStore {
             talkers: Vec::new(),
             present: HashSet::new(),
             retention,
+            seeded: false,
         }
+    }
+
+    /// COLD = this store's lineage has never observed a non-empty sample: a
+    /// first-ever run, or the in-memory fallback when the durable baseline
+    /// could not be opened. Its first sample seeds silently.
+    pub fn is_cold(&self) -> bool {
+        !self.seeded
     }
 
     /// The set of `(process, host)` pairs the store has EVER recorded — the
@@ -218,6 +256,9 @@ impl BaselineStore {
     /// is a rising edge and stamps `now` onto its (possibly new) record. Then
     /// stale talkers are pruned and the distinct-talker cap enforced.
     pub fn ingest_sample(&mut self, obs: &[Observation], now: u64) {
+        if !obs.is_empty() {
+            self.seeded = true;
+        }
         let current: HashSet<TalkerKey> = obs
             .iter()
             .map(|o| TalkerKey {
@@ -302,6 +343,198 @@ impl BaselineStore {
             self.present.remove(key);
         }
     }
+
+    /// Rebuild a store from persisted rows — the boot path of a restart. The
+    /// retention BOUNDS are re-imposed on load (the config may have changed,
+    /// and a hand-edited/oversized file must not blow memory): per-talker edge
+    /// rings keep their NEWEST `max_samples_per_talker` timestamps, and if the
+    /// row count exceeds `max_talkers` the most-recently-seen rows win. A store
+    /// loaded from a NON-EMPTY baseline is not cold — that is the whole point:
+    /// a restart diffs against what the previous run knew instead of re-calling
+    /// the owner's ordinary traffic first-seen.
+    pub fn from_persisted(retention: RetentionPolicy, mut rows: Vec<PersistedTalker>) -> Self {
+        if rows.len() > retention.max_talkers.max(1) {
+            rows.sort_by_key(|r| std::cmp::Reverse(r.last_seen));
+            rows.truncate(retention.max_talkers.max(1));
+        }
+        let seeded = !rows.is_empty();
+        let mut present = HashSet::new();
+        let mut talkers = Vec::with_capacity(rows.len());
+        for row in rows {
+            let key = TalkerKey {
+                process: row.process,
+                host: row.host,
+                port: row.port,
+            };
+            let mut edges: Vec<u64> = row.edges;
+            edges.sort_unstable();
+            let cap = retention.max_samples_per_talker.max(1);
+            if edges.len() > cap {
+                edges.drain(..edges.len() - cap);
+            }
+            // `present` survives the restart so a connection that was OPEN when
+            // the previous run stopped, and is still open now, does NOT get a
+            // fabricated rising edge on the first post-restart sample. (A
+            // connection that really dropped and re-established during the
+            // downtime loses that one edge — a miss toward FEWER alerts.)
+            if row.present {
+                present.insert(key.clone());
+            }
+            talkers.push(TalkerRecord {
+                key,
+                last_seen: row.last_seen,
+                edges: edges.into(),
+            });
+        }
+        Self {
+            talkers,
+            present,
+            retention,
+            seeded,
+        }
+    }
+
+    /// Snapshot the store for persistence — the inverse of [`from_persisted`].
+    pub fn to_persisted(&self) -> Vec<PersistedTalker> {
+        self.talkers
+            .iter()
+            .map(|r| PersistedTalker {
+                process: r.key.process.clone(),
+                host: r.key.host.clone(),
+                port: r.key.port,
+                last_seen: r.last_seen,
+                present: self.present.contains(&r.key),
+                edges: r.edges.iter().copied().collect(),
+            })
+            .collect()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Durable baseline store — mirrors tcc.rs::TccBaseline / persistence.rs::
+// PersistenceBaseline (its OWN dedicated SQLite file under state/, plaintext or
+// SQLCipher via the same open/open_encrypted seam, async-Mutex serialized).
+// This is what makes `egress.newhost` a statement about the NETWORK instead of
+// a statement about daemon uptime: before it existed, run_task's baseline was
+// `BaselineStore::new(..)` — in-memory, empty at every boot — so the first tick
+// after every restart called the owner's entirely ordinary traffic first-seen.
+// ---------------------------------------------------------------------------
+
+/// One persisted talker row: the full longitudinal record (identity, last-seen,
+/// presence at last save, rising-edge ring), so a restart resumes the store
+/// where the previous run stopped. Secret-free: process names + bare host IPs +
+/// unix seconds, the same data the module already held in memory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PersistedTalker {
+    pub process: String,
+    pub host: String,
+    pub port: u16,
+    pub last_seen: u64,
+    pub present: bool,
+    pub edges: Vec<u64>,
+}
+
+/// The durable egress baseline (`state/egress_baseline.db`). BOUNDED by
+/// construction: it only ever holds `BaselineStore::to_persisted()`, which is
+/// capped at `max_talkers` rows of `max_samples_per_talker` edges each (the
+/// shipped config bounds the file to 2048 rows x 64 edges).
+pub struct EgressBaselineDb {
+    conn: Mutex<Connection>,
+}
+
+impl EgressBaselineDb {
+    /// Open (or create) the baseline DB PLAINTEXT (the default).
+    pub fn open(path: &Path) -> Result<Self> {
+        Self::init_conn(Connection::open(path)?)
+    }
+
+    /// Open (or create) the baseline DB ENCRYPTED (SQLCipher). `key` is applied
+    /// via `PRAGMA key` before any other statement — the same seam as AuditLog /
+    /// TccBaseline / PersistenceBaseline.
+    pub fn open_encrypted(path: &Path, key: &crate::crypto::SecretKey) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        crate::crypto::apply_key(&conn, key)?;
+        Self::init_conn(conn)
+    }
+
+    /// Shared pragmas + schema, run AFTER any `PRAGMA key`.
+    fn init_conn(conn: Connection) -> Result<Self> {
+        conn.busy_timeout(Duration::from_millis(250))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS egress_baseline(
+                process TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL,
+                last_seen INTEGER NOT NULL,
+                present INTEGER NOT NULL,
+                edges TEXT NOT NULL,
+                PRIMARY KEY(process, host, port)
+            );",
+        )?;
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
+    }
+
+    /// In-memory baseline for tests (no disk). Same schema.
+    #[cfg(test)]
+    fn in_memory() -> Result<Self> {
+        Self::init_conn(Connection::open_in_memory()?)
+    }
+
+    /// Load every persisted talker row. A row whose `edges` cell does not parse
+    /// (hand-edited, torn, or from a future schema) degrades to an EDGELESS
+    /// known talker rather than an error: the `(process, host)` pair still
+    /// counts toward the baseline — corruption fails toward FEWER alerts, never
+    /// toward re-alarming on a known talker.
+    pub async fn load(&self) -> Result<Vec<PersistedTalker>> {
+        let conn = self.conn.lock().await;
+        let mut stmt = conn.prepare(
+            "SELECT process, host, port, last_seen, present, edges FROM egress_baseline",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(PersistedTalker {
+                process: r.get::<_, String>(0)?,
+                host: r.get::<_, String>(1)?,
+                port: r.get::<_, i64>(2)?.clamp(0, u16::MAX as i64) as u16,
+                last_seen: r.get::<_, i64>(3)?.max(0) as u64,
+                present: r.get::<_, i64>(4)? != 0,
+                edges: serde_json::from_str(&r.get::<_, String>(5)?).unwrap_or_default(),
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Replace the persisted baseline with EXACTLY `rows`, in ONE transaction
+    /// (the same atomic set-replacement as persistence.rs::replace_with — a
+    /// crash mid-save must leave the old baseline or the new one, never a
+    /// half-set the next boot would diff against).
+    pub async fn save(&self, rows: &[PersistedTalker]) -> Result<()> {
+        let conn = self.conn.lock().await;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM egress_baseline", [])?;
+        for row in rows {
+            tx.execute(
+                "INSERT INTO egress_baseline(process, host, port, last_seen, present, edges)
+                 VALUES(?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    row.process,
+                    row.host,
+                    row.port as i64,
+                    row.last_seen as i64,
+                    row.present as i64,
+                    serde_json::to_string(&row.edges)?,
+                ],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -352,6 +585,30 @@ pub fn diff_new_hosts(current: &[Observation], known: &HashSet<(String, String)>
         })
         .cloned()
         .collect()
+}
+
+/// PURE per-tick new-host pass, in exactly the live loop's order: read the
+/// baseline, diff the sample against it, ingest the sample, and return the
+/// first-seen findings — EMPTY when the store was COLD. A cold store's first
+/// sample is an inventory of everything currently talking, not a finding set;
+/// alerting on it is what made `egress.newhost` a false positive by
+/// construction once per boot (the in-memory baseline era) and would still be
+/// one per FRESH INSTALL without this seed. Mirrors the silent cold-start seed
+/// in tcc.rs::sentinel_tick / persistence.rs.
+pub fn fold_and_diff(
+    store: &mut BaselineStore,
+    obs: &[Observation],
+    now: u64,
+) -> Vec<Observation> {
+    let cold = store.is_cold();
+    let known = store.known_host_pairs();
+    let new_hosts = diff_new_hosts(obs, &known);
+    store.ingest_sample(obs, now);
+    if cold {
+        Vec::new()
+    } else {
+        new_hosts
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -590,7 +847,15 @@ fn now_secs() -> u64 {
 /// the longitudinal store, runs the two PURE classifiers, and emits a guarded,
 /// propose-only `egress.newhost` / `egress.beacon` frame for any survivor. It
 /// changes nothing on the host.
-pub async fn run_task(cfg: std::sync::Arc<crate::config::Config>) {
+///
+/// `baseline_db` is the durable baseline (main.rs opens it beside the TCC /
+/// persistence sentinel baselines). `None` — the store failed to open — falls
+/// back to exactly the old in-memory behaviour: a per-boot baseline whose first
+/// sample seeds silently.
+pub async fn run_task(
+    cfg: std::sync::Arc<crate::config::Config>,
+    baseline_db: Option<std::sync::Arc<EgressBaselineDb>>,
+) {
     let ec = &cfg.egress;
     tokio::time::sleep(Duration::from_secs(ec.startup_delay_secs)).await;
     let interval = Duration::from_secs(ec.sample_interval_secs.max(1));
@@ -602,7 +867,21 @@ pub async fn run_task(cfg: std::sync::Arc<crate::config::Config>) {
         cooldown_secs: ec.alert_cooldown_secs,
         min_gap_secs: ec.alert_min_gap_secs,
     };
-    let mut store = BaselineStore::new(RetentionPolicy::from_config(ec));
+    let retention = RetentionPolicy::from_config(ec);
+    // Resume the previous run's baseline so `egress.newhost` is a statement
+    // about the network, not about daemon uptime. An unreadable store degrades
+    // to the old in-memory behaviour (warn once, alert on nothing this boot's
+    // first sample) — toward FEWER alerts, never a wedge and never a flood.
+    let mut store = match &baseline_db {
+        Some(db) => match db.load().await {
+            Ok(rows) => BaselineStore::from_persisted(retention, rows),
+            Err(e) => {
+                warn!(error = %e, "egress: baseline load failed; using an empty in-memory baseline this run");
+                BaselineStore::new(retention)
+            }
+        },
+        None => BaselineStore::new(retention),
+    };
     let mut ledger = AlertLedger::default();
 
     loop {
@@ -633,11 +912,18 @@ pub async fn run_task(cfg: std::sync::Arc<crate::config::Config>) {
             })
             .collect();
 
-        // New-host diff BEFORE ingest, so a brand-new pair is flagged exactly on
-        // the tick it first appears (and never again — it is in the baseline after).
-        let known = store.known_host_pairs();
-        let new_hosts = diff_new_hosts(&obs, &known);
-        store.ingest_sample(&obs, now);
+        // New-host pass, diff BEFORE ingest (fold_and_diff), so a brand-new pair
+        // is flagged exactly on the tick it first appears (and never again — it
+        // is in the baseline after). A COLD store's first sample seeds silently.
+        let new_hosts = fold_and_diff(&mut store, &obs, now);
+        // Persist the fold so the NEXT boot diffs against what this run knew. A
+        // save failure is a warning, not an alert: the loop keeps its in-memory
+        // baseline and merely risks a stale file on restart.
+        if let Some(db) = &baseline_db {
+            if let Err(e) = db.save(&store.to_persisted()).await {
+                warn!(error = %e, "egress: baseline save failed; the on-disk baseline is stale");
+            }
+        }
 
         for o in &new_hosts {
             let key = format!("newhost:{}:{}", o.process, o.host);
@@ -646,18 +932,20 @@ pub async fn run_task(cfg: std::sync::Arc<crate::config::Config>) {
                     let proposal =
                         render_block_proposal(&o.process, &o.host, o.port, "first-seen outbound talker");
                     info!(process = %o.process, host = %o.host, "egress: new outbound talker");
-                    // THE REASON THIS IS SILENT IS A DEFECT, NOT A PREFERENCE. The
-                    // baseline this diff is taken against is `BaselineStore::new(..)`
-                    // a few lines up in THIS function — in-memory, never loaded from
-                    // disk — so the first tick after every daemon start sees an EMPTY
-                    // `known` set and calls the owner's entirely ordinary traffic
-                    // first-seen (test: a_cold_baseline_calls_every_ordinary_talker_
-                    // first_seen). The global debounce then lets exactly ONE of that
-                    // cohort through and swallows the rest, which are baselined by
-                    // the next tick. Per boot, this alert is one arbitrary ordinary
-                    // talker. PIXEL-FREE(diagnostic): drawing that would teach the
-                    // owner to dismiss the row before the day a real one appears.
-                    // Wire it when the baseline survives a restart, not before.
+                    // The per-boot false positive is FIXED (the baseline survives
+                    // restarts via EgressBaselineDb, and a cold store's first
+                    // sample seeds silently — test: a_restart_does_not_re_alert_
+                    // on_a_known_talker). The finding is real now, and it still
+                    // stays off the HUD, for a reason that is about the OWNER,
+                    // not a defect: the host is a bare IP (`lsof -nP`), and
+                    // ordinary browsing mints new (process, IP) pairs continuously
+                    // — measured on a desktop: 3 new pairs in one 45s window, all
+                    // browser-owned — so a rendered row would be dominated by
+                    // "browser -> fresh CDN IP" at the 5-minute debounce floor
+                    // (up to 288 rows/day). Nobody acts on that row; drawing it
+                    // trains dismissal. The regular-cadence beacon alert below IS
+                    // rendered. PIXEL-FREE(diagnostic): operator stream only; the
+                    // rendered pf proposal still rides this frame.
                     crate::telemetry::emit("egress", "egress.newhost", newhost_frame(o, &proposal));
                     ledger.record(&key, now);
                 }
@@ -739,50 +1027,192 @@ mod tests {
 
     // ---- Classifier 1: new-host baseline diff ----
 
-    /// THE COLD-START PROPERTY, MEASURED — the reason `egress.newhost` is marked
-    /// diagnostic at its emit site rather than drawn.
-    ///
-    /// `run_task` builds its baseline with `BaselineStore::new(...)` and never
-    /// loads one from disk, so the store a fresh daemon diffs against is EMPTY.
-    /// Against an empty baseline every ordinary talker on the machine — the
-    /// browser, the mail client, the update daemon — is "a first-seen outbound
-    /// talker", each one carrying a rendered pfctl block proposal. That is not a
-    /// finding; it is an inventory wearing a finding's clothes, and it recurs at
-    /// every restart. If persistence ever lands, this test is where to come back:
-    /// a baseline that survives a boot is what makes the alert worth a pixel.
+    /// A perfectly ordinary desktop sample: nothing here is suspicious.
+    fn ordinary_sample(ts: u64) -> Vec<Observation> {
+        vec![
+            obs("Google Chrome", "142.250.72.14", 443, ts),
+            obs("Mail", "17.42.251.7", 993, ts),
+            obs("softwareupdated", "17.253.55.202", 443, ts),
+        ]
+    }
+
+    /// THE COLD-START PROPERTY, FIXED AND RE-PINNED. The test that used to live
+    /// here measured the defect: run_task's baseline was in-memory-only, so the
+    /// first tick of EVERY boot called the owner's ordinary traffic first-seen
+    /// and the global debounce let one arbitrary talker through. Now a COLD
+    /// store's first sample is a silent seed (mirroring tcc.rs::sentinel_tick's
+    /// cold start): [`fold_and_diff`] returns NO findings on the seeding tick,
+    /// the same traffic stays silent afterwards, and only a pair genuinely new
+    /// AFTER the seed is a finding.
     #[test]
-    fn a_cold_baseline_calls_every_ordinary_talker_first_seen() {
-        let cold = BaselineStore::new(RetentionPolicy {
-            max_talkers: 2048,
-            max_samples_per_talker: 64,
-            retention_secs: 24 * 60 * 60,
-        });
+    fn a_cold_store_seeds_silently_then_flags_only_genuinely_new_talkers() {
+        let mut store = BaselineStore::new(retention());
+        assert!(store.is_cold(), "a fresh store must be cold — the seed depends on it");
+
+        let ordinary = ordinary_sample(100);
+        let first = fold_and_diff(&mut store, &ordinary, 100);
         assert!(
-            cold.known_host_pairs().is_empty(),
-            "a freshly constructed store must have no baseline — that IS the defect"
+            first.is_empty(),
+            "the seeding tick is an inventory, not a finding set: {first:?}"
+        );
+        assert!(!store.is_cold(), "a non-empty sample must latch the seed");
+
+        // The same traffic on the next tick is still silent…
+        let again = fold_and_diff(&mut store, &ordinary_sample(160), 160);
+        assert!(again.is_empty(), "identical traffic must be silent once baselined");
+
+        // …and a pair that genuinely appears AFTER the seed IS a finding.
+        let mut with_new = ordinary_sample(220);
+        with_new.push(obs("implant", "203.0.113.7", 443, 220));
+        let found = fold_and_diff(&mut store, &with_new, 220);
+        assert_eq!(found.len(), 1, "exactly the new pair: {found:?}");
+        assert_eq!(found[0].host, "203.0.113.7");
+    }
+
+    /// An all-empty first sample (network down at boot) must NOT latch the seed:
+    /// the store learns nothing from nothing, and the first REAL sample still
+    /// seeds silently instead of flagging the whole machine.
+    #[test]
+    fn an_empty_first_sample_does_not_consume_the_silent_seed() {
+        let mut store = BaselineStore::new(retention());
+        assert!(fold_and_diff(&mut store, &[], 40).is_empty());
+        assert!(store.is_cold(), "an empty sample must not latch the seed");
+        let first_real = fold_and_diff(&mut store, &ordinary_sample(100), 100);
+        assert!(first_real.is_empty(), "the first real sample still seeds silently");
+    }
+
+    /// THE PROPERTY THE PERSISTENCE EXISTS FOR: a restart does not re-alert on a
+    /// known talker. Round-trip the store through EgressBaselineDb exactly as
+    /// run_task does (save after ingest; load at boot) and diff the same
+    /// ordinary sample — silence. And the diff did not go blind: a talker first
+    /// seen only AFTER the reload is still a finding.
+    #[tokio::test]
+    async fn a_restart_does_not_re_alert_on_a_known_talker() {
+        let db = EgressBaselineDb::in_memory().unwrap();
+        let mut store = BaselineStore::new(retention());
+        fold_and_diff(&mut store, &ordinary_sample(100), 100); // silent seed
+        db.save(&store.to_persisted()).await.unwrap();
+
+        // "Restart": a fresh store loaded from the DB — run_task's boot path.
+        let mut reloaded = BaselineStore::from_persisted(retention(), db.load().await.unwrap());
+        assert!(
+            !reloaded.is_cold(),
+            "a store loaded from a non-empty baseline must not look cold, or every boot re-seeds"
+        );
+        let after_restart = fold_and_diff(&mut reloaded, &ordinary_sample(200), 200);
+        assert!(
+            after_restart.is_empty(),
+            "a restart must not re-alert on known talkers: {after_restart:?}"
         );
 
-        // A perfectly ordinary desktop sample: nothing here is suspicious.
-        let ordinary = vec![
-            obs("Google Chrome", "142.250.72.14", 443, 100),
-            obs("Mail", "17.42.251.7", 993, 100),
-            obs("softwareupdated", "17.253.55.202", 443, 100),
-        ];
-        let flagged = diff_new_hosts(&ordinary, &cold.known_host_pairs());
+        let mut with_new = ordinary_sample(260);
+        with_new.push(obs("implant", "203.0.113.7", 443, 260));
+        let found = fold_and_diff(&mut reloaded, &with_new, 260);
+        assert_eq!(found.len(), 1, "a genuinely new pair after the reload still fires");
+        assert_eq!(found[0].host, "203.0.113.7");
+    }
+
+    /// Round-trip fidelity: edges, last_seen and PRESENCE survive the DB. The
+    /// presence bit is load-bearing — a connection that was open when the
+    /// previous run stopped, and is still open at the first post-restart
+    /// sample, must NOT gain a fabricated rising edge (six regular restarts
+    /// would otherwise dress a long-lived tunnel up as a beacon).
+    #[tokio::test]
+    async fn the_round_trip_keeps_edges_and_does_not_fabricate_an_edge_for_a_still_open_socket() {
+        let db = EgressBaselineDb::in_memory().unwrap();
+        let mut store = BaselineStore::new(retention());
+        // A reappearing beacon: edges at 0, 120, 240 — and present at the end.
+        for tick in 0..5u64 {
+            let now = tick * 60;
+            let sample = if tick % 2 == 0 {
+                vec![obs("implant", "203.0.113.7", 443, now)]
+            } else {
+                vec![]
+            };
+            store.ingest_sample(&sample, now);
+        }
+        // A persistent talker, present in every sample including the last.
+        store.ingest_sample(&[obs("vpn", "10.0.0.1", 443, 300)], 300);
+        db.save(&store.to_persisted()).await.unwrap();
+
+        let mut reloaded = BaselineStore::from_persisted(retention(), db.load().await.unwrap());
         assert_eq!(
-            flagged.len(),
-            ordinary.len(),
-            "every ordinary talker is 'first-seen' against a cold baseline: {flagged:?}"
+            reloaded.edge_timestamps("implant", "203.0.113.7"),
+            vec![0, 120, 240],
+            "the rising-edge series must survive the restart — cadence reads it"
         );
+        assert_eq!(reloaded.edge_timestamps("vpn", "10.0.0.1"), vec![300]);
 
-        // …and once the same sample has been ingested, the very same traffic is
-        // silent. The alert is therefore a function of daemon uptime, not of the
-        // network — which is exactly what an owner-facing alarm must not be.
-        let mut warm = cold;
-        warm.ingest_sample(&ordinary, 100);
+        // Still open across the restart: the first post-restart sample must not
+        // stamp a new edge for it.
+        reloaded.ingest_sample(&[obs("vpn", "10.0.0.1", 443, 360)], 360);
+        assert_eq!(
+            reloaded.edge_timestamps("vpn", "10.0.0.1"),
+            vec![300],
+            "a still-open socket across a restart gains NO fabricated rising edge"
+        );
+    }
+
+    /// A corrupt `edges` cell degrades to an EDGELESS known talker: the pair
+    /// still counts toward the baseline (corruption fails toward FEWER alerts,
+    /// never toward re-alarming on a known talker), and nothing panics.
+    #[tokio::test]
+    async fn a_corrupt_edges_cell_degrades_to_an_edgeless_known_talker() {
+        let db = EgressBaselineDb::in_memory().unwrap();
+        {
+            let conn = db.conn.lock().await;
+            conn.execute(
+                "INSERT INTO egress_baseline(process, host, port, last_seen, present, edges)
+                 VALUES('Mail', '17.42.251.7', 993, 50, 1, 'not-json')",
+                [],
+            )
+            .unwrap();
+        }
+        let rows = db.load().await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].edges.is_empty(), "corrupt edges degrade to empty, never a panic");
+        let store = BaselineStore::from_persisted(retention(), rows);
         assert!(
-            diff_new_hosts(&ordinary, &warm.known_host_pairs()).is_empty(),
-            "identical traffic must be silent once baselined"
+            store
+                .known_host_pairs()
+                .contains(&("Mail".to_string(), "17.42.251.7".to_string())),
+            "the pair still counts as KNOWN"
+        );
+        assert!(!store.is_cold(), "a degraded row still seeds the store");
+    }
+
+    /// The retention BOUNDS are re-imposed on load: an oversized file (config
+    /// shrank, or hand-edited) is clamped to `max_talkers` most-recent rows and
+    /// `max_samples_per_talker` newest edges — the daemon's memory stays bounded
+    /// no matter what is on disk.
+    #[tokio::test]
+    async fn load_reimposes_the_retention_bounds() {
+        let db = EgressBaselineDb::in_memory().unwrap();
+        let rows: Vec<PersistedTalker> = (0..10u64)
+            .map(|i| PersistedTalker {
+                process: "p".into(),
+                host: format!("h{i}"),
+                port: 1,
+                last_seen: i * 10,
+                present: false,
+                edges: (0..20).map(|e| e * 7).collect(), // 20 edges, ring cap is 8
+            })
+            .collect();
+        db.save(&rows).await.unwrap();
+        let store = BaselineStore::from_persisted(retention(), db.load().await.unwrap()); // max_talkers 4
+        let known = store.known_host_pairs();
+        assert_eq!(known.len(), 4, "distinct-talker cap re-imposed on load");
+        assert!(known.contains(&("p".to_string(), "h9".to_string())), "most-recent rows win");
+        assert!(!known.contains(&("p".to_string(), "h0".to_string())));
+        assert_eq!(
+            store.edge_timestamps("p", "h9").len(),
+            8,
+            "per-talker edge ring re-imposed on load (newest kept)"
+        );
+        assert_eq!(
+            store.edge_timestamps("p", "h9"),
+            vec![84, 91, 98, 105, 112, 119, 126, 133],
+            "the NEWEST edges are the ones kept"
         );
     }
 

@@ -1455,30 +1455,31 @@ pub async fn route(
     // `recall_probe::tests::KNOWN_OPEN_HIJACKS` carries the 27-of-49 phrasings that
     // narrowing cost.
     //
-    // ONE REMAINS, AND IT IS NOT A VOCABULARY PROBLEM:
+    // THE LAST OF THE SIX — genimage's grammatical-person hole — IS NOW CLOSED
+    // (2026-08-11). The hole was PERSON, not vocabulary: a request to DARWIN is
+    // an IMPERATIVE, and present-tense narration reuses the base form in the
+    // same verb-object shape ("we draw a picture of the family every christmas",
+    // "the kids draw a picture of the dog every week"). Verb POSITION was the
+    // missing rule and is now rule 4 of `image_noun_is_commanded`
+    // (`image_verb_in_command_position`): the verb must open its clause modulo a
+    // CLOSED set of non-referential lead-ins and one optional request frame —
+    // closed-set because subjects are an OPEN class, which is exactly why the
+    // earlier subject-pronoun rule was refused (it closed three sentences and
+    // left the plural-noun class firing). Measured two-sided: 17/17 narration
+    // shapes silent (now in `router_ordinary.json`), 16/16 request shapes with
+    // pre-verb material still firing (15 now `router_recall.json` probes), cost
+    // enumerated in `recall_probe.rs` beside the one residual (comma-fronted
+    // coordinated VPs, still in `KNOWN_OPEN_HIJACKS`).
     //
-    //   genimage           the remaining hole is grammatical PERSON, not
-    //                      vocabulary: a request to DARWIN is an IMPERATIVE, and
-    //                      present-tense narration reuses the base form in the
-    //                      same verb-object shape — "we draw a picture of the
-    //                      family every christmas", "you cannot paint a picture
-    //                      with only one color", "we make art with the kids on
-    //                      saturdays". Verb POSITION (utterance-initial modulo a
-    //                      bounded politeness prefix) is the missing rule; verb
-    //                      FORM alone does not separate them. A subject-pronoun
-    //                      rule was measured and REFUSED: it closes those three
-    //                      and leaves "the kids draw a picture of the dog every
-    //                      week" firing, which would make the ratchet read closed
-    //                      while the hole stayed open. See
-    //                      `recall_probe::tests::KNOWN_OPEN_HIJACKS`.
-    //
-    // So the ORDER of operations is unchanged and one item shorter: close
-    // genimage's person rule, re-prove it against sentences written for the NEW
-    // rule, and only then hoist. Hoisting first buys 13.9% reachability by
-    // re-opening the defect class this campaign spent the most effort closing —
-    // 317 of 1,897 ordinary utterances captured by app gates, a tornado-watch
-    // question that turned the camera on. The gain is real and it is not worth
-    // that.
+    // THE HOIST ITSELF IS STILL NOT TAKEN. The stated precondition is met, but
+    // giving four app gates first refusal over the two cloud returns changes
+    // what every conversation turn can actuate — a routing POSTURE decision for
+    // the owner, not a precision fix an agent should ship as a side effect
+    // (`both_cloud_returns_are_unconditional` pins this deliberately). Hoisting
+    // without that decision buys 13.9% reachability by re-opening the risk
+    // surface this campaign spent the most effort closing — 317 of 1,897
+    // ordinary utterances captured by app gates, a tornado-watch question that
+    // turned the camera on. The gain is real and it is not an agent's call.
     //
     // The OTHER four (describe / sound / lumen / vision) are a separate question
     // and a harder one: each actuates a camera, a screen read, a mic clip or a UI
@@ -8072,7 +8073,7 @@ pub fn generate_image_command(text: &str) -> Option<GenerateImageRequest> {
 ///   "the big picture of this quarter is that we make less with more effort"
 ///   "make an effort with the picture of professionalism you project"
 ///   "I cannot imagine the pressure of taking a photo with a broken lens"
-/// Three rules close all of those and cost none of the shipped phrasings:
+/// Four rules close all of those and cost none of the shipped phrasings:
 ///   1. WHOLE WORDS on both halves — kills photosynthesis/art-therapy/remake.
 ///   2. BASE FORMS only for the verb. A request to DARWIN is imperative
 ///      ("draw me a picture"), so the inflected forms are narration about
@@ -8082,6 +8083,21 @@ pub fn generate_image_command(text: &str) -> Option<GenerateImageRequest> {
 ///      two determiner-ish words. That is what separates "make a picture of X"
 ///      from "make an effort with the picture of X" and from "the big picture …
 ///      we make less".
+///   4. The verb must sit in COMMAND POSITION — see
+///      [`image_verb_in_command_position`]. Rule 2 drops narration about the
+///      PAST and the THIRD PERSON (drew / draws / painted), but first/second-
+///      person and plural-noun present-tense narration reuses the BASE form in
+///      the same verb-object shape: "we make art with the kids on saturdays",
+///      "the kids draw a picture of the dog every week". What separates those
+///      from a request is not the verb or the noun but the SUBJECT sitting in
+///      front of the verb — English imperatives do not carry one. So the verb
+///      must open its clause, modulo a CLOSED set of non-referential lead-ins
+///      (politeness / discourse / the vocative "darwin") and one optional
+///      request frame ("can you …", "i want you to …", "let's …", "help me …").
+///      The allow-list is closed and everything else is refused, because
+///      subjects are an OPEN class — listing pronouns was measured and refused
+///      once already for exactly the "closes three sentences, leaves the class"
+///      failure (see `recall_probe`'s ratchet history).
 ///
 /// "imagine" is NOT a generate verb. It was, and it is the one verb on the list
 /// whose ordinary imperative sense ("imagine the artwork of a whole generation
@@ -8100,21 +8116,84 @@ fn image_noun_is_commanded(lower: &str) -> bool {
     // determiners and object pronouns: one content word in the gap ("make an
     // EFFORT with the picture") and the noun is not what is being generated.
     const GAP: &[&str] = &["me", "us", "a", "an", "the", "my", "your", "one", "some", "another"];
-    let words = speech_words(lower);
-    for (i, w) in words.iter().enumerate() {
-        if !GEN_VERBS.contains(w) {
-            continue;
-        }
-        for w2 in words.iter().skip(i + 1).take(3) {
-            if IMAGE_NOUNS.contains(w2) {
-                return true;
+    // Rule 4 scans PER CLAUSE: sentence punctuation resets command position, so
+    // a fronted adjunct does not hide an imperative ("instead of a photo, MAKE a
+    // drawing of the house") and a vocative comma costs nothing ("darwin, draw
+    // me a picture of a fox"). Segmenting can only NARROW rule 3: a segment's
+    // verb→noun window is a contiguous sub-window of the whole utterance's, so
+    // nothing that this gate refused before can pass it now.
+    for seg in lower.split([',', ';', '.', '!', '?', ':']) {
+        let words = speech_words(seg);
+        for (i, w) in words.iter().enumerate() {
+            if !GEN_VERBS.contains(w) {
+                continue;
             }
-            if !GAP.contains(w2) {
-                break;
+            if !image_verb_in_command_position(&words[..i]) {
+                continue;
+            }
+            for w2 in words.iter().skip(i + 1).take(3) {
+                if IMAGE_NOUNS.contains(w2) {
+                    return true;
+                }
+                if !GAP.contains(w2) {
+                    break;
+                }
             }
         }
     }
     false
+}
+
+/// Rule 4 of [`image_noun_is_commanded`]: is a generate verb preceded by `pre`
+/// (the tokens before it IN ITS CLAUSE) in command position?
+///
+/// A request to DARWIN is an IMPERATIVE, and English imperatives carry no overt
+/// subject — narration does ("we make art…", "the kids draw a picture…", "you
+/// cannot paint a picture…"). Subjects are an OPEN class (any noun phrase), so
+/// they cannot be listed; what CAN be listed is everything a request legitimately
+/// puts in front of its verb, which is closed:
+///
+///   * non-referential lead-ins — politeness, discourse markers, the vocative
+///     "darwin". None of these can be a subject or begin one, so FILTERING them
+///     out anywhere in the prefix never skips over a subject ("hey can you just
+///     make…" → `can you`); and
+///   * ONE request frame — subject-AUXILIARY INVERSION ("can/could/would/will
+///     you"), the embedded request ("i want/need you to", "i'd/i would like you
+///     to"), the hortative ("let's"/"let us"/"lets"), "help me", "go ahead".
+///     Word ORDER is what separates "can you paint…" (a request) from "you
+///     cannot paint…" (narration): the subject "you" precedes the verb in both,
+///     but only the inverted order asks.
+///
+/// Anything else before the verb — a pronoun subject, a noun-phrase subject, a
+/// fronted clause ("when you get a chance draw…" without a comma), a negation
+/// ("don't/never make a picture of me"), a subject-first auxiliary ("you can
+/// draw…") — refuses the fire. DENY BY DEFAULT is the honest direction here: a
+/// missed request falls through to conversation and can be rephrased; a false
+/// fire RENDERS AN IMAGE on the offline/vault/guest path, for exactly the
+/// population that cannot fall back on the cloud answering first.
+fn image_verb_in_command_position(pre: &[&str]) -> bool {
+    // Non-referential lead-ins. Every entry must be a word that can NEITHER be a
+    // subject NOR begin a subject noun phrase — that property is what makes
+    // filtering (rather than prefix-stripping) safe. Bounded on purpose: a word
+    // added here is a word narration may now carry in front of the verb.
+    const DISCOURSE: &[&str] = &[
+        "please", "hey", "ok", "okay", "oh", "um", "uh", "well", "now", "so", "and", "then",
+        "just", "also", "first", "next", "again", "actually", "alright", "yes", "yeah", "no",
+        "wait", "maybe", "kindly", "quickly", "darwin",
+    ];
+    const AUX: &[&str] = &["can", "could", "would", "will"];
+    let rest: Vec<&str> = pre.iter().copied().filter(|w| !DISCOURSE.contains(w)).collect();
+    // The frame must consume the WHOLE remaining prefix (no trailing `..` on any
+    // pattern): one unexplained token before the verb and this is narration.
+    matches!(rest.as_slice(),
+        []
+        | ["help", "me"]
+        | ["go", "ahead"]
+        | ["let", "s" | "us"]
+        | ["lets"]
+        | ["i", "want" | "need", "you", "to"]
+        | ["i", "d" | "would", "like", "you", "to"]
+    ) || matches!(rest.as_slice(), [aux, "you"] if AUX.contains(aux))
 }
 
 /// Extract the image PROMPT (subject) from a generate phrase, in ORIGINAL case.
@@ -11289,15 +11368,17 @@ mod tests {
     ///     MEASURED, and the measurement is why this is a rewritten rationale and
     ///     not a veto: of the 137 ordinary-corpus sentences that go heavy -> light,
     ///     ZERO fire any lexical gate (`recall_probe::all_hits` over all 137), so
-    ///     no corpus sentence realizes the exposure. It is realizable outside the
-    ///     corpus: "in art school the kids draw a picture of the dog every week and
-    ///     i never understood why" fires genimage, is heavy at HEAD and light here,
-    ///     and `[image]` ships enabled with a pre-downloaded checkpoint. Its bare
-    ///     form is already `KNOWN_OPEN_HIJACKS[3]` and already fires at HEAD, so
-    ///     this widens a documented hole by one phrasing rather than opening a new
-    ///     one — but the hole is genimage's grammatical-person gap, and the
-    ///     honest statement is that this edit removes some of the cover it was
-    ///     sitting behind, not that it is safe in that direction.
+    ///     no corpus sentence realizes the exposure. When this was written it WAS
+    ///     realizable outside the corpus: "in art school the kids draw a picture
+    ///     of the dog every week and i never understood why" fired genimage, was
+    ///     heavy at HEAD and light here, and `[image]` ships enabled with a
+    ///     pre-downloaded checkpoint — its bare form was `KNOWN_OPEN_HIJACKS[3]`,
+    ///     so the edit widened a documented hole by one phrasing. SINCE CLOSED
+    ///     (2026-08-11): the command-position rule (rule 4 of
+    ///     `image_noun_is_commanded`) refuses both that sentence and its bare
+    ///     form, and both are now enforced at zero captures in
+    ///     `router_ordinary.json`. The residual exposure this paragraph names is
+    ///     the ratchet's remaining comma-fronted entry, not the person class.
     ///   * two ordinary sentences newly reach an action intent: "do i need a visa
     ///     to visit japan" -> web.search and "make a note about the background
     ///     music in that film" -> memory.store (both stable over three runs).
@@ -13250,6 +13331,116 @@ mod tests {
                 .unwrap_or_else(|| panic!("{u:?} is a real image request and must still work"));
             assert_eq!(req.prompt, want, "prompt for {u:?}");
         }
+    }
+
+    /// RULE 4 (command position): present-tense NARRATION reusing the base verb
+    /// form never renders an image, and every request shape with legitimate
+    /// pre-verb material still does.
+    ///
+    /// This was the last open branch of the hoist-refusal block ("we make art
+    /// with the kids on saturdays" RENDERED AN IMAGE on the offline/vault/guest
+    /// path). Rules 1-3 cannot see it: the verb is base-form, the noun is its
+    /// object, both are whole words. The discriminator is the SUBJECT sitting in
+    /// front of the verb — English imperatives carry none — and because subjects
+    /// are an OPEN class the rule allow-lists the closed complement (politeness /
+    /// discourse / vocative lead-ins plus one request frame) and denies the rest.
+    /// A subject-pronoun list was measured and refused before this: it closed
+    /// three named sentences and left "the kids draw a picture of the dog every
+    /// week" firing.
+    ///
+    /// Every pair below probes BOTH sides of one boundary, so a widening and a
+    /// deletion both go red: the same sentence flips between fire and refuse on
+    /// exactly the feature the rule claims to read.
+    #[test]
+    fn narration_in_command_shape_never_generates_an_image() {
+        // Narration: a subject (pronoun, plural noun, bare plural, full NP)
+        // precedes the base verb. The plural-noun entries are the class the
+        // refused pronoun rule left open — they are the point of this test.
+        for u in [
+            "we make art with the kids on saturdays",
+            "we draw a picture of the family every christmas",
+            "you cannot paint a picture with only one color",
+            "the kids draw a picture of the dog every week",
+            "the students paint a picture of the harbour every term",
+            "kids draw pictures of their families in kindergarten",
+            "my art teacher makes us sketch a drawing of the class pet every term",
+            "in art school the kids draw a picture of the dog every week and i never understood why",
+            "i paint a picture of the coast every summer",
+            // fronted adverbial — the subject is not utterance-initial
+            "every christmas we draw a picture of the family",
+            // vocative then subject — "darwin" is skippable, "we" must still deny
+            "darwin we make art with the kids on saturdays",
+            // subject-first auxiliary — same words as "can you draw", wrong order
+            "you can draw a picture of the dog",
+            // negated imperatives — "don't"/"never" are not command openers
+            "don't make a picture of me",
+            "never draw a picture of my kids",
+            // discourse word mid-sentence does not launder the subject after it
+            "when we ask nicely they draw a picture of the dog",
+        ] {
+            assert!(
+                generate_image_command(u).is_none(),
+                "{u:?} is narration and must not generate an image: {:?}",
+                generate_image_command(u)
+            );
+        }
+        // ...and the request side of each boundary still fires, prompt intact.
+        for (u, want) in [
+            // verb-initial (the imperative baseline)
+            ("draw a picture of a red bicycle", "a red bicycle"),
+            // vocative, with and without the comma
+            ("darwin, draw me a picture of a fox in a suit", "a fox in a suit"),
+            ("darwin draw me a picture of a fox", "a fox"),
+            // politeness / discourse chains
+            ("please paint a picture of a sunset over the harbour", "a sunset over the harbour"),
+            ("ok now make me a drawing of a robot", "a robot"),
+            ("just draw a picture of a whale", "a whale"),
+            // aux-INVERSION — the order pair of "you can draw" above
+            ("can you draw me a picture of the golden gate bridge", "the golden gate bridge"),
+            ("could you please draw a picture of a dragon", "a dragon"),
+            ("would you kindly sketch a drawing of a sailboat", "a sailboat"),
+            ("will you draw a picture of two cats dancing", "two cats dancing"),
+            // embedded requests, with the discourse word INSIDE the frame
+            ("i want you to draw a picture of a castle on a hill", "a castle on a hill"),
+            ("i just want you to draw a picture of a dog", "a dog"),
+            ("i'd like you to make an image of a rainy street", "a rainy street"),
+            // hortative / help-me
+            ("let's make a picture of the garden in spring", "the garden in spring"),
+            ("help me draw a picture of a dragon", "a dragon"),
+            // clause punctuation resets command position: the fronted-adjunct
+            // request (pinned since the extract_image_prompt fix) and a spoken
+            // repair both keep working
+            ("instead of a photo, make a drawing of the house", "the house"),
+            ("no wait, make a picture of a green door instead", "a green door instead"),
+        ] {
+            let req = generate_image_command(u)
+                .unwrap_or_else(|| panic!("{u:?} is a request and must still render"));
+            assert_eq!(req.prompt, want, "prompt for {u:?}");
+        }
+        // THE MEASURED COST, pinned so a regression of it is a decision and not
+        // an accident: pre-verb material outside the closed set no longer fires,
+        // even when the sentence is a plausible request. The comma'd spelling of
+        // the fronted clause DOES fire (see "when you get a chance," below), so
+        // the loss is confined to punctuation-free transcripts of these shapes.
+        for u in [
+            "when you get a chance draw me a picture of the harbour",
+            "open the canvas and draw a picture of a fox",
+            "why don't you draw me a picture of the garden",
+            "you should draw a picture of the harbour",
+            "tomorrow draw me a picture of the sunrise",
+        ] {
+            assert!(
+                generate_image_command(u).is_none(),
+                "{u:?} was measured as the cost of the command-position rule; if \
+                 it fires now, the rule was widened — re-measure the narration \
+                 side before accepting that"
+            );
+        }
+        assert!(
+            generate_image_command("when you get a chance, draw me a picture of the harbour")
+                .is_some(),
+            "the comma'd fronted clause is a request and must keep firing"
+        );
     }
 
     /// PANIC PIN (no-regression): extract_image_prompt must never panic on an STT

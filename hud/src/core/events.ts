@@ -3451,6 +3451,50 @@ export function parseTccAnomalies(data: Record<string, unknown>): string[] {
 }
 
 // ---------------------------------------------------------------------------
+// EGRESS BEACON WATCH (egress.beacon) — a process contacting one host on a
+// suspiciously REGULAR interval, the classic C2 callback signature, from the
+// longitudinal egress sentinel (daemon/src/egress_beacon.rs beacon_frame: the
+// wire carries process/host/port, the measured period/jitter/samples, the
+// PROPOSE-ONLY rendered pf rule, and the standing UID caveat). SECRET-FREE:
+// process names + bare host IPs + numbers. The parser never throws.
+// ---------------------------------------------------------------------------
+
+/** Max beacon alerts retained/rendered (bounds an unbounded alert history). */
+export const EGRESS_BEACON_CAP = 20;
+
+/** One suspected-beacon alert. `key` identifies the talker (the daemon's own
+ *  per-key cooldown identity, process+host) so a re-alert after the 6h cooldown
+ *  REFRESHES its row instead of stacking near-duplicates; `proposal` is the
+ *  PROPOSE-ONLY pf rule text riding the frame — DARWIN never applies it. */
+export interface EgressBeaconAlert {
+  key: string;
+  line: string;
+  proposal: string;
+}
+
+/** Coerce an egress.beacon payload into its alert row. Returns null (drop the
+ *  frame) without process + host — an un-attributable beacon row would be
+ *  noise the owner cannot act on. Missing numbers render as 0, honestly odd
+ *  rather than invented. */
+export function parseEgressBeacon(data: Record<string, unknown>): EgressBeaconAlert | null {
+  const process = str(data, "process");
+  const host = str(data, "host");
+  if (process === null || process.length === 0) return null;
+  if (host === null || host.length === 0) return null;
+  const port = num(data, "port") ?? 0;
+  const period = num(data, "period_secs") ?? 0;
+  const jitter = num(data, "jitter_ratio") ?? 0;
+  const samples = num(data, "samples") ?? 0;
+  return {
+    key: `${process} → ${host}`,
+    line:
+      `BEACON: ${process} → ${host}:${port} every ~${Math.round(period)}s ` +
+      `(jitter ${jitter}, ${samples} edges)`,
+    proposal: str(data, "proposal") ?? "",
+  };
+}
+
+// ---------------------------------------------------------------------------
 // MICRO-APP INTROSPECTION (introspect.snapshot / introspect.profile_drift /
 // introspect.anomaly / introspect.module_violation / .modattest /
 // .security_event / .capabilities). WIRE CONTRACT: the daemon builds these

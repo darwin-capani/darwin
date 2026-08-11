@@ -40,7 +40,7 @@ export interface LedgerEntry {
  * It is pinned to the measured count, so a new pixel-free emit cannot be parked
  * in the backlog without editing it — which is a visible, arguable act in review.
  */
-export const UNTRIAGED = 94;
+export const UNTRIAGED = 93;
 
 /**
  * THE OTHER SILENCE — topics that DO have an `applyEnvelope` case, whose case is
@@ -60,11 +60,11 @@ export const UNTRIAGED = 94;
  * the moment it is written, in a diff a reviewer can see — the same contract the
  * `diagnostic` bucket imposes on the daemon side.
  *
- * TRUE PIXEL-FREE POPULATION = PIXEL_FREE (115 topics / 131 sites)
+ * TRUE PIXEL-FREE POPULATION = PIXEL_FREE (114 topics / 130 sites)
  *                            + NO_OP_CASES (9 topics / 14 sites)
- *                            = 124 topics / 145 sites,
- * out of 294 topics / 395 production emit calls — 42.2% of the topics the daemon
- * emits reach no pixel, not the 39.1% that counting only PIXEL_FREE reports.
+ *                            = 123 topics / 144 sites,
+ * out of 294 topics / 395 production emit calls — 41.8% of the topics the daemon
+ * emits reach no pixel, not the 38.8% that counting only PIXEL_FREE reports.
  */
 export const NO_OP_CASES: string[] = [
   "app.auth_failed",
@@ -137,12 +137,11 @@ export const PIXEL_FREE: Record<string, LedgerEntry> = {
   "design_voice.failed": { bucket: "untriaged", sites: "main.rs:5697" },
   "design_voice.no_key": { bucket: "untriaged", sites: "main.rs:5675" },
   "dls.status": { bucket: "untriaged", sites: "main.rs:3006" },
-  "egress.beacon": { bucket: "untriaged", sites: "egress_beacon.rs:675" },
   "egress.newhost": {
     bucket: "diagnostic",
     sites: "egress_beacon.rs:649",
     why:
-      "MARKED, NOT ENDORSED. run_task's baseline is in-memory and never loaded from disk, so the first tick after every restart calls the owner's ordinary traffic first-seen and the global debounce lets exactly one arbitrary talker through. Per boot, this alert is a false positive by construction. Drawing it would train the owner to dismiss the row. Wire it when the baseline survives a restart.",
+      "The old defect is FIXED (the baseline persists in state/egress_baseline.db and a cold store's first sample seeds silently, so a restart no longer re-alerts on known talkers) — what keeps this off the HUD now is the OWNER, not a bug: hosts are bare IPs (lsof -nP) and ordinary browsing mints new (process, IP) pairs continuously (measured: 3 in one 45s window, all browser-owned), so a rendered row would be 'browser -> fresh CDN IP' at the 5-minute debounce floor, up to 288/day. Nobody acts on that; the rendered surface for egress is the beacon alert, which names a behaviour instead of an inventory delta.",
   },
   "egress.refused": {
     bucket: "diagnostic",

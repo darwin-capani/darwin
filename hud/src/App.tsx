@@ -51,6 +51,7 @@ import OvernightPanel from "./components/OvernightPanel";
 import AmbientMode from "./components/AmbientMode";
 import { isAtRest } from "./core/ambient";
 import TccSentinelPanel from "./components/TccSentinelPanel";
+import EgressBeaconPanel from "./components/EgressBeaconPanel";
 import IntrospectPanel from "./components/IntrospectPanel";
 import PasteboardPanel from "./components/PasteboardPanel";
 import AperturePanel from "./components/AperturePanel";
@@ -744,6 +745,7 @@ export default function App() {
           />
           <AttributionHealthPanel health={state.attributionHealth} />
           <TccSentinelPanel sentinel={state.tccSentinel} anomalies={state.tccAnomalies} />
+          <EgressBeaconPanel beacons={state.egressBeacons} />
           <IntrospectPanel
             status={state.introspect}
             alerts={state.introspectAlerts}

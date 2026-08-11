@@ -464,15 +464,15 @@ describe("the pixel-free ledger is complete and current", () => {
     // understates the population by the whole NO_OP_CASES set.
     const total = pixelFree.length + noOpScan().noOp.length;
     const sites = siteCount(pixelFree) + siteCount(noOpScan().noOp);
-    expect(pixelFree.length).toBe(115);
-    expect(siteCount(pixelFree)).toBe(131);
+    expect(pixelFree.length).toBe(114);
+    expect(siteCount(pixelFree)).toBe(130);
     expect(noOpScan().noOp.length).toBe(9);
     expect(siteCount(noOpScan().noOp)).toBe(14);
-    expect(total).toBe(124);
-    expect(sites).toBe(145);
+    expect(total).toBe(123);
+    expect(sites).toBe(144);
     expect(emitted.length).toBe(294);
     expect(scan.sites.length).toBe(395);
-    expect(Math.round((total / emitted.length) * 1000) / 10).toBe(42.2);
+    expect(Math.round((total / emitted.length) * 1000) / 10).toBe(41.8);
   });
 
   /* A ledger line saying "deliberate" is a claim by whoever edited the ledger. The

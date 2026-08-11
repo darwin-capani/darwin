@@ -606,10 +606,10 @@ fn resolve_root() -> PathBuf {
 // ---------------------------------------------------------------------------
 
 /// The sensitive SQLite stores that whole-file SQLCipher encryption covers, as paths
-/// under `state/` — SEVEN of them, matching the array length below (the doc said
+/// under `state/` — EIGHT of them, matching the array length below (the doc said
 /// "four" while the signature already returned 7). The migration on enable re-keys
 /// each existing one.
-fn sensitive_db_paths(state_dir: &Path) -> [PathBuf; 7] {
+fn sensitive_db_paths(state_dir: &Path) -> [PathBuf; 8] {
     [
         state_dir.join("darwin.db"),            // memory.rs main Db
         state_dir.join("docsearch.db"),         // docsearch.rs
@@ -624,6 +624,11 @@ fn sensitive_db_paths(state_dir: &Path) -> [PathBuf; 7] {
         // the same failure. Every path opened with the key must also be migrated by it.
         state_dir.join("tcc_baseline.db"),        // tcc.rs ambient sentinel baseline
         state_dir.join("persistence_baseline.db"), // persistence.rs sentinel baseline
+        // The egress sentinel's durable talker baseline (egress_beacon.rs) — the
+        // third sentinel baseline, opened with the key like its two siblings and
+        // therefore migrated with them (every_keyed_open_is_covered_by_the_
+        // migration_list is the guard that would catch its absence).
+        state_dir.join("egress_baseline.db"),
     ]
 }
 
@@ -735,6 +740,20 @@ fn open_persistence_baseline(
     match key {
         Some(k) => persistence::PersistenceBaseline::open_encrypted(path, k),
         None => persistence::PersistenceBaseline::open(path),
+    }
+}
+
+/// Open the egress sentinel's durable talker baseline honoring the resolved
+/// encryption state (same plaintext/SQLCipher seam as the TCC / Persistence
+/// baselines — and, like them, its path is in `sensitive_db_paths` so enabling
+/// [security].encrypt_memory migrates it instead of crash-looping on it).
+fn open_egress_baseline(
+    path: &Path,
+    key: Option<&crypto::SecretKey>,
+) -> Result<egress_beacon::EgressBaselineDb> {
+    match key {
+        Some(k) => egress_beacon::EgressBaselineDb::open_encrypted(path, k),
+        None => egress_beacon::EgressBaselineDb::open(path),
     }
 }
 
@@ -3385,7 +3404,25 @@ async fn main() -> Result<()> {
     // loop never mutates the firewall. Ships ON ([egress].enabled). UID-scoped:
     // unprivileged lsof sees only same-UID processes (stated in every frame).
     if cfg.egress.enabled {
-        tokio::spawn(egress_beacon::run_task(cfg.clone()));
+        // The durable talker baseline (state/egress_baseline.db) is what makes
+        // egress.newhost a statement about the NETWORK rather than about daemon
+        // uptime: without it every restart re-called the owner's ordinary
+        // traffic first-seen. Unlike the two sibling baselines above it is a
+        // rebuildable observation CACHE, not a ledger, so an unreadable file
+        // degrades (warn + this run stays in-memory with a silent first-tick
+        // seed — exactly the pre-persistence behaviour) instead of `?`-wedging
+        // startup into a launchd crash loop over a cache.
+        let egress_baseline = match open_egress_baseline(
+            &state_dir.join("egress_baseline.db"),
+            master_key.as_ref(),
+        ) {
+            Ok(db) => Some(Arc::new(db)),
+            Err(e) => {
+                warn!(error = %e, "egress: baseline store failed to open; using an in-memory baseline this session");
+                None
+            }
+        };
+        tokio::spawn(egress_beacon::run_task(cfg.clone(), egress_baseline));
     }
     // Ambient CAPABILITY-HEALTH loop: a slow, READ-ONLY periodic pass over the
     // optimizer's own trace corpus that emits the PROPOSE-ONLY `attribution.health`
@@ -6352,12 +6389,12 @@ mod encryption_migration_tests {
     }
 
     #[test]
-    fn the_two_sentinel_baselines_are_in_the_list() {
+    fn the_sentinel_baselines_are_in_the_list() {
         let names: Vec<String> = sensitive_db_paths(Path::new("/S"))
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        for want in ["tcc_baseline.db", "persistence_baseline.db"] {
+        for want in ["tcc_baseline.db", "persistence_baseline.db", "egress_baseline.db"] {
             assert!(
                 names.iter().any(|n| n == want),
                 "{want} is opened with the key but not migrated; got {names:?}"
