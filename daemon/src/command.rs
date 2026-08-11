@@ -1956,6 +1956,7 @@ pub async fn dismiss_forge_marker(memory: &crate::memory::Memory, _root: &Path, 
         Ok(Some(current)) if current == ts.to_string() => {
             match memory.delete_fact("meta.forge_pending").await {
                 Ok(_) => {
+                    // PIXEL-FREE(diagnostic): returns 'Dismissed the forge proposal {ts}.' to the user; reply delivers it; stream record
                     telemetry::emit("system", "forge.dismissed", json!({"ts": ts}));
                     format!("Dismissed the forge proposal {ts}. (It was not deployed; apply stays scripts/apply_forge.sh.)")
                 }

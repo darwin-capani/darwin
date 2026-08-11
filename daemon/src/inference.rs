@@ -986,6 +986,7 @@ pub async fn liveness_task(socket_path: PathBuf, interval: Duration) {
         let now = chrono::Utc::now().timestamp();
         let was_reachable = record_probe(ok, now);
         let snap = health_snapshot();
+        // PIXEL-FREE(diagnostic): the background liveness snapshot on a cadence; documented in docs/BRINGUP.md; log/stream is the surface
         crate::telemetry::emit(
             "system",
             "inference.health",
@@ -1001,6 +1002,7 @@ pub async fn liveness_task(socket_path: PathBuf, interval: Duration) {
                 consecutive_failures = snap.consecutive_failures,
                 "inference server became UNREACHABLE — running degraded (local turns will abort honestly until it returns)"
             );
+            // PIXEL-FREE(diagnostic): paired warn! 'inference server became UNREACHABLE'; documented in docs/BRINGUP.md; log is the surface
             crate::telemetry::emit(
                 "system",
                 "inference.degraded",
@@ -1008,6 +1010,7 @@ pub async fn liveness_task(socket_path: PathBuf, interval: Duration) {
             );
         } else if !was_reachable && ok {
             info!("inference server is reachable again — degraded mode cleared");
+            // PIXEL-FREE(diagnostic): paired info! 'inference server is reachable again'; documented in docs/BRINGUP.md; log is the surface
             crate::telemetry::emit(
                 "system",
                 "inference.recovered",

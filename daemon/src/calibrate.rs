@@ -523,6 +523,7 @@ fn round3(x: f64) -> f64 {
 
 /// Emit one `calibrate.report` frame from a reliability curve.
 pub fn emit_report(rel: &Reliability) {
+    // PIXEL-FREE(diagnostic): an internal reliability-curve report for calibration eval; the stream/log is the surface
     telemetry::emit("system", "calibrate.report", report_json(rel));
 }
 

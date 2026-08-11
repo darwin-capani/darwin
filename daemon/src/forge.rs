@@ -683,6 +683,7 @@ async fn run_attempt(
     brain: &dyn ForgeBrain,
     goal: &str,
 ) -> AttemptResult {
+    // PIXEL-FREE(diagnostic): forge pipeline lifecycle; the draft lands on the changeq review surface; stream/log trace
     telemetry::emit("system", "forge.drafting", json!({"ts": ts, "goal": goal}));
 
     // (2) Draft.
@@ -1240,6 +1241,7 @@ pub async fn forge_draft(
 ) -> ForgeOutcome {
     let action = forge_action(enabled, mode);
     if action == ForgeAction::Disabled {
+        // PIXEL-FREE(diagnostic): the whole forge pipeline is inert (forge.enabled = false); reason-only; stream trace
         // No draft, no stage, no propose — the whole pipeline is inert.
         telemetry::emit("system", "forge.suppressed", json!({"reason": "forge.enabled = false"}));
         return ForgeOutcome::Disabled;
@@ -1314,6 +1316,7 @@ pub async fn forge_draft(
             ForgeOutcome::Rejected { stage, dir }
         }
         AttemptResult::Aborted { stage } => {
+            // PIXEL-FREE(diagnostic): forge draft aborted at a stage; paired with warn! nearby; stream/log lifecycle trace
             telemetry::emit("system", "forge.aborted", json!({"ts": ts, "stage": stage}));
             ForgeOutcome::Aborted { stage }
         }

@@ -2819,6 +2819,7 @@ async fn relay_line(
                     false
                 }
             };
+            // PIXEL-FREE(diagnostic): a tool-answered breadcrumb; HUD/audit have no consumer (pinned by silent-drops.test.ts); stream only
             telemetry::emit(
                 "system",
                 "app.result",

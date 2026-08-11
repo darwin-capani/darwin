@@ -322,6 +322,7 @@ pub async fn forge_gap_task(
             // the human clears meta.forge_pending (cleared branch below) or the
             // gap clears (None branch above).
             if !in_burst {
+                // PIXEL-FREE(diagnostic): emitted once-ish for visibility while a gap is suppressed; the eventual proposal lands on changeq
                 telemetry::emit(
                     "system",
                     "forge_gap.blocked",
@@ -347,6 +348,7 @@ pub async fn forge_gap_task(
             }
         };
         if !attempt_allowed(last.as_deref(), ts) {
+            // PIXEL-FREE(diagnostic): emitted once-ish for visibility while a gap is suppressed; the eventual proposal lands on changeq
             telemetry::emit(
                 "system",
                 "forge_gap.blocked",
@@ -367,6 +369,7 @@ pub async fn forge_gap_task(
         }
 
         let goal = synthesize_goal(&signal);
+        // PIXEL-FREE(diagnostic): a gap was detected and a goal synthesized; the resulting proposal lands on changeq; stream trace
         telemetry::emit(
             "system",
             "forge_gap.detected",

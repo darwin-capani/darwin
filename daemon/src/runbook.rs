@@ -958,6 +958,7 @@ pub fn emit_plan(plan: &Plan) {
             })
         })
         .collect();
+    // PIXEL-FREE(diagnostic): a runbook DAG plan (capability names, never values); operator-stream record of a benign-only automation
     crate::telemetry::emit(
         "system",
         "runbook.plan",
@@ -1187,6 +1188,7 @@ pub async fn run(rb: &Runbook, reg: &Registry, router: &dyn RunbookRouter) -> Ru
 /// wrapper; called by the eventual `runbook_run` op wiring.
 pub fn emit_run(report: &RunReport) {
     let count = |o: RunOutcome| report.steps.iter().filter(|s| s.outcome == o).count();
+    // PIXEL-FREE(diagnostic): a per-step run report (capabilities + outcomes, never values); operator-stream record
     crate::telemetry::emit(
         "system",
         "runbook.run",

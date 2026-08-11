@@ -280,6 +280,7 @@ pub async fn route(
     if !crate::voiceid::current_turn_gate().allow_noncly() {
         let prime = agents.orchestrator();
         emit_agent_active(prime);
+        // PIXEL-FREE(diagnostic): an owner-scope gate refusal; the turn's reply states it; operator-stream security record
         telemetry::emit("system", "voiceid.denied", json!({"phase": "all_scope"}));
         return Ok(RouteOutcome {
             routed_to: "local",
@@ -305,6 +306,7 @@ pub async fn route(
     // byte-for-byte today's.
     if crate::threshold::is_guest_turn() {
         if let Some(category) = guest_denied_fast_path(text, cfg) {
+            // PIXEL-FREE(diagnostic): guest-scope fast-path refusal; the honest message is spoken back; operator-stream security record
             telemetry::emit("local", "threshold.fast_path_refused", json!({"category": category}));
             let prime = agents.orchestrator();
             emit_agent_active(prime);
@@ -335,6 +337,7 @@ pub async fn route(
     // hit we apply the rule (which itself refuses if the layer is disabled or the
     // master ceiling would be exceeded at evaluate time) and SPEAK an honest ack.
     if let Some(ack) = crate::policy::handle_user_policy_text(text) {
+        // PIXEL-FREE(diagnostic): a spoken policy command; an honest ack is SPOKEN back to the user; operator-stream record
         telemetry::emit("system", "policy.user_set", json!({"via": "voice"}));
         let prime = agents.orchestrator();
         emit_agent_active(prime);
@@ -399,6 +402,7 @@ pub async fn route(
     // voice-id all-scope gate, so an unrecognized bystander cannot flip it.
     if let Some(cmd) = crate::prosody::parse_whisper_command(text) {
         let now_on = crate::prosody::apply_command_global(cfg, cmd);
+        // PIXEL-FREE(diagnostic): toggles whisper mode after the owner voice-id gate; the toggle is applied and acked; stream record
         telemetry::emit(
             "system",
             "voice.whisper_command",
@@ -591,6 +595,7 @@ pub async fn route(
         };
         // SECRET-FREE telemetry: the verb + the gate only — never the recalled
         // (already-redacted) app/title text.
+        // PIXEL-FREE(diagnostic): SECRET-FREE verb+gate only (never the recalled text); the command is acted on and the reply is the surface
         telemetry::emit(
             "system",
             "aperture.command",
@@ -710,6 +715,7 @@ pub async fn route(
         };
         // SECRET-FREE telemetry: the verb + the gate only — never the recalled
         // (already-redacted) clip text.
+        // PIXEL-FREE(diagnostic): SECRET-FREE verb+gate only (never the recalled clip text); the command is acted on and the reply is the surface
         telemetry::emit(
             "system",
             "pasteboard.command",
@@ -1041,6 +1047,7 @@ pub async fn route(
                 }
             };
             emit_agent_active(jerome);
+            // PIXEL-FREE(diagnostic): a start breadcrumb; the audible track (music.generated) and the reply are the surfaces
             telemetry::emit("system", "music.intent", json!({}));
             // Fire-and-forget the (genuinely non-Send) generation on its own thread,
             // reusing the command channel's Send-safe wrapper. Part 1 plays the track
@@ -1394,6 +1401,7 @@ pub async fn route(
             // autonomy — ask, never guess. Voiced by the orchestrator; nothing is
             // established, queried, or fired. The next turn's explicit answer
             // routes deterministically (hard cue or plain one-shot).
+            // PIXEL-FREE(diagnostic): an ambiguity question VOICED by the orchestrator; the spoken question is the surface
             telemetry::emit("local", "selector.clarify", json!({"question": question}));
             let prime = agents.orchestrator();
             emit_agent_active(prime);
@@ -1406,6 +1414,7 @@ pub async fn route(
             });
         }
         crate::selector::Selection::Route(mode) => {
+            // PIXEL-FREE(diagnostic): the routing mode selected for the turn; an internal routing trace for the stream
             telemetry::emit("local", "selector.mode", json!({"mode": mode.as_str()}));
             // THRESHOLD — GUEST MODE: the capability modes (World read/fold, a NOW
             // multi-step mission, a standing-mission setup) either READ the owner's
@@ -2210,6 +2219,7 @@ async fn roll_call(
 ) -> (String, speech::SpeakReport) {
     // Fresh run: clear any stale cancel from a previous, interrupted roll-call.
     ROLL_CALL_CANCEL.store(false, Ordering::Relaxed);
+    // PIXEL-FREE(diagnostic): roll-call is a SPOKEN feature (agents introduce themselves aloud); the speech is the surface
     telemetry::emit(
         "local",
         "rollcall.started",
@@ -2224,6 +2234,7 @@ async fn roll_call(
     for agent in agents.all() {
         if ROLL_CALL_CANCEL.load(Ordering::Relaxed) {
             info!("roll-call interrupted; stopping after {} agents", spoken_intros.len());
+            // PIXEL-FREE(diagnostic): paired info! 'roll-call interrupted'; roll-call is spoken; the speech is the surface
             telemetry::emit(
                 "local",
                 "rollcall.interrupted",
@@ -2269,6 +2280,7 @@ async fn roll_call(
         tokio::task::yield_now().await;
     }
 
+    // PIXEL-FREE(diagnostic): roll-call is a SPOKEN feature; the agents' spoken intros are the surface; stream record
     telemetry::emit(
         "local",
         "rollcall.completed",
@@ -2742,6 +2754,7 @@ async fn route_capability(
             emit_agent_active(prime);
             let (response, parked) =
                 anthropic::propose_standing_mission(text, &prime.namespace, &prime.tools, memory).await;
+            // PIXEL-FREE(diagnostic): proposes a standing mission; the spoken response is the surface; stream record
             telemetry::emit(
                 "local",
                 "selector.standing_proposed",
@@ -2840,6 +2853,7 @@ async fn handle_runbook_command(
 ) -> String {
     use crate::runbook::RunbookCommand;
     if !cfg.runbook.enabled {
+        // PIXEL-FREE(diagnostic): returns 'Runbooks are off ([runbook].enabled = false)' to the user; refusal delivered in the reply
         telemetry::emit("system", "runbook.blocked", json!({"reason": "disabled"}));
         return "Runbooks are off ([runbook].enabled = false), sir — I'm not planning or \
                 running any."
@@ -3119,6 +3133,7 @@ async fn handle_undo_command(cmd: crate::journal::UndoCommand, memory: &Memory) 
                 format!("I can't undo the last action — {why}.")
             }
             UndoPrep::Ready { seq, agent, tool, input, allowed, note, pending_id } => {
+                // PIXEL-FREE(diagnostic): an undo was armed and executed on 'undo that'; the user hears the spoken outcome; no undo chip exists
                 telemetry::emit(
                     "system",
                     "undo.armed",
@@ -3430,6 +3445,7 @@ fn enforce_tool<'a>(agents: &'a AgentRegistry, agent: &'a Agent, intent: &str) -
         tool = intent,
         "tool outside agent allowlist; re-routing to the owning agent"
     );
+    // PIXEL-FREE(diagnostic): paired warn! 'tool outside agent allowlist; re-routing to the owning agent'; the log is the surface
     telemetry::emit(
         "local",
         "agent.reroute",
@@ -3695,6 +3711,7 @@ async fn handle_local(
     // NO write. On the owner path (no scope installed) this is a no-op and handling
     // is byte-for-byte today's.
     if crate::threshold::is_guest_turn() && !matches!(intent, "conversation" | "system.query") {
+        // PIXEL-FREE(diagnostic): guest-scope local-intent refusal; the honest message is returned; operator-stream security record
         telemetry::emit(
             "local",
             "threshold.local_refused",
@@ -4162,6 +4179,7 @@ async fn handle_lumen(
             let op = op_read_screen(None);
             let data = match apps::send_op(app_registry, VISION_APP, &op).await {
                 Ok(()) => {
+                    // PIXEL-FREE(diagnostic): content-free forward+ack of a screen read; the Vision relay carries the content; stream record
                     telemetry::emit(
                         "system",
                         "lumen.read",
@@ -4184,6 +4202,7 @@ async fn handle_lumen(
             let controls = crate::lumen::snapshot_controls();
             let resolved = crate::lumen::resolve_voice_action(&phrase, &controls);
             // SECRET-FREE telemetry (control count + selected + refusal class only).
+            // PIXEL-FREE(diagnostic): SECRET-FREE control count+selected+refusal class only; the action's effect is the surface
             telemetry::emit(
                 "system",
                 "lumen.action",
@@ -8663,6 +8682,7 @@ async fn handle_identify_sound(
                             // (the app emits {label,confidence} only; the audio never
                             // leaves the device). This event carries NO audio, NO clip
                             // samples, NO path — just that the on-device classify ran.
+                            // PIXEL-FREE(diagnostic): records ONLY that the on-device sound classify ran (no audio/clip/path); the classes ride the vision.sound relay
                             telemetry::emit(
                                 "local",
                                 "audio.sound",

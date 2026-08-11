@@ -637,6 +637,7 @@ pub async fn create(memory: &Memory, goal: &str, schedule: Schedule) -> Result<S
     // no pixel. The user is told at the moment that matters — the confirm they just
     // gave, and the spoken ack this call returns into.
     if let Some(frame) = tripwire_armed_telemetry(&mission) {
+        // PIXEL-FREE(diagnostic): the user is told by the confirm they just gave and the spoken ack this call returns; journal record
         crate::telemetry::emit("system", "standing.tripwire_armed", frame);
     }
     Ok(mission)

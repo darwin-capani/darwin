@@ -531,6 +531,7 @@ pub fn verdict_frame(app: &str, pin: &PinState) -> Option<(&'static str, Value)>
 /// wiring called from the app launch path.
 pub fn emit_verdict(app: &str, pin: &PinState) {
     if let Some((event, data)) = verdict_frame(app, pin) {
+        // PIXEL-FREE(diagnostic): an app-pin verify verdict emitted on the launch path (no-op if unpinned); operator-stream security record
         crate::telemetry::emit("system", event, data);
     }
 }
@@ -638,6 +639,7 @@ pub async fn env_build(
             let message = env_build_egress_refusal(user_originated)
                 .unwrap_or_else(|| "env_build refused".to_string());
             warn!(app = app_name, "envlock: refusing a non-user-originated env_build (egress gate)");
+            // PIXEL-FREE(diagnostic): paired warn! 'refusing a non-user-originated env_build (egress gate)'; log/reply are the surface
             crate::telemetry::emit(
                 "system",
                 "envlock.build_refused",
@@ -670,6 +672,7 @@ pub async fn env_build(
     match materialize_closure(project_root, &lock).await {
         Ok(()) => {
             info!(app = app_name, hash = %lock.closure_hash, "envlock: closure materialized + verified");
+            // PIXEL-FREE(diagnostic): paired info! 'closure materialized + verified' (app, hash); the log is the surface
             crate::telemetry::emit(
                 "system",
                 "envlock.built",

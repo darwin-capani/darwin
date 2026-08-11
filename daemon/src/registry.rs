@@ -731,6 +731,7 @@ pub fn ev_status(verify: bool, require_rebuild_match: bool, signer_count: usize)
 pub fn announce_status(verify: bool, require_rebuild_match: bool, signers: &BTreeMap<String, String>) {
     let allowlist = SignerAllowlist::from_config(signers);
     let (event, payload) = ev_status(verify, require_rebuild_match, allowlist.len());
+    // PIXEL-FREE(diagnostic): plugin-registry policy (secret-free); paired tracing::info!; operator-stream security record
     telemetry::emit("system", event, payload);
     tracing::info!(
         verify,
@@ -838,6 +839,7 @@ pub async fn run_verification(
         require_rebuild_match,
     );
     let (event, payload) = ev_verdict(&attestation.plugin_id, &admission, &attestation.signer_key_id);
+    // PIXEL-FREE(diagnostic): a plugin admission verdict (secret-free); operator-stream security record
     telemetry::emit("system", event, payload);
     admission
 }
@@ -908,6 +910,7 @@ pub fn deploy_install_gate(
         .and_then(|n| n.to_str())
         .unwrap_or("<app>");
     let (event, payload) = ev_install_gate(app, &gate);
+    // PIXEL-FREE(diagnostic): a plugin install-gate decision (secret-free); operator-stream security record
     telemetry::emit("system", event, payload);
     gate
 }

@@ -394,6 +394,7 @@ pub fn guest_telemetry(decision: &GuestDecision) -> serde_json::Value {
 /// reply, and a per-turn banner announcing "a guest is speaking" to whoever is at
 /// the machine is a surface to add on purpose, not by wiring up a stray frame.
 pub fn emit_guest(decision: &GuestDecision) {
+    // PIXEL-FREE(diagnostic): guest posture is enforced by the gates and stated in the turn's reply; a banner is a deliberate future surface
     crate::telemetry::emit("threshold", "threshold.guest", guest_telemetry(decision));
 }
 

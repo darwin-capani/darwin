@@ -1103,6 +1103,7 @@ async fn retention_task(
                 Ok(0) => {}
                 Ok(entries_deleted) => {
                     info!(entries_deleted, "research-notebook retention pass evicted oldest entries");
+                    // PIXEL-FREE(diagnostic): paired info! 'research-notebook retention pass evicted oldest entries' (count); the log is the surface
                     telemetry::emit(
                         "system",
                         "notebook.retention",
@@ -1927,6 +1928,7 @@ async fn standing_task(root: PathBuf, cfg: Arc<Config>, memory: Arc<Memory>, soc
             // operator's live stream and the journal, where the WHY is the whole
             // value of a mission that fired without a clock.
             if is_tripwire {
+                // PIXEL-FREE(diagnostic): a mission fired from a tripwire not a clock; the HUD sees the mission's own run frames; journal holds the WHY
                 telemetry::emit(
                     "agent.fury",
                     "standing.tripwire",
@@ -2883,6 +2885,7 @@ async fn main() -> Result<()> {
             "interval_secs": cfg.screen_context.effective_interval_secs(),
         }),
     );
+    // PIXEL-FREE(diagnostic): narration opt-in gate; darwin.toml [lumen] is authoritative; operator-stream startup snapshot only
     telemetry::emit(
         "system",
         "lumen.configured",
@@ -2890,6 +2893,7 @@ async fn main() -> Result<()> {
         // content).
         lumen::status_frame(cfg.lumen.narrate),
     );
+    // PIXEL-FREE(diagnostic): semantic-pasteboard gate+bounds; twin of the rendered pasteboard.status; darwin.toml [pasteboard] is authoritative
     telemetry::emit(
         "system",
         "pasteboard.configured",
@@ -2899,6 +2903,7 @@ async fn main() -> Result<()> {
             "poll_interval_secs": cfg.pasteboard.effective_poll_interval_secs(),
         }),
     );
+    // PIXEL-FREE(diagnostic): activity-timeline gate+bounds; the rendered pixel is aperture.status and darwin.toml [aperture] is authoritative
     telemetry::emit(
         "system",
         "aperture.configured",
@@ -2916,6 +2921,7 @@ async fn main() -> Result<()> {
     // said "for the HUD" and there is no `runbook.status` case in `applyEnvelope`
     // — the frame reaches no pixel. Kept for the operator's live stream; the
     // subsystem ships OFF, so the honest surface for "is it on" is darwin.toml.
+    // PIXEL-FREE(diagnostic): automation-DAG master gate+step bound; ships OFF; darwin.toml [runbook] is the honest surface
     telemetry::emit(
         "system",
         "runbook.status",
@@ -2974,6 +2980,7 @@ async fn main() -> Result<()> {
     // `security.status` (emitted a few lines above), whose panel already states
     // whether the key resolved. Left emitting for the operator's live stream
     // rather than wired to a second indicator saying the same thing.
+    // PIXEL-FREE(diagnostic): hardware-custody posture; the rendered pixel is security.status (states whether the key resolved), this is the stream copy
     telemetry::emit("system", "enclave.status", enclave::status_frame(&enclave_custody));
     // SKILLS MARKETPLACE status (secret-free): the hand-written in-tree skill
     // catalog the HUD Skills panel browses — every skill's name, category,
@@ -3022,6 +3029,7 @@ async fn main() -> Result<()> {
     // endpoint on 127.0.0.1:[dls].port. STRICTLY READ-ONLY + LOOPBACK: it never
     // writes config and takes no action; it only assists a human editing DARWIN's
     // config/manifests.
+    // PIXEL-FREE(diagnostic): config-assistant LSP gate+port (read-only/loopback); darwin.toml [dls] is authoritative; startup snapshot
     telemetry::emit("system", "dls.status", dls::status_frame(&cfg.dls));
     if cfg.dls.enabled {
         let dls_cfg = cfg.clone();
@@ -3166,6 +3174,7 @@ async fn main() -> Result<()> {
         // succeeded/failed is observable.
         let command_token = apps::mint_command_token();
         let token_written = command::write_command_token(&root, &command_token);
+        // PIXEL-FREE(diagnostic): the deliberate observability signal for command-channel bring-up (socket path + token handoff ok); stream only
         telemetry::emit(
             "system",
             "command.channel_up",
@@ -3484,6 +3493,7 @@ async fn main() -> Result<()> {
             cloud_key_present,
             "daemon ready (lazy-connect resilient: startup is not gated on inference)"
         );
+        // PIXEL-FREE(diagnostic): paired info! 'daemon ready ...' with inference reachability; documented in docs/BRINGUP.md; log is the surface
         telemetry::emit("system", "daemon.ready", ready);
     }
 
@@ -3554,6 +3564,7 @@ async fn main() -> Result<()> {
             }
             Err(e) => {
                 warn!(app = %name, error = %e, "autostart skipped");
+                // PIXEL-FREE(diagnostic): paired warn! 'autostart skipped' with the app+error; a failure trace for the log
                 telemetry::emit(
                     "system",
                     "app.autostart_failed",
@@ -3601,6 +3612,7 @@ async fn main() -> Result<()> {
         match apps::send_op(&app_registry, "vision", &op_line).await {
             Ok(()) => {
                 info!(interval_secs = interval, "started continuous screen-context loop (#42)");
+                // PIXEL-FREE(diagnostic): paired info! 'started continuous screen-context loop (#42)'; the pixel is screen_context.watching
                 telemetry::emit(
                     "system",
                     "screen_context.loop_started",
@@ -3616,6 +3628,7 @@ async fn main() -> Result<()> {
                     armed,
                     "screen-context loop armed; it starts when Vision connects"
                 );
+                // PIXEL-FREE(diagnostic): paired info! 'screen-context loop armed; it starts when Vision connects'; the log is the surface
                 telemetry::emit(
                     "system",
                     "screen_context.loop_armed",
@@ -3634,6 +3647,7 @@ async fn main() -> Result<()> {
         let interval = cfg.pasteboard.effective_poll_interval_secs();
         tokio::spawn(pasteboard::poll_loop(interval));
         info!(poll_interval_secs = interval, "started semantic-pasteboard poll loop");
+        // PIXEL-FREE(diagnostic): paired info! 'started semantic-pasteboard poll loop'; the log is the surface, the pixel is pasteboard.status
         telemetry::emit(
             "system",
             "pasteboard.loop_started",
@@ -3651,6 +3665,7 @@ async fn main() -> Result<()> {
         let interval = cfg.aperture.effective_poll_interval_secs();
         tokio::spawn(aperture::poll_loop(interval));
         info!(poll_interval_secs = interval, "started aperture activity-timeline poll loop");
+        // PIXEL-FREE(diagnostic): paired info! 'started aperture activity-timeline poll loop'; the log is the surface, the pixel is aperture.status
         telemetry::emit(
             "system",
             "aperture.loop_started",
@@ -3846,6 +3861,7 @@ async fn run_pipeline(
     let queue_ms = queue_wait.map(|w| w.as_millis() as u64).unwrap_or(0);
     if is_stale_wait(queue_wait) {
         info!(path = %wav_str, waited_ms = queue_ms, "utterance waited out a long in-flight turn; discarding as stale");
+        // PIXEL-FREE(diagnostic): paired info! 'utterance waited out a long in-flight turn; discarding as stale'; the log is the surface
         telemetry::emit(
             "audio",
             "utterance.stale",
@@ -3948,6 +3964,7 @@ async fn run_pipeline(
     // (it only self-clears an expired slot).
     if !crate::confirm::is_live(std::time::Instant::now()) && is_self_echo(&text, last_reply) {
         info!(text = %text, "dropping implausible/self-echo transcript before route");
+        // PIXEL-FREE(diagnostic): paired info! 'dropping implausible/self-echo transcript before route' (text); the log is the surface
         telemetry::emit(
             "audio",
             "utterance.self_echo",
@@ -4555,6 +4572,7 @@ async fn run_pipeline(
                 );
             }
             if transient {
+                // PIXEL-FREE(diagnostic): records the privacy-preserving decision that a screen-read turn was NOT persisted; stream record
                 telemetry::emit(
                     "system",
                     "privacy.transient_screen_read",
@@ -4677,6 +4695,7 @@ async fn run_pipeline(
                             .label_outcome(prior.trace_id, optimize::Outcome::CorrectedNextTurn)
                             .await
                         {
+                            // PIXEL-FREE(diagnostic): labels a prior trace CorrectedNextTurn for offline optimize eval; the trace store is the surface
                             Ok(n) => telemetry::emit(
                                 "system",
                                 "optimize.trace_corrected",
@@ -5048,6 +5067,7 @@ fn handle_voice_id(
             // voice-id goes OFF, and the speaker gains the full owner scope on the
             // next turn (defeating threshold's can't-un-scope rail).
             if enrolled && !is_verified_owner {
+                // PIXEL-FREE(diagnostic): forget refused for an unverified speaker (anti-un-scope); the reply states it; security record
                 telemetry::emit(
                     "system",
                     "voiceid.forget_refused",
@@ -5087,6 +5107,7 @@ fn handle_voice_id(
             // bystander takes over the owner identity. The first enroll (unenrolled)
             // is open (that is how the owner is bootstrapped).
             if enrolled && !is_verified_owner {
+                // PIXEL-FREE(diagnostic): re-enroll refused for an unverified speaker (anti-takeover); the reply states it; security record
                 telemetry::emit(
                     "system",
                     "voiceid.enroll_refused",
@@ -5225,6 +5246,7 @@ async fn handle_voice_clone(
         if !voiceclone::is_confirmation(text) {
             // Fail-safe: anything that is not a clear yes cancels — the audio never
             // leaves the device.
+            // PIXEL-FREE(diagnostic): fail-safe cancel: anything not a clear yes cancels; the reply says so; agent slot only
             telemetry::emit("system", "voiceclone.cancelled", json!({"agent": agent}));
             return Some(
                 "Cancelled — I won't clone your voice. Nothing left the device.".to_string(),
@@ -5235,6 +5257,7 @@ async fn handle_voice_clone(
         // it. With no key the clone fails cleanly and the user keeps their voice.
         let key = crate::integrations::resolve_secret(voice_tier::ELEVENLABS_ACCOUNT).await;
         let Some(key) = key else {
+            // PIXEL-FREE(diagnostic): the clone fails cleanly and the user keeps their voice; agent slot only; stream record
             telemetry::emit("system", "voiceclone.no_key", json!({"agent": agent}));
             return Some(
                 "I can't clone your voice without an ElevenLabs key — add one in Settings. \
@@ -5256,6 +5279,7 @@ async fn handle_voice_clone(
                     );
                 }
                 // Telemetry: the AGENT slot only — NEVER the voice id, never the key.
+                // PIXEL-FREE(diagnostic): the clone result is returned to the user; agent slot only (never the voice id/key); stream record
                 telemetry::emit("system", "voiceclone.cloned", json!({"agent": agent}));
                 Some(
                     "Your voice is cloned and saved. With the cloud voice tier on, that agent \
@@ -5266,6 +5290,7 @@ async fn handle_voice_clone(
             }
             Err(e) => {
                 warn!(error = %e, "voice-clone: clone_voice failed");
+                // PIXEL-FREE(diagnostic): paired warn! 'clone_voice failed'; the failure is returned to the user; agent slot only
                 telemetry::emit("system", "voiceclone.failed", json!({"agent": agent}));
                 Some(
                     "I couldn't clone your voice just now — the cloud clone didn't go through. \
@@ -5285,6 +5310,7 @@ async fn handle_voice_clone(
                         warn!(error = %e, "voice-clone: failed to persist after forget");
                     }
                 }
+                // PIXEL-FREE(diagnostic): the forget outcome is returned to the user; carries only whether a clone existed; stream record
                 telemetry::emit("system", "voiceclone.forgot", json!({"had_clone": had}));
                 Some(if had {
                     "Done — I've forgotten your cloned voice. That agent falls back to its \
@@ -5317,6 +5343,7 @@ async fn handle_voice_clone(
                     sample,
                     agent: "darwin".to_string(),
                 };
+                // PIXEL-FREE(diagnostic): a spoken consent prompt is returned to the user; agent slot only; stream record
                 telemetry::emit("system", "voiceclone.proposed", json!({"agent": "darwin"}));
                 Some(voiceclone::consent_prompt(&display))
             }
@@ -5361,6 +5388,7 @@ async fn trigger_sound_effect(
         // sfx_enabled(cfg, key_present=false) == false: honest unavailable, no on-device
         // SFX generator to fall back to.
         debug_assert!(!voice_tier::sfx_enabled(cfg, false));
+        // PIXEL-FREE(diagnostic): the missing-key error is returned to the user in the reply; empty payload; stream record
         telemetry::emit("system", "sfx.no_key", json!({}));
         return Err("I can't generate sound effects without an ElevenLabs key — add one in \
                     Settings. There's no on-device sound generator."
@@ -5372,11 +5400,13 @@ async fn trigger_sound_effect(
         .await
     {
         Ok(path) => {
+            // PIXEL-FREE(diagnostic): the sound effect is produced and returned to the caller; empty payload; stream record
             telemetry::emit("system", "sfx.generated", json!({}));
             Ok(path)
         }
         Err(e) => {
             warn!(error = %e, "sound-effect: sound_effect op failed");
+            // PIXEL-FREE(diagnostic): paired warn! 'sound_effect op failed'; the failure is returned in the reply; stream record
             telemetry::emit("system", "sfx.failed", json!({}));
             Err("I couldn't generate that sound effect just now — the cloud cue didn't go \
                  through. Nothing was produced."
@@ -5423,6 +5453,7 @@ async fn trigger_compose_music(
         // music_enabled(cfg, key_present=false) == false: honest unavailable, no
         // on-device music generator to fall back to.
         debug_assert!(!voice_tier::music_enabled(cfg, false));
+        // PIXEL-FREE(diagnostic): the missing-key error is returned to the user in the reply; empty payload; stream record
         telemetry::emit("system", "music.no_key", json!({}));
         return Err("I can't compose music without an ElevenLabs key — add one in Settings. \
                     There's no on-device music generator."
@@ -5431,6 +5462,7 @@ async fn trigger_compose_music(
     debug_assert!(voice_tier::music_enabled(cfg, true), "gate must be open here");
     match infer.compose_music(prompt, &key, length_ms).await {
         Ok(path) => {
+            // PIXEL-FREE(diagnostic): the composed track is PLAYED for the user and the reply confirms it; empty payload; stream record
             telemetry::emit("system", "music.generated", json!({}));
             // PART 1: actually PLAY the composed track so the user HEARS it.
             // Fire-and-forget on the SEPARATE music sink (not the speech Session):
@@ -5442,6 +5474,7 @@ async fn trigger_compose_music(
         }
         Err(e) => {
             warn!(error = %e, "compose-music: compose_music op failed");
+            // PIXEL-FREE(diagnostic): paired warn! 'compose_music op failed'; the failure is returned in the reply; stream record
             telemetry::emit("system", "music.failed", json!({}));
             Err("I couldn't compose that track just now — the cloud request didn't go \
                  through. Nothing was created."
@@ -5494,17 +5527,20 @@ async fn trigger_cue(
 
     match sfx_cue::play_cue(name, cfg, offline, key.as_deref(), root, infer).await {
         sfx_cue::PlayOutcome::Played(p) => {
+            // PIXEL-FREE(diagnostic): the cue is played and its path returned to the caller; cue name only; stream record
             telemetry::emit("system", "sfx.cue.generated", json!({"cue": name}));
             Ok(p)
         }
         sfx_cue::PlayOutcome::Cached(p) => {
             // Served from cache — NO cloud call this time.
+            // PIXEL-FREE(diagnostic): served from cache (no cloud call); the cue plays and its path is returned; stream record
             telemetry::emit("system", "sfx.cue.cached", json!({"cue": name}));
             Ok(p)
         }
         sfx_cue::PlayOutcome::Disabled => {
             // Honest silent no-op: switch off / no key / offline.
             debug_assert!(!voice_tier::sfx_enabled(cfg, key.is_some()) || offline);
+            // PIXEL-FREE(diagnostic): the 'cue tier is off' message is returned to the user; cue name only; stream record
             telemetry::emit("system", "sfx.cue.disabled", json!({"cue": name}));
             Err("Cue tier is off. Turn on [voice].cloud_sfx and add an ElevenLabs key \
                  (and be online) to play cues."
@@ -5516,6 +5552,7 @@ async fn trigger_cue(
         }
         sfx_cue::PlayOutcome::Failed(msg) => {
             warn!(cue = %name, "sfx-cue: play_cue generation failed");
+            // PIXEL-FREE(diagnostic): paired warn! 'play_cue generation failed'; the error is returned to the caller; stream record
             telemetry::emit("system", "sfx.cue.failed", json!({"cue": name}));
             Err(msg)
         }
@@ -5709,6 +5746,7 @@ async fn trigger_design_voice(
     }
     let key = crate::integrations::resolve_secret(voice_tier::ELEVENLABS_ACCOUNT).await;
     let Some(key) = key else {
+        // PIXEL-FREE(diagnostic): the missing-key error is returned to the user in the reply; agent slot only; stream record
         telemetry::emit("system", "design_voice.no_key", json!({"agent": agent}));
         return Err("I can't design a voice without an ElevenLabs key — add one in Settings. \
                     No voice was created."
@@ -5726,11 +5764,13 @@ async fn trigger_design_voice(
                     .to_string());
             }
             // Telemetry: the AGENT slot only — NEVER the voice id, never the key.
+            // PIXEL-FREE(diagnostic): success is returned to the user in the reply; agent slot only (never the voice id/key); stream record
             telemetry::emit("system", "design_voice.created", json!({"agent": agent}));
             Ok(voice_id)
         }
         Err(e) => {
             warn!(error = %e, "design-voice: design_voice op failed");
+            // PIXEL-FREE(diagnostic): paired warn! 'design_voice op failed'; the failure is returned in the reply; stream record
             telemetry::emit("system", "design_voice.failed", json!({"agent": agent}));
             Err("I couldn't design that voice just now — the cloud request didn't go through. \
                  Nothing was created."
@@ -5764,6 +5804,7 @@ async fn trigger_create_pronunciation(
     }
     let key = crate::integrations::resolve_secret(voice_tier::ELEVENLABS_ACCOUNT).await;
     let Some(key) = key else {
+        // PIXEL-FREE(diagnostic): the missing-key error is returned to the user in the reply; empty payload; stream record
         telemetry::emit("system", "pronunciation.no_key", json!({}));
         return Err("I can't create a pronunciation dictionary without an ElevenLabs key — \
                     add one in Settings. Nothing was created."
@@ -5779,11 +5820,13 @@ async fn trigger_create_pronunciation(
                     .to_string());
             }
             // Telemetry carries NO ids and NO key.
+            // PIXEL-FREE(diagnostic): success is returned to the user; carries no ids and no key; stream record
             telemetry::emit("system", "pronunciation.created", json!({}));
             Ok((dictionary_id, version_id))
         }
         Err(e) => {
             warn!(error = %e, "create-pronunciation: create_pronunciation op failed");
+            // PIXEL-FREE(diagnostic): paired warn! 'create_pronunciation op failed'; the failure is returned in the reply; stream record
             telemetry::emit("system", "pronunciation.failed", json!({}));
             Err("I couldn't create that pronunciation dictionary just now — the cloud request \
                  didn't go through. Nothing was created."

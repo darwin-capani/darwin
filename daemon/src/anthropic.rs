@@ -2098,6 +2098,7 @@ async fn app_tool_dispatch(name: &str, input: &Value) -> Result<String> {
         crate::apps::APP_REQUEST_TIMEOUT,
     )
     .await;
+    // PIXEL-FREE(diagnostic): a per-app-tool-call breadcrumb (app, tool, ok, ms); pure observability for the stream
     crate::telemetry::emit(
         "system",
         "app.tool_invoked",
@@ -7248,6 +7249,7 @@ async fn execute_mcp_tool(
     // and the MCP behavior is byte-for-byte today's.
     if consequential && !crate::voiceid::current_turn_gate().allow_consequential() {
         warn!(tool = flat, agent = namespace, "voice-id: unrecognized speaker; refusing the consequential MCP action");
+        // PIXEL-FREE(diagnostic): an owner-scope gate refusal; the turn's reply states it; operator-stream security record
         crate::telemetry::emit(
             "system",
             "voiceid.denied",
@@ -7521,6 +7523,7 @@ fn downgrade_always_if_unattended(
             agent = namespace,
             "policy: Always downgraded to a park — unattended autonomous run, no human present to auto-approve"
         );
+        // PIXEL-FREE(diagnostic): paired warn! 'Always downgraded to a park - unattended autonomous run'; the park is the behavior
         crate::telemetry::emit(
             "system",
             "policy.parked_unattended",
@@ -7725,6 +7728,7 @@ async fn execute_tool_bound(
     if let Some(scope) = crate::threshold::current_turn_scope() {
         if !scope.admits(name) {
             warn!(tool = name, "THRESHOLD: refusing a tool outside the guest read-only scope");
+            // PIXEL-FREE(diagnostic): paired warn! 'refusing a tool outside the guest read-only scope'; log/reply are the surface
             crate::telemetry::emit(
                 "system",
                 "threshold.tool_refused",
@@ -7808,6 +7812,7 @@ async fn execute_tool_bound(
     // the router, never here — a consequential tool is what this guards).
     if needs_park && !crate::voiceid::current_turn_gate().allow_consequential() {
         warn!(tool = name, "voice-id: unrecognized speaker; refusing the consequential action");
+        // PIXEL-FREE(diagnostic): an owner-scope gate refusal; the turn's reply states it; operator-stream security record
         crate::telemetry::emit(
             "system",
             "voiceid.denied",
@@ -8037,6 +8042,7 @@ pub async fn replay_confirmed_action(
     // master switch + allowlist re-checks below still apply independently.
     if !crate::voiceid::current_turn_gate().allow_confirm_replay() {
         warn!(tool = %pending.tool, "voice-id: unrecognized speaker; refusing to replay the parked action");
+        // PIXEL-FREE(diagnostic): an owner-scope gate refusal; the turn's reply states it; operator-stream security record
         crate::telemetry::emit(
             "system",
             "voiceid.denied",
@@ -8063,6 +8069,7 @@ pub async fn replay_confirmed_action(
     // action fires nothing); the owner can re-initiate. Owner path (no scope): a no-op.
     if crate::threshold::is_guest_turn() {
         warn!(tool = %pending.tool, "THRESHOLD: refusing to replay a parked action for a guest");
+        // PIXEL-FREE(diagnostic): paired warn! 'refusing to replay a parked action for a guest'; the action fires nothing
         crate::telemetry::emit(
             "system",
             "threshold.confirm_refused",
@@ -9595,6 +9602,7 @@ async fn dispatch_tool(
                 // "couldn't translate" / empty-input line). The voicing now threads
                 // `Some(to_lang)` for a real rendering (EL multilingual when the tier is
                 // on; inert otherwise); this just records the turn's outcome.
+                // PIXEL-FREE(diagnostic): observability of whether a real rendering was produced; records the translate turn's outcome
                 crate::telemetry::emit(
                     "local",
                     "babel.interpret",
@@ -11785,6 +11793,7 @@ async fn verify_proposal_in_realm(
     let enabled = realm_cfg.enabled && !locked;
     let shell_enabled = shell_cfg.enabled && !locked;
     if !crate::realm::realm_permitted(enabled, &code_cfg.roots, shell_enabled) {
+        // PIXEL-FREE(diagnostic): realm subsystem inert (off/locked); returns None; operator-stream trace of a no-op
         telemetry::emit("system", "realm.blocked", json!({"reason": "inert", "ts": ts}));
         return None;
     }
@@ -11812,6 +11821,7 @@ async fn verify_proposal_in_realm(
     if let Err(e) = std::fs::write(dir.join("realm_verdict.md"), &annotation) {
         warn!(error = %e, "realm: could not write the verdict artifact to the proposal card");
     }
+    // PIXEL-FREE(diagnostic): the verdict is WRITTEN to realm_verdict.md on the proposal card (the rendered surface); this is the stream copy
     telemetry::emit("system", "realm.verdict", crate::realm::verdict_telemetry(ts, &verdict));
     Some(verdict)
 }
@@ -12764,6 +12774,7 @@ async fn standing_create_tool(memory: &Memory, goal: &str, schedule: &str, confi
     // CONFIRMED + switch on: persist the durable mission (bounded by the active cap).
     match crate::standing::create(memory, goal, sched).await {
         Ok(m) => {
+            // PIXEL-FREE(diagnostic): the spoken ack 'Standing mission established' is returned to the user; no HUD card (silent-drops.test.ts)
             telemetry::emit(
                 "system",
                 "standing.created",
@@ -12838,6 +12849,7 @@ pub async fn propose_standing_mission(
     // byte-for-byte today's.
     if !crate::voiceid::current_turn_gate().allow_consequential() {
         warn!(agent = agent_namespace, "voice-id: unrecognized speaker; refusing the standing-mission proposal");
+        // PIXEL-FREE(diagnostic): an owner-scope gate refusal; the turn's reply states it; operator-stream security record
         crate::telemetry::emit(
             "system",
             "voiceid.denied",
@@ -13013,6 +13025,7 @@ async fn standing_list_tool(memory: &Memory) -> String {
 async fn standing_cancel_tool(memory: &Memory, id: &str) -> String {
     match crate::standing::cancel(memory, id).await {
         Ok(true) => {
+            // PIXEL-FREE(diagnostic): returns 'Cancelled standing mission {id}.' to the user; id only; stream record
             telemetry::emit("system", "standing.cancelled", json!({"id": id.trim()}));
             format!("Cancelled standing mission {}.", id.trim())
         }
