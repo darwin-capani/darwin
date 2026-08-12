@@ -315,6 +315,26 @@ const ALLOWED_ACCOUNTS: &[&str] = &[
     // The constant lives in `crate::audit::AUDIT_ANCHOR_ACCOUNT`; a mirror test keeps
     // the allowlist + the module in lockstep.
     "audit_chain_anchor",
+    // THE WEBHOOK RECEIVER'S HMAC SECRET and THE HANDOFF CAPSULE KEY. Both were
+    // MISSING, and the effect was the one `account_is_allowlisted`'s own doc
+    // warns about: "silently, permanently inert". Measured on the owner's running
+    // daemon — 101 paired log lines per boot, webhooks asking and integrations
+    // refusing, while the refusal message blamed a missing Keychain item. So the
+    // activation path config/darwin.toml documents ("Add mappings + set the
+    // Keychain secret to use") could not work even if followed exactly.
+    //
+    // Neither entry opens anything by itself. `webhooks::serve` is FAIL-CLOSED on
+    // the secret — with no secret it returns BEFORE `TcpListener::bind`, so the
+    // port opens only once the owner has deliberately placed one, and the
+    // loopback-only bind, the empty-by-default mappings and the spoken confirm on
+    // consequential intents are all unchanged. `handoff` seals a capsule LOCALLY;
+    // handoff.rs states THERE IS NO DELIVERY LEG, so its key buys no egress.
+    // These are fixed first-party constants — exactly what this allowlist exists
+    // to admit, as opposed to the "\0evil" / "../../foo" shapes it exists to refuse.
+    // The constants live in `crate::webhooks::WEBHOOK_SECRET_ACCOUNT` and
+    // `crate::handoff`; the lockstep guard below pins every one of them.
+    "webhook_hmac_secret",
+    "handoff_shared_key",
 ];
 
 /// The exact security(1) argv for a Keychain read of `account`. Factored out
@@ -1159,6 +1179,52 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
+
+    /// EVERY ACCOUNT THE DAEMON ACTUALLY ASKS FOR MUST BE ADMITTED HERE.
+    ///
+    /// `account_is_allowlisted`'s own doc says a drifted account makes its
+    /// integration "silently, permanently inert", and a guard exists for that —
+    /// but it iterates only the Atlas's `INTEGRATIONS` descriptors. The webhook
+    /// receiver's HMAC secret and the handoff capsule key are not "integrations",
+    /// so both sat off the allowlist and both features were dead: MEASURED on the
+    /// owner's daemon as 101 paired ask/refuse lines per boot.
+    ///
+    /// This pins the CALLERS instead of the descriptors — the set every module
+    /// passes to `resolve_secret`. Add a new secret-reading feature and it fails
+    /// here until its account is admitted, which is the failure the last one
+    /// needed.
+    #[test]
+    fn every_account_the_daemon_reads_is_admitted() {
+        // Held as literals ON PURPOSE: importing each module's const would make
+        // this test agree with whatever the module says rather than with the
+        // allowlist, which is the tautology trap. Each is mirrored by a lockstep
+        // assert below so a renamed const cannot leave this list stale.
+        const READ_BY_THE_DAEMON: &[(&str, &str)] = &[
+            ("webhook_hmac_secret", "webhooks::serve — HMAC verify; fail-closed bind"),
+            ("handoff_shared_key", "handoff — local capsule seal"),
+            ("sync_shared_key", "sync/fleet — sealed bundle"),
+            ("audit_chain_anchor", "audit — external witness"),
+            ("memory_encryption_key", "crypto — vault master key"),
+            ("elevenlabs_api_key", "voice_tier — cloud voice"),
+            ("anthropic_api_key", "the cloud brain"),
+        ];
+        let refused: Vec<&str> = READ_BY_THE_DAEMON
+            .iter()
+            .filter(|(a, _)| !account_allowed(a))
+            .map(|(_a, why)| *why)
+            .collect();
+        assert!(
+            refused.is_empty(),
+            "these features are silently, permanently INERT — the daemon asks for \
+             their Keychain account and this allowlist refuses it: {refused:?}"
+        );
+        // LOCKSTEP: the literals above must still be the names the modules use.
+        assert_eq!(crate::webhooks::WEBHOOK_SECRET_ACCOUNT, "webhook_hmac_secret");
+        assert_eq!(crate::audit::AUDIT_ANCHOR_ACCOUNT, "audit_chain_anchor");
+        assert_eq!(crate::crypto::MASTER_KEY_ACCOUNT, "memory_encryption_key");
+        assert_eq!(crate::voice_tier::ELEVENLABS_ACCOUNT, "elevenlabs_api_key");
+    }
+
     use super::testing::MockTransport;
     use super::*;
 
@@ -1212,7 +1278,7 @@ mod tests {
         ] {
             assert!(account_allowed(account), "{account} must be allowed");
         }
-        assert_eq!(ALLOWED_ACCOUNTS.len(), 39, "the allowlist must not grow silently");
+        assert_eq!(ALLOWED_ACCOUNTS.len(), 41, "the allowlist must not grow silently");
     }
 
     /// Lockstep: the at-rest encryption master-key account literal on the allowlist
@@ -1535,7 +1601,7 @@ mod tests {
         }
         // The fixed allowlist did not grow (39 incl. F18's sync_shared_key + the
         // audit chain external anchor).
-        assert_eq!(ALLOWED_ACCOUNTS.len(), 39, "the fixed allowlist must not change");
+        assert_eq!(ALLOWED_ACCOUNTS.len(), 41, "the fixed allowlist must not change");
     }
 
     /// `resolve_secret` returns `None` for a non-allowlisted account WITHOUT
@@ -1729,7 +1795,7 @@ mod tests {
             !flatten_comments(include_str!("mod.rs")).contains(stale_allowlist_count.as_str()),
             "the allowlist size must not be restated in prose — the assert_eq! sites are the pin"
         );
-        assert_eq!(ALLOWED_ACCOUNTS.len(), 39, "…and this is that pin");
+        assert_eq!(ALLOWED_ACCOUNTS.len(), 41, "…and this is that pin");
     }
 
     /// SOURCE-ANCHORED GUARD for the two secret-handling claims that had gone
