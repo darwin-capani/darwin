@@ -1,253 +1,1127 @@
 [
-  {"gate": "lockdown.panic", "expect": "panic", "text": "panic"},
-  {"gate": "lockdown.panic", "expect": "panic", "text": "lockdown"},
-  {"gate": "lockdown.panic", "expect": "panic", "text": "kill switch"},
-  {"gate": "lockdown.panic", "expect": "panic", "text": "stop everything"},
-  {"gate": "lockdown.panic", "expect": "panic", "text": "shut it all down"},
-  {"gate": "lockdown.panic", "expect": "panic", "text": "emergency stop"},
-  {"gate": "lockdown.panic", "expect": "panic", "text": "lock everything down right now"},
-
-  {"gate": "lockdown.unlock", "expect": "unlock", "text": "unlock"},
-  {"gate": "lockdown.unlock", "expect": "unlock", "text": "stand down"},
-  {"gate": "lockdown.unlock", "expect": "unlock", "text": "resume normal operation"},
-  {"gate": "lockdown.unlock", "expect": "unlock", "text": "end lockdown"},
-  {"gate": "lockdown.unlock", "expect": "unlock", "text": "disengage lockdown"},
-
-  {"gate": "model_tier", "expect": "heavy", "text": "switch to the heavy model"},
-  {"gate": "model_tier", "expect": "heavy", "text": "use the big model for this"},
-  {"gate": "model_tier", "expect": "heavy", "text": "think harder about this one"},
-  {"gate": "model_tier", "expect": "fast", "text": "switch to the fast model"},
-  {"gate": "model_tier", "expect": "fast", "text": "use the quick model"},
-  {"gate": "model_tier", "expect": "local", "text": "work offline"},
-  {"gate": "model_tier", "expect": "local", "text": "stay on device"},
-  {"gate": "model_tier", "expect": "local", "text": "don't use the cloud"},
-  {"gate": "model_tier", "expect": "auto", "text": "go back to automatic model selection"},
-  {"gate": "model_tier", "expect": "auto", "text": "pick the model yourself"},
-
-  {"gate": "whisper", "expect": "on", "text": "whisper mode"},
-  {"gate": "whisper", "expect": "on", "text": "keep your voice down"},
-  {"gate": "whisper", "expect": "on", "text": "talk quietly"},
-  {"gate": "whisper", "expect": "on", "text": "whisper"},
-  {"gate": "whisper", "expect": "off", "text": "stop whispering"},
-  {"gate": "whisper", "expect": "off", "text": "you can speak normally again"},
-  {"gate": "whisper", "expect": "off", "text": "normal voice please"},
-
-  {"gate": "vault", "expect": "on", "text": "go dark"},
-  {"gate": "vault", "expect": "on", "text": "vault mode"},
-  {"gate": "vault", "expect": "on", "text": "private mode on"},
-  {"gate": "vault", "expect": "on", "text": "engage vault mode"},
-  {"gate": "vault", "expect": "off", "text": "come out of vault mode"},
-  {"gate": "vault", "expect": "off", "text": "turn private mode off"},
-  {"gate": "vault", "expect": "off", "text": "vault off"},
-
-  {"gate": "macros", "expect": "record", "text": "record a macro called morning setup"},
-  {"gate": "macros", "expect": "record", "text": "start recording a macro named deploy"},
-  {"gate": "macros", "expect": "record", "text": "start a macro called standup"},
-  {"gate": "macros", "expect": "stop", "text": "stop recording"},
-  {"gate": "macros", "expect": "stop", "text": "stop recording the macro"},
-  {"gate": "macros", "expect": "replay", "text": "replay the morning setup macro"},
-  {"gate": "macros", "expect": "replay", "text": "run my deploy macro"},
-  {"gate": "macros", "expect": "replay", "text": "play back the standup macro"},
-  {"gate": "macros", "expect": "list", "text": "list my macros"},
-  {"gate": "macros", "expect": "list", "text": "what macros do i have"},
-  {"gate": "macros", "expect": "forget", "text": "forget the deploy macro"},
-  {"gate": "macros", "expect": "forget", "text": "delete the morning setup macro"},
-
-  {"gate": "runbook", "expect": "plan", "text": "plan the release runbook"},
-  {"gate": "runbook", "expect": "plan", "text": "show me what the backup runbook would do"},
-  {"gate": "runbook", "expect": "run", "text": "run the release runbook"},
-  {"gate": "runbook", "expect": "run", "text": "execute the backup runbook"},
-
-  {"gate": "undo", "expect": "undo", "text": "undo that"},
-  {"gate": "undo", "expect": "undo", "text": "undo the last thing you did"},
-  {"gate": "undo", "expect": "undo", "text": "take that back"},
-  {"gate": "undo", "expect": "undo", "text": "revert what you just did"},
-  {"gate": "undo", "expect": "status", "text": "what can you undo"},
-  {"gate": "undo", "expect": "status", "text": "undo status"},
-
-  {"gate": "aperture", "expect": "recall", "text": "what was i working on around 3pm"},
-  {"gate": "aperture", "expect": "recall", "text": "what did i do this morning"},
-  {"gate": "aperture", "expect": "recall", "text": "show me my activity timeline"},
-  {"gate": "aperture", "expect": "recall", "text": "what was i doing at lunch"},
-  {"gate": "aperture", "expect": "forget", "text": "wipe my activity timeline"},
-  {"gate": "aperture", "expect": "forget", "text": "forget my activity history"},
-
-  {"gate": "screen_context", "expect": "recall", "text": "what was on my screen a minute ago"},
-  {"gate": "screen_context", "expect": "recall", "text": "recall my screen context"},
-  {"gate": "screen_context", "expect": "recall", "text": "what have i been looking at"},
-  {"gate": "screen_context", "expect": "forget", "text": "forget my screen context"},
-  {"gate": "screen_context", "expect": "forget", "text": "clear my screen context"},
-
-  {"gate": "pasteboard", "expect": "recall", "text": "what did i copy about the lease"},
-  {"gate": "pasteboard", "expect": "recall", "text": "what was that thing i copied earlier"},
-  {"gate": "pasteboard", "expect": "recall", "text": "recall my clipboard"},
-  {"gate": "pasteboard", "expect": "recall", "text": "find the thing i copied about the invoice"},
-  {"gate": "pasteboard", "expect": "forget", "text": "forget my clipboard history"},
-  {"gate": "pasteboard", "expect": "forget", "text": "clear my pasteboard history"},
-
-  {"gate": "notebook", "expect": "save", "text": "save this research"},
-  {"gate": "notebook", "expect": "save", "text": "save that to my notebook"},
-  {"gate": "notebook", "expect": "save", "text": "save this to my research notebook"},
-  {"gate": "notebook", "expect": "revisit", "text": "show my research on graphene"},
-  {"gate": "notebook", "expect": "revisit", "text": "open my notebook on fusion"},
-  {"gate": "notebook", "expect": "list", "text": "list my notebooks"},
-  {"gate": "notebook", "expect": "list", "text": "what research notebooks do i have"},
-  {"gate": "notebook", "expect": "forget", "text": "forget my notebook on graphene"},
-  {"gate": "notebook", "expect": "forget", "text": "delete my research notebook on fusion"},
-
-  {"gate": "precog", "expect": "hypothetical", "text": "what would you do if i said delete my downloads folder"},
-  {"gate": "precog", "expect": "hypothetical", "text": "if i asked you to email my boss, what would happen"},
-  {"gate": "precog", "expect": "hypothetical", "text": "what would happen if i told you to wipe my memory"},
-  {"gate": "precog", "expect": "hypothetical", "text": "suppose i said open safari, what would you do"},
-
-  {"gate": "report", "expect": "report", "text": "generate a report on solid state batteries"},
-  {"gate": "report", "expect": "report", "text": "write me a report about the lease terms"},
-  {"gate": "report", "expect": "report", "text": "put together a report on fusion research"},
-  {"gate": "report", "expect": "report", "text": "i need a report on what you found about graphene"},
-
-  {"gate": "chart", "expect": "chart", "text": "chart my cpu usage"},
-  {"gate": "chart", "expect": "chart", "text": "plot the last week of battery life"},
-  {"gate": "chart", "expect": "chart", "text": "graph the memory usage over time"},
-  {"gate": "chart", "expect": "chart", "text": "chart that for me"},
-
-  {"gate": "peek", "expect": "peek", "text": "what did you just do"},
-  {"gate": "peek", "expect": "peek", "text": "show me what you just produced"},
-  {"gate": "peek", "expect": "peek", "text": "peek at the last thing you made"},
-  {"gate": "peek", "expect": "peek", "text": "what was that last artifact"},
-
-  {"gate": "music", "expect": "music", "text": "play some lo-fi music"},
-  {"gate": "music", "expect": "music", "text": "make me a song about the rain"},
-  {"gate": "music", "expect": "music", "text": "generate some background music"},
-  {"gate": "music", "expect": "music", "text": "compose something calm for me"},
-
-  {"gate": "lifelog", "expect": "week", "text": "what did i do this week"},
-  {"gate": "lifelog", "expect": "day", "text": "give me a digest of my day"},
-  {"gate": "lifelog", "expect": "week", "text": "summarize my week"},
-  {"gate": "lifelog", "expect": "day", "text": "recap my day"},
-
-  {"gate": "rewind", "expect": "rewind", "text": "what happened at 2pm"},
-  {"gate": "rewind", "expect": "rewind", "text": "rewind the last hour"},
-  {"gate": "rewind", "expect": "rewind", "text": "walk me through this morning"},
-  {"gate": "rewind", "expect": "rewind", "text": "take me back through the last half hour"},
-
-  {"gate": "explain", "expect": "last", "text": "why did you do that"},
-  {"gate": "explain", "expect": "last", "text": "explain your last decision"},
-  {"gate": "explain", "expect": "last", "text": "how did you decide that"},
-  {"gate": "explain", "expect": "agent", "text": "why did friday handle that"},
-  {"gate": "explain", "expect": "agent", "text": "explain gecko's decision"},
-
-  {"gate": "mirror", "expect": "explain", "text": "what do you think you know about me"},
-  {"gate": "mirror", "expect": "explain", "text": "what is your model of me"},
-  {"gate": "mirror", "expect": "contest", "text": "you're wrong about my interest in rust"},
-  {"gate": "mirror", "expect": "contest", "text": "that's wrong about my music taste"},
-  {"gate": "mirror", "expect": "contest", "text": "forget what you think you know about my music taste"},
-  {"gate": "mirror", "expect": "contest", "text": "clear your model of my interests"},
-  {"gate": "mirror", "expect": "clear", "text": "actually you were right about my interest in rust"},
-  {"gate": "mirror", "expect": "clear", "text": "you can learn about my music taste again"},
-
-  {"gate": "rollcall", "expect": "rollcall", "text": "roll call"},
-  {"gate": "rollcall", "expect": "rollcall", "text": "who's on the team"},
-  {"gate": "rollcall", "expect": "rollcall", "text": "introduce the team"},
-  {"gate": "rollcall", "expect": "rollcall", "text": "everyone sound off"},
-
-  {"gate": "agentquery", "expect": "agentquery", "text": "which agent handles security"},
-  {"gate": "agentquery", "expect": "agentquery", "text": "what does gecko do"},
-  {"gate": "agentquery", "expect": "agentquery", "text": "who would handle a markets question"},
-
-  {"gate": "lumen", "expect": "read", "text": "what's on my screen"},
-  {"gate": "describe", "expect": "screen", "text": "describe my screen"},
-  {"gate": "describe", "expect": "screen", "text": "tell me what you see on my screen"},
-  {"gate": "describe", "expect": "image", "text": "describe ~/Desktop/photo.png"},
-  {"gate": "describe", "expect": "image", "text": "what's in ~/Pictures/holiday.jpg"},
-  {"gate": "describe", "expect": "image", "text": "look at ~/Desktop/diagram.png and tell me what it shows"},
-
-  {"gate": "genimage", "expect": "genimage", "text": "draw me a picture of a lighthouse"},
-  {"gate": "genimage", "expect": "genimage", "text": "generate an image of a red bicycle"},
-  {"gate": "genimage", "expect": "genimage", "text": "make me a picture of a mountain at sunset"},
-  {"gate": "genimage", "expect": "genimage", "text": "create an illustration of a fox in the snow"},
-  {"gate": "genimage", "expect": "genimage", "text": "darwin, draw me a picture of a fox in a suit"},
-  {"gate": "genimage", "expect": "genimage", "text": "darwin draw me a picture of a fox"},
-  {"gate": "genimage", "expect": "genimage", "text": "please paint a picture of a sunset over the harbour"},
-  {"gate": "genimage", "expect": "genimage", "text": "hey can you make a picture of the harbour"},
-  {"gate": "genimage", "expect": "genimage", "text": "could you please draw a picture of a dragon"},
-  {"gate": "genimage", "expect": "genimage", "text": "would you kindly sketch a drawing of a sailboat"},
-  {"gate": "genimage", "expect": "genimage", "text": "i want you to draw a picture of a castle on a hill"},
-  {"gate": "genimage", "expect": "genimage", "text": "i'd like you to make an image of a rainy street"},
-  {"gate": "genimage", "expect": "genimage", "text": "ok now make me a drawing of a robot"},
-  {"gate": "genimage", "expect": "genimage", "text": "will you draw a picture of two cats dancing"},
-  {"gate": "genimage", "expect": "genimage", "text": "help me draw a picture of a dragon"},
-  {"gate": "genimage", "expect": "genimage", "text": "let's make a picture of the garden in spring"},
-  {"gate": "genimage", "expect": "genimage", "text": "just draw a picture of a whale"},
-  {"gate": "genimage", "expect": "genimage", "text": "no wait, make a picture of a green door instead"},
-  {"gate": "genimage", "expect": "genimage", "text": "can you draw me a picture of the golden gate bridge"},
-
-  {"gate": "sound", "expect": "sound", "text": "what's that sound"},
-  {"gate": "sound", "expect": "sound", "text": "what am i hearing"},
-  {"gate": "sound", "expect": "sound", "text": "identify this noise"},
-  {"gate": "sound", "expect": "sound", "text": "what is that noise in the background"},
-
-  {"gate": "silicon", "expect": "launch", "text": "open silicon canvas"},
-  {"gate": "silicon", "expect": "select.net", "text": "select the ground net"},
-  {"gate": "silicon", "expect": "select.net", "text": "select the 3v3 net"},
-  {"gate": "silicon", "expect": "select.component", "text": "select r14"},
-  {"gate": "silicon", "expect": "select.component", "text": "select component u3"},
-  {"gate": "silicon", "expect": "erc.run", "text": "run erc"},
-  {"gate": "silicon", "expect": "erc.run", "text": "run an electrical rule check on the board"},
-  {"gate": "silicon", "expect": "trace.start", "text": "start tracing this net"},
-  {"gate": "silicon", "expect": "trace.stop", "text": "stop tracing the net"},
-  {"gate": "silicon", "expect": "view.set", "text": "fit the whole board in the view"},
-
-  {"gate": "lumen", "expect": "read", "text": "read the controls on this screen"},
-  {"gate": "lumen", "expect": "read", "text": "what buttons are on this screen"},
-  {"gate": "lumen", "expect": "act", "text": "click the submit button"},
-  {"gate": "lumen", "expect": "act", "text": "press the second button"},
-  {"gate": "lumen", "expect": "act", "text": "click the save button for me"},
-
-  {"gate": "vision", "expect": "launch", "text": "open the vision app"},
-  {"gate": "vision", "expect": "watch.start", "text": "turn on the camera"},
-  {"gate": "vision", "expect": "watch.start", "text": "start watching the camera"},
-  {"gate": "vision", "expect": "watch.start", "text": "keep an eye on the camera"},
-  {"gate": "vision", "expect": "watch.stop", "text": "stop watching the camera"},
-  {"gate": "vision", "expect": "watch.stop", "text": "turn the camera off"},
-  {"gate": "vision", "expect": "status", "text": "what is the vision app doing"},
-  {"gate": "vision", "expect": "read.handwriting", "text": "read this handwriting"},
-  {"gate": "vision", "expect": "read.handwriting", "text": "transcribe my handwritten notes"},
-  {"gate": "vision", "expect": "scan.document", "text": "scan this document"},
-  {"gate": "vision", "expect": "analyze.file", "text": "analyze the video at ~/Movies/clip.mp4"},
-  {"gate": "vision", "expect": "set.sensitivity", "text": "set the motion sensitivity to 0.4"},
-  {"gate": "lumen", "expect": "read", "text": "read my screen"},
-  {"gate": "vision", "expect": "read.screen", "text": "where's the send button"},
-
-  {"gate": "nexus", "expect": "launch", "text": "open nexus"},
-  {"gate": "nexus", "expect": "gain.set", "text": "mute channel 2"},
-  {"gate": "nexus", "expect": "gain.set", "text": "mute input 3"},
-  {"gate": "nexus", "expect": "gain.set", "text": "set channel 1 to -6 db"},
-  {"gate": "nexus", "expect": "route.set", "text": "route input 1 to output 2"},
-  {"gate": "nexus", "expect": "monitor.set", "text": "monitor input 1 on output 2"},
-  {"gate": "nexus", "expect": "preset.load", "text": "load the studio preset"},
-  {"gate": "nexus", "expect": "state.get", "text": "what's the mixer state"},
-
-  {"gate": "markforge", "expect": "launch", "text": "open mark forge"},
-  {"gate": "markforge", "expect": "world.reset", "text": "reset the physics world"},
-  {"gate": "markforge", "expect": "body.spawn", "text": "spawn a cube"},
-  {"gate": "markforge", "expect": "world.step", "text": "step the simulation 10 times"},
-  {"gate": "markforge", "expect": "set.gravity", "text": "set gravity to -9.8"},
-  {"gate": "markforge", "expect": "state.get", "text": "what's the physics state"},
-
-  {"gate": "policy", "expect": "policy", "text": "always allow the gmail_send action"},
-  {"gate": "policy", "expect": "policy", "text": "always ask before the gmail_send action"},
-
-  {"gate": "voiceid", "expect": "enroll", "text": "learn my voice"},
-  {"gate": "voiceid", "expect": "enroll", "text": "enroll my voice"},
-  {"gate": "voiceid", "expect": "forget", "text": "forget my voice"},
-
-  {"gate": "voiceclone", "expect": "clone", "text": "clone my voice"},
-  {"gate": "voiceclone", "expect": "clone", "text": "make a voice that sounds like me"},
-  {"gate": "voiceclone", "expect": "forget", "text": "delete my cloned voice"},
-  {"gate": "voiceclone", "expect": "forget", "text": "forget my cloned voice"},
-
-  {"gate": "guest", "expect": "on", "text": "guest mode on"},
-  {"gate": "guest", "expect": "on", "text": "turn on guest mode"},
-  {"gate": "guest", "expect": "off", "text": "guest mode off"},
-  {"gate": "guest", "expect": "off", "text": "turn off guest mode"}
+  {
+    "gate": "lockdown.panic",
+    "expect": "panic",
+    "text": "panic"
+  },
+  {
+    "gate": "lockdown.panic",
+    "expect": "panic",
+    "text": "lockdown"
+  },
+  {
+    "gate": "lockdown.panic",
+    "expect": "panic",
+    "text": "kill switch"
+  },
+  {
+    "gate": "lockdown.panic",
+    "expect": "panic",
+    "text": "stop everything"
+  },
+  {
+    "gate": "lockdown.panic",
+    "expect": "panic",
+    "text": "shut it all down"
+  },
+  {
+    "gate": "lockdown.panic",
+    "expect": "panic",
+    "text": "emergency stop"
+  },
+  {
+    "gate": "lockdown.panic",
+    "expect": "panic",
+    "text": "lock everything down right now"
+  },
+  {
+    "gate": "lockdown.unlock",
+    "expect": "unlock",
+    "text": "unlock"
+  },
+  {
+    "gate": "lockdown.unlock",
+    "expect": "unlock",
+    "text": "stand down"
+  },
+  {
+    "gate": "lockdown.unlock",
+    "expect": "unlock",
+    "text": "resume normal operation"
+  },
+  {
+    "gate": "lockdown.unlock",
+    "expect": "unlock",
+    "text": "end lockdown"
+  },
+  {
+    "gate": "lockdown.unlock",
+    "expect": "unlock",
+    "text": "disengage lockdown"
+  },
+  {
+    "gate": "model_tier",
+    "expect": "heavy",
+    "text": "switch to the heavy model"
+  },
+  {
+    "gate": "model_tier",
+    "expect": "heavy",
+    "text": "use the big model for this"
+  },
+  {
+    "gate": "model_tier",
+    "expect": "heavy",
+    "text": "think harder about this one"
+  },
+  {
+    "gate": "model_tier",
+    "expect": "fast",
+    "text": "switch to the fast model"
+  },
+  {
+    "gate": "model_tier",
+    "expect": "fast",
+    "text": "use the quick model"
+  },
+  {
+    "gate": "model_tier",
+    "expect": "local",
+    "text": "work offline"
+  },
+  {
+    "gate": "model_tier",
+    "expect": "local",
+    "text": "stay on device"
+  },
+  {
+    "gate": "model_tier",
+    "expect": "local",
+    "text": "don't use the cloud"
+  },
+  {
+    "gate": "model_tier",
+    "expect": "auto",
+    "text": "go back to automatic model selection"
+  },
+  {
+    "gate": "model_tier",
+    "expect": "auto",
+    "text": "pick the model yourself"
+  },
+  {
+    "gate": "whisper",
+    "expect": "on",
+    "text": "whisper mode"
+  },
+  {
+    "gate": "whisper",
+    "expect": "on",
+    "text": "keep your voice down"
+  },
+  {
+    "gate": "whisper",
+    "expect": "on",
+    "text": "talk quietly"
+  },
+  {
+    "gate": "whisper",
+    "expect": "on",
+    "text": "whisper"
+  },
+  {
+    "gate": "whisper",
+    "expect": "off",
+    "text": "stop whispering"
+  },
+  {
+    "gate": "whisper",
+    "expect": "off",
+    "text": "you can speak normally again"
+  },
+  {
+    "gate": "whisper",
+    "expect": "off",
+    "text": "normal voice please"
+  },
+  {
+    "gate": "vault",
+    "expect": "on",
+    "text": "go dark"
+  },
+  {
+    "gate": "vault",
+    "expect": "on",
+    "text": "vault mode"
+  },
+  {
+    "gate": "vault",
+    "expect": "on",
+    "text": "private mode on"
+  },
+  {
+    "gate": "vault",
+    "expect": "on",
+    "text": "engage vault mode"
+  },
+  {
+    "gate": "vault",
+    "expect": "off",
+    "text": "come out of vault mode"
+  },
+  {
+    "gate": "vault",
+    "expect": "off",
+    "text": "turn private mode off"
+  },
+  {
+    "gate": "vault",
+    "expect": "off",
+    "text": "vault off"
+  },
+  {
+    "gate": "macros",
+    "expect": "record",
+    "text": "record a macro called morning setup"
+  },
+  {
+    "gate": "macros",
+    "expect": "record",
+    "text": "start recording a macro named deploy"
+  },
+  {
+    "gate": "macros",
+    "expect": "record",
+    "text": "start a macro called standup"
+  },
+  {
+    "gate": "macros",
+    "expect": "stop",
+    "text": "stop recording"
+  },
+  {
+    "gate": "macros",
+    "expect": "stop",
+    "text": "stop recording the macro"
+  },
+  {
+    "gate": "macros",
+    "expect": "replay",
+    "text": "replay the morning setup macro"
+  },
+  {
+    "gate": "macros",
+    "expect": "replay",
+    "text": "run my deploy macro"
+  },
+  {
+    "gate": "macros",
+    "expect": "replay",
+    "text": "play back the standup macro"
+  },
+  {
+    "gate": "macros",
+    "expect": "list",
+    "text": "list my macros"
+  },
+  {
+    "gate": "macros",
+    "expect": "list",
+    "text": "what macros do i have"
+  },
+  {
+    "gate": "macros",
+    "expect": "forget",
+    "text": "forget the deploy macro"
+  },
+  {
+    "gate": "macros",
+    "expect": "forget",
+    "text": "delete the morning setup macro"
+  },
+  {
+    "gate": "runbook",
+    "expect": "plan",
+    "text": "plan the release runbook"
+  },
+  {
+    "gate": "runbook",
+    "expect": "plan",
+    "text": "show me what the backup runbook would do"
+  },
+  {
+    "gate": "runbook",
+    "expect": "run",
+    "text": "run the release runbook"
+  },
+  {
+    "gate": "runbook",
+    "expect": "run",
+    "text": "execute the backup runbook"
+  },
+  {
+    "gate": "undo",
+    "expect": "undo",
+    "text": "undo that"
+  },
+  {
+    "gate": "undo",
+    "expect": "undo",
+    "text": "undo the last thing you did"
+  },
+  {
+    "gate": "undo",
+    "expect": "undo",
+    "text": "take that back"
+  },
+  {
+    "gate": "undo",
+    "expect": "undo",
+    "text": "revert what you just did"
+  },
+  {
+    "gate": "undo",
+    "expect": "status",
+    "text": "what can you undo"
+  },
+  {
+    "gate": "undo",
+    "expect": "status",
+    "text": "undo status"
+  },
+  {
+    "gate": "aperture",
+    "expect": "recall",
+    "text": "what was i working on around 3pm"
+  },
+  {
+    "gate": "aperture",
+    "expect": "recall",
+    "text": "what did i do this morning"
+  },
+  {
+    "gate": "aperture",
+    "expect": "recall",
+    "text": "show me my activity timeline"
+  },
+  {
+    "gate": "aperture",
+    "expect": "recall",
+    "text": "what was i doing at lunch"
+  },
+  {
+    "gate": "aperture",
+    "expect": "forget",
+    "text": "wipe my activity timeline"
+  },
+  {
+    "gate": "aperture",
+    "expect": "forget",
+    "text": "forget my activity history"
+  },
+  {
+    "gate": "screen_context",
+    "expect": "recall",
+    "text": "what was on my screen a minute ago"
+  },
+  {
+    "gate": "screen_context",
+    "expect": "recall",
+    "text": "recall my screen context"
+  },
+  {
+    "gate": "screen_context",
+    "expect": "recall",
+    "text": "what have i been looking at"
+  },
+  {
+    "gate": "screen_context",
+    "expect": "forget",
+    "text": "forget my screen context"
+  },
+  {
+    "gate": "screen_context",
+    "expect": "forget",
+    "text": "clear my screen context"
+  },
+  {
+    "gate": "pasteboard",
+    "expect": "recall",
+    "text": "what did i copy about the lease"
+  },
+  {
+    "gate": "pasteboard",
+    "expect": "recall",
+    "text": "what was that thing i copied earlier"
+  },
+  {
+    "gate": "pasteboard",
+    "expect": "recall",
+    "text": "recall my clipboard"
+  },
+  {
+    "gate": "pasteboard",
+    "expect": "recall",
+    "text": "find the thing i copied about the invoice"
+  },
+  {
+    "gate": "pasteboard",
+    "expect": "forget",
+    "text": "forget my clipboard history"
+  },
+  {
+    "gate": "pasteboard",
+    "expect": "forget",
+    "text": "clear my pasteboard history"
+  },
+  {
+    "gate": "notebook",
+    "expect": "save",
+    "text": "save this research"
+  },
+  {
+    "gate": "notebook",
+    "expect": "save",
+    "text": "save that to my notebook"
+  },
+  {
+    "gate": "notebook",
+    "expect": "save",
+    "text": "save this to my research notebook"
+  },
+  {
+    "gate": "notebook",
+    "expect": "revisit",
+    "text": "show my research on graphene"
+  },
+  {
+    "gate": "notebook",
+    "expect": "revisit",
+    "text": "open my notebook on fusion"
+  },
+  {
+    "gate": "notebook",
+    "expect": "list",
+    "text": "list my notebooks"
+  },
+  {
+    "gate": "notebook",
+    "expect": "list",
+    "text": "what research notebooks do i have"
+  },
+  {
+    "gate": "notebook",
+    "expect": "forget",
+    "text": "forget my notebook on graphene"
+  },
+  {
+    "gate": "notebook",
+    "expect": "forget",
+    "text": "delete my research notebook on fusion"
+  },
+  {
+    "gate": "precog",
+    "expect": "hypothetical",
+    "text": "what would you do if i said delete my downloads folder"
+  },
+  {
+    "gate": "precog",
+    "expect": "hypothetical",
+    "text": "if i asked you to email my boss, what would happen"
+  },
+  {
+    "gate": "precog",
+    "expect": "hypothetical",
+    "text": "what would happen if i told you to wipe my memory"
+  },
+  {
+    "gate": "precog",
+    "expect": "hypothetical",
+    "text": "suppose i said open safari, what would you do"
+  },
+  {
+    "gate": "report",
+    "expect": "report",
+    "text": "generate a report on solid state batteries"
+  },
+  {
+    "gate": "report",
+    "expect": "report",
+    "text": "write me a report about the lease terms"
+  },
+  {
+    "gate": "report",
+    "expect": "report",
+    "text": "put together a report on fusion research"
+  },
+  {
+    "gate": "report",
+    "expect": "report",
+    "text": "i need a report on what you found about graphene"
+  },
+  {
+    "gate": "chart",
+    "expect": "chart",
+    "text": "chart my cpu usage"
+  },
+  {
+    "gate": "chart",
+    "expect": "chart",
+    "text": "plot the last week of battery life"
+  },
+  {
+    "gate": "chart",
+    "expect": "chart",
+    "text": "graph the memory usage over time"
+  },
+  {
+    "gate": "chart",
+    "expect": "chart",
+    "text": "chart that for me"
+  },
+  {
+    "gate": "peek",
+    "expect": "peek",
+    "text": "what did you just do"
+  },
+  {
+    "gate": "peek",
+    "expect": "peek",
+    "text": "show me what you just produced"
+  },
+  {
+    "gate": "peek",
+    "expect": "peek",
+    "text": "peek at the last thing you made"
+  },
+  {
+    "gate": "peek",
+    "expect": "peek",
+    "text": "what was that last artifact"
+  },
+  {
+    "gate": "music",
+    "expect": "music",
+    "text": "play some lo-fi music"
+  },
+  {
+    "gate": "music",
+    "expect": "music",
+    "text": "make me a song about the rain"
+  },
+  {
+    "gate": "music",
+    "expect": "music",
+    "text": "generate some background music"
+  },
+  {
+    "gate": "music",
+    "expect": "music",
+    "text": "compose something calm for me"
+  },
+  {
+    "gate": "lifelog",
+    "expect": "week",
+    "text": "what did i do this week"
+  },
+  {
+    "gate": "lifelog",
+    "expect": "day",
+    "text": "give me a digest of my day"
+  },
+  {
+    "gate": "lifelog",
+    "expect": "week",
+    "text": "summarize my week"
+  },
+  {
+    "gate": "lifelog",
+    "expect": "day",
+    "text": "recap my day"
+  },
+  {
+    "gate": "rewind",
+    "expect": "rewind",
+    "text": "what happened at 2pm"
+  },
+  {
+    "gate": "rewind",
+    "expect": "rewind",
+    "text": "rewind the last hour"
+  },
+  {
+    "gate": "rewind",
+    "expect": "rewind",
+    "text": "walk me through this morning"
+  },
+  {
+    "gate": "rewind",
+    "expect": "rewind",
+    "text": "take me back through the last half hour"
+  },
+  {
+    "gate": "explain",
+    "expect": "last",
+    "text": "why did you do that"
+  },
+  {
+    "gate": "explain",
+    "expect": "last",
+    "text": "explain your last decision"
+  },
+  {
+    "gate": "explain",
+    "expect": "last",
+    "text": "how did you decide that"
+  },
+  {
+    "gate": "explain",
+    "expect": "agent",
+    "text": "why did friday handle that"
+  },
+  {
+    "gate": "explain",
+    "expect": "agent",
+    "text": "explain gecko's decision"
+  },
+  {
+    "gate": "mirror",
+    "expect": "explain",
+    "text": "what do you think you know about me"
+  },
+  {
+    "gate": "mirror",
+    "expect": "explain",
+    "text": "what is your model of me"
+  },
+  {
+    "gate": "mirror",
+    "expect": "contest",
+    "text": "you're wrong about my interest in rust"
+  },
+  {
+    "gate": "mirror",
+    "expect": "contest",
+    "text": "that's wrong about my music taste"
+  },
+  {
+    "gate": "mirror",
+    "expect": "contest",
+    "text": "forget what you think you know about my music taste"
+  },
+  {
+    "gate": "mirror",
+    "expect": "contest",
+    "text": "clear your model of my interests"
+  },
+  {
+    "gate": "mirror",
+    "expect": "clear",
+    "text": "actually you were right about my interest in rust"
+  },
+  {
+    "gate": "mirror",
+    "expect": "clear",
+    "text": "you can learn about my music taste again"
+  },
+  {
+    "gate": "rollcall",
+    "expect": "rollcall",
+    "text": "roll call"
+  },
+  {
+    "gate": "rollcall",
+    "expect": "rollcall",
+    "text": "who's on the team"
+  },
+  {
+    "gate": "rollcall",
+    "expect": "rollcall",
+    "text": "introduce the team"
+  },
+  {
+    "gate": "rollcall",
+    "expect": "rollcall",
+    "text": "everyone sound off"
+  },
+  {
+    "gate": "agentquery",
+    "expect": "agentquery",
+    "text": "which agent handles security"
+  },
+  {
+    "gate": "agentquery",
+    "expect": "agentquery",
+    "text": "what does gecko do"
+  },
+  {
+    "gate": "agentquery",
+    "expect": "agentquery",
+    "text": "who would handle a markets question"
+  },
+  {
+    "gate": "lumen",
+    "expect": "read",
+    "text": "what's on my screen"
+  },
+  {
+    "gate": "describe",
+    "expect": "screen",
+    "text": "describe my screen"
+  },
+  {
+    "gate": "describe",
+    "expect": "screen",
+    "text": "tell me what you see on my screen"
+  },
+  {
+    "gate": "describe",
+    "expect": "image",
+    "text": "describe ~/Desktop/photo.png"
+  },
+  {
+    "gate": "describe",
+    "expect": "image",
+    "text": "what's in ~/Pictures/holiday.jpg"
+  },
+  {
+    "gate": "describe",
+    "expect": "image",
+    "text": "look at ~/Desktop/diagram.png and tell me what it shows"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "draw me a picture of a lighthouse"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "generate an image of a red bicycle"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "make me a picture of a mountain at sunset"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "create an illustration of a fox in the snow"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "darwin, draw me a picture of a fox in a suit"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "darwin draw me a picture of a fox"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "please paint a picture of a sunset over the harbour"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "hey can you make a picture of the harbour"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "could you please draw a picture of a dragon"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "would you kindly sketch a drawing of a sailboat"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "i want you to draw a picture of a castle on a hill"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "i'd like you to make an image of a rainy street"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "ok now make me a drawing of a robot"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "will you draw a picture of two cats dancing"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "help me draw a picture of a dragon"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "let's make a picture of the garden in spring"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "just draw a picture of a whale"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "no wait, make a picture of a green door instead"
+  },
+  {
+    "gate": "genimage",
+    "expect": "genimage",
+    "text": "can you draw me a picture of the golden gate bridge"
+  },
+  {
+    "gate": "sound",
+    "expect": "sound",
+    "text": "what's that sound"
+  },
+  {
+    "gate": "sound",
+    "expect": "sound",
+    "text": "what am i hearing"
+  },
+  {
+    "gate": "sound",
+    "expect": "sound",
+    "text": "identify this noise"
+  },
+  {
+    "gate": "sound",
+    "expect": "sound",
+    "text": "what is that noise in the background"
+  },
+  {
+    "gate": "silicon",
+    "expect": "launch",
+    "text": "open silicon canvas"
+  },
+  {
+    "gate": "silicon",
+    "expect": "select.net",
+    "text": "select the ground net"
+  },
+  {
+    "gate": "silicon",
+    "expect": "select.net",
+    "text": "select the 3v3 net"
+  },
+  {
+    "gate": "silicon",
+    "expect": "select.component",
+    "text": "select r14"
+  },
+  {
+    "gate": "silicon",
+    "expect": "select.component",
+    "text": "select component u3"
+  },
+  {
+    "gate": "silicon",
+    "expect": "erc.run",
+    "text": "run erc"
+  },
+  {
+    "gate": "silicon",
+    "expect": "erc.run",
+    "text": "run an electrical rule check on the board"
+  },
+  {
+    "gate": "silicon",
+    "expect": "trace.start",
+    "text": "start tracing this net"
+  },
+  {
+    "gate": "silicon",
+    "expect": "trace.stop",
+    "text": "stop tracing the net"
+  },
+  {
+    "gate": "silicon",
+    "expect": "view.set",
+    "text": "fit the whole board in the view"
+  },
+  {
+    "gate": "lumen",
+    "expect": "read",
+    "text": "read the controls on this screen"
+  },
+  {
+    "gate": "lumen",
+    "expect": "read",
+    "text": "what buttons are on this screen"
+  },
+  {
+    "gate": "lumen",
+    "expect": "act",
+    "text": "click the submit button"
+  },
+  {
+    "gate": "lumen",
+    "expect": "act",
+    "text": "press the second button"
+  },
+  {
+    "gate": "lumen",
+    "expect": "act",
+    "text": "click the save button for me"
+  },
+  {
+    "gate": "vision",
+    "expect": "launch",
+    "text": "open the vision app"
+  },
+  {
+    "gate": "vision",
+    "expect": "watch.start",
+    "text": "turn on the camera"
+  },
+  {
+    "gate": "vision",
+    "expect": "watch.start",
+    "text": "start watching the camera"
+  },
+  {
+    "gate": "vision",
+    "expect": "watch.start",
+    "text": "keep an eye on the camera"
+  },
+  {
+    "gate": "vision",
+    "expect": "watch.stop",
+    "text": "stop watching the camera"
+  },
+  {
+    "gate": "vision",
+    "expect": "watch.stop",
+    "text": "turn the camera off"
+  },
+  {
+    "gate": "vision",
+    "expect": "status",
+    "text": "what is the vision app doing"
+  },
+  {
+    "gate": "vision",
+    "expect": "read.handwriting",
+    "text": "read this handwriting"
+  },
+  {
+    "gate": "vision",
+    "expect": "read.handwriting",
+    "text": "transcribe my handwritten notes"
+  },
+  {
+    "gate": "vision",
+    "expect": "scan.document",
+    "text": "scan this document"
+  },
+  {
+    "gate": "vision",
+    "expect": "analyze.file",
+    "text": "analyze the video at ~/Movies/clip.mp4"
+  },
+  {
+    "gate": "vision",
+    "expect": "set.sensitivity",
+    "text": "set the motion sensitivity to 0.4"
+  },
+  {
+    "gate": "lumen",
+    "expect": "read",
+    "text": "read my screen"
+  },
+  {
+    "gate": "vision",
+    "expect": "read.screen",
+    "text": "where's the send button"
+  },
+  {
+    "gate": "nexus",
+    "expect": "launch",
+    "text": "open nexus"
+  },
+  {
+    "gate": "nexus",
+    "expect": "gain.set",
+    "text": "mute channel 2"
+  },
+  {
+    "gate": "nexus",
+    "expect": "gain.set",
+    "text": "mute input 3"
+  },
+  {
+    "gate": "nexus",
+    "expect": "gain.set",
+    "text": "set channel 1 to -6 db"
+  },
+  {
+    "gate": "nexus",
+    "expect": "route.set",
+    "text": "route input 1 to output 2"
+  },
+  {
+    "gate": "nexus",
+    "expect": "monitor.set",
+    "text": "monitor input 1 on output 2"
+  },
+  {
+    "gate": "nexus",
+    "expect": "preset.load",
+    "text": "load the studio preset"
+  },
+  {
+    "gate": "nexus",
+    "expect": "state.get",
+    "text": "what's the mixer state"
+  },
+  {
+    "gate": "markforge",
+    "expect": "launch",
+    "text": "open mark forge"
+  },
+  {
+    "gate": "markforge",
+    "expect": "world.reset",
+    "text": "reset the physics world"
+  },
+  {
+    "gate": "markforge",
+    "expect": "body.spawn",
+    "text": "spawn a cube"
+  },
+  {
+    "gate": "markforge",
+    "expect": "world.step",
+    "text": "step the simulation 10 times"
+  },
+  {
+    "gate": "markforge",
+    "expect": "set.gravity",
+    "text": "set gravity to -9.8"
+  },
+  {
+    "gate": "markforge",
+    "expect": "state.get",
+    "text": "what's the physics state"
+  },
+  {
+    "gate": "policy",
+    "expect": "policy",
+    "text": "always allow the gmail_send action"
+  },
+  {
+    "gate": "policy",
+    "expect": "policy",
+    "text": "always ask before the gmail_send action"
+  },
+  {
+    "gate": "voiceid",
+    "expect": "enroll",
+    "text": "learn my voice"
+  },
+  {
+    "gate": "voiceid",
+    "expect": "enroll",
+    "text": "enroll my voice"
+  },
+  {
+    "gate": "voiceid",
+    "expect": "forget",
+    "text": "forget my voice"
+  },
+  {
+    "gate": "voiceclone",
+    "expect": "clone",
+    "text": "clone my voice"
+  },
+  {
+    "gate": "voiceclone",
+    "expect": "clone",
+    "text": "make a voice that sounds like me"
+  },
+  {
+    "gate": "voiceclone",
+    "expect": "forget",
+    "text": "delete my cloned voice"
+  },
+  {
+    "gate": "voiceclone",
+    "expect": "forget",
+    "text": "forget my cloned voice"
+  },
+  {
+    "gate": "guest",
+    "expect": "on",
+    "text": "guest mode on"
+  },
+  {
+    "gate": "guest",
+    "expect": "on",
+    "text": "turn on guest mode"
+  },
+  {
+    "gate": "guest",
+    "expect": "off",
+    "text": "guest mode off"
+  },
+  {
+    "gate": "guest",
+    "expect": "off",
+    "text": "turn off guest mode"
+  },
+  {
+    "gate": "lumen",
+    "text": "i really need to know what's on my screen",
+    "expect": "read"
+  },
+  {
+    "gate": "lumen",
+    "text": "any idea what's on my screen",
+    "expect": "read"
+  },
+  {
+    "gate": "lumen",
+    "text": "i was wondering what's on my screen",
+    "expect": "read"
+  },
+  {
+    "gate": "lumen",
+    "text": "just curious what's on my screen",
+    "expect": "read"
+  },
+  {
+    "gate": "lumen",
+    "text": "quick question what's on my screen",
+    "expect": "read"
+  },
+  {
+    "gate": "lumen",
+    "text": "would you mind telling me what's on my screen",
+    "expect": "read"
+  },
+  {
+    "gate": "lumen",
+    "text": "do me a favor and tell me what's on my screen",
+    "expect": "read"
+  },
+  {
+    "gate": "lumen",
+    "text": "i wanna know what's on my screen",
+    "expect": "read"
+  }
 ]

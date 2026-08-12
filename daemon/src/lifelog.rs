@@ -354,11 +354,22 @@ pub fn classify_lifelog_intent(utterance: &str) -> Option<LifeLogIntent> {
         // never reached the model — they got "Here's your life log for this week,
         // sir" instead. `[lifelog].enabled` ships true and no earlier router arm
         // claims these utterances, so the hijack was total.
-        || own_activity_asks_about_a_period(lower, "what did i do")
-        || own_activity_asks_about_a_period(lower, "what i did")
-        || own_activity_asks_about_a_period(lower, "what have i done")
-        || lower.contains("what have i been up to")
-        || lower.contains("what i've been doing")
+        //
+        // AND THE WH-WORD HAS TO OPEN THE QUESTION. The period test above bounds
+        // what FOLLOWS the phrase and says nothing about what precedes it, so
+        // narrating the question still rendered the digest: "on sundays we joke
+        // about what did i do all week" reached `Week` at HEAD ("all week" is a
+        // period cue). Same rule as the capture gates —
+        // [`crate::utterance::wh_word_in_interrogative_position`] — so "what did i
+        // do this week" and "tell me what i did today" are untouched. The
+        // "life log" / "my activity" / "my week" limbs are not wh-questions and
+        // keep their own guards.
+        || (crate::utterance::wh_word_in_interrogative_position(lower, &["what"])
+            && (own_activity_asks_about_a_period(lower, "what did i do")
+                || own_activity_asks_about_a_period(lower, "what i did")
+                || own_activity_asks_about_a_period(lower, "what have i done")
+                || lower.contains("what have i been up to")
+                || lower.contains("what i've been doing")))
         || lower.contains("my activity")
         // "my week" / "my day" ALONE are not a request for a digest. They are how
         // people talk about their lives: "why does it always rain on MY DAY off",
@@ -499,6 +510,41 @@ mod tests {
                 classify_lifelog_intent(u).is_some(),
                 "{u:?} IS a life-log request and must still classify"
             );
+        }
+    }
+
+    /// ...AND THE PERIOD TEST BOUNDS ONLY THE TAIL. It says what may FOLLOW the
+    /// own-activity phrase and nothing about what precedes it, so narration whose
+    /// embedded question happens to name a period still rendered the digest: "on
+    /// sundays we joke about what did i do all week" reached `Week` at HEAD. The
+    /// interrogative-position rule bounds the other end.
+    #[test]
+    fn a_narrated_own_activity_question_is_not_a_digest() {
+        for u in [
+            "on sundays we joke about what did i do all week",
+            "she asked what did i do today",
+            "we laughed about what have i been up to lately",
+            "the kids joked about what i did today",
+            "on sundays we sometimes joke about what did i do all week",
+        ] {
+            assert_eq!(
+                classify_lifelog_intent(u),
+                None,
+                "{u:?} is narration and rendered the owner's life-log digest"
+            );
+        }
+        // ...and the openers, a direct-question frame, and the limbs that are not
+        // WH-questions at all are untouched.
+        for u in [
+            "what did i do today",
+            "what did i do this week",
+            "what have i been up to",
+            "tell me what did i do today",
+            "recap my week",
+            "show me my life log",
+            "show me my activity",
+        ] {
+            assert!(classify_lifelog_intent(u).is_some(), "{u:?} IS a lifelog request");
         }
     }
     use super::*;

@@ -429,6 +429,7 @@ pub fn all_hits(text: &str) -> Vec<(&'static str, String)> {
 #[cfg(test)]
 mod tests {
 
+
     /// HIJACKS THAT ARE STILL OPEN, AS A RATCHET.
     ///
     /// These fire TODAY. They are invisible on the shipped config because the
@@ -554,85 +555,151 @@ mod tests {
         // trigger require the verb in COMMAND POSITION, or does it match
         // anywhere? EIGHT were already clean: four carry the rule already
         // (watch.start, watch.stop, analyze.file, scan.document),
-        // and four are clean by a different construction the rule does not
-        // apply to (describe's IMAGE branch needs a real image-extension token,
-        // explicit_screen_vqa is head-anchored on starts_with, the where-is
-        // locate is bounded by locate_targets_a_control, and aperture's recall
-        // needs a resolvable time window or the literal timeline word) — all
-        // four probed inert on narration rather than assumed. TWO were closed
+        // and four were called clean by a different construction the rule does
+        // not apply to (describe's IMAGE branch needs a real image-extension
+        // token, explicit_screen_vqa is head-anchored on starts_with, the
+        // where-is locate is bounded by locate_targets_a_control, and aperture's
+        // recall needs a resolvable time window or the literal timeline word).
+        //
+        // APERTURE WAS NOT CLEAN, and the probe that "measured" it was the
+        // hand-picked one: the narration it was tried on named no resolvable
+        // window ("… what was i doing ALL WEEK"), so the time-window guard did
+        // the refusing and the anywhere-matched cue was never tested. Move the
+        // adjunct one phrase and the guard passes — "on sundays we joke about
+        // what was i doing AT LUNCH" reached `aperture recall` at HEAD. A
+        // downstream guard is not a position rule; aperture now carries the
+        // interrogative rule like the rest. TWO were closed
         // with the rule —
         // `lumen_is_read`'s read/narrate/list verbs and `describe_command`'s
         // screen branch — which took 18 measured narration sentences from
         // capturing to inert; they are in `router_ordinary.json`.
         //
-        // THE SIX BELOW ARE WHAT THE RULE CANNOT REACH, and the reason is
-        // structural rather than an oversight: every one of these triggers is a
-        // WH-QUESTION, not a verb. "what's on my screen" contains no verb that
-        // could be put in command position, so `vision_verb_in_command_position`
-        // has nothing to test and imposing it would delete the capability
-        // outright. The rule that WOULD close them is the interrogative analogue
-        // — the wh-word must open the utterance, behind nothing but the frame —
-        // and it is a NEW rule over five more gates, needing its own both-sides
-        // measurement (its risk is real: "tell me what's on the screen", "read
-        // what's on screen", "watch what's on the screen" and "describe what's
-        // on my screen" are all harvested REAL phrasings that lead with a word
-        // no current frame admits). Naming it beats half-proving it.
+        // SIX OF THE SEVEN QUESTION-FORM ENTRIES ARE NOW CLOSED, by the
+        // interrogative analogue the paragraph above named and declined to
+        // half-prove: [`crate::utterance::wh_word_in_interrogative_position`].
+        // A WH-QUESTION carries no verb that could sit in command position, so
+        // the rule bounds what precedes the WH-WORD instead — deny by default,
+        // behind a frame of vocatives/politeness/request modals and the
+        // direct-question verbs (tell/show/know/see/read/watch/describe), with
+        // the bare subject STICKY so an inserted adverb cannot clear it. Taken at
+        // EIGHT sites: `asks_what_is_on_screen` (both its call sites), Lumen's
+        // "what's on"/"what is on"/"what are" cues, Lumen's control inventory,
+        // screen_context's three recall cues, aperture's seven recall cues,
+        // vision's presence-status wh-cues, read.handwriting's "what does … say"
+        // conjunct, sound's identify cues, and lifelog's own-activity cues.
+        // MEASURED both sides: 75 narration sentences fired at HEAD and 0 fire
+        // now (all 75 are in `router_ordinary.json`); 88 real phrasings were
+        // probed and the same 86 fire before and after — the two that do not
+        // ("whos there", "what does this say") miss at HEAD too, for reasons
+        // unrelated to position.
         //
-        // ALL SIX MEASURED FIRING AFTER the two closures, one representative per
-        // gate; the class is wider than the six lines (10 of the 12 residue
-        // sentences probed fired, and "we argued about what are the buttons on
-        // this screen for" fires the same lumen+vision pair as the first).
-        // Ordered by consequence: the first three capture the owner's screen or
-        // camera and the readout is SPOKEN.
+        // The removed entries were checked ONE WORD AWAY, per this list's own
+        // rule: "on sundays we JOKE about what's on my screen", "on MONDAYS we
+        // talk …", "on sundays THEY talk …", "we/she forgot what was on the
+        // screen", "i/we ASKED|WONDERED who is there …", "the STUDENT asked what
+        // does the whiteboard say", "the SHOW had a great sound …", "on sundays
+        // we joke about what was i WORKING ON all week" — all closed too.
         //
-        // lumen + vision read.screen, via `asks_what_is_on_screen` and Lumen's
-        // "what's on" / "what is on" / "what are" cues.
-        "on sundays we talk about what's on my screen",
-        "i forgot what was on the screen",
-        // vision presence status — a CAMERA read, via `contains("who is there")`.
-        "we asked who is there and nobody answered",
-        // vision read.handwriting — a CAMERA OCR, via the `"what does" + "say"`
-        // conjunct that sits beside the (already clean) command-position verbs.
-        "the teacher asked what does the whiteboard say",
-        // sound — classifies the clip the daemon ALREADY captured, via a bare
-        // `contains("what was")` beside a "sound"/"noise" substring. Labels only
-        // leave the op, which is why it sits below the three above.
-        "the movie had a great sound and i wondered what was going on",
         // pasteboard recall — reads the clipboard ring, via "thing i copied".
+        // NOT wh-shaped ("the thing i copied" is a free relative with no
+        // interrogative to position), so the rule above does not reach it.
         "we talked about the thing i copied from the lease",
-        // screen_context recall — reads the redacted screen ring, via
-        // "what was i" + "doing".
-        "on sundays we joke about what was i doing all week",
         // ------------------------------------------------------------------
-        // AND THE MODAL-FORGIVENESS RESIDUE, which is NOT wh-question shaped —
-        // so the paragraph above, which called the wh-question the whole of what
-        // the rule cannot reach, was smaller than the truth.
+        // AND THE ELLIPTICAL-PRESENCE RESIDUE, ADDED by the pass that closed the
+        // wh half of the same gate — because closing "we asked WHO IS THERE and
+        // nobody answered" while an ordinary sentence one construction away still
+        // opens the CAMERA would have made this list read closed on a gate that
+        // is not.
         //
-        // `vision_verb_in_command_position` forgives a bare subject when a
-        // REQUEST MODAL came first, and that is load-bearing: it is the only
-        // reason "can YOU read my screen" and "i need YOU to read my screen"
-        // work. But VISION_REQUEST_MODALS cannot tell the ADDRESSEE apart from
-        // the SPEAKER, so a subject that precedes its own modal is forgiven too,
-        // and "we keep reading my screen" reads as a request. MEASURED still
-        // firing after the sticky-subject fix; unchanged by it, and firing
-        // identically at 668bcb3.
+        // `vision_command`'s status arm also matches the bare substrings
+        // "anyone there" / "anybody there" / "someone there" / "somebody there".
+        // Those are ELLIPTICAL yes/no questions ("is anyone there?"), not
+        // wh-questions: there is no interrogative word to require in first
+        // position, and the tell is the AUX INVERSION ("IS anyone there" vs
+        // "there WAS somebody there"). A subject-position rule over `there` is a
+        // different rule and needs its own both-sides sweep, so it is named here
+        // rather than guessed at. MEASURED still firing at this revision, both
+        // reaching `vision status` — a CAMERA snapshot.
+        "there was somebody there when i got home",
+        "i heard someone there last night",
+        // ------------------------------------------------------------------
+        // THE MODAL-FORGIVENESS RESIDUE THAT USED TO SIT HERE IS CLOSED, and by
+        // the structural rule the entry itself named: forgive only a subject the
+        // ADDRESSEE owns. "we keep reading my screen", "we like to read my
+        // screen on sundays" and "we keep watching the front door" are gone from
+        // this list and into `router_ordinary.json`, along with 41 more of the
+        // same shape.
         //
-        // WHAT WOULD CLOSE IT is one more turn of the same screw — forgive only
-        // a subject that appears AFTER the modal, i.e. the addressee — and it is
-        // NOT TAKEN here for a concrete reason, not a shrug: "we should watch the
-        // front door" and "you could read my screen" have the subject BEFORE the
-        // modal and are plausible real requests, so the rule needs its own
-        // both-sides sweep over all 11 call sites of the helper (watch.start,
+        // WHAT THE RULE IS. An English imperative uses the BARE verb, and a
+        // control verb takes its OWN subject as the subject of the verb it
+        // governs: in "we keep READING my screen" and "we like to READ my
+        // screen" the reader is "we", the speaker — narration. The aspect verbs
+        // therefore moved out of `VISION_REQUEST_MODALS` into
+        // `VISION_CONTROL_VERBS`, where they SUSPEND the forgiveness instead of
+        // granting it, and an ADDRESSEE after them restores it, because "i want
+        // YOU to read my screen" hands the verb back to DARWIN. Two siblings
+        // fell out of the same measurement and are closed with it: the
+        // apostrophe-free "im"/"id"/"ill"/"ive" were in the command frame but not
+        // in `VISION_BARE_SUBJECTS`, so "im going to read my screen later"
+        // carried no subject token at all; and a progressive with nothing verbal
+        // in front of it is a gerund SUBJECT, not a command ("reading my screen
+        // is a waste of time"), which no subject rule can see because a gerund
+        // clause has no subject pronoun.
+        //
+        // WHAT IT DID NOT TOUCH: the subject before a TRUE modal, and a control
+        // verb whose OBJECT is the addressee. Both still fire, and the two lines
+        // below hold the list to that breadth instead of a comment claiming it.
+        // Measured over all 11 call sites of the helper (watch.start,
         // watch.stop, the stop alias, analyze.file, scan.document,
         // read.handwriting, sensitivity, reads_this_or_that, read.screen, lumen
-        // read, describe screen). Half-proving it across eleven gates is traps
-        // (g) and (m) in one move.
+        // read, describe screen), both sides, in
+        // `aspectual_narration_is_inert_and_its_real_commands_still_fire`.
         //
-        // The first two capture the owner's SCREEN and the readout is SPOKEN; the
-        // third is on the shipped CAMERA gate and predates this hunt entirely.
-        "we keep reading my screen",
-        "we like to read my screen on sundays",
-        "we keep watching the front door",
+        // 1. SUBJECT BEFORE A TRUE MODAL. "we should watch the front door" and
+        //    "you could read my screen" were the stated reason this was not
+        //    closed before, and they survive because only the control verbs
+        //    changed. They are genuinely ambiguous between a request and a
+        //    suggestion — but the FAMILY is not, and calling the whole of it
+        //    ambiguous would be the comment flattering itself. A first-person
+        //    declarative has no request reading at all and fires just the same:
+        //    "i will read my screen later", "i can read my screen", "i would
+        //    read my screen", "we will watch the front door", "we let you read
+        //    my screen", "lets read my screen". A VOCATIVE or an opener does the
+        //    same job as the modal, because "darwin"/"hey"/"ok" are in this list
+        //    too: "darwin i'll read my screen after dinner", "hey i'll read my
+        //    screen after dinner" and "ok i'll read my screen after dinner" all
+        //    fire — addressing DARWIN and then narrating at him is not a
+        //    request. The entry below is one of THOSE, not one of the ambiguous
+        //    pair, so the ratchet states the part that a POS tagger CAN decide;
+        //    the breadth is this paragraph, not the single line.
+        // 2. CONTROL VERB + ADDRESSEE + PROGRESSIVE. The addressee restores the
+        //    forgiveness, which is right for "i want YOU to read my screen" and
+        //    wrong for the small-clause complement of a PREFERENCE verb: "i like
+        //    you watching the front door" is a compliment, not an order, and it
+        //    opens the CAMERA. So does "we like you reading my screen on
+        //    sundays", "i like darwin reading my screen", "we like you scanning
+        //    the receipt", and — one word substituted in the entry this pass
+        //    removed — "we like YOU read my screen on sundays". The split is
+        //    lexical, not structural: "need/want you watching" IS a directive
+        //    while "like/love you watching" is not, so it needs the control
+        //    verbs sorted into volition and preference, which is a different
+        //    hunt with its own both-sides sweep. Unchanged from a3b66fb either
+        //    way — "like" forgave the subject there too.
+        //
+        // THE MEASURED COST, so it is not rediscovered as a bug: the SUBJECT-
+        // CONTROL infinitives no longer fire — "i want to read my screen", "i
+        // need to read my screen", "i'd like to read my screen", "i want to
+        // watch the front door". These are structurally the speaker reading, not
+        // DARWIN ("want" is a subject-control verb), and the addressee spelling
+        // one word away — "i want YOU to read my screen" — fires. No probe in
+        // `router_recall.json` used the subject-control spelling, and recall is
+        // unchanged per-gate at 206/217.
+        //
+        // The two residues named above, as entries rather than as prose. Both
+        // capture — the first the owner's SCREEN, the second the CAMERA — and
+        // the readout is SPOKEN.
+        "i will read my screen later",
+        "i like you watching the front door",
     ];
 
     /// THE HARNESS CLOCK IS PINNED, AND IT HAS TO BE.
@@ -690,6 +757,94 @@ mod tests {
                 .is_none(),
             "precondition: at 00:00 this utterance reaches NOTHING — if it fired \
              here, the pin above would be defending nothing"
+        );
+    }
+
+    /// THE ASPECT/CONTROL CLOSURE, BOTH SIDES, IN ONE TEST.
+    ///
+    /// `router_ordinary.json` already enforces the narration half, but a corpus
+    /// entry does not say WHY it is there, and a one-sided guard is how a fix
+    /// that silences the real command gets shipped: silencing "read my screen"
+    /// would make every narration sentence pass. So the commands live here beside
+    /// the narration, and each pair is one word apart — "we keep reading my
+    /// screen" against "keep reading my screen", "we like to read my screen"
+    /// against "i want you to read my screen".
+    ///
+    /// The command half is deliberately NOT in `router_recall.json`: these are a
+    /// guard against over-narrowing, not new capability, and folding them into
+    /// the fixture would move the headline recall denominator for a reason that
+    /// has nothing to do with recall.
+    #[test]
+    fn aspectual_narration_is_inert_and_its_real_commands_still_fire() {
+        // NARRATION — a capture verb governed by an aspect/control verb whose
+        // subject is the SPEAKER, a first-person contraction subject, or a bare
+        // gerund subject. Every one reached a capture gate at a3b66fb and the
+        // readout is SPOKEN. Spread across all five gates that the hole touched.
+        const NARRATION: &[&str] = &[
+            "we keep reading my screen",              // lumen read
+            "we like to read my screen on sundays",   // lumen + vision read.screen
+            "we keep watching the front door",        // vision watch.start
+            "we keep scanning the receipt",           // vision scan.document
+            "we keep transcribing the whiteboard",    // vision read.handwriting
+            "we keep describing my screen to each other",
+            "i keep reading my screen",
+            "you keep reading my screen",
+            "we start reading my screen every monday",
+            "we continue reading my screen after lunch",
+            "we want to read my screen every night",
+            "we try to watch the front door",
+            "im going to read my screen later",
+            "id like to read my screen",
+            "reading my screen is a waste of time",
+            "watching the front door is boring",
+        ];
+        // COMMANDS — the same verbs, one word away, that MUST still fire. The
+        // aspect construction ("keep watching"), the addressee-restored control
+        // request ("i want you to read"), the bare imperative, the vocative and
+        // the question form.
+        const COMMANDS: &[&str] = &[
+            "read my screen",
+            "watch the front door",
+            "read the whiteboard",
+            "describe my screen",
+            "darwin read my screen",
+            "can you read my screen",
+            "please watch the door",
+            "keep reading my screen",
+            "keep watching the front door",
+            "start reading my screen",
+            "continue reading my screen",
+            "resume reading the screen",
+            "begin reading my screen",
+            "keep scanning the receipt",
+            "go back to watching the driveway",
+            "carry on watching the front door",
+            "i want you to read my screen",
+            "i need you to watch the front door",
+            "id like you to read my screen",
+            "im going to need you to watch the front door",
+            "we should watch the front door",
+            "you could read my screen",
+        ];
+        let captured: Vec<String> = NARRATION
+            .iter()
+            .map(|s| (s, super::all_hits(s)))
+            .filter(|(_, h)| !h.is_empty())
+            .map(|(s, h)| format!("  {s:?} -> {h:?}"))
+            .collect();
+        assert!(
+            captured.is_empty(),
+            "narration reached a CAPTURE gate and the readout is SPOKEN:\n{}",
+            captured.join("\n")
+        );
+        let silenced: Vec<&&str> = COMMANDS
+            .iter()
+            .filter(|s| super::all_hits(s).is_empty())
+            .collect();
+        assert!(
+            silenced.is_empty(),
+            "the fix silenced a REAL command — a narrowing that deletes the \
+             capability is not a fix: {silenced:?}"
         );
     }
 

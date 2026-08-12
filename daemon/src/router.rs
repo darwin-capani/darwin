@@ -5980,11 +5980,111 @@ const VISION_COMMAND_FRAME: &[&str] = &[
 ];
 
 /// The frame tokens that make what follows a REQUEST rather than a report.
+///
+/// TRUE MODALS ONLY — the CONTROL VERBS that used to sit here moved to
+/// [`VISION_CONTROL_VERBS`], because they do not mean what the rest of this list
+/// means. "can/could/would/should/will" and the vocative take the ADDRESSEE as
+/// the subject of the verb that follows ("can you READ my screen", "you could
+/// READ my screen", "we should WATCH the front door" — DARWIN reads/watches in
+/// every one), which is why forgiving a bare subject behind them is right. A
+/// control verb does NOT: "we keep READING my screen" and "we like to READ my
+/// screen" put the SPEAKER in the subject slot of the capture verb, so they are
+/// narration, and forgiving the subject behind them read a report as a request.
+/// AND THE BARE CONTRACTION FRAGMENTS "d"/"ll" ARE NOT MODALS EITHER — they were
+/// here and they made the contraction fix ONE-SIDED. `VISION_BARE_SUBJECTS` now
+/// admits the dictated one-token "im"/"id"/"ill"/"ive", so "ill read my screen
+/// after dinner" is inert and is enforced in `router_ordinary.json`. But the
+/// APOSTROPHE'D twin splits to "i" + "ll", and while "i" was a bare subject "ll"
+/// was a REQUEST MODAL, so it forgave that subject and the sentence one
+/// apostrophe away still read the owner's screen ALOUD. MEASURED firing with the
+/// aspect fix already applied: "i'll read my screen after dinner", "i'd read my
+/// screen every morning", "we'll read my screen after dinner", "you'll read my
+/// screen" (all lumen read + read.screen), "i'll watch the front door tonight"
+/// and "i'd watch the front door if i were you" (the CAMERA), "i'll scan the
+/// receipt later". Their "m"/"ve" siblings were never modals and were already
+/// inert ("i'm reading my screen right now", "i've read my screen already"),
+/// which is exactly the asymmetry: four spellings of one construction, two
+/// caught and two not.
+///
+/// THEY COST NO REQUEST, because a "'d"/"'ll" request carries its addressee and
+/// the addressee is what restores the forgiveness: "i'd like YOU to read my
+/// screen", "i'll need YOU to watch the front door", "we'd like DARWIN to read my
+/// screen" all still fire, by the same route in `vision_verb_in_command_position`
+/// that "i need you to …" always used. No probe in `router_recall.json` reaches a
+/// capture gate through a bare "'d"/"'ll"; recall is unchanged at 206/217,
+/// per-gate and per-probe. Both sides are pinned in
+/// `a_contraction_subject_is_read_the_same_with_and_without_its_apostrophe`.
 const VISION_REQUEST_MODALS: &[&str] = &[
-    "could", "can", "will", "would", "should", "please", "want", "wants", "need",
-    "needs", "like", "let", "lets", "try", "help", "gonna", "going", "d", "ll",
-    "darwin", "hey", "ok", "okay", "keep", "keeps", "keeping", "start", "starts",
-    "continue",
+    "could", "can", "will", "would", "should", "please", "let", "lets",
+    "darwin", "hey", "ok", "okay",
+];
+
+/// The ASPECT / CONTROL verbs. These license a following capture verb — that is
+/// what the aspect construction "keep watching the front door" IS, and it is a
+/// real imperative — but they are NOT request modals, because the subject of the
+/// capture verb they govern is their OWN subject, not the addressee.
+///
+/// WHAT WENT WRONG: every token below used to sit in [`VISION_REQUEST_MODALS`],
+/// so it set `modal_seen` and forgave any subject in front of it. That made
+/// "we keep reading my screen" — the owner NARRATING a habit — indistinguishable
+/// from "keep reading my screen", the imperative, and the readout is SPOKEN.
+/// MEASURED at a3b66fb reaching a capture gate through this hole, across SEVEN
+/// of the helper's eleven call sites (lumen read, vision read.screen,
+/// watch.start, watch.stop, scan.document, read.handwriting, describe screen —
+/// the last two found only by probing the siblings rather than assuming the
+/// three named sentences bounded the class): the three `KNOWN_OPEN_HIJACKS`
+/// entries plus 23 more of the same shape — "i keep reading my screen", "we start reading my screen every
+/// monday", "we continue reading my screen after lunch", "we keep watching the
+/// driveway", "we keep scanning the receipt", "we keep transcribing the
+/// whiteboard", "we want to read my screen every night", "we try to watch the
+/// front door", "i like to read my screen with coffee", "im going to read my
+/// screen later", "we like to stop watching the camera", "we like to describe my
+/// screen at parties" and the rest. All are now in `router_ordinary.json`.
+///
+/// Of the remaining four call sites, THREE were PROBED inert at a3b66fb rather
+/// than assumed — analyze.file ("we keep analyzing the pdf on my desktop"),
+/// sensitivity ("we like to set the motion sensitivity every week") and the stop
+/// alias ("we keep stopping the camera watch") — each bounded by something the
+/// narration never supplied (a file/document object, a "sensitivity" head, a
+/// base-form stop verb). The fourth, `reads_this_or_that`, is not a gate of its
+/// own: it surfaces through read.screen, which is already in the seven above
+/// ("we like to read this or that on my screen" fired both it and lumen).
+///
+/// THE ADDRESSEE IS THE DISCRIMINATOR, and it is the same modal+you exception
+/// this file already documents for "can you read": a control verb whose object
+/// is the addressee hands the capture verb BACK to DARWIN — "i want YOU to read
+/// my screen", "i'd like YOU to read my screen", "i'm going to need YOU to watch
+/// the front door" — and those must keep firing. So a control verb suspends the
+/// forgiveness rather than granting it, and an addressee token after it restores
+/// it. See [`vision_verb_in_command_position`].
+const VISION_CONTROL_VERBS: &[&str] = &[
+    "want", "wants", "need", "needs", "like", "try", "help", "gonna", "going",
+    "keep", "keeps", "keeping", "start", "starts", "continue",
+];
+
+/// The ADDRESSEE tokens: a control verb's object that puts DARWIN back in the
+/// subject slot of the capture verb. "darwin" is here as well as in
+/// VISION_REQUEST_MODALS because "i need DARWIN to read my screen" is the same
+/// construction as "i need YOU to read my screen".
+const VISION_ADDRESSEES: &[&str] = &["you", "darwin"];
+
+/// The ASPECT / CONTINUATION tokens that can GOVERN a progressive. An English
+/// imperative uses the BARE verb — "read my screen", never "reading my screen" —
+/// so a progressive is only ever a command as the COMPLEMENT of one of these
+/// ("keep watching the front door", "go back to watching the driveway", "carry
+/// on watching the front door"), which is the whole reason the -ing forms are in
+/// the verb lists at all. With nothing verbal in front of it a progressive is a
+/// GERUND-SUBJECT nominal, and the subject rule cannot see it because a gerund
+/// clause HAS no subject pronoun: "reading my screen is a waste of time" and
+/// "watching the front door is boring" both reached a capture gate at a3b66fb
+/// with the whole aspect fix above already applied. Both now in
+/// `router_ordinary.json`.
+///
+/// [`VISION_CONTROL_VERBS`] licenses a progressive too and is checked alongside
+/// this list rather than duplicated into it.
+const VISION_ASPECT_TOKENS: &[&str] = &[
+    "resume", "resumes", "begin", "begins", "stop", "carry", "back", "on", "go",
+    "get", "gets", "to",
 ];
 
 /// Bare subject pronouns. English spells the PAST tense of "read" and "set"
@@ -6011,7 +6111,29 @@ const VISION_REQUEST_MODALS: &[&str] = &[
 /// loud", "we also describe my screen" — and, on the CAMERA gates that share
 /// this helper, "we just watch the front door on sundays" (watch.start) and "we
 /// just read the whiteboard together" (read.handwriting).
-const VISION_BARE_SUBJECTS: &[&str] = &["i", "we", "you"];
+/// AND THE APOSTROPHE-FREE CONTRACTIONS ARE SUBJECTS TOO. VISION_COMMAND_FRAME
+/// admits "im"/"id"/"ill"/"ive" as the one-token spellings dictation produces for
+/// "i'm"/"i'd"/"i'll"/"i've", but only their APOSTROPHE'D halves reached this
+/// list: "i'm going to read my screen later" split to "i" + "m" and was caught by
+/// the subject "i", while the identical dictated "im going to read my screen
+/// later" carried no token in this list at all and CAPTURED THE SCREEN. Same for
+/// "id like to read my screen" (vs. the caught "i'd like to read my screen") and
+/// "ill read my screen" / "ive read my screen" — all four MEASURED firing at
+/// a3b66fb, all four now in `router_ordinary.json`. They cost no request: the
+/// real forms carry an addressee ("im going to need YOU to watch the front
+/// door", "id like YOU to read my screen"), which restores the forgiveness by
+/// the same route "i need you to …" always used.
+///
+/// ADDING THEM HERE WAS ONLY HALF OF IT, and the half-fix read as a whole one:
+/// with these four in this list but "d"/"ll" still in `VISION_REQUEST_MODALS`,
+/// the corpus enforced "ill read my screen after dinner" as inert while
+/// "i'll read my screen after dinner" — the SAME sentence, one apostrophe away,
+/// and the spelling a transcript actually produces — still read the screen
+/// ALOUD, because "i" + "ll" is a bare subject behind a request modal. The twins
+/// only agree now that `VISION_REQUEST_MODALS` has dropped "d"/"ll"; see the
+/// paragraph there for the seven measured sentences and what it cost (nothing).
+const VISION_BARE_SUBJECTS: &[&str] =
+    &["i", "we", "you", "im", "id", "ill", "ive"];
 
 /// Whether the FIRST content token of `lower` is one of `verbs` — i.e. the verb
 /// is in COMMAND position, preceded by nothing but [`VISION_COMMAND_FRAME`], and
@@ -6030,15 +6152,64 @@ fn vision_verb_in_command_position(lower: &str, verbs: &[&str]) -> bool {
     // through that way. A later modal still forgives ("i just need YOU to read
     // my screen" fires), because `modal_seen` is checked at the verb, not here.
     let mut subject_seen = false;
+    // A CONTROL VERB SUSPENDS THE FORGIVENESS UNLESS THE ADDRESSEE IS ITS
+    // SUBJECT. See [`VISION_CONTROL_VERBS`]: a control verb hands the capture
+    // verb to its OWN subject, so "we keep READING my screen" and "we like TO
+    // READ my screen" are the speaker's habit, and the modal forgiveness used to
+    // read them as a request.
+    //
+    // WHICH SUBJECT IS CURRENT is tracked, not merely whether an addressee
+    // appears SOMEWHERE. "the addressee must follow the control verb" was written
+    // first and it silenced a REAL command: "can YOU keep reading my screen" puts
+    // the addressee BEFORE the aspect verb — "you" is what "keep" governs — and a
+    // follows-only rule refused it. So an addressee token makes the addressee
+    // current, a speaker subject takes it back ("i", "we", and the dictated
+    // "im"/"id"), and a control verb suspends only while the SPEAKER is current.
+    let mut addressee_governs = false;
+    let mut control_pending = false;
+    // A PROGRESSIVE NEEDS A GOVERNOR. See [`VISION_ASPECT_TOKENS`]: the -ing
+    // forms are in the verb lists only to serve the aspect construction, so
+    // without an aspect or control verb in front of them they are a gerund
+    // SUBJECT ("reading my screen is a waste of time"), which no imperative ever
+    // is. Bounded by the verb lists themselves — none of the BASE verbs they
+    // carry ends in "ing" (asserted by
+    // `no_capture_verb_list_has_a_base_form_ending_in_ing`), so this test names
+    // the progressives exactly.
+    let mut gerund_licensed = false;
     for w in lower.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()) {
         if verbs.contains(&w) {
-            return !subject_seen || modal_seen;
+            if w.ends_with("ing") && !gerund_licensed {
+                return false;
+            }
+            return !subject_seen || (modal_seen && !control_pending);
         }
         if !VISION_COMMAND_FRAME.contains(&w) {
             return false;
         }
         if VISION_REQUEST_MODALS.contains(&w) {
             modal_seen = true;
+        }
+        if VISION_ASPECT_TOKENS.contains(&w) {
+            gerund_licensed = true;
+        }
+        if VISION_CONTROL_VERBS.contains(&w) {
+            gerund_licensed = true;
+            // Suspend only while the SPEAKER is the current subject: in "can you
+            // keep reading my screen" the addressee already governs, so "keep"
+            // is DARWIN's and nothing is suspended.
+            control_pending = !addressee_governs;
+        } else if VISION_ADDRESSEES.contains(&w) {
+            // The addressee becomes the current subject — as a control verb's
+            // OBJECT ("i want YOU to read my screen") this hands the capture verb
+            // back to DARWIN, so forgive exactly as a request modal would.
+            addressee_governs = true;
+            if control_pending {
+                control_pending = false;
+                modal_seen = true;
+            }
+        } else if VISION_BARE_SUBJECTS.contains(&w) {
+            // A speaker subject takes the subject slot back from the addressee.
+            addressee_governs = false;
         }
         if VISION_BARE_SUBJECTS.contains(&w) {
             subject_seen = true;
@@ -6482,6 +6653,18 @@ fn asks_what_is_on_screen(lower: &str) -> bool {
     if !crate::utterance::mentions_any_word(lower, &["what", "whats"]) {
         return false;
     }
+    // ...AND THE WH-WORD HAS TO OPEN THE QUESTION. The whole-word rule above
+    // still matched an EMBEDDED "what", so "on sundays we talk about what's on my
+    // screen" and "i forgot what was on the screen" captured the owner's screen
+    // and spoke it. See [`crate::utterance::wh_word_in_interrogative_position`]:
+    // it is the interrogative analogue of the command-position rule the
+    // imperative capture gates already carry, and it keeps the direct-question
+    // frames ("tell me what's on the screen", "watch what's on the screen",
+    // "describe what's on my screen") that this function's two call sites lead
+    // with.
+    if !crate::utterance::wh_word_in_interrogative_position(lower, &["what", "whats"]) {
+        return false;
+    }
     let mut it = lower
         .split(|c: char| !c.is_alphanumeric())
         .filter(|x| !x.is_empty())
@@ -6812,15 +6995,24 @@ pub fn vision_command(text: &str) -> Option<VisionCommand> {
     // DEFENSIVE-ONLY: "who is there" is a PRESENCE query, not identity — it maps
     // to the same generic status snapshot as "what do you see". There is no
     // face-match / name-lookup op anywhere in the contract.
-    if lower.contains("what do you see")
+    // THE WH-SHAPED CUES MUST OPEN THE QUESTION. Matched anywhere, they turned an
+    // owner NARRATING into a camera snapshot: "we asked who is there and nobody
+    // answered", "she wondered who is there", "the kids joked about what do you
+    // see" all reached this status op at HEAD. The elliptical "anyone/anybody/
+    // someone/somebody there" cues below are NOT wh-questions, so this rule
+    // cannot reach them — that residue is stated in `recall_probe`'s
+    // KNOWN_OPEN_HIJACKS rather than quietly dropped.
+    let asks_presence = (lower.contains("what do you see")
         || lower.contains("what can you see")
         || lower.contains("who is there")
         || lower.contains("who's there")
+        || lower.contains("what are you seeing"))
+        && crate::utterance::wh_word_in_interrogative_position(&lower, &["what", "who"]);
+    if asks_presence
         || lower.contains("anyone there")
         || lower.contains("anybody there")
         || lower.contains("someone there")
         || lower.contains("somebody there")
-        || lower.contains("what are you seeing")
         // MEASURED RECALL MISS: "what is the vision app doing" reached nothing.
         // The status snapshot IS the answer to that question, and the utterance
         // NAMES the app — the strongest anchor in this whole classifier.
@@ -7098,9 +7290,18 @@ fn handwriting_document_op(lower: &str) -> Option<String> {
         )
         // "what does this say" / "what does this handwriting say" / "what does it
         // say" — a "what does … say" question over the handwriting cue is a read.
-        || (lower.contains("what does") && mentions_word(lower, "say"))
-        || lower.contains("what's written")
-        || lower.contains("whats written");
+        //
+        // ...AND THE WH-WORD HAS TO OPEN IT. These three were matched anywhere, so
+        // reporting the question opened the CAMERA and read the whiteboard aloud:
+        // "the teacher asked what does the whiteboard say", "we joked about what
+        // does the whiteboard say", "she wondered what's written on the
+        // whiteboard". The command-position verbs above are untouched, and every
+        // opener ("what does the whiteboard say", "what's written on the
+        // whiteboard") still fires.
+        || (((lower.contains("what does") && mentions_word(lower, "say"))
+            || lower.contains("what's written")
+            || lower.contains("whats written"))
+            && crate::utterance::wh_word_in_interrogative_position(lower, &["what", "whats"]));
     if mentions_handwriting && names_read {
         // Handwriting/whiteboard is read off the camera by default; honor an
         // explicit "on screen" request (e.g. a whiteboard shared on screen).
@@ -7512,15 +7713,22 @@ fn lumen_is_read(lower: &str) -> bool {
             lower,
             &["read", "reread", "reading", "rereading", "narrate", "list", "listing"],
         );
-    // THE QUESTION CUES ARE LEFT AS THEY WERE, and deliberately so: they carry no
-    // verb that could sit in command position ("what's on my screen" has none at
-    // all), so the sibling's rule does not apply to them and imposing it would
-    // delete the capability. They remain matchable anywhere — see the
-    // question-form entries in `recall_probe`'s KNOWN_OPEN_HIJACKS, where the
-    // residue is stated rather than quietly dropped.
-    let asks = lower.contains("what's on")
+    // THE QUESTION CUES CARRY NO VERB that could sit in command position
+    // ("what's on my screen" has none at all), so the sibling's rule does not
+    // apply to them — but the INTERROGATIVE analogue does, and without it these
+    // three substrings matched an embedded content clause anywhere in the
+    // utterance. MEASURED reaching a Lumen read at HEAD, each one an owner
+    // NARRATING and getting their screen captured and read back ALOUD: "on
+    // sundays we talk about what's on my screen", "we joked about what's on my
+    // screen", "the kids talk about what's on my screen", "he asked what's on my
+    // screen", "i remember what's on my screen", "nobody knows what's on my
+    // screen", "we argued about what are the buttons on this screen for". The
+    // rule keeps every opener and every direct-question frame — see
+    // [`crate::utterance::wh_word_in_interrogative_position`].
+    let asks = (lower.contains("what's on")
         || lower.contains("what is on")
-        || lower.contains("what are");
+        || lower.contains("what are"))
+        && crate::utterance::wh_word_in_interrogative_position(lower, &["what"]);
     let reads = reads_verb || asks;
     // MEASURED RECALL MISS: "what buttons are on this screen" reached nothing.
     // "what are" was in `reads` but this word order interposes the noun ("what
@@ -7532,12 +7740,17 @@ fn lumen_is_read(lower: &str) -> bool {
     // noun — so folding them into `reads` would have made "what buttons should i
     // sew on this coat" a Lumen read (button + question). Anchoring the new cues
     // on the screen instead is what keeps the coat out.
+    // ...and these five are the SAME anywhere-matched interrogative, so they take
+    // the same position rule. Without it "we argued about what buttons are on
+    // this screen" and "she asked what controls are on my screen" are Lumen
+    // reads; the openers ("what buttons are on this screen") are untouched.
     let control_inventory = mentions_screen
         && (lower.contains("what buttons")
             || lower.contains("what controls")
             || lower.contains("what fields")
             || lower.contains("what links")
-            || lower.contains("what menus"));
+            || lower.contains("what menus"))
+        && crate::utterance::wh_word_in_interrogative_position(lower, &["what"]);
     control_inventory || (reads && (mentions_screen || mentions_controls))
 }
 
@@ -8696,22 +8909,33 @@ pub fn is_identify_sound_request(text: &str) -> bool {
     // verb, or a bare "what am i hearing" / "what do you hear" (hearing a SOUND,
     // not parsing speech — the speech veto above already removed "hear me say").
     let mentions_sound = lower.contains("sound") || lower.contains("noise");
-    let identify_verb = lower.contains("what was that")
-        || lower.contains("what's that")
-        || lower.contains("what is that")
-        || lower.contains("what was")
+    // THE WH-CUES MUST OPEN THE QUESTION. `contains("what was")` beside a
+    // "sound"/"noise" substring matched an EMBEDDED question, so narrating one
+    // classified the clip the daemon had already captured: "the movie had a great
+    // sound and i wondered what was going on", "we talked about what was that
+    // sound", "she asked what was that noise". `identify` / `name that` are
+    // imperatives, not questions, and are left exactly as they were.
+    let asked_directly = crate::utterance::wh_word_in_interrogative_position(&lower, &["what"]);
+    let identify_verb = (asked_directly
+        && (lower.contains("what was that")
+            || lower.contains("what's that")
+            || lower.contains("what is that")
+            || lower.contains("what was")
+            || lower.contains("what kind of")))
         || lower.contains("identify")
-        || lower.contains("name that")
-        || lower.contains("what kind of");
+        || lower.contains("name that");
     if mentions_sound && identify_verb {
         return true;
     }
     // Bare hearing queries (no "sound" word needed): "what am I hearing", "what
     // do you hear", "what are you hearing". Speech ("hear me say") was vetoed.
-    lower.contains("what am i hearing")
-        || lower.contains("what do you hear")
-        || lower.contains("what are you hearing")
-        || lower.contains("what's that i hear")
+    // These four are wh-questions too, so they take the same position rule — "we
+    // laughed about what do you hear" is a story, not a request to classify.
+    asked_directly
+        && (lower.contains("what am i hearing")
+            || lower.contains("what do you hear")
+            || lower.contains("what are you hearing")
+            || lower.contains("what's that i hear"))
 }
 
 /// The confined clip path the daemon writes (or already wrote) for a one-shot
@@ -12465,6 +12689,234 @@ mod tests {
         }
     }
 
+    /// AND THE QUESTION FORMS, which the command-position rule above cannot
+    /// touch. A WH-question carries no verb to put in command position, so its
+    /// cues were matched ANYWHERE and an owner narrating the question had the
+    /// screen, the camera or the mic clip read back ALOUD. Every sentence here
+    /// was MEASURED reaching the named gate at HEAD; the interrogative-position
+    /// rule ([`crate::utterance::wh_word_in_interrogative_position`]) is what
+    /// makes them inert.
+    ///
+    /// FOUR ROUTER GATES AT ONCE, because one shared rule closed all four and a
+    /// test per gate would let three of them drift: Lumen's read, Vision's
+    /// `read.screen`, Vision's presence `status`, Vision's `read.handwriting`,
+    /// and the sound classifier.
+    #[test]
+    fn a_narrated_wh_question_never_reaches_a_capture_gate() {
+        // Lumen read + vision read.screen, via the "what's on"/"what are" cues
+        // and `asks_what_is_on_screen`.
+        for text in [
+            "on sundays we talk about what's on my screen",
+            "on sundays we sometimes talk about what's on my screen",
+            "we joked about what's on my screen",
+            "the kids talk about what's on my screen",
+            "he asked what's on my screen",
+            "i forgot what was on the screen",
+            "i already forgot what was on the screen",
+            "she wondered what was on the screen",
+            "we argued about what are the buttons on this screen for",
+            "we argued about what buttons are on this screen",
+            "i know what's on my screen",
+            "you know what's on my screen",
+        ] {
+            assert_eq!(lumen_command(text), None, "{text:?} captured via Lumen");
+            assert_eq!(vision_command(text), None, "{text:?} captured via Vision");
+            assert!(!is_screen_read(text), "{text:?} is still a screen read");
+        }
+        // Vision presence status — a CAMERA snapshot.
+        for text in [
+            "we asked who is there and nobody answered",
+            "we asked who's there and nobody answered",
+            "they asked who is there and nobody answered",
+            "she wondered who is there",
+            "the kids joked about what do you see",
+            "nobody knew what can you see",
+        ] {
+            assert_eq!(vision_command(text), None, "{text:?} opened the camera");
+        }
+        // Vision read.handwriting — a CAMERA OCR.
+        for text in [
+            "the teacher asked what does the whiteboard say",
+            "the teacher asks what does the whiteboard say",
+            "we joked about what does the whiteboard say",
+            "she wondered what's written on the whiteboard",
+        ] {
+            assert_eq!(vision_command(text), None, "{text:?} read the whiteboard");
+        }
+        // The sound classifier, over the clip the daemon already captured.
+        for text in [
+            "the movie had a great sound and i wondered what was going on",
+            "the movie had a great sound and we wondered what was going on",
+            "we talked about what was that sound",
+            "she asked what was that noise",
+            "we laughed about what do you hear",
+        ] {
+            assert!(!is_identify_sound_request(text), "{text:?} classified the clip");
+        }
+    }
+
+    /// ...AND THE REAL QUESTION STILL FIRES, at every gate the rule touched. A
+    /// fix that silences the request is not a fix, and DENY BY DEFAULT is exactly
+    /// the shape that would: the openers, the dictation spellings, the vocative
+    /// and politeness prefixes, the aux-inverted requests and the four
+    /// direct-question frames that lead with a verb are each probed here.
+    #[test]
+    fn every_real_wh_question_survives_the_interrogative_position_rule() {
+        let read = r#"{"type":"op","op":"read.screen"}"#;
+        for text in [
+            "what's on my screen",
+            "whats on my screen",
+            "what is on the screen",
+            "what's on my second screen",
+            "whats on my second screen",
+            "what is displayed on the screen",
+            "tell me what's on the screen",
+            "tell me whats on the screen",
+            "show me what's on my screen",
+            "read what's on screen",
+            "darwin what's on my screen",
+            "hey darwin, what's on my screen",
+            "please tell me what's on my screen",
+            "can you tell me what's on my screen",
+            "let me know what's on my screen",
+            "i need to know what's on my screen",
+            "so what's on my screen",
+            "actually, what's on my screen",
+        ] {
+            assert_vision_op(text, read);
+        }
+        // The free-relative object of a watch, which shares `asks_what_is_on_screen`.
+        assert_vision_op(
+            "watch what's on the screen",
+            r#"{"type":"op","op":"watch.start","source":"screen"}"#,
+        );
+        // Presence and handwriting, the two CAMERA questions.
+        let status = r#"{"type":"op","op":"status"}"#;
+        for text in ["who is there", "who's there", "what do you see", "darwin, what can you see right now"] {
+            assert_vision_op(text, status);
+        }
+        assert_vision_op(
+            "what does the whiteboard say",
+            r#"{"type":"op","op":"read.handwriting"}"#,
+        );
+        // ...and the sound classifier, including the two IMPERATIVE cues that are
+        // not questions at all and so must be untouched by a rule about questions.
+        for text in [
+            "what's that sound",
+            "what was that noise",
+            "what am i hearing",
+            "what do you hear",
+            "what kind of sound is that",
+            "identify that sound",
+            "name that sound",
+        ] {
+            assert!(is_identify_sound_request(text), "{text:?} stopped being a sound ask");
+        }
+    }
+
+    /// AND THE REPORTS THAT CARRY A MODAL, which the interrogative-position rule
+    /// as first written let straight through: it forgave a bare subject on ANY
+    /// request modal in the prefix, and it returned at the FIRST wh-word while
+    /// the cues it guards are matched anywhere. Every sentence here was MEASURED
+    /// reaching the named gate WITH that rule in place — nine of them a Lumen
+    /// read AND a vision `read.screen`, whose readout is SPOKEN.
+    #[test]
+    fn a_report_with_a_modal_in_it_never_reaches_a_capture_gate() {
+        // Lumen read + vision read.screen.
+        for text in [
+            "i can see what's on my screen",
+            "you can see what's on my screen",
+            "we can see what's on my screen",
+            "you should see what's on my screen",
+            "i do know what's on my screen",
+            "you do know what's on my screen",
+            "i did know what was on the screen",
+            "i can tell you what's on my screen",
+            "let me tell you what's on my screen",
+            "let me show you what's on my screen",
+            "i want to let you know what's on my screen",
+            "let me remind you what's on my screen",
+            "let me get you what's on my screen",
+            "i want to show you what's on my second screen",
+            "i'll let you know what's on my screen",
+            "im watching what's on the screen",
+            "just watching what's on the screen",
+            "what a day, on sundays we talk about what's on my screen",
+            "what did you say, i forgot what was on the screen",
+        ] {
+            assert_eq!(lumen_command(text), None, "{text:?} captured via Lumen");
+            assert_eq!(vision_command(text), None, "{text:?} captured via Vision");
+            assert!(!is_screen_read(text), "{text:?} is still a screen read");
+        }
+        // CAMERA: presence status and the whiteboard OCR.
+        for text in [
+            "you can see who is there",
+            "i can hear who is there",
+            "what's for dinner, we asked who is there and nobody answered",
+            "i can see what's written on the whiteboard",
+            "let me tell you what's written on the whiteboard",
+            "i want to let you know who is there",
+            "what a day, the teacher asked what does the whiteboard say",
+        ] {
+            assert_eq!(vision_command(text), None, "{text:?} opened the camera");
+        }
+        // The sound classifier, over the clip the daemon already captured.
+        for text in [
+            "let me tell you what was that sound",
+            "let me remind you what was that sound",
+            "i can tell you what was that noise",
+            "what time is it, the movie had a great sound and i wondered what was going on",
+        ] {
+            assert!(!is_identify_sound_request(text), "{text:?} classified the clip");
+        }
+        // ...AND THE REQUESTS ONE WORD AWAY FROM EACH OF THEM, because an
+        // inversion rule bolted onto a deny-by-default frame is exactly the shape
+        // that deletes the capability it was meant to protect.
+        let read = r#"{"type":"op","op":"read.screen"}"#;
+        for text in [
+            "do you know what's on my screen",
+            "can you tell me what's on my screen",
+            "can i see what's on my screen",
+            "i want to know what's on my screen",
+            "i need to know what's on my screen",
+            "i'd like to know what's on my screen",
+            "let me know what's on my screen",
+            "let me see what's on my screen",
+            "tell me what's on the screen",
+            "show me what's on my screen",
+            "remind me what's on my screen",
+            "read me what's on the screen",
+            "can you let me know what's on my screen",
+            "i need you to tell me what's on my screen",
+            "what's on my screen",
+            "whats on my screen",
+        ] {
+            assert_vision_op(text, read);
+        }
+        // The question's own body may name the addressee — a prefix bound that
+        // ran past the opener would delete these three CAMERA/mic questions.
+        for text in ["what do you see", "what can you see", "what are you seeing"] {
+            assert_vision_op(text, r#"{"type":"op","op":"status"}"#);
+        }
+        assert!(is_identify_sound_request("what do you hear"));
+        // "keep watching what's on the screen" is a read, not a watch: the watch
+        // arm keys on the literal "watch what" and the participle breaks it. That
+        // is HEAD behaviour, unchanged here — pinned so this test says what the
+        // gate does rather than what it sounds like it should.
+        assert_vision_op("keep watching what's on the screen", read);
+        assert_vision_op(
+            "watch what's on the screen",
+            r#"{"type":"op","op":"watch.start","source":"screen"}"#,
+        );
+        assert_vision_op("who is there", r#"{"type":"op","op":"status"}"#);
+        assert_vision_op(
+            "what does the whiteboard say",
+            r#"{"type":"op","op":"read.handwriting"}"#,
+        );
+        assert!(is_identify_sound_request("what's that sound"));
+        assert!(is_identify_sound_request("identify that sound"));
+    }
+
     /// ...AND BOTH SIDES OF THE BOUNDARY. The command-position rule can only pay
     /// for itself if the real request survives every way an owner opens one, so
     /// each admitted shape is probed: bare imperative, vocative prefix,
@@ -12572,6 +13024,339 @@ mod tests {
                 lumen_command(text),
                 Some(LumenCommand::Read),
                 "{text:?} is a request and the sticky subject ate it"
+            );
+        }
+    }
+
+    /// A CONTROL VERB IS NOT A REQUEST MODAL, tested on the helper itself so the
+    /// rule is pinned independently of any one gate's object matcher.
+    ///
+    /// The aspect verbs used to sit in `VISION_REQUEST_MODALS`, so they forgave a
+    /// bare subject and "we keep reading my screen" — the owner narrating a habit
+    /// — read the owner's screen ALOUD. The discriminator is the ADDRESSEE: a
+    /// control verb takes its own subject as the subject of the verb it governs
+    /// ("we like to READ" = we read), unless its object is DARWIN ("i want YOU to
+    /// read" = DARWIN reads).
+    ///
+    /// BOTH SIDES, ONE DIMENSION AT A TIME: the subject is varied with the
+    /// control verb fixed, then the control verb is varied with the subject
+    /// fixed, then the SAME control verbs are re-run with an addressee inserted
+    /// and must all come back. The true modals are re-asserted last, because the
+    /// stated reason this was not closed earlier is that "we should watch" and
+    /// "you could read" must survive it.
+    #[test]
+    fn a_control_verb_governs_a_narration_but_an_addressee_hands_the_verb_back() {
+        // Subject varied, control verb fixed.
+        for text in [
+            "we keep reading my screen",
+            "i keep reading my screen",
+            "you keep reading my screen",
+        ] {
+            assert!(
+                !super::vision_verb_in_command_position(text, &["read", "reading"]),
+                "{text:?} is narration: the reader is the speaker, not DARWIN"
+            );
+        }
+        // Control verb varied, subject fixed. Both the progressive complement
+        // ("we keep READING") and the to-infinitive ("we like TO READ").
+        for text in [
+            "we keep reading my screen",
+            "we keeps reading my screen",
+            "we keeping reading my screen",
+            "we start reading my screen",
+            "we starts reading my screen",
+            "we continue reading my screen",
+            "we want to read my screen",
+            "we wants to read my screen",
+            "we need to read my screen",
+            "we needs to read my screen",
+            "we like to read my screen",
+            "we try to read my screen",
+            "we help to read my screen",
+            "we going to read my screen",
+            "we gonna read my screen",
+        ] {
+            assert!(
+                !super::vision_verb_in_command_position(text, &["read", "reading"]),
+                "{text:?} is narration and reached command position"
+            );
+        }
+        // THE SAME CONTROL VERBS WITH AN ADDRESSEE — every one must come back, or
+        // the narrowing above deleted the request form rather than the narration.
+        for text in [
+            "we want you to read my screen",
+            "i need you to read my screen",
+            "id like you to read my screen",
+            "i would like you to read my screen",
+            "im going to need you to read my screen",
+            "i want darwin to read my screen",
+            "we need you to read my screen",
+            // THE ADDRESSEE CAN PRECEDE THE CONTROL VERB TOO — "you" is what
+            // "keep" governs here, and a follows-only rule silenced these.
+            "can you keep reading my screen",
+            "could you continue reading my screen",
+            "can you start reading my screen",
+            "darwin keep reading my screen",
+        ] {
+            assert!(
+                super::vision_verb_in_command_position(text, &["read", "reading"]),
+                "{text:?} names DARWIN as the reader and the control-verb rule ate it"
+            );
+        }
+        // The BARE aspect imperative — "keep watching the front door" is a real
+        // command and is the entire reason the progressives are in the verb lists.
+        for text in [
+            "keep reading my screen",
+            "start reading my screen",
+            "continue reading my screen",
+            "resume reading my screen",
+            "begin reading my screen",
+            "go back to reading my screen",
+            "carry on reading my screen",
+            "try reading my screen",
+        ] {
+            assert!(
+                super::vision_verb_in_command_position(text, &["read", "reading"]),
+                "{text:?} is the aspect imperative and it stopped reaching"
+            );
+        }
+        // A PROGRESSIVE WITH NOTHING VERBAL IN FRONT OF IT IS A GERUND SUBJECT.
+        // No subject rule can see these: a gerund clause has no subject pronoun.
+        for text in ["reading my screen is a waste of time", "reading my screen bores me"] {
+            assert!(
+                !super::vision_verb_in_command_position(text, &["read", "reading"]),
+                "{text:?} is a gerund subject, not an imperative"
+            );
+        }
+        // ...and the BARE verb in the same position still is one, so the gerund
+        // rule is not just refusing everything.
+        assert!(
+            super::vision_verb_in_command_position("read my screen", &["read", "reading"]),
+            "the bare imperative is the command form and must always reach"
+        );
+        // THE TRUE MODALS ARE UNTOUCHED — the stated reason this stayed open.
+        for text in [
+            "we should watch the front door",
+            "you could read my screen",
+            "can you read my screen",
+            "would you read my screen",
+            "please read my screen",
+            "darwin read my screen",
+        ] {
+            assert!(
+                super::vision_verb_in_command_position(text, &["read", "reading", "watch", "watching"]),
+                "{text:?} is a request modal shape and must be untouched by the \
+                 control-verb rule"
+            );
+        }
+    }
+
+    /// THE GERUND RULE IS BOUNDED BY THE VERB LISTS THEMSELVES.
+    ///
+    /// `vision_verb_in_command_position` treats a matched verb ending in "ing" as
+    /// a progressive needing an aspect governor. That is exact today because every
+    /// -ing entry in every list it is called with IS a progressive — but a future
+    /// base verb that happens to end in "ing" ("ring", "ping") would silently need
+    /// a governor and the bare imperative would stop reaching. This resolves the
+    /// argument at each of the helper's call sites — literal lists and named
+    /// consts alike — and fails loudly rather than letting the bound rot.
+    ///
+    /// Bounded at BOTH ends and anti-vacuous: the window is router.rs up to its
+    /// FIRST `#[cfg(test)]`, so this test's own source (which names the helper and
+    /// contains -ing literals) is out of scope and cannot stand in for a call
+    /// site; both halves are floored; and the call-site count is asserted non-zero
+    /// so a rename cannot make this vouch for nothing.
+    #[test]
+    fn no_capture_verb_list_has_a_base_form_ending_in_ing() {
+        let src = include_str!("router.rs");
+        let cut = src.find("#[cfg(test)]").expect("router.rs has a test seam");
+        let prod = &src[..cut];
+        assert!(prod.len() > 100_000, "the production window collapsed: {}", prod.len());
+        assert!(
+            src.len() - cut > 10_000,
+            "the #[cfg(test)] marker matched too late — the window swallowed the tests"
+        );
+        // Every progressive that is legitimately in a list, i.e. the -ing form of
+        // a base verb that is in the SAME list. Anything else is a base form
+        // ending in "ing" and the gerund rule would misread it.
+        // The DEFINITION matches the same pattern and its `&[&str]` parameter
+        // resolves to an empty list — caught by the emptiness assert below rather
+        // than silently checking a signature, and excluded here by name.
+        assert_eq!(
+            prod.matches("fn vision_verb_in_command_position(").count(),
+            1,
+            "the helper's definition moved or was renamed; re-point this guard"
+        );
+        let mut sites = 0usize;
+        for (i, _) in prod.match_indices("vision_verb_in_command_position(") {
+            if prod[..i].ends_with("fn ") {
+                continue;
+            }
+            sites += 1;
+            // BOUNDED BY THE CALL'S OWN PARENTHESES. A fixed-width window instead
+            // read a LATER, unrelated `&[...]` for the sites whose argument is a
+            // const identifier (`…(lower, WATCH_VERBS)`) — the guard would have
+            // checked the wrong list at 4 of the 11 sites.
+            let open = i + "vision_verb_in_command_position".len();
+            let mut depth = 0usize;
+            let mut close = open;
+            for (k, c) in prod[open..].char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            close = open + k;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert!(close > open, "unterminated call at router.rs offset {i}");
+            let tail = &prod[open..close];
+            // The argument is either a literal `&[...]` or a const identifier.
+            let list_src = if let Some(b) = tail.find("&[") {
+                let e = tail[b..].find(']').expect("unterminated verb list literal");
+                tail[b..b + e].to_string()
+            } else {
+                let ident: String = tail
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .find(|t| t.chars().all(|c| c.is_ascii_uppercase() || c == '_') && t.len() > 3)
+                    .unwrap_or_default()
+                    .to_string();
+                let decl = format!("const {ident}: &[&str] = &[");
+                let d = prod
+                    .find(&decl)
+                    .unwrap_or_else(|| panic!("cannot resolve verb list {ident:?}"));
+                let e = prod[d..].find("];").expect("unterminated verb list const");
+                prod[d..d + e].to_string()
+            };
+            let words: Vec<&str> = list_src
+                .split('"')
+                .skip(1)
+                .step_by(2)
+                .filter(|w| w.chars().all(|c| c.is_ascii_lowercase()))
+                .collect();
+            assert!(!words.is_empty(), "resolved an EMPTY verb list at router.rs offset {i}");
+            for w in &words {
+                if let Some(stem) = w.strip_suffix("ing") {
+                    // A real progressive: its base is in the same list, either as
+                    // the stem ("watch"/"watching") or the doubled-consonant /
+                    // dropped-e spelling ("scan"/"scanning", "transcribe"/
+                    // "transcribing").
+                    let base_present = words.iter().any(|b| {
+                        *b == stem
+                            || stem.strip_suffix(&stem[stem.len() - 1..]) == Some(*b)
+                            || format!("{stem}e") == **b
+                    });
+                    assert!(
+                        base_present,
+                        "{w:?} ends in \"ing\" but no base form of it is in the same \
+                         list — the gerund rule in \
+                         `vision_verb_in_command_position` would demand an aspect \
+                         governor for what is really a BASE imperative"
+                    );
+                }
+            }
+        }
+        assert!(
+            sites >= 11,
+            "expected the helper's 11 documented call sites in router.rs's \
+             production half, found {sites} — re-point this guard rather than \
+             letting it pass over nothing"
+        );
+    }
+
+    /// THE TWO SPELLINGS OF ONE CONTRACTION MUST BE READ THE SAME WAY.
+    ///
+    /// A transcript writes "i'll read my screen after dinner"; dictation writes
+    /// "ill read my screen after dinner". They are the same sentence and neither
+    /// is a command. Adding "im"/"id"/"ill"/"ive" to `VISION_BARE_SUBJECTS`
+    /// closed the apostrophe-FREE half only: the apostrophe'd half splits to
+    /// "i" + "ll", and while "ll" sat in `VISION_REQUEST_MODALS` it forgave the
+    /// subject "i", so the corpus enforced one spelling as inert while the other
+    /// read the owner's screen ALOUD. This asserts the PAIR, not either half, so
+    /// a token put back in either list fails here rather than re-opening the gap
+    /// silently.
+    ///
+    /// BOTH SIDES, per the rule that a narrowing which deletes the capability is
+    /// not a fix: the request forms carry an ADDRESSEE ("i'd like YOU to read my
+    /// screen") and every one of them must still reach command position, as must
+    /// the true modals that were never touched.
+    #[test]
+    fn a_contraction_subject_is_read_the_same_with_and_without_its_apostrophe() {
+        const VERBS: &[&str] = &["read", "reading", "watch", "watching", "scan", "scanning"];
+        // NARRATION, as PAIRS. Neither spelling is a command, and — the whole
+        // point — the two must AGREE.
+        for (apostrophe, dictated) in [
+            ("i'll read my screen after dinner", "ill read my screen after dinner"),
+            ("i'd read my screen every morning", "id read my screen every morning"),
+            ("i've read my screen already", "ive read my screen already"),
+            ("i'm reading my screen right now", "im reading my screen right now"),
+            ("i'll watch the front door tonight", "ill watch the front door tonight"),
+            ("i'll scan the receipt later", "ill scan the receipt later"),
+            ("i'm going to read my screen later", "im going to read my screen later"),
+            ("i'd like to read my screen", "id like to read my screen"),
+        ] {
+            let a = super::vision_verb_in_command_position(apostrophe, VERBS);
+            let d = super::vision_verb_in_command_position(dictated, VERBS);
+            assert_eq!(
+                a, d,
+                "{apostrophe:?} and {dictated:?} are one sentence in two \
+                 spellings and the helper disagrees about them"
+            );
+            assert!(
+                !a,
+                "{apostrophe:?} is the speaker narrating and it reached command \
+                 position — the readout is SPOKEN"
+            );
+        }
+        // The third-person and second-person "'ll"/"'d" narrations too: nothing
+        // in this family is a command.
+        for text in [
+            "we'll read my screen after dinner",
+            "you'll read my screen",
+            "we'd read my screen every morning",
+            "i'd watch the front door if i were you",
+        ] {
+            assert!(
+                !super::vision_verb_in_command_position(text, VERBS),
+                "{text:?} is narration and it reached command position"
+            );
+        }
+        // THE REQUEST FORMS OF THE SAME CONTRACTIONS — an addressee is what makes
+        // DARWIN the reader, and every one of these must still fire or the
+        // narrowing above deleted the capability instead of the narration.
+        for text in [
+            "i'd like you to read my screen",
+            "id like you to read my screen",
+            "i'll need you to watch the front door",
+            "ill need you to watch the front door",
+            "i'd like darwin to read my screen",
+            "we'd like you to watch the front door",
+            "i'm going to need you to watch the front door",
+            "im going to need you to watch the front door",
+        ] {
+            assert!(
+                super::vision_verb_in_command_position(text, VERBS),
+                "{text:?} names DARWIN as the reader and dropping the \
+                 contraction fragments from the request modals ate it"
+            );
+        }
+        // ...and the TRUE modals, which this change did not touch, still forgive
+        // a bare subject — so the list was narrowed, not emptied.
+        for text in [
+            "can you read my screen",
+            "could you read my screen",
+            "would you read my screen",
+            "will you read my screen",
+            "please read my screen",
+            "read my screen",
+        ] {
+            assert!(
+                super::vision_verb_in_command_position(text, VERBS),
+                "{text:?} is a true-modal request and must be untouched"
             );
         }
     }
@@ -14272,10 +15057,22 @@ mod tests {
         // Pure punctuation / empty -> None.
         assert_eq!(vision_command(""), None);
         assert_eq!(vision_command("??? --- ..."), None);
-        // A Vision phrase buried in a huge string still resolves to a valid op
-        // (and serde framing stays well-formed) rather than choking.
+        // A Vision phrase LEADING a huge string still resolves to a valid op (and
+        // serde framing stays well-formed) rather than choking — that is what this
+        // test is for, and the oversize tail is what makes it a real exercise of
+        // the single-pass scan.
+        let leading = format!("what do you see {huge}");
+        assert_vision_op(&leading, r#"{"type":"op","op":"status"}"#);
+        // THIS ASSERTION USED TO READ THE OTHER WAY, and it was asserting the bug.
+        // It required a presence question BURIED in 60,000 characters of unrelated
+        // text to open the CAMERA — the anywhere-match that let "we asked who is
+        // there and nobody answered" take a snapshot. A question 5,000 words into
+        // somebody else's paragraph is not addressed to DARWIN, and the
+        // interrogative-position rule now says so. The oversize path is still
+        // exercised: it is the same 60KB input, and it must come back None
+        // without panicking or blowing up allocation.
         let buried = format!("{huge} what do you see {huge}");
-        assert_vision_op(&buried, r#"{"type":"op","op":"status"}"#);
+        assert_eq!(vision_command(&buried), None);
     }
 
     // ======================================================================

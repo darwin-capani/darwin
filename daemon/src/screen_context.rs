@@ -875,7 +875,19 @@ pub fn classify_screen_context_intent(utterance: &str) -> Option<ScreenContextIn
             || lower.contains("a moment ago")
             || lower.contains("just now")
             || lower.contains("recently"));
-    if working_recall || perfect_recall || past_screen_recall {
+    // ALL THREE CUES ABOVE ARE MATCHED ANYWHERE IN THE UTTERANCE, and all three
+    // are WH-QUESTIONS, so an owner NARRATING the question had the redacted
+    // screen ring recalled and read back. MEASURED at HEAD: "on sundays we joke
+    // about what was i doing all week", "on tuesdays we chat about what was i
+    // doing all week", "she always jokes about what was i doing all week", "we
+    // laughed about what was on the screen earlier". The WH-word must OPEN the
+    // question, behind nothing but the interrogative frame — the same rule the
+    // Vision/Lumen screen-read gates take, so the two cannot drift. Every opener
+    // ("what was i working on around 3pm", "what have i been looking at", "what
+    // was on my screen a minute ago") and every direct-question frame ("tell me
+    // what i was doing") is untouched.
+    let asked_directly = crate::utterance::wh_word_in_interrogative_position(&lower, &["what"]);
+    if (working_recall || perfect_recall || past_screen_recall) && asked_directly {
         return Some(ScreenContextIntent::Recall {
             subject: extract_recall_subject(&lower),
         });
@@ -1263,6 +1275,55 @@ mod tests {
                     Some(ScreenContextIntent::Recall { .. })
                 ),
                 "{u:?} should be a recall"
+            );
+        }
+    }
+
+    /// A NARRATED RECALL QUESTION IS NOT A RECALL. All three cues were matched
+    /// anywhere in the utterance, so telling a story ABOUT the question read the
+    /// redacted screen ring back aloud. Every sentence here was MEASURED
+    /// reaching `Recall` at HEAD; the interrogative-position rule is what makes
+    /// them None. The embedding verbs and the subjects are both varied, and the
+    /// last three insert an adverb between the subject and the embedding verb —
+    /// the one-word bypass that defeated the command-position sibling.
+    #[test]
+    fn a_narrated_recall_question_is_not_a_recall() {
+        for u in [
+            "on sundays we joke about what was i doing all week",
+            "on tuesdays we chat about what was i doing all week",
+            "she always jokes about what was i doing all week",
+            "on sundays we joke about what was i working on all week",
+            "on sundays we joke about what have i been looking at",
+            "the kids asked what have i been looking at",
+            "we laughed about what was on the screen earlier",
+            "on sundays we sometimes joke about what was i doing all week",
+        ] {
+            assert_eq!(
+                classify_screen_context_intent(u),
+                None,
+                "{u:?} is narration and recalled the owner's screen ring"
+            );
+            assert!(!is_screen_context_recall(u), "{u:?} is still flagged a recall");
+        }
+        // ...AND THE REAL RECALL SURVIVES, in every shape the fixture and this
+        // module's own doc list — openers, a direct-question frame, and the
+        // "screen context" phrase that is not a WH-question at all.
+        for u in [
+            "what was i working on",
+            "what was i doing earlier",
+            "what was i looking at",
+            "what have i been looking at",
+            "what was on my screen a minute ago",
+            "tell me what was i doing earlier",
+            "recall my screen context",
+            "remind me of my screen context",
+        ] {
+            assert!(
+                matches!(
+                    classify_screen_context_intent(u),
+                    Some(ScreenContextIntent::Recall { .. })
+                ),
+                "{u:?} is a real recall and stopped working"
             );
         }
     }

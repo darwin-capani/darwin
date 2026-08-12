@@ -965,13 +965,23 @@ pub fn classify_aperture_intent(utterance: &str, now: &DateTime<Local>) -> Optio
         return Some(ApertureIntent::Forget);
     }
 
-    let recall_cue = lower.contains("what did i do")
-        || lower.contains("what have i been doing")
-        || lower.contains("what did i work on")
-        || lower.contains("what was i working on")
-        || lower.contains("what was i doing")
-        || lower.contains("what were i doing")
-        || lower.contains("what was i up to")
+    // THE SEVEN WH-CUES MUST OPEN THE QUESTION. They were matched anywhere in the
+    // utterance, so narrating the question recalled the activity timeline and read
+    // it back: "on sundays we joke about what was i doing at lunch" reached
+    // `Recall` at HEAD (the time window resolves, so the guard below passes). The
+    // rule is the interrogative analogue of the command-position rule the capture
+    // gates carry — see [`crate::utterance::wh_word_in_interrogative_position`].
+    // The three `recall my activity` / `show my activity` cues and the timeline
+    // word are NOT wh-questions and are left exactly as they were.
+    let asked_directly = crate::utterance::wh_word_in_interrogative_position(&lower, &["what"]);
+    let recall_cue = (asked_directly
+        && (lower.contains("what did i do")
+            || lower.contains("what have i been doing")
+            || lower.contains("what did i work on")
+            || lower.contains("what was i working on")
+            || lower.contains("what was i doing")
+            || lower.contains("what were i doing")
+            || lower.contains("what was i up to")))
         || lower.contains("recall my activity")
         || lower.contains("show my activity")
         || lower.contains("show me my activity")
@@ -1652,6 +1662,49 @@ mod tests {
                 classify_aperture_intent(u, &fixed_now()),
                 None,
                 "{u:?} must NOT trigger an aperture intent"
+            );
+        }
+    }
+
+    /// A NARRATED RECALL QUESTION IS NOT A RECALL — and the time-window guard is
+    /// NOT what makes that true.
+    ///
+    /// WHAT WENT WRONG: this gate was audited as "clean by a different
+    /// construction — the recall needs a resolvable time window", and the probe
+    /// that showed it used narration whose adjunct named no window ("… what was i
+    /// doing ALL WEEK"). So the WINDOW did the refusing and the anywhere-matched
+    /// cue was never tested at all. Move the adjunct one phrase and the guard
+    /// passes: "on sundays we joke about what was i doing AT LUNCH" reached
+    /// `Recall` at HEAD and read the owner's activity timeline back. A downstream
+    /// guard is not a position rule.
+    #[test]
+    fn a_narrated_recall_question_is_not_a_recall_even_with_a_real_time_window() {
+        for u in [
+            "on sundays we joke about what was i doing at lunch",
+            "we laughed about what was i working on around 3pm",
+            "she asked what did i do this morning",
+            "the kids joked about what have i been doing all week",
+            "on sundays we sometimes joke about what was i up to yesterday",
+        ] {
+            assert_eq!(
+                classify_aperture_intent(u, &fixed_now()),
+                None,
+                "{u:?} is narration and recalled the activity timeline"
+            );
+        }
+        // ...AND THE REAL QUESTION STILL RESOLVES, including the non-question
+        // limbs the rule must not touch.
+        for u in [
+            "what was i working on around 3pm",
+            "what was i doing at lunch",
+            "what did i do this morning",
+            "tell me what was i doing at lunch",
+            "show me my activity timeline",
+            "recall my activity",
+        ] {
+            assert!(
+                classify_aperture_intent(u, &fixed_now()).is_some(),
+                "{u:?} is a real aperture recall and stopped working"
             );
         }
     }
