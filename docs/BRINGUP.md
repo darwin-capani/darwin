@@ -263,6 +263,20 @@ bash scripts/test_doc_claims.sh        # the doc-claims harness                 
 bash scripts/test_install_prune.sh     # -> the shipped-manifest prune                (4 checks)
 ```
 
+**Proving it WORKS, as opposed to proving it is installed:** every leg of
+`darwind --selftest` and every check in `scripts/doctor.sh` is a PRECONDITION — a directory
+exists, a port answers, a model file is present, a socket accepts a connection. A daemon can
+pass all of them and still never reply. `scripts/doctor.sh --ask` sends one real,
+non-consequential question and checks the answer:
+
+```sh
+scripts/doctor.sh --ask     # -> "DARWIN ANSWERS (4.9s): DARWIN OK"
+```
+
+It is OPT-IN because doctor is otherwise read-only and this makes the daemon think. With no
+cloud key it is also a live proof of the documented degrade path: the on-device brain answers
+rather than the turn failing.
+
 `test_install_prune.sh` guards the one destructive thing `install.sh` does. rsync runs
 WITHOUT `--delete`, so before the shipped-manifest a file removed from the repo stayed in
 the install home forever — measured, apps deleted in #237 were still deployed three weeks

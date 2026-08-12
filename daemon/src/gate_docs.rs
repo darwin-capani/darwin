@@ -328,3 +328,23 @@ fn the_bringup_doc_documents_running_the_install_prune_harness() {
          gates all state theirs so the price is known rather than discovered"
     );
 }
+
+/// THE ONLY DOCUMENTED CHECK THAT PROVES DARWIN ANSWERS. Every selfcheck leg and
+/// every doctor check is a PRECONDITION — a dir, a port, a model file, a socket
+/// that accepts a connection — and a daemon can pass all of them while never
+/// replying. That gap existed for the whole life of this repo. If the command
+/// stops being documented, the gap silently returns.
+#[test]
+fn the_bringup_doc_documents_the_end_to_end_answer_check() {
+    let doc = include_str!("../../docs/BRINGUP.md");
+    assert!(
+        doc.contains("scripts/doctor.sh --ask"),
+        "docs/BRINGUP.md no longer tells anyone how to verify DARWIN actually ANSWERS; \
+         every other documented check only proves it is installed"
+    );
+    assert!(
+        doc.contains("PRECONDITION"),
+        "the doc must say WHY --ask is different from the checks around it, or the \
+         next reader deletes it as redundant"
+    );
+}

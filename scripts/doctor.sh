@@ -21,8 +21,13 @@
 # bash 3.2 compatible: no associative arrays, no mapfile, no ${var^^}.
 set -euo pipefail
 
+ASK_CHECK=0
 case "${1:-}" in
     ""|--full) : ;;
+    # OPT-IN, because doctor's contract above is that every check is a READ and
+    # starts nothing. An --ask actually SENDS a request and makes the daemon think
+    # (~8s on the on-device brain), so it must never be the default.
+    --ask) ASK_CHECK=1 ;;
     -h|--help) sed -n '2,18p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) echo "error: unknown argument '${1}'" >&2; exit 2 ;;
 esac
@@ -243,6 +248,59 @@ elif [ -S "$CMD_SOCK" ]; then
     CMD_TAG="STALE"
 else
     say_info "command socket absent: $CMD_SOCK (daemon not running)"
+fi
+
+# --- the only check that proves DARWIN WORKS ---------------------------------
+#
+# Everything else in this file — and every leg of `darwind --selftest` — is a
+# PRECONDITION: a directory exists, a port answers, a model file is present, a
+# socket accepts a connection. None of them establishes the thing the owner
+# actually cares about, which is whether asking DARWIN a question produces an
+# answer. A daemon can pass every precondition and still never reply.
+#
+# So this sends one real, non-consequential question and checks the reply. It is
+# opt-in (`--ask`) because it costs a model round-trip and doctor is otherwise
+# read-only. MEASURED on an M1 Pro with no cloud key: 8.3s on the on-device brain,
+# which is also a live proof of the documented cloud-degrade path (no key => the
+# local 4B answers rather than the turn failing).
+if [ "$ASK_CHECK" -eq 1 ]; then
+    if [ "$CMD_TAG" != "UP" ]; then
+        say_warn "--ask skipped: the command socket is $CMD_TAG (start the daemon first)"
+    elif [ ! -r "$ROOT/state/ipc/command.token" ]; then
+        say_warn "--ask skipped: no readable command token at state/ipc/command.token"
+    else
+        ASK_OUT="$(ROOT="$ROOT" python3 - <<'ASKPY' 2>/dev/null
+import socket, json, os, sys, time
+root = os.environ["ROOT"]
+try:
+    tok = open(f"{root}/state/ipc/command.token").read().strip()
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(180)
+    s.connect(f"{root}/state/ipc/command.sock")
+    t0 = time.time()
+    s.sendall((json.dumps({"token": tok, "cmd": "ask",
+                           "text": "Reply with exactly: DARWIN OK"}) + "\n").encode())
+    buf = b""
+    while b"\n" not in buf:
+        c = s.recv(65536)
+        if not c:
+            break
+        buf += c
+    s.close()
+    j = json.loads(buf.decode(errors="replace").strip())
+    reply = (j.get("reply") or j.get("error") or "").strip().replace("\n", " ")
+    print(f"{'ok' if j.get('ok') else 'err'}|{time.time()-t0:.1f}|{reply[:120]}")
+except Exception as e:
+    print(f"err|0|{type(e).__name__}: {e}")
+ASKPY
+)"
+        ASK_STATUS="${ASK_OUT%%|*}"; ASK_REST="${ASK_OUT#*|}"
+        ASK_SECS="${ASK_REST%%|*}"; ASK_REPLY="${ASK_REST#*|}"
+        if [ "$ASK_STATUS" = "ok" ] && [ -n "$ASK_REPLY" ]; then
+            say_ok "DARWIN ANSWERS (${ASK_SECS}s): $ASK_REPLY"
+        else
+            say_fail "DARWIN did NOT answer: $ASK_REPLY"
+        fi
+    fi
 fi
 TEL_TAG="DOWN"
 if tcp_connectable "$TEL_PORT"; then
