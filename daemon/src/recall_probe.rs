@@ -544,6 +544,95 @@ mod tests {
         // reporting its own near-miss; every cheaper cut was measured to break
         // one side or the other. MEASURED still firing at this revision.
         "on sundays we sit down, draw pictures of the dog and drink cocoa",
+        // ------------------------------------------------------------------
+        // THE QUESTION-FORM RESIDUE OF THE CAPTURE/READ GATES, added — not
+        // closed — because closing it needs a rule this pass did not earn.
+        //
+        // The pass that put these here enumerated all 17 sites in the daemon
+        // that actuate a CAPTURE or a READ of owner content (screen, camera,
+        // mic, clipboard, files) and asked one question of each: does its
+        // trigger require the verb in COMMAND POSITION, or does it match
+        // anywhere? EIGHT were already clean: four carry the rule already
+        // (watch.start, watch.stop, analyze.file, scan.document),
+        // and four are clean by a different construction the rule does not
+        // apply to (describe's IMAGE branch needs a real image-extension token,
+        // explicit_screen_vqa is head-anchored on starts_with, the where-is
+        // locate is bounded by locate_targets_a_control, and aperture's recall
+        // needs a resolvable time window or the literal timeline word) — all
+        // four probed inert on narration rather than assumed. TWO were closed
+        // with the rule —
+        // `lumen_is_read`'s read/narrate/list verbs and `describe_command`'s
+        // screen branch — which took 18 measured narration sentences from
+        // capturing to inert; they are in `router_ordinary.json`.
+        //
+        // THE SIX BELOW ARE WHAT THE RULE CANNOT REACH, and the reason is
+        // structural rather than an oversight: every one of these triggers is a
+        // WH-QUESTION, not a verb. "what's on my screen" contains no verb that
+        // could be put in command position, so `vision_verb_in_command_position`
+        // has nothing to test and imposing it would delete the capability
+        // outright. The rule that WOULD close them is the interrogative analogue
+        // — the wh-word must open the utterance, behind nothing but the frame —
+        // and it is a NEW rule over five more gates, needing its own both-sides
+        // measurement (its risk is real: "tell me what's on the screen", "read
+        // what's on screen", "watch what's on the screen" and "describe what's
+        // on my screen" are all harvested REAL phrasings that lead with a word
+        // no current frame admits). Naming it beats half-proving it.
+        //
+        // ALL SIX MEASURED FIRING AFTER the two closures, one representative per
+        // gate; the class is wider than the six lines (10 of the 12 residue
+        // sentences probed fired, and "we argued about what are the buttons on
+        // this screen for" fires the same lumen+vision pair as the first).
+        // Ordered by consequence: the first three capture the owner's screen or
+        // camera and the readout is SPOKEN.
+        //
+        // lumen + vision read.screen, via `asks_what_is_on_screen` and Lumen's
+        // "what's on" / "what is on" / "what are" cues.
+        "on sundays we talk about what's on my screen",
+        "i forgot what was on the screen",
+        // vision presence status — a CAMERA read, via `contains("who is there")`.
+        "we asked who is there and nobody answered",
+        // vision read.handwriting — a CAMERA OCR, via the `"what does" + "say"`
+        // conjunct that sits beside the (already clean) command-position verbs.
+        "the teacher asked what does the whiteboard say",
+        // sound — classifies the clip the daemon ALREADY captured, via a bare
+        // `contains("what was")` beside a "sound"/"noise" substring. Labels only
+        // leave the op, which is why it sits below the three above.
+        "the movie had a great sound and i wondered what was going on",
+        // pasteboard recall — reads the clipboard ring, via "thing i copied".
+        "we talked about the thing i copied from the lease",
+        // screen_context recall — reads the redacted screen ring, via
+        // "what was i" + "doing".
+        "on sundays we joke about what was i doing all week",
+        // ------------------------------------------------------------------
+        // AND THE MODAL-FORGIVENESS RESIDUE, which is NOT wh-question shaped —
+        // so the paragraph above, which called the wh-question the whole of what
+        // the rule cannot reach, was smaller than the truth.
+        //
+        // `vision_verb_in_command_position` forgives a bare subject when a
+        // REQUEST MODAL came first, and that is load-bearing: it is the only
+        // reason "can YOU read my screen" and "i need YOU to read my screen"
+        // work. But VISION_REQUEST_MODALS cannot tell the ADDRESSEE apart from
+        // the SPEAKER, so a subject that precedes its own modal is forgiven too,
+        // and "we keep reading my screen" reads as a request. MEASURED still
+        // firing after the sticky-subject fix; unchanged by it, and firing
+        // identically at 668bcb3.
+        //
+        // WHAT WOULD CLOSE IT is one more turn of the same screw — forgive only
+        // a subject that appears AFTER the modal, i.e. the addressee — and it is
+        // NOT TAKEN here for a concrete reason, not a shrug: "we should watch the
+        // front door" and "you could read my screen" have the subject BEFORE the
+        // modal and are plausible real requests, so the rule needs its own
+        // both-sides sweep over all 11 call sites of the helper (watch.start,
+        // watch.stop, the stop alias, analyze.file, scan.document,
+        // read.handwriting, sensitivity, reads_this_or_that, read.screen, lumen
+        // read, describe screen). Half-proving it across eleven gates is traps
+        // (g) and (m) in one move.
+        //
+        // The first two capture the owner's SCREEN and the readout is SPOKEN; the
+        // third is on the shipped CAMERA gate and predates this hunt entirely.
+        "we keep reading my screen",
+        "we like to read my screen on sundays",
+        "we keep watching the front door",
     ];
 
     /// THE HARNESS CLOCK IS PINNED, AND IT HAS TO BE.
