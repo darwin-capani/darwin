@@ -307,3 +307,24 @@ fn the_bringup_doc_documents_running_the_installer_lifecycle_selftests() {
          discovers instead of reads"
     );
 }
+
+/// THE PRUNE HARNESS MUST BE REACHABLE, for the same reason its three siblings
+/// are: CI runs on a pushed v* tag only, so the commands a contributor is told to
+/// run ARE the merge gate. This one guards the ONLY destructive thing install.sh
+/// does, and the property that makes the prune safe — a runtime-created path that
+/// never appeared in a manifest is untouched, so forge-generated apps survive —
+/// has no other test anywhere in the tree.
+#[test]
+fn the_bringup_doc_documents_running_the_install_prune_harness() {
+    let doc = include_str!("../../docs/BRINGUP.md");
+    assert!(
+        doc.contains("scripts/test_install_prune.sh"),
+        "docs/BRINGUP.md never tells anyone to run scripts/test_install_prune.sh, so \
+         the guard on install.sh's destructive path runs nowhere"
+    );
+    assert!(
+        doc.contains("Measured cost: 0.08s"),
+        "the prune harness's measured cost is not stated beside it — the sibling \
+         gates all state theirs so the price is known rather than discovered"
+    );
+}

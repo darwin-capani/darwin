@@ -260,7 +260,19 @@ surface rather than to an installer, so it is wired the same way one section dow
 ./uninstall.sh --selftest              # -> scripts/test_uninstall_footprint.sh      (23 checks)
 scripts/install_boot.sh --selftest     # -> scripts/test_install_boot.sh              (6 checks)
 bash scripts/test_doc_claims.sh        # the doc-claims harness                      (28 checks)
+bash scripts/test_install_prune.sh     # -> the shipped-manifest prune                (4 checks)
 ```
+
+`test_install_prune.sh` guards the one destructive thing `install.sh` does. rsync runs
+WITHOUT `--delete`, so before the shipped-manifest a file removed from the repo stayed in
+the install home forever — measured, apps deleted in #237 were still deployed three weeks
+later and logged `skipping invalid micro-app manifest` on every boot. `--delete` is NOT the
+fix: the install home also holds forge-generated apps that are absent from source, and a
+blanket delete would destroy the owner's generated work. The prune is therefore driven by a
+manifest of what the LAST install placed, and the load-bearing assertion is the third one —
+a runtime-created path that never appeared in a manifest is untouched. A missing or corrupt
+manifest prunes nothing, so the failure direction is "leave it", never "delete it".
+Measured cost: 0.08s.
 
 **Cost, measured on an M1 Pro (best of three warm runs of the commands above, not of the
 bare harnesses — the wrapper scripts source `scripts/ui.sh` first): 0.96s + 0.81s + 0.28s
