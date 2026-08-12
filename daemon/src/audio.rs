@@ -70,7 +70,17 @@ fn acquire_input_device() -> Result<(cpal::Device, cpal::SupportedStreamConfig)>
                 .ok_or_else(|| anyhow!("no default input device"))
                 .and_then(|d| {
                     d.default_input_config()
-                        .context("querying default input config")
+                        // The 87 most common ERROR lines on the owner's daemon
+                        // were this context alone, which names the CALL and not
+                        // the CAUSE. Same reasoning as the timeout arm below: a
+                        // device that enumerates but will not yield a config is
+                        // the shape of an ungranted Microphone permission.
+                        .context(
+                            "querying default input config (a device was found but \
+                             would not report a config — usually a missing \
+                             Microphone privacy grant; System Settings > Privacy & \
+                             Security > Microphone, then restart the daemon)",
+                        )
                         .map(|c| (d, c))
                 });
             let _ = tx.send(out);
@@ -78,9 +88,23 @@ fn acquire_input_device() -> Result<(cpal::Device, cpal::SupportedStreamConfig)>
         .context("spawning the device probe thread")?;
     match rx.recv_timeout(DEVICE_QUERY_TIMEOUT) {
         Ok(res) => res,
+        // DO NOT NAME A CAUSE WE HAVE NOT MEASURED. This said "CoreAudio is
+        // wedged", and on the owner's machine that was FALSE: `system_profiler
+        // SPAudioDataType` answered in 0.29s with a default input device present,
+        // while this probe still timed out. A launchd daemon has no UI, so it
+        // cannot raise the macOS microphone prompt — an ungranted Microphone
+        // privacy permission looks exactly like a hang here, and it is the
+        // overwhelmingly common cause. The message now names the remedy the owner
+        // can act on and states the alternative honestly, instead of sending them
+        // to look at a CoreAudio that is answering fine.
         Err(_) => Err(anyhow!(
-            "the input-device query did not answer within {}s (CoreAudio is wedged); \
-             capture is unavailable this run",
+            "the input-device query did not answer within {}s. On a launchd daemon \
+             this is USUALLY a missing Microphone privacy grant, not a broken audio \
+             stack: DARWIN cannot raise the macOS prompt itself. Check System \
+             Settings > Privacy & Security > Microphone and grant DARWIN, then \
+             restart the daemon. If the grant is already there, CoreAudio itself is \
+             not answering (verify with `system_profiler SPAudioDataType`). Capture \
+             is OFF for this run; the rest of the daemon keeps running",
             DEVICE_QUERY_TIMEOUT.as_secs()
         )),
     }
@@ -1393,6 +1417,35 @@ fn round4(v: f64) -> f64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// A DIAGNOSTIC MUST NOT NAME A CAUSE NOBODY MEASURED. Both audio failure
+    /// messages used to assert "CoreAudio is wedged" / name only the call. On the
+    /// owner's machine that was measurably false — `system_profiler` answered in
+    /// 0.29s with a default input device present — while the probe still failed,
+    /// which is the signature of an ungranted Microphone permission on a daemon
+    /// that has no UI to prompt with. A wrong cause costs more than no cause: it
+    /// sends the reader to the wrong subsystem.
+    #[test]
+    fn the_audio_failure_messages_name_the_actionable_cause() {
+        let src = include_str!("audio.rs");
+        // Scope to the acquisition fn at BOTH ends so this cannot drift (trap g).
+        let start = src.find("fn acquire_input_device").expect("fn moved");
+        let end = src[start..].find("\npub fn spawn_capture").map(|o| start + o).unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            body.contains("Microphone privacy grant"),
+            "neither message tells the owner the thing they can actually fix"
+        );
+        assert!(
+            body.contains("System Settings"),
+            "the remedy must name where to go, not just what is wrong"
+        );
+        // ...and it must NOT reassert the measured-false cause as fact.
+        assert!(
+            !body.contains("CoreAudio is wedged)"),
+            "the message asserts a cause that was measured false on a real machine"
+        );
+    }
     use super::{read_app_handshake, round4, AppAudioHeader, LevelMeter, Vad, LEVEL_INTERVAL};
     use anyhow::Result;
     use crate::config::Config;
