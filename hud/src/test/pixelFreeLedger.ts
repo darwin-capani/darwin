@@ -60,10 +60,10 @@ export const UNTRIAGED = 0;
  * the moment it is written, in a diff a reviewer can see — the same contract the
  * `diagnostic` bucket imposes on the daemon side.
  *
- * TRUE PIXEL-FREE POPULATION = PIXEL_FREE (114 topics / 130 sites)
+ * TRUE PIXEL-FREE POPULATION = PIXEL_FREE (115 topics / 131 sites)
  *                            + NO_OP_CASES (9 topics / 14 sites)
- *                            = 123 topics / 144 sites,
- * out of 294 topics / 395 production emit calls — 41.8% of the topics the daemon
+ *                            = 124 topics / 145 sites,
+ * out of 294 topics / 396 production emit calls — 42.0% of the topics the daemon
  * emits reach no pixel, not the 38.8% that counting only PIXEL_FREE reports.
  */
 export const NO_OP_CASES: string[] = [
@@ -79,6 +79,12 @@ export const NO_OP_CASES: string[] = [
 ];
 
 export const PIXEL_FREE: Record<string, LedgerEntry> = {
+  "ask.stages": {
+    bucket: "diagnostic",
+    sites: "command.rs",
+    why:
+      "A per-turn latency breakdown for profiling the ask hot path. MEASURED cause: an ask the model answered in 300ms took 2.65s end to end and ~1.4s of it was unattributable, because this path had no stage timing. The reader is the log and any calibration pass; a HUD row on every utterance would be noise, and the owner cannot act on a stage split mid-conversation.",
+  },
   "action.deduped": {
     bucket: "diagnostic",
     sites: "anthropic.rs:2819",

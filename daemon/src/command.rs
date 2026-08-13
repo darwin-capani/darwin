@@ -56,7 +56,7 @@ use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::apps;
 use crate::telemetry;
@@ -1458,18 +1458,75 @@ fn vault_no_local_answer() -> String {
 impl CommandPipeline for LivePipeline {
 
     async fn ask(&self, text: &str, agent: Option<&str>) -> String {
+        // STAGE TIMING ON THE HOT PATH.
+        //
+        // MEASURED on the owner's live install before this existed: an `ask` that
+        // the model answers in 300ms took 2.65s end to end. The single largest
+        // component that could be measured FROM OUTSIDE was the intent classifier
+        // at ~900ms steady-state; the remaining ~1.4s was unattributable, because
+        // this path — the one every typed and spoken turn goes through — carried
+        // no stage timing at all. You cannot optimise what you have not measured,
+        // and every number above had to be reconstructed by probing the inference
+        // socket directly rather than read off the turn.
+        //
+        // These are monotonic reads around work that already happens; the cost is
+        // an Instant per stage. The frame rides existing telemetry so the HUD's
+        // latency surface and any future calibration can read it without a second
+        // mechanism.
+        let t_turn = Instant::now();
         let agent = self.resolve_agent(agent);
         let mem = self.memory.as_ref();
+        let t_stage = Instant::now();
         let facts =
             crate::anthropic::grounded_facts_live(text, mem, &agent.namespace).await;
+        let ms_facts = t_stage.elapsed().as_millis() as u64;
         // SHARED WORLD MODEL context (relevant to this request) from the shared
         // user.world.* tier — grounds the reply in the one coherent world picture
         // every agent shares; never reads another agent's private notes.
+        let t_stage = Instant::now();
         let world_context = crate::anthropic::grounded_world_live(text, mem).await;
+        let ms_world = t_stage.elapsed().as_millis() as u64;
         // PERSONALIZATION: the bounded user-model summary (observed profile) so
         // the command reply personalizes to the real observed user. Shared tier
         // only -> never another agent's private notes.
+        let t_stage = Instant::now();
         let personalization = crate::anthropic::grounded_personalization_live(mem).await;
+        let ms_personalization = t_stage.elapsed().as_millis() as u64;
+        // Emitted BEFORE the model call, so a turn that never reaches the model
+        // (a gate refusal, a swap arm, a park) still reports where its time went.
+        // THE LOG LINE IS NOT OPTIONAL, and writing it was not obvious: I marked
+        // the frame below "the operator surface is the log" and it was NOT — an
+        // emit goes to the telemetry hub (a WebSocket with Origin validation),
+        // never to daemon.log, so the breakdown was unreadable by the one reader
+        // it was written for. Measured immediately after deploying it: three live
+        // turns, zero `ask.stages` lines in the log. `debug!` rather than `info!`
+        // because this fires on EVERY turn and an always-on per-turn timing line
+        // is the noise that trains an operator to stop reading warnings.
+        debug!(
+            facts_ms = ms_facts,
+            world_ms = ms_world,
+            personalization_ms = ms_personalization,
+            grounding_ms = ms_facts + ms_world + ms_personalization,
+            elapsed_ms = t_turn.elapsed().as_millis() as u64,
+            "ask: stage timings"
+        );
+        // PIXEL-FREE(diagnostic): a per-turn latency breakdown for whoever is
+        // profiling the hot path, not a fact the owner acts on mid-conversation.
+        // The operator surfaces are the debug log line directly above and any
+        // future calibration reader; a HUD row per turn would be noise on every
+        // single utterance. Kept because the number it carries had to be
+        // reconstructed by hand once already.
+        telemetry::emit(
+            "system",
+            "ask.stages",
+            json!({
+                "facts_ms": ms_facts,
+                "world_ms": ms_world,
+                "personalization_ms": ms_personalization,
+                "grounding_ms": ms_facts + ms_world + ms_personalization,
+                "elapsed_ms": t_turn.elapsed().as_millis() as u64,
+            }),
+        );
         let persona =
             crate::anthropic::agent_persona_text(&agent.name, agent.is_orchestrator());
         // MODEL-TIER SWAP — a ROUTER intent with no tool, handled here so the
